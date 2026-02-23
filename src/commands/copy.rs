@@ -15,6 +15,7 @@ pub fn copy_to_clipboard(text: String) -> Result<(), String> {
     {
         // On Linux (including Docker), suggest using Web API
         // The frontend should handle this gracefully
+        let _ = text; // Suppress unused variable warning
         Err("Clipboard not available on Linux - use Web API".to_string())
     }
 }
