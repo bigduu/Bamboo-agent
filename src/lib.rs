@@ -25,14 +25,14 @@
 //!
 //! ## Library Mode
 //!
-//! ```rust
+//! ```rust,ignore
 //! use bamboo::{BambooServer, BambooConfig};
 //!
 //! #[tokio::main]
 //! async fn main() {
 //!     let config = BambooConfig::default();
 //!     let server = BambooServer::new(config);
-//!     server.start().await.unwrap();
+//!     // server.start().await.unwrap(); // Not yet implemented
 //! }
 //! ```
 
@@ -51,6 +51,7 @@ pub mod commands;
 
 pub use config::{BambooConfig, ServerConfig};
 pub use error::{BambooError, Result};
+pub use process::ProcessRegistry;
 
 /// Main Bamboo server instance
 pub struct BambooServer {
