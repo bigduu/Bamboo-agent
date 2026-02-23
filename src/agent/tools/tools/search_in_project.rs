@@ -1,4 +1,4 @@
-use agent_core::tools::{Tool, ToolError, ToolResult};
+use crate::agent::core::tools::{Tool, ToolError, ToolResult};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;

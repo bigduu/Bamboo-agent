@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use agent_core::budget::TokenBudget;
-use agent_core::composition::CompositionExecutor;
-use agent_core::storage::Storage;
-use agent_core::tools::ToolSchema;
-use agent_metrics::MetricsCollector;
-use agent_skill::SkillManager;
-use agent_tools::ToolRegistry;
+use crate::agent::core::budget::TokenBudget;
+use crate::agent::core::composition::CompositionExecutor;
+use crate::agent::core::storage::Storage;
+use crate::agent::core::tools::ToolSchema;
+use crate::agent::metrics::MetricsCollector;
+use crate::agent::skill::SkillManager;
+use crate::agent::tools::ToolRegistry;
 
 /// Configuration for the agent loop.
 pub struct AgentLoopConfig {

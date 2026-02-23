@@ -1,10 +1,10 @@
-use crate::metrics_service::MetricsService;
-use agent_core::tools::ToolExecutor;
-use agent_core::{storage::JsonlStorage, AgentEvent, Session};
-use agent_llm::OpenAIProvider;
-use agent_mcp::{CompositeToolExecutor, McpServerManager};
-use agent_skill::{SkillManager, SkillStoreConfig};
-use agent_tools::BuiltinToolExecutor;
+use crate::agent::server::metrics_service::MetricsService;
+use crate::agent::core::tools::ToolExecutor;
+use crate::agent::core::{storage::JsonlStorage, AgentEvent, Session};
+use crate::agent::llm::OpenAIProvider;
+use crate::agent::mcp::{CompositeToolExecutor, McpServerManager};
+use crate::agent::skill::{SkillManager, SkillStoreConfig};
+use crate::agent::tools::BuiltinToolExecutor;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::path::PathBuf;

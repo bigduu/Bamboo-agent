@@ -1,4 +1,4 @@
-use crate::types::{McpTool, ToolAlias};
+use crate::agent::mcp::types::{McpTool, ToolAlias};
 use dashmap::DashMap;
 
 /// Maps tool aliases to their original server/tool names

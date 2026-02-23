@@ -15,7 +15,7 @@
 //!
 //! ```rust
 //! use std::sync::Arc;
-//! use agent_tools::permission::{PermissionConfig, PermissionChecker, PermissionType};
+//! use crate::agent::tools::permission::{PermissionConfig, PermissionChecker, PermissionType};
 //!
 //! // Create a permission configuration
 //! let config = Arc::new(PermissionConfig::new());

@@ -1,7 +1,7 @@
 use actix_web::{web, HttpResponse, Result};
 use serde::Serialize;
 
-use crate::state::AppState;
+use crate::agent::server::state::AppState;
 
 /// Todo item response for frontend
 #[derive(Serialize)]

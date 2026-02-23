@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::{ForwardStatus, RoundStatus, SessionStatus, TokenUsage};
+use crate::agent::metrics::types::{ForwardStatus, RoundStatus, SessionStatus, TokenUsage};
 
 /// Metadata attached to every metrics event
 #[derive(Debug, Clone, Serialize, Deserialize)]

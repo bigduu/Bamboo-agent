@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use crate::permission::config::{PermissionConfig, SerializablePermissionConfig};
+use crate::agent::tools::permission::config::{PermissionConfig, SerializablePermissionConfig};
 
 /// Storage for permission configuration
 ///
@@ -196,7 +196,7 @@ pub fn app_storage(app_name: &str) -> Option<PermissionStorage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permission::config::{PermissionRule, PermissionType};
+    use crate::agent::tools::permission::config::{PermissionRule, PermissionType};
 
     #[tokio::test]
     async fn test_save_and_load() {

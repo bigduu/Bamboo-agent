@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use agent_metrics::{
+use crate::agent::metrics::{
     aggregate_monthly, aggregate_weekly, DailyMetrics, ForwardEndpointMetrics,
     ForwardMetricsFilter, ForwardMetricsSummary, ForwardRequestMetrics, MetricsCollector,
     MetricsDateFilter, MetricsError, MetricsStorage, MetricsSummary, ModelMetrics, PeriodMetrics,

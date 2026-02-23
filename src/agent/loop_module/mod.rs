@@ -13,16 +13,16 @@ pub use todo_evaluation::{evaluate_todo_progress, TodoEvaluationResult};
 mod tests {
     use std::sync::Arc;
 
-    use agent_core::composition::CompositionExecutor;
-    use agent_core::tools::{
+    use crate::agent::core::composition::CompositionExecutor;
+    use crate::agent::core::tools::{
         execute_tool_call, handle_tool_result_with_agentic_support, AgenticToolResult,
         FunctionCall, ToolCall, ToolExecutor, ToolHandlingOutcome, ToolRegistry, ToolResult,
     };
-    use agent_core::{AgentEvent, Session};
-    use agent_tools::BuiltinToolExecutor;
+    use crate::agent::core::{AgentEvent, Session};
+    use crate::agent::tools::BuiltinToolExecutor;
     use tokio::sync::mpsc;
 
-    use crate::config::AgentLoopConfig;
+    use crate::agent::loop_module::config::AgentLoopConfig;
 
     fn make_tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
         ToolCall {

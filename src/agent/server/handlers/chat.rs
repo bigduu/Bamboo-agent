@@ -1,9 +1,9 @@
 use actix_web::{web, HttpResponse, Responder};
-use agent_core::{Role, Session};
+use crate::agent::core::{Role, Session};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::state::AppState;
+use crate::agent::server::state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -141,7 +141,7 @@ fn build_enhanced_system_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::Session;
+    use crate::agent::core::Session;
 
     #[test]
     fn upsert_system_prompt_inserts_when_missing() {

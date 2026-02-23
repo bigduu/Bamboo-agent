@@ -1,7 +1,7 @@
 //! Conversion functions between Anthropic and OpenAI-compatible formats.
 
 use super::api_types::*;
-use crate::api::models::{
+use crate::agent::llm::api::models::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Content, ContentPart, FunctionCall,
     ImageUrl, Role, Tool, ToolCall, ToolChoice, Usage,
 };

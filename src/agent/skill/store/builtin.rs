@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::types::SkillDefinition;
+use crate::agent::skill::types::SkillDefinition;
 
 /// Script content embedded at compile time
 pub const INIT_SKILL_SCRIPT: &str = include_str!("builtin_scripts/init_skill.py");

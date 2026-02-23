@@ -1,4 +1,4 @@
-use agent_core::tools::ToolCall;
+use crate::agent::core::tools::ToolCall;
 
 #[derive(Debug, Clone)]
 pub enum LLMChunk {

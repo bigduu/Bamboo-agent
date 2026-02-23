@@ -1,7 +1,7 @@
 use actix_web::{web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
 
-use crate::state::AppState;
+use crate::agent::server::state::AppState;
 
 /// Response for server list
 #[derive(Debug, Serialize)]

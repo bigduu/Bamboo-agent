@@ -5,7 +5,7 @@
 //! - Waiting for asynchronous operations to complete
 //! - Adding pauses in automation workflows
 
-use agent_core::tools::{Tool, ToolError, ToolResult};
+use crate::agent::core::tools::{Tool, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use tokio::time::{sleep, Duration};

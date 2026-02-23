@@ -13,11 +13,11 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use reqwest::{Client, header::HeaderMap};
-use agent_core::{agent::Role, tools::ToolSchema, Message};
+use crate::agent::core::{agent::Role, tools::ToolSchema, Message};
 use serde_json::{json, Value};
 
-use crate::provider::{LLMError, LLMProvider, LLMStream, Result};
-use crate::types::LLMChunk;
+use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
+use crate::agent::llm::types::LLMChunk;
 
 /// Anthropic Messages API provider.
 pub struct AnthropicProvider {
@@ -393,8 +393,8 @@ pub fn parse_anthropic_sse_event(
 
 #[cfg(test)]
 mod anthropic_request_building {
-    use agent_core::tools::{FunctionCall, ToolCall};
-    use agent_core::Message;
+    use crate::agent::core::tools::{FunctionCall, ToolCall};
+    use crate::agent::core::Message;
 
     #[test]
     fn system_messages_are_extracted_into_top_level_system_field() {
@@ -450,7 +450,7 @@ mod anthropic_request_building {
 
 #[cfg(test)]
 mod anthropic_stream_parse {
-    use crate::types::LLMChunk;
+    use crate::agent::llm::types::LLMChunk;
 
     #[test]
     fn message_start_is_ignored() {
@@ -664,7 +664,7 @@ mod anthropic_stream_parse {
 
 #[cfg(test)]
 mod anthropic_request_building_edge_cases {
-    use agent_core::Message;
+    use crate::agent::core::Message;
 
     #[test]
     fn empty_messages_list() {
@@ -698,7 +698,7 @@ mod anthropic_request_building_edge_cases {
 
     #[test]
     fn assistant_message_with_both_content_and_tool_calls() {
-        use agent_core::tools::{FunctionCall, ToolCall};
+        use crate::agent::core::tools::{FunctionCall, ToolCall};
 
         let tool_call = ToolCall {
             id: "call_1".to_string(),
@@ -721,7 +721,7 @@ mod anthropic_request_building_edge_cases {
 
     #[test]
     fn tool_call_with_invalid_json_arguments_falls_back_to_string() {
-        use agent_core::tools::{FunctionCall, ToolCall};
+        use crate::agent::core::tools::{FunctionCall, ToolCall};
 
         let tool_call = ToolCall {
             id: "call_1".to_string(),

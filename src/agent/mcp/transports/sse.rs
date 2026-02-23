@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::config::{HeaderConfig, SseConfig};
-use crate::error::{McpError, Result};
-use crate::protocol::client::McpTransport;
+use crate::agent::mcp::config::{HeaderConfig, SseConfig};
+use crate::agent::mcp::error::{McpError, Result};
+use crate::agent::mcp::protocol::client::McpTransport;
 
 pub struct SseTransport {
     config: SseConfig,

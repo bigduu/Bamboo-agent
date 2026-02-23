@@ -1,12 +1,12 @@
 //! OpenAI protocol conversion implementation.
 
-use crate::api::models::{
+use crate::agent::llm::api::models::{
     ChatMessage as OpenAIChatMessage, Content as OpenAIContent,
     ContentPart as OpenAIContentPart, Role as OpenAIRole, Tool, ToolCall as OpenAIToolCall,
 };
-use crate::protocol::{FromProvider, ProtocolResult, ToProvider};
-use agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
-use agent_core::{Message, Role};
+use crate::agent::llm::protocol::{FromProvider, ProtocolResult, ToProvider};
+use crate::agent::core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
+use crate::agent::core::{Message, Role};
 
 /// OpenAI protocol converter.
 pub struct OpenAIProtocol;
@@ -190,9 +190,9 @@ impl OpenAIExt for Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::models::{FunctionCall as OpenAIFunctionCall, Role as OpenAIRole};
-    use agent_core::tools::FunctionCall;
-    use agent_core::Role;
+    use crate::agent::llm::api::models::{FunctionCall as OpenAIFunctionCall, Role as OpenAIRole};
+    use crate::agent::core::tools::FunctionCall;
+    use crate::agent::core::Role;
 
     #[test]
     fn test_openai_to_internal_simple_message() {

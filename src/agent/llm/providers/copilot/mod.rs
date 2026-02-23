@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 pub mod auth;
 use auth::{CopilotAuthHandler, DeviceCodeResponse};
-use crate::provider::{LLMError, LLMProvider, LLMStream, Result};
-use crate::types::LLMChunk;
-use agent_core::{tools::ToolSchema, Message};
+use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
+use crate::agent::llm::types::LLMChunk;
+use crate::agent::core::{tools::ToolSchema, Message};
 
 use super::common::openai_compat::{
     messages_to_openai_compat_json, parse_openai_compat_sse_data_lenient,

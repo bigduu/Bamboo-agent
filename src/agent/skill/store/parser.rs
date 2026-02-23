@@ -1,11 +1,11 @@
 use std::path::Path;
 
-use agent_tools::normalize_tool_ref;
+use crate::agent::tools::normalize_tool_ref;
 use chrono::{DateTime, Utc};
 use log::warn;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{SkillDefinition, SkillError, SkillResult, SkillVisibility};
+use crate::agent::skill::types::{SkillDefinition, SkillError, SkillResult, SkillVisibility};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SkillFrontmatter {

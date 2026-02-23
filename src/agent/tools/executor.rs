@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
-use agent_core::tools::{
+use crate::agent::core::tools::{
     normalize_tool_name, Tool, ToolCall, ToolError, ToolExecutor, ToolResult, ToolSchema,
 };
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
-use crate::permission::{check_permissions, PermissionChecker, PermissionError};
-use crate::tools::{
+use crate::agent::tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
+use crate::agent::tools::permission::{check_permissions, PermissionChecker, PermissionError};
+use crate::agent::tools::tools::{
     ApplyPatchTool, AskUserTool, CreateTodoListTool, ExecuteCommandTool, FileExistsTool,
     GetCurrentDirTool, GetFileInfoTool, GitDiffTool, GitStatusTool, GitWriteTool, GlobSearchTool,
     HttpRequestTool, ListDirectoryTool, ReadFileTool, ReadFileRangeTool,
@@ -325,12 +325,12 @@ impl Default for BuiltinToolExecutorBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::tools::FunctionCall;
+    use crate::agent::core::tools::FunctionCall;
     use serde_json::json;
     use std::sync::Arc;
     use tokio::fs;
 
-    use crate::tools::WriteFileTool;
+    use crate::agent::tools::tools::WriteFileTool;
 
     fn make_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
         ToolCall {

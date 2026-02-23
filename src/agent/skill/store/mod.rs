@@ -10,12 +10,12 @@ use std::path::PathBuf;
 use log::info;
 use tokio::sync::RwLock;
 
-use crate::store::builtin::{create_builtin_skills, get_builtin_scripts};
-use crate::store::parser::render_skill_markdown;
-use crate::store::storage::{
+use crate::agent::skill::store::builtin::{create_builtin_skills, get_builtin_scripts};
+use crate::agent::skill::store::parser::render_skill_markdown;
+use crate::agent::skill::store::storage::{
     ensure_skills_dir, load_skills_from_dir, skill_path, write_skill_file,
 };
-use crate::types::{
+use crate::agent::skill::types::{
     SkillDefinition, SkillError, SkillFilter, SkillId, SkillResult, SkillStoreConfig,
     SkillVisibility,
 };
@@ -326,7 +326,7 @@ mod tests {
     use tokio::fs;
 
     use super::SkillStore;
-    use crate::types::SkillStoreConfig;
+    use crate::agent::skill::types::SkillStoreConfig;
 
     #[tokio::test]
     async fn load_markdown_skills() {

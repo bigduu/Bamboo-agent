@@ -8,10 +8,10 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::json;
 
-use crate::provider::{LLMError, LLMProvider, LLMStream, Result};
-use crate::protocol::gemini::{GeminiRequest};
-use agent_core::{tools::ToolSchema, Message};
-use crate::protocol::ToProvider;
+use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
+use crate::agent::llm::protocol::gemini::{GeminiRequest};
+use crate::agent::core::{tools::ToolSchema, Message};
+use crate::agent::llm::protocol::ToProvider;
 
 /// Google Gemini API provider.
 pub struct GeminiProvider {

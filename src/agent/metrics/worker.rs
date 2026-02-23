@@ -4,10 +4,10 @@ use std::sync::Arc;
 use log::{error, info, warn};
 use tokio::sync::mpsc;
 
-use crate::bus::MetricsBus;
-use crate::events::{ChatEvent, ForwardEvent, MetricsEvent, SystemEvent};
-use crate::storage::{MetricsStorage, ToolCallCompletion};
-use crate::types::ForwardStatus;
+use crate::agent::metrics::bus::MetricsBus;
+use crate::agent::metrics::events::{ChatEvent, ForwardEvent, MetricsEvent, SystemEvent};
+use crate::agent::metrics::storage::{MetricsStorage, ToolCallCompletion};
+use crate::agent::metrics::types::ForwardStatus;
 
 /// Worker that consumes metrics events from the bus and writes them to storage
 pub struct MetricsWorker {
@@ -293,8 +293,8 @@ fn event_type_name(event: &MetricsEvent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::EventMeta;
-    use crate::types::{RoundStatus, TokenUsage};
+    use crate::agent::metrics::events::EventMeta;
+    use crate::agent::metrics::types::{RoundStatus, TokenUsage};
     use std::path::PathBuf;
     use tempfile::tempdir;
 

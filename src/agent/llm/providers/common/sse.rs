@@ -4,8 +4,8 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use reqwest::Response;
 
-use crate::provider::{LLMError, LLMStream, Result};
-use crate::types::LLMChunk;
+use crate::agent::llm::provider::{LLMError, LLMStream, Result};
+use crate::agent::llm::types::LLMChunk;
 
 fn to_stream_error(err: LLMError) -> LLMError {
     match err {

@@ -4,7 +4,7 @@
 //! or `src/**/*.{ts,tsx}`. It's more powerful than simple directory listing
 //! and supports exclusion patterns.
 
-use agent_core::tools::{Tool, ToolError, ToolResult};
+use crate::agent::core::tools::{Tool, ToolError, ToolResult};
 use async_trait::async_trait;
 use glob::Pattern;
 use globset::{Glob, GlobSet, GlobSetBuilder};

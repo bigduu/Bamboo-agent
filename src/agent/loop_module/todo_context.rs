@@ -3,8 +3,8 @@
 //! This module provides TodoLoopContext which integrates TodoList
 //! as a first-class citizen in the Agent Loop, similar to Token Budget.
 
-use agent_core::todo::{TodoItem, TodoItemStatus, TodoList};
-use agent_core::tools::ToolResult;
+use crate::agent::core::todo::{TodoItem, TodoItemStatus, TodoList};
+use crate::agent::core::tools::ToolResult;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 

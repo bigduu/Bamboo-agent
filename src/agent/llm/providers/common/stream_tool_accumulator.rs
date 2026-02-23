@@ -1,4 +1,4 @@
-use crate::models::{FunctionCall, StreamToolCall, ToolCall};
+use crate::agent::llm::models::{FunctionCall, StreamToolCall, ToolCall};
 use std::collections::HashMap;
 
 /// Accumulates streaming tool call fragments into complete tool calls.
@@ -103,7 +103,7 @@ impl StreamToolAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::StreamFunctionCall;
+    use crate::agent::llm::models::StreamFunctionCall;
 
     #[test]
     fn test_basic_accumulation() {

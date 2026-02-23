@@ -2,13 +2,13 @@
 // 在 Agent Loop 每轮结束时，让 LLM 评估任务进度
 
 use std::sync::Arc;
-use agent_core::{AgentEvent, Session, TodoItemStatus};
-use agent_llm::LLMProvider;
-use agent_core::tools::{ToolSchema, FunctionSchema};
+use crate::agent::core::{AgentEvent, Session, TodoItemStatus};
+use crate::agent::llm::LLMProvider;
+use crate::agent::core::tools::{ToolSchema, FunctionSchema};
 use tokio::sync::mpsc;
 use serde_json::json;
 
-use crate::todo_context::TodoLoopContext;
+use crate::agent::loop_module::todo_context::TodoLoopContext;
 
 /// 评估结果
 #[derive(Debug, Clone)]
@@ -162,7 +162,7 @@ pub async fn evaluate_todo_progress(
     session_id: &str,
     model: &str,  // Add model parameter (required)
 ) -> Result<TodoEvaluationResult, agent_core::AgentError> {
-    use crate::stream::handler::consume_llm_stream;
+    use crate::agent::loop_module::stream::handler::consume_llm_stream;
 
     // 检查是否有需要评估的任务
     let in_progress_count = ctx.items.iter()
@@ -267,8 +267,8 @@ pub async fn evaluate_todo_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::todo_context::{TodoLoopContext, TodoLoopItem};
-    use agent_core::todo::{TodoItem, TodoList};
+    use crate::agent::loop_module::todo_context::{TodoLoopContext, TodoLoopItem};
+    use crate::agent::core::todo::{TodoItem, TodoList};
     use chrono::Utc;
 
     fn create_test_context() -> TodoLoopContext {

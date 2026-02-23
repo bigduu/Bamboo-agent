@@ -1,4 +1,4 @@
-use crate::types::SkillDefinition;
+use crate::agent::skill::types::SkillDefinition;
 
 /// Build system prompt context text from available skills.
 /// Only includes metadata (id, name, description, category, tags).
@@ -59,7 +59,7 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::SkillDefinition;
+    use crate::agent::skill::types::SkillDefinition;
 
     use super::build_skill_context;
 

@@ -4,26 +4,26 @@ use chrono::Utc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use agent_core::agent::events::{TokenBudgetUsage, TokenUsage};
-use agent_core::budget::{
+use crate::agent::core::agent::events::{TokenBudgetUsage, TokenUsage};
+use crate::agent::core::budget::{
     prepare_hybrid_context, HeuristicTokenCounter, ModelLimitsRegistry, TokenBudget,
 };
-use agent_core::tools::{
+use crate::agent::core::tools::{
     execute_tool_call, handle_tool_result_with_agentic_support, parse_tool_args, ToolExecutor,
     ToolHandlingOutcome, ToolSchema,
 };
-use agent_core::{AgentError, AgentEvent, Message, Session, TodoItemStatus};
-use agent_llm::LLMProvider;
-use agent_metrics::{
+use crate::agent::core::{AgentError, AgentEvent, Message, Session, TodoItemStatus};
+use crate::agent::llm::LLMProvider;
+use crate::agent::metrics::{
     MetricsCollector, RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
     TokenUsage as MetricsTokenUsage,
 };
-use agent_tools::CreateTodoListTool;
-use agent_tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder};
+use crate::agent::tools::CreateTodoListTool;
+use crate::agent::tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder};
 
-use crate::config::AgentLoopConfig;
-use crate::stream::handler::consume_llm_stream;
-use crate::todo_context::TodoLoopContext;
+use crate::agent::loop_module::config::AgentLoopConfig;
+use crate::agent::loop_module::stream::handler::consume_llm_stream;
+use crate::agent::loop_module::todo_context::TodoLoopContext;
 
 pub type Result<T> = std::result::Result<T, AgentError>;
 
@@ -751,7 +751,7 @@ pub async fn run_agent_loop_with_config(
         // ========== NEW: TodoList Evaluation at end of each round ==========
         // Let LLM evaluate task progress with a dedicated query
         if let Some(ref ctx) = todo_context {
-            use crate::todo_evaluation::evaluate_todo_progress;
+            use crate::agent::loop_module::todo_evaluation::evaluate_todo_progress;
 
             log::debug!("[{}] Evaluating todo list progress at end of round {}", session_id, round + 1);
 
@@ -1181,7 +1181,7 @@ mod tests {
     /// This test documents the requirement that model comes from config.model_name
     #[test]
     fn model_must_come_from_config_not_session() {
-        use agent_core::Session;
+        use crate::agent::core::Session;
 
         // Create a config with model
         let config = AgentLoopConfig {

@@ -21,7 +21,7 @@ pub use openai::OpenAIProtocol;
 pub use anthropic::AnthropicProtocol;
 pub use gemini::GeminiProtocol;
 
-use agent_core::Message;
+use crate::agent::core::Message;
 
 /// Trait for converting provider-specific types to internal types.
 ///

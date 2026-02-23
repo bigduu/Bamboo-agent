@@ -7,8 +7,8 @@
 use std::io;
 use std::path::PathBuf;
 
-use agent_core::budget::counter::TokenCounter;
-use agent_core::budget::HeuristicTokenCounter;
+use crate::agent::core::budget::counter::TokenCounter;
+use crate::agent::core::budget::HeuristicTokenCounter;
 
 /// Reference to a stored artifact (full tool output stored externally).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -253,7 +253,7 @@ impl ToolOutputManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::budget::HeuristicTokenCounter;
+    use crate::agent::core::budget::HeuristicTokenCounter;
     use tempfile::tempdir;
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use agent_core::tools::{RegistryError, Tool, ToolError, ToolRegistry, ToolResult};
+    use crate::agent::core::tools::{RegistryError, Tool, ToolError, ToolRegistry, ToolResult};
     use async_trait::async_trait;
     use serde_json::json;
 
@@ -383,7 +383,7 @@ mod tests {
 
     mod registry_edge_cases {
         use super::*;
-        use agent_core::tools::normalize_tool_name;
+        use crate::agent::core::tools::normalize_tool_name;
 
         #[tokio::test]
         async fn test_empty_registry() {

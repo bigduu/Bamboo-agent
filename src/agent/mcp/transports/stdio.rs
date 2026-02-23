@@ -5,9 +5,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use crate::config::StdioConfig;
-use crate::error::{McpError, Result};
-use crate::protocol::client::McpTransport;
+use crate::agent::mcp::config::StdioConfig;
+use crate::agent::mcp::error::{McpError, Result};
+use crate::agent::mcp::protocol::client::McpTransport;
 
 pub struct StdioTransport {
     config: StdioConfig,

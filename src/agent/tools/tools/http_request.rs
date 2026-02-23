@@ -11,7 +11,7 @@
 //! This tool requires `PermissionType::HttpRequest` permission. The URL domain
 //! is extracted and checked against the whitelist/session grants.
 
-use agent_core::tools::{Tool, ToolError, ToolResult};
+use crate::agent::core::tools::{Tool, ToolError, ToolResult};
 use async_trait::async_trait;
 #[cfg(feature = "http")]
 use futures_util::StreamExt;

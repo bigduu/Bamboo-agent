@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::events::{MetricsEvent, SystemEvent};
+use crate::agent::metrics::events::{MetricsEvent, SystemEvent};
 
 /// A bounded channel-based metrics event bus
 ///
@@ -77,7 +77,7 @@ impl Clone for MetricsBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::ChatEvent;
+    use crate::agent::metrics::events::ChatEvent;
     use tokio::time::{timeout, Duration};
 
     #[tokio::test]

@@ -3,7 +3,7 @@ mod loader;
 #[cfg(test)]
 mod tests;
 
-use agent_core::composition::ToolExpr;
+use crate::agent::core::composition::ToolExpr;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;

@@ -1,5 +1,5 @@
-use crate::types::LLMChunk;
-use agent_core::{tools::ToolSchema, Message};
+use crate::agent::llm::types::LLMChunk;
+use crate::agent::core::{tools::ToolSchema, Message};
 use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;

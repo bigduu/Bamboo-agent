@@ -1,12 +1,12 @@
-use agent_core::tools::{ToolCall, ToolError, ToolExecutor, ToolResult, ToolSchema};
+use crate::agent::core::tools::{ToolCall, ToolError, ToolExecutor, ToolResult, ToolSchema};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::{debug, error};
 
-use crate::error::McpError;
-use crate::manager::McpServerManager;
-use crate::tool_index::ToolIndex;
-use crate::types::McpContentItem;
+use crate::agent::mcp::error::McpError;
+use crate::agent::mcp::manager::McpServerManager;
+use crate::agent::mcp::tool_index::ToolIndex;
+use crate::agent::mcp::types::McpContentItem;
 
 /// MCP tool executor that delegates to the MCP server manager
 pub struct McpToolExecutor {
@@ -170,8 +170,8 @@ impl ToolExecutor for CompositeToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::McpContentItem;
-    use agent_core::tools::{FunctionCall, FunctionSchema};
+    use crate::agent::mcp::types::McpContentItem;
+    use crate::agent::core::tools::{FunctionCall, FunctionSchema};
     use mockall::mock;
     use mockall::predicate::*;
 

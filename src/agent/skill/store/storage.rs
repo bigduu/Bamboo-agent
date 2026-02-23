@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use log::{debug, info, warn};
 use tokio::fs;
 
-use crate::store::parser::{parse_markdown_skill, render_skill_markdown};
-use crate::types::{SkillDefinition, SkillId, SkillResult};
+use crate::agent::skill::store::parser::{parse_markdown_skill, render_skill_markdown};
+use crate::agent::skill::types::{SkillDefinition, SkillId, SkillResult};
 
 pub async fn ensure_skills_dir(skills_dir: &Path) -> SkillResult<()> {
     fs::create_dir_all(skills_dir).await?;

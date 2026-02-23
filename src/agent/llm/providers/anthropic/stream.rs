@@ -1,6 +1,6 @@
 //! Streaming response handling for Anthropic API format.
 
-use crate::api::models::{ChatCompletionStreamChunk, StreamToolCall};
+use crate::agent::llm::api::models::{ChatCompletionStreamChunk, StreamToolCall};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -294,7 +294,7 @@ fn map_stop_reason_complete(reason: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::models::{StreamChoice, StreamDelta, StreamFunctionCall};
+    use crate::agent::llm::api::models::{StreamChoice, StreamDelta, StreamFunctionCall};
 
     #[test]
     fn test_format_sse_event() {

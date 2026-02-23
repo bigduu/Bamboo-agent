@@ -1,13 +1,13 @@
 //! Anthropic protocol conversion implementation.
 
-use crate::providers::anthropic::api_types::*;
-use crate::protocol::{FromProvider, ProtocolError, ProtocolResult, ToProvider};
-use agent_core::tools::{FunctionSchema, ToolSchema};
-use agent_core::{Message, Role};
+use crate::agent::llm::providers::anthropic::api_types::*;
+use crate::agent::llm::protocol::{FromProvider, ProtocolError, ProtocolResult, ToProvider};
+use crate::agent::core::tools::{FunctionSchema, ToolSchema};
+use crate::agent::core::{Message, Role};
 use serde_json::Value;
 
 #[cfg(test)]
-use agent_core::tools::{FunctionCall, ToolCall};
+use crate::agent::core::tools::{FunctionCall, ToolCall};
 
 /// Anthropic protocol converter.
 pub struct AnthropicProtocol;

@@ -1,7 +1,7 @@
 use serde_json::Value;
 
-use crate::permission::{PermissionContext, PermissionError, PermissionType};
-use crate::tools::http_request::extract_domain_from_url;
+use crate::agent::tools::permission::{PermissionContext, PermissionError, PermissionType};
+use crate::agent::tools::tools::http_request::extract_domain_from_url;
 
 const DELETE_COMMANDS: [&str; 7] = ["rm", "rmdir", "del", "erase", "unlink", "rd", "remove-item"];
 

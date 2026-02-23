@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use reqwest::Client;
 
-use crate::provider::{LLMError, LLMProvider, LLMStream, Result};
-use crate::types::LLMChunk;
-use agent_core::{tools::ToolSchema, Message};
+use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
+use crate::agent::llm::types::LLMChunk;
+use crate::agent::core::{tools::ToolSchema, Message};
 
 use super::common::openai_compat::{
     build_openai_compat_body, parse_openai_compat_sse_data_strict,
@@ -77,8 +77,8 @@ impl LLMProvider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::tools::{FunctionSchema, ToolSchema};
-    use agent_core::Message;
+    use crate::agent::core::tools::{FunctionSchema, ToolSchema};
+    use crate::agent::core::Message;
 
     // ===== Basic Tests (5 tests) =====
 

@@ -6,7 +6,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use thiserror::Error;
 
-use crate::types::{
+use crate::agent::metrics::types::{
     DailyMetrics, ForwardEndpointMetrics, ForwardMetricsFilter, ForwardMetricsSummary,
     ForwardRequestMetrics, ForwardStatus, MetricsDateFilter, MetricsSummary, ModelMetrics,
     RoundMetrics, RoundStatus, SessionDetail, SessionMetrics, SessionMetricsFilter, SessionStatus,
@@ -1349,7 +1349,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{MetricsStorage, SqliteMetricsStorage, ToolCallCompletion};
-    use crate::types::{
+    use crate::agent::metrics::types::{
         MetricsDateFilter, RoundStatus, SessionMetricsFilter, SessionStatus, TokenUsage,
     };
 

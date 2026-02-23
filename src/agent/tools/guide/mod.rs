@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use agent_core::tools::ToolSchema;
+use crate::agent::core::tools::ToolSchema;
 use serde::{Deserialize, Serialize};
 
 pub mod builtin_guides;
@@ -9,7 +9,7 @@ pub mod context;
 use builtin_guides::builtin_tool_guide;
 use context::{GuideBuildContext, GuideLanguage};
 
-use crate::tools::ToolRegistry;
+use crate::agent::tools::tools::ToolRegistry;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolExample {
@@ -422,9 +422,9 @@ fn schema_only_description(language: GuideLanguage) -> &'static str {
 mod tests {
     use serde_json::json;
 
-    use agent_core::tools::{FunctionSchema, ToolSchema};
+    use crate::agent::core::tools::{FunctionSchema, ToolSchema};
 
-    use crate::tools::{ReadFileTool, ToolRegistry};
+    use crate::agent::tools::tools::{ReadFileTool, ToolRegistry};
 
     use super::{context::GuideBuildContext, context::GuideLanguage, EnhancedPromptBuilder};
 

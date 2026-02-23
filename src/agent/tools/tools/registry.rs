@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use agent_core::tools::{
+use crate::agent::core::tools::{
     registry::{RegistryError, SharedTool},
     Tool, ToolSchema,
 };
 use dashmap::DashMap;
 
-use crate::guide::{ToolGuide, ToolGuideSpec};
+use crate::agent::tools::guide::{ToolGuide, ToolGuideSpec};
 
 /// Tool registry with guide support for enhanced prompting
 pub struct ToolRegistry {
@@ -136,7 +136,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::tools::ReadFileTool;
+    use crate::agent::tools::tools::ReadFileTool;
 
     struct MockGuide;
 

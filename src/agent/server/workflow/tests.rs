@@ -1,5 +1,5 @@
 use super::{WorkflowDefinition, WorkflowLoadError, WorkflowLoader};
-use agent_core::composition::ToolExpr;
+use crate::agent::core::composition::ToolExpr;
 use std::fs;
 use std::path::{Path, PathBuf};
 

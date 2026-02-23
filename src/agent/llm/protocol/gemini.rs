@@ -22,9 +22,9 @@
 //! }
 //! ```
 
-use crate::protocol::{FromProvider, ProtocolError, ProtocolResult, ToProvider};
-use agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
-use agent_core::{Message, Role};
+use crate::agent::llm::protocol::{FromProvider, ProtocolError, ProtocolResult, ToProvider};
+use crate::agent::core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
+use crate::agent::core::{Message, Role};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

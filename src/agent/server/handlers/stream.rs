@@ -4,8 +4,8 @@ use chrono::Utc;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::state::{AgentRunner, AgentStatus, AppState};
-use agent_loop::{run_agent_loop_with_config, AgentLoopConfig};
+use crate::agent::server::state::{AgentRunner, AgentStatus, AppState};
+use crate::agent::loop_module::{run_agent_loop_with_config, AgentLoopConfig};
 
 /// DEPRECATED: Use POST /execute + GET /events instead
 /// This handler maintains backward compatibility by combining execute + events

@@ -9,9 +9,9 @@
 //! data: [DONE]
 //! ```
 
-use crate::provider::{LLMError, Result};
-use crate::types::LLMChunk;
-use agent_core::tools::{FunctionCall, ToolCall};
+use crate::agent::llm::provider::{LLMError, Result};
+use crate::agent::llm::types::LLMChunk;
+use crate::agent::core::tools::{FunctionCall, ToolCall};
 use serde_json::Value;
 
 /// Stateful parser for Gemini SSE streaming events.
@@ -45,7 +45,7 @@ impl GeminiStreamState {
 /// # Example
 ///
 /// ```
-/// use agent_llm::providers::gemini::{GeminiStreamState, parse_gemini_sse_event};
+/// use crate::agent::llm::providers::gemini::{GeminiStreamState, parse_gemini_sse_event};
 ///
 /// let mut state = GeminiStreamState::default();
 /// let data = r#"{"candidates":[{"content":{"parts":[{"text":"Hello"}],"role":"model"}}]}"#;

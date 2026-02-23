@@ -6,12 +6,12 @@ use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
-use crate::config::{McpConfig, McpServerConfig, TransportConfig};
-use crate::error::{McpError, Result};
-use crate::protocol::{McpProtocolClient, McpTransport};
-use crate::tool_index::ToolIndex;
-use crate::transports::{SseTransport, StdioTransport};
-use crate::types::{McpEvent, McpTool, RuntimeInfo, ServerStatus};
+use crate::agent::mcp::config::{McpConfig, McpServerConfig, TransportConfig};
+use crate::agent::mcp::error::{McpError, Result};
+use crate::agent::mcp::protocol::{McpProtocolClient, McpTransport};
+use crate::agent::mcp::tool_index::ToolIndex;
+use crate::agent::mcp::transports::{SseTransport, StdioTransport};
+use crate::agent::mcp::types::{McpEvent, McpTool, RuntimeInfo, ServerStatus};
 
 /// Runtime state for a connected MCP server
 struct ServerRuntime {
@@ -698,7 +698,7 @@ impl Default for McpServerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ReconnectConfig, StdioConfig};
+    use crate::agent::mcp::config::{ReconnectConfig, StdioConfig};
     use tokio::sync::mpsc;
 
     fn create_test_server_config(id: &str) -> McpServerConfig {

@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::state::{AgentRunner, AgentStatus, AppState};
-use agent_core::agent::Role;
-use agent_loop::{run_agent_loop_with_config, AgentLoopConfig};
+use crate::agent::server::state::{AgentRunner, AgentStatus, AppState};
+use crate::agent::core::agent::Role;
+use crate::agent::loop_module::{run_agent_loop_with_config, AgentLoopConfig};
 
 #[derive(Serialize)]
 pub struct ExecuteResponse {
@@ -257,7 +257,7 @@ pub async fn handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::AgentRunner;
+    use crate::agent::server::state::AgentRunner;
 
     #[test]
     fn test_agent_status_running_blocks_restart() {

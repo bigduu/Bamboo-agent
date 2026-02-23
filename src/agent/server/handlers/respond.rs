@@ -1,8 +1,8 @@
 use actix_web::{web, HttpResponse, Result};
 use serde::Deserialize;
 
-use crate::state::AppState;
-use agent_core::Message;
+use crate::agent::server::state::AppState;
+use crate::agent::core::Message;
 
 #[derive(Debug, Deserialize)]
 pub struct RespondRequest {

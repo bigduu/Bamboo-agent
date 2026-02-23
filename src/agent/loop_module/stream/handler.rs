@@ -2,9 +2,9 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use agent_core::tools::{ToolCall, ToolCallAccumulator};
-use agent_core::{AgentError, AgentEvent};
-use agent_llm::{LLMChunk, LLMStream};
+use crate::agent::core::tools::{ToolCall, ToolCallAccumulator};
+use crate::agent::core::{AgentError, AgentEvent};
+use crate::agent::llm::{LLMChunk, LLMStream};
 
 pub struct StreamHandlingOutput {
     pub content: String,
@@ -74,9 +74,9 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
-    use agent_core::tools::{FunctionCall, ToolCall};
-    use agent_core::AgentEvent;
-    use agent_llm::LLMStream;
+    use crate::agent::core::tools::{FunctionCall, ToolCall};
+    use crate::agent::core::AgentEvent;
+    use crate::agent::llm::LLMStream;
 
     use super::*;
 

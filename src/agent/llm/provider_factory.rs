@@ -2,12 +2,12 @@
 //!
 //! Creates LLM providers based on configuration.
 
-use crate::providers::{AnthropicProvider, CopilotProvider, GeminiProvider, OpenAIProvider};
-use crate::provider::{LLMError, LLMProvider};
-use crate::providers::common::MaskingProviderDecorator;
-use chat_core::keyword_masking::KeywordMaskingConfig;
-use chat_core::paths::{bamboo_dir, keyword_masking_json_path};
-use chat_core::Config;
+use crate::agent::llm::providers::{AnthropicProvider, CopilotProvider, GeminiProvider, OpenAIProvider};
+use crate::agent::llm::provider::{LLMError, LLMProvider};
+use crate::agent::llm::providers::common::MaskingProviderDecorator;
+use crate::core::keyword_masking::KeywordMaskingConfig;
+use crate::core::paths::{bamboo_dir, keyword_masking_json_path};
+use crate::core::Config;
 use std::sync::Arc;
 
 /// Available provider types
@@ -228,7 +228,7 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chat_core::{AnthropicConfig, GeminiConfig, OpenAIConfig, ProviderConfigs};
+    use crate::core::{AnthropicConfig, GeminiConfig, OpenAIConfig, ProviderConfigs};
 
     #[tokio::test]
     async fn test_create_copilot_provider() {

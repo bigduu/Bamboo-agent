@@ -1,5 +1,5 @@
-use agent_core::tools::{Tool, ToolError, ToolResult};
-use agent_core::{TodoItem, TodoItemStatus, TodoList};
+use crate::agent::core::tools::{Tool, ToolError, ToolResult};
+use crate::agent::core::{TodoItem, TodoItemStatus, TodoList};
 use async_trait::async_trait;
 use serde_json::json;
 

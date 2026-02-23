@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use agent_core::AgentEvent;
+use crate::agent::core::AgentEvent;
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::mpsc;
 
-use crate::storage::{MetricsStorage, ToolCallCompletion};
-use crate::types::{RoundStatus, SessionStatus, TokenUsage};
+use crate::agent::metrics::storage::{MetricsStorage, ToolCallCompletion};
+use crate::agent::metrics::types::{RoundStatus, SessionStatus, TokenUsage};
 
 #[derive(Debug)]
 enum CollectorCommand {

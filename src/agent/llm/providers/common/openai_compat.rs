@@ -4,12 +4,12 @@
 //! with OpenAI's chat completions API. These helpers build a "compat" JSON body without leaking
 //! internal `agent_core::Message` fields (like `id` / `created_at`).
 
-use agent_core::{agent::Role, tools::ToolSchema, Message};
+use crate::agent::core::{agent::Role, tools::ToolSchema, Message};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::provider::Result;
-use crate::types::LLMChunk;
+use crate::agent::llm::provider::Result;
+use crate::agent::llm::types::LLMChunk;
 
 /// Convert internal [`Message`] values to an OpenAI-compatible JSON array.
 ///
@@ -190,9 +190,9 @@ pub fn parse_openai_compat_sse_data_lenient(data: &str) -> Result<LLMChunk> {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::LLMChunk;
-    use agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
-    use agent_core::Message;
+    use crate::agent::llm::types::LLMChunk;
+    use crate::agent::core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
+    use crate::agent::core::Message;
 
     #[test]
     fn messages_to_openai_compat_json_omits_internal_fields() {

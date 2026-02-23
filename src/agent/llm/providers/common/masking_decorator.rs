@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 
-use agent_core::{tools::ToolSchema, Message};
-use chat_core::keyword_masking::KeywordMaskingConfig;
+use crate::agent::core::{tools::ToolSchema, Message};
+use crate::core::keyword_masking::KeywordMaskingConfig;
 
-use crate::provider::{LLMProvider, LLMStream, Result};
+use crate::agent::llm::provider::{LLMProvider, LLMStream, Result};
 
 /// Decorates an [`LLMProvider`] by applying keyword masking to outgoing messages.
 ///
@@ -70,7 +70,7 @@ mod tests {
     use futures_util::stream;
 
     use super::*;
-    use chat_core::keyword_masking::{KeywordEntry, MatchType};
+    use crate::core::keyword_masking::{KeywordEntry, MatchType};
 
     #[derive(Clone, Default)]
     struct RecordingProvider {
