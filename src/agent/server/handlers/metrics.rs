@@ -41,8 +41,8 @@ pub struct ForwardMetricsQuery {
 /// Unified summary combining chat and forward metrics
 #[derive(Debug, Serialize)]
 pub struct UnifiedSummary {
-    pub chat: agent_metrics::MetricsSummary,
-    pub forward: agent_metrics::ForwardMetricsSummary,
+    pub chat: crate::agent::metrics::MetricsSummary,
+    pub forward: crate::agent::metrics::ForwardMetricsSummary,
     pub combined: CombinedSummary,
 }
 
@@ -102,7 +102,7 @@ pub async fn sessions(
     state: web::Data<AppState>,
     query: web::Query<MetricsSessionsQuery>,
 ) -> impl Responder {
-    let filter = agent_metrics::SessionMetricsFilter {
+    let filter = crate::agent::metrics::SessionMetricsFilter {
         start_date: query.start_date,
         end_date: query.end_date,
         model: query.model.clone(),
@@ -155,7 +155,7 @@ pub async fn forward_summary(
     state: web::Data<AppState>,
     query: web::Query<ForwardMetricsQuery>,
 ) -> impl Responder {
-    let filter = agent_metrics::ForwardMetricsFilter {
+    let filter = crate::agent::metrics::ForwardMetricsFilter {
         start_date: query.start_date,
         end_date: query.end_date,
         endpoint: query.endpoint.clone(),
@@ -173,7 +173,7 @@ pub async fn forward_by_endpoint(
     state: web::Data<AppState>,
     query: web::Query<ForwardMetricsQuery>,
 ) -> impl Responder {
-    let filter = agent_metrics::ForwardMetricsFilter {
+    let filter = crate::agent::metrics::ForwardMetricsFilter {
         start_date: query.start_date,
         end_date: query.end_date,
         endpoint: None, // Group by all endpoints
@@ -191,7 +191,7 @@ pub async fn forward_requests(
     state: web::Data<AppState>,
     query: web::Query<ForwardMetricsQuery>,
 ) -> impl Responder {
-    let filter = agent_metrics::ForwardMetricsFilter {
+    let filter = crate::agent::metrics::ForwardMetricsFilter {
         start_date: query.start_date,
         end_date: query.end_date,
         endpoint: query.endpoint.clone(),
@@ -227,7 +227,7 @@ pub async fn v2_unified_summary(
 
     let forward_result = state
         .metrics_service
-        .forward_summary(agent_metrics::ForwardMetricsFilter {
+        .forward_summary(crate::agent::metrics::ForwardMetricsFilter {
             start_date: query.start_date,
             end_date: query.end_date,
             endpoint: None,
@@ -277,7 +277,7 @@ pub async fn v2_unified_timeline(
     let chat_result = state.metrics_service.daily(days, query.end_date).await;
     let forward_result = state
         .metrics_service
-        .forward_daily(agent_metrics::ForwardMetricsFilter {
+        .forward_daily(crate::agent::metrics::ForwardMetricsFilter {
             start_date: None,
             end_date: query.end_date,
             endpoint: None,
@@ -289,13 +289,13 @@ pub async fn v2_unified_timeline(
     match (chat_result, forward_result) {
         (Ok(chat_daily), Ok(forward_daily)) => {
             // Build maps for efficient lookup
-            let chat_map: std::collections::HashMap<String, &agent_metrics::DailyMetrics> =
+            let chat_map: std::collections::HashMap<String, &crate::agent::metrics::DailyMetrics> =
                 chat_daily
                     .iter()
                     .map(|d| (d.date.to_string(), d))
                     .collect();
 
-            let forward_map: std::collections::HashMap<String, &agent_metrics::DailyMetrics> =
+            let forward_map: std::collections::HashMap<String, &crate::agent::metrics::DailyMetrics> =
                 forward_daily
                     .iter()
                     .map(|d| (d.date.to_string(), d))

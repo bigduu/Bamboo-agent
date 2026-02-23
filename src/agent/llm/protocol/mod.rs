@@ -8,7 +8,7 @@
 //! ```text
 //! Provider Types (OpenAI, Anthropic, etc.)
 //!     ↕
-//! Internal Types (agent_core::Message, ToolSchema)
+//! Internal Types (crate::agent::core::Message, ToolSchema)
 //! ```
 
 mod errors;

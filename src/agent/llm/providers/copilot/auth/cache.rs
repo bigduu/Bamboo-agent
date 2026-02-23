@@ -13,7 +13,7 @@ pub struct TokenCache {
 impl TokenCache {
     /// Get cache file path
     pub fn cache_path() -> PathBuf {
-        chat_core::paths::bamboo_dir().join("copilot_token.json")
+        crate::core::paths::bamboo_dir().join("copilot_token.json")
     }
 
     /// Load token from cache

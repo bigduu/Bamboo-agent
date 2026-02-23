@@ -79,7 +79,7 @@ pub struct ToolCallRecord {
 
 impl TodoLoopContext {
     /// Create TodoLoopContext from Session's TodoList
-    pub fn from_session(session: &agent_core::Session) -> Option<Self> {
+    pub fn from_session(session: &crate::agent::core::Session) -> Option<Self> {
         session.todo_list.as_ref().map(|todo_list| {
             // Preserve version from existing todo_list metadata if available
             // This prevents version reset across multiple executions
@@ -346,8 +346,8 @@ impl TodoLoopContext {
 mod tests {
     use super::*;
 
-    fn create_test_todo_list() -> agent_core::Session {
-        let mut session = agent_core::Session::new("test-session", "test-model");
+    fn create_test_todo_list() -> crate::agent::core::Session {
+        let mut session = crate::agent::core::Session::new("test-session", "test-model");
         let todo_list = TodoList {
             session_id: "test-session".to_string(),
             title: "Test Tasks".to_string(),

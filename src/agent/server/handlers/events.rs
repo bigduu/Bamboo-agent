@@ -40,7 +40,7 @@ pub async fn handler(
                         .append_header((header::CONTENT_TYPE, "text/event-stream"))
                         .append_header((header::CACHE_CONTROL, "no-cache"))
                         .streaming(async_stream::stream! {
-                            let event = agent_core::AgentEvent::Complete {
+                            let event = crate::agent::core::AgentEvent::Complete {
                                 usage: TokenUsage {
                                     prompt_tokens: 0,
                                     completion_tokens: 0,
@@ -60,7 +60,7 @@ pub async fn handler(
                         .append_header((header::CONTENT_TYPE, "text/event-stream"))
                         .append_header((header::CACHE_CONTROL, "no-cache"))
                         .streaming(async_stream::stream! {
-                            let event = agent_core::AgentEvent::Error {
+                            let event = crate::agent::core::AgentEvent::Error {
                                 message: err.clone(),
                             };
                             let event_json = serde_json::to_string(&event).unwrap();
@@ -111,8 +111,8 @@ pub async fn handler(
 
                         // Terminal events end the stream
                         match &event {
-                            agent_core::AgentEvent::Complete { .. } |
-                            agent_core::AgentEvent::Error { .. } => break,
+                            crate::agent::core::AgentEvent::Complete { .. } |
+                            crate::agent::core::AgentEvent::Error { .. } => break,
                             _ => {}
                         }
                     }
@@ -140,7 +140,7 @@ pub async fn handler(
                 HttpResponse::Ok()
                     .append_header((header::CONTENT_TYPE, "text/event-stream"))
                     .streaming(async_stream::stream! {
-                        let event = agent_core::AgentEvent::Complete {
+                        let event = crate::agent::core::AgentEvent::Complete {
                             usage: TokenUsage {
                                 prompt_tokens: 0,
                                 completion_tokens: 0,

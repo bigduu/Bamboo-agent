@@ -10,7 +10,7 @@ use crate::agent::tools::guide::{ToolGuide, ToolGuideSpec};
 
 /// Tool registry with guide support for enhanced prompting
 pub struct ToolRegistry {
-    tools: agent_core::tools::ToolRegistry,
+    tools: crate::agent::core::tools::ToolRegistry,
     guides: DashMap<String, Arc<dyn ToolGuide>>,
 }
 
@@ -23,7 +23,7 @@ impl Default for ToolRegistry {
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
-            tools: agent_core::tools::ToolRegistry::new(),
+            tools: crate::agent::core::tools::ToolRegistry::new(),
             guides: DashMap::new(),
         }
     }

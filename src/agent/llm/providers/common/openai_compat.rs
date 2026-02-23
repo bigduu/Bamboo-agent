@@ -2,7 +2,7 @@
 //!
 //! Many providers (OpenAI, GitHub Copilot, etc.) accept a request/stream shape that is compatible
 //! with OpenAI's chat completions API. These helpers build a "compat" JSON body without leaking
-//! internal `agent_core::Message` fields (like `id` / `created_at`).
+//! internal `crate::agent::core::Message` fields (like `id` / `created_at`).
 
 use crate::agent::core::{agent::Role, tools::ToolSchema, Message};
 use serde::Deserialize;
@@ -123,15 +123,15 @@ pub fn parse_openai_compat_chunk(chunk: OpenAICompatStreamChunk) -> LLMChunk {
     };
 
     if let Some(tool_calls) = &choice.delta.tool_calls {
-        let calls: Vec<agent_core::tools::ToolCall> = tool_calls
+        let calls: Vec<crate::agent::core::tools::ToolCall> = tool_calls
             .iter()
-            .map(|tc| agent_core::tools::ToolCall {
+            .map(|tc| crate::agent::core::tools::ToolCall {
                 id: tc.id.clone().unwrap_or_default(),
                 tool_type: tc
                     .tool_type
                     .clone()
                     .unwrap_or_else(|| "function".to_string()),
-                function: agent_core::tools::FunctionCall {
+                function: crate::agent::core::tools::FunctionCall {
                     name: tc
                         .function
                         .as_ref()

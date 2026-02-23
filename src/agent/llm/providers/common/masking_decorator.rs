@@ -67,7 +67,7 @@ impl<P: LLMProvider> LLMProvider for MaskingProviderDecorator<P> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use futures_util::stream;
+    use futures::stream;
 
     use super::*;
     use crate::core::keyword_masking::{KeywordEntry, MatchType};

@@ -64,7 +64,7 @@ impl AgentRunner {
 pub struct AppState {
     pub sessions: Arc<RwLock<HashMap<String, Session>>>,
     pub storage: JsonlStorage,
-    pub llm: Arc<dyn agent_llm::LLMProvider>,
+    pub llm: Arc<dyn crate::agent::llm::LLMProvider>,
     pub tools: Arc<dyn ToolExecutor>,
     pub cancel_tokens: Arc<RwLock<HashMap<String, tokio_util::sync::CancellationToken>>>,
     pub skill_manager: Arc<SkillManager>,
@@ -102,7 +102,7 @@ impl AppState {
         let sessions_dir = data_dir.join("sessions");
 
         // Migrate session files from old location if needed
-        if let Err(e) = chat_core::migrate_session_files() {
+        if let Err(e) = crate::core::migrate_session_files() {
             log::warn!("Failed to migrate session files: {}", e);
         }
 
@@ -122,17 +122,17 @@ impl AppState {
             model
         );
 
-        let llm: Arc<dyn agent_llm::LLMProvider> = match provider {
+        let llm: Arc<dyn crate::agent::llm::LLMProvider> = match provider {
             "copilot" => {
                 log::info!("Using Copilot provider with Device Code authentication");
 
                 // Create Copilot provider and authenticate
                 let mut copilot_provider = if api_key != "sk-test" && !api_key.is_empty() {
                     // Use provided API key directly
-                    agent_llm::CopilotProvider::with_token(api_key)
+                    crate::agent::llm::CopilotProvider::with_token(api_key)
                 } else {
                     // Use device code flow
-                    agent_llm::CopilotProvider::new()
+                    crate::agent::llm::CopilotProvider::new()
                 };
 
                 // Try silent auth first (cached token)
@@ -175,7 +175,7 @@ impl AppState {
         mcp_manager.initialize_from_config(&mcp_config).await;
 
         // Create composite tool executor (builtin + MCP)
-        let mcp_tools = Arc::new(agent_mcp::McpToolExecutor::new(
+        let mcp_tools = Arc::new(crate::agent::mcp::McpToolExecutor::new(
             mcp_manager.clone(),
             mcp_manager.tool_index(),
         ));
@@ -264,7 +264,7 @@ impl AppState {
     }
 
     /// Get all tool schemas from the built-in tool executor
-    pub fn get_all_tool_schemas(&self) -> Vec<agent_core::tools::ToolSchema> {
+    pub fn get_all_tool_schemas(&self) -> Vec<crate::agent::core::tools::ToolSchema> {
         self.tools.list_tools()
     }
 }
@@ -310,7 +310,7 @@ fn bamboo_dir() -> PathBuf {
 }
 
 /// Load MCP configuration from file
-async fn load_mcp_config(app_data_root: &std::path::Path) -> agent_mcp::McpConfig {
+async fn load_mcp_config(app_data_root: &std::path::Path) -> crate::agent::mcp::McpConfig {
     let config_path = app_data_root.join("mcp.json");
 
     if !config_path.exists() {
@@ -318,23 +318,23 @@ async fn load_mcp_config(app_data_root: &std::path::Path) -> agent_mcp::McpConfi
             "No MCP config file found at {:?}, using default",
             config_path
         );
-        return agent_mcp::McpConfig::default();
+        return crate::agent::mcp::McpConfig::default();
     }
 
     match tokio::fs::read_to_string(&config_path).await {
-        Ok(content) => match serde_json::from_str::<agent_mcp::McpConfig>(&content) {
+        Ok(content) => match serde_json::from_str::<crate::agent::mcp::McpConfig>(&content) {
             Ok(config) => {
                 log::info!("Loaded MCP config with {} servers", config.servers.len());
                 config
             }
             Err(e) => {
                 log::error!("Failed to parse MCP config: {}", e);
-                agent_mcp::McpConfig::default()
+                crate::agent::mcp::McpConfig::default()
             }
         },
         Err(e) => {
             log::error!("Failed to read MCP config: {}", e);
-            agent_mcp::McpConfig::default()
+            crate::agent::mcp::McpConfig::default()
         }
     }
 }

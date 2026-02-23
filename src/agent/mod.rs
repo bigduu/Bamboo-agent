@@ -21,28 +21,30 @@ pub mod server;
 pub mod skill;
 pub mod tools;
 
-// Re-export commonly used types
+// Re-export commonly used types from core
 pub use core::{
-    AgentContext, AgentResult, BudgetPolicy, CompositionEngine, MemoryBackend,
-    StorageBackend, ToolRegistry,
+    AgentError, AgentEvent, Message, MessageContent, Role, Session,
+    TokenBudgetUsage, TokenUsage, TodoItem, TodoItemStatus, TodoList,
 };
 
+// Re-export commonly used types from llm
 pub use llm::{
-    LLMProvider, LLMProviderBuilder, Message, StreamResponse,
+    LLMProvider, LLMProviderBuilder, StreamResponse,
 };
 
+// Re-export commonly used types from loop_module
 pub use loop_module::{
     AgentLoop, AgentLoopConfig, LoopEvent,
 };
 
+// Re-export commonly used types from tools
 pub use tools::{
-    BuiltinToolExecutor, ToolExecutor, ToolOutputManager,
+    BuiltinToolExecutor, BuiltinToolExecutorBuilder, ToolOutputManager,
 };
 
+// Re-export commonly used types from metrics
 pub use metrics::{
-    MetricsBus, MetricsWorker, UsageMetrics,
+    MetricsBus, MetricsWorker,
 };
 
-pub use server::{
-    AgentServer, ServerState,
-};
+// Note: server types are available through server module

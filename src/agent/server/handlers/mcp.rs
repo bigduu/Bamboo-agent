@@ -39,7 +39,7 @@ pub struct ToolInfo {
 #[derive(Debug, Deserialize)]
 pub struct ServerRequest {
     #[serde(flatten)]
-    pub config: agent_mcp::McpServerConfig,
+    pub config: crate::agent::mcp::McpServerConfig,
 }
 
 /// List all MCP servers and their status

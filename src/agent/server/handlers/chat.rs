@@ -77,7 +77,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     let system_prompt = build_enhanced_system_prompt(base_prompt, enhance_prompt, workspace_path);
     upsert_system_prompt_message(&mut session, system_prompt);
 
-    session.add_message(agent_core::Message::user(req.message.clone()));
+    session.add_message(crate::agent::core::Message::user(req.message.clone()));
 
     // Model is required (validated by request deserialization). Persist it on the session.
     session.model = model;
@@ -107,7 +107,7 @@ fn upsert_system_prompt_message(session: &mut Session, system_prompt: String) {
         .retain(|message| !matches!(message.role, Role::System));
     session
         .messages
-        .insert(0, agent_core::Message::system(system_prompt));
+        .insert(0, crate::agent::core::Message::system(system_prompt));
 }
 
 fn build_enhanced_system_prompt(
@@ -146,13 +146,13 @@ mod tests {
     #[test]
     fn upsert_system_prompt_inserts_when_missing() {
         let mut session = Session::new("session-1", "test-model");
-        session.add_message(agent_core::Message::user("hello"));
+        session.add_message(crate::agent::core::Message::user("hello"));
 
         upsert_system_prompt_message(&mut session, "system prompt".to_string());
 
         assert!(matches!(
             session.messages.first().map(|m| &m.role),
-            Some(agent_core::Role::System)
+            Some(crate::agent::core::Role::System)
         ));
         assert_eq!(session.messages[0].content, "system prompt");
     }
@@ -160,15 +160,15 @@ mod tests {
     #[test]
     fn upsert_system_prompt_replaces_existing_message() {
         let mut session = Session::new("session-1", "test-model");
-        session.add_message(agent_core::Message::system("old"));
-        session.add_message(agent_core::Message::user("hello"));
+        session.add_message(crate::agent::core::Message::system("old"));
+        session.add_message(crate::agent::core::Message::user("hello"));
 
         upsert_system_prompt_message(&mut session, "new".to_string());
 
         let system_messages = session
             .messages
             .iter()
-            .filter(|m| matches!(m.role, agent_core::Role::System))
+            .filter(|m| matches!(m.role, crate::agent::core::Role::System))
             .count();
         assert_eq!(system_messages, 1);
         assert_eq!(session.messages[0].content, "new");

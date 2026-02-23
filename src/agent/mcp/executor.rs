@@ -116,7 +116,7 @@ impl ToolExecutor for McpToolExecutor {
                     .get_tool_info(&alias.server_id, &alias.original_name)
                     .map(|tool| ToolSchema {
                         schema_type: "function".to_string(),
-                        function: agent_core::tools::FunctionSchema {
+                        function: crate::agent::core::tools::FunctionSchema {
                             name: alias.alias,
                             description: tool.description,
                             parameters: tool.parameters,

@@ -1,7 +1,7 @@
 //! Shared SSE -> [`LLMStream`] adapter.
 
 use eventsource_stream::Eventsource;
-use futures_util::StreamExt;
+use futures::StreamExt;
 use reqwest::Response;
 
 use crate::agent::llm::provider::{LLMError, LLMStream, Result};
@@ -45,7 +45,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::StreamExt;
+    use futures::StreamExt;
     use http;
 
     #[tokio::test]

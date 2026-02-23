@@ -80,7 +80,7 @@ mod tests {
 
     use super::*;
 
-    fn build_stream(items: Vec<agent_llm::provider::Result<LLMChunk>>) -> LLMStream {
+    fn build_stream(items: Vec<crate::agent::llm::provider::Result<LLMChunk>>) -> LLMStream {
         Box::pin(stream::iter(items))
     }
 

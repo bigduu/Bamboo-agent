@@ -51,7 +51,7 @@ pub async fn handler(
     let last_message_is_user = session
         .messages
         .last()
-        .map(|m| matches!(m.role, agent_core::agent::Role::User))
+        .map(|m| matches!(m.role, crate::agent::core::agent::Role::User))
         .unwrap_or(false);
 
     if !last_message_is_user {
@@ -93,7 +93,7 @@ pub async fn handler(
     log::info!("[{}] Starting agent execution (legacy stream handler)", session_id);
 
     // Create mpsc channel for agent loop
-    let (mpsc_tx, mut mpsc_rx) = mpsc::channel::<agent_core::AgentEvent>(100);
+    let (mpsc_tx, mut mpsc_rx) = mpsc::channel::<crate::agent::core::AgentEvent>(100);
 
     // Start agent loop in background
     let state_clone = state.get_ref().clone();
@@ -116,14 +116,14 @@ pub async fn handler(
         let system_prompt = session
             .messages
             .iter()
-            .find(|m| matches!(m.role, agent_core::agent::Role::System))
+            .find(|m| matches!(m.role, crate::agent::core::agent::Role::System))
             .map(|m| m.content.clone());
 
         // Get initial user message
         let initial_message = session
             .messages
             .last()
-            .filter(|m| matches!(m.role, agent_core::agent::Role::User))
+            .filter(|m| matches!(m.role, crate::agent::core::agent::Role::User))
             .map(|m| m.content.clone())
             .unwrap_or_default();
 
@@ -143,7 +143,7 @@ pub async fn handler(
         }
 
         // Run agent loop
-        let storage: Arc<dyn agent_core::storage::Storage> =
+        let storage: Arc<dyn crate::agent::core::storage::Storage> =
             Arc::new(state_clone.storage.clone());
 
         let result = run_agent_loop_with_config(
@@ -171,11 +171,11 @@ pub async fn handler(
         if let Err(ref e) = result {
             if e.to_string().contains("cancelled") {
                 // Emit a specific cancellation event so SSE streams can close cleanly
-                let _ = mpsc_tx.send(agent_core::AgentEvent::Error {
+                let _ = mpsc_tx.send(crate::agent::core::AgentEvent::Error {
                     message: "Agent execution cancelled by user".to_string(),
                 }).await;
             } else {
-                let _ = mpsc_tx.send(agent_core::AgentEvent::Error {
+                let _ = mpsc_tx.send(crate::agent::core::AgentEvent::Error {
                     message: e.to_string(),
                 }).await;
             }
@@ -236,8 +236,8 @@ pub async fn handler(
 
                 // Terminal events end the stream
                 match &event {
-                    agent_core::AgentEvent::Complete { .. } |
-                    agent_core::AgentEvent::Error { .. } => break,
+                    crate::agent::core::AgentEvent::Complete { .. } |
+                    crate::agent::core::AgentEvent::Error { .. } => break,
                     _ => {}
                 }
             }
@@ -269,8 +269,8 @@ fn subscribe_to_runner(
 
                 // Terminal events end the stream
                 match &event {
-                    agent_core::AgentEvent::Complete { .. } |
-                    agent_core::AgentEvent::Error { .. } => break,
+                    crate::agent::core::AgentEvent::Complete { .. } |
+                    crate::agent::core::AgentEvent::Error { .. } => break,
                     _ => {}
                 }
             }

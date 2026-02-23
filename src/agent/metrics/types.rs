@@ -18,8 +18,8 @@ impl TokenUsage {
     }
 }
 
-impl From<agent_core::agent::events::TokenUsage> for TokenUsage {
-    fn from(value: agent_core::agent::events::TokenUsage) -> Self {
+impl From<crate::agent::core::agent::events::TokenUsage> for TokenUsage {
+    fn from(value: crate::agent::core::agent::events::TokenUsage) -> Self {
         Self {
             prompt_tokens: u64::from(value.prompt_tokens),
             completion_tokens: u64::from(value.completion_tokens),

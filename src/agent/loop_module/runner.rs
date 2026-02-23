@@ -96,7 +96,7 @@ pub async fn run_agent_loop_with_config(
             session
                 .messages
                 .iter()
-                .find(|message| matches!(message.role, agent_core::Role::System))
+                .find(|message| matches!(message.role, crate::agent::core::Role::System))
                 .map(|message| message.content.as_str())
         })
         .unwrap_or_default();
@@ -116,7 +116,7 @@ pub async fn run_agent_loop_with_config(
     if let Some(system_message) = session
         .messages
         .iter_mut()
-        .find(|message| matches!(message.role, agent_core::Role::System))
+        .find(|message| matches!(message.role, crate::agent::core::Role::System))
     {
         let base_prompt = config
             .system_prompt
@@ -251,7 +251,7 @@ pub async fn run_agent_loop_with_config(
 
         // Use model from config (provided by execute request), not from session
         let model = config.model_name.as_deref().ok_or_else(|| {
-            agent_core::AgentError::LLM("model_name is required in AgentLoopConfig".to_string())
+            crate::agent::core::AgentError::LLM("model_name is required in AgentLoopConfig".to_string())
         })?;
 
         let stream = match llm
@@ -525,10 +525,10 @@ pub async fn run_agent_loop_with_config(
                                 (args["item_id"].as_str(), args["status"].as_str())
                             {
                                 let status_enum = match status {
-                                    "pending" => Some(agent_core::TodoItemStatus::Pending),
-                                    "in_progress" => Some(agent_core::TodoItemStatus::InProgress),
-                                    "completed" => Some(agent_core::TodoItemStatus::Completed),
-                                    "blocked" => Some(agent_core::TodoItemStatus::Blocked),
+                                    "pending" => Some(crate::agent::core::TodoItemStatus::Pending),
+                                    "in_progress" => Some(crate::agent::core::TodoItemStatus::InProgress),
+                                    "completed" => Some(crate::agent::core::TodoItemStatus::Completed),
+                                    "blocked" => Some(crate::agent::core::TodoItemStatus::Blocked),
                                     _ => None,
                                 };
                                 if let Some(s) = status_enum {
@@ -757,7 +757,7 @@ pub async fn run_agent_loop_with_config(
 
             // Use model from config
             let model = config.model_name.as_deref().ok_or_else(|| {
-                agent_core::AgentError::LLM("model_name is required in AgentLoopConfig".to_string())
+                crate::agent::core::AgentError::LLM("model_name is required in AgentLoopConfig".to_string())
             })?;
 
             match evaluate_todo_progress(
@@ -924,7 +924,7 @@ fn resolve_token_budget(
     TokenBudget::with_safety_margin(
         model_limit.max_context_tokens,
         model_limit.get_max_output_tokens(),
-        agent_core::budget::BudgetStrategy::default(),
+        crate::agent::core::budget::BudgetStrategy::default(),
         model_limit.get_safety_margin(),
     )
 }
@@ -1001,7 +1001,7 @@ fn inject_todo_list_into_system_message(session: &mut Session) {
     if let Some(system_message) = session
         .messages
         .iter_mut()
-        .find(|message| matches!(message.role, agent_core::Role::System))
+        .find(|message| matches!(message.role, crate::agent::core::Role::System))
     {
         let base_prompt = strip_existing_todo_list(&system_message.content);
 

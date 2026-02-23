@@ -115,7 +115,7 @@ pub async fn handler(
     log::info!("[{}] Starting agent execution", session_id);
 
     // Create mpsc channel for agent loop
-    let (mpsc_tx, mut mpsc_rx) = mpsc::channel::<agent_core::AgentEvent>(100);
+    let (mpsc_tx, mut mpsc_rx) = mpsc::channel::<crate::agent::core::AgentEvent>(100);
 
     // Start agent loop in background
     let state_clone = state.get_ref().clone();
@@ -127,7 +127,7 @@ pub async fn handler(
     tokio::spawn(async move {
         while let Some(event) = mpsc_rx.recv().await {
             // Store budget events for late subscribers
-            if matches!(&event, agent_core::AgentEvent::TokenBudgetUpdated { .. }) {
+            if matches!(&event, crate::agent::core::AgentEvent::TokenBudgetUpdated { .. }) {
                 let mut runners = state_for_forwarder.agent_runners.write().await;
                 if let Some(runner) = runners.get_mut(&session_id_forwarder) {
                     runner.last_budget_event = Some(event.clone());
@@ -178,7 +178,7 @@ pub async fn handler(
         }
 
         // Run agent loop
-        let storage: Arc<dyn agent_core::storage::Storage> =
+        let storage: Arc<dyn crate::agent::core::storage::Storage> =
             Arc::new(state_clone.storage.clone());
 
         let result = run_agent_loop_with_config(
@@ -206,11 +206,11 @@ pub async fn handler(
         if let Err(ref e) = result {
             if e.to_string().contains("cancelled") {
                 // Emit a specific cancellation event so SSE streams can close cleanly
-                let _ = mpsc_tx.send(agent_core::AgentEvent::Error {
+                let _ = mpsc_tx.send(crate::agent::core::AgentEvent::Error {
                     message: "Agent execution cancelled by user".to_string(),
                 }).await;
             } else {
-                let _ = mpsc_tx.send(agent_core::AgentEvent::Error {
+                let _ = mpsc_tx.send(crate::agent::core::AgentEvent::Error {
                     message: e.to_string(),
                 }).await;
             }

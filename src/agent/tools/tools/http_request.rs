@@ -14,7 +14,7 @@
 use crate::agent::core::tools::{Tool, ToolError, ToolResult};
 use async_trait::async_trait;
 #[cfg(feature = "http")]
-use futures_util::StreamExt;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;

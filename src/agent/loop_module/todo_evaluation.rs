@@ -32,7 +32,7 @@ pub struct TodoItemUpdate {
 pub fn build_todo_evaluation_messages(
     ctx: &TodoLoopContext,
     _session: &Session,
-) -> Vec<agent_core::Message> {
+) -> Vec<crate::agent::core::Message> {
     let mut messages = Vec::new();
 
     // System prompt：专门用于 TodoList 评估
@@ -56,7 +56,7 @@ Review the todo list and execution history, then decide if any tasks should be m
 - Provide clear reasoning in notes
 "#;
 
-    messages.push(agent_core::Message::system(system_prompt));
+    messages.push(crate::agent::core::Message::system(system_prompt));
 
     // 构建 todo list 上下文
     let todo_context = format!(
@@ -82,7 +82,7 @@ Remember: You are NOT executing the task. You are only evaluating if existing wo
         format_recent_tools(ctx, 5), // 最近 5 个 tool 调用
     );
 
-    messages.push(agent_core::Message::user(todo_context));
+    messages.push(crate::agent::core::Message::user(todo_context));
 
     messages
 }
@@ -161,7 +161,7 @@ pub async fn evaluate_todo_progress(
     event_tx: &mpsc::Sender<AgentEvent>,
     session_id: &str,
     model: &str,  // Add model parameter (required)
-) -> Result<TodoEvaluationResult, agent_core::AgentError> {
+) -> Result<TodoEvaluationResult, crate::agent::core::AgentError> {
     use crate::agent::loop_module::stream::handler::consume_llm_stream;
 
     // 检查是否有需要评估的任务
@@ -205,7 +205,7 @@ pub async fn evaluate_todo_progress(
                 event_tx,
                 &tokio_util::sync::CancellationToken::new(),
                 session_id,
-            ).await.map_err(|e| agent_core::AgentError::LLM(e.to_string()))?;
+            ).await.map_err(|e| crate::agent::core::AgentError::LLM(e.to_string()))?;
 
             log::info!(
                 "[{}] Todo evaluation completed: {} tokens, {} tool calls",
@@ -272,7 +272,7 @@ mod tests {
     use chrono::Utc;
 
     fn create_test_context() -> TodoLoopContext {
-        let mut session = agent_core::Session::new("test", "test-model");
+        let mut session = crate::agent::core::Session::new("test", "test-model");
         let todo_list = TodoList {
             session_id: "test".to_string(),
             title: "Test Tasks".to_string(),
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn test_build_evaluation_messages() {
         let ctx = create_test_context();
-        let session = agent_core::Session::new("test", "test-model");
+        let session = crate::agent::core::Session::new("test", "test-model");
 
         let messages = build_todo_evaluation_messages(&ctx, &session);
 
@@ -367,7 +367,7 @@ mod tests {
         //     event_tx: &mpsc::Sender<AgentEvent>,
         //     session_id: &str,
         //     model: &str,  // <-- Required parameter
-        // ) -> Result<TodoEvaluationResult, agent_core::AgentError>
+        // ) -> Result<TodoEvaluationResult, crate::agent::core::AgentError>
         //
         // The presence of `model: &str` in the signature proves that
         // model must be passed as a parameter, not read from session.

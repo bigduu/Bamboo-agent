@@ -223,7 +223,7 @@ fn message_to_anthropic_json(message: &Message) -> Value {
     }
 }
 
-fn tool_call_to_tool_use_block(tool_call: &agent_core::tools::ToolCall) -> Value {
+fn tool_call_to_tool_use_block(tool_call: &crate::agent::core::tools::ToolCall) -> Value {
     let input: Value = serde_json::from_str(&tool_call.function.arguments)
         .unwrap_or_else(|_| Value::String(tool_call.function.arguments.clone()));
 
@@ -313,10 +313,10 @@ pub fn parse_anthropic_sse_event(
                 .tool_uses_by_index
                 .insert(index, (id.to_string(), name.to_string()));
 
-            Ok(Some(LLMChunk::ToolCalls(vec![agent_core::tools::ToolCall {
+            Ok(Some(LLMChunk::ToolCalls(vec![crate::agent::core::tools::ToolCall {
                 id: id.to_string(),
                 tool_type: "function".to_string(),
-                function: agent_core::tools::FunctionCall {
+                function: crate::agent::core::tools::FunctionCall {
                     name: name.to_string(),
                     arguments: String::new(),
                 },
@@ -363,10 +363,10 @@ pub fn parse_anthropic_sse_event(
                         )));
                     };
 
-                    Ok(Some(LLMChunk::ToolCalls(vec![agent_core::tools::ToolCall {
+                    Ok(Some(LLMChunk::ToolCalls(vec![crate::agent::core::tools::ToolCall {
                         id: id.clone(),
                         tool_type: "function".to_string(),
-                        function: agent_core::tools::FunctionCall {
+                        function: crate::agent::core::tools::FunctionCall {
                             name: name.clone(),
                             arguments: partial.to_string(),
                         },
