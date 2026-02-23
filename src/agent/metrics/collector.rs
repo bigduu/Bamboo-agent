@@ -5,7 +5,7 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::mpsc;
 
 use crate::agent::metrics::storage::{MetricsStorage, ToolCallCompletion};
-use crate::agent::metrics::types::{ForwardStatus, RoundStatus, SessionStatus, TokenUsage};
+use crate::agent::metrics::types::{RoundStatus, SessionStatus, TokenUsage};
 
 #[derive(Debug)]
 enum CollectorCommand {

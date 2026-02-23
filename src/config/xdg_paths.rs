@@ -47,13 +47,28 @@ pub fn xdg_cache_home() -> PathBuf {
         })
 }
 
-/// Get XDG_RUNTIME_DIR or fallback (/tmp/bamboo-$UID)
+/// Get XDG_RUNTIME_DIR or fallback
+/// On Unix: /tmp/bamboo-$UID
+/// On Windows: %TEMP%\bamboo
 pub fn xdg_runtime_dir() -> PathBuf {
     env::var("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            let uid = unsafe { libc::getuid() };
-            PathBuf::from(format!("/tmp/bamboo-{}", uid))
+            #[cfg(unix)]
+            {
+                let uid = unsafe { libc::getuid() };
+                PathBuf::from(format!("/tmp/bamboo-{}", uid))
+            }
+            #[cfg(windows)]
+            {
+                // On Windows, use the temp directory
+                std::env::temp_dir().join("bamboo")
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                // Fallback for other platforms
+                std::env::temp_dir().join("bamboo")
+            }
         })
 }
 

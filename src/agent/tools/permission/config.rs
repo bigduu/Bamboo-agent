@@ -374,19 +374,11 @@ pub fn open_file_no_follow(path: &Path) -> Result<std::fs::File, std::io::Error>
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use std::os::windows::raw::HANDLE;
-        use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
-        use winapi::um::winnt::{FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, GENERIC_READ, GENERIC_WRITE};
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
 
-        let wide_path: Vec<u16> = path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+        // On Windows, use FILE_FLAG_OPEN_REPARSE_POINT to avoid following reparse points
+        // This is similar to O_NOFOLLOW on Unix
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
 
-        // For Windows, we need to use the Windows API directly for more control
-        // Fall back to standard options which provide some protection
         std::fs::OpenOptions::new()
             .read(true)
             .write(true)
