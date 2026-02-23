@@ -14,6 +14,7 @@ Welcome to the Bamboo documentation! This directory contains comprehensive guide
 ### Guides
 
 - **[GitHub Actions Setup](guides/GITHUB_ACTIONS_SETUP.md)** - Setting up CI/CD with GitHub Actions
+- **[Auto-Publish Workflow](guides/AUTO_PUBLISH.md)** - Automatic version detection and publishing to crates.io
 
 ### Development
 
