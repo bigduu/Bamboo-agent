@@ -1,0 +1,72 @@
+[package]
+name = "bamboo"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Bamboo Contributors"]
+description = "A fully self-contained AI agent backend framework with built-in web services"
+repository = "https://github.com/bamboo-ai/bamboo"
+keywords = ["ai", "agent", "llm", "automation", "assistant"]
+categories = ["development-tools", "api-bindings", "web-programming"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+actix-web = "4"
+actix-cors = "0.7"
+actix-files = "0.6"
+tower = "0.5"
+tower-http = "0.6"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Utilities
+dirs = "5"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+lazy_static = "1"
+
+# Async utilities
+futures = "0.3"
+async-trait = "0.1"
+tokio-stream = "0.1"
+
+# HTTP client (for LLM providers)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest-eventsource = "0.6"
+
+# Encryption
+aes-gcm = "0.10"
+base64 = "0.22"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Process management
+sysinfo = "0.33"
+libc = "0.2"
+
+[[bin]]
+name = "bamboo"
+path = "src/bin/bamboo.rs"
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = true

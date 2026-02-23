@@ -1,0 +1,125 @@
+//! XDG Base Directory specification implementation for Bamboo
+//!
+//! Follows the XDG Base Directory specification: https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
+//!
+//! Default paths:
+//! - Config: ~/.config/bamboo/
+//! - Data: ~/.local/share/bamboo/
+//! - Cache: ~/.cache/bamboo/
+//! - Runtime: /tmp/bamboo-$UID/ (or $XDG_RUNTIME_DIR/bamboo/)
+
+use std::path::PathBuf;
+use std::env;
+use std::fs;
+use anyhow::{Result, Context};
+
+/// Get XDG_CONFIG_HOME or default (~/.config)
+pub fn xdg_config_home() -> PathBuf {
+    env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .expect("Could not determine home directory")
+                .join(".config")
+        })
+}
+
+/// Get XDG_DATA_HOME or default (~/.local/share)
+pub fn xdg_data_home() -> PathBuf {
+    env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .expect("Could not determine home directory")
+                .join(".local")
+                .join("share")
+        })
+}
+
+/// Get XDG_CACHE_HOME or default (~/.cache)
+pub fn xdg_cache_home() -> PathBuf {
+    env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .expect("Could not determine home directory")
+                .join(".cache")
+        })
+}
+
+/// Get XDG_RUNTIME_DIR or fallback (/tmp/bamboo-$UID)
+pub fn xdg_runtime_dir() -> PathBuf {
+    env::var("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let uid = unsafe { libc::getuid() };
+            PathBuf::from(format!("/tmp/bamboo-{}", uid))
+        })
+}
+
+/// Bamboo config directory: $XDG_CONFIG_HOME/bamboo/
+pub fn bamboo_config_dir() -> PathBuf {
+    xdg_config_home().join("bamboo")
+}
+
+/// Bamboo data directory: $XDG_DATA_HOME/bamboo/
+pub fn bamboo_data_dir() -> PathBuf {
+    xdg_data_home().join("bamboo")
+}
+
+/// Bamboo cache directory: $XDG_CACHE_HOME/bamboo/
+pub fn bamboo_cache_dir() -> PathBuf {
+    xdg_cache_home().join("bamboo")
+}
+
+/// Bamboo runtime directory: $XDG_RUNTIME_DIR/bamboo/
+pub fn bamboo_runtime_dir() -> PathBuf {
+    xdg_runtime_dir().join("bamboo")
+}
+
+/// Bamboo config file path: $XDG_CONFIG_HOME/bamboo/config.json
+pub fn bamboo_config_file() -> PathBuf {
+    bamboo_config_dir().join("config.json")
+}
+
+/// Ensure a directory exists, creating it if necessary
+fn ensure_dir_exists(path: &PathBuf) -> Result<()> {
+    if !path.exists() {
+        fs::create_dir_all(path)
+            .with_context(|| format!("Failed to create directory: {:?}", path))?;
+    }
+    Ok(())
+}
+
+/// Ensure all Bamboo directories exist
+pub fn ensure_bamboo_dirs() -> Result<()> {
+    ensure_dir_exists(&bamboo_config_dir())?;
+    ensure_dir_exists(&bamboo_data_dir())?;
+    ensure_dir_exists(&bamboo_cache_dir())?;
+    ensure_dir_exists(&bamboo_runtime_dir())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_xdg_paths() {
+        // Test that paths are generated correctly
+        let config = bamboo_config_dir();
+        let data = bamboo_data_dir();
+        let cache = bamboo_cache_dir();
+
+        // Should end with /bamboo
+        assert!(config.ends_with("bamboo"));
+        assert!(data.ends_with("bamboo"));
+        assert!(cache.ends_with("bamboo"));
+    }
+
+    #[test]
+    fn test_ensure_dirs() {
+        // This test creates directories in the actual filesystem
+        assert!(ensure_bamboo_dirs().is_ok());
+    }
+}

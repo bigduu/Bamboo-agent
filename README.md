@@ -1,0 +1,175 @@
+# Bamboo
+
+A fully self-contained AI agent backend framework with built-in web services.
+
+## Features
+
+- 🤖 **Complete Agent System**: Agent loop, tool execution, skill management
+- 🌐 **Built-in HTTP Server**: Actix-web based API server
+- 🧠 **Multi-LLM Support**: OpenAI, Anthropic, Google Gemini, GitHub Copilot
+- 📁 **XDG-Compliant**: Follows XDG Base Directory specification
+- 🔧 **Dual Mode**: Binary (standalone) or library (embedded)
+- 🔐 **Production-Ready**: CORS, rate limiting, security headers
+- 🔄 **Session Management**: Persistent conversation history
+- ⚡ **Workflow System**: Automate complex tasks
+- 🤝 **Claude Integration**: Seamless Claude Code integration
+
+## Installation
+
+### From crates.io
+
+```bash
+cargo install bamboo
+```
+
+### From source
+
+```bash
+git clone https://github.com/bamboo-ai/bamboo
+cd bamboo
+cargo install --path .
+```
+
+## Quick Start
+
+### Binary Mode
+
+```bash
+# Start server with default settings
+bamboo serve
+
+# Custom configuration
+bamboo serve --port 9000 --bind 0.0.0.0 --data-dir /var/lib/bamboo
+```
+
+### Library Mode
+
+```rust
+use bamboo::{BambooBuilder, BambooConfig};
+
+#[tokio::main]
+async fn main() {
+    let server = BambooBuilder::new()
+        .port(3000)
+        .bind("0.0.0.0")
+        .data_dir(std::path::PathBuf::from("/var/lib/myapp"))
+        .build()
+        .unwrap();
+
+    server.start().await.unwrap();
+}
+```
+
+## Configuration
+
+Bamboo follows the [XDG Base Directory specification](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html).
+
+### Default Paths
+
+- **Config**: `$XDG_CONFIG_HOME/bamboo/config.json` (default: `~/.config/bamboo/`)
+- **Data**: `$XDG_DATA_HOME/bamboo/` (default: `~/.local/share/bamboo/`)
+- **Cache**: `$XDG_CACHE_HOME/bamboo/` (default: `~/.cache/bamboo/`)
+
+### Configuration File
+
+Edit `~/.config/bamboo/config.json`:
+
+```json
+{
+  "server": {
+    "port": 8080,
+    "bind": "127.0.0.1",
+    "workers": 10
+  },
+  "data_dir": "~/.local/share/bamboo"
+}
+```
+
+### Environment Variables
+
+Override configuration with environment variables:
+
+- `BAMBOO_PORT`: Server port
+- `BAMBOO_BIND`: Bind address
+- `BAMBOO_DATA_DIR`: Data directory
+
+## API Endpoints
+
+Once running, Bamboo exposes the following endpoints:
+
+### Health Check
+```
+GET /api/v1/health
+```
+
+### Chat Completions
+```
+POST /api/v1/chat/completions
+```
+
+### Agent Execution
+```
+POST /api/v1/agent/run
+```
+
+### Workflows
+```
+GET    /v1/workflows
+POST   /v1/workflows
+DELETE /v1/workflows/{name}
+```
+
+### Sessions
+```
+GET  /api/v1/sessions
+POST /api/v1/sessions
+```
+
+## Development
+
+### Build
+
+```bash
+cargo build
+```
+
+### Test
+
+```bash
+cargo test
+```
+
+### Run
+
+```bash
+cargo run -- serve
+```
+
+## Architecture
+
+Bamboo is organized into the following modules:
+
+- **`config`**: Configuration management with XDG support
+- **`core`**: Core types and utilities
+- **`agent`**: Agent system (loop, tools, skills, LLM providers)
+- **`server`**: HTTP server and controllers
+- **`process`**: Process management
+- **`claude`**: Claude Code integration
+- **`commands`**: Workflow, slash commands, keyword masking
+
+## License
+
+MIT
+
+## Contributing
+
+Contributions are welcome! Please read our contributing guidelines before submitting PRs.
+
+## Roadmap
+
+- [ ] Complete agent system migration
+- [ ] Full OpenAI/Anthropic API compatibility
+- [ ] Webhook support
+- [ ] Plugin system
+- [ ] gRPC API
+- [ ] Kubernetes deployment guides
