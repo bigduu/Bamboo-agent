@@ -9,14 +9,10 @@ async fn test_history_endpoint_exists() {
     let state = crate::e2e::common::create_test_app().await;
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/history/{session_id}",
-                web::get().to(handlers::history::handler),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/history/{session_id}",
+        web::get().to(handlers::history::handler),
+    ))
     .await;
 
     let uri = format!("/api/v1/history/{}", session_id);
@@ -33,14 +29,10 @@ async fn test_history_returns_empty_for_new_session() {
     let state = crate::e2e::common::create_test_app().await;
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/history/{session_id}",
-                web::get().to(handlers::history::handler),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/history/{session_id}",
+        web::get().to(handlers::history::handler),
+    ))
     .await;
 
     let uri = format!("/api/v1/history/{}", session_id);
@@ -56,14 +48,10 @@ async fn test_history_returns_empty_for_new_session() {
 async fn test_history_with_multiple_sessions() {
     let state = crate::e2e::common::create_test_app().await;
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/history/{session_id}",
-                web::get().to(handlers::history::handler),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/history/{session_id}",
+        web::get().to(handlers::history::handler),
+    ))
     .await;
 
     // Test multiple sessions

@@ -9,14 +9,10 @@ async fn test_get_todo_list_endpoint() {
     let state = crate::e2e::common::create_test_app().await;
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/todo/{session_id}",
-                web::get().to(handlers::todo::get_todo_list),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/todo/{session_id}",
+        web::get().to(handlers::todo::get_todo_list),
+    ))
     .await;
 
     let uri = format!("/api/v1/todo/{}", session_id);
@@ -33,14 +29,10 @@ async fn test_has_todo_list_endpoint() {
     let state = crate::e2e::common::create_test_app().await;
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/todo/{session_id}/exists",
-                web::get().to(handlers::todo::has_todo_list),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/todo/{session_id}/exists",
+        web::get().to(handlers::todo::has_todo_list),
+    ))
     .await;
 
     let uri = format!("/api/v1/todo/{}/exists", session_id);

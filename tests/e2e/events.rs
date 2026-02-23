@@ -9,14 +9,10 @@ async fn test_events_endpoint_exists() {
     let state = crate::e2e::common::create_test_app().await;
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/events/{session_id}",
-                web::get().to(handlers::events::handler),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/events/{session_id}",
+        web::get().to(handlers::events::handler),
+    ))
     .await;
 
     let uri = format!("/api/v1/events/{}", session_id);
@@ -33,14 +29,10 @@ async fn test_events_content_type() {
     let state = crate::e2e::common::create_test_app().await;
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/events/{session_id}",
-                web::get().to(handlers::events::handler),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/events/{session_id}",
+        web::get().to(handlers::events::handler),
+    ))
     .await;
 
     let uri = format!("/api/v1/events/{}", session_id);
@@ -64,14 +56,10 @@ async fn test_events_content_type() {
 async fn test_events_with_different_sessions() {
     let state = crate::e2e::common::create_test_app().await;
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/events/{session_id}",
-                web::get().to(handlers::events::handler),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/events/{session_id}",
+        web::get().to(handlers::events::handler),
+    ))
     .await;
 
     // Test with multiple different session IDs

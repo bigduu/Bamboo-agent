@@ -9,14 +9,10 @@ async fn test_stop_endpoint_exists() {
     let state = crate::e2e::common::create_test_app().await;
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/stop/{session_id}",
-                web::post().to(handlers::stop::handler),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/stop/{session_id}",
+        web::post().to(handlers::stop::handler),
+    ))
     .await;
 
     let uri = format!("/api/v1/stop/{}", session_id);
@@ -33,14 +29,10 @@ async fn test_stop_nonexistent_session() {
     let state = crate::e2e::common::create_test_app().await;
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/stop/{session_id}",
-                web::post().to(handlers::stop::handler),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/stop/{session_id}",
+        web::post().to(handlers::stop::handler),
+    ))
     .await;
 
     let uri = format!("/api/v1/stop/{}", session_id);
@@ -56,14 +48,10 @@ async fn test_stop_nonexistent_session() {
 async fn test_stop_multiple_sessions() {
     let state = crate::e2e::common::create_test_app().await;
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/stop/{session_id}",
-                web::post().to(handlers::stop::handler),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/stop/{session_id}",
+        web::post().to(handlers::stop::handler),
+    ))
     .await;
 
     // Test stopping multiple sessions

@@ -11,26 +11,71 @@ fn create_api_scope() -> actix_web::Scope {
     web::scope("/api/v1")
         // Core chat and execution
         .route("/chat", web::post().to(handlers::chat::handler))
-        .route("/execute/{session_id}", web::post().to(handlers::execute::handler))
-        .route("/events/{session_id}", web::get().to(handlers::events::handler))
-        .route("/stop/{session_id}", web::post().to(handlers::stop::handler))
-        .route("/history/{session_id}", web::get().to(handlers::history::handler))
+        .route(
+            "/execute/{session_id}",
+            web::post().to(handlers::execute::handler),
+        )
+        .route(
+            "/events/{session_id}",
+            web::get().to(handlers::events::handler),
+        )
+        .route(
+            "/stop/{session_id}",
+            web::post().to(handlers::stop::handler),
+        )
+        .route(
+            "/history/{session_id}",
+            web::get().to(handlers::history::handler),
+        )
         // Todo endpoints
-        .route("/todo/{session_id}", web::get().to(handlers::todo::get_todo_list))
-        .route("/todo/{session_id}/exists", web::get().to(handlers::todo::has_todo_list))
+        .route(
+            "/todo/{session_id}",
+            web::get().to(handlers::todo::get_todo_list),
+        )
+        .route(
+            "/todo/{session_id}/exists",
+            web::get().to(handlers::todo::has_todo_list),
+        )
         // Respond endpoints
-        .route("/respond/{session_id}", web::post().to(handlers::respond::submit_response))
-        .route("/respond/{session_id}/pending", web::get().to(handlers::respond::get_pending_question))
+        .route(
+            "/respond/{session_id}",
+            web::post().to(handlers::respond::submit_response),
+        )
+        .route(
+            "/respond/{session_id}/pending",
+            web::get().to(handlers::respond::get_pending_question),
+        )
         // Session management
-        .route("/sessions/{session_id}", web::delete().to(handlers::delete::handler))
+        .route(
+            "/sessions/{session_id}",
+            web::delete().to(handlers::delete::handler),
+        )
         // Metrics endpoints
-        .route("/metrics/summary", web::get().to(handlers::metrics::summary))
-        .route("/metrics/by-model", web::get().to(handlers::metrics::by_model))
-        .route("/metrics/sessions", web::get().to(handlers::metrics::sessions))
-        .route("/metrics/sessions/{session_id}", web::get().to(handlers::metrics::session_detail))
+        .route(
+            "/metrics/summary",
+            web::get().to(handlers::metrics::summary),
+        )
+        .route(
+            "/metrics/by-model",
+            web::get().to(handlers::metrics::by_model),
+        )
+        .route(
+            "/metrics/sessions",
+            web::get().to(handlers::metrics::sessions),
+        )
+        .route(
+            "/metrics/sessions/{session_id}",
+            web::get().to(handlers::metrics::session_detail),
+        )
         .route("/metrics/daily", web::get().to(handlers::metrics::daily))
-        .route("/metrics/v2/summary", web::get().to(handlers::metrics::v2_unified_summary))
-        .route("/metrics/v2/timeline", web::get().to(handlers::metrics::v2_unified_timeline))
+        .route(
+            "/metrics/v2/summary",
+            web::get().to(handlers::metrics::v2_unified_summary),
+        )
+        .route(
+            "/metrics/v2/timeline",
+            web::get().to(handlers::metrics::v2_unified_timeline),
+        )
         // Health check
         .route("/health", web::get().to(handlers::health::handler))
         // MCP routes
@@ -40,11 +85,26 @@ fn create_api_scope() -> actix_web::Scope {
                 .route("/servers", web::post().to(handlers::mcp::add_server))
                 .route("/servers/{id}", web::get().to(handlers::mcp::get_server))
                 .route("/servers/{id}", web::put().to(handlers::mcp::update_server))
-                .route("/servers/{id}", web::delete().to(handlers::mcp::delete_server))
-                .route("/servers/{id}/connect", web::post().to(handlers::mcp::connect_server))
-                .route("/servers/{id}/disconnect", web::post().to(handlers::mcp::disconnect_server))
-                .route("/servers/{id}/refresh", web::post().to(handlers::mcp::refresh_tools))
-                .route("/servers/{id}/tools", web::get().to(handlers::mcp::get_server_tools))
+                .route(
+                    "/servers/{id}",
+                    web::delete().to(handlers::mcp::delete_server),
+                )
+                .route(
+                    "/servers/{id}/connect",
+                    web::post().to(handlers::mcp::connect_server),
+                )
+                .route(
+                    "/servers/{id}/disconnect",
+                    web::post().to(handlers::mcp::disconnect_server),
+                )
+                .route(
+                    "/servers/{id}/refresh",
+                    web::post().to(handlers::mcp::refresh_tools),
+                )
+                .route(
+                    "/servers/{id}/tools",
+                    web::get().to(handlers::mcp::get_server_tools),
+                )
                 .route("/tools", web::get().to(handlers::mcp::list_tools)),
         )
 }
@@ -53,17 +113,10 @@ fn create_api_scope() -> actix_web::Scope {
 async fn test_full_api_routing() {
     let state = crate::e2e::common::create_test_app().await;
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .service(create_api_scope()),
-    )
-    .await;
+    let app = test::init_service(App::new().app_data(state).service(create_api_scope())).await;
 
     // Test health endpoint as basic connectivity check
-    let req = test::TestRequest::get()
-        .uri("/api/v1/health")
-        .to_request();
+    let req = test::TestRequest::get().uri("/api/v1/health").to_request();
 
     let resp = test::call_service(&app, req).await;
     assert!(resp.status().is_success());
@@ -73,12 +126,7 @@ async fn test_full_api_routing() {
 async fn test_all_endpoints_respond() {
     let state = crate::e2e::common::create_test_app().await;
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .service(create_api_scope()),
-    )
-    .await;
+    let app = test::init_service(App::new().app_data(state).service(create_api_scope())).await;
 
     let session_id = uuid::Uuid::new_v4().to_string();
 

@@ -13,7 +13,9 @@ pub struct TestApp {
 impl TestApp {
     /// Create a new test application instance
     pub async fn new() -> Self {
-        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir").keep();
+        let temp_dir = tempfile::tempdir()
+            .expect("Failed to create temp dir")
+            .keep();
 
         Self {
             port: 0, // Let OS assign a random port
@@ -25,7 +27,9 @@ impl TestApp {
 
 /// Create a test app with AppState
 pub async fn create_test_app() -> actix_web::web::Data<AppState> {
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir").keep();
+    let temp_dir = tempfile::tempdir()
+        .expect("Failed to create temp dir")
+        .keep();
 
     actix_web::web::Data::new(
         AppState::new_with_config(

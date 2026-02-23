@@ -29,7 +29,11 @@ async fn test_chat_endpoint_exists() {
     let resp = test::call_service(&app, req).await;
 
     // The endpoint should at least respond (even if with an error)
-    assert!(resp.status().is_client_error() || resp.status().is_server_error() || resp.status().is_success());
+    assert!(
+        resp.status().is_client_error()
+            || resp.status().is_server_error()
+            || resp.status().is_success()
+    );
 }
 
 #[actix_web::test]
@@ -43,9 +47,7 @@ async fn test_chat_requires_json_body() {
     )
     .await;
 
-    let req = test::TestRequest::post()
-        .uri("/api/v1/chat")
-        .to_request();
+    let req = test::TestRequest::post().uri("/api/v1/chat").to_request();
 
     let resp = test::call_service(&app, req).await;
 
@@ -77,5 +79,9 @@ async fn test_chat_accepts_session_id() {
     let resp = test::call_service(&app, req).await;
 
     // Endpoint should accept the request structure
-    assert!(resp.status().is_client_error() || resp.status().is_server_error() || resp.status().is_success());
+    assert!(
+        resp.status().is_client_error()
+            || resp.status().is_server_error()
+            || resp.status().is_success()
+    );
 }

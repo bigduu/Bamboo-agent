@@ -10,14 +10,10 @@ async fn test_submit_response_endpoint() {
     let state = crate::e2e::common::create_test_app().await;
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/respond/{session_id}",
-                web::post().to(handlers::respond::submit_response),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/respond/{session_id}",
+        web::post().to(handlers::respond::submit_response),
+    ))
     .await;
 
     let uri = format!("/api/v1/respond/{}", session_id);
@@ -39,14 +35,10 @@ async fn test_get_pending_question_endpoint() {
     let state = crate::e2e::common::create_test_app().await;
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/respond/{session_id}/pending",
-                web::get().to(handlers::respond::get_pending_question),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/respond/{session_id}/pending",
+        web::get().to(handlers::respond::get_pending_question),
+    ))
     .await;
 
     let uri = format!("/api/v1/respond/{}/pending", session_id);
@@ -63,20 +55,14 @@ async fn test_respond_with_empty_body() {
     let state = crate::e2e::common::create_test_app().await;
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/respond/{session_id}",
-                web::post().to(handlers::respond::submit_response),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/respond/{session_id}",
+        web::post().to(handlers::respond::submit_response),
+    ))
     .await;
 
     let uri = format!("/api/v1/respond/{}", session_id);
-    let req = test::TestRequest::post()
-        .uri(&uri)
-        .to_request();
+    let req = test::TestRequest::post().uri(&uri).to_request();
 
     let resp = test::call_service(&app, req).await;
 

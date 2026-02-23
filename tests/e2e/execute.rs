@@ -10,14 +10,10 @@ async fn test_execute_endpoint_exists() {
     let state = crate::e2e::common::create_test_app().await;
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/execute/{session_id}",
-                web::post().to(handlers::execute::handler),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/execute/{session_id}",
+        web::post().to(handlers::execute::handler),
+    ))
     .await;
 
     let uri = format!("/api/v1/execute/{}", session_id);
@@ -31,21 +27,21 @@ async fn test_execute_endpoint_exists() {
     let resp = test::call_service(&app, req).await;
 
     // Endpoint should respond
-    assert!(resp.status().is_client_error() || resp.status().is_server_error() || resp.status().is_success());
+    assert!(
+        resp.status().is_client_error()
+            || resp.status().is_server_error()
+            || resp.status().is_success()
+    );
 }
 
 #[actix_web::test]
 async fn test_execute_with_different_session_ids() {
     let state = crate::e2e::common::create_test_app().await;
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/execute/{session_id}",
-                web::post().to(handlers::execute::handler),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/execute/{session_id}",
+        web::post().to(handlers::execute::handler),
+    ))
     .await;
 
     // Test with multiple session IDs
@@ -61,7 +57,11 @@ async fn test_execute_with_different_session_ids() {
             .to_request();
 
         let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_client_error() || resp.status().is_server_error() || resp.status().is_success());
+        assert!(
+            resp.status().is_client_error()
+                || resp.status().is_server_error()
+                || resp.status().is_success()
+        );
     }
 }
 
@@ -70,14 +70,10 @@ async fn test_execute_accepts_message() {
     let state = crate::e2e::common::create_test_app().await;
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/execute/{session_id}",
-                web::post().to(handlers::execute::handler),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/execute/{session_id}",
+        web::post().to(handlers::execute::handler),
+    ))
     .await;
 
     let uri = format!("/api/v1/execute/{}", session_id);
@@ -89,5 +85,9 @@ async fn test_execute_accepts_message() {
         .to_request();
 
     let resp = test::call_service(&app, req).await;
-    assert!(resp.status().is_client_error() || resp.status().is_server_error() || resp.status().is_success());
+    assert!(
+        resp.status().is_client_error()
+            || resp.status().is_server_error()
+            || resp.status().is_success()
+    );
 }

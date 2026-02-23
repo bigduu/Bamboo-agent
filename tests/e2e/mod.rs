@@ -3,18 +3,18 @@
 //! This module contains comprehensive end-to-end tests for all HTTP endpoints
 //! exposed by the Bamboo Agent server.
 
-mod common;
 mod chat;
-mod execute;
-mod events;
-mod stream;
-mod history;
-mod todo;
-mod respond;
-mod stop;
+mod common;
 mod delete;
+mod events;
+mod execute;
+mod health;
+mod history;
+mod integration_tests;
+mod mcp;
 mod metrics;
 mod metrics_forward;
-mod health;
-mod mcp;
-mod integration_tests;
+mod respond;
+mod stop;
+mod stream;
+mod todo;

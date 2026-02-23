@@ -8,14 +8,10 @@ use bamboo_agent::agent::server::state::AppState;
 async fn test_metrics_forward_summary_endpoint() {
     let state = crate::e2e::common::create_test_app().await;
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/metrics/forward/summary",
-                web::get().to(handlers::metrics::forward_summary),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/metrics/forward/summary",
+        web::get().to(handlers::metrics::forward_summary),
+    ))
     .await;
 
     let req = test::TestRequest::get()
@@ -31,14 +27,10 @@ async fn test_metrics_forward_summary_endpoint() {
 async fn test_metrics_forward_by_endpoint() {
     let state = crate::e2e::common::create_test_app().await;
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/metrics/forward/by-endpoint",
-                web::get().to(handlers::metrics::forward_by_endpoint),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/metrics/forward/by-endpoint",
+        web::get().to(handlers::metrics::forward_by_endpoint),
+    ))
     .await;
 
     let req = test::TestRequest::get()
@@ -54,14 +46,10 @@ async fn test_metrics_forward_by_endpoint() {
 async fn test_metrics_forward_requests() {
     let state = crate::e2e::common::create_test_app().await;
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .route(
-                "/api/v1/metrics/forward/requests",
-                web::get().to(handlers::metrics::forward_requests),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/metrics/forward/requests",
+        web::get().to(handlers::metrics::forward_requests),
+    ))
     .await;
 
     let req = test::TestRequest::get()

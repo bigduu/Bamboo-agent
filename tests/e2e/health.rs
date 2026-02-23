@@ -15,9 +15,7 @@ async fn test_health_endpoint() {
     )
     .await;
 
-    let req = test::TestRequest::get()
-        .uri("/api/v1/health")
-        .to_request();
+    let req = test::TestRequest::get().uri("/api/v1/health").to_request();
 
     let resp = test::call_service(&app, req).await;
 
@@ -35,9 +33,7 @@ async fn test_health_returns_ok() {
     )
     .await;
 
-    let req = test::TestRequest::get()
-        .uri("/api/v1/health")
-        .to_request();
+    let req = test::TestRequest::get().uri("/api/v1/health").to_request();
 
     let resp = test::call_service(&app, req).await;
     let body = test::read_body(resp).await;
