@@ -47,7 +47,7 @@ jobs:
           echo '<meta http-equiv="refresh" content="0;url=bamboo_agent/index.html">' > target/doc/index.html
 
       - name: Upload documentation artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: documentation
           path: target/doc
@@ -66,7 +66,7 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Download documentation artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: documentation
           path: doc
