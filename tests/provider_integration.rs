@@ -4,7 +4,7 @@
 
 #[cfg(test)]
 mod tests {
-    use bamboo::agent::llm::*;
+    use bamboo_agent::agent::llm::*;
 
     #[test]
     fn test_provider_types_exist() {
@@ -22,20 +22,20 @@ mod tests {
 
     #[test]
     fn test_message_conversion() {
-        use bamboo::agent::Message;
-        use bamboo::agent::llm::protocol::{OpenAIProtocol, ToProvider};
+        use bamboo_agent::agent::Message;
+        use bamboo_agent::agent::llm::protocol::{OpenAIProtocol, ToProvider};
 
         let msg = Message::user("Test message".to_string());
 
         // Test that we can convert messages to OpenAI format
         // In practice, this would require the full protocol implementation
-        assert_eq!(msg.role, bamboo::agent::Role::User);
+        assert_eq!(msg.role, bamboo_agent::agent::Role::User);
         assert!(!msg.content.is_empty());
     }
 
     #[test]
     fn test_llm_chunk_types() {
-        use bamboo::agent::llm::types::LLMChunk;
+        use bamboo_agent::agent::llm::types::LLMChunk;
 
         // Test token chunk
         let token_chunk = LLMChunk::Token("Hello".to_string());
@@ -62,8 +62,8 @@ mod tests {
 
     #[test]
     fn test_tool_schema_creation() {
-        use bamboo::agent::core::ToolSchema;
-        use bamboo::agent::core::tools::FunctionSchema;
+        use bamboo_agent::agent::core::ToolSchema;
+        use bamboo_agent::agent::core::tools::FunctionSchema;
         use serde_json::json;
 
         let tool = ToolSchema {
@@ -96,7 +96,7 @@ mod tests {
     #[test]
     fn test_available_providers() {
         // Verify that AVAILABLE_PROVIDERS is accessible
-        let providers = bamboo::agent::llm::AVAILABLE_PROVIDERS;
+        let providers = bamboo_agent::agent::llm::AVAILABLE_PROVIDERS;
 
         // Should include at least these providers
         assert!(providers.contains(&"openai"));
@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn test_protocol_enums() {
-        use bamboo::agent::llm::protocol::{AnthropicProtocol, GeminiProtocol, OpenAIProtocol};
+        use bamboo_agent::agent::llm::protocol::{AnthropicProtocol, GeminiProtocol, OpenAIProtocol};
 
         // Test that protocol types exist and can be referenced
         // This verifies the module structure
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_llm_error_types() {
-        use bamboo::agent::llm::LLMError;
+        use bamboo_agent::agent::llm::LLMError;
 
         // Test error variants - using proper construction methods
         let api_error = LLMError::Api("Rate limit exceeded".to_string());

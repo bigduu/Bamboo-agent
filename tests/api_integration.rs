@@ -4,8 +4,8 @@
 
 #[cfg(test)]
 mod tests {
-    use bamboo::web_service::server::AppState;
-    use bamboo::web_service::controllers::*;
+    use bamboo_agent::web_service::server::AppState;
+    use bamboo_agent::web_service::controllers::*;
 
     // Note: These are placeholder tests that verify the module structure
     // Full integration tests would require starting the server and making HTTP requests
@@ -22,8 +22,8 @@ mod tests {
         // Test that we can create app state with test configuration
         use std::sync::Arc;
         use tokio::sync::RwLock;
-        use bamboo::agent::llm::LLMProvider;
-        use bamboo::core::Config;
+        use bamboo_agent::agent::llm::LLMProvider;
+        use bamboo_agent::core::Config;
         use std::path::PathBuf;
 
         // Note: This is a simplified test
@@ -37,8 +37,8 @@ mod tests {
 
     #[test]
     fn test_tool_schema_structure() {
-        use bamboo::agent::core::ToolSchema;
-        use bamboo::agent::core::tools::FunctionSchema;
+        use bamboo_agent::agent::core::ToolSchema;
+        use bamboo_agent::agent::core::tools::FunctionSchema;
         use serde_json::json;
 
         let schema = ToolSchema {
@@ -65,21 +65,21 @@ mod tests {
 
     #[test]
     fn test_message_creation() {
-        use bamboo::agent::Message;
+        use bamboo_agent::agent::Message;
 
         let user_msg = Message::user("Hello".to_string());
-        assert_eq!(user_msg.role, bamboo::agent::Role::User);
+        assert_eq!(user_msg.role, bamboo_agent::agent::Role::User);
 
         let assistant_msg = Message::assistant("Hi there".to_string(), None);
-        assert_eq!(assistant_msg.role, bamboo::agent::Role::Assistant);
+        assert_eq!(assistant_msg.role, bamboo_agent::agent::Role::Assistant);
 
         let system_msg = Message::system("You are helpful".to_string());
-        assert_eq!(system_msg.role, bamboo::agent::Role::System);
+        assert_eq!(system_msg.role, bamboo_agent::agent::Role::System);
     }
 
     #[test]
     fn test_session_creation() {
-        use bamboo::agent::Session;
+        use bamboo_agent::agent::Session;
 
         let session = Session::new("test-session-id", "gpt-4");
         assert_eq!(session.id, "test-session-id");
@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_workflow_operations() {
-        use bamboo::commands::workflows::{save_workflow, delete_workflow};
+        use bamboo_agent::commands::workflows::{save_workflow, delete_workflow};
 
         // These would need to be async in practice
         // This is just verifying the module structure
@@ -98,8 +98,8 @@ mod tests {
 
     #[test]
     fn test_keyword_masking_config() {
-        use bamboo::core::keyword_masking::KeywordMaskingConfig;
-        use bamboo::commands::keyword_masking::load_keyword_masking_config;
+        use bamboo_agent::core::keyword_masking::KeywordMaskingConfig;
+        use bamboo_agent::commands::keyword_masking::load_keyword_masking_config;
         use std::path::Path;
 
         let temp_dir = tempfile::TempDir::new().unwrap();

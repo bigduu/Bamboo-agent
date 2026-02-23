@@ -4,7 +4,7 @@
 
 #[cfg(test)]
 mod tests {
-    use bamboo::commands::slash_commands::SlashCommand;
+    use bamboo_agent::commands::slash_commands::SlashCommand;
 
     #[test]
     fn test_slash_command_structure() {
@@ -102,12 +102,12 @@ Just a simple command without frontmatter.
 
     #[test]
     fn test_keyword_masking() {
-        use bamboo::core::keyword_masking::{
+        use bamboo_agent::core::keyword_masking::{
             KeywordMaskingConfig,
             KeywordEntry,
             MatchType,
         };
-        use bamboo::commands::keyword_masking::load_keyword_masking_config;
+        use bamboo_agent::commands::keyword_masking::load_keyword_masking_config;
         use std::path::Path;
 
         // Test default config

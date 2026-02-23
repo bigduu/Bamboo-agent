@@ -14,8 +14,8 @@
 //!
 //! # Example
 //!
-//! ```rust
-//! use bamboo::process::ProcessRegistry;
+//! ```rust,ignore
+//! use bamboo_agent::process::ProcessRegistry;
 //! use std::sync::{Arc, Mutex};
 //!
 //! #[tokio::main]

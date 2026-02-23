@@ -2,7 +2,7 @@
 //!
 //! Tests for server startup, configuration, and basic functionality.
 
-use bamboo::{BambooConfig, BambooServer};
+use bamboo_agent::{BambooConfig, BambooServer};
 
 #[cfg(test)]
 mod tests {
@@ -19,7 +19,7 @@ mod tests {
     #[test]
     fn test_bamboo_config_custom_port() {
         let config = BambooConfig {
-            server: bamboo::ServerConfig {
+            server: bamboo_agent::ServerConfig {
                 port: 9090,
                 bind: "127.0.0.1".to_string(),
                 static_dir: None,
@@ -42,7 +42,7 @@ mod tests {
     #[test]
     fn test_bamboo_server_addr() {
         let config = BambooConfig {
-            server: bamboo::ServerConfig {
+            server: bamboo_agent::ServerConfig {
                 port: 8080,
                 bind: "127.0.0.1".to_string(),
                 static_dir: None,
@@ -58,7 +58,7 @@ mod tests {
 
     #[test]
     fn test_xdg_paths() {
-        use bamboo::config::xdg_paths::*;
+        use bamboo_agent::config::xdg_paths::*;
 
         let config_home = xdg_config_home();
         assert!(config_home.to_string_lossy().contains(".config"));
@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn test_bamboo_builder() {
-        use bamboo::BambooBuilder;
+        use bamboo_agent::BambooBuilder;
         use std::path::PathBuf;
 
         let server = BambooBuilder::new()

@@ -3,7 +3,7 @@
 //! Standalone HTTP server for Bamboo
 
 use clap::{Parser, Subcommand};
-use bamboo::{BambooBuilder, BambooConfig};
+use bamboo_agent::{BambooBuilder, BambooConfig};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -89,7 +89,7 @@ async fn main() {
 
         Commands::Config { path } => {
             if path {
-                println!("{}", bamboo::config::bamboo_config_file().display());
+                println!("{}", bamboo_agent::config::bamboo_config_file().display());
             } else {
                 match BambooConfig::load() {
                     Ok(config) => {
