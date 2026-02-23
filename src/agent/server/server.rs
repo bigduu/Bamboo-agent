@@ -4,7 +4,7 @@ use std::io;
 use std::path::PathBuf;
 use std::thread;
 
-use crate::handlers;
+use crate::agent::server::handlers;
 use crate::agent::server::state::AppState;
 
 #[allow(dead_code)]

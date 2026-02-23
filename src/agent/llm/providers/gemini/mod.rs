@@ -105,7 +105,7 @@ impl LLMProvider for GeminiProvider {
         // Parse SSE stream with Gemini-specific parser
         let mut state = GeminiStreamState::default();
 
-        let stream = crate::providers::common::sse::llm_stream_from_sse(response, move |event, data| {
+        let stream = crate::agent::llm::providers::common::sse::llm_stream_from_sse(response, move |event, data| {
             parse_gemini_sse_event(&mut state, event, data)
         });
 

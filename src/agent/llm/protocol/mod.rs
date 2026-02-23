@@ -51,16 +51,16 @@ pub trait ToProviderBatch<T>: Sized {
 
 // Implement batch conversion for specific types
 
-impl FromProviderBatch<crate::api::models::ChatMessage> for Message {
-    fn from_provider_batch(values: Vec<crate::api::models::ChatMessage>) -> ProtocolResult<Vec<Self>> {
+impl FromProviderBatch<crate::agent::llm::api::models::ChatMessage> for Message {
+    fn from_provider_batch(values: Vec<crate::agent::llm::api::models::ChatMessage>) -> ProtocolResult<Vec<Self>> {
         values.into_iter()
             .map(Self::from_provider)
             .collect()
     }
 }
 
-impl ToProviderBatch<crate::api::models::ChatMessage> for Vec<Message> {
-    fn to_provider_batch(&self) -> ProtocolResult<Vec<crate::api::models::ChatMessage>> {
+impl ToProviderBatch<crate::agent::llm::api::models::ChatMessage> for Vec<Message> {
+    fn to_provider_batch(&self) -> ProtocolResult<Vec<crate::agent::llm::api::models::ChatMessage>> {
         self.iter()
             .map(|msg| msg.to_provider())
             .collect()

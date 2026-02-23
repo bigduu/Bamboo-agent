@@ -111,7 +111,7 @@ impl ToProvider<OpenAIToolCall> for ToolCall {
         Ok(OpenAIToolCall {
             id: self.id.clone(),
             tool_type: self.tool_type.clone(),
-            function: crate::api::models::FunctionCall {
+            function: crate::agent::llm::api::models::FunctionCall {
                 name: self.function.name.clone(),
                 arguments: self.function.arguments.clone(),
             },
@@ -123,7 +123,7 @@ impl ToProvider<Tool> for ToolSchema {
     fn to_provider(&self) -> ProtocolResult<Tool> {
         Ok(Tool {
             tool_type: self.schema_type.clone(),
-            function: crate::api::models::FunctionDefinition {
+            function: crate::agent::llm::api::models::FunctionDefinition {
                 name: self.function.name.clone(),
                 description: Some(self.function.description.clone()),
                 parameters: self.function.parameters.clone(),
@@ -289,7 +289,7 @@ mod tests {
     fn test_tool_schema_conversion() {
         let openai_tool = Tool {
             tool_type: "function".to_string(),
-            function: crate::api::models::FunctionDefinition {
+            function: crate::agent::llm::api::models::FunctionDefinition {
                 name: "search".to_string(),
                 description: Some("Search the web".to_string()),
                 parameters: serde_json::json!({

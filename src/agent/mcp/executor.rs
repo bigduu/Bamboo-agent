@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn test_format_result_resource_with_text() {
         let content = vec![McpContentItem::Resource {
-            resource: crate::types::McpResource {
+            resource: crate::agent::mcp::types::McpResource {
                 uri: "file:///test.txt".to_string(),
                 mime_type: Some("text/plain".to_string()),
                 text: Some("File content".to_string()),
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn test_format_result_resource_without_text() {
         let content = vec![McpContentItem::Resource {
-            resource: crate::types::McpResource {
+            resource: crate::agent::mcp::types::McpResource {
                 uri: "file:///test.bin".to_string(),
                 mime_type: None,
                 text: None,

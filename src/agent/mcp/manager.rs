@@ -243,7 +243,7 @@ impl McpServerManager {
         server_id: &str,
         tool_name: &str,
         args: serde_json::Value,
-    ) -> Result<crate::types::McpCallResult> {
+    ) -> Result<crate::agent::mcp::types::McpCallResult> {
         let runtime = self
             .runtimes
             .get(server_id)

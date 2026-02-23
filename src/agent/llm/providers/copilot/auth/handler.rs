@@ -1,4 +1,4 @@
-use crate::error::ProxyAuthRequiredError;
+use crate::agent::llm::ProxyAuthRequiredError;
 use anyhow::anyhow;
 use lazy_static::lazy_static;
 use log::error;

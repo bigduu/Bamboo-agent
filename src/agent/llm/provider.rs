@@ -23,7 +23,7 @@ pub enum LLMError {
     Auth(String),
 
     #[error("Protocol conversion error: {0}")]
-    Protocol(#[from] crate::protocol::ProtocolError),
+    Protocol(#[from] crate::agent::llm::protocol::ProtocolError),
 }
 
 pub type Result<T> = std::result::Result<T, LLMError>;

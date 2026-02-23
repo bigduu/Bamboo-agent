@@ -349,7 +349,7 @@ mod tests {
 
         // Verify data was written
         let summary = storage
-            .summary(crate::types::MetricsDateFilter::default())
+            .summary(crate::agent::mcp::types::MetricsDateFilter::default())
             .await
             .expect("get summary");
         assert_eq!(summary.total_sessions, 1);
@@ -394,7 +394,7 @@ mod tests {
 
         // Verify data was written
         let summary = storage
-            .forward_summary(crate::types::ForwardMetricsFilter::default())
+            .forward_summary(crate::agent::mcp::types::ForwardMetricsFilter::default())
             .await
             .expect("get forward summary");
         assert_eq!(summary.total_requests, 1);

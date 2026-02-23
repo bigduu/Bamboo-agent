@@ -63,7 +63,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         .as_deref()
         .map(str::trim)
         .filter(|prompt| !prompt.is_empty())
-        .unwrap_or(crate::state::DEFAULT_BASE_PROMPT);
+        .unwrap_or(crate::agent::server::state::DEFAULT_BASE_PROMPT);
     let enhance_prompt = req
         .enhance_prompt
         .as_deref()
@@ -132,7 +132,7 @@ fn build_enhanced_system_prompt(
         merged_prompt.push_str("\n\nWorkspace path: ");
         merged_prompt.push_str(workspace_path);
         merged_prompt.push('\n');
-        merged_prompt.push_str(crate::state::WORKSPACE_PROMPT_GUIDANCE);
+        merged_prompt.push_str(crate::agent::server::state::WORKSPACE_PROMPT_GUIDANCE);
     }
 
     merged_prompt

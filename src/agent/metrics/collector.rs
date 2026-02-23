@@ -5,7 +5,7 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::mpsc;
 
 use crate::agent::metrics::storage::{MetricsStorage, ToolCallCompletion};
-use crate::agent::metrics::types::{RoundStatus, SessionStatus, TokenUsage};
+use crate::agent::metrics::types::{ForwardStatus, RoundStatus, SessionStatus, TokenUsage};
 
 #[derive(Debug)]
 enum CollectorCommand {
@@ -59,7 +59,7 @@ enum CollectorCommand {
         forward_id: String,
         completed_at: DateTime<Utc>,
         status_code: Option<u16>,
-        status: crate::types::ForwardStatus,
+        status: crate::agent::metrics::types::ForwardStatus,
         usage: Option<TokenUsage>,
         error: Option<String>,
     },
@@ -334,7 +334,7 @@ impl MetricsCollector {
         forward_id: impl Into<String>,
         completed_at: DateTime<Utc>,
         status_code: Option<u16>,
-        status: crate::types::ForwardStatus,
+        status: crate::agent::metrics::types::ForwardStatus,
         usage: Option<TokenUsage>,
         error: Option<String>,
     ) {

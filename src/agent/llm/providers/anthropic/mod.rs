@@ -114,7 +114,7 @@ impl LLMProvider for AnthropicProvider {
         // Use shared SSE adapter with Anthropic-specific parser
         let mut state = AnthropicStreamState::default();
 
-        let stream = crate::providers::common::sse::llm_stream_from_sse(response, move |event, data| {
+        let stream = crate::agent::llm::providers::common::sse::llm_stream_from_sse(response, move |event, data| {
             parse_anthropic_sse_event(&mut state, event, data)
         });
 

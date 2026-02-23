@@ -89,7 +89,7 @@ Remember: You are NOT executing the task. You are only evaluating if existing wo
 
 /// 格式化最近的 tool 调用（用于 context）
 fn format_recent_tools(ctx: &TodoLoopContext, limit: usize) -> String {
-    let mut all_calls: Vec<(String, &crate::todo_context::ToolCallRecord)> = Vec::new();
+    let mut all_calls: Vec<(String, &crate::agent::loop_module::todo_context::ToolCallRecord)> = Vec::new();
 
     for item in &ctx.items {
         for call in &item.tool_calls {
@@ -296,13 +296,13 @@ mod tests {
             description: "Fix bug in authentication".to_string(),
             status: TodoItemStatus::InProgress,
             tool_calls: vec![
-                crate::todo_context::ToolCallRecord {
+                crate::agent::loop_module::todo_context::ToolCallRecord {
                     round: 0,
                     tool_name: "read_file".to_string(),
                     success: true,
                     timestamp: Utc::now(),
                 },
-                crate::todo_context::ToolCallRecord {
+                crate::agent::loop_module::todo_context::ToolCallRecord {
                     round: 1,
                     tool_name: "write_file".to_string(),
                     success: true,

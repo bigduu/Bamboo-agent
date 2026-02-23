@@ -160,7 +160,7 @@ pub struct McpToolCallRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpToolCallResult {
-    pub content: Vec<crate::types::McpContentItem>,
+    pub content: Vec<crate::agent::mcp::types::McpContentItem>,
     #[serde(default)]
     pub is_error: bool,
 }

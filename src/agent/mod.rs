@@ -29,12 +29,12 @@ pub use core::{
 
 // Re-export commonly used types from llm
 pub use llm::{
-    LLMProvider, LLMProviderBuilder, StreamResponse,
+    LLMProvider,
 };
 
 // Re-export commonly used types from loop_module
 pub use loop_module::{
-    AgentLoop, AgentLoopConfig, LoopEvent,
+    AgentLoopConfig,
 };
 
 // Re-export commonly used types from tools

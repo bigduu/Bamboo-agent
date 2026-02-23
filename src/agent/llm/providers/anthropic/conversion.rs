@@ -136,7 +136,7 @@ pub fn convert_messages_request(
                 .into_iter()
                 .map(|tool| Tool {
                     tool_type: "function".to_string(),
-                    function: crate::api::models::FunctionDefinition {
+                    function: crate::agent::llm::api::models::FunctionDefinition {
                         name: tool.name,
                         description: tool.description,
                         parameters: tool.input_schema,
@@ -404,7 +404,7 @@ fn map_tool_choice(choice: AnthropicToolChoice) -> Result<ToolChoice, AnthropicC
             }
             Ok(ToolChoice::Object {
                 tool_type: "function".to_string(),
-                function: crate::api::models::FunctionChoice { name },
+                function: crate::agent::llm::api::models::FunctionChoice { name },
             })
         }
     }
