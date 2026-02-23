@@ -551,7 +551,7 @@ mod retry_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
 
-    use http;
+    // use http; // TODO: add http crate if needed
     use reqwest::Method;
     use reqwest_middleware::{ClientBuilder, Middleware, Next, Result as MiddlewareResult};
     use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};

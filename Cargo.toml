@@ -93,6 +93,7 @@ tempfile = "3"
 wiremock = "0.6"
 tokio-test = "0.4"
 mockall = "0.13"
+http = "1"
 
 [profile.release]
 opt-level = 3

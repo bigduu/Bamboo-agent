@@ -431,7 +431,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_executor_with_permission_checker_enforces_checks() {
-        let checker = Arc::new(crate::permission::DenyDangerousPermissionChecker);
+        let checker = Arc::new(crate::agent::tools::permission::DenyDangerousPermissionChecker);
         let executor = make_executor(Some(checker));
         let path = "/tmp/executor_permission_denied.txt";
         let _ = fs::remove_file(path).await;

@@ -85,7 +85,7 @@ mod tests {
         let (bus, mut rx) = MetricsBus::new(10);
 
         let event = MetricsEvent::Chat(ChatEvent::SessionStarted {
-            meta: crate::events::EventMeta::new(),
+            meta: crate::agent::metrics::events::EventMeta::new(),
             session_id: "test".to_string(),
             model: "gpt-4".to_string(),
         });
@@ -111,7 +111,7 @@ mod tests {
 
         // Fill the channel
         let event1 = MetricsEvent::Chat(ChatEvent::SessionStarted {
-            meta: crate::events::EventMeta::new(),
+            meta: crate::agent::metrics::events::EventMeta::new(),
             session_id: "1".to_string(),
             model: "gpt-4".to_string(),
         });
@@ -119,7 +119,7 @@ mod tests {
 
         // This should be dropped
         let event2 = MetricsEvent::Chat(ChatEvent::SessionStarted {
-            meta: crate::events::EventMeta::new(),
+            meta: crate::agent::metrics::events::EventMeta::new(),
             session_id: "2".to_string(),
             model: "gpt-4".to_string(),
         });
@@ -138,7 +138,7 @@ mod tests {
 
         // Emit through bus1
         let event = MetricsEvent::Chat(ChatEvent::SessionStarted {
-            meta: crate::events::EventMeta::new(),
+            meta: crate::agent::metrics::events::EventMeta::new(),
             session_id: "1".to_string(),
             model: "gpt-4".to_string(),
         });

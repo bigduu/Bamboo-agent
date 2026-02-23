@@ -46,7 +46,7 @@ where
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use http;
+    // use http; // TODO: add http crate if needed
 
     #[tokio::test]
     async fn llm_stream_from_sse_filters_none_and_passes_event_name_and_data() {

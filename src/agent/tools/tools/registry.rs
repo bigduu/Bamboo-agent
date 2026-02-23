@@ -153,7 +153,7 @@ mod tests {
             "in production"
         }
 
-        fn examples(&self) -> Vec<crate::guide::ToolExample> {
+        fn examples(&self) -> Vec<crate::agent::tools::guide::ToolExample> {
             vec![]
         }
 
@@ -161,8 +161,8 @@ mod tests {
             vec![]
         }
 
-        fn category(&self) -> crate::guide::ToolCategory {
-            crate::guide::ToolCategory::FileReading
+        fn category(&self) -> crate::agent::tools::guide::ToolCategory {
+            crate::agent::tools::guide::ToolCategory::FileReading
         }
     }
 

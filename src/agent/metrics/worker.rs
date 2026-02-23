@@ -303,7 +303,7 @@ mod tests {
         let db_path = dir.path().join("metrics.db");
         // Keep temp dir alive for the test
         std::mem::forget(dir);
-        let storage = Arc::new(crate::storage::SqliteMetricsStorage::new(&db_path));
+        let storage = Arc::new(crate::agent::metrics::storage::SqliteMetricsStorage::new(&db_path));
         storage.init().await.expect("init storage");
         (storage, db_path)
     }
@@ -349,7 +349,7 @@ mod tests {
 
         // Verify data was written
         let summary = storage
-            .summary(crate::agent::mcp::types::MetricsDateFilter::default())
+            .summary(crate::agent::metrics::types::MetricsDateFilter::default())
             .await
             .expect("get summary");
         assert_eq!(summary.total_sessions, 1);
@@ -394,7 +394,7 @@ mod tests {
 
         // Verify data was written
         let summary = storage
-            .forward_summary(crate::agent::mcp::types::ForwardMetricsFilter::default())
+            .forward_summary(crate::agent::metrics::types::ForwardMetricsFilter::default())
             .await
             .expect("get forward summary");
         assert_eq!(summary.total_requests, 1);
