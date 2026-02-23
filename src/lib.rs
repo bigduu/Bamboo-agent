@@ -46,6 +46,7 @@ pub mod core;
 pub mod agent;
 pub mod server;
 pub mod process;
+pub mod web_service;
 pub mod claude;
 pub mod commands;
 
