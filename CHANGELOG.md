@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-02-24
+
+### Added
+- **Auto-publish workflow** - Automatic version detection and crates.io publishing
+- **Comprehensive documentation structure** - Organized docs/ directory with guides
+- **CODE_OF_CONDUCT.md** - Contributor Covenant code of conduct
+- **SECURITY.md** - Security policy and vulnerability reporting guide
+- **Auto-publish guide** - Complete documentation for automated releases
+
+### Changed
+- **Documentation reorganization** - Moved development docs to archive, guides to dedicated folder
+- **Improved code quality** - Fixed all clippy warnings across the codebase
+- **Better path handling** - Changed `&PathBuf` to `&Path` for better idiomatic Rust
+
+### Fixed
+- **Windows compilation** - Fixed Windows-specific compilation errors
+  - Removed winapi dependency, using std library instead
+  - Platform-specific XDG_RUNTIME_DIR implementation
+- **CI/CD workflows** - Updated GitHub Actions to use latest artifact versions (v4)
+- **Code formatting** - Applied consistent formatting with cargo fmt
+- **Lint warnings** - Resolved all clippy warnings for strict `-D warnings` mode
+
+### Removed
+- **Unused src/main.rs** - Project uses src/bin/bamboo.rs as binary entry point
+
+### Security
+- No security changes in this release
+
 ## [0.1.0] - 2026-02-23
 
 ### Added
