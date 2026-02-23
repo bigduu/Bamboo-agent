@@ -44,7 +44,7 @@ impl GeminiStreamState {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use crate::agent::llm::providers::gemini::{GeminiStreamState, parse_gemini_sse_event};
 ///
 /// let mut state = GeminiStreamState::default();

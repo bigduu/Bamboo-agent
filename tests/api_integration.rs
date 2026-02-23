@@ -38,25 +38,29 @@ mod tests {
     #[test]
     fn test_tool_schema_structure() {
         use bamboo::agent::core::ToolSchema;
+        use bamboo::agent::core::tools::FunctionSchema;
         use serde_json::json;
 
         let schema = ToolSchema {
-            name: "test_tool".to_string(),
-            description: "A test tool for unit tests".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "input": {
-                        "type": "string",
-                        "description": "Test input"
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "test_tool".to_string(),
+                description: "A test tool for unit tests".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                            "description": "Test input"
+                        }
                     }
-                }
-            }),
+                }),
+            },
         };
 
-        assert_eq!(schema.name, "test_tool");
-        assert!(!schema.description.is_empty());
-        assert!(schema.parameters.is_object());
+        assert_eq!(schema.function.name, "test_tool");
+        assert!(!schema.function.description.is_empty());
+        assert!(schema.function.parameters.is_object());
     }
 
     #[test]
@@ -94,10 +98,8 @@ mod tests {
 
     #[test]
     fn test_keyword_masking_config() {
-        use bamboo::commands::keyword_masking::{
-            load_keyword_masking_config,
-            KeywordMaskingConfig,
-        };
+        use bamboo::core::keyword_masking::KeywordMaskingConfig;
+        use bamboo::commands::keyword_masking::load_keyword_masking_config;
         use std::path::Path;
 
         let temp_dir = tempfile::TempDir::new().unwrap();

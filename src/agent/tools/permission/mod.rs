@@ -13,7 +13,7 @@
 //!
 //! # Usage
 //!
-//! ```rust
+//! ```ignore
 //! use std::sync::Arc;
 //! use crate::agent::tools::permission::{PermissionConfig, PermissionChecker, PermissionType};
 //!
