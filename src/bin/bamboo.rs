@@ -59,8 +59,8 @@ async fn main() {
             port,
             bind,
             data_dir,
-            static_dir,
-            workers,
+            static_dir: _,
+            workers: _,
         } => {
             let mut builder = BambooBuilder::new().port(port).bind(&bind);
 

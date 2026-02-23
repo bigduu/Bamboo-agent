@@ -120,7 +120,7 @@ pub async fn generate_content(
     // Add tool calls as function_call parts
     if let Some(calls) = tool_calls {
         // Remove empty text part if we have tool calls and no text
-        if parts[0].text.as_ref().map_or(true, |t| t.is_empty()) {
+        if parts[0].text.as_ref().is_none_or(|t| t.is_empty()) {
             parts.clear();
         }
 

@@ -6,7 +6,7 @@ mod command;
 mod discovery;
 mod version;
 
-use log::{error, info, warn};
+use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 

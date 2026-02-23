@@ -90,11 +90,10 @@ impl McpTransport for SseTransport {
                         if event.event == "endpoint" {
                             // Store the endpoint URL for POST requests
                             debug!("Got endpoint: {}", event.data);
-                        } else if event.event == "message" || event.event.is_empty() {
-                            if message_tx.send(event.data).await.is_err() {
+                        } else if (event.event == "message" || event.event.is_empty())
+                            && message_tx.send(event.data).await.is_err() {
                                 break;
                             }
-                        }
                     }
                     Err(e) => {
                         warn!("SSE stream error: {}", e);

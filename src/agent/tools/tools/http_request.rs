@@ -13,11 +13,12 @@
 
 use crate::agent::core::tools::{Tool, ToolError, ToolResult};
 use async_trait::async_trait;
-#[cfg(feature = "http")]
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::net::IpAddr;
+use std::time::Duration;
 
 /// HTTP method
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,7 +37,6 @@ pub enum HttpMethod {
 
 impl HttpMethod {
     /// Convert to reqwest method
-    #[cfg(feature = "http")]
     fn to_reqwest(&self) -> reqwest::Method {
         match self {
             HttpMethod::Get => reqwest::Method::GET,
@@ -88,7 +88,6 @@ fn default_max_size() -> usize {
 /// - Link-local addresses (169.254.0.0/16, fe80::/10)
 /// - IPv6 unique local addresses (fc00::/7)
 /// - AWS metadata endpoint (169.254.169.254)
-#[cfg(feature = "http")]
 fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => {
@@ -137,7 +136,6 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 /// This prevents SSRF attacks by blocking requests to internal network resources.
 /// Returns an error if the host is private or if DNS resolution fails in a way
 /// that might indicate an attack.
-#[cfg(feature = "http")]
 async fn validate_url_not_internal(parsed_url: &url::Url) -> Result<(), String> {
     let host = parsed_url.host_str().ok_or("URL has no host")?;
 
@@ -190,35 +188,26 @@ impl HttpRequestArgs {
 
 /// Tool for making HTTP requests
 pub struct HttpRequestTool {
-    #[cfg(feature = "http")]
+    
     client: reqwest::Client,
 }
 
 impl HttpRequestTool {
     /// Create a new HTTP request tool
     pub fn new() -> Self {
-        #[cfg(feature = "http")]
-        {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .user_agent("Bamboo-Agent-Tools/0.1.0")
-                // Disable automatic redirects to prevent bypassing domain whitelist checks
-                // If redirects are needed, the application should handle them explicitly
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("Failed to build HTTP client");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent("Bamboo-Agent-Tools/0.1.0")
+            // Disable automatic redirects to prevent bypassing domain whitelist checks
+            // If redirects are needed, the application should handle them explicitly
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("Failed to build HTTP client");
 
-            Self { client }
-        }
-
-        #[cfg(not(feature = "http"))]
-        {
-            Self {}
-        }
+        Self { client }
     }
 
     /// Execute an HTTP request
-    #[cfg(feature = "http")]
     pub async fn execute_request(&self, args: HttpRequestArgs) -> Result<HttpResponse, String> {
         // Validate URL using Url::parse for consistency with permission checking
         let url_str = args.url.trim();
@@ -322,12 +311,6 @@ impl HttpRequestTool {
             headers,
             body,
         })
-    }
-
-    /// Execute an HTTP request (stub when http feature is disabled)
-    #[cfg(not(feature = "http"))]
-    pub async fn execute_request(&self, _args: HttpRequestArgs) -> Result<HttpResponse, String> {
-        Err("HTTP support is not enabled. Enable the 'http' feature to use this tool.".to_string())
     }
 }
 
@@ -551,7 +534,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "http")]
+    
     async fn test_http_request_invalid_url() {
         let tool = HttpRequestTool::new();
         let result = tool
@@ -566,7 +549,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "http")]
+    
     async fn test_http_request_get() {
         let tool = HttpRequestTool::new();
         let result = tool
@@ -587,7 +570,7 @@ mod tests {
 
     // SSRF Protection Tests
     #[tokio::test]
-    #[cfg(feature = "http")]
+    
     async fn test_ssrf_private_ip_blocked() {
         let tool = HttpRequestTool::new();
 
@@ -617,7 +600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "http")]
+    
     async fn test_ssrf_loopback_blocked() {
         let tool = HttpRequestTool::new();
 
@@ -641,7 +624,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "http")]
+    
     async fn test_ssrf_aws_metadata_blocked() {
         let tool = HttpRequestTool::new();
 
@@ -657,7 +640,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "http")]
+    
     async fn test_ssrf_valid_external_allowed() {
         let tool = HttpRequestTool::new();
 
@@ -684,7 +667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "http")]
+    
     async fn test_ssrf_dns_to_private_blocked() {
         // Note: This test would require a controlled DNS environment
         // In practice, we'd need a mock DNS server or known test domain
