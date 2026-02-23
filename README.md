@@ -1,7 +1,7 @@
-# Bamboo 🎋
+# Bamboo Agent 🎋
 
-[![Crates.io](https://img.shields.io/crates/v/bamboo.svg)](https://crates.io/crates/bamboo)
-[![Documentation](https://docs.rs/bamboo/badge.svg)](https://docs.rs/bamboo)
+[![Crates.io](https://img.shields.io/crates/v/bamboo-agent.svg)](https://crates.io/crates/bamboo-agent)
+[![Documentation](https://docs.rs/bamboo-agent/badge.svg)](https://docs.rs/bamboo-agent)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/bigduu/Bamboo-agent/ci.yml?branch=main)](https://github.com/bigduu/Bamboo-agent/actions)
 [![Test Coverage](https://img.shields.io/badge/tests-806%20passing-brightgreen)](https://github.com/bigduu/Bamboo-agent)
@@ -28,7 +28,7 @@ Bamboo provides everything you need to build, deploy, and scale AI-powered appli
 ### From crates.io
 
 ```bash
-cargo install bamboo
+cargo install bamboo-agent
 ```
 
 ### From source
@@ -54,7 +54,7 @@ bamboo serve --port 9000 --bind 0.0.0.0 --data-dir /var/lib/bamboo
 ### Library Mode
 
 ```rust
-use bamboo::{BambooBuilder, BambooConfig};
+use bamboo_agent::{BambooBuilder, BambooConfig};
 
 #[tokio::main]
 async fn main() {

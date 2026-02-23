@@ -1,28 +1,33 @@
 [package]
-name = "bamboo"
+name = "bamboo-agent"
 version = "0.1.0"
-edition = "2021"
-license = "MIT"
-authors = ["Bamboo Contributors <bamboo@example.com>"]
+edition = "2024"
+license = "Apache-2.0"
+authors = ["mugeng.du@gmail.com"]
 description = "A fully self-contained AI agent backend framework with built-in web services, multi-LLM provider support, and comprehensive tool execution"
 homepage = "https://github.com/bigduu/Bamboo-agent"
 repository = "https://github.com/bigduu/Bamboo-agent"
 documentation = "https://docs.rs/bamboo"
 readme = "README.md"
-keywords = ["ai", "agent", "llm", "automation", "assistant", "openai", "anthropic", "gemini", "copilot", "chatbot"]
-categories = ["development-tools", "api-bindings", "web-programming", "asynchronous"]
-exclude = [
-    "tests/*",
-    "docs/*",
-    "*.md",
-    ".github/*",
-    ".gitignore",
+keywords = [
+    "ai",
+    "agent",
+    "llm",
+    "automation",
+    "assistant",
+    "openai",
+    "anthropic",
+    "gemini",
+    "copilot",
+    "chatbot",
 ]
-include = [
-    "Cargo.toml",
-    "LICENSE",
-    "src/**/*",
+categories = [
+    "development-tools",
+    "api-bindings",
+    "web-programming",
+    "asynchronous",
 ]
+include = ["Cargo.toml", "LICENSE", "src/**/*"]
 
 [dependencies]
 # Async runtime

@@ -1,6 +1,6 @@
 # Migration Guide
 
-This guide helps you migrate from the old `agent-*` crates to the unified `bamboo` crate.
+This guide helps you migrate from the old `agent-*` crates to the unified `bamboo-agent` crate.
 
 ## Overview
 
@@ -35,7 +35,7 @@ web_service = { path = "../web_service" }
 **After:**
 ```toml
 [dependencies]
-bamboo = "0.1"
+bamboo-agent = "0.1"
 ```
 
 ### 2. Update Imports
