@@ -1,0 +1,182 @@
+use crate::agent::core::agent::{AgentEvent, Session};
+use std::path::{Path, PathBuf};
+use tokio::fs;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+#[derive(Debug, Clone)]
+pub struct JsonlStorage {
+    base_path: PathBuf,
+}
+
+impl JsonlStorage {
+    pub fn new(base_path: impl AsRef<Path>) -> Self {
+        Self {
+            base_path: base_path.as_ref().to_path_buf(),
+        }
+    }
+
+    pub async fn init(&self) -> std::io::Result<()> {
+        fs::create_dir_all(&self.base_path).await
+    }
+
+    pub async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+        let path = self.session_path(&session.id);
+        let json = serde_json::to_string(session)?;
+        fs::write(path, json).await
+    }
+
+    pub async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+        let path = self.session_path(session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(path).await?;
+        let session = serde_json::from_str(&content)?;
+        Ok(Some(session))
+    }
+
+    pub async fn append_event(&self, session_id: &str, event: &AgentEvent) -> std::io::Result<()> {
+        let path = self.events_path(session_id);
+        let json = serde_json::to_string(event)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        file.write_all(json.as_bytes()).await?;
+        file.write_all(b"\n").await?;
+        file.flush().await
+    }
+
+    pub async fn load_events(&self, session_id: &str) -> std::io::Result<Vec<AgentEvent>> {
+        let path = self.events_path(session_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let file = fs::File::open(path).await?;
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        let mut events = Vec::new();
+
+        while let Some(line) = lines.next_line().await? {
+            if let Ok(event) = serde_json::from_str(&line) {
+                events.push(event);
+            }
+        }
+
+        Ok(events)
+    }
+
+    pub async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
+        let session_path = self.session_path(session_id);
+        let events_path = self.events_path(session_id);
+        let mut deleted_any = false;
+
+        for path in [session_path, events_path] {
+            match fs::remove_file(&path).await {
+                Ok(()) => {
+                    deleted_any = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(deleted_any)
+    }
+
+    fn session_path(&self, session_id: &str) -> PathBuf {
+        self.base_path.join(format!("{}.json", session_id))
+    }
+
+    fn events_path(&self, session_id: &str) -> PathBuf {
+        self.base_path.join(format!("{}.jsonl", session_id))
+    }
+}
+
+#[async_trait::async_trait]
+pub trait Storage: Send + Sync {
+    async fn save_session(&self, session: &Session) -> std::io::Result<()>;
+    async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>>;
+    async fn append_event(&self, session_id: &str, event: &AgentEvent) -> std::io::Result<()>;
+    async fn load_events(&self, session_id: &str) -> std::io::Result<Vec<AgentEvent>>;
+    async fn delete_session(&self, session_id: &str) -> std::io::Result<bool>;
+}
+
+#[async_trait::async_trait]
+impl Storage for JsonlStorage {
+    async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+        JsonlStorage::save_session(self, session).await
+    }
+
+    async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+        JsonlStorage::load_session(self, session_id).await
+    }
+
+    async fn append_event(&self, session_id: &str, event: &AgentEvent) -> std::io::Result<()> {
+        JsonlStorage::append_event(self, session_id, event).await
+    }
+
+    async fn load_events(&self, session_id: &str) -> std::io::Result<Vec<AgentEvent>> {
+        JsonlStorage::load_events(self, session_id).await
+    }
+
+    async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
+        JsonlStorage::delete_session(self, session_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use uuid::Uuid;
+
+    async fn create_temp_storage() -> io::Result<(JsonlStorage, PathBuf)> {
+        let temp_dir = std::env::temp_dir().join(format!("jsonl-storage-test-{}", Uuid::new_v4()));
+        let storage = JsonlStorage::new(&temp_dir);
+        storage.init().await?;
+        Ok((storage, temp_dir))
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_metadata_and_events_files() -> io::Result<()> {
+        let (storage, temp_dir) = create_temp_storage().await?;
+        let session = Session::new("session-1", "test-model");
+
+        storage.save_session(&session).await?;
+        storage
+            .append_event(
+                &session.id,
+                &AgentEvent::Token {
+                    content: "token".to_string(),
+                },
+            )
+            .await?;
+
+        assert!(storage.session_path(&session.id).exists());
+        assert!(storage.events_path(&session.id).exists());
+
+        let deleted = storage.delete_session(&session.id).await?;
+
+        assert!(deleted);
+        assert!(!storage.session_path(&session.id).exists());
+        assert!(!storage.events_path(&session.id).exists());
+
+        fs::remove_dir_all(temp_dir).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_session_returns_false_when_files_do_not_exist() -> io::Result<()> {
+        let (storage, temp_dir) = create_temp_storage().await?;
+
+        let deleted = storage.delete_session("missing-session").await?;
+
+        assert!(!deleted);
+
+        fs::remove_dir_all(temp_dir).await?;
+        Ok(())
+    }
+}
