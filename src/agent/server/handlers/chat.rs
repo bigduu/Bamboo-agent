@@ -1,3 +1,7 @@
+//! Chat API handler for creating and managing agent conversations.
+//!
+//! This module provides the HTTP endpoint for initiating chat sessions with the AI agent.
+
 use crate::agent::core::{Role, Session};
 use actix_web::{web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
@@ -5,6 +9,28 @@ use uuid::Uuid;
 
 use crate::agent::server::state::AppState;
 
+/// Request payload for creating a new chat message.
+///
+/// # Fields
+///
+/// * `message` - The user's message content
+/// * `session_id` - Optional session ID. If not provided, a new UUID will be generated
+/// * `system_prompt` - Optional custom system prompt. If empty, uses the default
+/// * `enhance_prompt` - Optional additional prompt instructions appended to the system prompt
+/// * `workspace_path` - Optional workspace path to include in the system prompt
+/// * `model` - Required model identifier (e.g., "gpt-4o-mini", "claude-3-opus")
+///
+/// # Examples
+///
+/// ```json
+/// {
+///   "message": "Hello, how can I help?",
+///   "session_id": "optional-existing-session-id",
+///   "model": "gpt-4o-mini",
+///   "system_prompt": "You are a helpful assistant",
+///   "workspace_path": "/path/to/workspace"
+/// }
+/// ```
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub message: String,
@@ -18,13 +44,68 @@ pub struct ChatRequest {
     pub model: String,
 }
 
+/// Response returned after successfully creating a chat message.
+///
+/// # Fields
+///
+/// * `session_id` - The session identifier for subsequent API calls
+/// * `stream_url` - URL endpoint to stream agent events (SSE)
+/// * `status` - Current status of the chat session
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {
+    /// Unique session identifier for this conversation
     pub session_id: String,
+    /// SSE endpoint URL to receive real-time agent events
     pub stream_url: String,
+    /// Current session status (e.g., "streaming")
     pub status: String,
 }
 
+/// Create a new chat message or update an existing session.
+///
+/// This endpoint accepts a user message and creates or updates a chat session.
+/// After calling this endpoint, use the returned `stream_url` to execute
+/// the agent and receive events.
+///
+/// # HTTP Method
+///
+/// `POST /api/v1/chat`
+///
+/// # Request Body
+///
+/// JSON-encoded [`ChatRequest`]
+///
+/// # Response
+///
+/// - `201 Created` - Chat message created successfully, returns [`ChatResponse`]
+/// - `400 Bad Request` - Missing required `model` field
+/// - `500 Internal Server Error` - Failed to load or save session
+///
+/// # Workflow
+///
+/// 1. Validates that `model` is provided and non-empty
+/// 2. Loads existing session from memory or storage, or creates a new one
+/// 3. Builds system prompt from `base_prompt`, `enhance_prompt`, and `workspace_path`
+/// 4. Adds the user message to the session
+/// 5. Persists the session to storage
+/// 6. Returns session ID and stream URL for subsequent execution
+///
+/// # Example
+///
+/// ```bash
+/// curl -X POST http://localhost:8080/api/v1/chat \
+///   -H "Content-Type: application/json" \
+///   -d '{
+///     "message": "Help me write a function",
+///     "model": "gpt-4o-mini"
+///   }'
+/// ```
+///
+/// # Next Steps
+///
+/// After creating a chat message, call:
+/// - `POST /api/v1/execute/{session_id}` to start agent execution
+/// - `GET /api/v1/events/{session_id}` to subscribe to events
 pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) -> impl Responder {
     let session_id = req
         .session_id
