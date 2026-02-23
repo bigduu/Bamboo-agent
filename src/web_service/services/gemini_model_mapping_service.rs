@@ -39,10 +39,7 @@ pub async fn save_gemini_model_mapping(
 }
 
 /// Resolve a Gemini model name to the actual backend model
-pub async fn resolve_model(
-    data_dir: &Path,
-    gemini_model: &str,
-) -> anyhow::Result<ModelResolution> {
+pub async fn resolve_model(data_dir: &Path, gemini_model: &str) -> anyhow::Result<ModelResolution> {
     let mapping = load_gemini_model_mapping(data_dir).await?;
 
     log::info!(
