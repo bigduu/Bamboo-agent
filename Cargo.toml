@@ -9,18 +9,7 @@ homepage = "https://github.com/bigduu/Bamboo-agent"
 repository = "https://github.com/bigduu/Bamboo-agent"
 documentation = "https://docs.rs/bamboo"
 readme = "README.md"
-keywords = [
-    "ai",
-    "agent",
-    "llm",
-    "automation",
-    "assistant",
-    "openai",
-    "anthropic",
-    "gemini",
-    "copilot",
-    "chatbot",
-]
+keywords = ["ai", "agent", "llm", "automation", "assistant"]
 categories = [
     "development-tools",
     "api-bindings",
