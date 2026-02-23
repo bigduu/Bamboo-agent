@@ -1,18 +1,27 @@
-# Bamboo
+# Bamboo 🎋
 
-A fully self-contained AI agent backend framework with built-in web services.
+[![Crates.io](https://img.shields.io/crates/v/bamboo.svg)](https://crates.io/crates/bamboo)
+[![Documentation](https://docs.rs/bamboo/badge.svg)](https://docs.rs/bamboo)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/bigduu/Bamboo-agent/ci.yml?branch=main)](https://github.com/bigduu/Bamboo-agent/actions)
+[![Test Coverage](https://img.shields.io/badge/tests-806%20passing-brightgreen)](https://github.com/bigduu/Bamboo-agent)
 
-## Features
+**A fully self-contained AI agent backend framework with built-in web services.**
+
+Bamboo provides everything you need to build, deploy, and scale AI-powered applications with support for multiple LLM providers, comprehensive tool execution, and production-ready infrastructure.
+
+## ✨ Features
 
 - 🤖 **Complete Agent System**: Agent loop, tool execution, skill management
-- 🌐 **Built-in HTTP Server**: Actix-web based API server
+- 🌐 **Built-in HTTP Server**: Actix-web based API server with REST and streaming endpoints
 - 🧠 **Multi-LLM Support**: OpenAI, Anthropic, Google Gemini, GitHub Copilot
 - 📁 **XDG-Compliant**: Follows XDG Base Directory specification
-- 🔧 **Dual Mode**: Binary (standalone) or library (embedded)
-- 🔐 **Production-Ready**: CORS, rate limiting, security headers
+- 🔧 **Dual Mode**: Binary (standalone server) or library (embedded)
+- 🔐 **Production-Ready**: CORS, rate limiting, security headers built-in
 - 🔄 **Session Management**: Persistent conversation history
-- ⚡ **Workflow System**: Automate complex tasks
-- 🤝 **Claude Integration**: Seamless Claude Code integration
+- ⚡ **Workflow System**: Automate complex tasks with YAML workflows
+- 🤝 **Claude Integration**: Seamless Claude Code binary discovery and management
+- 🧪 **Well Tested**: 806 tests with 100% pass rate
 
 ## Installation
 
@@ -25,7 +34,7 @@ cargo install bamboo
 ### From source
 
 ```bash
-git clone https://github.com/bamboo-ai/bamboo
+git clone https://github.com/bigduu/Bamboo-agent
 cd bamboo
 cargo install --path .
 ```
