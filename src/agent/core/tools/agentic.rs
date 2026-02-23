@@ -1,3 +1,35 @@
+//! Agentic tool execution framework.
+//!
+//! This module provides a framework for implementing autonomous agent tools
+//! that can iterate and interact with the environment through tool calls.
+//!
+//! # Overview
+//!
+//! The agentic system allows tools to:
+//! - Execute multiple iterations toward a goal
+//! - Maintain state across iterations
+//! - Record interactions between user, assistant, and tools
+//! - Perform autonomous code review and refinement
+//!
+//! # Key Types
+//!
+//! - [`ToolGoal`] - Defines the objective and parameters for an agentic tool
+//! - [`AgenticContext`] - Execution context with state and interaction history
+//! - [`Interaction`] - Records of user/assistant/tool exchanges
+//! - [`ToolExecutor`] - Trait for executing tool calls
+//! - [`AgenticTool`] - Trait for autonomous agentic tools
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use bamboo_agent::agent::core::tools::agentic::*;
+//!
+//! let goal = ToolGoal::new("Review code for bugs", json!({"file": "main.rs"}));
+//! let context = AgenticContext::new(executor);
+//! let tool = SmartCodeReviewTool::new();
+//! let result = tool.execute(goal, context).await?;
+//! ```
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -7,14 +39,47 @@ use tokio::sync::RwLock;
 
 use crate::agent::core::tools::{FunctionCall, ToolCall, ToolError};
 
+/// Represents the objective and parameters for an agentic tool execution.
+///
+/// A `ToolGoal` defines what an agentic tool should accomplish, including
+/// the intent, input parameters, and iteration limits.
+///
+/// # Fields
+///
+/// * `intent` - High-level description of what the tool should achieve
+/// * `params` - JSON parameters for the tool execution
+/// * `max_iterations` - Maximum number of iterations before stopping (default: 10)
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let goal = ToolGoal::new("Fix all bugs", json!({"files": ["main.rs", "lib.rs"]}))
+///     .with_max_iterations(20);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolGoal {
     pub intent: String,
+    /// Input parameters for the tool execution
     pub params: Value,
+    /// Maximum iterations before stopping
     pub max_iterations: usize,
 }
 
 impl ToolGoal {
+    /// Create a new tool goal with intent and parameters.
+    ///
+    /// Uses the default maximum iteration count of 10.
+    ///
+    /// # Arguments
+    ///
+    /// * `intent` - High-level description of the goal
+    /// * `params` - JSON parameters for execution
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let goal = ToolGoal::new("Review code", json!({"path": "src/main.rs"}));
+    /// ```
     pub fn new(intent: impl Into<String>, params: Value) -> Self {
         Self {
             intent: intent.into(),
