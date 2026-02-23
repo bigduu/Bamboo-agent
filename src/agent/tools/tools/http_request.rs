@@ -188,7 +188,6 @@ impl HttpRequestArgs {
 
 /// Tool for making HTTP requests
 pub struct HttpRequestTool {
-    
     client: reqwest::Client,
 }
 
@@ -534,7 +533,7 @@ mod tests {
     }
 
     #[tokio::test]
-    
+
     async fn test_http_request_invalid_url() {
         let tool = HttpRequestTool::new();
         let result = tool
@@ -549,7 +548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    
+
     async fn test_http_request_get() {
         let tool = HttpRequestTool::new();
         let result = tool
@@ -570,7 +569,7 @@ mod tests {
 
     // SSRF Protection Tests
     #[tokio::test]
-    
+
     async fn test_ssrf_private_ip_blocked() {
         let tool = HttpRequestTool::new();
 
@@ -600,7 +599,7 @@ mod tests {
     }
 
     #[tokio::test]
-    
+
     async fn test_ssrf_loopback_blocked() {
         let tool = HttpRequestTool::new();
 
@@ -624,7 +623,7 @@ mod tests {
     }
 
     #[tokio::test]
-    
+
     async fn test_ssrf_aws_metadata_blocked() {
         let tool = HttpRequestTool::new();
 
@@ -640,7 +639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    
+
     async fn test_ssrf_valid_external_allowed() {
         let tool = HttpRequestTool::new();
 
@@ -667,7 +666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    
+
     async fn test_ssrf_dns_to_private_blocked() {
         // Note: This test would require a controlled DNS environment
         // In practice, we'd need a mock DNS server or known test domain
