@@ -128,7 +128,7 @@ pub async fn get_command(
 }
 
 async fn list_workflows_as_commands(
-    data_dir: &std::path::PathBuf,
+    data_dir: &std::path::Path,
 ) -> Result<Vec<CommandItem>, AppError> {
     let dir = data_dir.join("workflows");
     tokio::fs::create_dir_all(&dir).await.map_err(|e| {

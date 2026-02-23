@@ -1,7 +1,7 @@
 use crate::web_service::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 use tokio::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -11,7 +11,7 @@ pub struct AnthropicModelMapping {
 }
 
 pub async fn load_anthropic_model_mapping(
-    data_dir: &PathBuf,
+    data_dir: &Path,
 ) -> Result<AnthropicModelMapping, AppError> {
     let path = data_dir.join("anthropic-model-mapping.json");
     match fs::read(&path).await {
@@ -28,7 +28,7 @@ pub async fn load_anthropic_model_mapping(
 }
 
 pub async fn save_anthropic_model_mapping(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     mapping: AnthropicModelMapping,
 ) -> Result<AnthropicModelMapping, AppError> {
     let path = data_dir.join("anthropic-model-mapping.json");

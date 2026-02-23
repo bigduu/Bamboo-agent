@@ -739,7 +739,7 @@ impl AnthropicError {
 }
 
 async fn resolve_model(
-    data_dir: &std::path::PathBuf,
+    data_dir: &std::path::Path,
     model: &str,
 ) -> Result<ModelResolution, AnthropicError> {
     let mapping = load_anthropic_model_mapping(data_dir)

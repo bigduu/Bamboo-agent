@@ -1,3 +1,10 @@
+//! CLI module for agent interaction
+//!
+//! This module contains CLI utilities for interacting with the agent server.
+//! Currently used for testing and development purposes.
+
+#![allow(dead_code)]
+
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use eventsource_client::Client;

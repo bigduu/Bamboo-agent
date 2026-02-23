@@ -7,6 +7,7 @@ mod executor;
 pub mod guide;
 pub mod output_manager;
 pub mod permission;
+#[allow(clippy::module_inception)]
 pub mod tools;
 
 // Re-export executor types

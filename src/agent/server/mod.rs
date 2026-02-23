@@ -1,6 +1,7 @@
 pub mod handlers;
 pub mod logging;
 pub mod metrics_service;
+#[allow(clippy::module_inception)]
 pub mod server;
 pub mod state;
 pub mod workflow;

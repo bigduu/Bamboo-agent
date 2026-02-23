@@ -1,7 +1,7 @@
 use crate::web_service::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 use tokio::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -10,7 +10,7 @@ pub struct GeminiModelMapping {
     pub mappings: HashMap<String, String>,
 }
 
-pub async fn load_gemini_model_mapping(data_dir: &PathBuf) -> Result<GeminiModelMapping, AppError> {
+pub async fn load_gemini_model_mapping(data_dir: &Path) -> Result<GeminiModelMapping, AppError> {
     let path = data_dir.join("gemini-model-mapping.json");
     match fs::read(&path).await {
         Ok(content) => {
@@ -26,7 +26,7 @@ pub async fn load_gemini_model_mapping(data_dir: &PathBuf) -> Result<GeminiModel
 }
 
 pub async fn save_gemini_model_mapping(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     mapping: GeminiModelMapping,
 ) -> Result<GeminiModelMapping, AppError> {
     let path = data_dir.join("gemini-model-mapping.json");
@@ -40,7 +40,7 @@ pub async fn save_gemini_model_mapping(
 
 /// Resolve a Gemini model name to the actual backend model
 pub async fn resolve_model(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     gemini_model: &str,
 ) -> anyhow::Result<ModelResolution> {
     let mapping = load_gemini_model_mapping(data_dir).await?;

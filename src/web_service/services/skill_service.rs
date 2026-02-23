@@ -1,9 +1,9 @@
 use crate::web_service::error::AppError;
-use std::path::PathBuf;
+use std::path::Path;
 use tokio::fs;
 
 /// List available workflows from the workflows directory
-pub async fn list_workflows(data_dir: &PathBuf) -> Result<Vec<String>, AppError> {
+pub async fn list_workflows(data_dir: &Path) -> Result<Vec<String>, AppError> {
     let workflows_dir = data_dir.join("workflows");
 
     if !workflows_dir.exists() {
