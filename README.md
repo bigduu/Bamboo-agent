@@ -11,6 +11,8 @@
 
 Bamboo provides everything you need to build, deploy, and scale AI-powered applications with support for multiple LLM providers, comprehensive tool execution, and production-ready infrastructure.
 
+📖 **[Full Documentation](docs/README.md)** | 🚀 **[Getting Started](#quick-start)** | 📚 **[API Docs](https://docs.rs/bamboo-agent)**
+
 ## ✨ Features
 
 - 🤖 **Complete Agent System**: Agent loop, tool execution, skill management
@@ -167,13 +169,28 @@ Bamboo is organized into the following modules:
 - **`claude`**: Claude Code integration
 - **`commands`**: Workflow, slash commands, keyword masking
 
+## Documentation
+
+- **[Full Documentation](docs/README.md)** - Comprehensive guides and references
+- **[API Documentation](https://docs.rs/bamboo-agent)** - Auto-generated API docs
+- **[Migration Guide](MIGRATION_GUIDE.md)** - Migrating from monorepo structure
+- **[Contributing](CONTRIBUTING.md)** - How to contribute to Bamboo
+- **[Changelog](CHANGELOG.md)** - Version history and release notes
+- **[Security Policy](SECURITY.md)** - Security information and reporting
+
 ## License
 
-MIT
+MIT License - see [LICENSE](LICENSE) for details.
 
 ## Contributing
 
-Contributions are welcome! Please read our contributing guidelines before submitting PRs.
+Contributions are welcome! Please read our [Contributing Guidelines](CONTRIBUTING.md) before submitting PRs.
+
+## Support
+
+- **Issues**: https://github.com/bigduu/Bamboo-agent/issues
+- **Discussions**: https://github.com/bigduu/Bamboo-agent/discussions
+- **Security**: See [SECURITY.md](SECURITY.md) for reporting security issues
 
 ## Roadmap
 
@@ -183,3 +200,7 @@ Contributions are welcome! Please read our contributing guidelines before submit
 - [ ] Plugin system
 - [ ] gRPC API
 - [ ] Kubernetes deployment guides
+
+---
+
+**Made with ❤️ by the Bamboo Contributors**

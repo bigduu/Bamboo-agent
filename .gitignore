@@ -52,3 +52,6 @@ workflows/
 # Configuration (keep templates)
 config.local.json
 *.local.json
+
+# Documentation is tracked
+!docs/
