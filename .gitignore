@@ -1,11 +1,51 @@
-/target
+# Rust
+/target/
 **/*.rs.bk
 Cargo.lock
-.DS_Store
+
+# IDEs
+.idea/
+.vscode/
 *.swp
 *.swo
 *~
-.vscode/
-.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.profraw
+*.profdata
+/coverage/
+
+# Documentation
+/doc/
+
+# Build artifacts
 *.log
+*.pid
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Environment
 .env
+.env.local
+.env.*.local
+
+# Data directories (for local development)
+data/
+sessions/
+workflows/
+*.db
+*.db-journal
+
+# Claude integration
+.claude/
+
+# Configuration (keep templates)
+config.local.json
+*.local.json
