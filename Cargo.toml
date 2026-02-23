@@ -2,12 +2,12 @@
 name = "bamboo-agent"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
+license = "MIT"
 authors = ["mugeng.du@gmail.com"]
 description = "A fully self-contained AI agent backend framework with built-in web services, multi-LLM provider support, and comprehensive tool execution"
 homepage = "https://github.com/bigduu/Bamboo-agent"
 repository = "https://github.com/bigduu/Bamboo-agent"
-documentation = "https://docs.rs/bamboo"
+documentation = "https://docs.rs/bamboo-agent"
 readme = "README.md"
 keywords = ["ai", "agent", "llm", "automation", "assistant"]
 categories = [

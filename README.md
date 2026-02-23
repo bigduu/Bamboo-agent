@@ -2,8 +2,9 @@
 
 [![Crates.io](https://img.shields.io/crates/v/bamboo-agent.svg)](https://crates.io/crates/bamboo-agent)
 [![Documentation](https://docs.rs/bamboo-agent/badge.svg)](https://docs.rs/bamboo-agent)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/bigduu/Bamboo-agent/ci.yml?branch=main)](https://github.com/bigduu/Bamboo-agent/actions)
+[![License](https://img.shields.io/crates/l/bamboo-agent.svg)](https://crates.io/crates/bamboo-agent)
+[![Build Status](https://github.com/bigduu/Bamboo-agent/workflows/CI/badge.svg)](https://github.com/bigduu/Bamboo-agent/actions/workflows/ci.yml)
+[![Documentation](https://github.com/bigduu/Bamboo-agent/workflows/Documentation/badge.svg)](https://github.com/bigduu/Bamboo-agent/actions/workflows/docs.yml)
 [![Test Coverage](https://img.shields.io/badge/tests-806%20passing-brightgreen)](https://github.com/bigduu/Bamboo-agent)
 
 **A fully self-contained AI agent backend framework with built-in web services.**

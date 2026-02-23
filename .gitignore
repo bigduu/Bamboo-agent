@@ -43,6 +43,9 @@ workflows/
 *.db
 *.db-journal
 
+# But NOT GitHub Actions workflows
+!.github/workflows/
+
 # Claude integration
 .claude/
 
