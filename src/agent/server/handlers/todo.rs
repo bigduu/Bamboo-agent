@@ -59,7 +59,7 @@ pub async fn get_todo_list(
                     "error": "Session not found"
                 })));
             }
-        }
+        },
     };
 
     let todo_list = match &session.todo_list {
@@ -95,10 +95,7 @@ pub async fn get_todo_list(
         })
         .collect();
 
-    let completed = items
-        .iter()
-        .filter(|i| i.status == "completed")
-        .count();
+    let completed = items.iter().filter(|i| i.status == "completed").count();
     let total = items.len();
     let percentage = if total > 0 {
         ((completed as f32 / total as f32) * 100.0) as u8
@@ -147,7 +144,7 @@ pub async fn has_todo_list(
                     "error": "Session not found"
                 })));
             }
-        }
+        },
     };
 
     Ok(HttpResponse::Ok().json(serde_json::json!({

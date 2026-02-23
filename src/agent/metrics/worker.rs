@@ -68,17 +68,25 @@ impl MetricsWorker {
     }
 
     /// Handle a single metrics event
-    async fn handle_event(storage: &Arc<dyn MetricsStorage>, event: &MetricsEvent) -> anyhow::Result<()> {
+    async fn handle_event(
+        storage: &Arc<dyn MetricsStorage>,
+        event: &MetricsEvent,
+    ) -> anyhow::Result<()> {
         match event {
             MetricsEvent::Chat(chat_event) => Self::handle_chat_event(storage, chat_event).await,
-            MetricsEvent::Forward(forward_event) => Self::handle_forward_event(storage, forward_event).await,
+            MetricsEvent::Forward(forward_event) => {
+                Self::handle_forward_event(storage, forward_event).await
+            }
             MetricsEvent::System(system_event) => {
                 // Just log system events
                 match system_event {
                     SystemEvent::WorkerStarted => info!("System: WorkerStarted"),
                     SystemEvent::WorkerStopped => info!("System: WorkerStopped"),
                     SystemEvent::MetricsDropped { count, reason } => {
-                        warn!("System: MetricsDropped - {} events, reason: {}", count, reason);
+                        warn!(
+                            "System: MetricsDropped - {} events, reason: {}",
+                            count, reason
+                        );
                     }
                     SystemEvent::StorageError { error, event_type } => {
                         error!("System: StorageError for {} - {}", event_type, error);
@@ -125,7 +133,10 @@ impl MetricsWorker {
                 storage
                     .insert_round_start(round_id, session_id, model, meta.occurred_at)
                     .await?;
-                info!("Chat: RoundStarted - {} in session {}", round_id, session_id);
+                info!(
+                    "Chat: RoundStarted - {} in session {}",
+                    round_id, session_id
+                );
             }
             ChatEvent::RoundCompleted {
                 round_id,
@@ -136,19 +147,11 @@ impl MetricsWorker {
                 ..
             } => {
                 storage
-                    .complete_round(
-                        round_id,
-                        meta.occurred_at,
-                        *status,
-                        *usage,
-                        error.clone(),
-                    )
+                    .complete_round(round_id, meta.occurred_at, *status, *usage, error.clone())
                     .await?;
                 info!(
                     "Chat: RoundCompleted - {} ({:?}) - {} tokens",
-                    round_id,
-                    status,
-                    usage.total_tokens
+                    round_id, status, usage.total_tokens
                 );
             }
             ChatEvent::ToolCalled {
@@ -303,7 +306,9 @@ mod tests {
         let db_path = dir.path().join("metrics.db");
         // Keep temp dir alive for the test
         std::mem::forget(dir);
-        let storage = Arc::new(crate::agent::metrics::storage::SqliteMetricsStorage::new(&db_path));
+        let storage = Arc::new(crate::agent::metrics::storage::SqliteMetricsStorage::new(
+            &db_path,
+        ));
         storage.init().await.expect("init storage");
         (storage, db_path)
     }

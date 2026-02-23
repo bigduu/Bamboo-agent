@@ -283,7 +283,10 @@ impl CopilotAuthHandler {
     }
 
     pub(super) async fn get_device_code(&self) -> anyhow::Result<DeviceCodeResponse> {
-        let params = [("client_id", "Iv1.b507a08c87ecfe98"), ("scope", "read:user")];
+        let params = [
+            ("client_id", "Iv1.b507a08c87ecfe98"),
+            ("scope", "read:user"),
+        ];
         let url = format!("{}/login/device/code", self.github_login_base_url);
 
         let response = self
@@ -526,9 +529,7 @@ impl CopilotAuthHandler {
         match serde_json::from_slice::<CopilotConfig>(&body) {
             Ok(copilot_config) => {
                 if !copilot_config.chat_enabled {
-                    return Err(anyhow!(
-                        "❌ Copilot chat is not enabled for this account."
-                    ));
+                    return Err(anyhow!("❌ Copilot chat is not enabled for this account."));
                 }
                 if !self.headless_auth {
                     println!("  ✅ Copilot token received!");
@@ -836,7 +837,11 @@ mod retry_tests {
         // Call the actual method - it should retry and eventually succeed
         let result = handler.get_device_code().await;
 
-        assert!(result.is_ok(), "Should succeed after retries: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should succeed after retries: {:?}",
+            result.err()
+        );
         assert_eq!(request_count.load(Ordering::SeqCst), 3);
 
         let device_code = result.unwrap();

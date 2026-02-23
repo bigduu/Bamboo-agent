@@ -11,9 +11,9 @@ use crate::agent::tools::permission::{check_permissions, PermissionChecker, Perm
 use crate::agent::tools::tools::{
     ApplyPatchTool, AskUserTool, CreateTodoListTool, ExecuteCommandTool, FileExistsTool,
     GetCurrentDirTool, GetFileInfoTool, GitDiffTool, GitStatusTool, GitWriteTool, GlobSearchTool,
-    HttpRequestTool, ListDirectoryTool, ReadFileTool, ReadFileRangeTool,
-    SearchInFileTool, SearchInProjectTool, SetWorkspaceTool, SleepTool, TerminalSessionTool,
-    ToolRegistry, UpdateTodoItemTool, WriteFileTool,
+    HttpRequestTool, ListDirectoryTool, ReadFileRangeTool, ReadFileTool, SearchInFileTool,
+    SearchInProjectTool, SetWorkspaceTool, SleepTool, TerminalSessionTool, ToolRegistry,
+    UpdateTodoItemTool, WriteFileTool,
 };
 
 /// List of all built-in tool names
@@ -343,7 +343,9 @@ mod tests {
         }
     }
 
-    fn make_executor(permission_checker: Option<Arc<dyn PermissionChecker>>) -> BuiltinToolExecutor {
+    fn make_executor(
+        permission_checker: Option<Arc<dyn PermissionChecker>>,
+    ) -> BuiltinToolExecutor {
         let builder = BuiltinToolExecutorBuilder::new()
             .with_tool(WriteFileTool::new())
             .expect("register write_file tool");

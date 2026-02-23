@@ -1,9 +1,9 @@
-use actix_web::{get, web, HttpResponse};
-use serde::{Deserialize, Serialize};
-use crate::web_service::error::AppError;
-use crate::web_service::server::AppState;
 use crate::agent::server::state::AppState as AgentAppState;
 use crate::agent::skill::SkillDefinition;
+use crate::web_service::error::AppError;
+use crate::web_service::server::AppState;
+use actix_web::{get, web, HttpResponse};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
@@ -20,7 +20,7 @@ pub struct CommandItem {
     pub display_name: String,
     pub description: String,
     #[serde(rename = "type")]
-    pub command_type: String,  // "workflow" | "skill" | "mcp"
+    pub command_type: String, // "workflow" | "skill" | "mcp"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -51,7 +51,8 @@ pub async fn list_commands(
     }
 
     // 2. Load Skills
-    let skills = agent_state.skill_manager
+    let skills = agent_state
+        .skill_manager
         .store()
         .list_skills(None, false)
         .await;
@@ -98,8 +99,9 @@ pub async fn get_command(
                 return Err(AppError::NotFound(format!("Workflow {} not found", id)));
             }
 
-            let content = tokio::fs::read_to_string(&filepath).await
-                .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to read workflow: {}", e)))?;
+            let content = tokio::fs::read_to_string(&filepath).await.map_err(|e| {
+                AppError::InternalError(anyhow::anyhow!("Failed to read workflow: {}", e))
+            })?;
 
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "id": format!("workflow-{}", id),
@@ -108,39 +110,49 @@ pub async fn get_command(
                 "type": "workflow"
             })))
         }
-        "skill" => {
-            match agent_state.skill_manager.store().get_skill(&id).await {
-                Ok(skill) => Ok(HttpResponse::Ok().json(skill)),
-                Err(e) => Err(AppError::NotFound(format!("Skill {} not found: {}", id, e))),
-            }
-        }
+        "skill" => match agent_state.skill_manager.store().get_skill(&id).await {
+            Ok(skill) => Ok(HttpResponse::Ok().json(skill)),
+            Err(e) => Err(AppError::NotFound(format!("Skill {} not found: {}", id, e))),
+        },
         "mcp" => {
             // MCP tools don't need separate content retrieval
-            Err(AppError::NotFound("MCP tools do not support content retrieval".to_string()))
+            Err(AppError::NotFound(
+                "MCP tools do not support content retrieval".to_string(),
+            ))
         }
-        _ => Err(AppError::NotFound(format!("Unknown command type: {}", command_type))),
+        _ => Err(AppError::NotFound(format!(
+            "Unknown command type: {}",
+            command_type
+        ))),
     }
 }
 
-async fn list_workflows_as_commands(data_dir: &std::path::PathBuf) -> Result<Vec<CommandItem>, AppError> {
+async fn list_workflows_as_commands(
+    data_dir: &std::path::PathBuf,
+) -> Result<Vec<CommandItem>, AppError> {
     let dir = data_dir.join("workflows");
-    tokio::fs::create_dir_all(&dir).await
-        .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to create workflows dir: {}", e)))?;
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+        AppError::InternalError(anyhow::anyhow!("Failed to create workflows dir: {}", e))
+    })?;
 
-    let mut entries = tokio::fs::read_dir(&dir).await
-        .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to read workflows dir: {}", e)))?;
+    let mut entries = tokio::fs::read_dir(&dir).await.map_err(|e| {
+        AppError::InternalError(anyhow::anyhow!("Failed to read workflows dir: {}", e))
+    })?;
 
     let mut commands = Vec::new();
 
-    while let Some(entry) = entries.next_entry().await.map_err(|e| {
-        AppError::InternalError(anyhow::anyhow!("Failed to read entry: {}", e))
-    })? {
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to read entry: {}", e)))?
+    {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("md") {
             continue;
         }
 
-        let name = path.file_stem()
+        let name = path
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
@@ -153,7 +165,8 @@ async fn list_workflows_as_commands(data_dir: &std::path::PathBuf) -> Result<Vec
             AppError::InternalError(anyhow::anyhow!("Failed to read metadata: {}", e))
         })?;
 
-        let filename = path.file_name()
+        let filename = path
+            .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
@@ -201,7 +214,9 @@ async fn list_mcp_tools_as_commands(state: &AgentAppState) -> Result<Vec<Command
     let commands: Vec<CommandItem> = aliases
         .into_iter()
         .filter_map(|alias| {
-            state.mcp_manager.get_tool_info(&alias.server_id, &alias.original_name)
+            state
+                .mcp_manager
+                .get_tool_info(&alias.server_id, &alias.original_name)
                 .map(|tool| CommandItem {
                     id: format!("mcp-{}-{}", alias.server_id, alias.original_name),
                     name: alias.alias.clone(),
@@ -222,6 +237,5 @@ async fn list_mcp_tools_as_commands(state: &AgentAppState) -> Result<Vec<Command
 }
 
 pub fn config(cfg: &mut web::ServiceConfig) {
-    cfg.service(list_commands)
-        .service(get_command);
+    cfg.service(list_commands).service(get_command);
 }

@@ -150,10 +150,7 @@ mod tests {
         let tilde_path = format!("~/{}", relative.to_string_lossy());
 
         // Read using ~
-        let result = tool
-            .execute(json!({"path": tilde_path}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"path": tilde_path})).await.unwrap();
 
         assert!(result.success);
         assert_eq!(result.result, "tilde test content");

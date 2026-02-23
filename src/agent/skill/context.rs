@@ -13,7 +13,11 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
     log::info!(
         "Building skill metadata context from {} skill(s): [{}]",
         skills.len(),
-        skills.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(", ")
+        skills
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     let mut context = String::from("\n\n## Skill System\n");
@@ -21,7 +25,8 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
     context.push_str("When a user's request matches a skill's description, read the skill file to get detailed instructions and follow them.\n\n");
     context.push_str("### How to Use Skills\n");
     context.push_str("1. Analyze the user's request\n");
-    context.push_str("2. Match it against the available skills below based on their descriptions\n");
+    context
+        .push_str("2. Match it against the available skills below based on their descriptions\n");
     context.push_str("3. If there's a match, read the skill file: `read_file({\"path\": \"~/.bamboo/skills/<skill_id>/SKILL.md\"})`\n");
     context.push_str("4. Follow the instructions in the skill file to help the user\n\n");
     context.push_str("### Available Skills\n");
@@ -44,11 +49,17 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
         }
 
         if !skill.tool_refs.is_empty() {
-            context.push_str(&format!("- Provides tools: {}\n", skill.tool_refs.join(", ")));
+            context.push_str(&format!(
+                "- Provides tools: {}\n",
+                skill.tool_refs.join(", ")
+            ));
         }
 
         // Tell AI where to find the full skill content
-        context.push_str(&format!("- Skill file: `~/.bamboo/skills/{}/SKILL.md`\n", skill.id));
+        context.push_str(&format!(
+            "- Skill file: `~/.bamboo/skills/{}/SKILL.md`\n",
+            skill.id
+        ));
     }
 
     log::info!("Skill metadata context built: {} chars", context.len());

@@ -120,11 +120,7 @@ impl ExternalMemory {
 }
 
 /// Format a conversation summary as a note for external memory.
-pub fn format_summary_as_note(
-    summary: &str,
-    message_count: usize,
-    token_count: u32,
-) -> String {
+pub fn format_summary_as_note(summary: &str, message_count: usize, token_count: u32) -> String {
     let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
 
     format!(
@@ -184,7 +180,10 @@ mod tests {
         let memory = ExternalMemory::new(dir.path());
 
         memory.save_note("session-1", "First part").await.unwrap();
-        memory.append_note("session-1", "Second part").await.unwrap();
+        memory
+            .append_note("session-1", "Second part")
+            .await
+            .unwrap();
 
         let read = memory.read_note("session-1").await.unwrap();
         assert_eq!(read, Some("First part\n\nSecond part".to_string()));

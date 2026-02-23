@@ -22,7 +22,11 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> imp
                 log::info!("[{}] Runner cancellation triggered", session_id);
                 true
             } else {
-                log::warn!("[{}] Runner not in Running status: {:?}", session_id, runner.status);
+                log::warn!(
+                    "[{}] Runner not in Running status: {:?}",
+                    session_id,
+                    runner.status
+                );
                 false
             }
         } else {

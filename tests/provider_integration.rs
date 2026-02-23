@@ -22,8 +22,8 @@ mod tests {
 
     #[test]
     fn test_message_conversion() {
-        use bamboo_agent::agent::Message;
         use bamboo_agent::agent::llm::protocol::{OpenAIProtocol, ToProvider};
+        use bamboo_agent::agent::Message;
 
         let msg = Message::user("Test message".to_string());
 
@@ -62,8 +62,8 @@ mod tests {
 
     #[test]
     fn test_tool_schema_creation() {
-        use bamboo_agent::agent::core::ToolSchema;
         use bamboo_agent::agent::core::tools::FunctionSchema;
+        use bamboo_agent::agent::core::ToolSchema;
         use serde_json::json;
 
         let tool = ToolSchema {
@@ -107,7 +107,9 @@ mod tests {
 
     #[test]
     fn test_protocol_enums() {
-        use bamboo_agent::agent::llm::protocol::{AnthropicProtocol, GeminiProtocol, OpenAIProtocol};
+        use bamboo_agent::agent::llm::protocol::{
+            AnthropicProtocol, GeminiProtocol, OpenAIProtocol,
+        };
 
         // Test that protocol types exist and can be referenced
         // This verifies the module structure

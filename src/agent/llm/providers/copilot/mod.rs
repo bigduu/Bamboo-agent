@@ -4,10 +4,10 @@ use serde_json::json;
 use std::path::PathBuf;
 
 pub mod auth;
-use auth::{CopilotAuthHandler, DeviceCodeResponse};
+use crate::agent::core::{tools::ToolSchema, Message};
 use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
 use crate::agent::llm::types::LLMChunk;
-use crate::agent::core::{tools::ToolSchema, Message};
+use auth::{CopilotAuthHandler, DeviceCodeResponse};
 
 use super::common::openai_compat::{
     messages_to_openai_compat_json, parse_openai_compat_sse_data_lenient,
@@ -58,11 +58,7 @@ impl CopilotProvider {
     }
 
     /// Create provider with auth handler (for HTTP/CLI authentication)
-    pub fn with_auth_handler(
-        client: Client,
-        app_data_dir: PathBuf,
-        headless_auth: bool,
-    ) -> Self {
+    pub fn with_auth_handler(client: Client, app_data_dir: PathBuf, headless_auth: bool) -> Self {
         use reqwest_middleware::ClientBuilder;
         use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
         use std::sync::Arc;
@@ -79,7 +75,8 @@ impl CopilotProvider {
                 .build(),
         );
 
-        let auth_handler = CopilotAuthHandler::new(client_with_middleware, app_data_dir, headless_auth);
+        let auth_handler =
+            CopilotAuthHandler::new(client_with_middleware, app_data_dir, headless_auth);
 
         Self {
             client,
@@ -123,7 +120,9 @@ impl CopilotProvider {
 
         // Need interactive authentication
         if let Some(handler) = &self.auth_handler {
-            let token = handler.get_chat_token().await
+            let token = handler
+                .get_chat_token()
+                .await
                 .map_err(|e| LLMError::Auth(e.to_string()))?;
             self.token = Some(token);
             Ok(())
@@ -135,7 +134,9 @@ impl CopilotProvider {
     /// Start authentication and return device code info for frontend display
     pub async fn start_authentication(&self) -> std::result::Result<DeviceCodeResponse, LLMError> {
         if let Some(handler) = &self.auth_handler {
-            handler.start_authentication().await
+            handler
+                .start_authentication()
+                .await
                 .map_err(|e| LLMError::Auth(e.to_string()))
         } else {
             Err(LLMError::Auth("No auth handler configured".to_string()))
@@ -148,7 +149,9 @@ impl CopilotProvider {
         device_code: &DeviceCodeResponse,
     ) -> std::result::Result<(), LLMError> {
         if let Some(handler) = &self.auth_handler {
-            let config = handler.complete_authentication(device_code).await
+            let config = handler
+                .complete_authentication(device_code)
+                .await
                 .map_err(|e| LLMError::Auth(e.to_string()))?;
             self.token = Some(config.token);
             self.token_expires_at = Some(config.expires_at);
@@ -171,8 +174,9 @@ impl CopilotProvider {
             }
 
             if copilot_token_path.exists() {
-                std::fs::remove_file(&copilot_token_path)
-                    .map_err(|e| LLMError::Auth(format!("Failed to delete .copilot_token.json: {}", e)))?;
+                std::fs::remove_file(&copilot_token_path).map_err(|e| {
+                    LLMError::Auth(format!("Failed to delete .copilot_token.json: {}", e))
+                })?;
             }
         }
 
@@ -356,10 +360,7 @@ impl LLMProvider for CopilotProvider {
             id: String,
         }
 
-        let models: ModelResponse = response
-            .json()
-            .await
-            .map_err(LLMError::Http)?;
+        let models: ModelResponse = response.json().await.map_err(LLMError::Http)?;
 
         // Deduplicate model IDs to avoid duplicates in the list
         let mut model_ids: Vec<String> = models.data.into_iter().map(|m| m.id).collect();
@@ -508,10 +509,7 @@ mod tests {
         assert!(headers.contains_key("copilot-integration-id"));
 
         // Verify specific VS Code mimic values
-        assert_eq!(
-            headers.get("editor-version").unwrap(),
-            "vscode/1.99.2"
-        );
+        assert_eq!(headers.get("editor-version").unwrap(), "vscode/1.99.2");
         assert_eq!(
             headers.get("editor-plugin-version").unwrap(),
             "copilot-chat/0.20.3"
@@ -524,10 +522,7 @@ mod tests {
             headers.get("copilot-integration-id").unwrap(),
             "vscode-chat"
         );
-        assert_eq!(
-            headers.get("content-type").unwrap(),
-            "application/json"
-        );
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
     }
 
     // ============================================
@@ -652,7 +647,11 @@ mod tests {
 
         // Verify header values are valid UTF-8
         for (name, value) in headers.iter() {
-            assert!(value.to_str().is_ok(), "Header {} has invalid UTF-8 value", name);
+            assert!(
+                value.to_str().is_ok(),
+                "Header {} has invalid UTF-8 value",
+                name
+            );
         }
 
         // Verify Bearer token format
@@ -674,9 +673,8 @@ mod tests {
         let provider = CopilotProvider::new(); // No token
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            provider.chat_stream(&[], &[], None, "copilot-chat").await
-        });
+        let result =
+            rt.block_on(async { provider.chat_stream(&[], &[], None, "copilot-chat").await });
 
         assert!(result.is_err());
         match result {

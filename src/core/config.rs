@@ -9,7 +9,7 @@ pub struct Config {
     pub proxy_auth: Option<ProxyAuth>,
     pub model: Option<String>,
     #[serde(default)]
-    pub headless_auth: bool,  // Deprecated: moved to providers.copilot.headless_auth
+    pub headless_auth: bool, // Deprecated: moved to providers.copilot.headless_auth
 
     // Provider configuration
     #[serde(default = "default_provider")]
@@ -61,7 +61,7 @@ pub struct CopilotConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
-    pub headless_auth: bool,  // Print login URL in console instead of opening browser
+    pub headless_auth: bool, // Print login URL in console instead of opening browser
 }
 
 fn default_provider() -> String {
@@ -172,10 +172,14 @@ struct OldConfig {
 fn migrate_config(old: OldConfig) -> Config {
     // Log warning about deprecated fields
     if old.api_key.is_some() {
-        log::warn!("api_key is no longer used. CopilotClient automatically manages authentication.");
+        log::warn!(
+            "api_key is no longer used. CopilotClient automatically manages authentication."
+        );
     }
     if old.api_base.is_some() {
-        log::warn!("api_base is no longer used. CopilotClient automatically manages API endpoints.");
+        log::warn!(
+            "api_base is no longer used. CopilotClient automatically manages API endpoints."
+        );
     }
 
     Config {
@@ -435,7 +439,10 @@ mod tests {
         let config = Config::new();
 
         // Should fallback to http_proxy_auth when https_proxy_auth is absent
-        assert!(config.proxy_auth.is_some(), "proxy_auth should be migrated from http_proxy_auth");
+        assert!(
+            config.proxy_auth.is_some(),
+            "proxy_auth should be migrated from http_proxy_auth"
+        );
         let auth = config.proxy_auth.unwrap();
         assert_eq!(auth.username, "http_user");
         assert_eq!(auth.password, "http_pass");

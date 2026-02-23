@@ -4,8 +4,8 @@
 
 #[cfg(test)]
 mod tests {
-    use bamboo_agent::web_service::server::AppState;
     use bamboo_agent::web_service::controllers::*;
+    use bamboo_agent::web_service::server::AppState;
 
     // Note: These are placeholder tests that verify the module structure
     // Full integration tests would require starting the server and making HTTP requests
@@ -20,11 +20,11 @@ mod tests {
     #[test]
     fn test_app_state_creation() {
         // Test that we can create app state with test configuration
-        use std::sync::Arc;
-        use tokio::sync::RwLock;
         use bamboo_agent::agent::llm::LLMProvider;
         use bamboo_agent::core::Config;
         use std::path::PathBuf;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
 
         // Note: This is a simplified test
         // In practice, we'd need to mock the LLM provider
@@ -37,8 +37,8 @@ mod tests {
 
     #[test]
     fn test_tool_schema_structure() {
-        use bamboo_agent::agent::core::ToolSchema;
         use bamboo_agent::agent::core::tools::FunctionSchema;
+        use bamboo_agent::agent::core::ToolSchema;
         use serde_json::json;
 
         let schema = ToolSchema {
@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_workflow_operations() {
-        use bamboo_agent::commands::workflows::{save_workflow, delete_workflow};
+        use bamboo_agent::commands::workflows::{delete_workflow, save_workflow};
 
         // These would need to be async in practice
         // This is just verifying the module structure
@@ -98,8 +98,8 @@ mod tests {
 
     #[test]
     fn test_keyword_masking_config() {
-        use bamboo_agent::core::keyword_masking::KeywordMaskingConfig;
         use bamboo_agent::commands::keyword_masking::load_keyword_masking_config;
+        use bamboo_agent::core::keyword_masking::KeywordMaskingConfig;
         use std::path::Path;
 
         let temp_dir = tempfile::TempDir::new().unwrap();

@@ -4,8 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Todo item status
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum TodoItemStatus {
     #[serde(rename = "pending")]
     #[default]
@@ -17,7 +16,6 @@ pub enum TodoItemStatus {
     #[serde(rename = "blocked")]
     Blocked,
 }
-
 
 /// Todo item
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,26 +52,44 @@ impl TodoList {
                 TodoItemStatus::Blocked => "[!]",
             };
 
-            output.push_str(&format!("\n{} {}: {}", status_icon, item.id, item.description));
+            output.push_str(&format!(
+                "\n{} {}: {}",
+                status_icon, item.id, item.description
+            ));
 
             if !item.depends_on.is_empty() {
                 output.push_str(&format!(" (depends on: {})", item.depends_on.join(", ")));
             }
 
             if !item.notes.is_empty() {
-                output.push_str(&format!("\n    Notes: {}", item.notes.replace('\n', "\n    ")));
+                output.push_str(&format!(
+                    "\n    Notes: {}",
+                    item.notes.replace('\n', "\n    ")
+                ));
             }
         }
 
-        let completed = self.items.iter().filter(|i| i.status == TodoItemStatus::Completed).count();
+        let completed = self
+            .items
+            .iter()
+            .filter(|i| i.status == TodoItemStatus::Completed)
+            .count();
         let total = self.items.len();
-        output.push_str(&format!("\n\nProgress: {}/{} tasks completed", completed, total));
+        output.push_str(&format!(
+            "\n\nProgress: {}/{} tasks completed",
+            completed, total
+        ));
 
         output
     }
 
     /// Update a todo item status
-    pub fn update_item(&mut self, item_id: &str, status: TodoItemStatus, notes: Option<&str>) -> Result<String, String> {
+    pub fn update_item(
+        &mut self,
+        item_id: &str,
+        status: TodoItemStatus,
+        notes: Option<&str>,
+    ) -> Result<String, String> {
         if let Some(item) = self.items.iter_mut().find(|i| i.id == item_id) {
             item.status = status;
             if let Some(n) = notes {

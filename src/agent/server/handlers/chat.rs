@@ -1,5 +1,5 @@
-use actix_web::{web, HttpResponse, Responder};
 use crate::agent::core::{Role, Session};
+use actix_web::{web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -50,7 +50,11 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
             Ok(Some(session)) => session,
             Ok(None) => Session::new(session_id.clone(), model.clone()),
             Err(e) => {
-                log::error!("[{}] Failed to load session from storage: {}", session_id, e);
+                log::error!(
+                    "[{}] Failed to load session from storage: {}",
+                    session_id,
+                    e
+                );
                 return HttpResponse::InternalServerError().json(serde_json::json!({
                     "error": format!("Failed to load session: {}", e)
                 }));

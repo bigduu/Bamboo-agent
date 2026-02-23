@@ -1,8 +1,8 @@
 // Helper function to extract default model from config
 // This should be used instead of hardcoding "gpt-4o-mini" or "default"
 
-use crate::core::Config;
 use crate::agent::llm::LLMError;
+use crate::core::Config;
 
 /// Get the default model for the current provider from config
 /// Returns an error if no model is configured
@@ -20,22 +20,19 @@ pub fn get_default_model_from_config(config: &Config) -> Result<String, LLMError
                 .as_ref()
                 .ok_or_else(|| LLMError::Auth("OpenAI configuration required".to_string()))?;
 
-            openai_config
-                .model
-                .clone()
-                .ok_or_else(|| LLMError::Auth("OpenAI model must be specified in config".to_string()))
+            openai_config.model.clone().ok_or_else(|| {
+                LLMError::Auth("OpenAI model must be specified in config".to_string())
+            })
         }
         "anthropic" => {
-            let anthropic_config = config
-                .providers
-                .anthropic
-                .as_ref()
-                .ok_or_else(|| LLMError::Auth("Anthropic configuration required".to_string()))?;
+            let anthropic_config =
+                config.providers.anthropic.as_ref().ok_or_else(|| {
+                    LLMError::Auth("Anthropic configuration required".to_string())
+                })?;
 
-            anthropic_config
-                .model
-                .clone()
-                .ok_or_else(|| LLMError::Auth("Anthropic model must be specified in config".to_string()))
+            anthropic_config.model.clone().ok_or_else(|| {
+                LLMError::Auth("Anthropic model must be specified in config".to_string())
+            })
         }
         "gemini" => {
             let gemini_config = config
@@ -44,10 +41,9 @@ pub fn get_default_model_from_config(config: &Config) -> Result<String, LLMError
                 .as_ref()
                 .ok_or_else(|| LLMError::Auth("Gemini configuration required".to_string()))?;
 
-            gemini_config
-                .model
-                .clone()
-                .ok_or_else(|| LLMError::Auth("Gemini model must be specified in config".to_string()))
+            gemini_config.model.clone().ok_or_else(|| {
+                LLMError::Auth("Gemini model must be specified in config".to_string())
+            })
         }
         _ => Err(LLMError::Auth(format!(
             "Unknown provider: {}",
@@ -95,7 +91,7 @@ mod tests {
                 openai: Some(OpenAIConfig {
                     api_key: "test".to_string(),
                     base_url: None,
-                    model: None,  // No model configured
+                    model: None, // No model configured
                 }),
                 anthropic: None,
                 gemini: None,
@@ -110,6 +106,9 @@ mod tests {
 
         let result = get_default_model_from_config(&config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("model must be specified"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("model must be specified"));
     }
 }

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
-use reqwest::{Client, header::HeaderMap};
+use reqwest::{header::HeaderMap, Client};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
@@ -44,9 +44,9 @@ impl SseTransport {
         for HeaderConfig { name, value } in &self.config.headers {
             let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|e| McpError::InvalidConfig(format!("Invalid header name: {}", e)))?;
-            let header_value = value.parse().map_err(|e| {
-                McpError::InvalidConfig(format!("Invalid header value: {}", e))
-            })?;
+            let header_value = value
+                .parse()
+                .map_err(|e| McpError::InvalidConfig(format!("Invalid header value: {}", e)))?;
             headers.insert(header_name, header_value);
         }
 
@@ -64,7 +64,9 @@ impl McpTransport for SseTransport {
             .client
             .get(&self.config.url)
             .headers(headers)
-            .timeout(tokio::time::Duration::from_millis(self.config.connect_timeout_ms))
+            .timeout(tokio::time::Duration::from_millis(
+                self.config.connect_timeout_ms,
+            ))
             .send()
             .await?;
 
@@ -165,12 +167,7 @@ impl McpTransport for SseTransport {
         }
 
         let mut rx = self.message_rx.lock().await;
-        match tokio::time::timeout(
-            tokio::time::Duration::from_millis(100),
-            rx.recv(),
-        )
-        .await
-        {
+        match tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.recv()).await {
             Ok(Some(message)) => {
                 debug!("Received SSE message: {}", message);
                 Ok(Some(message))

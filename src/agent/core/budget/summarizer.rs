@@ -13,7 +13,10 @@ pub trait Summarizer: Send + Sync {
     /// Generate a summary of the given messages.
     ///
     /// Returns a string containing the summary.
-    async fn summarize(&self, messages: &[Message]) -> Result<String, crate::agent::core::budget::types::BudgetError>;
+    async fn summarize(
+        &self,
+        messages: &[Message],
+    ) -> Result<String, crate::agent::core::budget::types::BudgetError>;
 
     /// Get the estimated token count of the summary.
     ///
@@ -96,7 +99,8 @@ impl HeuristicSummarizer {
 
 #[async_trait]
 impl Summarizer for HeuristicSummarizer {
-    async fn summarize(&self,
+    async fn summarize(
+        &self,
         messages: &[Message],
     ) -> Result<String, crate::agent::core::budget::types::BudgetError> {
         if messages.is_empty() {
@@ -368,7 +372,8 @@ mod tests {
         let summarizer = HeuristicSummarizer::new();
 
         // Create messages with unicode that needs truncation
-        let long_unicode = "这是一段很长的中文消息需要被截断以测试我们的安全截断功能 😀🎉🚀".repeat(10);
+        let long_unicode =
+            "这是一段很长的中文消息需要被截断以测试我们的安全截断功能 😀🎉🚀".repeat(10);
         let messages = vec![
             Message::user(&long_unicode),
             Message::assistant("Response", None),

@@ -1,8 +1,8 @@
-use crate::agent::server::metrics_service::MetricsService;
 use crate::agent::core::tools::ToolExecutor;
 use crate::agent::core::{storage::JsonlStorage, AgentEvent, Session};
 use crate::agent::llm::OpenAIProvider;
 use crate::agent::mcp::{CompositeToolExecutor, McpServerManager};
+use crate::agent::server::metrics_service::MetricsService;
 use crate::agent::skill::{SkillManager, SkillStoreConfig};
 use crate::agent::tools::BuiltinToolExecutor;
 use chrono::{DateTime, Utc};
@@ -218,7 +218,7 @@ impl AppState {
                             AgentStatus::Running => true,
                             _ => {
                                 let age = now.signed_duration_since(
-                                    runner.completed_at.unwrap_or(runner.started_at)
+                                    runner.completed_at.unwrap_or(runner.started_at),
                                 );
                                 age.num_seconds() < 300 // 5分钟 TTL
                             }

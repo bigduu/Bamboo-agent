@@ -27,9 +27,9 @@ impl CreateTodoListTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidArguments("Missing 'title' parameter".to_string()))?;
 
-        let items_array = args["items"].as_array().ok_or_else(|| {
-            ToolError::InvalidArguments("Missing 'items' parameter".to_string())
-        })?;
+        let items_array = args["items"]
+            .as_array()
+            .ok_or_else(|| ToolError::InvalidArguments("Missing 'items' parameter".to_string()))?;
 
         let mut items = Vec::with_capacity(items_array.len());
         for item_val in items_array {
@@ -47,7 +47,11 @@ impl CreateTodoListTool {
 
             let depends_on: Vec<String> = item_val["depends_on"]
                 .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
 
             items.push(TodoItem {
@@ -80,7 +84,10 @@ impl CreateTodoListTool {
                 TodoItemStatus::Blocked => "[!]",
             };
 
-            output.push_str(&format!("{} {}: {}\n", status_icon, item.id, item.description));
+            output.push_str(&format!(
+                "{} {}: {}\n",
+                status_icon, item.id, item.description
+            ));
 
             if !item.notes.is_empty() {
                 output.push_str(&format!("    Notes: {}\n", item.notes));
@@ -93,7 +100,10 @@ impl CreateTodoListTool {
 
         output.push_str(&format!(
             "\nProgress: {}/{} completed",
-            list.items.iter().filter(|i| i.status == TodoItemStatus::Completed).count(),
+            list.items
+                .iter()
+                .filter(|i| i.status == TodoItemStatus::Completed)
+                .count(),
             list.items.len()
         ));
 

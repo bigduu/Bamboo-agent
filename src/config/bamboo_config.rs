@@ -2,10 +2,10 @@
 //!
 //! Handles loading/saving configuration from XDG-compliant paths
 
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::fs;
-use anyhow::{Result, Context};
+use std::path::PathBuf;
 
 use super::xdg_paths;
 
@@ -39,10 +39,18 @@ pub struct ServerConfig {
     pub workers: usize,
 }
 
-fn default_port() -> u16 { 8080 }
-fn default_bind() -> String { "127.0.0.1".to_string() }
-fn default_workers() -> usize { 10 }
-fn default_data_dir() -> PathBuf { xdg_paths::bamboo_data_dir() }
+fn default_port() -> u16 {
+    8080
+}
+fn default_bind() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_workers() -> usize {
+    10
+}
+fn default_data_dir() -> PathBuf {
+    xdg_paths::bamboo_data_dir()
+}
 
 impl Default for BambooConfig {
     fn default() -> Self {
@@ -92,8 +100,8 @@ impl BambooConfig {
 
         let config_path = xdg_paths::bamboo_config_file();
 
-        let content = serde_json::to_string_pretty(self)
-            .context("Failed to serialize config to JSON")?;
+        let content =
+            serde_json::to_string_pretty(self).context("Failed to serialize config to JSON")?;
 
         fs::write(&config_path, content)
             .with_context(|| format!("Failed to write config file: {:?}", config_path))?;
@@ -111,8 +119,7 @@ impl BambooConfig {
         let mut config = Self::load()?;
 
         if let Ok(port) = std::env::var("BAMBOO_PORT") {
-            config.server.port = port.parse()
-                .context("Invalid BAMBOO_PORT value")?;
+            config.server.port = port.parse().context("Invalid BAMBOO_PORT value")?;
         }
 
         if let Ok(bind) = std::env::var("BAMBOO_BIND") {

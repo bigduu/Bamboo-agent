@@ -14,7 +14,6 @@ pub enum ParallelWait {
     N(usize),
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

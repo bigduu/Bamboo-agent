@@ -40,8 +40,8 @@ impl SearchInFileTool {
         // Compile regex
         let regex_flags = if case_sensitive { "" } else { "(?i)" };
         let full_pattern = format!("{}{}", regex_flags, pattern);
-        let regex = Regex::new(&full_pattern)
-            .map_err(|e| format!("Invalid regex pattern: {}", e))?;
+        let regex =
+            Regex::new(&full_pattern).map_err(|e| format!("Invalid regex pattern: {}", e))?;
 
         let max = max_results.unwrap_or(100);
         let mut matches = Vec::new();
@@ -144,9 +144,9 @@ impl Tool for SearchInFileTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidArguments("Missing 'path' parameter".to_string()))?;
 
-        let pattern = args["pattern"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("Missing 'pattern' parameter".to_string()))?;
+        let pattern = args["pattern"].as_str().ok_or_else(|| {
+            ToolError::InvalidArguments("Missing 'pattern' parameter".to_string())
+        })?;
 
         let case_sensitive = args["case_sensitive"].as_bool().unwrap_or(false);
         let max_results = args["max_results"].as_u64().map(|n| n as usize);

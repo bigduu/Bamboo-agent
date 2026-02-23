@@ -83,7 +83,9 @@ impl TodoLoopContext {
         session.todo_list.as_ref().map(|todo_list| {
             // Preserve version from existing todo_list metadata if available
             // This prevents version reset across multiple executions
-            let existing_version = session.metadata.get("todo_list_version")
+            let existing_version = session
+                .metadata
+                .get("todo_list_version")
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
 
@@ -114,12 +116,7 @@ impl TodoLoopContext {
     /// Track tool execution
     ///
     /// Records a tool call and associates it with the active todo item.
-    pub fn track_tool_execution(
-        &mut self,
-        tool_name: &str,
-        result: &ToolResult,
-        round: u32,
-    ) {
+    pub fn track_tool_execution(&mut self, tool_name: &str, result: &ToolResult, round: u32) {
         self.current_round = round;
 
         // Record tool call
@@ -292,19 +289,23 @@ impl TodoLoopContext {
 
         if let Some(ref active_id) = self.active_item_id.clone() {
             // First, determine what action to take (avoid borrow issues)
-            let action = self.items.iter().find(|i| &i.id == active_id).and_then(|item| {
-                if result.success {
-                    if self.should_mark_completed(item) {
-                        Some(TodoItemStatus::Completed)
+            let action = self
+                .items
+                .iter()
+                .find(|i| &i.id == active_id)
+                .and_then(|item| {
+                    if result.success {
+                        if self.should_mark_completed(item) {
+                            Some(TodoItemStatus::Completed)
+                        } else {
+                            None
+                        }
+                    } else if self.should_mark_blocked(item) {
+                        Some(TodoItemStatus::Blocked)
                     } else {
                         None
                     }
-                } else if self.should_mark_blocked(item) {
-                    Some(TodoItemStatus::Blocked)
-                } else {
-                    None
-                }
-            });
+                });
 
             // Then apply the action
             if let Some(new_status) = action {

@@ -9,9 +9,7 @@ pub mod worker;
 pub use aggregator::{aggregate_monthly, aggregate_weekly, PeriodMetrics};
 pub use bus::MetricsBus;
 pub use collector::MetricsCollector;
-pub use events::{
-    ChatEvent, EventMeta, ForwardEvent, MetricsEvent, SystemEvent,
-};
+pub use events::{ChatEvent, EventMeta, ForwardEvent, MetricsEvent, SystemEvent};
 pub use storage::{MetricsError, MetricsResult, MetricsStorage, SqliteMetricsStorage};
 pub use types::{
     DailyMetrics, ForwardEndpointMetrics, ForwardMetricsFilter, ForwardMetricsSummary,

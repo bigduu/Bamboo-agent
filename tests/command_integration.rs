@@ -102,12 +102,8 @@ Just a simple command without frontmatter.
 
     #[test]
     fn test_keyword_masking() {
-        use bamboo_agent::core::keyword_masking::{
-            KeywordMaskingConfig,
-            KeywordEntry,
-            MatchType,
-        };
         use bamboo_agent::commands::keyword_masking::load_keyword_masking_config;
+        use bamboo_agent::core::keyword_masking::{KeywordEntry, KeywordMaskingConfig, MatchType};
         use std::path::Path;
 
         // Test default config

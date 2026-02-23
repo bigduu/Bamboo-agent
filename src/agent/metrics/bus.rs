@@ -43,10 +43,12 @@ impl MetricsBus {
     pub fn emit_dropped_notification(&self, count: u64, reason: &str) {
         // We use try_send here too, but for system events we don't count drops
         // to avoid infinite recursion
-        let _ = self.tx.try_send(MetricsEvent::System(SystemEvent::MetricsDropped {
-            count,
-            reason: reason.to_string(),
-        }));
+        let _ = self
+            .tx
+            .try_send(MetricsEvent::System(SystemEvent::MetricsDropped {
+                count,
+                reason: reason.to_string(),
+            }));
     }
 
     /// Get the number of dropped events since the bus was created

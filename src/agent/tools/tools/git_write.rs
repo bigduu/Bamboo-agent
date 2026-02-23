@@ -184,9 +184,11 @@ impl GitWriteTool {
                 allow_unrelated,
             } => self.git_merge(cwd, branch, message, allow_unrelated).await,
             GitWriteOperation::Add { files } => self.git_add(cwd, files).await,
-            GitWriteOperation::Reset { mode, target, paths } => {
-                self.git_reset(cwd, mode, target, paths).await
-            }
+            GitWriteOperation::Reset {
+                mode,
+                target,
+                paths,
+            } => self.git_reset(cwd, mode, target, paths).await,
         }
     }
 
@@ -372,7 +374,10 @@ impl GitWriteTool {
             if !checkout_result.success {
                 return Ok(GitResult {
                     success: false,
-                    message: format!("Branch '{}' created but checkout failed: {}", name, checkout_result.message),
+                    message: format!(
+                        "Branch '{}' created but checkout failed: {}",
+                        name, checkout_result.message
+                    ),
                     details: checkout_result.details,
                 });
             }
@@ -716,7 +721,11 @@ mod tests {
 
         let op: GitWriteOperation = serde_json::from_value(json).unwrap();
         match op {
-            GitWriteOperation::Commit { message, files, allow_empty } => {
+            GitWriteOperation::Commit {
+                message,
+                files,
+                allow_empty,
+            } => {
                 assert_eq!(message, "Test commit");
                 assert_eq!(files.len(), 2);
                 assert!(!allow_empty);
@@ -736,7 +745,11 @@ mod tests {
 
         let op: GitWriteOperation = serde_json::from_value(json).unwrap();
         match op {
-            GitWriteOperation::Push { remote, branch, force } => {
+            GitWriteOperation::Push {
+                remote,
+                branch,
+                force,
+            } => {
                 assert_eq!(remote, "origin");
                 assert_eq!(branch, Some("main".to_string()));
                 assert!(!force);

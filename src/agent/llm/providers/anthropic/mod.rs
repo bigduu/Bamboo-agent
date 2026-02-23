@@ -6,14 +6,19 @@ pub mod stream;
 
 // Re-export commonly used types
 pub use api_types::*;
-pub use conversion::{convert_complete_request, convert_complete_response, convert_messages_request, convert_messages_response, format_model_display_name};
-pub use stream::{AnthropicStreamAdapter, map_completion_stream_chunk, format_sse_event, format_sse_data};
+pub use conversion::{
+    convert_complete_request, convert_complete_response, convert_messages_request,
+    convert_messages_response, format_model_display_name,
+};
+pub use stream::{
+    format_sse_data, format_sse_event, map_completion_stream_chunk, AnthropicStreamAdapter,
+};
 
 use std::collections::HashMap;
 
-use async_trait::async_trait;
-use reqwest::{Client, header::HeaderMap};
 use crate::agent::core::{agent::Role, tools::ToolSchema, Message};
+use async_trait::async_trait;
+use reqwest::{header::HeaderMap, Client};
 use serde_json::{json, Value};
 
 use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
@@ -56,10 +61,7 @@ impl AnthropicProvider {
             HeaderValue::from_str(&self.api_key)
                 .map_err(|e| LLMError::Auth(format!("Invalid API key: {}", e)))?,
         );
-        headers.insert(
-            "anthropic-version",
-            HeaderValue::from_static("2023-06-01"),
-        );
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         Ok(headers)
@@ -77,10 +79,7 @@ impl LLMProvider for AnthropicProvider {
     ) -> Result<LLMStream> {
         let max_tokens = max_output_tokens.unwrap_or(self.max_tokens);
 
-        log::debug!(
-            "Anthropic provider using model: {}",
-            model
-        );
+        log::debug!("Anthropic provider using model: {}", model);
 
         let body = build_anthropic_request(messages, tools, model, max_tokens, true);
         let headers = self.build_headers()?;
@@ -114,9 +113,10 @@ impl LLMProvider for AnthropicProvider {
         // Use shared SSE adapter with Anthropic-specific parser
         let mut state = AnthropicStreamState::default();
 
-        let stream = crate::agent::llm::providers::common::sse::llm_stream_from_sse(response, move |event, data| {
-            parse_anthropic_sse_event(&mut state, event, data)
-        });
+        let stream = crate::agent::llm::providers::common::sse::llm_stream_from_sse(
+            response,
+            move |event, data| parse_anthropic_sse_event(&mut state, event, data),
+        );
 
         Ok(stream)
     }
@@ -313,14 +313,16 @@ pub fn parse_anthropic_sse_event(
                 .tool_uses_by_index
                 .insert(index, (id.to_string(), name.to_string()));
 
-            Ok(Some(LLMChunk::ToolCalls(vec![crate::agent::core::tools::ToolCall {
-                id: id.to_string(),
-                tool_type: "function".to_string(),
-                function: crate::agent::core::tools::FunctionCall {
-                    name: name.to_string(),
-                    arguments: String::new(),
+            Ok(Some(LLMChunk::ToolCalls(vec![
+                crate::agent::core::tools::ToolCall {
+                    id: id.to_string(),
+                    tool_type: "function".to_string(),
+                    function: crate::agent::core::tools::FunctionCall {
+                        name: name.to_string(),
+                        arguments: String::new(),
+                    },
                 },
-            }])))
+            ])))
         }
         "content_block_delta" => {
             if data.is_empty() {
@@ -363,14 +365,16 @@ pub fn parse_anthropic_sse_event(
                         )));
                     };
 
-                    Ok(Some(LLMChunk::ToolCalls(vec![crate::agent::core::tools::ToolCall {
-                        id: id.clone(),
-                        tool_type: "function".to_string(),
-                        function: crate::agent::core::tools::FunctionCall {
-                            name: name.clone(),
-                            arguments: partial.to_string(),
+                    Ok(Some(LLMChunk::ToolCalls(vec![
+                        crate::agent::core::tools::ToolCall {
+                            id: id.clone(),
+                            tool_type: "function".to_string(),
+                            function: crate::agent::core::tools::FunctionCall {
+                                name: name.clone(),
+                                arguments: partial.to_string(),
+                            },
                         },
-                    }])))
+                    ])))
                 }
                 _ => Ok(None),
             }
@@ -552,7 +556,8 @@ mod anthropic_stream_parse {
     #[test]
     fn invalid_json_returns_error() {
         let mut state = super::AnthropicStreamState::default();
-        let result = super::parse_anthropic_sse_event(&mut state, "content_block_delta", "{invalid}");
+        let result =
+            super::parse_anthropic_sse_event(&mut state, "content_block_delta", "{invalid}");
         assert!(result.is_err());
     }
 
@@ -567,7 +572,8 @@ mod anthropic_stream_parse {
     #[test]
     fn text_delta_with_empty_text_returns_empty_token() {
         let mut state = super::AnthropicStreamState::default();
-        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}"#;
+        let data =
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}"#;
 
         let chunk = super::parse_anthropic_sse_event(&mut state, "content_block_delta", data)
             .unwrap()
@@ -647,7 +653,8 @@ mod anthropic_stream_parse {
         let mut state = super::AnthropicStreamState::default();
         let data = r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Hello"}}"#;
 
-        let chunk = super::parse_anthropic_sse_event(&mut state, "content_block_start", data).unwrap();
+        let chunk =
+            super::parse_anthropic_sse_event(&mut state, "content_block_start", data).unwrap();
         assert!(chunk.is_none());
     }
 
@@ -709,13 +716,19 @@ mod anthropic_request_building_edge_cases {
             },
         };
 
-        let messages = vec![Message::assistant("Let me search for that.", Some(vec![tool_call]))];
+        let messages = vec![Message::assistant(
+            "Let me search for that.",
+            Some(vec![tool_call]),
+        )];
         let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
 
         assert_eq!(out["messages"][0]["role"], "assistant");
         assert_eq!(out["messages"][0]["content"].as_array().unwrap().len(), 2);
         assert_eq!(out["messages"][0]["content"][0]["type"], "text");
-        assert_eq!(out["messages"][0]["content"][0]["text"], "Let me search for that.");
+        assert_eq!(
+            out["messages"][0]["content"][0]["text"],
+            "Let me search for that."
+        );
         assert_eq!(out["messages"][0]["content"][1]["type"], "tool_use");
     }
 
@@ -743,10 +756,12 @@ mod anthropic_request_building_edge_cases {
     fn stream_parameter_set_correctly() {
         let messages = vec![Message::user("Hello")];
 
-        let out_stream_true = super::build_anthropic_request(&messages, &[], "claude-test", 64, true);
+        let out_stream_true =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, true);
         assert_eq!(out_stream_true["stream"], true);
 
-        let out_stream_false = super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
+        let out_stream_false =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
         assert_eq!(out_stream_false["stream"], false);
     }
 
@@ -761,7 +776,8 @@ mod anthropic_request_building_edge_cases {
     #[test]
     fn model_included_in_request() {
         let messages = vec![Message::user("Hello")];
-        let out = super::build_anthropic_request(&messages, &[], "claude-3-opus-20240229", 64, false);
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-3-opus-20240229", 64, false);
 
         assert_eq!(out["model"], "claude-3-opus-20240229");
     }
@@ -781,15 +797,14 @@ mod anthropic_provider_tests {
 
     #[test]
     fn test_with_base_url() {
-        let provider = AnthropicProvider::new("test_key")
-            .with_base_url("https://custom.anthropic.com");
+        let provider =
+            AnthropicProvider::new("test_key").with_base_url("https://custom.anthropic.com");
         assert_eq!(provider.base_url, "https://custom.anthropic.com");
     }
 
     #[test]
     fn test_with_max_tokens() {
-        let provider = AnthropicProvider::new("test_key")
-            .with_max_tokens(2048);
+        let provider = AnthropicProvider::new("test_key").with_max_tokens(2048);
         assert_eq!(provider.max_tokens, 2048);
     }
 
@@ -810,13 +825,22 @@ mod anthropic_provider_tests {
         let headers = provider.build_headers().unwrap();
 
         assert!(headers.contains_key("x-api-key"));
-        assert_eq!(headers.get("x-api-key").unwrap().to_str().unwrap(), "test_key");
+        assert_eq!(
+            headers.get("x-api-key").unwrap().to_str().unwrap(),
+            "test_key"
+        );
 
         assert!(headers.contains_key("anthropic-version"));
-        assert_eq!(headers.get("anthropic-version").unwrap().to_str().unwrap(), "2023-06-01");
+        assert_eq!(
+            headers.get("anthropic-version").unwrap().to_str().unwrap(),
+            "2023-06-01"
+        );
 
         assert!(headers.contains_key("content-type"));
-        assert_eq!(headers.get("content-type").unwrap().to_str().unwrap(), "application/json");
+        assert_eq!(
+            headers.get("content-type").unwrap().to_str().unwrap(),
+            "application/json"
+        );
     }
 
     #[test]
@@ -839,7 +863,8 @@ mod anthropic_provider_tests {
     fn test_error_response_handling() {
         // Test error event parsing
         let mut state = AnthropicStreamState::default();
-        let error_data = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let error_data =
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
 
         let result = parse_anthropic_sse_event(&mut state, "error", error_data);
         assert!(result.is_err());

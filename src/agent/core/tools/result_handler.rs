@@ -246,7 +246,10 @@ mod tests {
 
     #[async_trait]
     impl ToolExecutor for StaticExecutor {
-        async fn execute(&self, call: &ToolCall) -> crate::agent::core::tools::executor::Result<ToolResult> {
+        async fn execute(
+            &self,
+            call: &ToolCall,
+        ) -> crate::agent::core::tools::executor::Result<ToolResult> {
             self.results
                 .get(&call.function.name)
                 .cloned()

@@ -10,7 +10,7 @@ pub use agent::events::{AgentEvent, TokenBudgetUsage, TokenUsage};
 pub use agent::types::{ConversationSummary, Message, MessageContent, Role, Session};
 pub use agent::AgentError;
 pub use budget::limits::create_budget_for_model;
-pub use memory::{ExternalMemory, format_summary_as_note};
+pub use memory::{format_summary_as_note, ExternalMemory};
 pub use storage::{JsonlStorage, Storage};
 pub use todo::{TodoItem, TodoItemStatus, TodoList};
 pub use tools::{

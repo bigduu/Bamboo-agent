@@ -132,17 +132,19 @@ pub fn convert_messages_request(
 
     apply_reasoning_mapping(&mut parameters);
 
-    let tools = request.tools.map(|tools| tools
-                .into_iter()
-                .map(|tool| Tool {
-                    tool_type: "function".to_string(),
-                    function: crate::agent::llm::api::models::FunctionDefinition {
-                        name: tool.name,
-                        description: tool.description,
-                        parameters: tool.input_schema,
-                    },
-                })
-                .collect());
+    let tools = request.tools.map(|tools| {
+        tools
+            .into_iter()
+            .map(|tool| Tool {
+                tool_type: "function".to_string(),
+                function: crate::agent::llm::api::models::FunctionDefinition {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.input_schema,
+                },
+            })
+            .collect()
+    });
 
     let tool_choice = match request.tool_choice {
         Some(choice) => Some(map_tool_choice(choice)?),

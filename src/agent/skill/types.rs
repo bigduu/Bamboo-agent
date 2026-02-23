@@ -18,7 +18,6 @@ pub enum SkillVisibility {
     Private,
 }
 
-
 /// Complete definition of a skill
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillDefinition {

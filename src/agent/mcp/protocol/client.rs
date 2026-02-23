@@ -82,12 +82,9 @@ impl McpProtocolClient {
                 match transport.receive().await {
                     Ok(Some(message)) => {
                         debug!("Received message: {}", message);
-                        if let Err(e) = Self::handle_message(
-                            &message,
-                            &pending_requests,
-                            &notification_tx,
-                        )
-                        .await
+                        if let Err(e) =
+                            Self::handle_message(&message, &pending_requests, &notification_tx)
+                                .await
                         {
                             warn!("Failed to handle message: {}", e);
                         }
@@ -130,7 +127,8 @@ impl McpProtocolClient {
         Err(McpError::Protocol("Unknown message type".to_string()))
     }
 
-    async fn send_request(&self,
+    async fn send_request(
+        &self,
         method: &str,
         params: Option<Value>,
         timeout_ms: u64,
@@ -150,12 +148,7 @@ impl McpProtocolClient {
         transport.send(request_json).await?;
         drop(transport);
 
-        match tokio::time::timeout(
-            tokio::time::Duration::from_millis(timeout_ms),
-            rx,
-        )
-        .await
-        {
+        match tokio::time::timeout(tokio::time::Duration::from_millis(timeout_ms), rx).await {
             Ok(Ok(Ok(response))) => {
                 if let Some(error) = response.error {
                     Err(McpError::Protocol(format!(
@@ -187,7 +180,9 @@ impl McpProtocolClient {
             .await?;
 
         let result: McpInitializeResult = serde_json::from_value(
-            response.result.ok_or_else(|| McpError::Protocol("Missing result".to_string()))?
+            response
+                .result
+                .ok_or_else(|| McpError::Protocol("Missing result".to_string()))?,
         )?;
 
         // Send initialized notification
@@ -203,12 +198,12 @@ impl McpProtocolClient {
     }
 
     pub async fn list_tools(&self, timeout_ms: u64) -> Result<Vec<McpTool>> {
-        let response = self
-            .send_request("tools/list", None, timeout_ms)
-            .await?;
+        let response = self.send_request("tools/list", None, timeout_ms).await?;
 
         let result: McpToolListResult = serde_json::from_value(
-            response.result.ok_or_else(|| McpError::Protocol("Missing result".to_string()))?
+            response
+                .result
+                .ok_or_else(|| McpError::Protocol("Missing result".to_string()))?,
         )?;
 
         Ok(result
@@ -239,7 +234,9 @@ impl McpProtocolClient {
             .await?;
 
         let result: McpToolCallResult = serde_json::from_value(
-            response.result.ok_or_else(|| McpError::Protocol("Missing result".to_string()))?
+            response
+                .result
+                .ok_or_else(|| McpError::Protocol("Missing result".to_string()))?,
         )?;
 
         Ok(McpCallResult {
@@ -370,7 +367,8 @@ mod tests {
 
     #[test]
     fn test_json_rpc_request_new() {
-        let request = JsonRpcRequest::new(1, "test/method", Some(serde_json::json!({"key": "value"})));
+        let request =
+            JsonRpcRequest::new(1, "test/method", Some(serde_json::json!({"key": "value"})));
         assert_eq!(request.jsonrpc, "2.0");
         assert_eq!(request.id, 1);
         assert_eq!(request.method, "test/method");

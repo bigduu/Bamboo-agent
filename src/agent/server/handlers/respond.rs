@@ -1,8 +1,8 @@
 use actix_web::{web, HttpResponse, Result};
 use serde::Deserialize;
 
-use crate::agent::server::state::AppState;
 use crate::agent::core::Message;
+use crate::agent::server::state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct RespondRequest {
@@ -41,7 +41,7 @@ pub async fn submit_response(
                     "error": "Session not found"
                 })));
             }
-        }
+        },
     };
 
     // Check if there's a pending question
@@ -70,17 +70,34 @@ pub async fn submit_response(
 
     // Find and update the existing tool result message (the placeholder added by ask_user)
     let tool_call_id = pending.tool_call_id.clone();
-    log::debug!("[{}] Looking for tool result message with tool_call_id: {}", session_id, tool_call_id);
-    log::debug!("[{}] Session has {} messages", session_id, session.messages.len());
+    log::debug!(
+        "[{}] Looking for tool result message with tool_call_id: {}",
+        session_id,
+        tool_call_id
+    );
+    log::debug!(
+        "[{}] Session has {} messages",
+        session_id,
+        session.messages.len()
+    );
 
     let mut found = false;
     for (idx, message) in session.messages.iter_mut().enumerate() {
-        log::debug!("[{}] Message {}: role={:?}, tool_call_id={:?}",
-            session_id, idx, message.role, message.tool_call_id);
+        log::debug!(
+            "[{}] Message {}: role={:?}, tool_call_id={:?}",
+            session_id,
+            idx,
+            message.role,
+            message.tool_call_id
+        );
         if let Some(id) = &message.tool_call_id {
             if id == &tool_call_id {
                 // Update the placeholder message with actual user response
-                log::info!("[{}] Found tool result message at index {}, updating content", session_id, idx);
+                log::info!(
+                    "[{}] Found tool result message at index {}, updating content",
+                    session_id,
+                    idx
+                );
                 message.content = format!("User selected: {}", user_response);
                 found = true;
                 break;
@@ -91,7 +108,11 @@ pub async fn submit_response(
     if !found {
         // Fallback: if no existing tool result found, add a new one
         // This shouldn't happen in normal flow, but handles edge cases
-        log::warn!("[{}] Tool result message not found for tool_call_id: {}, adding new one", session_id, tool_call_id);
+        log::warn!(
+            "[{}] Tool result message not found for tool_call_id: {}, adding new one",
+            session_id,
+            tool_call_id
+        );
         session.add_message(Message::tool_result(
             tool_call_id,
             format!("User selected: {}", user_response),
@@ -109,7 +130,11 @@ pub async fn submit_response(
 
     // Save the session
     if let Err(e) = state.storage.save_session(&session).await {
-        log::warn!("[{}] Failed to save session after response: {}", session_id, e);
+        log::warn!(
+            "[{}] Failed to save session after response: {}",
+            session_id,
+            e
+        );
     }
 
     // Update in-memory session
@@ -118,7 +143,10 @@ pub async fn submit_response(
         sessions.insert(session_id.clone(), session);
     }
 
-    log::info!("[{}] Response processed successfully, agent loop can resume", session_id);
+    log::info!(
+        "[{}] Response processed successfully, agent loop can resume",
+        session_id
+    );
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
@@ -154,7 +182,7 @@ pub async fn get_pending_question(
                     "error": "Session not found"
                 })));
             }
-        }
+        },
     };
 
     match session.pending_question {
@@ -167,6 +195,6 @@ pub async fn get_pending_question(
         }))),
         None => Ok(HttpResponse::Ok().json(serde_json::json!({
             "has_pending_question": false
-        })))
+        }))),
     }
 }

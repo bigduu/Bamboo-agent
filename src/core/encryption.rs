@@ -195,16 +195,17 @@ pub fn decrypt(encrypted: &str) -> Result<String> {
     let ciphertext = hex::decode(parts[1]).map_err(|e| anyhow!("Invalid ciphertext: {e}"))?;
 
     if nonce_bytes.len() != 12 {
-        return Err(anyhow!("Invalid nonce length: expected 12, got {}", nonce_bytes.len()));
+        return Err(anyhow!(
+            "Invalid nonce length: expected 12, got {}",
+            nonce_bytes.len()
+        ));
     }
 
     let key = get_encryption_key();
     let cipher =
         Aes256Gcm::new_from_slice(&key).map_err(|e| anyhow!("Failed to create cipher: {e}"))?;
 
-    let nonce_array: [u8; 12] = nonce_bytes
-        .try_into()
-        .expect("nonce length checked above");
+    let nonce_array: [u8; 12] = nonce_bytes.try_into().expect("nonce length checked above");
     let nonce = Nonce::from(nonce_array);
     let plaintext = cipher
         .decrypt(&nonce, ciphertext.as_ref())

@@ -190,9 +190,9 @@ pub fn parse_openai_compat_sse_data_lenient(data: &str) -> Result<LLMChunk> {
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::llm::types::LLMChunk;
     use crate::agent::core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
     use crate::agent::core::Message;
+    use crate::agent::llm::types::LLMChunk;
 
     #[test]
     fn messages_to_openai_compat_json_omits_internal_fields() {
@@ -231,7 +231,10 @@ mod tests {
         assert_eq!(out[0]["tool_calls"][0]["id"], "call_1");
         assert_eq!(out[0]["tool_calls"][0]["type"], "function");
         assert_eq!(out[0]["tool_calls"][0]["function"]["name"], "search");
-        assert_eq!(out[0]["tool_calls"][0]["function"]["arguments"], r#"{"q":"test"}"#);
+        assert_eq!(
+            out[0]["tool_calls"][0]["function"]["arguments"],
+            r#"{"q":"test"}"#
+        );
 
         assert_eq!(out[1]["role"], "tool");
         assert_eq!(out[1]["tool_call_id"], "call_1");
@@ -411,7 +414,8 @@ mod tests {
         let tools: Vec<ToolSchema> = Vec::new();
         let tool_choice = serde_json::json!("auto");
 
-        let body = super::build_openai_compat_body("gpt-4", &messages, &tools, Some(tool_choice), None);
+        let body =
+            super::build_openai_compat_body("gpt-4", &messages, &tools, Some(tool_choice), None);
 
         assert_eq!(body["tool_choice"], "auto");
     }

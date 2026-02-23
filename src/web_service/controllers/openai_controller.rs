@@ -1,8 +1,12 @@
-use crate::web_service::{error::AppError, model_config_helper::get_default_model_from_config, server::AppState};
-use actix_web::{get, post, web, HttpResponse};
-use crate::agent::llm::api::models::{ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamChunk};
+use crate::agent::llm::api::models::{
+    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamChunk,
+};
 use crate::agent::llm::protocol::FromProvider;
 use crate::agent::server::state::AppState as AgentAppState;
+use crate::web_service::{
+    error::AppError, model_config_helper::get_default_model_from_config, server::AppState,
+};
+use actix_web::{get, post, web, HttpResponse};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -40,7 +44,8 @@ struct CopilotTokenConfig {
 fn has_valid_auth(app_data_dir: &Path) -> bool {
     // Check for COPILOT_API_KEY environment variable first
     if std::env::var("COPILOT_API_KEY")
-        .ok().map(|k| !k.trim().is_empty())
+        .ok()
+        .map(|k| !k.trim().is_empty())
         .unwrap_or(false)
     {
         log::info!("COPILOT_API_KEY is set, auth available");
@@ -160,9 +165,11 @@ fn convert_messages(
 ) -> Result<Vec<crate::agent::core::Message>, AppError> {
     messages
         .into_iter()
-        .map(|msg| crate::agent::core::Message::from_provider(msg).map_err(|e| {
-            AppError::InternalError(anyhow::anyhow!("Failed to convert message: {}", e))
-        }))
+        .map(|msg| {
+            crate::agent::core::Message::from_provider(msg).map_err(|e| {
+                AppError::InternalError(anyhow::anyhow!("Failed to convert message: {}", e))
+            })
+        })
         .collect()
 }
 
@@ -173,9 +180,11 @@ fn convert_tools(
     match tools {
         Some(tools) => tools
             .into_iter()
-            .map(|tool| crate::agent::core::tools::ToolSchema::from_provider(tool).map_err(|e| {
-                AppError::InternalError(anyhow::anyhow!("Failed to convert tool: {}", e))
-            }))
+            .map(|tool| {
+                crate::agent::core::tools::ToolSchema::from_provider(tool).map_err(|e| {
+                    AppError::InternalError(anyhow::anyhow!("Failed to convert tool: {}", e))
+                })
+            })
             .collect(),
         None => Ok(vec![]),
     }
@@ -189,24 +198,22 @@ fn convert_chunk_to_openai(
     use crate::agent::llm::api::models::*;
 
     match chunk {
-        crate::agent::llm::types::LLMChunk::Token(text) => {
-            Some(ChatCompletionStreamChunk {
-                id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-                object: Some("chat.completion.chunk".to_string()),
-                created: chrono::Utc::now().timestamp() as u64,
-                model: Some(model.to_string()),
-                choices: vec![StreamChoice {
-                    index: 0,
-                    delta: StreamDelta {
-                        role: None,
-                        content: Some(text),
-                        tool_calls: None,
-                    },
-                    finish_reason: None,
-                }],
-                usage: None,
-            })
-        }
+        crate::agent::llm::types::LLMChunk::Token(text) => Some(ChatCompletionStreamChunk {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            object: Some("chat.completion.chunk".to_string()),
+            created: chrono::Utc::now().timestamp() as u64,
+            model: Some(model.to_string()),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: StreamDelta {
+                    role: None,
+                    content: Some(text),
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        }),
         crate::agent::llm::types::LLMChunk::ToolCalls(tool_calls) => {
             let stream_tool_calls: Vec<StreamToolCall> = tool_calls
                 .into_iter()
@@ -239,24 +246,22 @@ fn convert_chunk_to_openai(
                 usage: None,
             })
         }
-        crate::agent::llm::types::LLMChunk::Done => {
-            Some(ChatCompletionStreamChunk {
-                id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-                object: Some("chat.completion.chunk".to_string()),
-                created: chrono::Utc::now().timestamp() as u64,
-                model: Some(model.to_string()),
-                choices: vec![StreamChoice {
-                    index: 0,
-                    delta: StreamDelta {
-                        role: None,
-                        content: None,
-                        tool_calls: None,
-                    },
-                    finish_reason: Some("stop".to_string()),
-                }],
-                usage: None,
-            })
-        }
+        crate::agent::llm::types::LLMChunk::Done => Some(ChatCompletionStreamChunk {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            object: Some("chat.completion.chunk".to_string()),
+            created: chrono::Utc::now().timestamp() as u64,
+            model: Some(model.to_string()),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: StreamDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: None,
+        }),
     }
 }
 
@@ -316,7 +321,11 @@ pub async fn chat_completions(
     // Convert messages to internal format
     let internal_messages = convert_messages(request.messages)?;
     let internal_tools = convert_tools(request.tools)?;
-    let max_tokens = request.parameters.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let max_tokens = request
+        .parameters
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
 
     if stream {
         let provider = app_state.get_provider().await;
@@ -349,7 +358,8 @@ pub async fn chat_completions(
                 match chunk_result {
                     Ok(chunk) => {
                         if let Some(openai_chunk) = convert_chunk_to_openai(chunk, &model_clone) {
-                            let chunk_str = serde_json::to_string(&openai_chunk).unwrap_or_default();
+                            let chunk_str =
+                                serde_json::to_string(&openai_chunk).unwrap_or_default();
                             if tx.send(Ok(Bytes::from(chunk_str))).await.is_err() {
                                 break;
                             }
@@ -421,7 +431,10 @@ pub async fn chat_completions(
                 }
                 Ok(crate::agent::llm::types::LLMChunk::Done) => break,
                 Err(e) => {
-                    return Err(AppError::InternalError(anyhow::anyhow!("Stream error: {}", e)));
+                    return Err(AppError::InternalError(anyhow::anyhow!(
+                        "Stream error: {}",
+                        e
+                    )));
                 }
             }
         }

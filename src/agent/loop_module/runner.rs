@@ -18,8 +18,8 @@ use crate::agent::metrics::{
     MetricsCollector, RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
     TokenUsage as MetricsTokenUsage,
 };
-use crate::agent::tools::CreateTodoListTool;
 use crate::agent::tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder};
+use crate::agent::tools::CreateTodoListTool;
 
 use crate::agent::loop_module::config::AgentLoopConfig;
 use crate::agent::loop_module::stream::handler::consume_llm_stream;
@@ -251,7 +251,9 @@ pub async fn run_agent_loop_with_config(
 
         // Use model from config (provided by execute request), not from session
         let model = config.model_name.as_deref().ok_or_else(|| {
-            crate::agent::core::AgentError::LLM("model_name is required in AgentLoopConfig".to_string())
+            crate::agent::core::AgentError::LLM(
+                "model_name is required in AgentLoopConfig".to_string(),
+            )
         })?;
 
         let stream = match llm
@@ -433,11 +435,7 @@ pub async fn run_agent_loop_with_config(
                         // Then track tool execution (so first tool is recorded)
                         ctx.auto_update_status(&tool_call.function.name, &result);
 
-                        ctx.track_tool_execution(
-                            &tool_call.function.name,
-                            &result,
-                            round as u32,
-                        );
+                        ctx.track_tool_execution(&tool_call.function.name, &result, round as u32);
 
                         // Send progress event if active item exists
                         // Note: Even if auto_update_status cleared active_item_id (completed),
@@ -456,16 +454,15 @@ pub async fn run_agent_loop_with_config(
                         } else {
                             // Active item was just completed, find it by checking last updated item
                             // The item that was just updated will have the highest version bump
-                            ctx.items.iter()
+                            ctx.items
+                                .iter()
                                 .find(|item| item.status == TodoItemStatus::Completed)
-                                .map(|item| {
-                                    AgentEvent::TodoListItemProgress {
-                                        session_id: session_id.clone(),
-                                        item_id: item.id.clone(),
-                                        status: item.status.clone(),
-                                        tool_calls_count: item.tool_calls.len(),
-                                        version: ctx.version,
-                                    }
+                                .map(|item| AgentEvent::TodoListItemProgress {
+                                    session_id: session_id.clone(),
+                                    item_id: item.id.clone(),
+                                    status: item.status.clone(),
+                                    tool_calls_count: item.tool_calls.len(),
+                                    version: ctx.version,
                                 })
                         };
 
@@ -526,8 +523,12 @@ pub async fn run_agent_loop_with_config(
                             {
                                 let status_enum = match status {
                                     "pending" => Some(crate::agent::core::TodoItemStatus::Pending),
-                                    "in_progress" => Some(crate::agent::core::TodoItemStatus::InProgress),
-                                    "completed" => Some(crate::agent::core::TodoItemStatus::Completed),
+                                    "in_progress" => {
+                                        Some(crate::agent::core::TodoItemStatus::InProgress)
+                                    }
+                                    "completed" => {
+                                        Some(crate::agent::core::TodoItemStatus::Completed)
+                                    }
                                     "blocked" => Some(crate::agent::core::TodoItemStatus::Blocked),
                                     _ => None,
                                 };
@@ -753,11 +754,17 @@ pub async fn run_agent_loop_with_config(
         if let Some(ref ctx) = todo_context {
             use crate::agent::loop_module::todo_evaluation::evaluate_todo_progress;
 
-            log::debug!("[{}] Evaluating todo list progress at end of round {}", session_id, round + 1);
+            log::debug!(
+                "[{}] Evaluating todo list progress at end of round {}",
+                session_id,
+                round + 1
+            );
 
             // Use model from config
             let model = config.model_name.as_deref().ok_or_else(|| {
-                crate::agent::core::AgentError::LLM("model_name is required in AgentLoopConfig".to_string())
+                crate::agent::core::AgentError::LLM(
+                    "model_name is required in AgentLoopConfig".to_string(),
+                )
             })?;
 
             match evaluate_todo_progress(
@@ -766,8 +773,10 @@ pub async fn run_agent_loop_with_config(
                 llm.clone(),
                 &event_tx,
                 &session_id,
-                model,  // Pass model from config
-            ).await {
+                model, // Pass model from config
+            )
+            .await
+            {
                 Ok(evaluation_result) => {
                     if evaluation_result.needs_evaluation && !evaluation_result.updates.is_empty() {
                         log::info!(
@@ -791,11 +800,7 @@ pub async fn run_agent_loop_with_config(
                                     );
                                 } else {
                                     let status = update.status.clone();
-                                    let _ = session.update_todo_item(
-                                        &update.item_id,
-                                        status,
-                                        None,
-                                    );
+                                    let _ = session.update_todo_item(&update.item_id, status, None);
                                 }
                             }
                         }
@@ -828,12 +833,14 @@ pub async fn run_agent_loop_with_config(
         if ctx.is_all_completed() {
             log::info!("[{}] All todo items completed", session_id);
 
-            let _ = event_tx.send(AgentEvent::TodoListCompleted {
-                session_id: session_id.clone(),
-                completed_at: Utc::now(),
-                total_rounds: ctx.current_round + 1, // Convert 0-indexed to 1-indexed for display
-                total_tool_calls: ctx.items.iter().map(|i| i.tool_calls.len()).sum(),
-            }).await;
+            let _ = event_tx
+                .send(AgentEvent::TodoListCompleted {
+                    session_id: session_id.clone(),
+                    completed_at: Utc::now(),
+                    total_rounds: ctx.current_round + 1, // Convert 0-indexed to 1-indexed for display
+                    total_tool_calls: ctx.items.iter().map(|i| i.tool_calls.len()).sum(),
+                })
+                .await;
         }
     }
 
@@ -841,20 +848,27 @@ pub async fn run_agent_loop_with_config(
     if let Some(ctx) = todo_context {
         // Save version to session metadata before consuming ctx
         let version = ctx.version;
-        session.metadata.insert(
-            "todo_list_version".to_string(),
-            version.to_string(),
-        );
+        session
+            .metadata
+            .insert("todo_list_version".to_string(), version.to_string());
 
         session.todo_list = Some(ctx.into_todo_list());
         session.updated_at = Utc::now();
 
-        log::debug!("[{}] Synced TodoLoopContext to session, version={}", session_id, version);
+        log::debug!(
+            "[{}] Synced TodoLoopContext to session, version={}",
+            session_id,
+            version
+        );
 
         // Persist session with updated todo list
         if let Some(ref storage) = config.storage {
             if let Err(e) = storage.save_session(session).await {
-                log::warn!("[{}] Failed to save session after agent loop: {}", session_id, e);
+                log::warn!(
+                    "[{}] Failed to save session after agent loop: {}",
+                    session_id,
+                    e
+                );
             } else {
                 log::debug!("[{}] Session saved with updated todo list", session_id);
             }

@@ -1,12 +1,12 @@
 //! OpenAI protocol conversion implementation.
 
-use crate::agent::llm::api::models::{
-    ChatMessage as OpenAIChatMessage, Content as OpenAIContent,
-    ContentPart as OpenAIContentPart, Role as OpenAIRole, Tool, ToolCall as OpenAIToolCall,
-};
-use crate::agent::llm::protocol::{FromProvider, ProtocolResult, ToProvider};
 use crate::agent::core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
 use crate::agent::core::{Message, Role};
+use crate::agent::llm::api::models::{
+    ChatMessage as OpenAIChatMessage, Content as OpenAIContent, ContentPart as OpenAIContentPart,
+    Role as OpenAIRole, Tool, ToolCall as OpenAIToolCall,
+};
+use crate::agent::llm::protocol::{FromProvider, ProtocolResult, ToProvider};
 
 /// OpenAI protocol converter.
 pub struct OpenAIProtocol;
@@ -36,12 +36,7 @@ impl FromProvider<OpenAIChatMessage> for Message {
 
         let tool_calls = msg
             .tool_calls
-            .map(|calls| {
-                calls
-                    .into_iter()
-                    .map(ToolCall::from_provider)
-                    .collect()
-            })
+            .map(|calls| calls.into_iter().map(ToolCall::from_provider).collect())
             .transpose()?;
 
         Ok(Message {
@@ -190,9 +185,9 @@ impl OpenAIExt for Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::llm::api::models::{FunctionCall as OpenAIFunctionCall, Role as OpenAIRole};
     use crate::agent::core::tools::FunctionCall;
     use crate::agent::core::Role;
+    use crate::agent::llm::api::models::{FunctionCall as OpenAIFunctionCall, Role as OpenAIRole};
 
     #[test]
     fn test_openai_to_internal_simple_message() {
@@ -308,7 +303,10 @@ mod tests {
         // Internal → OpenAI
         let roundtrip: Tool = internal_schema.to_provider().unwrap();
         assert_eq!(roundtrip.function.name, "search");
-        assert_eq!(roundtrip.function.description, Some("Search the web".to_string()));
+        assert_eq!(
+            roundtrip.function.description,
+            Some("Search the web".to_string())
+        );
     }
 
     #[test]

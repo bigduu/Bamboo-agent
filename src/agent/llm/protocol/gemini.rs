@@ -22,9 +22,9 @@
 //! }
 //! ```
 
-use crate::agent::llm::protocol::{FromProvider, ProtocolError, ProtocolResult, ToProvider};
 use crate::agent::core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
 use crate::agent::core::{Message, Role};
+use crate::agent::llm::protocol::{FromProvider, ProtocolError, ProtocolResult, ToProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -145,8 +145,7 @@ impl FromProvider<GeminiContent> for Message {
                     tool_type: "function".to_string(),
                     function: FunctionCall {
                         name: func_call.name,
-                        arguments: serde_json::to_string(&func_call.args)
-                            .unwrap_or_default(),
+                        arguments: serde_json::to_string(&func_call.args).unwrap_or_default(),
                     },
                 });
             }
@@ -155,8 +154,7 @@ impl FromProvider<GeminiContent> for Message {
                 // Tool response becomes a tool message
                 return Ok(Message::tool_result(
                     format!("gemini_tool_{}", func_response.name),
-                    serde_json::to_string(&func_response.response)
-                        .unwrap_or_default(),
+                    serde_json::to_string(&func_response.response).unwrap_or_default(),
                 ));
             }
         }
@@ -167,7 +165,11 @@ impl FromProvider<GeminiContent> for Message {
             id: String::new(),
             role,
             content: content_text,
-            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
             tool_call_id: None,
             created_at: chrono::Utc::now(),
         })
@@ -304,7 +306,10 @@ impl ToProvider<GeminiContent> for Message {
             });
         }
 
-        Ok(GeminiContent { role: role.to_string(), parts })
+        Ok(GeminiContent {
+            role: role.to_string(),
+            parts,
+        })
     }
 }
 
@@ -481,10 +486,7 @@ mod tests {
 
     #[test]
     fn test_system_message_extraction() {
-        let messages = vec![
-            Message::system("You are helpful"),
-            Message::user("Hello"),
-        ];
+        let messages = vec![Message::system("You are helpful"), Message::user("Hello")];
 
         let request: GeminiRequest = messages.to_provider().unwrap();
 

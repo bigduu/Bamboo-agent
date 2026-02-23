@@ -4,7 +4,7 @@
 
 #[cfg(test)]
 mod tests {
-    use bamboo_agent::commands::workflows::{save_workflow, delete_workflow};
+    use bamboo_agent::commands::workflows::{delete_workflow, save_workflow};
     use bamboo_agent::core::paths::workflows_dir;
     use std::fs;
     use tempfile::TempDir;

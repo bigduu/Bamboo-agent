@@ -59,8 +59,7 @@ impl ToolRegistry {
                 tool_name
             )));
         }
-        self.guides
-            .insert(tool_name.to_string(), Arc::new(guide));
+        self.guides.insert(tool_name.to_string(), Arc::new(guide));
         Ok(())
     }
 
@@ -200,7 +199,9 @@ mod tests {
             "category": "FileReading"
         }"#;
 
-        registry.register_guide_from_json("read_file", json_spec).unwrap();
+        registry
+            .register_guide_from_json("read_file", json_spec)
+            .unwrap();
 
         let guide = registry.get_guide("read_file").unwrap();
         assert_eq!(guide.when_to_use(), "Read small files");

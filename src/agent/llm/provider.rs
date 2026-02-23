@@ -1,5 +1,5 @@
-use crate::agent::llm::types::LLMChunk;
 use crate::agent::core::{tools::ToolSchema, Message};
+use crate::agent::llm::types::LLMChunk;
 use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
@@ -80,7 +80,10 @@ mod tests {
     fn provider_chat_stream_requires_model_parameter() {
         // This is a documentation test
         // The actual enforcement happens at compile time
-        assert!(true, "Model parameter requirement is enforced by trait signature");
+        assert!(
+            true,
+            "Model parameter requirement is enforced by trait signature"
+        );
     }
 
     /// Test: LLMProvider trait documentation states model is required

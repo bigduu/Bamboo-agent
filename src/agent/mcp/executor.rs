@@ -20,7 +20,7 @@ impl McpToolExecutor {
     }
 
     /// Convert MCP result to string representation
-    fn format_result_content(content: &[ McpContentItem]) -> String {
+    fn format_result_content(content: &[McpContentItem]) -> String {
         content
             .iter()
             .map(|item| match item {
@@ -43,9 +43,7 @@ impl McpToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for McpToolExecutor {
-    async fn execute(&self,
-        call: &ToolCall,
-    ) -> std::result::Result<ToolResult, ToolError> {
+    async fn execute(&self, call: &ToolCall) -> std::result::Result<ToolResult, ToolError> {
         let tool_name = &call.function.name;
 
         // Lookup the tool alias
@@ -65,10 +63,8 @@ impl ToolExecutor for McpToolExecutor {
         );
 
         // Parse arguments
-        let args: serde_json::Value =
-            serde_json::from_str(&call.function.arguments).map_err(|e| {
-                ToolError::InvalidArguments(format!("Invalid JSON: {}", e))
-            })?;
+        let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
+            .map_err(|e| ToolError::InvalidArguments(format!("Invalid JSON: {}", e)))?;
 
         // Execute via manager
         match self
@@ -93,9 +89,10 @@ impl ToolExecutor for McpToolExecutor {
                     })
                 }
             }
-            Err(McpError::ServerNotFound(id)) => {
-                Err(ToolError::NotFound(format!("MCP server '{}' not found", id)))
-            }
+            Err(McpError::ServerNotFound(id)) => Err(ToolError::NotFound(format!(
+                "MCP server '{}' not found",
+                id
+            ))),
             Err(McpError::ToolNotFound(name)) => {
                 Err(ToolError::NotFound(format!("Tool '{}' not found", name)))
             }
@@ -134,19 +131,14 @@ pub struct CompositeToolExecutor {
 }
 
 impl CompositeToolExecutor {
-    pub fn new(
-        builtin: Arc<dyn ToolExecutor>,
-        mcp: Arc<dyn ToolExecutor>,
-    ) -> Self {
+    pub fn new(builtin: Arc<dyn ToolExecutor>, mcp: Arc<dyn ToolExecutor>) -> Self {
         Self { builtin, mcp }
     }
 }
 
 #[async_trait]
 impl ToolExecutor for CompositeToolExecutor {
-    async fn execute(&self,
-        call: &ToolCall,
-    ) -> std::result::Result<ToolResult, ToolError> {
+    async fn execute(&self, call: &ToolCall) -> std::result::Result<ToolResult, ToolError> {
         // Try built-in first
         match self.builtin.execute(call).await {
             Ok(result) => return Ok(result),
@@ -170,8 +162,8 @@ impl ToolExecutor for CompositeToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::mcp::types::McpContentItem;
     use crate::agent::core::tools::{FunctionCall, FunctionSchema};
+    use crate::agent::mcp::types::McpContentItem;
     use mockall::mock;
     use mockall::predicate::*;
 
@@ -286,10 +278,7 @@ mod tests {
         mock_builtin.expect_list_tools().returning(|| vec![]);
         mock_mcp.expect_list_tools().returning(|| vec![]);
 
-        let composite = CompositeToolExecutor::new(
-            Arc::new(mock_builtin),
-            Arc::new(mock_mcp),
-        );
+        let composite = CompositeToolExecutor::new(Arc::new(mock_builtin), Arc::new(mock_mcp));
 
         let call = create_test_tool_call("test_tool", "{}");
         let result = composite.execute(&call).await.unwrap();
@@ -322,10 +311,7 @@ mod tests {
             }]
         });
 
-        let composite = CompositeToolExecutor::new(
-            Arc::new(mock_builtin),
-            Arc::new(mock_mcp),
-        );
+        let composite = CompositeToolExecutor::new(Arc::new(mock_builtin), Arc::new(mock_mcp));
 
         let call = create_test_tool_call("test_tool", "{}");
         let result = composite.execute(&call).await.unwrap();
@@ -339,9 +325,9 @@ mod tests {
         let mock_mcp = MockToolExecutor::new();
 
         // Built-in returns error (not NotFound), should propagate
-        mock_builtin.expect_execute().returning(|_| {
-            Err(ToolError::Execution("Built-in error".to_string()))
-        });
+        mock_builtin
+            .expect_execute()
+            .returning(|_| Err(ToolError::Execution("Built-in error".to_string())));
 
         mock_builtin.expect_list_tools().returning(|| {
             vec![ToolSchema {
@@ -354,10 +340,7 @@ mod tests {
             }]
         });
 
-        let composite = CompositeToolExecutor::new(
-            Arc::new(mock_builtin),
-            Arc::new(mock_mcp),
-        );
+        let composite = CompositeToolExecutor::new(Arc::new(mock_builtin), Arc::new(mock_mcp));
 
         let call = create_test_tool_call("test_tool", "{}");
         let result = composite.execute(&call).await;
@@ -395,10 +378,7 @@ mod tests {
             }]
         });
 
-        let composite = CompositeToolExecutor::new(
-            Arc::new(mock_builtin),
-            Arc::new(mock_mcp),
-        );
+        let composite = CompositeToolExecutor::new(Arc::new(mock_builtin), Arc::new(mock_mcp));
 
         let tools = composite.list_tools();
         assert_eq!(tools.len(), 2);

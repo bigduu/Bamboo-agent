@@ -1,7 +1,7 @@
-use crate::web_service::{error::AppError, server::AppState};
-use actix_web::{delete, get, post, web, HttpResponse};
 use crate::core::keyword_masking::{KeywordEntry, KeywordMaskingConfig};
 use crate::core::ProxyAuth;
+use crate::web_service::{error::AppError, server::AppState};
+use actix_web::{delete, get, post, web, HttpResponse};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -123,9 +123,8 @@ fn is_safe_workflow_name(name: &str) -> bool {
     let upper = name.to_uppercase();
     let stem = upper.split('.').next().unwrap_or(&upper);
     let reserved = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
-        "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
-        "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     if reserved.contains(&stem) {
         return false;
@@ -341,9 +340,7 @@ fn setup_status_message(
 }
 
 #[get("/bamboo/setup/status")]
-pub async fn get_setup_status(
-    app_state: web::Data<AppState>,
-) -> Result<HttpResponse, AppError> {
+pub async fn get_setup_status(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let path = config_path(&app_state);
     let config = match fs::read_to_string(&path).await {
         Ok(content) => serde_json::from_str::<Value>(&content)?,
@@ -367,9 +364,7 @@ pub async fn get_setup_status(
 }
 
 #[post("/bamboo/setup/complete")]
-pub async fn mark_setup_complete(
-    app_state: web::Data<AppState>,
-) -> Result<HttpResponse, AppError> {
+pub async fn mark_setup_complete(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let path = config_path(&app_state);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
@@ -540,7 +535,9 @@ pub async fn set_proxy_auth(
 
     // Reload provider to apply new proxy settings
     app_state.reload_provider().await.map_err(|e| {
-        AppError::InternalError(anyhow::anyhow!("Failed to reload provider after updating proxy auth: {e}"))
+        AppError::InternalError(anyhow::anyhow!(
+            "Failed to reload provider after updating proxy auth: {e}"
+        ))
     })?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
@@ -589,7 +586,9 @@ pub async fn reset_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpR
     // Try to delete config.json if it exists
     match fs::try_exists(&path).await {
         Ok(true) => {
-            fs::remove_file(&path).await.map_err(AppError::StorageError)?;
+            fs::remove_file(&path)
+                .await
+                .map_err(AppError::StorageError)?;
         }
         Ok(false) => {
             // Config file doesn't exist, nothing to do
@@ -611,10 +610,13 @@ pub async fn get_anthropic_model_mapping(
 #[post("/bamboo/anthropic-model-mapping")]
 pub async fn set_anthropic_model_mapping(
     app_state: web::Data<AppState>,
-    payload: web::Json<crate::web_service::services::anthropic_model_mapping_service::AnthropicModelMapping>,
+    payload: web::Json<
+        crate::web_service::services::anthropic_model_mapping_service::AnthropicModelMapping,
+    >,
 ) -> Result<HttpResponse, AppError> {
     use crate::web_service::services::anthropic_model_mapping_service::save_anthropic_model_mapping;
-    let mapping = save_anthropic_model_mapping(&app_state.app_data_dir, payload.into_inner()).await?;
+    let mapping =
+        save_anthropic_model_mapping(&app_state.app_data_dir, payload.into_inner()).await?;
     Ok(HttpResponse::Ok().json(mapping))
 }
 
@@ -755,9 +757,7 @@ struct UpdateProviderRequest {
 
 /// Get current provider configuration
 #[get("/bamboo/settings/provider")]
-pub async fn get_provider_config(
-    app_state: web::Data<AppState>,
-) -> Result<HttpResponse, AppError> {
+pub async fn get_provider_config(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let path = config_path(&app_state);
 
     let config_value = match fs::read_to_string(&path).await {
@@ -768,8 +768,16 @@ pub async fn get_provider_config(
             let mut needs_save = false;
 
             // Migration 1: Move root-level "model" field to provider-specific config
-            if let Some(old_model) = config.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()) {
-                let provider = config.get("provider").and_then(|p| p.as_str()).unwrap_or("copilot").to_string();
+            if let Some(old_model) = config
+                .get("model")
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+            {
+                let provider = config
+                    .get("provider")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("copilot")
+                    .to_string();
 
                 // Only migrate for non-Copilot providers
                 if provider != "copilot" {
@@ -778,7 +786,11 @@ pub async fn get_provider_config(
                             // Only set if not already present
                             if provider_config.get("model").is_none() {
                                 provider_config["model"] = Value::String(old_model.clone());
-                                log::info!("Migrated root-level model '{}' to provider '{}' config", old_model, provider);
+                                log::info!(
+                                    "Migrated root-level model '{}' to provider '{}' config",
+                                    old_model,
+                                    provider
+                                );
 
                                 // Remove root-level model field
                                 if let Some(obj) = config.as_object_mut() {
@@ -803,7 +815,9 @@ pub async fn get_provider_config(
                         // Only set if not already present
                         if copilot_config.get("headless_auth").is_none() {
                             copilot_config["headless_auth"] = Value::Bool(headless_auth);
-                            log::info!("Migrated root-level headless_auth to providers.copilot config");
+                            log::info!(
+                                "Migrated root-level headless_auth to providers.copilot config"
+                            );
 
                             // Remove root-level headless_auth field
                             if let Some(obj) = config.as_object_mut() {
@@ -910,7 +924,10 @@ pub async fn update_provider_config(
 
     // Update provider
     if let Some(obj) = existing_config.as_object_mut() {
-        obj.insert("provider".to_string(), Value::String(payload.provider.clone()));
+        obj.insert(
+            "provider".to_string(),
+            Value::String(payload.provider.clone()),
+        );
 
         // Merge providers config
         if let Some(existing_providers) = obj.get_mut("providers") {
@@ -924,10 +941,15 @@ pub async fn update_provider_config(
                                     if key_str.contains("***") || key_str.contains("...") {
                                         // This is a masked key, preserve the existing one
                                         if let Some(existing_provider) = existing_obj.get(key) {
-                                            if let Some(existing_key) = existing_provider.get("api_key") {
+                                            if let Some(existing_key) =
+                                                existing_provider.get("api_key")
+                                            {
                                                 let mut merged = value.clone();
                                                 if let Some(merged_obj) = merged.as_object_mut() {
-                                                    merged_obj.insert("api_key".to_string(), existing_key.clone());
+                                                    merged_obj.insert(
+                                                        "api_key".to_string(),
+                                                        existing_key.clone(),
+                                                    );
                                                 }
                                                 existing_obj.insert(key.clone(), merged);
                                                 continue;
@@ -974,7 +996,10 @@ pub async fn update_provider_config(
 
     // Reload provider to apply new configuration
     if let Err(e) = app_state.reload_provider().await {
-        log::error!("Failed to reload provider after updating configuration: {}", e);
+        log::error!(
+            "Failed to reload provider after updating configuration: {}",
+            e
+        );
         return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
             "success": false,
             "error": format!("Configuration saved but failed to reload provider: {}", e)
@@ -1009,7 +1034,9 @@ pub async fn fetch_provider_models(
             config
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(AppError::NotFound("Configuration file not found".to_string()));
+            return Err(AppError::NotFound(
+                "Configuration file not found".to_string(),
+            ));
         }
         Err(err) => return Err(AppError::StorageError(err)),
     };
@@ -1030,9 +1057,7 @@ pub async fn fetch_provider_models(
         return Err(AppError::BadRequest("API key not configured".to_string()));
     }
 
-    let base_url = provider_config
-        .get("base_url")
-        .and_then(|v| v.as_str());
+    let base_url = provider_config.get("base_url").and_then(|v| v.as_str());
 
     // Fetch models from the API
     let models = fetch_models_from_api(provider_type, api_key, base_url).await?;
@@ -1072,7 +1097,10 @@ async fn fetch_models_from_api(
                 let base = base.trim_end_matches('/');
                 format!("{}?key={}", base, api_key)
             } else {
-                format!("https://generativelanguage.googleapis.com/v1beta/models?key={}", api_key)
+                format!(
+                    "https://generativelanguage.googleapis.com/v1beta/models?key={}",
+                    api_key
+                )
             };
             (url, String::new(), true) // Gemini uses query param for auth
         }
@@ -1122,7 +1150,12 @@ async fn fetch_models_from_api(
     let models: Vec<String> = if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
         // Standard OpenAI format
         data.iter()
-            .filter_map(|model| model.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()))
+            .filter_map(|model| {
+                model
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect()
     } else if let Some(models_arr) = json.get("models").and_then(|m| m.as_array()) {
         // Alternative format: { models: [...] } - Gemini uses this

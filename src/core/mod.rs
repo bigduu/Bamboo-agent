@@ -14,7 +14,9 @@ pub mod paths;
 pub mod todo;
 
 // Re-export commonly used types
-pub use config::{Config, ProxyAuth, ProviderConfigs, OpenAIConfig, AnthropicConfig, GeminiConfig, CopilotConfig};
+pub use config::{
+    AnthropicConfig, Config, CopilotConfig, GeminiConfig, OpenAIConfig, ProviderConfigs, ProxyAuth,
+};
 pub use encryption::{decrypt, encrypt};
 pub use keyword_masking::{KeywordEntry, KeywordMaskingConfig, MatchType};
 pub use paths::*;

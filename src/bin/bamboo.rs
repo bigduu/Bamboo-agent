@@ -2,8 +2,8 @@
 //!
 //! Standalone HTTP server for Bamboo
 
-use clap::{Parser, Subcommand};
 use bamboo_agent::{BambooBuilder, BambooConfig};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -62,9 +62,7 @@ async fn main() {
             static_dir,
             workers,
         } => {
-            let mut builder = BambooBuilder::new()
-                .port(port)
-                .bind(&bind);
+            let mut builder = BambooBuilder::new().port(port).bind(&bind);
 
             if let Some(dir) = data_dir {
                 builder = builder.data_dir(dir);

@@ -55,27 +55,28 @@ impl Tool for AskUserTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        let question = args["question"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("Missing 'question' parameter".to_string()))?;
+        let question = args["question"].as_str().ok_or_else(|| {
+            ToolError::InvalidArguments("Missing 'question' parameter".to_string())
+        })?;
 
-        let options_array = args["options"]
-            .as_array()
-            .ok_or_else(|| ToolError::InvalidArguments("Missing 'options' parameter".to_string()))?;
+        let options_array = args["options"].as_array().ok_or_else(|| {
+            ToolError::InvalidArguments("Missing 'options' parameter".to_string())
+        })?;
 
         if options_array.len() < 2 || options_array.len() > 6 {
-            return Err(ToolError::InvalidArguments(
-                format!("'options' must contain 2 to 6 items, got {}", options_array.len())
-            ));
+            return Err(ToolError::InvalidArguments(format!(
+                "'options' must contain 2 to 6 items, got {}",
+                options_array.len()
+            )));
         }
 
         let options: Vec<String> = options_array
             .iter()
             .enumerate()
             .map(|(idx, opt)| {
-                opt.as_str()
-                    .map(String::from)
-                    .ok_or_else(|| ToolError::InvalidArguments(format!("Option at index {} is not a string", idx)))
+                opt.as_str().map(String::from).ok_or_else(|| {
+                    ToolError::InvalidArguments(format!("Option at index {} is not a string", idx))
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
 

@@ -22,10 +22,7 @@ pub enum MessageContent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
-    #[serde(
-        default = "generate_id",
-        skip_serializing_if = "String::is_empty"
-    )]
+    #[serde(default = "generate_id", skip_serializing_if = "String::is_empty")]
     pub id: String,
     pub role: Role,
     pub content: String,
@@ -194,7 +191,12 @@ impl Session {
     }
 
     /// Update a todo item status
-    pub fn update_todo_item(&mut self, item_id: &str, status: TodoItemStatus, notes: Option<&str>) -> Result<String, String> {
+    pub fn update_todo_item(
+        &mut self,
+        item_id: &str,
+        status: TodoItemStatus,
+        notes: Option<&str>,
+    ) -> Result<String, String> {
         if let Some(ref mut todo_list) = self.todo_list {
             if let Some(item) = todo_list.items.iter_mut().find(|i| i.id == item_id) {
                 item.status = status;
@@ -217,7 +219,9 @@ impl Session {
 
     /// Format todo list for display in system prompt
     pub fn format_todo_list_for_prompt(&self) -> String {
-        self.todo_list.as_ref().map_or_else(String::new, |list| list.format_for_prompt())
+        self.todo_list
+            .as_ref()
+            .map_or_else(String::new, |list| list.format_for_prompt())
     }
 
     /// Set a pending question when waiting for user response

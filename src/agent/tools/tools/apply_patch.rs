@@ -17,15 +17,9 @@ pub enum PatchOperation {
         new_content: String,
     },
     /// Insert content at specific line
-    Insert {
-        line: usize,
-        content: String,
-    },
+    Insert { line: usize, content: String },
     /// Delete specific line range
-    Delete {
-        start_line: usize,
-        end_line: usize,
-    },
+    Delete { start_line: usize, end_line: usize },
 }
 
 impl ApplyPatchTool {
@@ -203,9 +197,9 @@ impl Tool for ApplyPatchTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidArguments("Missing 'mode' parameter".to_string()))?;
 
-        let new_content = args["new_content"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("Missing 'new_content' parameter".to_string()))?;
+        let new_content = args["new_content"].as_str().ok_or_else(|| {
+            ToolError::InvalidArguments("Missing 'new_content' parameter".to_string())
+        })?;
 
         let result = match mode {
             "content_replace" => {
@@ -217,18 +211,25 @@ impl Tool for ApplyPatchTool {
                 Self::apply_patch(path, old_content, new_content).await
             }
             "line_replace" => {
-                let start_line = args["start_line"].as_u64().map(|n| n as usize).ok_or_else(|| {
-                    ToolError::InvalidArguments(
-                        "'start_line' required for line_replace mode".to_string(),
-                    )
-                })?;
+                let start_line =
+                    args["start_line"]
+                        .as_u64()
+                        .map(|n| n as usize)
+                        .ok_or_else(|| {
+                            ToolError::InvalidArguments(
+                                "'start_line' required for line_replace mode".to_string(),
+                            )
+                        })?;
                 let end_line = args["end_line"]
                     .as_u64()
                     .map(|n| n as usize)
                     .unwrap_or(start_line);
                 Self::replace_lines(path, start_line, end_line, new_content).await
             }
-            _ => Err(format!("Unknown mode: {}. Use 'content_replace' or 'line_replace'", mode)),
+            _ => Err(format!(
+                "Unknown mode: {}. Use 'content_replace' or 'line_replace'",
+                mode
+            )),
         };
 
         match result {

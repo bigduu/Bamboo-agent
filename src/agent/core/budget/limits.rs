@@ -116,16 +116,18 @@ impl ModelLimitsRegistry {
         }
 
         let content = tokio::fs::read_to_string(&path).await?;
-        let limits: Vec<ModelLimit> = serde_json::from_str(&content).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let limits: Vec<ModelLimit> = serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
         for limit in limits {
-            self.user_limits
-                .insert(limit.model_pattern.clone(), limit);
+            self.user_limits.insert(limit.model_pattern.clone(), limit);
         }
 
-        tracing::info!("Loaded {} user model limits from {:?}", self.user_limits.len(), path);
+        tracing::info!(
+            "Loaded {} user model limits from {:?}",
+            self.user_limits.len(),
+            path
+        );
         Ok(())
     }
 
@@ -159,7 +161,8 @@ impl ModelLimitsRegistry {
 
         // Find the best partial match from user limits
         // Sort by pattern length (longer = more specific) for deterministic selection
-        let best_user_match = self.user_limits
+        let best_user_match = self
+            .user_limits
             .iter()
             .filter(|(pattern, _)| model.contains(*pattern) || pattern.contains(model))
             .max_by_key(|(pattern, _)| pattern.len())
@@ -207,9 +210,8 @@ impl ModelLimitsRegistry {
         }
 
         let limits: Vec<&ModelLimit> = self.user_limits.values().collect();
-        let content = serde_json::to_string_pretty(&limits).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let content = serde_json::to_string_pretty(&limits)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         tokio::fs::write(&path, content).await?;
 
         Ok(())
@@ -278,7 +280,9 @@ mod tests {
     fn registry_finds_builtin_by_partial_match() {
         let registry = ModelLimitsRegistry::new();
         // "gpt-4o-mini" contains "gpt-4o"
-        let limit = registry.get("gpt-4o-mini").expect("Should find gpt-4o-mini");
+        let limit = registry
+            .get("gpt-4o-mini")
+            .expect("Should find gpt-4o-mini");
         assert_eq!(limit.max_context_tokens, 128_000);
     }
 
@@ -294,7 +298,9 @@ mod tests {
         let mut registry = ModelLimitsRegistry::new();
         registry.add_limit(ModelLimit::new("gpt-4o", 64_000)); // Override with smaller limit
 
-        let limit = registry.get("gpt-4o").expect("Should find overridden limit");
+        let limit = registry
+            .get("gpt-4o")
+            .expect("Should find overridden limit");
         assert_eq!(limit.max_context_tokens, 64_000);
     }
 

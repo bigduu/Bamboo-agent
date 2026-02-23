@@ -128,7 +128,11 @@ mod tests {
 
         // "Hello, world!" = 13 chars -> 13/4 * 1.1 ≈ 3.57 -> 4 tokens
         let tokens = counter.count_text("Hello, world!");
-        assert!(tokens >= 3 && tokens <= 5, "Expected ~4 tokens, got {}", tokens);
+        assert!(
+            tokens >= 3 && tokens <= 5,
+            "Expected ~4 tokens, got {}",
+            tokens
+        );
     }
 
     #[test]
@@ -144,7 +148,11 @@ mod tests {
 
         let tokens = counter.count_message(&message);
         // Should include content + metadata overhead (10)
-        assert!(tokens >= 10, "Expected at least 10 tokens (content + metadata), got {}", tokens);
+        assert!(
+            tokens >= 10,
+            "Expected at least 10 tokens (content + metadata), got {}",
+            tokens
+        );
     }
 
     #[test]

@@ -9,9 +9,9 @@
 //! data: [DONE]
 //! ```
 
+use crate::agent::core::tools::{FunctionCall, ToolCall};
 use crate::agent::llm::provider::{LLMError, Result};
 use crate::agent::llm::types::LLMChunk;
-use crate::agent::core::tools::{FunctionCall, ToolCall};
 use serde_json::Value;
 
 /// Stateful parser for Gemini SSE streaming events.
@@ -70,8 +70,9 @@ pub fn parse_gemini_sse_event(
     }
 
     // Parse the JSON response
-    let value: Value = serde_json::from_str(data)
-        .map_err(|e| LLMError::Stream(format!("Failed to parse Gemini SSE data: {}: {}", e, data)))?;
+    let value: Value = serde_json::from_str(data).map_err(|e| {
+        LLMError::Stream(format!("Failed to parse Gemini SSE data: {}: {}", e, data))
+    })?;
 
     // Check for error in the response
     if let Some(error) = value.get("error") {
@@ -86,7 +87,9 @@ pub fn parse_gemini_sse_event(
     let candidates = value
         .get("candidates")
         .and_then(|c| c.as_array())
-        .ok_or_else(|| LLMError::Stream(format!("Missing candidates in Gemini response: {}", data)))?;
+        .ok_or_else(|| {
+            LLMError::Stream(format!("Missing candidates in Gemini response: {}", data))
+        })?;
 
     if candidates.is_empty() {
         return Ok(None);
@@ -134,7 +137,12 @@ pub fn parse_gemini_sse_event(
         let name = function_call
             .get("name")
             .and_then(|n| n.as_str())
-            .ok_or_else(|| LLMError::Stream(format!("Missing function name in Gemini response: {}", data)))?;
+            .ok_or_else(|| {
+                LLMError::Stream(format!(
+                    "Missing function name in Gemini response: {}",
+                    data
+                ))
+            })?;
 
         let args = function_call
             .get("args")

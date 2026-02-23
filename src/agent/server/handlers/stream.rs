@@ -4,8 +4,8 @@ use chrono::Utc;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::agent::server::state::{AgentRunner, AgentStatus, AppState};
 use crate::agent::loop_module::{run_agent_loop_with_config, AgentLoopConfig};
+use crate::agent::server::state::{AgentRunner, AgentStatus, AppState};
 
 /// DEPRECATED: Use POST /execute + GET /events instead
 /// This handler maintains backward compatibility by combining execute + events
@@ -71,10 +71,17 @@ pub async fn handler(
         // Check if there's already a running runner for this session
         if let Some(runner) = runners.get(&session_id) {
             if matches!(runner.status, AgentStatus::Running) {
-                log::debug!("[{}] Runner already running, subscribing to events", session_id);
+                log::debug!(
+                    "[{}] Runner already running, subscribing to events",
+                    session_id
+                );
                 return subscribe_to_runner(runner.clone(), session_id);
             }
-            log::debug!("[{}] Existing runner with status {:?}, will restart", session_id, runner.status);
+            log::debug!(
+                "[{}] Existing runner with status {:?}, will restart",
+                session_id,
+                runner.status
+            );
         }
 
         // Remove stale runner and insert new one atomically
@@ -90,7 +97,10 @@ pub async fn handler(
         (broadcast_tx, cancel_token)
     };
 
-    log::info!("[{}] Starting agent execution (legacy stream handler)", session_id);
+    log::info!(
+        "[{}] Starting agent execution (legacy stream handler)",
+        session_id
+    );
 
     // Create mpsc channel for agent loop
     let (mpsc_tx, mut mpsc_rx) = mpsc::channel::<crate::agent::core::AgentEvent>(100);
@@ -171,13 +181,17 @@ pub async fn handler(
         if let Err(ref e) = result {
             if e.to_string().contains("cancelled") {
                 // Emit a specific cancellation event so SSE streams can close cleanly
-                let _ = mpsc_tx.send(crate::agent::core::AgentEvent::Error {
-                    message: "Agent execution cancelled by user".to_string(),
-                }).await;
+                let _ = mpsc_tx
+                    .send(crate::agent::core::AgentEvent::Error {
+                        message: "Agent execution cancelled by user".to_string(),
+                    })
+                    .await;
             } else {
-                let _ = mpsc_tx.send(crate::agent::core::AgentEvent::Error {
-                    message: e.to_string(),
-                }).await;
+                let _ = mpsc_tx
+                    .send(crate::agent::core::AgentEvent::Error {
+                        message: e.to_string(),
+                    })
+                    .await;
             }
         }
 
@@ -209,7 +223,10 @@ pub async fn handler(
             tokens.remove(&session_id_clone);
         }
 
-        log::info!("[{}] Agent execution completed (legacy stream)", session_id_clone);
+        log::info!(
+            "[{}] Agent execution completed (legacy stream)",
+            session_id_clone
+        );
     });
 
     // Subscribe to the broadcast channel
@@ -245,10 +262,7 @@ pub async fn handler(
 }
 
 /// Subscribe to an existing runner's broadcast channel
-fn subscribe_to_runner(
-    runner: AgentRunner,
-    _session_id: String,
-) -> HttpResponse {
+fn subscribe_to_runner(runner: AgentRunner, _session_id: String) -> HttpResponse {
     let mut receiver = runner.event_sender.subscribe();
 
     HttpResponse::Ok()

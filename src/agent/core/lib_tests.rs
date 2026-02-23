@@ -2,7 +2,9 @@
 mod tests {
     use super::*;
     use crate::agent::core::agent::{Message, Role, Session};
-    use crate::agent::core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolResult, ToolSchema};
+    use crate::agent::core::tools::{
+        FunctionCall, FunctionSchema, ToolCall, ToolResult, ToolSchema,
+    };
 
     #[test]
     fn test_session_creation() {
@@ -110,12 +112,15 @@ mod tests {
         assert_eq!(parsed["tool_call_id"], "call_yyaeEH9yC4MEL0kc5fWJwOZv");
 
         // Ensure tool_call_id field exists with correct name
-        assert!(parsed.get("tool_call_id").is_some(), "tool_call_id field should exist");
+        assert!(
+            parsed.get("tool_call_id").is_some(),
+            "tool_call_id field should exist"
+        );
     }
 
     #[test]
     fn test_assistant_with_tool_calls_serialization() {
-        use crate::agent::core::tools::{ToolCall, FunctionCall};
+        use crate::agent::core::tools::{FunctionCall, ToolCall};
 
         let tool_calls = vec![ToolCall {
             id: "call_yyaeEH9yC4MEL0kc5fWJwOZv".to_string(),
@@ -132,27 +137,40 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["role"], "assistant");
-        assert!(parsed.get("tool_calls").is_some(), "tool_calls field should exist");
+        assert!(
+            parsed.get("tool_calls").is_some(),
+            "tool_calls field should exist"
+        );
     }
 
     #[test]
     fn test_session_metadata_serialization() {
         let mut session = Session::new("test-metadata", "test-model");
-        session.metadata.insert("model".to_string(), "gpt-5".to_string());
-        session.metadata.insert("key".to_string(), "value".to_string());
+        session
+            .metadata
+            .insert("model".to_string(), "gpt-5".to_string());
+        session
+            .metadata
+            .insert("key".to_string(), "value".to_string());
 
         let json = serde_json::to_string(&session).unwrap();
         println!("Serialized session with metadata: {}", json);
 
         // Verify metadata is present in JSON
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed.get("metadata").is_some(), "metadata field should exist");
+        assert!(
+            parsed.get("metadata").is_some(),
+            "metadata field should exist"
+        );
         assert_eq!(parsed["metadata"]["model"], "gpt-5");
         assert_eq!(parsed["metadata"]["key"], "value");
 
         // Deserialize and verify
         let deserialized: Session = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.metadata.get("model"), Some(&"gpt-5".to_string()));
+        assert_eq!(
+            deserialized.metadata.get("model"),
+            Some(&"gpt-5".to_string())
+        );
         assert_eq!(deserialized.metadata.get("key"), Some(&"value".to_string()));
     }
 
@@ -233,8 +251,12 @@ mod tests {
     fn test_session_model_and_metadata_together() {
         // Test that model and metadata can coexist
         let mut session = Session::new("test-session", "gpt-4o");
-        session.metadata.insert("temperature".to_string(), "0.7".to_string());
-        session.metadata.insert("max_tokens".to_string(), "4096".to_string());
+        session
+            .metadata
+            .insert("temperature".to_string(), "0.7".to_string());
+        session
+            .metadata
+            .insert("max_tokens".to_string(), "4096".to_string());
 
         let json = serde_json::to_string(&session).unwrap();
         println!("Serialized session with model and metadata: {}", json);
@@ -246,6 +268,9 @@ mod tests {
 
         let deserialized: Session = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.model, "gpt-4o");
-        assert_eq!(deserialized.metadata.get("temperature"), Some(&"0.7".to_string()));
+        assert_eq!(
+            deserialized.metadata.get("temperature"),
+            Some(&"0.7".to_string())
+        );
     }
 }

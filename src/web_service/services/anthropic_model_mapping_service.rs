@@ -10,7 +10,9 @@ pub struct AnthropicModelMapping {
     pub mappings: HashMap<String, String>,
 }
 
-pub async fn load_anthropic_model_mapping(data_dir: &PathBuf) -> Result<AnthropicModelMapping, AppError> {
+pub async fn load_anthropic_model_mapping(
+    data_dir: &PathBuf,
+) -> Result<AnthropicModelMapping, AppError> {
     let path = data_dir.join("anthropic-model-mapping.json");
     match fs::read(&path).await {
         Ok(content) => {

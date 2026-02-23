@@ -54,7 +54,8 @@ pub async fn list_servers(state: web::Data<AppState>) -> impl Responder {
                     .mcp_manager
                     .list_servers()
                     .into_iter()
-                    .find(|s| s == &id).map(|_| id.clone());
+                    .find(|s| s == &id)
+                    .map(|_| id.clone());
 
                 ServerInfo {
                     id: id.clone(),
@@ -73,10 +74,7 @@ pub async fn list_servers(state: web::Data<AppState>) -> impl Responder {
 }
 
 /// Get MCP server details by ID
-pub async fn get_server(
-    state: web::Data<AppState>,
-    path: web::Path<String>,
-) -> impl Responder {
+pub async fn get_server(state: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let server_id = path.into_inner();
 
     match state.mcp_manager.get_server_info(&server_id) {
@@ -107,17 +105,13 @@ pub async fn add_server(
     let server_id = config.id.clone();
 
     match state.mcp_manager.start_server(config).await {
-        Ok(_) => {
-            HttpResponse::Created().json(serde_json::json!({
-                "message": "Server started",
-                "server_id": server_id
-            }))
-        }
-        Err(e) => {
-            HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Failed to start server: {}", e)
-            }))
-        }
+        Ok(_) => HttpResponse::Created().json(serde_json::json!({
+            "message": "Server started",
+            "server_id": server_id
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("Failed to start server: {}", e)
+        })),
     }
 }
 
@@ -136,39 +130,28 @@ pub async fn update_server(
 
     // Start with new config
     match state.mcp_manager.start_server(config).await {
-        Ok(_) => {
-            HttpResponse::Ok().json(serde_json::json!({
-                "message": "Server updated",
-                "server_id": server_id
-            }))
-        }
-        Err(e) => {
-            HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Failed to update server: {}", e)
-            }))
-        }
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({
+            "message": "Server updated",
+            "server_id": server_id
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("Failed to update server: {}", e)
+        })),
     }
 }
 
 /// Delete MCP server
-pub async fn delete_server(
-    state: web::Data<AppState>,
-    path: web::Path<String>,
-) -> impl Responder {
+pub async fn delete_server(state: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let server_id = path.into_inner();
 
     match state.mcp_manager.stop_server(&server_id).await {
-        Ok(_) => {
-            HttpResponse::Ok().json(serde_json::json!({
-                "message": "Server stopped and removed",
-                "server_id": server_id
-            }))
-        }
-        Err(e) => {
-            HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Failed to stop server: {}", e)
-            }))
-        }
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({
+            "message": "Server stopped and removed",
+            "server_id": server_id
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("Failed to stop server: {}", e)
+        })),
     }
 }
 
@@ -194,25 +177,18 @@ pub async fn disconnect_server(
     let server_id = path.into_inner();
 
     match state.mcp_manager.stop_server(&server_id).await {
-        Ok(_) => {
-            HttpResponse::Ok().json(serde_json::json!({
-                "message": "Server disconnected",
-                "server_id": server_id
-            }))
-        }
-        Err(e) => {
-            HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Failed to disconnect server: {}", e)
-            }))
-        }
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({
+            "message": "Server disconnected",
+            "server_id": server_id
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("Failed to disconnect server: {}", e)
+        })),
     }
 }
 
 /// Refresh tools from MCP server
-pub async fn refresh_tools(
-    state: web::Data<AppState>,
-    path: web::Path<String>,
-) -> impl Responder {
+pub async fn refresh_tools(state: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let server_id = path.into_inner();
 
     match state.mcp_manager.refresh_tools(&server_id).await {
@@ -229,11 +205,9 @@ pub async fn refresh_tools(
                 "tool_count": tool_count
             }))
         }
-        Err(e) => {
-            HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Failed to refresh tools: {}", e)
-            }))
-        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("Failed to refresh tools: {}", e)
+        })),
     }
 }
 

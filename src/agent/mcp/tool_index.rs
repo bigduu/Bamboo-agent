@@ -18,10 +18,7 @@ impl ToolIndex {
     }
 
     /// Generate a unique alias for a tool from a specific server
-    pub fn generate_alias(&self,
-        server_id: &str,
-        tool_name: &str,
-    ) -> String {
+    pub fn generate_alias(&self, server_id: &str, tool_name: &str) -> String {
         // Use format: mcp__{server_id}__{tool_name}
         // Sanitize server_id and tool_name (replace :: with __)
         let sanitized_server = server_id.replace("::", "__").replace(':', "_");
@@ -34,8 +31,8 @@ impl ToolIndex {
         &self,
         server_id: &str,
         tools: &[McpTool],
-        allowed_tools: &[ String],
-        denied_tools: &[ String],
+        allowed_tools: &[String],
+        denied_tools: &[String],
     ) -> Vec<ToolAlias> {
         let mut aliases = Vec::new();
         let mut tool_names = Vec::new();
@@ -68,9 +65,7 @@ impl ToolIndex {
     }
 
     /// Remove all tools from a server
-    pub fn remove_server_tools(&self,
-        server_id: &str,
-    ) {
+    pub fn remove_server_tools(&self, server_id: &str) {
         if let Some((_, tools)) = self.server_tools.remove(server_id) {
             for tool_name in tools {
                 let alias = self.generate_alias(server_id, &tool_name);
@@ -80,9 +75,7 @@ impl ToolIndex {
     }
 
     /// Lookup a tool by its alias
-    pub fn lookup(&self,
-        alias: &str,
-    ) -> Option<ToolAlias> {
+    pub fn lookup(&self, alias: &str) -> Option<ToolAlias> {
         self.aliases.get(alias).map(|entry| {
             let (server_id, original_name) = entry.value();
             ToolAlias {
@@ -94,8 +87,7 @@ impl ToolIndex {
     }
 
     /// Get all registered aliases
-    pub fn all_aliases(&self,
-    ) -> Vec<ToolAlias> {
+    pub fn all_aliases(&self) -> Vec<ToolAlias> {
         self.aliases
             .iter()
             .map(|entry| {
@@ -110,9 +102,7 @@ impl ToolIndex {
     }
 
     /// Get tools for a specific server
-    pub fn get_server_tools(&self,
-        server_id: &str,
-    ) -> Option<Vec<String>> {
+    pub fn get_server_tools(&self, server_id: &str) -> Option<Vec<String>> {
         self.server_tools.get(server_id).map(|entry| entry.clone())
     }
 
@@ -123,9 +113,7 @@ impl ToolIndex {
     }
 
     /// Check if an alias exists
-    pub fn contains(&self,
-        alias: &str,
-    ) -> bool {
+    pub fn contains(&self, alias: &str) -> bool {
         self.aliases.contains_key(alias)
     }
 }
@@ -196,8 +184,7 @@ mod tests {
             },
         ];
 
-        let aliases =
-            index.register_server_tools("fs", &tools, &["read_file".to_string()], &[]);
+        let aliases = index.register_server_tools("fs", &tools, &["read_file".to_string()], &[]);
         assert_eq!(aliases.len(), 1);
         assert_eq!(aliases[0].original_name, "read_file");
     }
@@ -218,8 +205,7 @@ mod tests {
             },
         ];
 
-        let aliases =
-            index.register_server_tools("fs", &tools, &[], &["delete_file".to_string()]);
+        let aliases = index.register_server_tools("fs", &tools, &[], &["delete_file".to_string()]);
         assert_eq!(aliases.len(), 1);
         assert_eq!(aliases[0].original_name, "read_file");
     }

@@ -1,8 +1,8 @@
 use actix_web::http::header;
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 
-use crate::agent::server::state::{AgentStatus, AppState};
 use crate::agent::core::TokenUsage;
+use crate::agent::server::state::{AgentStatus, AppState};
 
 pub async fn handler(
     state: web::Data<AppState>,
@@ -35,7 +35,10 @@ pub async fn handler(
             // Check if runner is already completed or errored - if so, send immediate event
             match runner_status {
                 Some(AgentStatus::Completed) => {
-                    log::debug!("[{}] Runner already completed, sending immediate complete event", session_id);
+                    log::debug!(
+                        "[{}] Runner already completed, sending immediate complete event",
+                        session_id
+                    );
                     return HttpResponse::Ok()
                         .append_header((header::CONTENT_TYPE, "text/event-stream"))
                         .append_header((header::CACHE_CONTROL, "no-cache"))
@@ -55,7 +58,11 @@ pub async fn handler(
                         });
                 }
                 Some(AgentStatus::Error(err)) => {
-                    log::debug!("[{}] Runner already errored, sending immediate error event: {}", session_id, err);
+                    log::debug!(
+                        "[{}] Runner already errored, sending immediate error event: {}",
+                        session_id,
+                        err
+                    );
                     return HttpResponse::Ok()
                         .append_header((header::CONTENT_TYPE, "text/event-stream"))
                         .append_header((header::CACHE_CONTROL, "no-cache"))

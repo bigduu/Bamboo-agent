@@ -199,7 +199,8 @@ mod tests {
 
     #[test]
     fn test_json_rpc_response_error() {
-        let json = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#;
+        let json =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#;
         let response: JsonRpcResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.jsonrpc, "2.0");
         assert_eq!(response.id, 1);
@@ -266,9 +267,7 @@ mod tests {
 
     #[test]
     fn test_tools_capability() {
-        let caps = ToolsCapability {
-            list_changed: true,
-        };
+        let caps = ToolsCapability { list_changed: true };
         assert!(caps.list_changed);
     }
 

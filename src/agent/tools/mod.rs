@@ -28,9 +28,9 @@ pub use output_manager::{ArtifactRef, ToolOutputManager};
 pub use tools::{
     ApplyPatchTool, AskUserTool, CreateTodoListTool, ExecuteCommandTool, FileExistsTool,
     GetCurrentDirTool, GetFileInfoTool, GitDiffTool, GitStatusTool, GitWriteTool, GlobSearchTool,
-    HttpRequestTool, ListDirectoryTool, ReadFileTool, ReadFileRangeTool,
-    SearchInFileTool, SearchInProjectTool, SetWorkspaceTool, SleepTool, TerminalSessionTool,
-    ToolRegistry, UpdateTodoItemTool, WriteFileTool,
+    HttpRequestTool, ListDirectoryTool, ReadFileRangeTool, ReadFileTool, SearchInFileTool,
+    SearchInProjectTool, SetWorkspaceTool, SleepTool, TerminalSessionTool, ToolRegistry,
+    UpdateTodoItemTool, WriteFileTool,
 };
 
 // Re-export todo types from agent-core for convenience

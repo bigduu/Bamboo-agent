@@ -292,7 +292,10 @@ impl Session {
                 .map_err(|e| format!("Failed to write newline: {}", e))?;
         }
 
-        stdin.flush().await.map_err(|e| format!("Failed to flush stdin: {}", e))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| format!("Failed to flush stdin: {}", e))?;
 
         *self.last_activity.lock().await = Instant::now();
         Ok(())
@@ -377,7 +380,10 @@ impl TerminalSessionTool {
                     for (id, session) in sessions_to_check {
                         // Check inactivity status without holding any DashMap guards
                         // This prevents deadlock and allows other operations during cleanup
-                        if session.is_inactive(DEFAULT_SESSION_INACTIVITY_TIMEOUT).await {
+                        if session
+                            .is_inactive(DEFAULT_SESSION_INACTIVITY_TIMEOUT)
+                            .await
+                        {
                             to_remove.push(id);
                         }
                     }
@@ -413,16 +419,17 @@ impl TerminalSessionTool {
         }
 
         // Generate session ID
-        let session_id = format!("session_{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("unknown"));
+        let session_id = format!(
+            "session_{}",
+            uuid::Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("unknown")
+        );
 
         // Create session
-        let session = Arc::new(Session::new(
-            session_id.clone(),
-            command,
-            working_dir,
-            env,
-        )
-        .await?);
+        let session = Arc::new(Session::new(session_id.clone(), command, working_dir, env).await?);
 
         let info = session.get_info().await;
         self.sessions.insert(session_id, session);
@@ -508,7 +515,11 @@ impl TerminalSessionTool {
         let mut infos = Vec::new();
 
         // Collect Arc clones first, then await to avoid holding lock
-        let sessions: Vec<Arc<Session>> = self.sessions.iter().map(|entry| entry.value().clone()).collect();
+        let sessions: Vec<Arc<Session>> = self
+            .sessions
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
 
         for session in sessions {
             infos.push(session.get_info().await);
@@ -589,26 +600,24 @@ impl Tool for TerminalSessionTool {
                 command,
                 working_dir,
                 env,
-            } => {
-                match self.start_session(command, working_dir, env).await {
-                    Ok(info) => {
-                        let output = format!(
-                            "Session '{}' started\nCommand: {}\nWorking directory: {}",
-                            info.id, info.command, info.working_dir
-                        );
-                        ToolResult {
-                            success: true,
-                            result: output,
-                            display_preference: Some("markdown".to_string()),
-                        }
+            } => match self.start_session(command, working_dir, env).await {
+                Ok(info) => {
+                    let output = format!(
+                        "Session '{}' started\nCommand: {}\nWorking directory: {}",
+                        info.id, info.command, info.working_dir
+                    );
+                    ToolResult {
+                        success: true,
+                        result: output,
+                        display_preference: Some("markdown".to_string()),
                     }
-                    Err(e) => ToolResult {
-                        success: false,
-                        result: e,
-                        display_preference: None,
-                    },
                 }
-            }
+                Err(e) => ToolResult {
+                    success: false,
+                    result: e,
+                    display_preference: None,
+                },
+            },
             SessionAction::SendInput { session_id, input } => {
                 match self.send_input(&session_id, &input).await {
                     Ok(()) => ToolResult {
@@ -628,7 +637,10 @@ impl Tool for TerminalSessionTool {
                 max_lines,
                 timeout_seconds,
             } => {
-                match self.read_output(&session_id, max_lines, timeout_seconds).await {
+                match self
+                    .read_output(&session_id, max_lines, timeout_seconds)
+                    .await
+                {
                     Ok(lines) => {
                         let output = if lines.is_empty() {
                             "No output available".to_string()
@@ -648,49 +660,45 @@ impl Tool for TerminalSessionTool {
                     },
                 }
             }
-            SessionAction::Status { session_id } => {
-                match self.get_status(&session_id).await {
-                    Ok(info) => {
-                        let status = if info.is_running {
-                            "Running"
-                        } else {
-                            "Stopped"
-                        };
-                        let exit_info = info
-                            .exit_code
-                            .map(|code| format!(", exit code: {}", code))
-                            .unwrap_or_default();
-                        let output = format!(
-                            "Session: {}\nStatus: {}{}\nCommand: {}\nOutput buffer: {} lines",
-                            info.id, status, exit_info, info.command, info.output_buffer_size
-                        );
-                        ToolResult {
-                            success: true,
-                            result: output,
-                            display_preference: Some("markdown".to_string()),
-                        }
-                    }
-                    Err(e) => ToolResult {
-                        success: false,
-                        result: e,
-                        display_preference: None,
-                    },
-                }
-            }
-            SessionAction::Kill { session_id } => {
-                match self.kill_session(&session_id).await {
-                    Ok(()) => ToolResult {
+            SessionAction::Status { session_id } => match self.get_status(&session_id).await {
+                Ok(info) => {
+                    let status = if info.is_running {
+                        "Running"
+                    } else {
+                        "Stopped"
+                    };
+                    let exit_info = info
+                        .exit_code
+                        .map(|code| format!(", exit code: {}", code))
+                        .unwrap_or_default();
+                    let output = format!(
+                        "Session: {}\nStatus: {}{}\nCommand: {}\nOutput buffer: {} lines",
+                        info.id, status, exit_info, info.command, info.output_buffer_size
+                    );
+                    ToolResult {
                         success: true,
-                        result: format!("Session '{}' terminated", session_id),
-                        display_preference: None,
-                    },
-                    Err(e) => ToolResult {
-                        success: false,
-                        result: e,
-                        display_preference: None,
-                    },
+                        result: output,
+                        display_preference: Some("markdown".to_string()),
+                    }
                 }
-            }
+                Err(e) => ToolResult {
+                    success: false,
+                    result: e,
+                    display_preference: None,
+                },
+            },
+            SessionAction::Kill { session_id } => match self.kill_session(&session_id).await {
+                Ok(()) => ToolResult {
+                    success: true,
+                    result: format!("Session '{}' terminated", session_id),
+                    display_preference: None,
+                },
+                Err(e) => ToolResult {
+                    success: false,
+                    result: e,
+                    display_preference: None,
+                },
+            },
             SessionAction::List => {
                 let sessions = self.list_sessions().await;
                 if sessions.is_empty() {
@@ -709,7 +717,11 @@ impl Tool for TerminalSessionTool {
                         .collect();
                     ToolResult {
                         success: true,
-                        result: format!("Active sessions ({}):\n\n{}", sessions.len(), lines.join("\n")),
+                        result: format!(
+                            "Active sessions ({}):\n\n{}",
+                            sessions.len(),
+                            lines.join("\n")
+                        ),
                         display_preference: Some("markdown".to_string()),
                     }
                 }
@@ -742,7 +754,11 @@ mod tests {
 
         let action: SessionAction = serde_json::from_value(json).unwrap();
         match action {
-            SessionAction::Start { command, working_dir, env } => {
+            SessionAction::Start {
+                command,
+                working_dir,
+                env,
+            } => {
                 assert_eq!(command, "echo hello");
                 assert_eq!(working_dir, Some("/tmp".to_string()));
                 assert!(env.is_none());
@@ -902,7 +918,9 @@ mod tests {
         }
 
         // Cleanup
-        let _ = tool.execute(json!({"action": "kill", "session_id": session_id})).await;
+        let _ = tool
+            .execute(json!({"action": "kill", "session_id": session_id}))
+            .await;
     }
 
     #[tokio::test]
@@ -944,7 +962,9 @@ mod tests {
         assert!(!session.is_inactive(Duration::from_secs(300)).await);
 
         // Kill the session
-        let _ = tool.execute(json!({"action": "kill", "session_id": session_id})).await;
+        let _ = tool
+            .execute(json!({"action": "kill", "session_id": session_id}))
+            .await;
 
         // After kill, session should no longer exist
         assert!(tool.sessions.get(&session_id).is_none());
@@ -986,7 +1006,9 @@ mod tests {
         }
 
         // Cleanup
-        let _ = tool.execute(json!({"action": "kill", "session_id": session_id})).await;
+        let _ = tool
+            .execute(json!({"action": "kill", "session_id": session_id}))
+            .await;
     }
 
     #[tokio::test]
@@ -1043,6 +1065,8 @@ mod tests {
         assert!(new_activity > initial_activity);
 
         // Cleanup
-        let _ = tool.execute(json!({"action": "kill", "session_id": session_id})).await;
+        let _ = tool
+            .execute(json!({"action": "kill", "session_id": session_id}))
+            .await;
     }
 }

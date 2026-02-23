@@ -11,15 +11,15 @@
 //! Internal Types (crate::agent::core::Message, ToolSchema)
 //! ```
 
-mod errors;
-mod openai;
 mod anthropic;
+mod errors;
 pub mod gemini;
+mod openai;
 
-pub use errors::{ProtocolError, ProtocolResult};
-pub use openai::OpenAIProtocol;
 pub use anthropic::AnthropicProtocol;
+pub use errors::{ProtocolError, ProtocolResult};
 pub use gemini::GeminiProtocol;
+pub use openai::OpenAIProtocol;
 
 use crate::agent::core::Message;
 
@@ -52,18 +52,18 @@ pub trait ToProviderBatch<T>: Sized {
 // Implement batch conversion for specific types
 
 impl FromProviderBatch<crate::agent::llm::api::models::ChatMessage> for Message {
-    fn from_provider_batch(values: Vec<crate::agent::llm::api::models::ChatMessage>) -> ProtocolResult<Vec<Self>> {
-        values.into_iter()
-            .map(Self::from_provider)
-            .collect()
+    fn from_provider_batch(
+        values: Vec<crate::agent::llm::api::models::ChatMessage>,
+    ) -> ProtocolResult<Vec<Self>> {
+        values.into_iter().map(Self::from_provider).collect()
     }
 }
 
 impl ToProviderBatch<crate::agent::llm::api::models::ChatMessage> for Vec<Message> {
-    fn to_provider_batch(&self) -> ProtocolResult<Vec<crate::agent::llm::api::models::ChatMessage>> {
-        self.iter()
-            .map(|msg| msg.to_provider())
-            .collect()
+    fn to_provider_batch(
+        &self,
+    ) -> ProtocolResult<Vec<crate::agent::llm::api::models::ChatMessage>> {
+        self.iter().map(|msg| msg.to_provider()).collect()
     }
 }
 

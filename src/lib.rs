@@ -42,13 +42,13 @@ pub mod config;
 pub mod error;
 
 // Placeholder modules (will be populated during migration)
-pub mod core;
 pub mod agent;
-pub mod server;
-pub mod process;
-pub mod web_service;
 pub mod claude;
 pub mod commands;
+pub mod core;
+pub mod process;
+pub mod server;
+pub mod web_service;
 
 pub use config::{BambooConfig, ServerConfig};
 pub use error::{BambooError, Result};

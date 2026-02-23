@@ -36,8 +36,8 @@ impl SearchInProjectTool {
         // Compile regex
         let regex_flags = if case_sensitive { "" } else { "(?i)" };
         let full_pattern = format!("{}{}", regex_flags, pattern);
-        let regex = Regex::new(&full_pattern)
-            .map_err(|e| format!("Invalid regex pattern: {}", e))?;
+        let regex =
+            Regex::new(&full_pattern).map_err(|e| format!("Invalid regex pattern: {}", e))?;
 
         let mut matches = Vec::new();
         let mut dirs_to_scan = vec![directory.to_string()];
@@ -186,24 +186,31 @@ impl Tool for SearchInProjectTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        let directory = args["directory"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("Missing 'directory' parameter".to_string()))?;
+        let directory = args["directory"].as_str().ok_or_else(|| {
+            ToolError::InvalidArguments("Missing 'directory' parameter".to_string())
+        })?;
 
-        let pattern = args["pattern"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("Missing 'pattern' parameter".to_string()))?;
+        let pattern = args["pattern"].as_str().ok_or_else(|| {
+            ToolError::InvalidArguments("Missing 'pattern' parameter".to_string())
+        })?;
 
-        let file_extensions: Option<Vec<String>> = args["file_extensions"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+        let file_extensions: Option<Vec<String>> = args["file_extensions"].as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
 
         let case_sensitive = args["case_sensitive"].as_bool().unwrap_or(false);
-        let max_results = args["max_results"].as_u64().map(|n| n as usize).unwrap_or(50);
+        let max_results = args["max_results"]
+            .as_u64()
+            .map(|n| n as usize)
+            .unwrap_or(50);
 
         let ext_slice = file_extensions.as_deref();
 
-        match Self::search_in_project(directory, pattern, ext_slice, case_sensitive, max_results).await {
+        match Self::search_in_project(directory, pattern, ext_slice, case_sensitive, max_results)
+            .await
+        {
             Ok(matches) => {
                 let result_text = Self::format_results(&matches, 30);
                 Ok(ToolResult {

@@ -1,12 +1,12 @@
 // TodoList Evaluation Module
 // 在 Agent Loop 每轮结束时，让 LLM 评估任务进度
 
-use std::sync::Arc;
+use crate::agent::core::tools::{FunctionSchema, ToolSchema};
 use crate::agent::core::{AgentEvent, Session, TodoItemStatus};
 use crate::agent::llm::LLMProvider;
-use crate::agent::core::tools::{ToolSchema, FunctionSchema};
-use tokio::sync::mpsc;
 use serde_json::json;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use crate::agent::loop_module::todo_context::TodoLoopContext;
 
@@ -89,7 +89,10 @@ Remember: You are NOT executing the task. You are only evaluating if existing wo
 
 /// 格式化最近的 tool 调用（用于 context）
 fn format_recent_tools(ctx: &TodoLoopContext, limit: usize) -> String {
-    let mut all_calls: Vec<(String, &crate::agent::loop_module::todo_context::ToolCallRecord)> = Vec::new();
+    let mut all_calls: Vec<(
+        String,
+        &crate::agent::loop_module::todo_context::ToolCallRecord,
+    )> = Vec::new();
 
     for item in &ctx.items {
         for call in &item.tool_calls {
@@ -123,34 +126,32 @@ fn format_recent_tools(ctx: &TodoLoopContext, limit: usize) -> String {
 
 /// 获取 TodoList 评估的 tool schemas
 pub fn get_todo_evaluation_tools() -> Vec<ToolSchema> {
-    vec![
-        ToolSchema {
-            schema_type: "function".to_string(),
-            function: FunctionSchema {
-                name: "update_todo_item".to_string(),
-                description: "Update the status of a todo item based on evaluation".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "item_id": {
-                            "type": "string",
-                            "description": "The ID of the todo item to update"
-                        },
-                        "status": {
-                            "type": "string",
-                            "enum": ["completed", "blocked"],
-                            "description": "New status for the item"
-                        },
-                        "notes": {
-                            "type": "string",
-                            "description": "Brief explanation of why the status changed"
-                        }
+    vec![ToolSchema {
+        schema_type: "function".to_string(),
+        function: FunctionSchema {
+            name: "update_todo_item".to_string(),
+            description: "Update the status of a todo item based on evaluation".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "item_id": {
+                        "type": "string",
+                        "description": "The ID of the todo item to update"
                     },
-                    "required": ["item_id", "status"]
-                }),
-            },
-        }
-    ]
+                    "status": {
+                        "type": "string",
+                        "enum": ["completed", "blocked"],
+                        "description": "New status for the item"
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "Brief explanation of why the status changed"
+                    }
+                },
+                "required": ["item_id", "status"]
+            }),
+        },
+    }]
 }
 
 /// 执行 TodoList 评估
@@ -160,12 +161,14 @@ pub async fn evaluate_todo_progress(
     llm: Arc<dyn LLMProvider>,
     event_tx: &mpsc::Sender<AgentEvent>,
     session_id: &str,
-    model: &str,  // Add model parameter (required)
+    model: &str, // Add model parameter (required)
 ) -> Result<TodoEvaluationResult, crate::agent::core::AgentError> {
     use crate::agent::loop_module::stream::handler::consume_llm_stream;
 
     // 检查是否有需要评估的任务
-    let in_progress_count = ctx.items.iter()
+    let in_progress_count = ctx
+        .items
+        .iter()
         .filter(|item| matches!(item.status, TodoItemStatus::InProgress))
         .count();
 
@@ -184,10 +187,12 @@ pub async fn evaluate_todo_progress(
     );
 
     // 发送评估开始事件
-    let _ = event_tx.send(AgentEvent::TodoEvaluationStarted {
-        session_id: session_id.to_string(),
-        items_count: in_progress_count,
-    }).await;
+    let _ = event_tx
+        .send(AgentEvent::TodoEvaluationStarted {
+            session_id: session_id.to_string(),
+            items_count: in_progress_count,
+        })
+        .await;
 
     // 构建评估消息
     let messages = build_todo_evaluation_messages(ctx, session);
@@ -205,7 +210,9 @@ pub async fn evaluate_todo_progress(
                 event_tx,
                 &tokio_util::sync::CancellationToken::new(),
                 session_id,
-            ).await.map_err(|e| crate::agent::core::AgentError::LLM(e.to_string()))?;
+            )
+            .await
+            .map_err(|e| crate::agent::core::AgentError::LLM(e.to_string()))?;
 
             log::info!(
                 "[{}] Todo evaluation completed: {} tokens, {} tool calls",
@@ -218,9 +225,9 @@ pub async fn evaluate_todo_progress(
             let mut updates = Vec::new();
             for tool_call in &stream_output.tool_calls {
                 if tool_call.function.name == "update_todo_item" {
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(
-                        &tool_call.function.arguments
-                    ) {
+                    if let Ok(args) =
+                        serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+                    {
                         if let (Some(item_id), Some(status_str)) =
                             (args["item_id"].as_str(), args["status"].as_str())
                         {
@@ -241,11 +248,13 @@ pub async fn evaluate_todo_progress(
             }
 
             // 发送评估完成事件
-            let _ = event_tx.send(AgentEvent::TodoEvaluationCompleted {
-                session_id: session_id.to_string(),
-                updates_count: updates.len(),
-                reasoning: stream_output.content.clone(),
-            }).await;
+            let _ = event_tx
+                .send(AgentEvent::TodoEvaluationCompleted {
+                    session_id: session_id.to_string(),
+                    updates_count: updates.len(),
+                    reasoning: stream_output.content.clone(),
+                })
+                .await;
 
             Ok(TodoEvaluationResult {
                 needs_evaluation: true,
@@ -267,8 +276,8 @@ pub async fn evaluate_todo_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::loop_module::todo_context::{TodoLoopContext, TodoLoopItem};
     use crate::agent::core::todo::{TodoItem, TodoList};
+    use crate::agent::loop_module::todo_context::{TodoLoopContext, TodoLoopItem};
     use chrono::Utc;
 
     fn create_test_context() -> TodoLoopContext {
@@ -276,15 +285,13 @@ mod tests {
         let todo_list = TodoList {
             session_id: "test".to_string(),
             title: "Test Tasks".to_string(),
-            items: vec![
-                TodoItem {
-                    id: "1".to_string(),
-                    description: "Fix bug in authentication".to_string(),
-                    status: TodoItemStatus::InProgress,
-                    depends_on: Vec::new(),
-                    notes: String::new(),
-                },
-            ],
+            items: vec![TodoItem {
+                id: "1".to_string(),
+                description: "Fix bug in authentication".to_string(),
+                status: TodoItemStatus::InProgress,
+                depends_on: Vec::new(),
+                notes: String::new(),
+            }],
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -343,11 +350,17 @@ mod tests {
         let mut ctx = create_test_context();
 
         // In-progress task needs evaluation
-        assert!(ctx.items.iter().any(|i| matches!(i.status, TodoItemStatus::InProgress)));
+        assert!(ctx
+            .items
+            .iter()
+            .any(|i| matches!(i.status, TodoItemStatus::InProgress)));
 
         // Completed task doesn't need evaluation
         ctx.items[0].status = TodoItemStatus::Completed;
-        assert!(!ctx.items.iter().any(|i| matches!(i.status, TodoItemStatus::InProgress)));
+        assert!(!ctx
+            .items
+            .iter()
+            .any(|i| matches!(i.status, TodoItemStatus::InProgress)));
     }
 
     // ========== MODEL REQUIREMENT ARCHITECTURE TESTS ==========
@@ -374,6 +387,9 @@ mod tests {
         //
         // This is a documentation test - the actual verification
         // happens at compile time when the function is called.
-        assert!(true, "Model parameter requirement is enforced by function signature");
+        assert!(
+            true,
+            "Model parameter requirement is enforced by function signature"
+        );
     }
 }

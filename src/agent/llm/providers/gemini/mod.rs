@@ -2,16 +2,16 @@
 
 mod stream;
 
-pub use stream::{GeminiStreamState, parse_gemini_sse_event};
+pub use stream::{parse_gemini_sse_event, GeminiStreamState};
 
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::json;
 
-use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
-use crate::agent::llm::protocol::gemini::{GeminiRequest};
 use crate::agent::core::{tools::ToolSchema, Message};
+use crate::agent::llm::protocol::gemini::GeminiRequest;
 use crate::agent::llm::protocol::ToProvider;
+use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
 
 /// Google Gemini API provider.
 pub struct GeminiProvider {
@@ -65,7 +65,10 @@ impl LLMProvider for GeminiProvider {
             }));
         }
 
-        log::debug!("Gemini request: {}", serde_json::to_string_pretty(&request).unwrap_or_default());
+        log::debug!(
+            "Gemini request: {}",
+            serde_json::to_string_pretty(&request).unwrap_or_default()
+        );
 
         // Build URL with query param authentication
         let url = format!(
@@ -105,9 +108,10 @@ impl LLMProvider for GeminiProvider {
         // Parse SSE stream with Gemini-specific parser
         let mut state = GeminiStreamState::default();
 
-        let stream = crate::agent::llm::providers::common::sse::llm_stream_from_sse(response, move |event, data| {
-            parse_gemini_sse_event(&mut state, event, data)
-        });
+        let stream = crate::agent::llm::providers::common::sse::llm_stream_from_sse(
+            response,
+            move |event, data| parse_gemini_sse_event(&mut state, event, data),
+        );
 
         Ok(stream)
     }
@@ -121,20 +125,22 @@ mod tests {
     fn test_new_provider() {
         let provider = GeminiProvider::new("test_key");
         assert_eq!(provider.api_key, "test_key");
-        assert_eq!(provider.base_url, "https://generativelanguage.googleapis.com/v1beta");
+        assert_eq!(
+            provider.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
     }
 
     #[test]
     fn test_with_base_url() {
-        let provider = GeminiProvider::new("test_key")
-            .with_base_url("https://custom.googleapis.com/v1");
+        let provider =
+            GeminiProvider::new("test_key").with_base_url("https://custom.googleapis.com/v1");
         assert_eq!(provider.base_url, "https://custom.googleapis.com/v1");
     }
 
     #[test]
     fn test_chained_builders() {
-        let provider = GeminiProvider::new("test_key")
-            .with_base_url("https://custom.api.com");
+        let provider = GeminiProvider::new("test_key").with_base_url("https://custom.api.com");
 
         assert_eq!(provider.api_key, "test_key");
         assert_eq!(provider.base_url, "https://custom.api.com");
@@ -142,8 +148,8 @@ mod tests {
 
     #[test]
     fn test_url_construction() {
-        let provider = GeminiProvider::new("my_api_key_123")
-            .with_base_url("https://test.api.com/v1beta");
+        let provider =
+            GeminiProvider::new("my_api_key_123").with_base_url("https://test.api.com/v1beta");
 
         // This verifies URL construction logic
         let expected_url = "https://test.api.com/v1beta/models/gemini-custom:streamGenerateContent?key=my_api_key_123";
@@ -175,7 +181,10 @@ mod tests {
         let provider = GeminiProvider::new("test_key");
         // Verify we can access known fields
         assert_eq!(provider.api_key, "test_key");
-        assert_eq!(provider.base_url, "https://generativelanguage.googleapis.com/v1beta");
+        assert_eq!(
+            provider.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
         // There is NO provider.model field to access
     }
 

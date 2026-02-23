@@ -46,19 +46,18 @@ impl MessageSegment {
 
     /// Check if this segment contains a tool result for the given tool call ID.
     pub fn contains_tool_result(&self, tool_call_id: &str) -> bool {
-        self.messages.iter().any(|m| {
-            m.role == Role::Tool
-                && m.tool_call_id.as_deref() == Some(tool_call_id)
-        })
+        self.messages
+            .iter()
+            .any(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(tool_call_id))
     }
 
     /// Check if this segment contains the tool call (assistant message) for the given ID.
     pub fn contains_tool_call(&self, tool_call_id: &str) -> bool {
         self.messages.iter().any(|m| {
             m.role == Role::Assistant
-                && m.tool_calls.as_ref().is_some_and(|tc| {
-                    tc.iter().any(|c| c.id == tool_call_id)
-                })
+                && m.tool_calls
+                    .as_ref()
+                    .is_some_and(|tc| tc.iter().any(|c| c.id == tool_call_id))
         })
     }
 
@@ -301,7 +300,11 @@ mod tests {
             Message::user("Search for something"),
             Message::assistant(
                 "Let me search",
-                Some(vec![create_tool_call("call_1", "search", r#"{"q":"test"}"#)]),
+                Some(vec![create_tool_call(
+                    "call_1",
+                    "search",
+                    r#"{"q":"test"}"#,
+                )]),
             ),
             Message::tool_result("call_1", "Here are the results..."),
         ];
@@ -373,10 +376,16 @@ mod tests {
         let segmenter = MessageSegmenter::new();
         let messages = vec![
             Message::user("First task"),
-            Message::assistant("Doing first", Some(vec![create_tool_call("call_1", "search", "{}")])),
+            Message::assistant(
+                "Doing first",
+                Some(vec![create_tool_call("call_1", "search", "{}")]),
+            ),
             Message::tool_result("call_1", "Result 1"),
             Message::user("Second task"),
-            Message::assistant("Doing second", Some(vec![create_tool_call("call_2", "read", "{}")])),
+            Message::assistant(
+                "Doing second",
+                Some(vec![create_tool_call("call_2", "read", "{}")]),
+            ),
             Message::tool_result("call_2", "Result 2"),
         ];
 

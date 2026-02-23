@@ -122,7 +122,9 @@ pub fn is_delete_command(command: &str, args: &[String]) -> bool {
 fn required_string_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, PermissionError> {
     args.get(key)
         .and_then(|value| value.as_str())
-        .ok_or_else(|| PermissionError::CheckFailed(format!("Missing or invalid '{}' parameter", key)))
+        .ok_or_else(|| {
+            PermissionError::CheckFailed(format!("Missing or invalid '{}' parameter", key))
+        })
 }
 
 fn build_command_resource(command: &str, args: &[String]) -> String {
@@ -167,7 +169,9 @@ mod tests {
     #[test]
     fn check_permissions_execute_command_non_delete() {
         let args = json!({"command": "ls", "args": ["-la"]});
-        let contexts = check_permissions("execute_command", &args).unwrap().unwrap();
+        let contexts = check_permissions("execute_command", &args)
+            .unwrap()
+            .unwrap();
         let expected = PermissionContext::new(
             PermissionType::ExecuteCommand,
             "ls -la",
@@ -179,7 +183,9 @@ mod tests {
     #[test]
     fn check_permissions_execute_command_delete() {
         let args = json!({"command": "rm", "args": ["-rf", "/tmp"]});
-        let contexts = check_permissions("execute_command", &args).unwrap().unwrap();
+        let contexts = check_permissions("execute_command", &args)
+            .unwrap()
+            .unwrap();
         let delete_expected = PermissionContext::new(
             PermissionType::DeleteOperation,
             "rm -rf /tmp",
@@ -237,7 +243,9 @@ mod tests {
     #[test]
     fn check_permissions_terminal_session_start() {
         let args = json!({"action": "start", "command": "npm run dev"});
-        let contexts = check_permissions("terminal_session", &args).unwrap().unwrap();
+        let contexts = check_permissions("terminal_session", &args)
+            .unwrap()
+            .unwrap();
         let expected = PermissionContext::new(
             PermissionType::TerminalSession,
             "npm run dev",
@@ -249,7 +257,9 @@ mod tests {
     #[test]
     fn check_permissions_terminal_session_other_action() {
         let args = json!({"action": "kill", "session_id": "session-123"});
-        let contexts = check_permissions("terminal_session", &args).unwrap().unwrap();
+        let contexts = check_permissions("terminal_session", &args)
+            .unwrap()
+            .unwrap();
         let expected = PermissionContext::new(
             PermissionType::TerminalSession,
             "session-123",

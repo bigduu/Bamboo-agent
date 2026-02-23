@@ -161,7 +161,13 @@ impl MetricsCollector {
                         started_at,
                     } => {
                         storage
-                            .insert_forward_start(&forward_id, &endpoint, &model, is_stream, started_at)
+                            .insert_forward_start(
+                                &forward_id,
+                                &endpoint,
+                                &model,
+                                is_stream,
+                                started_at,
+                            )
                             .await
                     }
                     CollectorCommand::ForwardCompleted {
@@ -173,7 +179,14 @@ impl MetricsCollector {
                         error,
                     } => {
                         storage
-                            .complete_forward(&forward_id, completed_at, status_code, status, usage, error)
+                            .complete_forward(
+                                &forward_id,
+                                completed_at,
+                                status_code,
+                                status,
+                                usage,
+                                error,
+                            )
                             .await
                     }
                     CollectorCommand::Prune { cutoff } => {

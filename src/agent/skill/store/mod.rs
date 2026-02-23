@@ -100,7 +100,11 @@ impl SkillStore {
 
     /// List all skills with optional filtering.
     /// Optionally reload from disk before listing.
-    pub async fn list_skills(&self, filter: Option<SkillFilter>, refresh: bool) -> Vec<SkillDefinition> {
+    pub async fn list_skills(
+        &self,
+        filter: Option<SkillFilter>,
+        refresh: bool,
+    ) -> Vec<SkillDefinition> {
         // Optionally reload from disk to pick up new/updated skills
         if refresh {
             if let Err(e) = self.reload().await {
@@ -187,13 +191,7 @@ impl SkillStore {
 
     /// Get all skills.
     pub async fn get_all_skills(&self) -> Vec<SkillDefinition> {
-        let mut skills: Vec<SkillDefinition> = self
-            .skills
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect();
+        let mut skills: Vec<SkillDefinition> = self.skills.read().await.values().cloned().collect();
         skills.sort_by(|left, right| left.name.cmp(&right.name));
         skills
     }
@@ -353,7 +351,9 @@ Use this skill for testing.
 "#;
 
         let skill_dir = skills_dir.join("test-skill");
-        fs::create_dir_all(&skill_dir).await.expect("create skill dir");
+        fs::create_dir_all(&skill_dir)
+            .await
+            .expect("create skill dir");
         let skill_file = skill_dir.join("SKILL.md");
         fs::write(&skill_file, content).await.expect("write");
 

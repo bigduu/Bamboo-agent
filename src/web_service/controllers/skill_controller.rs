@@ -1,7 +1,7 @@
-use actix_web::{get, web, HttpResponse};
 use crate::agent::server::state::AppState as AgentAppState;
 use crate::agent::skill::{SkillDefinition, SkillFilter};
 use crate::agent::tools::BuiltinToolExecutor;
+use actix_web::{get, web, HttpResponse};
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -185,9 +185,12 @@ pub async fn get_available_workflows(
     app_state: web::Data<AppState>,
     _agent_state: web::Data<AgentAppState>,
 ) -> Result<HttpResponse, AppError> {
-    let workflows = crate::web_service::services::skill_service::list_workflows(&app_state.app_data_dir)
-        .await
-        .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to list workflows: {}", e)))?;
+    let workflows =
+        crate::web_service::services::skill_service::list_workflows(&app_state.app_data_dir)
+            .await
+            .map_err(|e| {
+                AppError::InternalError(anyhow::anyhow!("Failed to list workflows: {}", e))
+            })?;
 
     Ok(HttpResponse::Ok().json(AvailableWorkflowsResponse { workflows }))
 }

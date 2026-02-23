@@ -152,9 +152,7 @@ pub async fn create_project(
     let canonical = path.canonicalize().map_err(|e| {
         AppError::InternalError(anyhow::anyhow!("Failed to canonicalize path: {}", e))
     })?;
-    let project_id = canonical
-        .to_string_lossy()
-        .replace(['/', '\\'], "-");
+    let project_id = canonical.to_string_lossy().replace(['/', '\\'], "-");
 
     let project_dir = claude_dir.join(&project_id);
     std::fs::create_dir_all(&project_dir).map_err(|e| {

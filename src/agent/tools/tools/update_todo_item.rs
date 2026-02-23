@@ -131,9 +131,9 @@ impl Tool for UpdateTodoItemTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        let item_id = args["item_id"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("Missing 'item_id' parameter".to_string()))?;
+        let item_id = args["item_id"].as_str().ok_or_else(|| {
+            ToolError::InvalidArguments("Missing 'item_id' parameter".to_string())
+        })?;
 
         let status_str = args["status"]
             .as_str()
@@ -161,11 +161,7 @@ impl Tool for UpdateTodoItemTool {
             "Ready to update item '{}' to status '{:?}'{}",
             item_id,
             status,
-            if notes.is_some() {
-                " with notes"
-            } else {
-                ""
-            }
+            if notes.is_some() { " with notes" } else { "" }
         );
 
         Ok(ToolResult {

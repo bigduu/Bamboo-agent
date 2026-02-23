@@ -206,7 +206,6 @@ fn create_default_commands() -> Vec<SlashCommand> {
     ]
 }
 
-
 pub async fn slash_commands_list(
     project_path: Option<String>,
 ) -> Result<Vec<SlashCommand>, String> {
@@ -267,7 +266,6 @@ pub async fn slash_commands_list(
     Ok(commands)
 }
 
-
 pub async fn slash_command_get(command_id: String) -> Result<SlashCommand, String> {
     debug!("Getting slash command: {}", command_id);
 
@@ -283,7 +281,6 @@ pub async fn slash_command_get(command_id: String) -> Result<SlashCommand, Strin
         .find(|cmd| cmd.id == command_id)
         .ok_or_else(|| format!("Command not found: {}", command_id))
 }
-
 
 pub async fn slash_command_save(
     scope: String,
@@ -355,7 +352,6 @@ pub async fn slash_command_save(
     load_command_from_file(&file_path, &base_dir, &scope)
         .map_err(|e| format!("Failed to load saved command: {}", e))
 }
-
 
 pub async fn slash_command_delete(
     command_id: String,

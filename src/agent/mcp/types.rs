@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// MCP tool metadata from server
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,7 +281,11 @@ mod tests {
             error: None,
         };
         match event {
-            McpEvent::ServerStatusChanged { server_id, status, error } => {
+            McpEvent::ServerStatusChanged {
+                server_id,
+                status,
+                error,
+            } => {
                 assert_eq!(server_id, "test-server");
                 assert_eq!(status, ServerStatus::Ready);
                 assert!(error.is_none());
@@ -313,7 +317,11 @@ mod tests {
             success: true,
         };
         match event {
-            McpEvent::ToolExecuted { server_id, tool_name, success } => {
+            McpEvent::ToolExecuted {
+                server_id,
+                tool_name,
+                success,
+            } => {
                 assert_eq!(server_id, "test-server");
                 assert_eq!(tool_name, "test-tool");
                 assert!(success);

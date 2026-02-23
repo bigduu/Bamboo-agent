@@ -57,7 +57,10 @@ pub fn migrate_session_files() -> std::io::Result<()> {
         Ok(entries) => entries,
         Err(e) => {
             // If we can't read the directory, just log and continue
-            eprintln!("Warning: Could not read bamboo directory for migration: {}", e);
+            eprintln!(
+                "Warning: Could not read bamboo directory for migration: {}",
+                e
+            );
             return Ok(());
         }
     };
@@ -78,10 +81,7 @@ pub fn migrate_session_files() -> std::io::Result<()> {
             // Only move if destination doesn't exist
             if !dest_path.exists() {
                 if let Err(e) = std::fs::rename(&path, &dest_path) {
-                    eprintln!(
-                        "Warning: Could not migrate session file {:?}: {}",
-                        path, e
-                    );
+                    eprintln!("Warning: Could not migrate session file {:?}: {}", path, e);
                 } else {
                     println!("Migrated session file: {}", file_name);
                 }

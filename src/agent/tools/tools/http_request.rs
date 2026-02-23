@@ -50,7 +50,6 @@ impl HttpMethod {
     }
 }
 
-
 /// Arguments for HTTP request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpRequestArgs {
@@ -223,13 +222,17 @@ impl HttpRequestTool {
     pub async fn execute_request(&self, args: HttpRequestArgs) -> Result<HttpResponse, String> {
         // Validate URL using Url::parse for consistency with permission checking
         let url_str = args.url.trim();
-        let parsed_url = url::Url::parse(url_str)
-            .map_err(|e| format!("Invalid URL: {}", e))?;
+        let parsed_url = url::Url::parse(url_str).map_err(|e| format!("Invalid URL: {}", e))?;
 
         // Check scheme is http or https (case-insensitive)
         match parsed_url.scheme().to_lowercase().as_str() {
             "http" | "https" => {}
-            scheme => return Err(format!("URL scheme must be http:// or https://, got: {}://", scheme)),
+            scheme => {
+                return Err(format!(
+                    "URL scheme must be http:// or https://, got: {}://",
+                    scheme
+                ))
+            }
         }
 
         // Validate SSRF protection - block internal/private IP addresses
@@ -250,7 +253,10 @@ impl HttpRequestTool {
         }
 
         // Add body for appropriate methods
-        if matches!(args.method, HttpMethod::Post | HttpMethod::Put | HttpMethod::Patch) {
+        if matches!(
+            args.method,
+            HttpMethod::Post | HttpMethod::Put | HttpMethod::Patch
+        ) {
             if let Some(body) = &args.body {
                 // Try to determine content type from body
                 if body.trim().starts_with('{') || body.trim().starts_with('[') {
@@ -271,11 +277,7 @@ impl HttpRequestTool {
         let headers = response
             .headers()
             .iter()
-            .filter_map(|(k, v)| {
-                v.to_str()
-                    .ok()
-                    .map(|v| (k.to_string(), v.to_string()))
-            })
+            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
             .collect();
 
         // Get response body with size limit
@@ -598,14 +600,19 @@ mod tests {
         ];
 
         for url in private_ips {
-            let result = tool
-                .execute(json!({"url": url}))
-                .await
-                .unwrap();
+            let result = tool.execute(json!({"url": url})).await.unwrap();
 
             assert!(!result.success, "Should block private IP: {}", url);
-            assert!(result.result.contains("SSRF protection"), "Should mention SSRF protection: {}", url);
-            assert!(result.result.contains("private IP"), "Should mention private IP: {}", url);
+            assert!(
+                result.result.contains("SSRF protection"),
+                "Should mention SSRF protection: {}",
+                url
+            );
+            assert!(
+                result.result.contains("private IP"),
+                "Should mention private IP: {}",
+                url
+            );
         }
     }
 
@@ -622,13 +629,14 @@ mod tests {
         ];
 
         for url in loopback_ips {
-            let result = tool
-                .execute(json!({"url": url}))
-                .await
-                .unwrap();
+            let result = tool.execute(json!({"url": url})).await.unwrap();
 
             assert!(!result.success, "Should block loopback IP: {}", url);
-            assert!(result.result.contains("SSRF protection"), "Should mention SSRF protection: {}", url);
+            assert!(
+                result.result.contains("SSRF protection"),
+                "Should mention SSRF protection: {}",
+                url
+            );
         }
     }
 
@@ -667,8 +675,11 @@ mod tests {
 
         // Either success or a network error, NOT an SSRF error
         if !result.success {
-            assert!(!result.result.contains("SSRF protection"),
-                "Should not block valid external URL: {}", result.result);
+            assert!(
+                !result.result.contains("SSRF protection"),
+                "Should not block valid external URL: {}",
+                result.result
+            );
         }
     }
 
@@ -701,9 +712,6 @@ mod tests {
             max_response_size: 1024 * 1024,
         };
 
-        assert_eq!(
-            args.extract_domain(),
-            Some("api.github.com".to_string())
-        );
+        assert_eq!(args.extract_domain(), Some("api.github.com".to_string()));
     }
 }

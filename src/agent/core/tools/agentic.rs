@@ -288,7 +288,9 @@ pub trait AgenticTool: Send + Sync {
     ) -> Result<ToolResult, ToolError>;
 }
 
-pub fn convert_to_standard_result(agentic_result: ToolResult) -> crate::agent::core::tools::types::ToolResult {
+pub fn convert_to_standard_result(
+    agentic_result: ToolResult,
+) -> crate::agent::core::tools::types::ToolResult {
     match agentic_result {
         ToolResult::Success { result } => crate::agent::core::tools::types::ToolResult {
             success: true,
@@ -300,16 +302,20 @@ pub fn convert_to_standard_result(agentic_result: ToolResult) -> crate::agent::c
             result: error,
             display_preference: Some("error".to_string()),
         },
-        ToolResult::NeedClarification { question, .. } => crate::agent::core::tools::types::ToolResult {
-            success: true,
-            result: question,
-            display_preference: Some("clarification".to_string()),
-        },
-        ToolResult::NeedMoreActions { reason, .. } => crate::agent::core::tools::types::ToolResult {
-            success: true,
-            result: reason,
-            display_preference: Some("actions_needed".to_string()),
-        },
+        ToolResult::NeedClarification { question, .. } => {
+            crate::agent::core::tools::types::ToolResult {
+                success: true,
+                result: question,
+                display_preference: Some("clarification".to_string()),
+            }
+        }
+        ToolResult::NeedMoreActions { reason, .. } => {
+            crate::agent::core::tools::types::ToolResult {
+                success: true,
+                result: reason,
+                display_preference: Some("actions_needed".to_string()),
+            }
+        }
     }
 }
 

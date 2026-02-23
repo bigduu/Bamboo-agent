@@ -96,7 +96,8 @@ impl ProcessRegistry {
             model,
         };
 
-        self.register_process_internal(run_id, process_info, child).await
+        self.register_process_internal(run_id, process_info, child)
+            .await
     }
 
     pub async fn register_sidecar_process(

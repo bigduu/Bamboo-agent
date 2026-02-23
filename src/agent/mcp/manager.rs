@@ -59,27 +59,20 @@ impl McpServerManager {
     }
 
     /// Initialize from configuration
-    pub async fn initialize_from_config(&self,
-        config: &McpConfig,
-    ) {
+    pub async fn initialize_from_config(&self, config: &McpConfig) {
         for server_config in &config.servers {
             if !server_config.enabled {
                 continue;
             }
 
             if let Err(e) = self.start_server(server_config.clone()).await {
-                error!(
-                    "Failed to start MCP server '{}': {}",
-                    server_config.id, e
-                );
+                error!("Failed to start MCP server '{}': {}", server_config.id, e);
             }
         }
     }
 
     /// Start a new MCP server connection
-    pub async fn start_server(&self,
-        config: McpServerConfig,
-    ) -> Result<()> {
+    pub async fn start_server(&self, config: McpServerConfig) -> Result<()> {
         let server_id = config.id.clone();
 
         if self.runtimes.contains_key(&server_id) {
@@ -93,9 +86,7 @@ impl McpServerManager {
             TransportConfig::Stdio(stdio_config) => {
                 Box::new(StdioTransport::new(stdio_config.clone()))
             }
-            TransportConfig::Sse(sse_config) => {
-                Box::new(SseTransport::new(sse_config.clone()))
-            }
+            TransportConfig::Sse(sse_config) => Box::new(SseTransport::new(sse_config.clone())),
         };
 
         // Create client
@@ -112,10 +103,7 @@ impl McpServerManager {
             .initialize(config.request_timeout_ms)
             .await
             .map_err(|e| {
-                error!(
-                    "Failed to initialize MCP server '{}': {}",
-                    server_id, e
-                );
+                error!("Failed to initialize MCP server '{}': {}", server_id, e);
                 e
             })?;
 
@@ -126,11 +114,7 @@ impl McpServerManager {
 
         // List tools
         let tools = client.list_tools(config.request_timeout_ms).await?;
-        info!(
-            "MCP server '{}' has {} tools",
-            server_id,
-            tools.len()
-        );
+        info!("MCP server '{}' has {} tools", server_id, tools.len());
 
         // Create runtime
         let runtime = Arc::new(ServerRuntime {
@@ -177,10 +161,7 @@ impl McpServerManager {
                 })
                 .await;
 
-            let tool_names: Vec<String> = aliases
-                .into_iter()
-                .map(|a| a.alias)
-                .collect();
+            let tool_names: Vec<String> = aliases.into_iter().map(|a| a.alias).collect();
             let _ = tx
                 .send(McpEvent::ToolsChanged {
                     server_id,
@@ -196,9 +177,7 @@ impl McpServerManager {
     }
 
     /// Stop an MCP server connection
-    pub async fn stop_server(&self,
-        server_id: &str,
-    ) -> Result<()> {
+    pub async fn stop_server(&self, server_id: &str) -> Result<()> {
         let (_, runtime) = self
             .runtimes
             .remove(server_id)
@@ -269,11 +248,7 @@ impl McpServerManager {
     }
 
     /// Get tool info for a specific tool
-    pub fn get_tool_info(
-        &self,
-        server_id: &str,
-        tool_name: &str,
-    ) -> Option<McpTool> {
+    pub fn get_tool_info(&self, server_id: &str, tool_name: &str) -> Option<McpTool> {
         self.runtimes.get(server_id).and_then(|runtime| {
             let tools = runtime.tools.try_read().ok()?;
             tools.iter().find(|t| t.name == tool_name).cloned()
@@ -281,10 +256,7 @@ impl McpServerManager {
     }
 
     /// Refresh tools from a server
-    pub async fn refresh_tools(
-        &self,
-        server_id: &str,
-    ) -> Result<()> {
+    pub async fn refresh_tools(&self, server_id: &str) -> Result<()> {
         let runtime = self
             .runtimes
             .get(server_id)
@@ -293,9 +265,7 @@ impl McpServerManager {
         info!("Refreshing tools for MCP server '{}'", server_id);
 
         let client = runtime.client.read().await;
-        let new_tools = client
-            .list_tools(runtime.config.request_timeout_ms)
-            .await?;
+        let new_tools = client.list_tools(runtime.config.request_timeout_ms).await?;
         drop(client);
 
         // Update tools
@@ -324,10 +294,7 @@ impl McpServerManager {
 
         // Emit event
         if let Some(ref tx) = self.event_tx {
-            let tool_names: Vec<String> = aliases
-                .into_iter()
-                .map(|a| a.alias)
-                .collect();
+            let tool_names: Vec<String> = aliases.into_iter().map(|a| a.alias).collect();
             let _ = tx
                 .send(McpEvent::ToolsChanged {
                     server_id: server_id.to_string(),
@@ -348,24 +315,19 @@ impl McpServerManager {
     }
 
     /// Get runtime info for a server
-    pub fn get_server_info(&self,
-        server_id: &str,
-    ) -> Option<RuntimeInfo> {
-        self.runtimes.get(server_id).and_then(|runtime| {
-            runtime.info.try_read().ok().map(|info| info.clone())
-        })
+    pub fn get_server_info(&self, server_id: &str) -> Option<RuntimeInfo> {
+        self.runtimes
+            .get(server_id)
+            .and_then(|runtime| runtime.info.try_read().ok().map(|info| info.clone()))
     }
 
     /// Check if a server is running
-    pub fn is_server_running(&self,
-        server_id: &str,
-    ) -> bool {
+    pub fn is_server_running(&self, server_id: &str) -> bool {
         self.runtimes.contains_key(server_id)
     }
 
     /// Shutdown all servers
-    pub async fn shutdown_all(&self,
-    ) {
+    pub async fn shutdown_all(&self) {
         let server_ids: Vec<String> = self.list_servers();
         for server_id in server_ids {
             if let Err(e) = self.stop_server(&server_id).await {
@@ -374,11 +336,7 @@ impl McpServerManager {
         }
     }
 
-    fn start_health_check(
-        &self,
-        runtime: Arc<ServerRuntime>,
-        interval_ms: u64,
-    ) {
+    fn start_health_check(&self, runtime: Arc<ServerRuntime>, interval_ms: u64) {
         let server_id = runtime.config.id.clone();
         let manager = Arc::new(self.clone());
 
@@ -417,10 +375,7 @@ impl McpServerManager {
                         }
                     }
                     Err(e) => {
-                        warn!(
-                            "Health check failed for MCP server '{}': {}",
-                            server_id, e
-                        );
+                        warn!("Health check failed for MCP server '{}': {}", server_id, e);
 
                         // Drop client lock before attempting reconnection
                         drop(client);
@@ -445,7 +400,9 @@ impl McpServerManager {
 
                         // Attempt reconnection if enabled
                         if runtime.config.reconnect.enabled {
-                            if let Err(reconnect_err) = manager.attempt_reconnection(runtime.clone()).await {
+                            if let Err(reconnect_err) =
+                                manager.attempt_reconnection(runtime.clone()).await
+                            {
                                 error!(
                                     "Reconnection failed for MCP server '{}': {}",
                                     server_id, reconnect_err
@@ -463,13 +420,15 @@ impl McpServerManager {
         let server_id = runtime.config.id.clone();
 
         // Check if already reconnecting
-        if runtime.reconnecting.compare_exchange(
-            false,
-            true,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ).is_err() {
-            info!("Reconnection already in progress for MCP server '{}'", server_id);
+        if runtime
+            .reconnecting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            info!(
+                "Reconnection already in progress for MCP server '{}'",
+                server_id
+            );
             return Ok(());
         }
 
@@ -490,7 +449,10 @@ impl McpServerManager {
         loop {
             // Check if shutdown was requested
             if runtime.shutdown.load(Ordering::SeqCst) {
-                info!("Reconnection cancelled due to shutdown for MCP server '{}'", server_id);
+                info!(
+                    "Reconnection cancelled due to shutdown for MCP server '{}'",
+                    server_id
+                );
                 runtime.reconnecting.store(false, Ordering::SeqCst);
                 return Ok(());
             }
@@ -576,10 +538,8 @@ impl McpServerManager {
 
                     // Calculate next backoff with exponential increase
                     if reconnect_config.max_backoff_ms > current_backoff {
-                        current_backoff = std::cmp::min(
-                            current_backoff * 2,
-                            reconnect_config.max_backoff_ms
-                        );
+                        current_backoff =
+                            std::cmp::min(current_backoff * 2, reconnect_config.max_backoff_ms);
                     }
                 }
             }
@@ -605,9 +565,7 @@ impl McpServerManager {
             TransportConfig::Stdio(stdio_config) => {
                 Box::new(StdioTransport::new(stdio_config.clone()))
             }
-            TransportConfig::Sse(sse_config) => {
-                Box::new(SseTransport::new(sse_config.clone()))
-            }
+            TransportConfig::Sse(sse_config) => Box::new(SseTransport::new(sse_config.clone())),
         };
 
         // Create new client
@@ -673,10 +631,7 @@ impl McpServerManager {
 
         // Emit tools changed event
         if let Some(ref tx) = self.event_tx {
-            let tool_names: Vec<String> = aliases
-                .into_iter()
-                .map(|a| a.alias)
-                .collect();
+            let tool_names: Vec<String> = aliases.into_iter().map(|a| a.alias).collect();
             let _ = tx
                 .send(McpEvent::ToolsChanged {
                     server_id,

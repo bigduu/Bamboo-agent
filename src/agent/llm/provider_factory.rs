@@ -2,9 +2,11 @@
 //!
 //! Creates LLM providers based on configuration.
 
-use crate::agent::llm::providers::{AnthropicProvider, CopilotProvider, GeminiProvider, OpenAIProvider};
 use crate::agent::llm::provider::{LLMError, LLMProvider};
 use crate::agent::llm::providers::common::MaskingProviderDecorator;
+use crate::agent::llm::providers::{
+    AnthropicProvider, CopilotProvider, GeminiProvider, OpenAIProvider,
+};
 use crate::core::keyword_masking::KeywordMaskingConfig;
 use crate::core::paths::{bamboo_dir, keyword_masking_json_path};
 use crate::core::Config;
@@ -110,11 +112,10 @@ pub async fn create_provider_with_dir(
         }
 
         "anthropic" => {
-            let anthropic_config = config
-                .providers
-                .anthropic
-                .as_ref()
-                .ok_or_else(|| LLMError::Auth("Anthropic configuration required".to_string()))?;
+            let anthropic_config =
+                config.providers.anthropic.as_ref().ok_or_else(|| {
+                    LLMError::Auth("Anthropic configuration required".to_string())
+                })?;
 
             if anthropic_config.api_key.is_empty() {
                 return Err(LLMError::Auth("Anthropic API key is required".to_string()));
@@ -191,11 +192,10 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
         }
 
         "anthropic" => {
-            let anthropic_config = config
-                .providers
-                .anthropic
-                .as_ref()
-                .ok_or_else(|| LLMError::Auth("Anthropic configuration required".to_string()))?;
+            let anthropic_config =
+                config.providers.anthropic.as_ref().ok_or_else(|| {
+                    LLMError::Auth("Anthropic configuration required".to_string())
+                })?;
 
             if anthropic_config.api_key.is_empty() {
                 return Err(LLMError::Auth("Anthropic API key is required".to_string()));

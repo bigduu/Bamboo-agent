@@ -57,13 +57,15 @@ impl McpTransport for StdioTransport {
         })?;
 
         // Get stdin/stdout
-        let stdin = child.stdin.take().ok_or_else(|| {
-            McpError::Transport("Failed to capture stdin".to_string())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| McpError::Transport("Failed to capture stdin".to_string()))?;
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            McpError::Transport("Failed to capture stdout".to_string())
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| McpError::Transport("Failed to capture stdout".to_string()))?;
 
         // Start stderr logger
         if let Some(stderr) = child.stderr.take() {
@@ -93,12 +95,7 @@ impl McpTransport for StdioTransport {
 
         if let Some(mut child) = self.child.take() {
             // Try graceful shutdown
-            match tokio::time::timeout(
-                tokio::time::Duration::from_secs(5),
-                child.wait(),
-            )
-            .await
-            {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(5), child.wait()).await {
                 Ok(Ok(_)) => {
                     info!("MCP server process exited gracefully");
                 }
@@ -113,9 +110,7 @@ impl McpTransport for StdioTransport {
     }
 
     async fn send(&self, message: String) -> Result<()> {
-        let stdin = self.stdin.as_ref().ok_or_else(|| {
-            McpError::Disconnected
-        })?;
+        let stdin = self.stdin.as_ref().ok_or_else(|| McpError::Disconnected)?;
 
         let mut stdin = stdin.lock().await;
         let message_with_newline = format!("{}\n", message);
@@ -123,18 +118,17 @@ impl McpTransport for StdioTransport {
             .write_all(message_with_newline.as_bytes())
             .await
             .map_err(|e| McpError::Transport(format!("Failed to write: {}", e)))?;
-        stdin.flush().await.map_err(|e| {
-            McpError::Transport(format!("Failed to flush: {}", e))
-        })?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| McpError::Transport(format!("Failed to flush: {}", e)))?;
 
         debug!("Sent: {}", message);
         Ok(())
     }
 
     async fn receive(&self) -> Result<Option<String>> {
-        let stdout = self.stdout.as_ref().ok_or_else(|| {
-            McpError::Disconnected
-        })?;
+        let stdout = self.stdout.as_ref().ok_or_else(|| McpError::Disconnected)?;
 
         let mut stdout = stdout.lock().await;
         let mut line = String::new();
@@ -159,10 +153,7 @@ impl McpTransport for StdioTransport {
                     Ok(Some(line.to_string()))
                 }
             }
-            Ok(Err(e)) => Err(McpError::Transport(format!(
-                "Failed to read: {}",
-                e
-            ))),
+            Ok(Err(e)) => Err(McpError::Transport(format!("Failed to read: {}", e))),
             Err(_) => {
                 // Timeout, no data available
                 Ok(None)

@@ -6,7 +6,9 @@
 use crate::agent::core::agent::types::Session;
 use crate::agent::core::budget::counter::TokenCounter;
 use crate::agent::core::budget::segmenter::MessageSegmenter;
-use crate::agent::core::budget::types::{BudgetError, BudgetStrategy, PreparedContext, TokenBudget, TokenUsageBreakdown};
+use crate::agent::core::budget::types::{
+    BudgetError, BudgetStrategy, PreparedContext, TokenBudget, TokenUsageBreakdown,
+};
 
 /// Prepare context for LLM call with budget enforcement.
 ///
@@ -71,11 +73,8 @@ pub fn prepare_hybrid_context(
     }
 
     // 6. Select segments from the end until budget is filled
-    let (mut selected_segments, removed_count) = select_segments_within_budget(
-        segments,
-        remaining_budget,
-        &budget.strategy,
-    );
+    let (mut selected_segments, removed_count) =
+        select_segments_within_budget(segments, remaining_budget, &budget.strategy);
 
     // 7. Build final message list
     let mut prepared_messages = system_messages;
@@ -124,7 +123,10 @@ fn select_segments_within_budget(
     segments: Vec<crate::agent::core::budget::segmenter::MessageSegment>,
     remaining_budget: u32,
     _strategy: &BudgetStrategy,
-) -> (Vec<crate::agent::core::budget::segmenter::MessageSegment>, usize) {
+) -> (
+    Vec<crate::agent::core::budget::segmenter::MessageSegment>,
+    usize,
+) {
     let total_segments = segments.len();
     let mut selected: Vec<crate::agent::core::budget::segmenter::MessageSegment> = Vec::new();
     let mut current_tokens: u32 = 0;
@@ -224,7 +226,10 @@ mod tests {
 
         let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
 
-        assert!(prepared.messages.iter().any(|m| m.role == crate::agent::core::agent::types::Role::System));
+        assert!(prepared
+            .messages
+            .iter()
+            .any(|m| m.role == crate::agent::core::agent::types::Role::System));
     }
 
     #[test]
@@ -237,7 +242,10 @@ mod tests {
         // Create many messages to exceed budget
         let mut messages = vec![Message::system("System")];
         for i in 0..50 {
-            messages.push(Message::user(format!("Message number {} with some content", i)));
+            messages.push(Message::user(format!(
+                "Message number {} with some content",
+                i
+            )));
             messages.push(Message::assistant(format!("Response {}", i), None));
         }
 
@@ -246,8 +254,14 @@ mod tests {
         let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
 
         assert!(prepared.truncation_occurred, "Should have truncated");
-        assert!(prepared.messages.len() < messages.len(), "Should have fewer messages");
-        assert!(prepared.segments_removed > 0, "Should have removed some segments");
+        assert!(
+            prepared.messages.len() < messages.len(),
+            "Should have fewer messages"
+        );
+        assert!(
+            prepared.segments_removed > 0,
+            "Should have removed some segments"
+        );
     }
 
     #[test]
@@ -268,7 +282,11 @@ mod tests {
         let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
 
         // Recent messages should be preserved
-        let last_user = prepared.messages.iter().rev().find(|m| m.role == crate::agent::core::agent::types::Role::User);
+        let last_user = prepared
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::agent::core::agent::types::Role::User);
         assert!(last_user.is_some());
         assert!(last_user.unwrap().content.contains("Recent"));
     }
@@ -291,14 +309,20 @@ mod tests {
 
         // If tool call is included, tool result must also be included
         let has_tool_call = prepared.messages.iter().any(|m| {
-            m.tool_calls.as_ref().map_or(false, |tc| tc.iter().any(|c| c.id == "call_1"))
+            m.tool_calls
+                .as_ref()
+                .map_or(false, |tc| tc.iter().any(|c| c.id == "call_1"))
         });
-        let has_tool_result = prepared.messages.iter().any(|m| {
-            m.tool_call_id.as_deref() == Some("call_1")
-        });
+        let has_tool_result = prepared
+            .messages
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("call_1"));
 
         // Either both are present or neither is
-        assert_eq!(has_tool_call, has_tool_result, "Tool call and result must stay together");
+        assert_eq!(
+            has_tool_call, has_tool_result,
+            "Tool call and result must stay together"
+        );
     }
 
     #[test]
@@ -315,7 +339,10 @@ mod tests {
 
         let result = prepare_hybrid_context(&session, &budget, &counter);
 
-        assert!(matches!(result, Err(BudgetError::SystemPromptTooLarge { .. })));
+        assert!(matches!(
+            result,
+            Err(BudgetError::SystemPromptTooLarge { .. })
+        ));
     }
 
     #[test]
@@ -416,10 +443,16 @@ mod tests {
 
         // The large message should be skipped, small message should be included
         let has_large_message = prepared.messages.iter().any(|m| m.content.len() > 100);
-        let has_small_message = prepared.messages.iter().any(|m| m.content.contains("Small"));
+        let has_small_message = prepared
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Small"));
 
         assert!(!has_large_message, "Oversized segment should be skipped");
-        assert!(has_small_message, "Small message within budget should be included");
+        assert!(
+            has_small_message,
+            "Small message within budget should be included"
+        );
     }
 
     #[test]
@@ -437,7 +470,10 @@ mod tests {
 
         // Should fail with SystemPromptTooLarge since 22 tokens > 0 available
         let result = prepare_hybrid_context(&session, &budget, &counter);
-        assert!(matches!(result, Err(BudgetError::SystemPromptTooLarge { .. })));
+        assert!(matches!(
+            result,
+            Err(BudgetError::SystemPromptTooLarge { .. })
+        ));
     }
 
     #[test]
@@ -448,7 +484,9 @@ mod tests {
         let budget = TokenBudget::new(200, 50, BudgetStrategy::Window { size: 50 });
 
         let messages = vec![
-            Message::system("This is a longer system prompt that uses up more of the available budget space"),
+            Message::system(
+                "This is a longer system prompt that uses up more of the available budget space",
+            ),
             Message::user("User message"),
         ];
         let session = make_session_with_messages(messages);
@@ -456,7 +494,10 @@ mod tests {
         let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
 
         // System message should always be present
-        let has_system = prepared.messages.iter().any(|m| m.role == crate::agent::core::agent::types::Role::System);
+        let has_system = prepared
+            .messages
+            .iter()
+            .any(|m| m.role == crate::agent::core::agent::types::Role::System);
         assert!(has_system, "System message should always be included");
 
         // Budget should be enforced

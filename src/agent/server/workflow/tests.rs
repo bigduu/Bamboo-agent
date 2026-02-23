@@ -65,7 +65,10 @@ fn parses_yaml_definition_with_version_field() {
 
     assert_eq!(workflow.id, "code-review");
     assert_eq!(workflow.name, "Intelligent Code Review");
-    assert_eq!(workflow.description, "Automatically analyze code and provide review suggestions");
+    assert_eq!(
+        workflow.description,
+        "Automatically analyze code and provide review suggestions"
+    );
     let json = serde_json::to_value(&workflow).expect("workflow should serialize");
     assert_eq!(json["version"], serde_json::json!("1.0.0"));
 

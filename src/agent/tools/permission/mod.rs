@@ -29,20 +29,20 @@
 //! config.grant_session_permission(PermissionType::WriteFile, "/tmp/*");
 //! ```
 
-pub mod config;
 pub mod checker;
+pub mod config;
 pub mod storage;
 pub mod tool_permissions;
 
 // Re-export commonly used types
-pub use config::{
-    PermissionConfig, PermissionRule, PermissionType, RiskLevel, SerializablePermissionConfig,
-    SessionGrant,
-};
 pub use checker::{
     AllowAllPermissionChecker, ConfigPermissionChecker, DenyDangerousPermissionChecker,
     LoggingPermissionChecker, PermissionChecker, PermissionCheckerExt, PermissionContext,
     PermissionError, PermissionResult,
+};
+pub use config::{
+    PermissionConfig, PermissionRule, PermissionType, RiskLevel, SerializablePermissionConfig,
+    SessionGrant,
 };
 pub use storage::PermissionStorage;
 pub use tool_permissions::{check_permissions, is_delete_command};

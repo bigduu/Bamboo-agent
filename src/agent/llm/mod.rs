@@ -20,8 +20,13 @@ pub mod provider_factory;
 pub use crate::core::Config;
 pub use error::ProxyAuthRequiredError;
 pub use models::*;
-pub use protocol::{AnthropicProtocol, GeminiProtocol, OpenAIProtocol, FromProvider, ToProvider, ProtocolError, ProtocolResult};
+pub use protocol::{
+    AnthropicProtocol, FromProvider, GeminiProtocol, OpenAIProtocol, ProtocolError, ProtocolResult,
+    ToProvider,
+};
 pub use provider::{LLMError, LLMProvider, LLMStream};
-pub use provider_factory::{create_provider, create_provider_with_dir, validate_provider_config, AVAILABLE_PROVIDERS};
+pub use provider_factory::{
+    create_provider, create_provider_with_dir, validate_provider_config, AVAILABLE_PROVIDERS,
+};
 pub use providers::{AnthropicProvider, CopilotProvider, GeminiProvider, OpenAIProvider};
 pub use types::LLMChunk;

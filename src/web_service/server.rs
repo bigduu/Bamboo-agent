@@ -1,15 +1,15 @@
 use std::{path::PathBuf, sync::Arc};
 
-use actix_cors::Cors;
-use actix_files as fs;
-use actix_governor::{Governor, GovernorConfigBuilder};
-use actix_web::{http::header, web, App, HttpServer};
-use actix_web::middleware::DefaultHeaders;
 use crate::agent::llm::LLMProvider;
 use crate::agent::metrics::{MetricsBus, MetricsStorage, MetricsWorker};
 use crate::agent::server::handlers as agent_handlers;
 use crate::agent::server::state::AppState as AgentAppState;
 use crate::core::Config;
+use actix_cors::Cors;
+use actix_files as fs;
+use actix_governor::{Governor, GovernorConfigBuilder};
+use actix_web::middleware::DefaultHeaders;
+use actix_web::{http::header, web, App, HttpServer};
 use log::{error, info};
 use tokio::sync::{oneshot, RwLock};
 
@@ -17,8 +17,8 @@ use crate::web_service::controllers::anthropic as anthropic_controller;
 use crate::web_service::controllers::copilot_auth_controller;
 use crate::web_service::controllers::gemini_controller;
 use crate::web_service::controllers::{
-    agent_controller, command_controller, settings_controller, openai_controller,
-    skill_controller, tools_controller, workspace_controller,
+    agent_controller, command_controller, openai_controller, settings_controller, skill_controller,
+    tools_controller, workspace_controller,
 };
 use crate::web_service::model_config_helper::get_default_model_from_config;
 
@@ -39,10 +39,15 @@ impl AppState {
         log::info!(
             "Reloading provider: type={}, model={:?}",
             config.provider,
-            config.providers.anthropic.as_ref().and_then(|p| p.model.as_ref())
+            config
+                .providers
+                .anthropic
+                .as_ref()
+                .and_then(|p| p.model.as_ref())
         );
 
-        let new_provider = crate::agent::llm::create_provider_with_dir(&config, self.app_data_dir.clone()).await?;
+        let new_provider =
+            crate::agent::llm::create_provider_with_dir(&config, self.app_data_dir.clone()).await?;
 
         let mut provider = self.provider.write().await;
         *provider = new_provider;
@@ -95,7 +100,8 @@ impl MetricsState {
 
     /// Stop the metrics worker
     pub fn stop(&self) {
-        self.worker_handle.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.worker_handle
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -167,14 +173,10 @@ pub fn app_config(cfg: &mut web::ServiceConfig) {
     );
 
     // Anthropic endpoints under /anthropic/v1 (to match Anthropic SDK expectations)
-    cfg.service(
-        web::scope("/anthropic/v1").configure(anthropic_controller::config),
-    );
+    cfg.service(web::scope("/anthropic/v1").configure(anthropic_controller::config));
 
     // Gemini endpoints under /gemini/v1beta (to match Gemini SDK expectations)
-    cfg.service(
-        web::scope("/gemini/v1beta").configure(gemini_controller::config),
-    );
+    cfg.service(web::scope("/gemini/v1beta").configure(gemini_controller::config));
 }
 
 /// Production config with rate limiting enabled
@@ -196,7 +198,7 @@ pub fn app_config_with_rate_limiting(cfg: &mut web::ServiceConfig) {
             .service(
                 web::scope("")
                     .wrap(Governor::new(&rate_limiter))
-                    .configure(openai_controller::config)
+                    .configure(openai_controller::config),
             )
             .configure(settings_controller::config)
             .configure(skill_controller::config)
@@ -206,14 +208,10 @@ pub fn app_config_with_rate_limiting(cfg: &mut web::ServiceConfig) {
     );
 
     // Anthropic endpoints under /anthropic/v1 (to match Anthropic SDK expectations)
-    cfg.service(
-        web::scope("/anthropic/v1").configure(anthropic_controller::config),
-    );
+    cfg.service(web::scope("/anthropic/v1").configure(anthropic_controller::config));
 
     // Gemini endpoints under /gemini/v1beta (to match Gemini SDK expectations)
-    cfg.service(
-        web::scope("/gemini/v1beta").configure(gemini_controller::config),
-    );
+    cfg.service(web::scope("/gemini/v1beta").configure(gemini_controller::config));
 }
 
 pub fn agent_api_config(cfg: &mut web::ServiceConfig) {
@@ -301,8 +299,14 @@ pub fn agent_api_config(cfg: &mut web::ServiceConfig) {
                 web::scope("/mcp")
                     .route("/servers", web::get().to(agent_handlers::mcp::list_servers))
                     .route("/servers", web::post().to(agent_handlers::mcp::add_server))
-                    .route("/servers/{id}", web::get().to(agent_handlers::mcp::get_server))
-                    .route("/servers/{id}", web::put().to(agent_handlers::mcp::update_server))
+                    .route(
+                        "/servers/{id}",
+                        web::get().to(agent_handlers::mcp::get_server),
+                    )
+                    .route(
+                        "/servers/{id}",
+                        web::put().to(agent_handlers::mcp::update_server),
+                    )
                     .route(
                         "/servers/{id}",
                         web::delete().to(agent_handlers::mcp::delete_server),
@@ -328,12 +332,20 @@ pub fn agent_api_config(cfg: &mut web::ServiceConfig) {
     );
 }
 
-async fn build_agent_state(app_data_dir: PathBuf, port: u16, config: &Config) -> Result<AgentAppState, String> {
+async fn build_agent_state(
+    app_data_dir: PathBuf,
+    port: u16,
+    config: &Config,
+) -> Result<AgentAppState, String> {
     let base_url = format!("http://127.0.0.1:{}/v1", port);
 
     // Get model from config - fail if not configured
-    let model = get_default_model_from_config(config)
-        .map_err(|e| format!("Failed to get model from config: {}. Please specify a model in your config.json file.", e))?;
+    let model = get_default_model_from_config(config).map_err(|e| {
+        format!(
+            "Failed to get model from config: {}. Please specify a model in your config.json file.",
+            e
+        )
+    })?;
 
     info!("Agent Server using model from config: {}", model);
 
@@ -344,7 +356,8 @@ async fn build_agent_state(app_data_dir: PathBuf, port: u16, config: &Config) ->
         "tauri".to_string(),
         Some(app_data_dir),
         true,
-    ).await)
+    )
+    .await)
 }
 
 pub async fn run(app_data_dir: PathBuf, port: u16) -> Result<(), String> {
@@ -360,9 +373,7 @@ pub async fn run(app_data_dir: PathBuf, port: u16) -> Result<(), String> {
         .await
         .map_err(|e| format!("Failed to create provider: {}", e))?;
 
-    let agent_state = web::Data::new(
-        build_agent_state(app_data_dir.clone(), port, &config).await?
-    );
+    let agent_state = web::Data::new(build_agent_state(app_data_dir.clone(), port, &config).await?);
 
     let app_state = web::Data::new(AppState {
         app_data_dir,
@@ -376,7 +387,7 @@ pub async fn run(app_data_dir: PathBuf, port: u16) -> Result<(), String> {
             .app_data(app_state.clone())
             .app_data(agent_state.clone())
             .wrap(build_cors("127.0.0.1", port))
-            .configure(app_config)  // No rate limiting for desktop mode (localhost only)
+            .configure(app_config) // No rate limiting for desktop mode (localhost only)
             .configure(agent_api_config)
     })
     .workers(DEFAULT_WORKER_COUNT)
@@ -432,9 +443,8 @@ impl WebService {
             .await
             .map_err(|e| format!("Failed to create provider: {}", e))?;
 
-        let agent_state = web::Data::new(
-            build_agent_state(self.app_data_dir.clone(), port, &config).await?
-        );
+        let agent_state =
+            web::Data::new(build_agent_state(self.app_data_dir.clone(), port, &config).await?);
 
         let app_state = web::Data::new(AppState {
             app_data_dir: self.app_data_dir.clone(),
@@ -531,9 +541,7 @@ pub async fn run_with_bind(app_data_dir: PathBuf, port: u16, bind: &str) -> Resu
         .await
         .map_err(|e| format!("Failed to create provider: {}", e))?;
 
-    let agent_state = web::Data::new(
-        build_agent_state(app_data_dir.clone(), port, &config).await?
-    );
+    let agent_state = web::Data::new(build_agent_state(app_data_dir.clone(), port, &config).await?);
 
     let app_state = web::Data::new(AppState {
         app_data_dir,
@@ -555,7 +563,7 @@ pub async fn run_with_bind(app_data_dir: PathBuf, port: u16, bind: &str) -> Resu
             .app_data(agent_state.clone())
             .wrap(build_cors(&bind_for_cors, port))
             .wrap(build_security_headers())
-            .configure(app_config_with_rate_limiting)  // Enable rate limiting
+            .configure(app_config_with_rate_limiting) // Enable rate limiting
             .configure(agent_api_config)
     })
     .workers(DEFAULT_WORKER_COUNT)
@@ -609,10 +617,14 @@ pub async fn run_with_bind_and_static(
     // This is required for fs::Files to work correctly in multi-threaded environment
     let static_dir: Option<PathBuf> = match static_dir {
         Some(path) => {
-            let canonicalized = path.canonicalize()
+            let canonicalized = path
+                .canonicalize()
                 .map_err(|e| format!("Static directory not found: {:?}: {}", path, e))?;
             if !canonicalized.is_dir() {
-                return Err(format!("Static path is not a directory: {}", canonicalized.display()));
+                return Err(format!(
+                    "Static path is not a directory: {}",
+                    canonicalized.display()
+                ));
             }
             info!("Serving static files from: {:?}", canonicalized);
             Some(canonicalized)
@@ -630,9 +642,7 @@ pub async fn run_with_bind_and_static(
         .await
         .map_err(|e| format!("Failed to create provider: {}", e))?;
 
-    let agent_state = web::Data::new(
-        build_agent_state(app_data_dir.clone(), port, &config).await?
-    );
+    let agent_state = web::Data::new(build_agent_state(app_data_dir.clone(), port, &config).await?);
 
     let app_state = web::Data::new(AppState {
         app_data_dir,
@@ -655,7 +665,7 @@ pub async fn run_with_bind_and_static(
             .app_data(agent_state.clone())
             .wrap(build_cors(&bind_for_cors, port))
             .wrap(build_security_headers())
-            .configure(app_config_with_rate_limiting)  // Enable rate limiting
+            .configure(app_config_with_rate_limiting) // Enable rate limiting
             .configure(agent_api_config);
 
         // Add static file serving if directory is provided

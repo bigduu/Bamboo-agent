@@ -311,7 +311,10 @@ impl EnhancedPromptBuilder {
         output
     }
 
-    fn collect_guides(registry: Option<&ToolRegistry>, tool_names: &[String]) -> Vec<ToolGuideSpec> {
+    fn collect_guides(
+        registry: Option<&ToolRegistry>,
+        tool_names: &[String],
+    ) -> Vec<ToolGuideSpec> {
         let mut seen = BTreeSet::new();
         let mut guides = Vec::new();
 
@@ -348,10 +351,7 @@ impl EnhancedPromptBuilder {
             output.push_str("## Tool Usage Guidelines\n");
         }
 
-        output.push_str(&format!(
-            "\n### {}\n",
-            schema_only_title(context.language)
-        ));
+        output.push_str(&format!("\n### {}\n", schema_only_title(context.language)));
         output.push_str(schema_only_description(context.language));
         output.push('\n');
 
@@ -434,7 +434,8 @@ mod tests {
         registry.register(ReadFileTool::new()).unwrap();
 
         let schemas = registry.list_tools();
-        let prompt = EnhancedPromptBuilder::build(Some(&registry), &schemas, &GuideBuildContext::default());
+        let prompt =
+            EnhancedPromptBuilder::build(Some(&registry), &schemas, &GuideBuildContext::default());
 
         assert!(prompt.contains("## Tool Usage Guidelines"));
         assert!(prompt.contains("**read_file**"));

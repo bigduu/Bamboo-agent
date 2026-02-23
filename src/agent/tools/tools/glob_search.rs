@@ -395,9 +395,12 @@ mod tests {
         fs::create_dir_all(format!("{}/node_modules/pkg", test_dir))
             .await
             .unwrap();
-        fs::write(format!("{}/node_modules/pkg/index.js", test_dir), "content2")
-            .await
-            .unwrap();
+        fs::write(
+            format!("{}/node_modules/pkg/index.js", test_dir),
+            "content2",
+        )
+        .await
+        .unwrap();
 
         let args = GlobArgs {
             pattern: "**/*".to_string(),
@@ -405,14 +408,21 @@ mod tests {
             // Match node_modules directory and all its contents
             // **/node_modules matches the directory itself
             // **/node_modules/** matches all contents
-            exclude: vec!["**/node_modules".to_string(), "**/node_modules/**".to_string()],
+            exclude: vec![
+                "**/node_modules".to_string(),
+                "**/node_modules/**".to_string(),
+            ],
             limit: 1000,
             files_only: false,
             dirs_only: false,
         };
 
         let results = GlobSearchTool::search(args).await.unwrap();
-        assert!(!results.iter().any(|p| p.contains("node_modules")), "Found node_modules in results: {:?}", results);
+        assert!(
+            !results.iter().any(|p| p.contains("node_modules")),
+            "Found node_modules in results: {:?}",
+            results
+        );
 
         // Cleanup
         let _ = fs::remove_dir_all(test_dir).await;
@@ -643,7 +653,12 @@ mod tests {
 
         let result = GlobSearchTool::search(args).await.unwrap();
         // Should only find test.txt in the root, not subdir/nested.txt
-        assert_eq!(result.len(), 1, "Expected 1 file for non-recursive pattern, got {:?}", result);
+        assert_eq!(
+            result.len(),
+            1,
+            "Expected 1 file for non-recursive pattern, got {:?}",
+            result
+        );
         // Check that it ends with test.txt (accounting for macOS /private/tmp path)
         assert!(
             result[0].ends_with("test.txt"),
@@ -668,9 +683,20 @@ mod tests {
 
         let result = GlobSearchTool::search(args).await.unwrap();
         // Should find both test.txt and subdir/nested.txt
-        assert_eq!(result.len(), 2, "Expected 2 files for recursive pattern, got {:?}", result);
-        assert!(result.iter().any(|p| p.contains("test.txt")), "Missing test.txt");
-        assert!(result.iter().any(|p| p.contains("nested.txt")), "Missing nested.txt");
+        assert_eq!(
+            result.len(),
+            2,
+            "Expected 2 files for recursive pattern, got {:?}",
+            result
+        );
+        assert!(
+            result.iter().any(|p| p.contains("test.txt")),
+            "Missing test.txt"
+        );
+        assert!(
+            result.iter().any(|p| p.contains("nested.txt")),
+            "Missing nested.txt"
+        );
 
         // Cleanup
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
@@ -712,8 +738,10 @@ mod tests {
         let result = GlobSearchTool::search(args).await;
         if let Ok(files) = result {
             // If the pattern was accepted, ensure we didn't get outside files
-            assert!(!files.iter().any(|f| f.contains("outside_file")),
-                "Should not find files outside base_dir");
+            assert!(
+                !files.iter().any(|f| f.contains("outside_file")),
+                "Should not find files outside base_dir"
+            );
         }
         // If it was rejected, that's also acceptable
 

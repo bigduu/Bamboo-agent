@@ -128,14 +128,8 @@ pub enum ForwardEvent {
 /// System-level events for operational metrics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SystemEvent {
-    MetricsDropped {
-        count: u64,
-        reason: String,
-    },
-    StorageError {
-        error: String,
-        event_type: String,
-    },
+    MetricsDropped { count: u64, reason: String },
+    StorageError { error: String, event_type: String },
     WorkerStarted,
     WorkerStopped,
 }
@@ -170,7 +164,9 @@ mod tests {
         let deserialized: MetricsEvent = serde_json::from_str(&json).expect("deserialize");
 
         match deserialized {
-            MetricsEvent::Chat(ChatEvent::SessionStarted { session_id, model, .. }) => {
+            MetricsEvent::Chat(ChatEvent::SessionStarted {
+                session_id, model, ..
+            }) => {
                 assert_eq!(session_id, "session-123");
                 assert_eq!(model, "gpt-4");
             }

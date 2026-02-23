@@ -2,8 +2,8 @@
 //!
 //! This module contains various LLM provider implementations.
 
-pub(crate) mod common;
 pub mod anthropic;
+pub(crate) mod common;
 pub mod copilot;
 pub mod gemini;
 pub mod openai;

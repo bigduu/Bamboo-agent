@@ -12,7 +12,6 @@ pub enum MatchType {
     Regex,
 }
 
-
 /// A single keyword masking entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeywordEntry {
@@ -60,14 +59,12 @@ impl KeywordEntry {
 }
 
 /// Configuration for global keyword masking
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct KeywordMaskingConfig {
     /// List of keyword masking entries
     #[serde(default)]
     pub entries: Vec<KeywordEntry>,
 }
-
 
 impl KeywordMaskingConfig {
     /// Create a new empty config

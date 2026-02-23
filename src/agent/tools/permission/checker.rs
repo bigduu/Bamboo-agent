@@ -21,7 +21,7 @@ pub struct PermissionContext {
     pub operation_description: String,
     /// Additional details about the operation
     #[serde(skip_serializing_if = "Option::is_none")]
-pub details: Option<serde_json::Value>,
+    pub details: Option<serde_json::Value>,
 }
 
 impl PermissionContext {
@@ -229,7 +229,11 @@ impl<T: PermissionChecker> PermissionChecker for LoggingPermissionChecker<T> {
     }
 
     fn grant_session_permission(&self, perm_type: PermissionType, resource: String) {
-        log::info!("Granting session permission: {:?} for '{}'", perm_type, resource);
+        log::info!(
+            "Granting session permission: {:?} for '{}'",
+            perm_type,
+            resource
+        );
         self.inner.grant_session_permission(perm_type, resource);
     }
 }
@@ -405,8 +409,16 @@ mod tests {
     async fn test_allow_all_checker() {
         let checker = AllowAllPermissionChecker;
 
-        assert!(!checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
-        assert!(!checker.needs_confirmation(PermissionType::ExecuteCommand, "rm -rf /").await);
+        assert!(
+            !checker
+                .needs_confirmation(PermissionType::WriteFile, "/tmp/test")
+                .await
+        );
+        assert!(
+            !checker
+                .needs_confirmation(PermissionType::ExecuteCommand, "rm -rf /")
+                .await
+        );
 
         let ctx = PermissionContext::new(PermissionType::WriteFile, "/tmp/test", "test");
         assert!(checker.request_confirmation(ctx).await.unwrap());
@@ -416,8 +428,16 @@ mod tests {
     async fn test_deny_dangerous_checker() {
         let checker = DenyDangerousPermissionChecker;
 
-        assert!(checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
-        assert!(checker.needs_confirmation(PermissionType::ExecuteCommand, "ls").await);
+        assert!(
+            checker
+                .needs_confirmation(PermissionType::WriteFile, "/tmp/test")
+                .await
+        );
+        assert!(
+            checker
+                .needs_confirmation(PermissionType::ExecuteCommand, "ls")
+                .await
+        );
     }
 
     #[tokio::test]
@@ -426,11 +446,19 @@ mod tests {
         let checker = ConfigPermissionChecker::new(config);
 
         // By default, should need confirmation
-        assert!(checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
+        assert!(
+            checker
+                .needs_confirmation(PermissionType::WriteFile, "/tmp/test")
+                .await
+        );
 
         // After granting session permission, should not need confirmation
         checker.grant_session_permission(PermissionType::WriteFile, "/tmp/*".to_string());
-        assert!(!checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
+        assert!(
+            !checker
+                .needs_confirmation(PermissionType::WriteFile, "/tmp/test")
+                .await
+        );
     }
 
     #[test]

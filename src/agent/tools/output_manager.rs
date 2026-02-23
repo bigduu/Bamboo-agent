@@ -71,7 +71,9 @@ impl ToolOutputManager {
         }
 
         // Store full result as artifact
-        let artifact = self.store_artifact(tool_call_id, &result, token_count).await?;
+        let artifact = self
+            .store_artifact(tool_call_id, &result, token_count)
+            .await?;
 
         // Result is too large - truncate and add a short notice referencing the artifact id.
         // The notice itself costs tokens, so we reserve budget for it up-front.
@@ -137,7 +139,8 @@ impl ToolOutputManager {
         }
 
         // Try to truncate at a natural boundary (newline or space)
-        let truncate_at = text[..max_chars].rfind('\n')
+        let truncate_at = text[..max_chars]
+            .rfind('\n')
             .or_else(|| text[..max_chars].rfind(' '))
             .unwrap_or(max_chars);
 
@@ -262,7 +265,10 @@ mod tests {
         let manager = ToolOutputManager::new(dir.path(), 100);
 
         let result = "Small result".to_string();
-        let (capped, artifact) = manager.cap_tool_result("call_1", result.clone()).await.unwrap();
+        let (capped, artifact) = manager
+            .cap_tool_result("call_1", result.clone())
+            .await
+            .unwrap();
 
         assert_eq!(capped, result);
         assert!(artifact.is_none());
@@ -275,7 +281,10 @@ mod tests {
 
         // Create a large result (more than 100 tokens)
         let result = "x".repeat(1000);
-        let (capped, artifact) = manager.cap_tool_result("call_1", result.clone()).await.unwrap();
+        let (capped, artifact) = manager
+            .cap_tool_result("call_1", result.clone())
+            .await
+            .unwrap();
 
         // Should be truncated
         assert!(capped.len() < result.len());

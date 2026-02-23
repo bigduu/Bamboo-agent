@@ -53,12 +53,12 @@ impl PermissionStorage {
             return Ok(None);
         }
 
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| PermissionStorageError::ReadError {
+        let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
+            PermissionStorageError::ReadError {
                 path: path.clone(),
                 source: e,
-            })?;
+            }
+        })?;
 
         if content.trim().is_empty() {
             return Ok(None);
@@ -77,8 +77,7 @@ impl PermissionStorage {
     ///
     /// Returns the loaded config, or a default config if loading fails
     /// or the file doesn't exist.
-    pub async fn load_or_default(&self,
-    ) -> Result<PermissionConfig, PermissionStorageError> {
+    pub async fn load_or_default(&self) -> Result<PermissionConfig, PermissionStorageError> {
         match self.load().await {
             Ok(Some(config)) => Ok(config),
             Ok(None) => Ok(PermissionConfig::new()),
@@ -87,10 +86,7 @@ impl PermissionStorage {
     }
 
     /// Save permission configuration to storage
-    pub async fn save(
-        &self,
-        config: &PermissionConfig,
-    ) -> Result<(), PermissionStorageError> {
+    pub async fn save(&self, config: &PermissionConfig) -> Result<(), PermissionStorageError> {
         let path = self.config_path();
 
         // Ensure the config directory exists
@@ -111,12 +107,12 @@ impl PermissionStorage {
             }
         })?;
 
-        tokio::fs::write(&path, content).await.map_err(|e| {
-            PermissionStorageError::WriteError {
+        tokio::fs::write(&path, content)
+            .await
+            .map_err(|e| PermissionStorageError::WriteError {
                 path: path.clone(),
                 source: e,
-            }
-        })?;
+            })?;
 
         Ok(())
     }
@@ -131,12 +127,12 @@ impl PermissionStorage {
         let path = self.config_path();
 
         if path.exists() {
-            tokio::fs::remove_file(&path)
-                .await
-                .map_err(|e| PermissionStorageError::WriteError {
+            tokio::fs::remove_file(&path).await.map_err(|e| {
+                PermissionStorageError::WriteError {
                     path: path.clone(),
                     source: e,
-                })?;
+                }
+            })?;
         }
 
         Ok(())
@@ -208,7 +204,11 @@ mod tests {
         // Create a config with some rules
         let config = PermissionConfig::new();
         config.add_rule(PermissionRule::new(PermissionType::WriteFile, "*.rs", true));
-        config.add_rule(PermissionRule::new(PermissionType::ExecuteCommand, "cargo *", true));
+        config.add_rule(PermissionRule::new(
+            PermissionType::ExecuteCommand,
+            "cargo *",
+            true,
+        ));
 
         // Save the config
         storage.save(&config).await.unwrap();

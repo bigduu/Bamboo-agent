@@ -1,13 +1,15 @@
-use crate::web_service::services::gemini_model_mapping_service::resolve_model;
-use crate::web_service::{error::AppError, model_config_helper::get_default_model_from_config, server::AppState};
-use actix_web::{get, post, web, HttpResponse};
-use crate::agent::core::Message;
 use crate::agent::core::tools::ToolSchema;
+use crate::agent::core::Message;
 use crate::agent::llm::protocol::gemini::{
     GeminiCandidate, GeminiContent, GeminiFunctionCall, GeminiPart, GeminiRequest, GeminiResponse,
 };
 use crate::agent::llm::protocol::FromProvider;
 use crate::agent::llm::LLMChunk;
+use crate::web_service::services::gemini_model_mapping_service::resolve_model;
+use crate::web_service::{
+    error::AppError, model_config_helper::get_default_model_from_config, server::AppState,
+};
+use actix_web::{get, post, web, HttpResponse};
 use anyhow::anyhow;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -36,7 +38,11 @@ pub async fn generate_content(
     let resolution = match resolve_model(&state.app_data_dir, &gemini_model).await {
         Ok(res) => res,
         Err(e) => {
-            log::warn!("Failed to resolve model mapping for '{}': {}", gemini_model, e);
+            log::warn!(
+                "Failed to resolve model mapping for '{}': {}",
+                gemini_model,
+                e
+            );
             // Continue with empty mapping (will use default model)
             crate::web_service::services::gemini_model_mapping_service::ModelResolution {
                 mapped_model: String::new(),
@@ -67,15 +73,19 @@ pub async fn generate_content(
     // 4. Call provider with mapped model
     let model_to_use = if resolution.mapped_model.trim().is_empty() {
         let config = state.config.read().await.clone();
-        get_default_model_from_config(&config).map_err(|e| {
-            AppError::InternalError(anyhow!("No default model configured: {}", e))
-        })?
+        get_default_model_from_config(&config)
+            .map_err(|e| AppError::InternalError(anyhow!("No default model configured: {}", e)))?
     } else {
         resolution.mapped_model.clone()
     };
 
     let mut stream = provider
-        .chat_stream(&internal_messages, &internal_tools, None, model_to_use.as_str())
+        .chat_stream(
+            &internal_messages,
+            &internal_tools,
+            None,
+            model_to_use.as_str(),
+        )
         .await
         .map_err(|e| AppError::InternalError(anyhow!("Provider error: {}", e)))?;
 
@@ -90,12 +100,7 @@ pub async fn generate_content(
             Ok(LLMChunk::ToolCalls(calls)) => {
                 tool_calls = Some(calls);
             }
-            Err(e) => {
-                return Err(AppError::InternalError(anyhow!(
-                    "Stream error: {}",
-                    e
-                )))
-            }
+            Err(e) => return Err(AppError::InternalError(anyhow!("Stream error: {}", e))),
         }
     }
 
@@ -160,7 +165,11 @@ pub async fn stream_generate_content(
     let resolution = match resolve_model(&state.app_data_dir, &gemini_model).await {
         Ok(res) => res,
         Err(e) => {
-            log::warn!("Failed to resolve model mapping for '{}': {}", gemini_model, e);
+            log::warn!(
+                "Failed to resolve model mapping for '{}': {}",
+                gemini_model,
+                e
+            );
             // Continue with empty mapping (will use default model)
             crate::web_service::services::gemini_model_mapping_service::ModelResolution {
                 mapped_model: String::new(),
@@ -188,9 +197,8 @@ pub async fn stream_generate_content(
     // 3. Get provider and create stream
     let model_to_use = if resolution.mapped_model.trim().is_empty() {
         let config = state.config.read().await.clone();
-        get_default_model_from_config(&config).map_err(|e| {
-            AppError::InternalError(anyhow!("No default model configured: {}", e))
-        })?
+        get_default_model_from_config(&config)
+            .map_err(|e| AppError::InternalError(anyhow!("No default model configured: {}", e)))?
     } else {
         resolution.mapped_model.clone()
     };
@@ -198,7 +206,12 @@ pub async fn stream_generate_content(
     let mut stream = state
         .get_provider()
         .await
-        .chat_stream(&internal_messages, &internal_tools, None, model_to_use.as_str())
+        .chat_stream(
+            &internal_messages,
+            &internal_tools,
+            None,
+            model_to_use.as_str(),
+        )
         .await
         .map_err(|e| AppError::InternalError(anyhow!("Provider error: {}", e)))?;
 
@@ -301,9 +314,7 @@ pub async fn stream_generate_content(
 
 /// List available models
 #[get("/models")]
-pub async fn list_models(
-    state: web::Data<AppState>,
-) -> Result<HttpResponse, AppError> {
+pub async fn list_models(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let provider = state.get_provider().await;
 
     let models = provider
@@ -332,9 +343,7 @@ pub async fn list_models(
 }
 
 /// Helper: Convert Gemini contents to internal Messages
-fn convert_gemini_to_messages(
-    contents: &[GeminiContent],
-) -> Result<Vec<Message>, AppError> {
+fn convert_gemini_to_messages(contents: &[GeminiContent]) -> Result<Vec<Message>, AppError> {
     contents
         .iter()
         .map(|content| {

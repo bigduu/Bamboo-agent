@@ -17,10 +17,7 @@ pub enum ProtocolError {
     MissingField(String),
 
     #[error("Unsupported feature '{feature}' for protocol '{protocol}'")]
-    UnsupportedFeature {
-        feature: String,
-        protocol: String,
-    },
+    UnsupportedFeature { feature: String, protocol: String },
 
     #[error("Invalid tool call: {0}")]
     InvalidToolCall(String),

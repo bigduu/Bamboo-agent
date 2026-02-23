@@ -51,9 +51,7 @@ impl SleepTool {
 
         sleep(duration).await;
 
-        let reason_str = reason
-            .map(|r| format!(" ({})", r))
-            .unwrap_or_default();
+        let reason_str = reason.map(|r| format!(" ({})", r)).unwrap_or_default();
         Ok(format!("Slept for {} seconds{}", seconds, reason_str))
     }
 }

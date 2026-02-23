@@ -8,10 +8,10 @@
 //! - Cache: ~/.cache/bamboo/
 //! - Runtime: /tmp/bamboo-$UID/ (or $XDG_RUNTIME_DIR/bamboo/)
 
-use std::path::PathBuf;
+use anyhow::{Context, Result};
 use std::env;
 use std::fs;
-use anyhow::{Result, Context};
+use std::path::PathBuf;
 
 /// Get XDG_CONFIG_HOME or default (~/.config)
 pub fn xdg_config_home() -> PathBuf {

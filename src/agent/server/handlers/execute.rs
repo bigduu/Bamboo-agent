@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::agent::server::state::{AgentRunner, AgentStatus, AppState};
 use crate::agent::core::agent::Role;
 use crate::agent::loop_module::{run_agent_loop_with_config, AgentLoopConfig};
+use crate::agent::server::state::{AgentRunner, AgentStatus, AppState};
 
 #[derive(Serialize)]
 pub struct ExecuteResponse {
@@ -37,7 +37,11 @@ pub async fn handler(
     }
     let model = model.to_string();
 
-    log::debug!("[{}] Execute request received with model: {}", session_id, model);
+    log::debug!(
+        "[{}] Execute request received with model: {}",
+        session_id,
+        model
+    );
 
     // Load session from memory or storage first (async, no locks held)
     let mut session = {
@@ -74,7 +78,10 @@ pub async fn handler(
         .unwrap_or(false);
 
     if !last_message_is_user {
-        log::debug!("[{}] No pending user message, returning completed status", session_id);
+        log::debug!(
+            "[{}] No pending user message, returning completed status",
+            session_id
+        );
         return HttpResponse::Ok().json(ExecuteResponse {
             session_id: session_id.clone(),
             status: "completed".to_string(),
@@ -89,14 +96,21 @@ pub async fn handler(
         // Check if there's already a running runner for this session
         if let Some(runner) = runners.get(&session_id) {
             if matches!(runner.status, AgentStatus::Running) {
-                log::debug!("[{}] Runner already running, returning status: already_running", session_id);
+                log::debug!(
+                    "[{}] Runner already running, returning status: already_running",
+                    session_id
+                );
                 return HttpResponse::Ok().json(ExecuteResponse {
                     session_id: session_id.clone(),
                     status: "already_running".to_string(),
                     events_url: format!("/api/v1/events/{}", session_id),
                 });
             }
-            log::debug!("[{}] Existing runner with status {:?}, will restart", session_id, runner.status);
+            log::debug!(
+                "[{}] Existing runner with status {:?}, will restart",
+                session_id,
+                runner.status
+            );
         }
 
         // Remove stale runner and insert new one atomically
@@ -127,11 +141,17 @@ pub async fn handler(
     tokio::spawn(async move {
         while let Some(event) = mpsc_rx.recv().await {
             // Store budget events for late subscribers
-            if matches!(&event, crate::agent::core::AgentEvent::TokenBudgetUpdated { .. }) {
+            if matches!(
+                &event,
+                crate::agent::core::AgentEvent::TokenBudgetUpdated { .. }
+            ) {
                 let mut runners = state_for_forwarder.agent_runners.write().await;
                 if let Some(runner) = runners.get_mut(&session_id_forwarder) {
                     runner.last_budget_event = Some(event.clone());
-                    log::debug!("[{}] Stored budget event for late subscribers", session_id_forwarder);
+                    log::debug!(
+                        "[{}] Stored budget event for late subscribers",
+                        session_id_forwarder
+                    );
                 }
             }
 
@@ -206,13 +226,17 @@ pub async fn handler(
         if let Err(ref e) = result {
             if e.to_string().contains("cancelled") {
                 // Emit a specific cancellation event so SSE streams can close cleanly
-                let _ = mpsc_tx.send(crate::agent::core::AgentEvent::Error {
-                    message: "Agent execution cancelled by user".to_string(),
-                }).await;
+                let _ = mpsc_tx
+                    .send(crate::agent::core::AgentEvent::Error {
+                        message: "Agent execution cancelled by user".to_string(),
+                    })
+                    .await;
             } else {
-                let _ = mpsc_tx.send(crate::agent::core::AgentEvent::Error {
-                    message: e.to_string(),
-                }).await;
+                let _ = mpsc_tx
+                    .send(crate::agent::core::AgentEvent::Error {
+                        message: e.to_string(),
+                    })
+                    .await;
             }
         }
 

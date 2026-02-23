@@ -10,11 +10,11 @@ pub struct AuthStatus {
 
 #[derive(Serialize)]
 pub struct DeviceCodeInfo {
-    device_code: String,  // The actual device code for polling
-    user_code: String,    // The code user enters in browser
+    device_code: String, // The actual device code for polling
+    user_code: String,   // The code user enters in browser
     verification_uri: String,
     expires_in: u64,
-    interval: u64,        // Polling interval in seconds
+    interval: u64, // Polling interval in seconds
 }
 
 #[derive(Deserialize)]
@@ -26,10 +26,7 @@ pub struct CompleteAuthRequest {
 
 /// Start Copilot authentication - returns device code info
 #[post("/bamboo/copilot/auth/start")]
-pub async fn start_copilot_auth(
-    app_state: web::Data<AppState>,
-) -> Result<HttpResponse, AppError> {
-    
+pub async fn start_copilot_auth(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
     use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
     use std::sync::Arc;
@@ -108,11 +105,8 @@ pub async fn complete_copilot_auth(
     );
 
     // Create auth handler
-    let handler = CopilotAuthHandler::new(
-        client_with_middleware,
-        app_data_dir,
-        config.headless_auth,
-    );
+    let handler =
+        CopilotAuthHandler::new(client_with_middleware, app_data_dir, config.headless_auth);
 
     // Create device code response from request
     let device_code = DeviceCodeResponse {
@@ -220,10 +214,7 @@ pub async fn get_copilot_auth_status(
                         let remaining = expires_at.saturating_sub(now);
                         return Ok(HttpResponse::Ok().json(AuthStatus {
                             authenticated: true,
-                            message: Some(format!(
-                                "Token expires in {} minutes",
-                                remaining / 60
-                            )),
+                            message: Some(format!("Token expires in {} minutes", remaining / 60)),
                         }));
                     } else {
                         return Ok(HttpResponse::Ok().json(AuthStatus {
@@ -244,9 +235,7 @@ pub async fn get_copilot_auth_status(
 
 /// Logout from Copilot (delete cached token)
 #[post("/bamboo/copilot/logout")]
-pub async fn logout_copilot(
-    app_state: web::Data<AppState>,
-) -> Result<HttpResponse, AppError> {
+pub async fn logout_copilot(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     use std::fs;
 
     let app_data_dir = app_state.app_data_dir.clone();

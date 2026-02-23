@@ -91,7 +91,11 @@ pub struct PermissionRule {
 
 impl PermissionRule {
     /// Create a new permission rule
-    pub fn new(tool_type: PermissionType, resource_pattern: impl Into<String>, allowed: bool) -> Self {
+    pub fn new(
+        tool_type: PermissionType,
+        resource_pattern: impl Into<String>,
+        allowed: bool,
+    ) -> Self {
         Self {
             tool_type,
             resource_pattern: resource_pattern.into(),
@@ -340,7 +344,9 @@ fn normalize_path_basic(path: &str) -> String {
 /// This check alone is NOT sufficient for security - always use `canonicalize_path_for_matching`
 /// before permission checks to fully resolve symlinks and normalize paths.
 pub fn has_path_traversal(path: &str) -> bool {
-    Path::new(path).components().any(|c| matches!(c, Component::ParentDir))
+    Path::new(path)
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
 }
 
 /// Open a file safely with O_NOFOLLOW to prevent TOCTOU symlink attacks.
@@ -395,7 +401,7 @@ pub fn open_file_no_follow(path: &Path) -> Result<std::fs::File, std::io::Error>
             if metadata.file_type().is_symlink() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    "Path is a symbolic link"
+                    "Path is a symbolic link",
                 ));
             }
         }
@@ -425,7 +431,7 @@ pub fn open_file_for_write_secure(path: &Path) -> Result<std::fs::File, std::io:
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "Path has no parent directory"
+            "Path has no parent directory",
         )
     })?;
 
@@ -434,7 +440,7 @@ pub fn open_file_for_write_secure(path: &Path) -> Result<std::fs::File, std::io:
     let canonical_parent = std::fs::canonicalize(parent).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("Parent directory cannot be resolved: {}", e)
+            format!("Parent directory cannot be resolved: {}", e),
         )
     })?;
 
@@ -443,16 +449,13 @@ pub fn open_file_for_write_secure(path: &Path) -> Result<std::fs::File, std::io:
     if !parent_metadata.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "Parent path is not a directory"
+            "Parent path is not a directory",
         ));
     }
 
     // Reconstruct the full path with canonical parent
     let file_name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Path has no file name"
-        )
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no file name")
     })?;
 
     let canonical_path = canonical_parent.join(file_name);
@@ -552,8 +555,7 @@ fn match_pattern_internal(pattern: &str, resource: &str) -> bool {
     // /tmp/* should match /tmp/file.txt but NOT /tmpx/file.txt
     if pattern.ends_with("/*") && !pattern.contains("**") {
         let prefix = &pattern[..pattern.len() - 1]; // /tmp/
-        return resource.starts_with(prefix)
-            && !resource[prefix.len()..].contains('/');
+        return resource.starts_with(prefix) && !resource[prefix.len()..].contains('/');
     }
 
     // Recursive directory pattern: /tmp/**
@@ -561,8 +563,7 @@ fn match_pattern_internal(pattern: &str, resource: &str) -> bool {
         // pattern is like "/tmp/**", remove the "/**" to get "/tmp"
         // Remove "**" and the preceding "/"
         return resource.starts_with(prefix)
-            && (resource.len() == prefix.len()
-                || resource[prefix.len()..].starts_with('/'));
+            && (resource.len() == prefix.len() || resource[prefix.len()..].starts_with('/'));
     }
 
     // Exact match
@@ -659,7 +660,11 @@ impl PermissionConfig {
     }
 
     /// Grant a permission for the current session
-    pub fn grant_session_permission(&self, perm_type: PermissionType, resource_pattern: impl Into<String>) {
+    pub fn grant_session_permission(
+        &self,
+        perm_type: PermissionType,
+        resource_pattern: impl Into<String>,
+    ) {
         let grant = SessionGrant::new(resource_pattern, self.session_grant_duration);
 
         self.session_grants
@@ -735,9 +740,9 @@ impl PermissionConfig {
 
         // Check whitelist
         match self.is_whitelist_allowed(perm_type, resource) {
-            Some(true) => false,  // Explicitly allowed
-            Some(false) => true,  // Explicitly denied (requires override)
-            None => true,         // No rule found, require confirmation
+            Some(true) => false, // Explicitly allowed
+            Some(false) => true, // Explicitly denied (requires override)
+            None => true,        // No rule found, require confirmation
         }
     }
 
@@ -791,8 +796,12 @@ mod tests {
 
     #[test]
     fn test_permission_type_description() {
-        assert!(PermissionType::WriteFile.description().contains("Write files"));
-        assert!(PermissionType::ExecuteCommand.description().contains("Execute"));
+        assert!(PermissionType::WriteFile
+            .description()
+            .contains("Write files"));
+        assert!(PermissionType::ExecuteCommand
+            .description()
+            .contains("Execute"));
     }
 
     #[test]
@@ -888,7 +897,11 @@ mod tests {
     #[test]
     fn test_whitelist_denial() {
         let config = PermissionConfig::new();
-        config.add_rule(PermissionRule::new(PermissionType::WriteFile, "*.txt", false));
+        config.add_rule(PermissionRule::new(
+            PermissionType::WriteFile,
+            "*.txt",
+            false,
+        ));
 
         assert_eq!(
             config.is_whitelist_allowed(PermissionType::WriteFile, "/tmp/test.txt"),
@@ -1156,12 +1169,17 @@ mod tests {
 
         for path in test_cases {
             let config = PermissionConfig::new();
-            config.add_rule(PermissionRule::new(PermissionType::WriteFile, "/safe/*", true));
+            config.add_rule(PermissionRule::new(
+                PermissionType::WriteFile,
+                "/safe/*",
+                true,
+            ));
 
             // All traversal attempts should be rejected
             assert!(
                 config.needs_confirmation(PermissionType::WriteFile, path),
-                "Path traversal should require confirmation (be blocked by default): {}", path
+                "Path traversal should require confirmation (be blocked by default): {}",
+                path
             );
         }
     }
@@ -1170,11 +1188,17 @@ mod tests {
     fn test_path_within_allowed_directory() {
         let config = PermissionConfig::new();
         // Use ** for recursive matching to include subdirectories
-        config.add_rule(PermissionRule::new(PermissionType::WriteFile, "/tmp/allowed/**", true));
+        config.add_rule(PermissionRule::new(
+            PermissionType::WriteFile,
+            "/tmp/allowed/**",
+            true,
+        ));
 
         // Files within allowed directory should be allowed
         assert!(!config.needs_confirmation(PermissionType::WriteFile, "/tmp/allowed/file.txt"));
-        assert!(!config.needs_confirmation(PermissionType::WriteFile, "/tmp/allowed/subdir/file.txt"));
+        assert!(
+            !config.needs_confirmation(PermissionType::WriteFile, "/tmp/allowed/subdir/file.txt")
+        );
 
         // Files outside should require confirmation
         assert!(config.needs_confirmation(PermissionType::WriteFile, "/tmp/other/file.txt"));
@@ -1185,7 +1209,8 @@ mod tests {
     fn test_secure_file_create_parent_validation() {
         use std::io::Write;
 
-        let temp_dir = std::env::temp_dir().join(format!("secure_create_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("secure_create_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
@@ -1195,7 +1220,10 @@ mod tests {
         // Creating a file in an allowed directory should work
         let new_file = allowed_dir.join("new_file.txt");
         let result = open_file_for_write_secure(&new_file);
-        assert!(result.is_ok(), "Should be able to create file in allowed directory");
+        assert!(
+            result.is_ok(),
+            "Should be able to create file in allowed directory"
+        );
 
         if let Ok(mut file) = result {
             file.write_all(b"test content").unwrap();
@@ -1226,7 +1254,11 @@ mod integration_tests {
         let config = PermissionConfig::new();
 
         // Add whitelist rule
-        config.add_rule(PermissionRule::new(PermissionType::WriteFile, "/tmp/*", true));
+        config.add_rule(PermissionRule::new(
+            PermissionType::WriteFile,
+            "/tmp/*",
+            true,
+        ));
 
         // Whitelist allows, should not require confirmation
         assert!(!config.needs_confirmation(PermissionType::WriteFile, "/tmp/test.txt"));
@@ -1259,10 +1291,18 @@ mod integration_tests {
         let config = PermissionConfig::new();
 
         // Add allow rule
-        config.add_rule(PermissionRule::new(PermissionType::WriteFile, "/tmp/*", true));
+        config.add_rule(PermissionRule::new(
+            PermissionType::WriteFile,
+            "/tmp/*",
+            true,
+        ));
 
         // Add deny rule (should override allow)
-        config.add_rule(PermissionRule::new(PermissionType::WriteFile, "/tmp/sensitive.txt", false));
+        config.add_rule(PermissionRule::new(
+            PermissionType::WriteFile,
+            "/tmp/sensitive.txt",
+            false,
+        ));
 
         // Normal files in /tmp should be allowed
         assert_eq!(

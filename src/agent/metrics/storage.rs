@@ -517,7 +517,11 @@ impl MetricsStorage for SqliteMetricsStorage {
         let completed_at_str = format_timestamp(completed_at);
         let status_code_int = status_code.map(|s| s as i64);
         let (prompt, completion, total) = match usage {
-            Some(u) => (Some(u.prompt_tokens as i64), Some(u.completion_tokens as i64), Some(u.total_tokens as i64)),
+            Some(u) => (
+                Some(u.prompt_tokens as i64),
+                Some(u.completion_tokens as i64),
+                Some(u.total_tokens as i64),
+            ),
             None => (None, None, None),
         };
 

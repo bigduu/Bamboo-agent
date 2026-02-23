@@ -1,13 +1,11 @@
 use async_trait::async_trait;
 use reqwest::Client;
 
+use crate::agent::core::{tools::ToolSchema, Message};
 use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
 use crate::agent::llm::types::LLMChunk;
-use crate::agent::core::{tools::ToolSchema, Message};
 
-use super::common::openai_compat::{
-    build_openai_compat_body, parse_openai_compat_sse_data_strict,
-};
+use super::common::openai_compat::{build_openai_compat_body, parse_openai_compat_sse_data_strict};
 use super::common::sse::llm_stream_from_sse;
 
 pub struct OpenAIProvider {
@@ -91,8 +89,8 @@ mod tests {
 
     #[test]
     fn test_with_base_url() {
-        let provider = OpenAIProvider::new("test_key")
-            .with_base_url("https://custom.openai.com/v1");
+        let provider =
+            OpenAIProvider::new("test_key").with_base_url("https://custom.openai.com/v1");
         assert_eq!(provider.base_url, "https://custom.openai.com/v1");
     }
 
@@ -104,8 +102,8 @@ mod tests {
 
     #[test]
     fn test_chained_builders() {
-        let provider = OpenAIProvider::new("test_key")
-            .with_base_url("https://custom.openai.com/v1");
+        let provider =
+            OpenAIProvider::new("test_key").with_base_url("https://custom.openai.com/v1");
 
         assert_eq!(provider.api_key, "test_key");
         assert_eq!(provider.base_url, "https://custom.openai.com/v1");
@@ -124,8 +122,7 @@ mod tests {
 
     #[test]
     fn test_request_url_construction() {
-        let provider = OpenAIProvider::new("test_key")
-            .with_base_url("https://api.custom.com/v1");
+        let provider = OpenAIProvider::new("test_key").with_base_url("https://api.custom.com/v1");
 
         let expected_url = format!("{}/chat/completions", provider.base_url);
         assert_eq!(expected_url, "https://api.custom.com/v1/chat/completions");
@@ -277,8 +274,7 @@ mod tests {
     #[test]
     fn test_provider_immutability() {
         // Verify that builder methods work correctly
-        let provider = OpenAIProvider::new("key1")
-            .with_base_url("https://custom.api.com");
+        let provider = OpenAIProvider::new("key1").with_base_url("https://custom.api.com");
 
         // Verify all settings are applied
         assert_eq!(provider.api_key, "key1");

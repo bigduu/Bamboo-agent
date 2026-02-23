@@ -240,8 +240,8 @@ pub async fn v2_unified_summary(
         (Ok(chat), Ok(forward)) => {
             let total_requests = chat.total_sessions + forward.total_requests;
             let total_tokens = chat.total_tokens.total_tokens + forward.total_tokens.total_tokens;
-            let total_success = (chat.total_sessions - chat.active_sessions)
-                + forward.successful_requests;
+            let total_success =
+                (chat.total_sessions - chat.active_sessions) + forward.successful_requests;
             let total_errors = forward.failed_requests;
             let success_rate = if total_requests > 0 {
                 (total_success as f64 / total_requests as f64) * 100.0
@@ -290,16 +290,15 @@ pub async fn v2_unified_timeline(
         (Ok(chat_daily), Ok(forward_daily)) => {
             // Build maps for efficient lookup
             let chat_map: std::collections::HashMap<String, &crate::agent::metrics::DailyMetrics> =
-                chat_daily
-                    .iter()
-                    .map(|d| (d.date.to_string(), d))
-                    .collect();
+                chat_daily.iter().map(|d| (d.date.to_string(), d)).collect();
 
-            let forward_map: std::collections::HashMap<String, &crate::agent::metrics::DailyMetrics> =
-                forward_daily
-                    .iter()
-                    .map(|d| (d.date.to_string(), d))
-                    .collect();
+            let forward_map: std::collections::HashMap<
+                String,
+                &crate::agent::metrics::DailyMetrics,
+            > = forward_daily
+                .iter()
+                .map(|d| (d.date.to_string(), d))
+                .collect();
 
             // Get all unique dates
             let mut dates: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -317,9 +316,7 @@ pub async fn v2_unified_timeline(
                     let chat = chat_map.get(&date);
                     let forward = forward_map.get(&date);
 
-                    let chat_tokens = chat
-                        .map(|d| d.total_token_usage.total_tokens)
-                        .unwrap_or(0);
+                    let chat_tokens = chat.map(|d| d.total_token_usage.total_tokens).unwrap_or(0);
                     let chat_sessions = chat.map(|d| d.total_sessions).unwrap_or(0);
                     let forward_tokens = forward
                         .map(|d| d.total_token_usage.total_tokens)

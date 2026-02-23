@@ -316,7 +316,11 @@ mod tests {
     #[test]
     fn every_builtin_tool_has_a_guide() {
         for name in BUILTIN_GUIDE_NAMES {
-            assert!(builtin_guide_spec(name).is_some(), "missing guide for {}", name);
+            assert!(
+                builtin_guide_spec(name).is_some(),
+                "missing guide for {}",
+                name
+            );
         }
     }
 }

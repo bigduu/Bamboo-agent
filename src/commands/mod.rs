@@ -8,8 +8,8 @@ pub mod slash_commands;
 pub mod workflows;
 
 pub use keyword_masking::{
-    load_keyword_masking_config, save_keyword_masking_config,
-    KeywordMaskingResponse, ValidationError,
+    load_keyword_masking_config, save_keyword_masking_config, KeywordMaskingResponse,
+    ValidationError,
 };
 pub use slash_commands::SlashCommand;
 pub use workflows::{delete_workflow, save_workflow};

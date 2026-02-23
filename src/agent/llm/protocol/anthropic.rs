@@ -1,9 +1,9 @@
 //! Anthropic protocol conversion implementation.
 
-use crate::agent::llm::providers::anthropic::api_types::*;
-use crate::agent::llm::protocol::{FromProvider, ProtocolError, ProtocolResult, ToProvider};
 use crate::agent::core::tools::{FunctionSchema, ToolSchema};
 use crate::agent::core::{Message, Role};
+use crate::agent::llm::protocol::{FromProvider, ProtocolError, ProtocolResult, ToProvider};
+use crate::agent::llm::providers::anthropic::api_types::*;
 use serde_json::Value;
 
 #[cfg(test)]
@@ -22,9 +22,7 @@ impl FromProvider<AnthropicMessage> for Message {
 
         let content = match msg.content {
             AnthropicContent::Text(text) => text,
-            AnthropicContent::Blocks(blocks) => {
-                extract_text_from_anthropic_blocks(blocks)?
-            }
+            AnthropicContent::Blocks(blocks) => extract_text_from_anthropic_blocks(blocks)?,
         };
 
         Ok(Message {
@@ -102,11 +100,9 @@ impl ToProvider<AnthropicMessage> for Message {
                 // System messages are handled at the request level
                 AnthropicContent::Text(self.content.clone())
             }
-            Role::User => {
-                AnthropicContent::Blocks(vec![AnthropicContentBlock::Text {
-                    text: self.content.clone(),
-                }])
-            }
+            Role::User => AnthropicContent::Blocks(vec![AnthropicContentBlock::Text {
+                text: self.content.clone(),
+            }]),
             Role::Assistant => {
                 let mut blocks: Vec<AnthropicContentBlock> = Vec::new();
 
@@ -237,7 +233,9 @@ fn convert_internal_role_to_anthropic(role: &Role) -> AnthropicRole {
     }
 }
 
-fn extract_text_from_anthropic_blocks(blocks: Vec<AnthropicContentBlock>) -> ProtocolResult<String> {
+fn extract_text_from_anthropic_blocks(
+    blocks: Vec<AnthropicContentBlock>,
+) -> ProtocolResult<String> {
     let mut texts = Vec::new();
 
     for block in blocks {
@@ -253,10 +251,7 @@ fn extract_text_from_anthropic_blocks(blocks: Vec<AnthropicContentBlock>) -> Pro
                     Value::Array(arr) => {
                         for item in arr {
                             if let Some(obj) = item.as_object() {
-                                if let Some(text) = obj
-                                    .get("text")
-                                    .and_then(|v| v.as_str())
-                                {
+                                if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
                                     texts.push(text.to_string());
                                 }
                             }
@@ -333,7 +328,9 @@ mod tests {
         match anthropic.content {
             AnthropicContent::Blocks(blocks) => {
                 assert_eq!(blocks.len(), 1);
-                assert!(matches!(blocks[0], AnthropicContentBlock::Text { text: ref t } if t == "Hello"));
+                assert!(
+                    matches!(blocks[0], AnthropicContentBlock::Text { text: ref t } if t == "Hello")
+                );
             }
             _ => panic!("Expected Blocks content"),
         }
@@ -341,10 +338,7 @@ mod tests {
 
     #[test]
     fn test_internal_to_anthropic_system_message_extraction() {
-        let messages = vec![
-            Message::system("You are helpful"),
-            Message::user("Hello"),
-        ];
+        let messages = vec![Message::system("You are helpful"), Message::user("Hello")];
 
         let request: AnthropicRequest = messages.to_provider().unwrap();
 
@@ -372,7 +366,9 @@ mod tests {
             AnthropicContent::Blocks(blocks) => {
                 assert_eq!(blocks.len(), 2);
                 assert!(matches!(blocks[0], AnthropicContentBlock::Text { .. }));
-                assert!(matches!(blocks[1], AnthropicContentBlock::ToolUse { ref id, ref name, .. } if id == "toolu_1" && name == "search"));
+                assert!(
+                    matches!(blocks[1], AnthropicContentBlock::ToolUse { ref id, ref name, .. } if id == "toolu_1" && name == "search")
+                );
             }
             _ => panic!("Expected Blocks content"),
         }
@@ -388,7 +384,9 @@ mod tests {
         match anthropic.content {
             AnthropicContent::Blocks(blocks) => {
                 assert_eq!(blocks.len(), 1);
-                assert!(matches!(blocks[0], AnthropicContentBlock::ToolResult { ref tool_use_id, .. } if tool_use_id == "toolu_1"));
+                assert!(
+                    matches!(blocks[0], AnthropicContentBlock::ToolResult { ref tool_use_id, .. } if tool_use_id == "toolu_1")
+                );
             }
             _ => panic!("Expected Blocks content"),
         }
@@ -408,7 +406,8 @@ mod tests {
         };
 
         // Anthropic → Internal
-        let internal_schema: ToolSchema = ToolSchema::from_provider(anthropic_tool.clone()).unwrap();
+        let internal_schema: ToolSchema =
+            ToolSchema::from_provider(anthropic_tool.clone()).unwrap();
         assert_eq!(internal_schema.function.name, "search");
 
         // Internal → Anthropic
@@ -423,11 +422,9 @@ mod tests {
             id: "msg_1".to_string(),
             response_type: "message".to_string(),
             role: "assistant".to_string(),
-            content: vec![
-                AnthropicResponseContentBlock::Text {
-                    text: "Hello, world!".to_string(),
-                },
-            ],
+            content: vec![AnthropicResponseContentBlock::Text {
+                text: "Hello, world!".to_string(),
+            }],
             model: "claude-3-sonnet".to_string(),
             stop_reason: "end_turn".to_string(),
             stop_sequence: None,
