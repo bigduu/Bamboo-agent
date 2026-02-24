@@ -7,6 +7,10 @@ use tokio::fs;
 pub struct FileExistsTool;
 
 impl FileExistsTool {
+    /// Create a new FileExistsTool instance.
+    ///
+    /// This tool checks whether a file or directory exists at the specified path.
+    /// Includes security checks to prevent path traversal attacks.
     pub fn new() -> Self {
         Self
     }

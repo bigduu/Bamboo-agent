@@ -7,6 +7,11 @@ use tokio::fs;
 pub struct ListDirectoryTool;
 
 impl ListDirectoryTool {
+    /// Create a new ListDirectoryTool instance.
+    ///
+    /// This tool lists all files and subdirectories in a given directory,
+    /// showing each entry's type (\[DIR\] or \[FILE\]) alongside its name.
+    /// Includes security checks to prevent path traversal attacks.
     pub fn new() -> Self {
         Self
     }

@@ -16,6 +16,11 @@ pub struct ProjectSearchMatch {
 }
 
 impl SearchInProjectTool {
+    /// Create a new SearchInProjectTool instance.
+    ///
+    /// This tool recursively searches for text patterns across an entire project directory.
+    /// Automatically skips common non-source directories (node_modules, target, .git, etc.).
+    /// Supports file extension filtering and regex patterns.
     pub fn new() -> Self {
         Self
     }

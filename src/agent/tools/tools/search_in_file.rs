@@ -17,6 +17,11 @@ pub struct SearchMatch {
 }
 
 impl SearchInFileTool {
+    /// Create a new SearchInFileTool instance.
+    ///
+    /// This tool searches for text patterns in a single file using regular expressions.
+    /// Returns matching lines with their line numbers and match positions.
+    /// Supports both case-sensitive and case-insensitive searches.
     pub fn new() -> Self {
         Self
     }

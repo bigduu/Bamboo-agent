@@ -6,6 +6,10 @@ use serde_json::json;
 pub struct GetCurrentDirTool;
 
 impl GetCurrentDirTool {
+    /// Create a new GetCurrentDirTool instance.
+    ///
+    /// This tool returns the absolute path of the current working directory.
+    /// Useful for understanding the execution context of other file operations.
     pub fn new() -> Self {
         Self
     }

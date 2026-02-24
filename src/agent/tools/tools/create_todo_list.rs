@@ -7,6 +7,10 @@ use serde_json::json;
 pub struct CreateTodoListTool;
 
 impl CreateTodoListTool {
+    /// Create a new CreateTodoListTool instance.
+    ///
+    /// This tool creates a structured todo list for tracking multi-step task progress.
+    /// Each item can have dependencies on other items, enabling complex task workflows.
     pub fn new() -> Self {
         Self
     }

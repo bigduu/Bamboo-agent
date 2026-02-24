@@ -23,6 +23,11 @@ pub enum PatchOperation {
 }
 
 impl ApplyPatchTool {
+    /// Create a new ApplyPatchTool instance.
+    ///
+    /// This tool applies patches to files using two modes:
+    /// - Content replacement: Finds and replaces specific text
+    /// - Line replacement: Replaces content within specified line numbers
     pub fn new() -> Self {
         Self
     }

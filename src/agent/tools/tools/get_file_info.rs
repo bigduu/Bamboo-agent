@@ -7,6 +7,13 @@ use tokio::fs;
 pub struct GetFileInfoTool;
 
 impl GetFileInfoTool {
+    /// Create a new GetFileInfoTool instance.
+    ///
+    /// This tool retrieves detailed metadata about a file or directory including:
+    /// - File type (file, directory, or other)
+    /// - Size in bytes
+    /// - Last modification timestamp
+    /// - Path validation for security
     pub fn new() -> Self {
         Self
     }

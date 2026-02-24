@@ -7,6 +7,11 @@ use tokio::process::Command;
 pub struct GitDiffTool;
 
 impl GitDiffTool {
+    /// Create a new GitDiffTool instance.
+    ///
+    /// This tool displays git diff output showing code changes.
+    /// Supports viewing both working directory changes and staged changes.
+    /// Can filter by specific file paths.
     pub fn new() -> Self {
         Self
     }

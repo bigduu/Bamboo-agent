@@ -145,7 +145,18 @@ pub struct GitResult {
 pub struct GitWriteTool;
 
 impl GitWriteTool {
-    /// Create a new Git write tool
+    /// Create a new GitWriteTool instance.
+    ///
+    /// This tool performs git write operations including:
+    /// - Commit: Stage and commit changes with messages
+    /// - Push: Push changes to remote repositories (force push blocked for safety)
+    /// - Branch: Create new branches with optional checkout
+    /// - Checkout: Switch branches or restore files
+    /// - Merge: Merge branches with conflict detection
+    /// - Add: Stage files for commit
+    /// - Reset: Undo changes with soft/mixed/hard modes
+    ///
+    /// All operations require GitWrite permission and include safety checks.
     pub fn new() -> Self {
         Self
     }
