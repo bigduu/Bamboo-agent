@@ -9,16 +9,16 @@
 //! # Architecture
 //!
 //! The server is organized into several key components:
-//! - `app_state`: Unified state management with direct provider access
-//! - `config`: CORS and security header configuration
-//! - `metrics`: Unified metrics infrastructure
-//! - `handlers`: Agent API handlers (chat, execute, events, etc.)
-//! - `controllers`: Multi-provider API controllers (OpenAI, Anthropic, Gemini)
-//! - `services`: Business logic services
-//! - `routes`: Route configuration for all API endpoints
-//! - `server`: Entry points for running the server
+//! - **app_state**: Unified state management with direct provider access
+//! - **config**: CORS and security header configuration
+//! - **metrics**: Unified metrics infrastructure
+//! - **handlers**: Agent API handlers (chat, execute, events, etc.)
+//! - **controllers**: Multi-provider API controllers (OpenAI, Anthropic, Gemini)
+//! - **services**: Business logic services
+//! - **routes**: Route configuration for all API endpoints
+//! - **server**: Entry points for running the server
 //!
-//! # Example
+//! # Quick Start
 //!
 //! ```no_run
 //! use std::path::PathBuf;
@@ -30,6 +30,63 @@
 //!     run(app_data_dir, 3456).await
 //! }
 //! ```
+//!
+//! # Server Modes
+//!
+//! The server supports three modes:
+//!
+//! ## 1. Desktop Mode (Default)
+//!
+//! Binds to localhost only, No rate limiting. Perfect for local development.
+//!
+//! ```no_run
+//! use bamboo_agent::server::run;
+//!
+//! run(data_dir, 8080).await?;
+//! ```
+//!
+//! ## 2. Docker Mode
+//!
+//! Custom bind address with rate limiting. For containerized deployments.
+//!
+//! ```no_run
+//! use bamboo_agent::server::run_with_bind;
+//!
+//! run_with_bind(data_dir, 8080, "0.0.0.0").await?;
+//! ```
+//!
+//! ## 3. Production Mode with Frontend
+//!
+//! Serves static files alongside API. Full production setup.
+//!
+//! ```no_run
+//! use bamboo_agent::server::run_with_bind_and_static;
+//!
+//! run_with_bind_and_static(
+//!     data_dir,
+//!     8080,
+//!     "0.0.0.0",
+//!     Some(PathBuf::from("./dist"))
+//! ).await?;
+//! ```
+//!
+//! # Route Organization
+//!
+//! ## Agent Routes (/api/v1/*)
+//!
+//! Core agent functionality: chat, execute, events, metrics, MCP.
+//!
+//! ## OpenAI Routes (/v1/*)
+//!
+//! OpenAI-compatible API for tool integration.
+//!
+//! ## Anthropic Routes (/anthropic/v1/*)
+//!
+//! Anthropic Claude API compatible endpoints.
+//!
+//! ## Gemini Routes (/gemini/v1beta/*)
+//!
+//! Google Gemini API compatible endpoints.
 
 pub mod app_state;
 pub mod config;

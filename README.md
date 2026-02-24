@@ -105,6 +105,54 @@ Override configuration with environment variables:
 - `BAMBOO_BIND`: Bind address
 - `BAMBOO_DATA_DIR`: Data directory
 
+## Migration Guide
+
+### Migrating from v0.1.x to v0.2.0
+
+Version 0.2.0 consolidates `web_service` and `agent::server` into a unified `server` module. If you were using the library API:
+
+#### Before v0.2.0
+```rust
+use bamboo_agent::agent::server::state::AppState;
+use bamboo_agent::agent::server::handlers;
+use bamboo_agent::web_service::WebService;
+use bamboo_agent::web_service::controllers::*;
+```
+
+#### After v0.2.0
+```rust
+use bamboo_agent::server::AppState;
+use bamboo_agent::server::handlers;
+use bamboo_agent::server::WebService;
+use bamboo_agent::server::controllers::*;
+```
+
+All other code works without changes. The old import paths still work but will show deprecation warnings.
+
+### What Changed
+
+**Consolidated Modules:**
+- `agent::server::handlers` → `server::handlers`
+- `agent::server::state` → `server::app_state`
+- `agent::server::workflow` → `server::workflow`
+- `web_service::controllers` → `server::controllers`
+- `web_service::services` → `server::services`
+
+**Unified State Management:**
+- Single `AppState` with direct provider access (no more proxy pattern)
+- Consolidated route definitions (eliminated 24 duplicate routes)
+- Unified metrics infrastructure
+
+**Breaking Changes:**
+- None (all old import paths still work with deprecation warnings)
+
+### Benefits
+
+- ✅ **No route duplication**: Single source of truth for 100+ routes
+- ✅ **Direct provider access**: No HTTP callbacks to self
+- ✅ **Clearer architecture**: One server module instead of two
+- ✅ **Better performance**: Eliminated proxy pattern
+
 ## API Endpoints
 
 Once running, Bamboo exposes the following endpoints:
