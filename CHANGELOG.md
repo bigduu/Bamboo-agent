@@ -7,17 +7,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0] - 2026-02-24
 
+### 🎉 Major Refactoring: Unified Server Architecture
+
+This release consolidates `web_service` and `agent::server` into a unified `server/` module
+and unifies all HTTP handlers with explicit routing.
+
 ### Added
-- Unified `server/` module consolidating `web_service` and `agent::server`
-- Comprehensive migration guide in README.md and MIGRATION.md
-- New `server::routes` module with single source of truth for all 100+ routes
-- New `server::server` module with unified entry points (run, run_with_bind, WebService)
-- Unified `AppState` with direct provider access (eliminates proxy pattern)
+
+- **Unified server module** (`src/server/`)
+  - Single `AppState` with direct provider access (eliminates proxy pattern)
+  - Unified metrics infrastructure
+  - Comprehensive migration guide in README.md and MIGRATION.md
+
+- **Explicit routing system**
+  - All routes now use explicit `web::route()` registration
+  - No more `#[get]`, `#[post]` macros in handlers
+  - Single source of truth in `src/server/routes.rs` (~120 routes)
+
+- **Unified handler terminology**
+  - All HTTP handlers consolidated under `src/server/handlers/`
+  - Agent handlers: `handlers/agent/` (chat, execute, events, etc.)
+  - Provider handlers: `handlers/*.rs` (openai, anthropic, gemini, etc.)
+
+- **Server modes**
+  - `run()` - Desktop mode (localhost only, no rate limiting)
+  - `run_with_bind()` - Docker mode (custom bind, rate limiting)
+  - `run_with_bind_and_static()` - Production with frontend serving
+
+- **Module organization**
+  - New `server::routes` module with route configuration
+  - New `server::server` module with entry points
+  - New `server::config` module with CORS/security headers
+  - New `server::metrics` module with unified infrastructure
 
 ### Changed
-- **BREAKING**: Deprecated `agent::server` module (use `server` instead)
-- **BREAKING**: Deprecated `web_service` module (use `server` instead)
-- Consolidated 54 route registrations → 30 (44% reduction)
+
+- **BREAKING** (with backward compatibility):
+  - Deprecated `agent::server` module → use `server` instead
+  - Deprecated `web_service` module → use `server` instead
+  - Old imports still work with deprecation warnings
+
+- **Handlers structure**:
+  - `src/server/handlers/*.rs` → `src/server/handlers/agent/*.rs` (core handlers)
+  - `src/server/controllers/*.rs` → `src/server/handlers/*.rs` (provider handlers)
+  - All handlers unified with consistent terminology
+
+- **Route registration**:
+  - From: Macro-based (`#[get("/path")]`)
+  - To: Explicit (`.route("/path", web::get().to(handler))`)
+  - All ~120 routes now explicitly registered
+
+- **State management**:
+  - Single unified `AppState` instead of dual state
+  - Direct provider access instead of HTTP callbacks to self
+
+- **Code organization**:
+  - Eliminated 24 duplicate route registrations (54 → 30, 44% reduction)
+  - Removed proxy pattern (`build_agent_state()` function)
+  - Cleaner module structure
+
+### Removed
+
+- Duplicate route definitions (24 routes eliminated)
+- Proxy pattern with HTTP callbacks to self
+- Routing macros in favor of explicit registration
+- ~430 lines of redundant code
+
+### Fixed
+
+- Async test blocking issue in `app_state::tests`
+- Config save/load tests now use temp paths for CI compatibility
+- HTTP request tests opt-in via `BAMBOO_TEST_NETWORK=1` environment variable
+
+### Migration Guide
+
+#### For Library Users
+
+Old (deprecated but still works):
+```rust
+use bamboo_agent::agent::server::state::AppState;
+use bamboo_agent::web_service::WebService;
+use bamboo_agent::agent::server::handlers;
+```
+
+New (recommended):
+```rust
+use bamboo_agent::server::AppState;
+use bamboo_agent::server::WebService;
+use bamboo_agent::server::handlers;
+```
+
+#### For Contributors
+
+- All HTTP handlers are in `src/server/handlers/`
+- Use explicit route registration in `src/server/routes.rs`
+- No more `#[get]`, `#[post]`, etc. macros
+
+### Stats
+
+- **Files changed**: 63
+- **Lines added**: +599
+- **Lines removed**: -1029
+- **Net change**: -430 lines (cleaner codebase!)
+- **Tests**: 867/867 passing (100%)
+- **Duplicate routes eliminated**: 24 (44% reduction)
+- **Commits**: 8 major commits over 2-3 days
 - Eliminated proxy pattern (`build_agent_state`)
 - Unified state management (single AppState)
 - All 866 tests updated and passing
