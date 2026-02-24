@@ -26,7 +26,7 @@ enum Commands {
         #[arg(short, long, default_value = "127.0.0.1")]
         bind: String,
 
-        /// Data directory (defaults to XDG_DATA_HOME/bamboo)
+        /// Data directory (defaults to ~/.bamboo)
         #[arg(short, long)]
         data_dir: Option<PathBuf>,
 

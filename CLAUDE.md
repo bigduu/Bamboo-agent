@@ -167,21 +167,21 @@ The codebase is organized into these major modules:
 - Todo list tracking for task management
 
 **Workflow Engine:**
-- Workflows defined in YAML/JSON files in `~/.local/share/bamboo/workflows/`
+- Workflows defined in YAML/JSON files in `~/.bamboo/workflows/`
 - Supports sequential, parallel, and conditional execution
 - Tool composition allows complex agent behaviors
 
-**XDG Compliance:**
-- Config: `$XDG_CONFIG_HOME/bamboo/config.json` (default: `~/.config/bamboo/`)
-- Data: `$XDG_DATA_HOME/bamboo/` (default: `~/.local/share/bamboo/`)
-- Cache: `$XDG_CACHE_HOME/bamboo/` (default: `~/.cache/bamboo/`)
-- Runtime: `$XDG_RUNTIME_DIR/bamboo/` (default: `/tmp/bamboo-$UID/`)
+**Directory Structure:**
+- Config: `~/.bamboo/config.json`
+- Data: `~/.bamboo/` (sessions, skills, workflows, etc.)
+- Cache: `~/.bamboo/cache/`
+- Runtime: `~/.bamboo/runtime/`
 
 ## Configuration
 
 ### Configuration File Format
 
-Configuration is stored in `~/.config/bamboo/config.json`:
+Configuration is stored in `~/.bamboo/config.json`:
 
 ```json
 {

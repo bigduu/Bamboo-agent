@@ -134,18 +134,21 @@ async fn main() {
 
 ## ⚙️ Configuration
 
-Bamboo follows the [XDG Base Directory specification](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html) for clean, standards-compliant configuration management.
+Bamboo uses a simple, unified directory structure for all configuration and data.
 
 ### 📁 Default Paths
 
-- **Config**: `$XDG_CONFIG_HOME/bamboo/config.json` (default: `~/.config/bamboo/`)
-- **Data**: `$XDG_DATA_HOME/bamboo/` (default: `~/.local/share/bamboo/`)
-- **Cache**: `$XDG_CACHE_HOME/bamboo/` (default: `~/.cache/bamboo/`)
-- **Runtime**: `$XDG_RUNTIME_DIR/bamboo/` (default: `/tmp/bamboo-$UID/`)
+All Bamboo data is stored under `~/.bamboo/`:
+- **Config**: `~/.bamboo/config.json`
+- **Data**: `~/.bamboo/` (sessions, skills, workflows, etc.)
+- **Cache**: `~/.bamboo/cache/`
+- **Runtime**: `~/.bamboo/runtime/`
+
+You can override the data directory with the `BAMBOO_DATA_DIR` environment variable.
 
 ### 📝 Configuration File
 
-Edit `~/.config/bamboo/config.json` (JSON format):
+Edit `~/.bamboo/config.json` (JSON format):
 
 ```json
 {

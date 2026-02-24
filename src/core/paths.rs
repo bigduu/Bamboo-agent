@@ -1,9 +1,8 @@
 use std::path::{Path, PathBuf};
 
-/// Get Bamboo data directory using XDG specification
-/// Priority: XDG_DATA_HOME/bamboo, fallback to ~/.local/share/bamboo
+/// Get Bamboo data directory (~/.bamboo)
 pub fn bamboo_dir() -> PathBuf {
-    crate::config::xdg_paths::bamboo_data_dir()
+    crate::config::paths::bamboo_home()
 }
 
 /// Get config.json path (in data directory)
@@ -38,13 +37,103 @@ pub fn ensure_bamboo_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Get sessions directory ($XDG_DATA_HOME/bamboo/sessions)
+/// Get sessions directory (~/.bamboo/sessions)
 pub fn sessions_dir() -> PathBuf {
     bamboo_dir().join("sessions")
 }
 
-/// Migrate session files from ~/.bamboo to XDG data directory
-/// This is a one-time migration for backwards compatibility
+/// Migrate from old XDG paths to ~/.bamboo
+///
+/// This is a one-time migration for backwards compatibility.
+/// This function is deprecated and will be removed in a future version.
+///
+/// # Migration Paths
+/// - `~/.config/bamboo/` → `~/.bamboo/`
+/// - `~/.local/share/bamboo/` → `~/.bamboo/`
+///
+/// # Safety
+/// - Only migrates if destination doesn't exist
+/// - Does not delete old files
+/// - Safe to call multiple times
+#[deprecated(
+    since = "0.2.3",
+    note = "XDG migration is temporary. This function will be removed in v0.3.0"
+)]
+pub fn migrate_from_xdg() -> std::io::Result<()> {
+    let new_home = bamboo_dir();
+
+    // Define old XDG paths
+    let old_config = dirs::home_dir()
+        .expect("Could not determine home directory")
+        .join(".config")
+        .join("bamboo");
+    let old_data = dirs::home_dir()
+        .expect("Could not determine home directory")
+        .join(".local")
+        .join("share")
+        .join("bamboo");
+
+    // Migrate config directory
+    if old_config.exists() && !new_home.join("config.json").exists() {
+        migrate_directory(&old_config, &new_home)?;
+    }
+
+    // Migrate data directory
+    if old_data.exists() {
+        migrate_directory(&old_data, &new_home)?;
+    }
+
+    // Also handle session file migration from root bamboo dir
+    #[allow(deprecated)]
+    migrate_session_files()?;
+
+    Ok(())
+}
+
+/// Migrate contents from one directory to another
+fn migrate_directory(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+
+    let entries = match std::fs::read_dir(from) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("Warning: Could not read directory for migration: {}", e);
+            return Ok(());
+        }
+    };
+
+    for entry in entries.flatten() {
+        let dest = to.join(entry.file_name());
+        // Only move if destination doesn't exist
+        if !dest.exists() {
+            if let Err(e) = std::fs::rename(&entry.path(), &dest) {
+                eprintln!(
+                    "Warning: Could not migrate {:?}: {}",
+                    entry.path(),
+                    e
+                );
+            } else {
+                println!("Migrated: {:?}", entry.file_name());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Migrate session files from root bamboo directory to sessions subdirectory
+///
+/// This is for legacy installations that had sessions in the root.
+/// This function is deprecated and will be removed in a future version.
+///
+/// # Safety
+/// - Only migrates if destination doesn't exist
+/// - Does not delete old files
+/// - Safe to call multiple times
+#[deprecated(
+    since = "0.2.3",
+    note = "Session migration is temporary. This function will be removed in v0.3.0"
+)]
 pub fn migrate_session_files() -> std::io::Result<()> {
     let bamboo_path = bamboo_dir();
     let sessions_path = sessions_dir();
@@ -120,31 +209,32 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_sessions_dir_returns_xdg_bamboo_sessions() {
-        // Set XDG_DATA_HOME for test
+    fn test_sessions_dir_returns_bamboo_sessions() {
+        // Set BAMBOO_DATA_DIR for test
         let temp_dir = tempdir().expect("Failed to create temp dir");
-        let xdg_data = temp_dir.path().to_string_lossy().to_string();
+        let bamboo_home = temp_dir.path().to_string_lossy().to_string();
 
         // Save current env
-        let original = std::env::var_os("XDG_DATA_HOME");
+        let original = std::env::var_os("BAMBOO_DATA_DIR");
 
-        std::env::set_var("XDG_DATA_HOME", &xdg_data);
+        std::env::set_var("BAMBOO_DATA_DIR", &bamboo_home);
 
         let sessions = sessions_dir();
         let sessions_str = sessions.to_str().unwrap();
 
-        // Should end with /bamboo/sessions
-        assert!(sessions_str.ends_with("bamboo/sessions"));
+        // Should end with /sessions
+        assert!(sessions_str.ends_with("sessions"));
 
         // Restore original env
         if let Some(val) = original {
-            std::env::set_var("XDG_DATA_HOME", val);
+            std::env::set_var("BAMBOO_DATA_DIR", val);
         } else {
-            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("BAMBOO_DATA_DIR");
         }
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_migrate_session_files_moves_session_files() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let bamboo_path = temp_dir.path().join("bamboo");
@@ -164,10 +254,9 @@ mod tests {
             .write_all(b"{}")
             .expect("Failed to write config file");
 
-        // Mock the bamboo_dir for testing by setting XDG_DATA_HOME
-        let original = std::env::var_os("XDG_DATA_HOME");
-        let parent_dir = temp_dir.path().to_string_lossy().to_string();
-        std::env::set_var("XDG_DATA_HOME", parent_dir);
+        // Mock the bamboo_dir for testing by setting BAMBOO_DATA_DIR
+        let original = std::env::var_os("BAMBOO_DATA_DIR");
+        std::env::set_var("BAMBOO_DATA_DIR", &bamboo_path);
 
         // Run migration
         migrate_session_files().expect("Migration failed");
@@ -186,11 +275,11 @@ mod tests {
         assert!(!bamboo_path.join("session-1.json").exists());
         assert!(!bamboo_path.join("session-1.jsonl").exists());
 
-        // Restore original XDG_DATA_HOME
+        // Restore original BAMBOO_DATA_DIR
         if let Some(val) = original {
-            std::env::set_var("XDG_DATA_HOME", val);
+            std::env::set_var("BAMBOO_DATA_DIR", val);
         } else {
-            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("BAMBOO_DATA_DIR");
         }
     }
 }

@@ -182,7 +182,7 @@ let result = executor.execute(&tool_call).await;
 
 ### 4. Update Configuration
 
-Bamboo now uses XDG Base Directory specification by default:
+Bamboo now uses a unified `~/.bamboo` directory for all configuration and data:
 
 **Before:**
 ```rust
@@ -191,8 +191,8 @@ let config_dir = dirs::home_dir().unwrap().join(".bamboo");
 
 **After:**
 ```rust
-let config_dir = bamboo::config::xdg_paths::bamboo_config_dir();
-let data_dir = bamboo::config::xdg_paths::bamboo_data_dir();
+let config_dir = bamboo::config::paths::bamboo_home();
+let data_dir = bamboo::config::paths::bamboo_home();
 ```
 
 You can also use the provided helper functions:

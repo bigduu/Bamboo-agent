@@ -1,13 +1,13 @@
 //! Bamboo configuration management
 //!
-//! Handles loading/saving configuration from XDG-compliant paths
+//! Handles loading/saving configuration from ~/.bamboo/config.json
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::xdg_paths;
+use super::paths;
 
 /// Main configuration for Bamboo server
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,7 +15,7 @@ pub struct BambooConfig {
     /// Server configuration
     pub server: ServerConfig,
 
-    /// Data directory (defaults to XDG_DATA_HOME/bamboo)
+    /// Data directory (defaults to ~/.bamboo)
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
 }
@@ -49,7 +49,7 @@ fn default_workers() -> usize {
     10
 }
 fn default_data_dir() -> PathBuf {
-    xdg_paths::bamboo_data_dir()
+    paths::bamboo_home()
 }
 
 impl Default for BambooConfig {
@@ -73,19 +73,19 @@ impl Default for ServerConfig {
 }
 
 impl BambooConfig {
-    /// Load configuration from XDG config path
+    /// Load configuration from ~/.bamboo/config.json
     ///
     /// Returns default config if file doesn't exist
     pub fn load() -> Result<Self> {
-        Self::load_from_path(xdg_paths::bamboo_config_file())
+        Self::load_from_path(paths::bamboo_config_file())
     }
 
-    /// Save configuration to XDG config path
+    /// Save configuration to ~/.bamboo/config.json
     pub fn save(&self) -> Result<()> {
         // Ensure config directory exists
-        xdg_paths::ensure_bamboo_dirs()?;
+        paths::ensure_bamboo_dirs()?;
 
-        self.save_to_path(xdg_paths::bamboo_config_file())
+        self.save_to_path(paths::bamboo_config_file())
     }
 
     /// Load configuration from a specific path.

@@ -24,12 +24,13 @@ const DEFAULT_WORKER_COUNT: usize = 10;
 /// - No security headers (development mode)
 ///
 /// # Arguments
-/// * `app_data_dir` - Application data directory
+/// * `bamboo_home_dir` - Bamboo home directory containing all app data (config, sessions, skills, etc.)
+///                       Equivalent to ~/.bamboo in standard installations.
 /// * `port` - Port to listen on
-pub async fn run(app_data_dir: PathBuf, port: u16) -> Result<(), String> {
+pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
     info!("Starting unified server in desktop mode...");
 
-    let app_state = web::Data::new(AppState::new(app_data_dir.clone()).await);
+    let app_state = web::Data::new(AppState::new(bamboo_home_dir.clone()).await);
 
     let server = HttpServer::new(move || {
         App::new()
@@ -61,13 +62,14 @@ pub async fn run(app_data_dir: PathBuf, port: u16) -> Result<(), String> {
 /// - Request size limits (1MB JSON, 10MB payload)
 ///
 /// # Arguments
-/// * `app_data_dir` - Application data directory
+/// * `bamboo_home_dir` - Bamboo home directory containing all app data (config, sessions, skills, etc.)
+///                       Equivalent to ~/.bamboo in standard installations.
 /// * `port` - Port to listen on
 /// * `bind` - Bind address (127.0.0.1, 0.0.0.0, or custom)
-pub async fn run_with_bind(app_data_dir: PathBuf, port: u16, bind: &str) -> Result<(), String> {
+pub async fn run_with_bind(bamboo_home_dir: PathBuf, port: u16, bind: &str) -> Result<(), String> {
     info!("Starting unified server on {}:{}", bind, port);
 
-    let app_state = web::Data::new(AppState::new(app_data_dir.clone()).await);
+    let app_state = web::Data::new(AppState::new(bamboo_home_dir.clone()).await);
 
     // Move bind_addr into the closure
     let bind_for_closure = bind.to_string();
@@ -105,7 +107,8 @@ pub async fn run_with_bind(app_data_dir: PathBuf, port: u16, bind: &str) -> Resu
 /// - Static file serving for frontend (index.html, assets, etc.)
 ///
 /// # Arguments
-/// * `app_data_dir` - Application data directory
+/// * `bamboo_home_dir` - Bamboo home directory containing all app data (config, sessions, skills, etc.)
+///                       Equivalent to ~/.bamboo in standard installations.
 /// * `port` - Port to listen on
 /// * `bind` - Bind address (127.0.0.1 for localhost, 0.0.0.0 for all interfaces)
 /// * `static_dir` - Optional directory containing built frontend files
@@ -119,7 +122,7 @@ pub async fn run_with_bind(app_data_dir: PathBuf, port: u16, bind: &str) -> Resu
 /// bamboo serve --port 8080 --static-dir ./dist
 /// ```
 pub async fn run_with_bind_and_static(
-    app_data_dir: PathBuf,
+    bamboo_home_dir: PathBuf,
     port: u16,
     bind: &str,
     static_dir: Option<PathBuf>,
@@ -145,7 +148,7 @@ pub async fn run_with_bind_and_static(
         None => None,
     };
 
-    let app_state = web::Data::new(AppState::new(app_data_dir.clone()).await);
+    let app_state = web::Data::new(AppState::new(bamboo_home_dir.clone()).await);
 
     // Move bind_addr into the closure
     let bind_addr = bind.to_string();
@@ -204,17 +207,21 @@ pub async fn run_with_bind_and_static(
 pub struct WebService {
     shutdown_tx: Option<oneshot::Sender<()>>,
     server_handle: Option<tokio::task::JoinHandle<()>>,
-    app_data_dir: PathBuf,
+    /// Bamboo home directory containing all application data (config, sessions, skills, etc.)
+    bamboo_home_dir: PathBuf,
     port: u16,
 }
 
 impl WebService {
     /// Create a new WebService instance
-    pub fn new(app_data_dir: PathBuf) -> Self {
+    ///
+    /// # Arguments
+    /// * `bamboo_home_dir` - Bamboo home directory (e.g., ~/.bamboo or custom path)
+    pub fn new(bamboo_home_dir: PathBuf) -> Self {
         Self {
             shutdown_tx: None,
             server_handle: None,
-            app_data_dir,
+            bamboo_home_dir,
             port: 3456, // Default port
         }
     }
@@ -229,7 +236,7 @@ impl WebService {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         self.port = port;
 
-        let app_state = web::Data::new(AppState::new(self.app_data_dir.clone()).await);
+        let app_state = web::Data::new(AppState::new(self.bamboo_home_dir.clone()).await);
         let bind_addr = "127.0.0.1".to_string();
 
         let server = HttpServer::new(move || {

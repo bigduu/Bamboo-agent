@@ -57,20 +57,17 @@ mod tests {
     }
 
     #[test]
-    fn test_xdg_paths() {
-        use bamboo_agent::config::xdg_paths::*;
+    fn test_bamboo_paths() {
+        use bamboo_agent::config::paths::*;
 
-        let config_home = xdg_config_home();
-        assert!(config_home.to_string_lossy().contains(".config"));
-
-        let data_home = xdg_data_home();
-        assert!(data_home.to_string_lossy().contains(".local/share"));
+        let bamboo_home = bamboo_home();
+        assert!(bamboo_home.to_string_lossy().ends_with(".bamboo"));
 
         let bamboo_config = bamboo_config_dir();
-        assert!(bamboo_config.to_string_lossy().ends_with("bamboo"));
+        assert!(bamboo_config.to_string_lossy().ends_with(".bamboo"));
 
         let bamboo_data = bamboo_data_dir();
-        assert!(bamboo_data.to_string_lossy().ends_with("bamboo"));
+        assert!(bamboo_data.to_string_lossy().ends_with(".bamboo"));
     }
 
     #[test]

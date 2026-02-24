@@ -295,7 +295,14 @@ impl AppState {
     ///
     /// # Arguments
     ///
-    /// * `app_data_dir` - Directory for storing application data (sessions, config, etc.)
+    /// * `bamboo_home_dir` - Bamboo home directory containing all application data.
+    ///                        This is the root directory (e.g., ~/.bamboo) that contains:
+    ///                        - config.json: Configuration file
+    ///                        - sessions/: Conversation history
+    ///                        - skills/: Skill definitions
+    ///                        - workflows/: Workflow definitions
+    ///                        - cache/: Cached data
+    ///                        - runtime/: Runtime files
     ///
     /// # Returns
     ///
@@ -317,13 +324,13 @@ impl AppState {
     ///     println!("Initialized with model: {}", state.model_name);
     /// }
     /// ```
-    pub async fn new(app_data_dir: PathBuf) -> Self {
+    pub async fn new(bamboo_home_dir: PathBuf) -> Self {
         let config = Config::new();
 
         // Create provider with direct access (no HTTP proxy)
         let provider = match crate::agent::llm::create_provider_with_dir(
             &config,
-            app_data_dir.clone(),
+            bamboo_home_dir.clone(),
         )
         .await
         {
@@ -339,7 +346,7 @@ impl AppState {
             }
         };
 
-        Self::new_with_provider(app_data_dir, config, provider).await
+        Self::new_with_provider(bamboo_home_dir, config, provider).await
     }
 
     /// Create unified app state with a specific provider
@@ -349,7 +356,7 @@ impl AppState {
     ///
     /// # Arguments
     ///
-    /// * `app_data_dir` - Directory for storing application data
+    /// * `bamboo_home_dir` - Bamboo home directory containing all application data
     /// * `config` - Application configuration
     /// * `provider` - Pre-configured LLM provider implementation
     ///
@@ -359,27 +366,37 @@ impl AppState {
     ///
     /// # Initialization Steps
     ///
-    /// 1. Migrate session files from old location (if needed)
-    /// 2. Initialize JSONL storage in `{app_data_dir}/sessions`
-    /// 3. Load built-in tools
-    /// 4. Initialize MCP manager and load configured servers
-    /// 5. Create composite tool executor (builtin + MCP)
-    /// 6. Initialize skill manager
-    /// 7. Initialize metrics service with SQLite backend
-    /// 8. Start runner cleanup task (removes completed runners after 5 minutes)
+    /// 1. Migrate from old XDG paths to ~/.bamboo (if needed)
+    /// 2. Migrate session files from old location (if needed)
+    /// 3. Initialize JSONL storage in `{bamboo_home_dir}/sessions`
+    /// 4. Load built-in tools
+    /// 5. Initialize MCP manager and load configured servers
+    /// 6. Create composite tool executor (builtin + MCP)
+    /// 7. Initialize skill manager
+    /// 8. Initialize metrics service with SQLite backend
+    /// 9. Start runner cleanup task (removes completed runners after 5 minutes)
     ///
     /// # Panics
     ///
     /// Panics if storage or metrics initialization fails.
     pub async fn new_with_provider(
-        app_data_dir: PathBuf,
+        bamboo_home_dir: PathBuf,
         config: Config,
         provider: Arc<dyn LLMProvider>,
     ) -> Self {
-        let data_dir = app_data_dir.clone();
+        let data_dir = bamboo_home_dir.clone();
         let sessions_dir = data_dir.join("sessions");
 
+        // Migrate from old XDG paths to ~/.bamboo if needed
+        // This is a temporary migration function that will be removed in v0.3.0
+        #[allow(deprecated)]
+        if let Err(e) = crate::core::migrate_from_xdg() {
+            log::warn!("Failed to migrate from XDG paths: {}", e);
+        }
+
         // Migrate session files from old location if needed
+        // This is a temporary migration function that will be removed in v0.3.0
+        #[allow(deprecated)]
         if let Err(e) = crate::core::migrate_session_files() {
             log::warn!("Failed to migrate session files: {}", e);
         }
@@ -476,7 +493,7 @@ impl AppState {
             .unwrap_or_else(|| "claude-3-5-sonnet-20241022".to_string());
 
         Self {
-            app_data_dir,
+            app_data_dir: bamboo_home_dir,
             config: Arc::new(RwLock::new(config)),
             provider: Arc::new(RwLock::new(provider.clone())),
             sessions: Arc::new(RwLock::new(HashMap::new())),

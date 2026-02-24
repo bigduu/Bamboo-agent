@@ -327,6 +327,8 @@ impl AppState {
         let sessions_dir = data_dir.join("sessions");
 
         // Migrate session files from old location if needed
+        // This is a temporary migration function that will be removed in v0.3.0
+        #[allow(deprecated)]
         if let Err(e) = crate::core::migrate_session_files() {
             log::warn!("Failed to migrate session files: {}", e);
         }
@@ -557,15 +559,11 @@ fn merge_workspace_context(base_prompt: &str, workspace_path: Option<&str>) -> S
 /// Get the default Bamboo data directory path
 ///
 /// Returns the path to ~/.bamboo on Unix/Linux/macOS or
-/// %USERPROFILE%\\.bamboo on Windows.
+/// %USERPROFILE%\.bamboo on Windows.
 ///
 /// Falls back to the system temp directory if home cannot be determined.
 fn bamboo_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".bamboo")
+    crate::config::paths::bamboo_home()
 }
 
 /// Load MCP configuration from file

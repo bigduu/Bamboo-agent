@@ -375,8 +375,8 @@ mod tests {
         }
 
         fn set_config_json(&self, content: &str) {
-            // Use XDG data directory instead of .bamboo
-            let config_dir = self.path.join(".local").join("share").join("bamboo");
+            // Use .bamboo directory
+            let config_dir = self.path.join(".bamboo");
             std::fs::create_dir_all(&config_dir).expect("failed to create config dir");
             std::fs::write(config_dir.join("config.json"), content)
                 .expect("failed to write config.json");
@@ -421,7 +421,6 @@ mod tests {
 
         let home = temp_home.path.to_string_lossy().to_string();
         let _home = EnvVarGuard::set("HOME", &home);
-        let _xdg_data_home = EnvVarGuard::set("XDG_DATA_HOME", &format!("{}/.local/share", home));
         let _http_proxy = EnvVarGuard::set("HTTP_PROXY", "http://env-proxy.example.com:8080");
         let _https_proxy = EnvVarGuard::set("HTTPS_PROXY", "http://env-proxy.example.com:8443");
 
@@ -449,7 +448,6 @@ mod tests {
 
         let home = temp_home.path.to_string_lossy().to_string();
         let _home = EnvVarGuard::set("HOME", &home);
-        let _xdg_data_home = EnvVarGuard::set("XDG_DATA_HOME", &format!("{}/.local/share", home));
         let _http_proxy = EnvVarGuard::unset("HTTP_PROXY");
         let _https_proxy = EnvVarGuard::unset("HTTPS_PROXY");
 
@@ -476,7 +474,6 @@ mod tests {
 
         let home = temp_home.path.to_string_lossy().to_string();
         let _home = EnvVarGuard::set("HOME", &home);
-        let _xdg_data_home = EnvVarGuard::set("XDG_DATA_HOME", &format!("{}/.local/share", home));
         let _http_proxy = EnvVarGuard::set("HTTP_PROXY", "http://env-proxy.example.com:8080");
         let _https_proxy = EnvVarGuard::set("HTTPS_PROXY", "http://env-proxy.example.com:8443");
 
@@ -520,7 +517,6 @@ mod tests {
 
         let home = temp_home.path.to_string_lossy().to_string();
         let _home = EnvVarGuard::set("HOME", &home);
-        let _xdg_data_home = EnvVarGuard::set("XDG_DATA_HOME", &format!("{}/.local/share", home));
 
         let config = Config::new();
 
@@ -559,7 +555,6 @@ mod tests {
 
         let home = temp_home.path.to_string_lossy().to_string();
         let _home = EnvVarGuard::set("HOME", &home);
-        let _xdg_data_home = EnvVarGuard::set("XDG_DATA_HOME", &format!("{}/.local/share", home));
 
         let config = Config::new();
 
