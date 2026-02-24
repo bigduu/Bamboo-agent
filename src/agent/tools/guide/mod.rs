@@ -1,3 +1,30 @@
+//! Tool guide system for enhanced LLM prompts
+//!
+//! This module provides a comprehensive system for generating enhanced tool usage
+//! guidelines that help LLMs understand when and how to use different tools effectively.
+//!
+//! # Components
+//!
+//! - `ToolGuide` trait: Interface for defining tool usage guides
+//! - `ToolGuideSpec`: Serializable guide specification
+//! - `ToolExample`: Usage examples for tools
+//! - `ToolCategory`: Categorization system for tools
+//! - `EnhancedPromptBuilder`: Generates formatted prompt sections
+//!
+//! # Example
+//!
+//! ```
+//! use bamboo::agent::tools::guide::{EnhancedPromptBuilder, ToolGuideSpec};
+//! use bamboo::agent::tools::tools::ToolRegistry;
+//!
+//! let registry = ToolRegistry::new();
+//! let schemas = registry.list_tools();
+//! let context = GuideBuildContext::default();
+//!
+//! let prompt = EnhancedPromptBuilder::build(Some(&registry), &schemas, &context);
+//! println!("{}", prompt);
+//! ```
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::agent::core::tools::ToolSchema;
@@ -11,14 +38,30 @@ use context::{GuideBuildContext, GuideLanguage};
 
 use crate::agent::tools::tools::ToolRegistry;
 
+/// Represents a usage example for a tool
+///
+/// Each example demonstrates a specific scenario with parameters
+/// and an explanation of the expected outcome.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolExample {
+    /// Description of the scenario/use case
     pub scenario: String,
+
+    /// Example parameters in JSON format
     pub parameters: serde_json::Value,
+
+    /// Explanation of what this example does and why
     pub explanation: String,
 }
 
 impl ToolExample {
+    /// Creates a new tool example
+    ///
+    /// # Arguments
+    ///
+    /// * `scenario` - Description of the use case
+    /// * `parameters` - JSON parameters for the example
+    /// * `explanation` - What this example accomplishes
     pub fn new(
         scenario: impl Into<String>,
         parameters: serde_json::Value,
@@ -32,18 +75,36 @@ impl ToolExample {
     }
 }
 
+/// Categories for organizing tools
+///
+/// Tools are grouped into logical categories to help LLMs understand
+/// their purpose and choose the right tool for each task.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ToolCategory {
+    /// Tools for reading files and understanding code
     FileReading,
+
+    /// Tools for creating and modifying files
     FileWriting,
+
+    /// Tools for searching code and text
     CodeSearch,
+
+    /// Tools for running shell commands
     CommandExecution,
+
+    /// Tools for Git operations
     GitOperations,
+
+    /// Tools for managing tasks and workflows
     TaskManagement,
+
+    /// Tools for interacting with the user
     UserInteraction,
 }
 
 impl ToolCategory {
+    /// Order for presenting categories in prompts
     const ORDER: [ToolCategory; 7] = [
         ToolCategory::FileReading,
         ToolCategory::FileWriting,
@@ -54,10 +115,12 @@ impl ToolCategory {
         ToolCategory::UserInteraction,
     ];
 
+    /// Returns categories in their standard presentation order
     pub fn ordered() -> &'static [ToolCategory] {
         &Self::ORDER
     }
 
+    /// Returns the display title for this category in the specified language
     fn title(self, language: GuideLanguage) -> &'static str {
         match (self, language) {
             (ToolCategory::FileReading, GuideLanguage::Chinese) => "File Reading Tools",
@@ -77,6 +140,7 @@ impl ToolCategory {
         }
     }
 
+    /// Returns the description for this category in the specified language
     fn description(self, language: GuideLanguage) -> &'static str {
         match (self, language) {
             (ToolCategory::FileReading, GuideLanguage::Chinese) => {
@@ -125,26 +189,70 @@ impl ToolCategory {
     }
 }
 
+/// Trait for defining tool usage guides
+///
+/// Implement this trait to provide contextual guidance for tools,
+/// helping LLMs understand when and how to use them effectively.
+///
+/// # Required Methods
+///
+/// - `tool_name`: Unique identifier for the tool
+/// - `when_to_use`: Guidance on appropriate use cases
+/// - `when_not_to_use`: Scenarios where the tool should be avoided
+/// - `examples`: Concrete usage examples
+/// - `related_tools`: Other tools that work well with this one
+/// - `category`: Logical grouping for the tool
 pub trait ToolGuide: Send + Sync {
+    /// Returns the tool's unique name
     fn tool_name(&self) -> &str;
+
+    /// Returns guidance on when this tool should be used
     fn when_to_use(&self) -> &str;
+
+    /// Returns guidance on when this tool should NOT be used
     fn when_not_to_use(&self) -> &str;
+
+    /// Returns usage examples for this tool
     fn examples(&self) -> Vec<ToolExample>;
+
+    /// Returns names of related tools that complement this one
     fn related_tools(&self) -> Vec<&str>;
+
+    /// Returns the category this tool belongs to
     fn category(&self) -> ToolCategory;
 }
 
+/// Serializable specification for a tool guide
+///
+/// This struct can be loaded from JSON or YAML files and implements
+/// the `ToolGuide` trait for use in the prompt building system.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolGuideSpec {
+    /// Unique tool identifier
     pub tool_name: String,
+
+    /// When to use this tool
     pub when_to_use: String,
+
+    /// When NOT to use this tool
     pub when_not_to_use: String,
+
+    /// Usage examples
     pub examples: Vec<ToolExample>,
+
+    /// Related tool names
     pub related_tools: Vec<String>,
+
+    /// Tool category
     pub category: ToolCategory,
 }
 
 impl ToolGuideSpec {
+    /// Creates a spec from a `ToolGuide` implementation
+    ///
+    /// # Arguments
+    ///
+    /// * `guide` - Reference to any type implementing `ToolGuide`
     pub fn from_guide(guide: &dyn ToolGuide) -> Self {
         Self {
             tool_name: guide.tool_name().to_string(),
@@ -160,10 +268,20 @@ impl ToolGuideSpec {
         }
     }
 
+    /// Parses a guide spec from a JSON string
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the JSON is malformed or missing required fields
     pub fn from_json_str(raw: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(raw)
     }
 
+    /// Parses a guide spec from a YAML string
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the YAML is malformed or missing required fields
     pub fn from_yaml_str(raw: &str) -> Result<Self, serde_yaml::Error> {
         serde_yaml::from_str(raw)
     }
@@ -195,9 +313,50 @@ impl ToolGuide for ToolGuideSpec {
     }
 }
 
+/// Builds enhanced prompt sections with tool usage guidelines
+///
+/// This builder constructs formatted markdown sections containing:
+/// - Categorized tool guides with examples
+/// - Best practices for tool usage
+/// - Schema-only fallback for tools without guides
+///
+/// # Output Format
+///
+/// The generated prompts follow this structure:
+///
+/// ```markdown
+/// ## Tool Usage Guidelines
+///
+/// ### File Reading Tools
+/// Use these to inspect existing files and structure.
+///
+/// **read_file**
+/// - When to use: Read file contents when you need to understand code
+/// - When NOT to use: When you only need to check if a file exists
+/// - Example: {"path": "/src/main.rs"} -> Reads the main source file
+/// - Related tools: list_directory, search_files
+///
+/// ### Best Practices
+/// 1. Always verify file paths before reading
+/// 2. Use appropriate tools for the task
+/// ```
 pub struct EnhancedPromptBuilder;
 
 impl EnhancedPromptBuilder {
+    /// Builds an enhanced prompt section for available tools
+    ///
+    /// This method looks up guides for all provided schemas and generates
+    /// a formatted markdown section with usage guidelines.
+    ///
+    /// # Arguments
+    ///
+    /// * `registry` - Optional tool registry with registered guides
+    /// * `available_schemas` - List of tool schemas to document
+    /// * `context` - Build context (language, max examples, etc.)
+    ///
+    /// # Returns
+    ///
+    /// Formatted markdown string with tool usage guidelines
     pub fn build(
         registry: Option<&ToolRegistry>,
         available_schemas: &[ToolSchema],
@@ -213,6 +372,21 @@ impl EnhancedPromptBuilder {
         Self::build_for_tools(registry, &tool_names, available_schemas, context)
     }
 
+    /// Builds an enhanced prompt for a specific set of tools
+    ///
+    /// This method allows specifying exactly which tools to include,
+    /// even if they're not in the available schemas.
+    ///
+    /// # Arguments
+    ///
+    /// * `registry` - Optional tool registry with registered guides
+    /// * `tool_names` - Specific tools to document
+    /// * `fallback_schemas` - Schemas for tools without guides
+    /// * `context` - Build context (language, max examples, etc.)
+    ///
+    /// # Returns
+    ///
+    /// Formatted markdown string with tool usage guidelines
     pub fn build_for_tools(
         registry: Option<&ToolRegistry>,
         tool_names: &[String],
@@ -311,6 +485,7 @@ impl EnhancedPromptBuilder {
         output
     }
 
+    /// Collects guides for the specified tools from registry and built-in guides
     fn collect_guides(
         registry: Option<&ToolRegistry>,
         tool_names: &[String],
@@ -337,6 +512,7 @@ impl EnhancedPromptBuilder {
         guides
     }
 
+    /// Renders a section listing tools by schema only (no detailed guides)
     fn render_schema_only_section(
         schemas: &[ToolSchema],
         context: &GuideBuildContext,
@@ -369,6 +545,9 @@ impl EnhancedPromptBuilder {
     }
 }
 
+// Helper functions for internationalized labels
+
+/// Returns the "When to use" label in the appropriate language
 fn when_to_use_label(language: GuideLanguage) -> &'static str {
     match language {
         GuideLanguage::Chinese => "When to use",
@@ -376,6 +555,7 @@ fn when_to_use_label(language: GuideLanguage) -> &'static str {
     }
 }
 
+/// Returns the "When NOT to use" label in the appropriate language
 fn when_not_to_use_label(language: GuideLanguage) -> &'static str {
     match language {
         GuideLanguage::Chinese => "When NOT to use",
@@ -383,6 +563,7 @@ fn when_not_to_use_label(language: GuideLanguage) -> &'static str {
     }
 }
 
+/// Returns the "Example" label in the appropriate language
 fn example_label(language: GuideLanguage) -> &'static str {
     match language {
         GuideLanguage::Chinese => "Example",
@@ -390,6 +571,7 @@ fn example_label(language: GuideLanguage) -> &'static str {
     }
 }
 
+/// Returns the "Related tools" label in the appropriate language
 fn related_tools_label(language: GuideLanguage) -> &'static str {
     match language {
         GuideLanguage::Chinese => "Related tools",
@@ -397,6 +579,7 @@ fn related_tools_label(language: GuideLanguage) -> &'static str {
     }
 }
 
+/// Returns the "Best Practices" title in the appropriate language
 fn best_practices_title(language: GuideLanguage) -> &'static str {
     match language {
         GuideLanguage::Chinese => "Best Practices",
@@ -404,6 +587,7 @@ fn best_practices_title(language: GuideLanguage) -> &'static str {
     }
 }
 
+/// Returns the "Additional Tools (Schema Only)" title in the appropriate language
 fn schema_only_title(language: GuideLanguage) -> &'static str {
     match language {
         GuideLanguage::Chinese => "Additional Tools (Schema Only)",
@@ -411,6 +595,7 @@ fn schema_only_title(language: GuideLanguage) -> &'static str {
     }
 }
 
+/// Returns the description for schema-only tools in the appropriate language
 fn schema_only_description(language: GuideLanguage) -> &'static str {
     match language {
         GuideLanguage::Chinese => "No detailed guide is available for these tools; rely on schema.",

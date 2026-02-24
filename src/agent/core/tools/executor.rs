@@ -1,3 +1,8 @@
+//! Tool execution infrastructure
+//!
+//! This module provides the trait and utilities for executing tool calls,
+//! with support for both direct tool execution and composition-based workflows.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,26 +13,105 @@ use crate::agent::core::tools::{ToolCall, ToolResult, ToolSchema};
 
 use super::result_handler::parse_tool_args;
 
+/// Errors that can occur during tool execution
 #[derive(Error, Debug, Clone)]
 pub enum ToolError {
+    /// The requested tool was not found in the registry
     #[error("Tool not found: {0}")]
     NotFound(String),
 
+    /// Tool execution failed
     #[error("Execution failed: {0}")]
     Execution(String),
 
+    /// Invalid arguments provided to the tool
     #[error("Invalid arguments: {0}")]
     InvalidArguments(String),
 }
 
+/// Convenient result type for tool execution operations
 pub type Result<T> = std::result::Result<T, ToolError>;
 
+/// Trait for tool execution backends
+///
+/// This trait defines the interface for executing tool calls and listing
+/// available tools. Implementations can wrap tool registries, provide
+/// mock tools for testing, or implement custom execution logic.
+///
+/// # Example
+///
+/// ```ignore
+/// use bamboo::agent::core::tools::executor::ToolExecutor;
+///
+/// struct MyExecutor {
+///     tools: HashMap<String, Box<dyn Tool>>,
+/// }
+///
+/// #[async_trait]
+/// impl ToolExecutor for MyExecutor {
+///     async fn execute(&self, call: &ToolCall) -> Result<ToolResult> {
+///         let tool = self.tools.get(&call.function.name)
+///             .ok_or_else(|| ToolError::NotFound(call.function.name.clone()))?;
+///         let args = parse_tool_args(&call.function.arguments)?;
+///         tool.execute(args).await
+///     }
+///
+///     fn list_tools(&self) -> Vec<ToolSchema> {
+///         self.tools.values().map(|t| t.schema()).collect()
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
+    /// Executes a tool call
+    ///
+    /// # Arguments
+    ///
+    /// * `call` - The tool call to execute (contains tool name and arguments)
+    ///
+    /// # Returns
+    ///
+    /// The tool execution result or an error
     async fn execute(&self, call: &ToolCall) -> Result<ToolResult>;
+
+    /// Lists all available tools and their schemas
+    ///
+    /// Returns schemas for all tools that can be executed via this executor
     fn list_tools(&self) -> Vec<ToolSchema>;
 }
 
+/// Executes a tool call with composition support
+///
+/// This function provides a unified interface for tool execution that supports
+/// both composition-based workflows and direct tool execution.
+///
+/// # Execution Strategy
+///
+/// 1. If a `composition_executor` is provided, attempts to execute as a composition
+/// 2. If composition execution fails with `NotFound`, falls back to direct execution
+/// 3. Other composition errors are propagated immediately
+///
+/// # Arguments
+///
+/// * `tool_call` - The tool call to execute
+/// * `tools` - Direct tool executor (fallback)
+/// * `composition_executor` - Optional composition-based executor
+///
+/// # Returns
+///
+/// The tool execution result or an error
+///
+/// # Example
+///
+/// ```ignore
+/// use bamboo::agent::core::tools::executor::execute_tool_call;
+///
+/// let result = execute_tool_call(
+///     &tool_call,
+///     &registry,
+///     Some(composition_executor),
+/// ).await?;
+/// ```
 pub async fn execute_tool_call(
     tool_call: &ToolCall,
     tools: &dyn ToolExecutor,
