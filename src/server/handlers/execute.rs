@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::core::agent::Role;
 use crate::agent::loop_module::{run_agent_loop_with_config, AgentLoopConfig};
-use crate::agent::server::state::{AgentRunner, AgentStatus, AppState};
+use crate::server::app_state::{AgentRunner, AgentStatus, AppState};
 
 /// Response returned after triggering agent execution.
 ///
@@ -368,7 +368,7 @@ pub async fn handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::server::state::AgentRunner;
+    use crate::server::app_state::AgentRunner;
 
     #[test]
     fn test_agent_status_running_blocks_restart() {

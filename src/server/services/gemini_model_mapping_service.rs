@@ -1,4 +1,4 @@
-use crate::web_service::error::AppError;
+use crate::server::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;

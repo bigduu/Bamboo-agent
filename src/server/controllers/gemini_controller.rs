@@ -5,9 +5,9 @@ use crate::agent::llm::protocol::gemini::{
 };
 use crate::agent::llm::protocol::FromProvider;
 use crate::agent::llm::LLMChunk;
-use crate::web_service::services::gemini_model_mapping_service::resolve_model;
-use crate::web_service::{
-    error::AppError, model_config_helper::get_default_model_from_config, server::AppState,
+use crate::server::services::gemini_model_mapping_service::resolve_model;
+use crate::server::{
+    error::AppError, model_config_helper::get_default_model_from_config, app_state::AppState,
 };
 use actix_web::{get, post, web, HttpResponse};
 use anyhow::anyhow;
@@ -44,7 +44,7 @@ pub async fn generate_content(
                 e
             );
             // Continue with empty mapping (will use default model)
-            crate::web_service::services::gemini_model_mapping_service::ModelResolution {
+            crate::server::services::gemini_model_mapping_service::ModelResolution {
                 mapped_model: String::new(),
                 response_model: gemini_model.clone(),
             }
@@ -171,7 +171,7 @@ pub async fn stream_generate_content(
                 e
             );
             // Continue with empty mapping (will use default model)
-            crate::web_service::services::gemini_model_mapping_service::ModelResolution {
+            crate::server::services::gemini_model_mapping_service::ModelResolution {
                 mapped_model: String::new(),
                 response_model: gemini_model.clone(),
             }

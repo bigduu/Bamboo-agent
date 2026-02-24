@@ -1,4 +1,4 @@
-use crate::web_service::error::AppError;
+use crate::server::error::AppError;
 use std::path::Path;
 use tokio::fs;
 

@@ -1,7 +1,7 @@
 use crate::agent::server::state::AppState as AgentAppState;
 use crate::agent::skill::SkillDefinition;
-use crate::web_service::error::AppError;
-use crate::web_service::server::AppState;
+use crate::server::error::AppError;
+use crate::server::app_state::AppState;
 use actix_web::{get, web, HttpResponse};
 use serde::{Deserialize, Serialize};
 

@@ -7,7 +7,7 @@ use actix_web::{web, HttpResponse, Result};
 use serde::Deserialize;
 
 use crate::agent::core::Message;
-use crate::agent::server::state::AppState;
+use crate::server::app_state::AppState;
 
 /// Request payload for submitting a user response.
 ///

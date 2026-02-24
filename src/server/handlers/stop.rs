@@ -6,7 +6,7 @@
 use actix_web::{web, HttpResponse, Responder};
 use serde::Serialize;
 
-use crate::agent::server::state::{AgentStatus, AppState};
+use crate::server::app_state::{AgentStatus, AppState};
 
 /// Response for stop request.
 #[derive(Serialize)]
@@ -119,7 +119,7 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> imp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::server::state::AgentRunner;
+    use crate::server::app_state::AgentRunner;
 
     #[test]
     fn test_stop_cancels_running_status() {

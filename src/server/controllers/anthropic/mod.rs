@@ -6,9 +6,9 @@ use crate::agent::llm::api::models::{
 };
 use crate::agent::llm::protocol::FromProvider;
 use crate::agent::server::state::AppState as AgentAppState;
-use crate::web_service::services::anthropic_model_mapping_service::load_anthropic_model_mapping;
-use crate::web_service::{
-    error::AppError, model_config_helper::get_default_model_from_config, server::AppState,
+use crate::server::services::anthropic_model_mapping_service::load_anthropic_model_mapping;
+use crate::server::{
+    error::AppError, model_config_helper::get_default_model_from_config, app_state::AppState,
 };
 use actix_web::{get, http::StatusCode, post, web, HttpResponse};
 use async_stream::stream;

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::agent::loop_module::{run_agent_loop_with_config, AgentLoopConfig};
-use crate::agent::server::state::{AgentRunner, AgentStatus, AppState};
+use crate::server::app_state::{AgentRunner, AgentStatus, AppState};
 
 /// Legacy SSE streaming endpoint (DEPRECATED).
 ///
@@ -348,6 +348,9 @@ fn subscribe_to_runner(runner: AgentRunner, _session_id: String) -> HttpResponse
 impl Clone for AppState {
     fn clone(&self) -> Self {
         Self {
+            app_data_dir: self.app_data_dir.clone(),
+            config: self.config.clone(),
+            provider: self.provider.clone(),
             sessions: self.sessions.clone(),
             storage: self.storage.clone(),
             llm: self.llm.clone(),
@@ -358,6 +361,7 @@ impl Clone for AppState {
             metrics_service: self.metrics_service.clone(),
             model_name: self.model_name.clone(),
             agent_runners: self.agent_runners.clone(),
+            metrics_bus: self.metrics_bus.clone(),
         }
     }
 }

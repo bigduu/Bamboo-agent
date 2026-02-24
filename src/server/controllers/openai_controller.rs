@@ -3,8 +3,8 @@ use crate::agent::llm::api::models::{
 };
 use crate::agent::llm::protocol::FromProvider;
 use crate::agent::server::state::AppState as AgentAppState;
-use crate::web_service::{
-    error::AppError, model_config_helper::get_default_model_from_config, server::AppState,
+use crate::server::{
+    error::AppError, model_config_helper::get_default_model_from_config, app_state::AppState,
 };
 use actix_web::{get, post, web, HttpResponse};
 use bytes::Bytes;

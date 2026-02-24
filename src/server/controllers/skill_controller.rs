@@ -6,8 +6,8 @@ use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::web_service::error::AppError;
-use crate::web_service::server::AppState;
+use crate::server::error::AppError;
+use crate::server::app_state::AppState;
 
 /// Configure skill routes
 pub fn config(cfg: &mut web::ServiceConfig) {
@@ -186,7 +186,7 @@ pub async fn get_available_workflows(
     _agent_state: web::Data<AgentAppState>,
 ) -> Result<HttpResponse, AppError> {
     let workflows =
-        crate::web_service::services::skill_service::list_workflows(&app_state.app_data_dir)
+        crate::server::services::skill_service::list_workflows(&app_state.app_data_dir)
             .await
             .map_err(|e| {
                 AppError::InternalError(anyhow::anyhow!("Failed to list workflows: {}", e))

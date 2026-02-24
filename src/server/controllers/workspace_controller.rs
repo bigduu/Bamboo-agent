@@ -2,8 +2,8 @@ use actix_web::{get, post, web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::web_service::error::AppError;
-use crate::web_service::server::AppState;
+use crate::server::error::AppError;
+use crate::server::app_state::AppState;
 
 /// Validates and canonicalizes a workspace path to prevent directory traversal attacks.
 /// Ensures the path exists and is accessible.

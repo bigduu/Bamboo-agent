@@ -12,6 +12,9 @@
 //! - `app_state`: Unified state management with direct provider access
 //! - `config`: CORS and security header configuration
 //! - `metrics`: Unified metrics infrastructure
+//! - `handlers`: Agent API handlers (chat, execute, events, etc.)
+//! - `controllers`: Multi-provider API controllers (OpenAI, Anthropic, Gemini)
+//! - `services`: Business logic services
 //! - `routes`: Route configuration for all API endpoints
 //! - `server`: Entry points for running the server
 //!
@@ -30,9 +33,18 @@
 
 pub mod app_state;
 pub mod config;
+pub mod controllers;
+pub mod error;
+pub mod handlers;
+pub mod logging;
 pub mod metrics;
+pub mod metrics_service;
+pub mod model_config_helper;
+pub mod services;
+pub mod workflow;
 
 // Re-export commonly used types
 pub use app_state::{AgentRunner, AgentStatus, AppState};
 pub use config::{build_cors, build_security_headers};
+pub use error::AppError;
 pub use metrics::MetricsInfrastructure;

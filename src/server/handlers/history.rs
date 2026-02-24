@@ -4,7 +4,7 @@
 
 use actix_web::{web, HttpResponse, Responder};
 
-use crate::agent::server::state::AppState;
+use crate::server::app_state::AppState;
 
 /// Retrieve message history for a chat session.
 ///

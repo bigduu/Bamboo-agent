@@ -1,13 +1,17 @@
 //! Web service layer - HTTP controllers and services
 //!
-//! This module provides the web service layer that wraps the agent system
-//! with additional controllers for various LLM provider APIs.
+//! DEPRECATED: This module has been consolidated into crate::server
+//! All functionality is now available in the unified server module.
+//!
+//! Use `crate::server` instead.
 
-pub mod controllers;
-pub mod error;
-pub mod model_config_helper;
+// Deprecated: These modules have been moved to crate::server
+// Re-exports provided for backward compatibility
+pub use crate::server::controllers;
+pub use crate::server::error;
+pub use crate::server::model_config_helper;
 pub mod server;
-pub mod services;
+pub use crate::server::services;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;

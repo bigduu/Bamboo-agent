@@ -1,4 +1,4 @@
-use crate::web_service::error::AppError;
+use crate::server::error::AppError;
 use actix_web::{get, post, web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

@@ -1,6 +1,6 @@
 use crate::core::keyword_masking::{KeywordEntry, KeywordMaskingConfig};
 use crate::core::ProxyAuth;
-use crate::web_service::{error::AppError, server::AppState};
+use crate::server::{error::AppError, app_state::AppState};
 use actix_web::{delete, get, post, web, HttpResponse};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -602,7 +602,7 @@ pub async fn reset_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpR
 pub async fn get_anthropic_model_mapping(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
-    use crate::web_service::services::anthropic_model_mapping_service::load_anthropic_model_mapping;
+    use crate::server::services::anthropic_model_mapping_service::load_anthropic_model_mapping;
     let mapping = load_anthropic_model_mapping(&app_state.app_data_dir).await?;
     Ok(HttpResponse::Ok().json(mapping))
 }
@@ -611,10 +611,10 @@ pub async fn get_anthropic_model_mapping(
 pub async fn set_anthropic_model_mapping(
     app_state: web::Data<AppState>,
     payload: web::Json<
-        crate::web_service::services::anthropic_model_mapping_service::AnthropicModelMapping,
+        crate::server::services::anthropic_model_mapping_service::AnthropicModelMapping,
     >,
 ) -> Result<HttpResponse, AppError> {
-    use crate::web_service::services::anthropic_model_mapping_service::save_anthropic_model_mapping;
+    use crate::server::services::anthropic_model_mapping_service::save_anthropic_model_mapping;
     let mapping =
         save_anthropic_model_mapping(&app_state.app_data_dir, payload.into_inner()).await?;
     Ok(HttpResponse::Ok().json(mapping))

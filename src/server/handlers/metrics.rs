@@ -2,7 +2,7 @@ use actix_web::{web, HttpResponse, Responder};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::server::state::AppState;
+use crate::server::app_state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct MetricsSummaryQuery {

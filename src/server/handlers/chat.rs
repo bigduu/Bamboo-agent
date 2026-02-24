@@ -7,7 +7,7 @@ use actix_web::{web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agent::server::state::AppState;
+use crate::server::app_state::AppState;
 
 /// Request payload for creating a new chat message.
 ///
@@ -148,7 +148,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         .as_deref()
         .map(str::trim)
         .filter(|prompt| !prompt.is_empty())
-        .unwrap_or(crate::agent::server::state::DEFAULT_BASE_PROMPT);
+        .unwrap_or(crate::server::app_state::DEFAULT_BASE_PROMPT);
     let enhance_prompt = req
         .enhance_prompt
         .as_deref()
@@ -217,7 +217,7 @@ fn build_enhanced_system_prompt(
         merged_prompt.push_str("\n\nWorkspace path: ");
         merged_prompt.push_str(workspace_path);
         merged_prompt.push('\n');
-        merged_prompt.push_str(crate::agent::server::state::WORKSPACE_PROMPT_GUIDANCE);
+        merged_prompt.push_str(crate::server::app_state::WORKSPACE_PROMPT_GUIDANCE);
     }
 
     merged_prompt

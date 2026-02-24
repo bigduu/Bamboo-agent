@@ -36,7 +36,7 @@ use crate::agent::core::tools::{FunctionCall, ToolCall};
 use crate::agent::core::ToolExecutor;
 use crate::agent::tools::{normalize_tool_ref, BuiltinToolExecutor};
 
-use crate::web_service::error::AppError;
+use crate::server::error::AppError;
 
 /// Request payload for tool execution.
 ///

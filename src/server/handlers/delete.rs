@@ -5,7 +5,7 @@
 
 use actix_web::{web, HttpResponse, Result};
 
-use crate::agent::server::state::AppState;
+use crate::server::app_state::AppState;
 
 /// Delete a chat session and cancel any running agent execution.
 ///

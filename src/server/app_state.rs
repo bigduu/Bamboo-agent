@@ -16,6 +16,11 @@ use crate::agent::server::metrics_service::MetricsService;
 use crate::agent::skill::{SkillManager, SkillStoreConfig};
 use crate::core::Config;
 
+pub const DEFAULT_BASE_PROMPT: &str =
+    "You are a helpful AI assistant with access to various tools and skills.";
+pub const WORKSPACE_PROMPT_GUIDANCE: &str =
+    "If you need to inspect files, check the workspace first, then ~/.bamboo.";
+
 /// Runner that manages agent execution for a session
 #[derive(Debug, Clone)]
 pub enum AgentStatus {
@@ -38,6 +43,26 @@ pub struct AgentRunner {
     pub last_budget_event: Option<AgentEvent>,
 }
 
+impl Default for AgentRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AgentRunner {
+    pub fn new() -> Self {
+        let (event_sender, _) = broadcast::channel(1000);
+        Self {
+            event_sender,
+            cancel_token: CancellationToken::new(),
+            status: AgentStatus::Pending,
+            started_at: Utc::now(),
+            completed_at: None,
+            last_budget_event: None,
+        }
+    }
+}
+
 /// Unified application state consolidating web_service and agent/server state
 ///
 /// This eliminates the proxy pattern where web_service created an AgentAppState
@@ -52,6 +77,8 @@ pub struct AppState {
     // From agent::server::AppState
     pub sessions: Arc<RwLock<HashMap<String, crate::agent::core::Session>>>,
     pub storage: JsonlStorage,
+    /// Direct LLM provider (same as provider.read().await, but more convenient)
+    pub llm: Arc<dyn LLMProvider>,
     pub tools: Arc<dyn ToolExecutor>,
     pub cancel_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
     pub skill_manager: Arc<SkillManager>,
@@ -107,8 +134,7 @@ impl AppState {
         log::info!("Storage initialized successfully at: {:?}", sessions_dir);
 
         // Initialize built-in tools
-        let builtin_tools: Arc<dyn ToolExecutor> =
-            Arc::new(crate::agent::tools::BuiltinToolExecutor::new());
+        let builtin_tools: Arc<dyn ToolExecutor> = Arc::new(crate::agent::tools::BuiltinToolExecutor::new());
 
         // Initialize MCP manager
         let mcp_manager = Arc::new(McpServerManager::new());
@@ -190,9 +216,10 @@ impl AppState {
         Self {
             app_data_dir,
             config: Arc::new(RwLock::new(config)),
-            provider: Arc::new(RwLock::new(provider)),
+            provider: Arc::new(RwLock::new(provider.clone())),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             storage,
+            llm: provider,
             tools,
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             skill_manager,

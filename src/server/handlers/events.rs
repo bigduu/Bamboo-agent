@@ -7,7 +7,7 @@ use actix_web::http::header;
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 
 use crate::agent::core::TokenUsage;
-use crate::agent::server::state::{AgentStatus, AppState};
+use crate::server::app_state::{AgentStatus, AppState};
 
 /// Subscribe to real-time agent execution events via Server-Sent Events (SSE).
 ///
