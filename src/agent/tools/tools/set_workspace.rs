@@ -8,6 +8,11 @@ use std::path::Path;
 pub struct SetWorkspaceTool;
 
 impl SetWorkspaceTool {
+    /// Create a new SetWorkspaceTool instance.
+    ///
+    /// This tool changes the current working directory for subsequent file operations
+    /// and command executions. The path must exist and be a directory.
+    /// Includes security checks to prevent path traversal attacks.
     pub fn new() -> Self {
         Self
     }

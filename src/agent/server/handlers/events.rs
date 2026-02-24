@@ -1,9 +1,85 @@
+//! Server-Sent Events (SSE) handler for real-time agent event streaming.
+//!
+//! This module provides the HTTP endpoint for subscribing to agent execution
+//! events via Server-Sent Events protocol.
+
 use actix_web::http::header;
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 
 use crate::agent::core::TokenUsage;
 use crate::agent::server::state::{AgentStatus, AppState};
 
+/// Subscribe to real-time agent execution events via Server-Sent Events (SSE).
+///
+/// This endpoint opens a persistent SSE connection that streams agent events
+/// in real-time. Call this after starting execution with `POST /api/v1/execute/{session_id}`.
+///
+/// # HTTP Method
+///
+/// `GET /api/v1/events/{session_id}`
+///
+/// # Path Parameters
+///
+/// - `session_id` - The session identifier to subscribe to
+///
+/// # Response
+///
+/// - `200 OK` - SSE stream established successfully
+/// - `404 Not Found` - Session does not exist
+///
+/// # Response Format
+///
+/// Returns a text/event-stream with events in the format:
+/// ```text
+/// data: {"type":"TextDelta","delta":"Hello"}
+///
+/// data: {"type":"Complete","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}
+/// ```
+///
+/// # Event Types
+///
+/// The stream can emit the following event types:
+///
+/// - `TextDelta` - Partial text generation
+/// - `ToolCall` - Agent is calling a tool
+/// - `ToolResult` - Tool execution completed
+/// - `TokenBudgetUpdated` - Token usage statistics updated
+/// - `Complete` - Agent execution completed (terminal event)
+/// - `Error` - Agent execution failed (terminal event)
+///
+/// # Terminal Events
+///
+/// The SSE stream will close automatically after receiving:
+/// - `Complete` - Successful completion
+/// - `Error` - Execution error
+///
+/// # Late Subscribers
+///
+/// If you subscribe after agent execution has started:
+/// - You'll receive the last `TokenBudgetUpdated` event immediately
+/// - Subsequent events will stream normally
+/// - Terminal events will still be delivered
+///
+/// # Completed/Errored Agents
+///
+/// If the agent has already finished:
+/// - Returns immediate `Complete` or `Error` event
+/// - Stream closes immediately after
+///
+/// # Example
+///
+/// ```javascript
+/// const eventSource = new EventSource('/api/v1/events/session-123');
+///
+/// eventSource.onmessage = (event) => {
+///   const data = JSON.parse(event.data);
+///   console.log('Received event:', data);
+///
+///   if (data.type === 'Complete' || data.type === 'Error') {
+///     eventSource.close();
+///   }
+/// };
+/// ```
 pub async fn handler(
     state: web::Data<AppState>,
     path: web::Path<String>,

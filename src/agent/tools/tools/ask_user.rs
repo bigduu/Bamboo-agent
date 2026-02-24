@@ -6,6 +6,10 @@ use serde_json::json;
 pub struct AskUserTool;
 
 impl AskUserTool {
+    /// Create a new AskUserTool instance.
+    ///
+    /// This tool prompts the user with a question and provides multiple choice options.
+    /// It supports custom answers when `allow_custom` is true.
     pub fn new() -> Self {
         Self
     }

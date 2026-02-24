@@ -1,14 +1,62 @@
+//! Agent execution cancellation API handler.
+//!
+//! This module provides the HTTP endpoint for stopping in-flight
+//! agent executions.
+
 use actix_web::{web, HttpResponse, Responder};
 use serde::Serialize;
 
 use crate::agent::server::state::{AgentStatus, AppState};
 
+/// Response for stop request.
 #[derive(Serialize)]
 struct StopResponse {
+    /// Whether the stop operation succeeded
     success: bool,
+    /// Human-readable status message
     message: String,
 }
 
+/// Stop a running agent execution.
+///
+/// This endpoint cancels an in-flight agent execution for the specified session.
+/// The agent will finish its current operation and then terminate gracefully.
+///
+/// # HTTP Method
+///
+/// `POST /api/v1/stop/{session_id}`
+///
+/// # Path Parameters
+///
+/// - `session_id` - The session identifier to stop
+///
+/// # Response
+///
+/// - `200 OK` - Agent execution stopped successfully, returns [`StopResponse`]
+/// - `404 Not Found` - No active execution found for this session
+///
+/// # Behavior
+///
+/// When a stop request is received:
+/// 1. Checks if there's an active runner with `Running` status
+/// 2. Triggers cancellation via the cancel token
+/// 3. Updates runner status to `Cancelled`
+/// 4. Agent loop receives cancellation signal and terminates
+/// 5. Any pending tool executions are aborted
+///
+/// # Graceful Shutdown
+///
+/// The agent will:
+/// - Complete the current LLM request if in progress
+/// - Cancel pending tool executions
+/// - Send an `Error` event with "cancelled" message
+/// - Save session state before terminating
+///
+/// # Example
+///
+/// ```bash
+/// curl -X POST http://localhost:8080/api/v1/stop/session-123
+/// ```
 pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let session_id = path.into_inner();
     log::info!("[{}] Stop request received", session_id);

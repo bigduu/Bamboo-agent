@@ -7,6 +7,11 @@ use tokio::fs;
 pub struct ReadFileTool;
 
 impl ReadFileTool {
+    /// Create a new ReadFileTool instance.
+    ///
+    /// This tool reads and returns the complete contents of a text file.
+    /// Supports both absolute paths and tilde expansion (~ for home directory).
+    /// Includes security checks to prevent path traversal attacks.
     pub fn new() -> Self {
         Self
     }

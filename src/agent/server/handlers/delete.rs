@@ -1,7 +1,49 @@
+//! Session deletion API handler.
+//!
+//! This module provides the HTTP endpoint for deleting chat sessions
+//! and cancelling in-flight agent executions.
+
 use actix_web::{web, HttpResponse, Result};
 
 use crate::agent::server::state::AppState;
 
+/// Delete a chat session and cancel any running agent execution.
+///
+/// This endpoint removes the session from both memory and persistent storage,
+/// and cancels any in-flight agent execution for that session.
+///
+/// # HTTP Method
+///
+/// `DELETE /api/v1/sessions/{session_id}`
+///
+/// # Path Parameters
+///
+/// - `session_id` - The session identifier to delete
+///
+/// # Response
+///
+/// - `200 OK` - Session deleted successfully (no body)
+/// - `404 Not Found` - Session does not exist
+/// - `500 Internal Server Error` - Failed to delete from storage
+///
+/// # Side Effects
+///
+/// When a session is deleted:
+/// 1. Session is removed from persistent storage (if exists)
+/// 2. Session is removed from in-memory cache
+/// 3. Any running agent execution is cancelled
+/// 4. Associated cancellation tokens are cleaned up
+///
+/// # Idempotency
+///
+/// This endpoint is idempotent. Calling it multiple times with the same
+/// session ID will return `404 Not Found` after the first successful deletion.
+///
+/// # Example
+///
+/// ```bash
+/// curl -X DELETE http://localhost:8080/api/v1/sessions/session-123
+/// ```
 pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Result<HttpResponse> {
     let session_id = path.into_inner();
 

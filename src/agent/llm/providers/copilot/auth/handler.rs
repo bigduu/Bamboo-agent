@@ -1,3 +1,8 @@
+//! GitHub Copilot authentication handler.
+//!
+//! This module provides authentication handling for GitHub Copilot,
+//! including device code flow, token caching, and automatic refresh.
+
 use crate::agent::llm::ProxyAuthRequiredError;
 use anyhow::anyhow;
 use lazy_static::lazy_static;
@@ -17,6 +22,10 @@ use tokio::time::sleep;
 
 use super::device_code::DeviceCodeResponse;
 
+/// Copilot API configuration returned from GitHub.
+///
+/// Contains the authentication token, feature flags, and endpoint URLs
+/// for the Copilot service.
 // Models for GitHub authentication flow
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CopilotConfig {
@@ -136,6 +145,7 @@ mod tests {
     }
 }
 
+/// API endpoint configuration for Copilot services.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Endpoints {
     pub api: Option<String>,
@@ -144,6 +154,9 @@ pub struct Endpoints {
     pub telemetry: Option<String>,
 }
 
+/// Access token response from GitHub OAuth.
+///
+/// Contains the access token or error information from the OAuth flow.
 /// Access token response from GitHub
 #[derive(Debug, Deserialize)]
 pub(crate) struct AccessTokenResponse {
@@ -173,6 +186,13 @@ lazy_static! {
     static ref CHAT_TOKEN_LOCK: Mutex<()> = Mutex::new(());
 }
 
+/// Handler for GitHub Copilot authentication.
+///
+/// Manages the complete authentication lifecycle including:
+/// - Device code flow for initial authentication
+/// - Token caching and validation
+/// - Automatic token refresh
+/// - Silent authentication attempts
 // Struct for handling authentication logic
 #[derive(Debug, Clone)]
 pub struct CopilotAuthHandler {
@@ -184,6 +204,13 @@ pub struct CopilotAuthHandler {
 }
 
 impl CopilotAuthHandler {
+    /// Creates a new authentication handler.
+    ///
+    /// # Arguments
+    ///
+    /// * `client` - HTTP client with middleware for retry logic
+    /// * `app_data_dir` - Directory for storing cached tokens
+    /// * `headless_auth` - Whether to print authentication instructions to console
     pub fn new(
         client: Arc<ClientWithMiddleware>,
         app_data_dir: PathBuf,
@@ -198,11 +225,13 @@ impl CopilotAuthHandler {
         }
     }
 
+    /// Returns the application data directory path.
     /// Get app data directory
     pub fn app_data_dir(&self) -> &PathBuf {
         &self.app_data_dir
     }
 
+    /// Sets a custom GitHub API base URL for testing.
     /// Create handler with custom GitHub API base URL (for testing)
     #[cfg(test)]
     fn with_github_api_base_url(mut self, url: impl Into<String>) -> Self {
@@ -210,6 +239,7 @@ impl CopilotAuthHandler {
         self
     }
 
+    /// Sets a custom GitHub login base URL for testing.
     /// Create handler with custom GitHub login base URL (for testing)
     #[cfg(test)]
     fn with_github_login_base_url(mut self, url: impl Into<String>) -> Self {
@@ -217,18 +247,25 @@ impl CopilotAuthHandler {
         self
     }
 
+    /// Performs authentication and returns an access token.
     pub async fn authenticate(&self) -> anyhow::Result<String> {
         self.get_chat_token().await
     }
 
+    /// Ensures the handler is authenticated, without returning the token.
     pub async fn ensure_authenticated(&self) -> anyhow::Result<()> {
         self.get_chat_token().await.map(|_| ())
     }
 
+    /// Gets the current access token, authenticating if necessary.
     pub async fn get_token(&self) -> anyhow::Result<String> {
         self.get_chat_token().await
     }
 
+    /// Gets a chat token, using cached credentials or triggering device flow.
+    ///
+    /// This method attempts silent authentication first, then falls back
+    /// to interactive device code flow if necessary.
     // get_chat_token remains in CopilotClient, delegates to auth_handler
     pub async fn get_chat_token(&self) -> anyhow::Result<String> {
         // Acquire global lock to ensure sequential execution
@@ -245,6 +282,7 @@ impl CopilotAuthHandler {
         Ok(copilot_config.token)
     }
 
+    /// Reads an access token from a file, trimming whitespace.
     fn read_access_token(token_path: &PathBuf) -> Option<String> {
         if !token_path.exists() {
             return None;
@@ -258,11 +296,13 @@ impl CopilotAuthHandler {
         }
     }
 
+    /// Reads a cached Copilot configuration from a file.
     fn read_cached_copilot_config(&self, token_path: &PathBuf) -> Option<CopilotConfig> {
         let cached_str = read_to_string(token_path).ok()?;
         serde_json::from_str::<CopilotConfig>(&cached_str).ok()
     }
 
+    /// Writes a Copilot configuration to a cache file.
     fn write_cached_copilot_config(
         &self,
         token_path: &PathBuf,
@@ -274,6 +314,7 @@ impl CopilotAuthHandler {
         Ok(())
     }
 
+    /// Checks if a Copilot token is valid with a 60-second buffer.
     fn is_copilot_token_valid(&self, copilot_config: &CopilotConfig) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -282,6 +323,7 @@ impl CopilotAuthHandler {
         copilot_config.expires_at.saturating_sub(60) > now
     }
 
+    /// Requests a device code from GitHub for OAuth flow.
     pub(super) async fn get_device_code(&self) -> anyhow::Result<DeviceCodeResponse> {
         let params = [
             ("client_id", "Iv1.b507a08c87ecfe98"),
@@ -315,6 +357,10 @@ impl CopilotAuthHandler {
         Ok(response.json::<DeviceCodeResponse>().await?)
     }
 
+    /// Starts the authentication process by getting a device code.
+    ///
+    /// If `headless_auth` is false, prints user-friendly instructions to console.
+    /// Always returns the device code info for the caller to display if needed.
     /// Start authentication - get device code
     /// If headless_auth is false, prints instructions to console
     /// Always returns device code info for caller to display
@@ -348,6 +394,7 @@ impl CopilotAuthHandler {
         Ok(device_code)
     }
 
+    /// Completes authentication by polling for access token and exchanging for Copilot token.
     /// Complete authentication - poll for access token and exchange for copilot token
     pub async fn complete_authentication(
         &self,
@@ -377,6 +424,10 @@ impl CopilotAuthHandler {
         Ok(copilot_config)
     }
 
+    /// Attempts silent authentication without user interaction.
+    ///
+    /// Checks cached tokens, environment variables, and stored access tokens.
+    /// Returns `None` if silent authentication is not possible.
     /// Try to get chat token silently (from cache or env, without triggering device flow)
     pub async fn try_get_chat_token_silent(&self) -> anyhow::Result<Option<String>> {
         let copilot_token_path = self.app_data_dir.join(".copilot_token.json");
@@ -415,6 +466,7 @@ impl CopilotAuthHandler {
         Ok(None)
     }
 
+    /// Polls GitHub for an access token after user completes device flow.
     pub(super) async fn get_access_token(
         &self,
         device_code: &DeviceCodeResponse,
@@ -493,6 +545,7 @@ impl CopilotAuthHandler {
         }
     }
 
+    /// Exchanges a GitHub access token for a Copilot API token.
     pub(super) async fn get_copilot_token(
         &self,
         access_token: AccessTokenResponse,

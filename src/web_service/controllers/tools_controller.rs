@@ -1,3 +1,33 @@
+//! Tool execution API controller.
+//!
+//! This module provides HTTP endpoints for directly executing agent tools
+//! without running the full agent loop. This is useful for testing tools
+//! or using Bamboo's built-in utilities standalone.
+//!
+//! # Endpoint
+//!
+//! `POST /api/v1/tools/execute`
+//!
+//! # Available Tools
+//!
+//! - **File Operations**: `read_file`, `write_file`, `list_directory`, `file_exists`, `get_file_info`
+//! - **Git Operations**: `git_status`, `git_diff`
+//! - **Command Execution**: `execute_command`
+//! - **Workspace**: `set_workspace`, `get_current_dir`
+//!
+//! # Example
+//!
+//! ```bash
+//! curl -X POST http://localhost:8080/api/v1/tools/execute \
+//!   -H "Content-Type: application/json" \
+//!   -d '{
+//!     "tool_name": "read_file",
+//!     "parameters": [
+//!       {"name": "path", "value": "/path/to/file.txt"}
+//!     ]
+//!   }'
+//! ```
+
 use actix_web::{post, web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,30 +38,107 @@ use crate::agent::tools::{normalize_tool_ref, BuiltinToolExecutor};
 
 use crate::web_service::error::AppError;
 
+/// Request payload for tool execution.
+///
+/// # Fields
+///
+/// * `tool_name` - Name of the tool to execute (e.g., "read_file", "execute_command")
+/// * `parameters` - List of tool parameters as key-value pairs
+///
+/// # Example
+///
+/// ```json
+/// {
+///   "tool_name": "read_file",
+///   "parameters": [
+///     {"name": "path", "value": "/path/to/file"}
+///   ]
+/// }
+/// ```
 #[derive(Deserialize)]
-struct ToolExecutionRequest {
-    tool_name: String,
-    parameters: Vec<ToolParameter>,
+pub struct ToolExecutionRequest {
+    /// Tool name to execute
+    pub tool_name: String,
+    /// Tool parameters as key-value pairs
+    pub parameters: Vec<ToolParameter>,
 }
 
+/// Single tool parameter.
 #[derive(Deserialize)]
-struct ToolParameter {
-    name: String,
-    value: String,
+pub struct ToolParameter {
+    /// Parameter name
+    pub name: String,
+    /// Parameter value (string, will be parsed as JSON if possible)
+    pub value: String,
 }
 
+/// Response wrapper for tool execution result.
 #[derive(Serialize)]
-struct ToolExecutionResponse {
-    result: String,
+pub struct ToolExecutionResponse {
+    /// JSON-encoded result payload
+    pub result: String,
 }
 
+/// Internal tool execution result payload.
 #[derive(Serialize)]
-struct ToolExecutionResultPayload {
-    tool_name: String,
-    result: String,
-    display_preference: String,
+pub struct ToolExecutionResultPayload {
+    /// Name of the executed tool
+    pub tool_name: String,
+    /// Tool execution result (usually JSON string)
+    pub result: String,
+    /// Display preference hint (always "Default")
+    pub display_preference: String,
 }
 
+/// Execute a tool directly without agent loop.
+///
+/// This endpoint allows direct execution of Bamboo's built-in tools
+/// for testing or standalone use cases.
+///
+/// # HTTP Method
+///
+/// `POST /api/v1/tools/execute`
+///
+/// # Request Body
+///
+/// JSON-encoded [`ToolExecutionRequest`]
+///
+/// # Response
+///
+/// - `200 OK` - Tool executed successfully, returns [`ToolExecutionResponse`]
+/// - `400 Bad Request` - Invalid request or parameters
+/// - `404 Not Found` - Tool not found
+/// - `500 Internal Server Error` - Tool execution failed
+///
+/// # Available Tools
+///
+/// - `read_file` - Read file contents
+/// - `write_file` - Write file contents
+/// - `execute_command` - Execute shell command
+/// - `list_directory` - List directory contents
+/// - `file_exists` - Check if file exists
+/// - `get_file_info` - Get file metadata
+/// - `git_status` - Get git repository status
+/// - `git_diff` - Get git diff
+/// - And more...
+///
+/// # Parameter Parsing
+///
+/// Parameters values are automatically parsed as JSON if possible.
+/// If parsing fails, they're treated as plain strings.
+///
+/// # Example
+///
+/// ```bash
+/// curl -X POST http://localhost:8080/api/v1/tools/execute \
+///   -H "Content-Type: application/json" \
+///   -d '{
+///     "tool_name": "read_file",
+///     "parameters": [
+///       {"name": "path", "value": "/path/to/file.txt"}
+///     ]
+///   }'
+/// ```
 #[post("/tools/execute")]
 pub async fn execute_tool(
     payload: web::Json<ToolExecutionRequest>,
@@ -73,6 +180,10 @@ pub async fn execute_tool(
     Ok(HttpResponse::Ok().json(response))
 }
 
+/// Configure tool execution routes.
+///
+/// This function registers the tool execution endpoint with the Actix-web
+/// service configuration.
 pub fn config(cfg: &mut web::ServiceConfig) {
     cfg.service(execute_tool);
 }

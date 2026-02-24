@@ -1,10 +1,79 @@
-// In: crates/copilot_client/src/api/models.rs
+//! LLM API request and response models.
+//!
+//! This module defines the data structures used to communicate with
+//! various LLM providers (OpenAI, Anthropic, etc.) following OpenAI's API format.
+//!
+//! # Key Types
+//!
+//! ## Request Types
+//! - [`ChatCompletionRequest`] - Main request structure
+//! - [`ChatMessage`] - Message in conversation
+//!
+//! ## Content Types
+//! - [`Role`] - Message role (system, user, assistant, tool)
+//! - [`Content`] - Message content (text or parts)
+//! - [`ContentPart`] - Content part (text or image)
+//!
+//! ## Tool Types
+//! - [`Tool`] - Tool definition
+//! - [`ToolChoice`] - Tool selection strategy
+//! - [`ToolCall`] - Tool invocation
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use bamboo_agent::agent::llm::models::*;
+//!
+//! let request = ChatCompletionRequest {
+//!     model: "gpt-4o-mini".to_string(),
+//!     messages: vec![
+//!         ChatMessage {
+//!             role: Role::User,
+//!             content: Content::Text("Hello".to_string()),
+//!             tool_calls: None,
+//!             tool_call_id: None,
+//!         }
+//!     ],
+//!     tools: None,
+//!     tool_choice: None,
+//!     stream: Some(true),
+//!     stream_options: Some(StreamOptions { include_usage: true }),
+//!     parameters: HashMap::new(),
+//! };
+//! ```
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // ========== Core Request Body ==========
 
+/// Chat completion request to LLM API.
+///
+/// Main request structure sent to LLM providers to generate
+/// chat completions with optional tool calling support.
+///
+/// # Fields
+///
+/// * `model` - Model identifier (e.g., "gpt-4o-mini", "claude-3-opus")
+/// * `messages` - Conversation history
+/// * `tools` - Available tools for the model
+/// * `tool_choice` - Tool selection strategy
+/// * `stream` - Whether to stream the response
+/// * `stream_options` - Streaming options
+/// * `parameters` - Additional model parameters (temperature, etc.)
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let request = ChatCompletionRequest {
+///     model: "gpt-4o-mini".to_string(),
+///     messages: vec![
+///         ChatMessage::user("What is Rust?"),
+///     ],
+///     stream: Some(true),
+///     ..Default::default()
+/// };
+/// ```
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ChatCompletionRequest {
     /// The model to use for the completion.
@@ -28,6 +97,11 @@ pub struct ChatCompletionRequest {
     pub parameters: HashMap<String, serde_json::Value>,
 }
 
+/// Options for streaming responses.
+///
+/// # Fields
+///
+/// * `include_usage` - Include token usage in final chunk
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct StreamOptions {
     /// If set to true, the streaming response will include a `usage` field in the final chunk.
@@ -36,6 +110,34 @@ pub struct StreamOptions {
 
 // ========== Message and Content Structures ==========
 
+/// A message in the conversation.
+///
+/// Represents one turn in the conversation with role and content.
+///
+/// # Fields
+///
+/// * `role` - Message author role
+/// * `content` - Message contents
+/// * `tool_calls` - Tool calls (for assistant messages)
+/// * `tool_call_id` - Tool call ID (for tool result messages)
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let user_msg = ChatMessage {
+///     role: Role::User,
+///     content: Content::Text("Hello".to_string()),
+///     tool_calls: None,
+///     tool_call_id: None,
+/// };
+///
+/// let tool_result = ChatMessage {
+///     role: Role::Tool,
+///     content: Content::Text("Result".to_string()),
+///     tool_calls: None,
+///     tool_call_id: Some("call-123".to_string()),
+/// };
+/// ```
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ChatMessage {
     /// The role of the message author.
@@ -50,15 +152,49 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
 }
 
+/// Role of a message author.
+///
+/// # Variants
+///
+/// * `System` - System instructions
+/// * `User` - User input
+/// * `Assistant` - AI response
+/// * `Tool` - Tool execution result
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    /// System instructions or prompts
     System,
+    /// User input message
     User,
+    /// AI assistant response
     Assistant,
+    /// Tool execution result
     Tool,
 }
 
+/// Message content.
+///
+/// Can be either plain text or a list of content parts
+/// (for multimodal messages with text and images).
+///
+/// # Variants
+///
+/// * `Text(String)` - Simple text content
+/// * `Parts(Vec<ContentPart>)` - Multiple content parts
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // Simple text
+/// let text = Content::Text("Hello".to_string());
+///
+/// // Multimodal
+/// let parts = Content::Parts(vec![
+///     ContentPart::Text { text: "What's in this image?".to_string() },
+///     ContentPart::ImageUrl { image_url: ImageUrl { url: "...".to_string(), detail: None } },
+/// ]);
+/// ```
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum Content {
@@ -68,13 +204,44 @@ pub enum Content {
     Parts(Vec<ContentPart>),
 }
 
+/// A part of message content.
+///
+/// For multimodal messages, content can be text or image URLs.
+///
+/// # Variants
+///
+/// * `Text` - Text content
+/// * `ImageUrl` - Image URL reference
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let text_part = ContentPart::Text {
+///     text: "Describe this image".to_string()
+/// };
+///
+/// let image_part = ContentPart::ImageUrl {
+///     image_url: ImageUrl {
+///         url: "https://example.com/image.png".to_string(),
+///         detail: Some("high".to_string()),
+///     }
+/// };
+/// ```
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
+    /// Text content part
     Text { text: String },
+    /// Image URL content part
     ImageUrl { image_url: ImageUrl },
 }
 
+/// Image URL reference.
+///
+/// # Fields
+///
+/// * `url` - Image URL or base64 data URI
+/// * `detail` - Detail level ("low", "high", "auto")
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ImageUrl {
     /// The URL of the image.
@@ -86,6 +253,32 @@ pub struct ImageUrl {
 
 // ========== Tool-Related Structures ==========
 
+/// Tool definition for LLM function calling.
+///
+/// Defines a tool that the model can call during generation.
+///
+/// # Fields
+///
+/// * `tool_type` - Tool type (always "function")
+/// * `function` - Function definition
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let tool = Tool {
+///     tool_type: "function".to_string(),
+///     function: FunctionDefinition {
+///         name: "read_file".to_string(),
+///         description: Some("Read file contents".to_string()),
+///         parameters: json!({
+///             "type": "object",
+///             "properties": {
+///                 "path": {"type": "string"}
+///             }
+///         }),
+///     },
+/// };
+/// ```
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Tool {
     #[serde(rename = "type")]
@@ -93,18 +286,56 @@ pub struct Tool {
     pub function: FunctionDefinition,
 }
 
+/// Function definition for tool schema.
+///
+/// # Fields
+///
+/// * `name` - Function name
+/// * `description` - Function description
+/// * `parameters` - JSON Schema for parameters
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct FunctionDefinition {
+    /// Function name
     pub name: String,
+    /// Function description for the model
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// JSON Schema for function parameters
     pub parameters: serde_json::Value, // JSON Schema
 }
 
+/// Tool selection strategy.
+///
+/// Controls which tool (if any) the model should call.
+///
+/// # Variants
+///
+/// * `String(String)` - "none", "auto", or "required"
+/// * `Object` - Specific function to call
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // No tools
+/// let none = ToolChoice::String("none".to_string());
+///
+/// // Automatic selection
+/// let auto = ToolChoice::String("auto".to_string());
+///
+/// // Force specific tool
+/// let specific = ToolChoice::Object {
+///     tool_type: "function".to_string(),
+///     function: FunctionChoice {
+///         name: "read_file".to_string(),
+///     },
+/// };
+/// ```
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum ToolChoice {
-    String(String), // e.g., "none", "auto"
+    /// Tool selection mode: "none", "auto", or "required"
+    String(String),
+    /// Force specific function call
     Object {
         #[serde(rename = "type")]
         tool_type: String, // "function"
@@ -112,28 +343,59 @@ pub enum ToolChoice {
     },
 }
 
+/// Specific function choice for tool_choice.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct FunctionChoice {
+    /// Function name to call
     pub name: String,
 }
 
+/// Tool call from the model.
+///
+/// Represents a tool invocation requested by the LLM.
+///
+/// # Fields
+///
+/// * `id` - Unique call identifier
+/// * `tool_type` - Tool type (always "function")
+/// * `function` - Function call details
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ToolCall {
+    /// Unique tool call identifier
     pub id: String,
     #[serde(rename = "type")]
     pub tool_type: String, // Always "function"
+    /// Function call details
     pub function: FunctionCall,
 }
 
+/// Function call details.
+///
+/// # Fields
+///
+/// * `name` - Function name
+/// * `arguments` - JSON-encoded arguments
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct FunctionCall {
+    /// Function name to invoke
     pub name: String,
+    /// JSON-encoded function arguments
     pub arguments: String, // JSON string
 }
 
 // ========== Response Structures ==========
 
-// For Block Responses
+/// Chat completion response from LLM API.
+///
+/// # Fields
+///
+/// * `id` - Response ID
+/// * `object` - Object type
+/// * `created` - Creation timestamp
+/// * `model` - Model used
+/// * `choices` - Completion choices
+/// * `usage` - Token usage statistics
+/// * `system_fingerprint` - System fingerprint
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ChatCompletionResponse {
     pub id: String,
@@ -151,6 +413,13 @@ pub struct ChatCompletionResponse {
     pub system_fingerprint: Option<String>,
 }
 
+/// A completion choice in the response.
+///
+/// # Fields
+///
+/// * `index` - Choice index
+/// * `message` - Completion message
+/// * `finish_reason` - Reason for finishing
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ResponseChoice {
     #[serde(default)]
@@ -160,17 +429,40 @@ pub struct ResponseChoice {
     pub finish_reason: Option<String>,
 }
 
+/// Token usage statistics.
+///
+/// # Fields
+///
+/// * `prompt_tokens` - Tokens in prompt
+/// * `completion_tokens` - Tokens in completion
+/// * `total_tokens` - Total tokens used
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Usage {
+    /// Tokens in the prompt
     #[serde(default)]
     pub prompt_tokens: u32,
+    /// Tokens in the completion
     #[serde(default)]
     pub completion_tokens: u32,
+    /// Total tokens used
     #[serde(default)]
     pub total_tokens: u32,
 }
 
 // For Stream Responses
+
+/// Streaming chat completion chunk.
+///
+/// Each chunk contains incremental updates during streaming.
+///
+/// # Fields
+///
+/// * `id` - Response ID
+/// * `object` - Object type
+/// * `created` - Creation timestamp
+/// * `model` - Model used
+/// * `choices` - Stream choices with deltas
+/// * `usage` - Usage statistics (final chunk only)
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ChatCompletionStreamChunk {
     pub id: String,
@@ -185,16 +477,38 @@ pub struct ChatCompletionStreamChunk {
     pub usage: Option<Usage>,
 }
 
+/// A choice in a streaming chunk.
+///
+/// # Fields
+///
+/// * `index` - Choice index
+/// * `delta` - Content delta
+/// * `finish_reason` - Reason for finishing (if complete)
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct StreamChoice {
+    /// Choice index
     pub index: u32,
+    /// Content delta
     pub delta: StreamDelta,
+    /// Reason for finishing
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
 }
 
 // Streaming-specific tool call structures
 // These allow partial data since the API sends tool calls incrementally across multiple chunks
+
+/// Streaming tool call fragment.
+///
+/// During streaming, tool calls are sent incrementally across multiple chunks.
+/// The `index` field identifies which tool call each fragment belongs to.
+///
+/// # Fields
+///
+/// * `index` - Tool call index for reassembly
+/// * `id` - Tool call ID (first chunk only)
+/// * `tool_type` - Tool type (first chunk only)
+/// * `function` - Function call fragment
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct StreamToolCall {
     /// Index to identify which tool call this fragment belongs to
@@ -211,6 +525,12 @@ pub struct StreamToolCall {
     pub function: Option<StreamFunctionCall>,
 }
 
+/// Streaming function call fragment.
+///
+/// # Fields
+///
+/// * `name` - Function name (first chunk only)
+/// * `arguments` - Arguments fragment (sent incrementally)
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct StreamFunctionCall {
     /// Function name (only present in the first chunk)
@@ -221,12 +541,24 @@ pub struct StreamFunctionCall {
     pub arguments: Option<String>,
 }
 
+/// Content delta in a streaming chunk.
+///
+/// Contains incremental content updates during streaming.
+///
+/// # Fields
+///
+/// * `role` - Message role (first chunk only)
+/// * `content` - Text content delta
+/// * `tool_calls` - Tool call fragments
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct StreamDelta {
+    /// Message role (only present in first chunk)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<Role>,
+    /// Text content delta
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Tool call fragments
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<StreamToolCall>>,
 }

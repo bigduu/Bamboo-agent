@@ -1,3 +1,43 @@
+//! Tool registry for managing and executing tools.
+//!
+//! This module provides a thread-safe registry for tool management,
+//! including registration, lookup, and execution of tools.
+//!
+//! # Key Types
+//!
+//! - [`Tool`] - Trait for implementing executable tools
+//! - [`ToolRegistry`] - Thread-safe tool registry
+//! - [`RegistryError`] - Registration errors
+//! - [`SharedTool`] - Reference-counted tool pointer
+//!
+//! # Usage
+//!
+//! ```rust,ignore
+//! use bamboo_agent::agent::core::tools::registry::*;
+//!
+//! // Create a registry
+//! let registry = ToolRegistry::new();
+//!
+//! // Register a tool
+//! registry.register(MyTool::new())?;
+//!
+//! // Get tool schema for LLM
+//! let schemas = registry.list_tools();
+//!
+//! // Execute a tool
+//! let tool = registry.get("my_tool").unwrap();
+//! let result = tool.execute(args).await?;
+//! ```
+//!
+//! # Global Registry
+//!
+//! For convenience, a global singleton registry is available:
+//!
+//! ```rust,ignore
+//! let registry = global_registry();
+//! registry.register(my_tool)?;
+//! ```
+
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -6,13 +46,70 @@ use thiserror::Error;
 
 use crate::agent::core::tools::{FunctionSchema, ToolError, ToolResult, ToolSchema};
 
+/// Trait for implementing executable tools.
+///
+/// All tools must implement this trait to be registered with the tool registry.
+///
+/// # Required Methods
+///
+/// - `name()` - Unique tool identifier
+/// - `description()` - Human-readable tool description
+/// - `parameters_schema()` - JSON Schema for tool parameters
+/// - `execute()` - Async tool execution logic
+///
+/// # Provided Methods
+///
+/// - `to_schema()` - Convert tool to LLM-compatible schema
+///
+/// # Example
+///
+/// ```rust,ignore
+/// struct ReadFileTool;
+///
+/// #[async_trait]
+/// impl Tool for ReadFileTool {
+///     fn name(&self) -> &str {
+///         "read_file"
+///     }
+///
+///     fn description(&self) -> &str {
+///         "Read file contents from disk"
+///     }
+///
+///     fn parameters_schema(&self) -> serde_json::Value {
+///         json!({
+///             "type": "object",
+///             "properties": {
+///                 "path": {"type": "string"}
+///             },
+///             "required": ["path"]
+///         })
+///     }
+///
+///     async fn execute(&self, args: Value) -> Result<ToolResult, ToolError> {
+///         let path = args["path"].as_str().unwrap();
+///         let content = tokio::fs::read_to_string(path).await?;
+///         Ok(ToolResult {
+///             success: true,
+///             result: content,
+///             display_preference: None,
+///         })
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
+    /// Human-readable tool description for LLM.
     fn description(&self) -> &str;
+    /// JSON Schema for tool parameters.
     fn parameters_schema(&self) -> serde_json::Value;
+    /// Execute the tool with given arguments.
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError>;
 
+    /// Convert tool to LLM-compatible schema.
+    ///
+    /// Creates a [`ToolSchema`] suitable for LLM function calling.
     fn to_schema(&self) -> ToolSchema {
         ToolSchema {
             schema_type: "function".to_string(),
@@ -25,17 +122,54 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// Reference-counted pointer to a tool.
 pub type SharedTool = Arc<dyn Tool>;
 
+/// Errors that can occur during tool registration.
+///
+/// # Variants
+///
+/// * `DuplicateTool` - Tool with same name already registered
+/// * `InvalidTool` - Tool validation failed (e.g., empty name)
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RegistryError {
+    /// Tool with same name already exists in registry.
     #[error("tool with name '{0}' already registered")]
     DuplicateTool(String),
 
+    /// Tool validation failed.
     #[error("invalid tool: {0}")]
     InvalidTool(String),
 }
 
+/// Thread-safe tool registry.
+///
+/// Manages a collection of tools with concurrent access support.
+/// Uses a `DashMap` for lock-free concurrent operations.
+///
+/// # Features
+///
+/// - Thread-safe registration and lookup
+/// - Tool schema generation for LLM
+/// - Global singleton registry support
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let registry = ToolRegistry::new();
+///
+/// // Register tools
+/// registry.register(ReadFileTool::new())?;
+/// registry.register(WriteFileTool::new())?;
+///
+/// // List all tool schemas
+/// let schemas = registry.list_tools();
+///
+/// // Get and execute a tool
+/// if let Some(tool) = registry.get("read_file") {
+///     let result = tool.execute(json!({"path": "test.txt"})).await?;
+/// }
+/// ```
 pub struct ToolRegistry {
     tools: DashMap<String, SharedTool>,
 }
@@ -47,12 +181,29 @@ impl Default for ToolRegistry {
 }
 
 impl ToolRegistry {
+    /// Create a new empty tool registry.
     pub fn new() -> Self {
         Self {
             tools: DashMap::new(),
         }
     }
 
+    /// Register a tool in the registry.
+    ///
+    /// # Arguments
+    ///
+    /// * `tool` - Tool to register
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::DuplicateTool`] if tool name already exists.
+    /// Returns [`RegistryError::InvalidTool`] if tool name is empty.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// registry.register(MyTool::new())?;
+    /// ```
     pub fn register<T>(&self, tool: T) -> Result<(), RegistryError>
     where
         T: Tool + 'static,
@@ -60,6 +211,15 @@ impl ToolRegistry {
         self.register_shared(Arc::new(tool))
     }
 
+    /// Register a shared tool reference.
+    ///
+    /// # Arguments
+    ///
+    /// * `tool` - Shared tool reference
+    ///
+    /// # Errors
+    ///
+    /// Same as [`register`](Self::register).
     pub fn register_shared(&self, tool: SharedTool) -> Result<(), RegistryError> {
         let name = tool.name().trim();
 
@@ -78,14 +238,27 @@ impl ToolRegistry {
         }
     }
 
+    /// Get a tool by name.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Tool name
+    ///
+    /// # Returns
+    ///
+    /// Shared tool reference if found, `None` otherwise.
     pub fn get(&self, name: &str) -> Option<SharedTool> {
         self.tools.get(name).map(|entry| Arc::clone(entry.value()))
     }
 
+    /// Check if a tool exists in the registry.
     pub fn contains(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
 
+    /// List all tool schemas.
+    ///
+    /// Returns schemas sorted alphabetically by tool name.
     pub fn list_tools(&self) -> Vec<ToolSchema> {
         let mut tools: Vec<ToolSchema> = self
             .tools
@@ -96,35 +269,74 @@ impl ToolRegistry {
         tools
     }
 
+    /// List all tool names.
+    ///
+    /// Returns names sorted alphabetically.
     pub fn list_tool_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.tools.iter().map(|entry| entry.key().clone()).collect();
         names.sort();
         names
     }
 
+    /// Remove a tool from the registry.
+    ///
+    /// # Returns
+    ///
+    /// `true` if tool was removed, `false` if not found.
     pub fn unregister(&self, name: &str) -> bool {
         self.tools.remove(name).is_some()
     }
 
+    /// Get the number of registered tools.
     pub fn len(&self) -> usize {
         self.tools.len()
     }
 
+    /// Check if registry is empty.
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
 
+    /// Remove all tools from the registry.
     pub fn clear(&self) {
         self.tools.clear();
     }
 }
 
+/// Global tool registry singleton.
 static GLOBAL_REGISTRY: OnceLock<ToolRegistry> = OnceLock::new();
 
+/// Get the global tool registry.
+///
+/// The global registry is a singleton that persists for the lifetime
+/// of the application. Useful for sharing tools across components.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let registry = global_registry();
+/// registry.register(my_tool)?;
+/// ```
 pub fn global_registry() -> &'static ToolRegistry {
     GLOBAL_REGISTRY.get_or_init(ToolRegistry::new)
 }
 
+/// Normalize a tool name by removing namespace prefix.
+///
+/// # Arguments
+///
+/// * `name` - Tool name (may include `::` namespace separator)
+///
+/// # Returns
+///
+/// Tool name after the last `::`, or the original name if no separator.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// assert_eq!(normalize_tool_name("bamboo::read_file"), "read_file");
+/// assert_eq!(normalize_tool_name("read_file"), "read_file");
+/// ```
 pub fn normalize_tool_name(name: &str) -> &str {
     name.split("::").last().unwrap_or(name)
 }

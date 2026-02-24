@@ -1,44 +1,153 @@
+//! Core agent types for sessions, messages, and conversations.
+//!
+//! This module defines the fundamental types used throughout the agent system
+//! for managing conversations, sessions, and message exchanges.
+//!
+//! # Key Types
+//!
+//! - [`Role`] - Message role (System, User, Assistant, Tool)
+//! - [`Message`] - A single message in a conversation
+//! - [`MessageContent`] - Message content (text or tool calls)
+//! - [`Session`] - A complete conversation session with state
+//! - [`PendingQuestion`] - User question waiting for response
+//! - [`ConversationSummary`] - Summary of truncated context
+//!
+//! # Session Lifecycle
+//!
+//! 1. Create session with `Session::new(id, model)`
+//! 2. Add messages with `session.add_message(Message::user("..."))`
+//! 3. Track progress with todo list
+//! 4. Persist to storage
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use bamboo_agent::agent::core::agent::types::*;
+//!
+//! let mut session = Session::new("session-1", "gpt-4o-mini");
+//! session.add_message(Message::user("Hello"));
+//! session.add_message(Message::assistant("Hi there!", None));
+//! ```
+
 use crate::agent::core::todo::{TodoItemStatus, TodoList};
 use crate::agent::core::tools::ToolCall;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Message role in a conversation.
+///
+/// Identifies the sender of a message in the conversation history.
+///
+/// # Variants
+///
+/// * `System` - System instructions/prompts
+/// * `User` - User input
+/// * `Assistant` - AI assistant response
+/// * `Tool` - Tool execution result
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let role = Role::User;
+/// assert_eq!(role, Role::User);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    /// System instructions or prompts
     System,
+    /// User input message
     User,
+    /// AI assistant response
     Assistant,
+    /// Tool execution result
     Tool,
 }
 
+/// Message content in a conversation.
+///
+/// Can be either plain text or a list of tool calls from the assistant.
+///
+/// # Variants
+///
+/// * `Text(String)` - Plain text content
+/// * `ToolCalls(Vec<ToolCall>)` - Tool call requests
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let text = MessageContent::Text("Hello".to_string());
+/// let tools = MessageContent::ToolCalls(vec![tool_call]);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum MessageContent {
+    /// Plain text content
     Text(String),
+    /// Tool call requests from assistant
     ToolCalls(Vec<ToolCall>),
 }
 
+/// A single message in a conversation.
+///
+/// Represents one turn in the conversation, including the role,
+/// content, optional tool calls, and metadata.
+///
+/// # Fields
+///
+/// * `id` - Unique message identifier
+/// * `role` - Message sender role
+/// * `content` - Message content text
+/// * `tool_calls` - Optional tool calls (for Assistant messages)
+/// * `tool_call_id` - Optional tool call ID (for Tool messages)
+/// * `created_at` - Message timestamp
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let user_msg = Message::user("What is Rust?");
+/// let assistant_msg = Message::assistant("Rust is a systems language", None);
+/// let tool_msg = Message::tool_result("call-123", "Tool result");
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    /// Unique message identifier (auto-generated)
     #[serde(default = "generate_id", skip_serializing_if = "String::is_empty")]
     pub id: String,
+    /// Message sender role
     pub role: Role,
+    /// Message content text
     pub content: String,
+    /// Tool calls (for Assistant messages)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Tool call ID (for Tool result messages)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Message creation timestamp
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
 }
 
+/// Generate a unique ID for messages.
 fn generate_id() -> String {
     Uuid::new_v4().to_string()
 }
 
 impl Message {
+    /// Create a user message.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - User message text
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let msg = Message::user("Hello, assistant!");
+    /// assert_eq!(msg.role, Role::User);
+    /// ```
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -50,6 +159,19 @@ impl Message {
         }
     }
 
+    /// Create an assistant message.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - Assistant response text
+    /// * `tool_calls` - Optional tool calls made by assistant
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let msg = Message::assistant("Hello!", None);
+    /// let msg_with_tools = Message::assistant("Let me help", Some(vec![tool_call]));
+    /// ```
     pub fn assistant(content: impl Into<String>, tool_calls: Option<Vec<ToolCall>>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -61,6 +183,19 @@ impl Message {
         }
     }
 
+    /// Create a tool result message.
+    ///
+    /// # Arguments
+    ///
+    /// * `tool_call_id` - ID of the tool call this is responding to
+    /// * `content` - Tool execution result
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let result = Message::tool_result("call-123", "File contents here");
+    /// assert_eq!(result.role, Role::Tool);
+    /// ```
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -72,6 +207,18 @@ impl Message {
         }
     }
 
+    /// Create a system message.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - System instructions/prompt
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let msg = Message::system("You are a helpful assistant");
+    /// assert_eq!(msg.role, Role::System);
+    /// ```
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -84,11 +231,37 @@ impl Message {
     }
 }
 
+/// A pending question waiting for user response.
+///
+/// When the agent calls the `ask_user` tool, it creates a pending question
+/// that blocks execution until the user responds via the API.
+///
+/// # Fields
+///
+/// * `tool_call_id` - ID of the tool call that asked the question
+/// * `question` - Question text to display to user
+/// * `options` - Predefined response options
+/// * `allow_custom` - Whether user can enter custom response
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let pending = PendingQuestion {
+///     tool_call_id: "call-123".to_string(),
+///     question: "Which language?".to_string(),
+///     options: vec!["Rust".to_string(), "Python".to_string()],
+///     allow_custom: false,
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingQuestion {
+    /// ID of the tool call that created this question
     pub tool_call_id: String,
+    /// Question to ask the user
     pub question: String,
+    /// Predefined response options
     pub options: Vec<String>,
+    /// Whether custom responses are allowed
     pub allow_custom: bool,
 }
 
@@ -96,6 +269,31 @@ pub struct PendingQuestion {
 ///
 /// When conversations are truncated due to token limits, a summary
 /// can preserve key information from earlier context.
+///
+/// # Fields
+///
+/// * `created_at` - When the summary was created
+/// * `updated_at` - When the summary was last updated
+/// * `content` - Summary text
+/// * `message_count` - Number of messages summarized
+/// * `token_count` - Token count of the summary
+///
+/// # Usage
+///
+/// Summaries are created when the conversation exceeds token budget:
+/// 1. Old messages are summarized by the LLM
+/// 2. Summary replaces old messages
+/// 3. New messages continue the conversation
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let summary = ConversationSummary::new(
+///     "User discussed Rust programming",
+///     10,
+///     50
+/// );
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationSummary {
     /// When the summary was created
@@ -112,6 +310,22 @@ pub struct ConversationSummary {
 
 impl ConversationSummary {
     /// Create a new conversation summary.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - Summary text
+    /// * `message_count` - Number of messages being summarized
+    /// * `token_count` - Token count of the summary
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let summary = ConversationSummary::new(
+    ///     "Discussion about Rust async programming",
+    ///     15,
+    ///     75
+    /// );
+    /// ```
     pub fn new(content: impl Into<String>, message_count: usize, token_count: u32) -> Self {
         let now = Utc::now();
         Self {
@@ -124,6 +338,12 @@ impl ConversationSummary {
     }
 
     /// Update the summary with new content.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - New summary text
+    /// * `message_count` - Updated message count
+    /// * `token_count` - Updated token count
     pub fn update(&mut self, content: impl Into<String>, message_count: usize, token_count: u32) {
         self.content = content.into();
         self.message_count = message_count;
@@ -132,11 +352,55 @@ impl ConversationSummary {
     }
 }
 
+/// A complete conversation session with state management.
+///
+/// Represents a full conversation session including message history,
+/// todo list, pending questions, and session metadata.
+///
+/// # Fields
+///
+/// * `id` - Unique session identifier
+/// * `messages` - Conversation message history
+/// * `created_at` - Session creation timestamp
+/// * `updated_at` - Last update timestamp
+/// * `todo_list` - Optional task tracking list
+/// * `pending_question` - Question waiting for user response
+/// * `model` - LLM model name for this session
+/// * `metadata` - Extensible key-value metadata
+/// * `token_budget` - Token budget configuration
+/// * `token_usage` - Last token usage information
+/// * `conversation_summary` - Summary of truncated context
+///
+/// # Lifecycle
+///
+/// 1. Create: `Session::new("session-id", "gpt-4o-mini")`
+/// 2. Add messages: `session.add_message(Message::user("Hello"))`
+/// 3. Track tasks: `session.set_todo_list(todo_list)`
+/// 4. Ask questions: `session.set_pending_question(...)`
+/// 5. Persist to storage
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let mut session = Session::new("session-1", "gpt-4o-mini");
+/// session.add_message(Message::user("Help me with Rust"));
+/// session.add_message(Message::assistant("I'd be happy to help!", None));
+///
+/// // Track progress
+/// session.set_todo_list(todo_list);
+///
+/// // Save
+/// storage.save_session(&session).await?;
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    /// Unique session identifier
     pub id: String,
+    /// Conversation message history
     pub messages: Vec<Message>,
+    /// Session creation timestamp
     pub created_at: DateTime<Utc>,
+    /// Last update timestamp
     pub updated_at: DateTime<Utc>,
     /// Optional todo list for task tracking
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -162,6 +426,20 @@ pub struct Session {
 }
 
 impl Session {
+    /// Create a new session.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Unique session identifier
+    /// * `model` - LLM model name (e.g., "gpt-4o-mini")
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let session = Session::new("session-123", "gpt-4o-mini");
+    /// assert_eq!(session.id, "session-123");
+    /// assert_eq!(session.model, "gpt-4o-mini");
+    /// ```
     pub fn new(id: impl Into<String>, model: impl Into<String>) -> Self {
         let now = Utc::now();
         Self {
@@ -179,18 +457,48 @@ impl Session {
         }
     }
 
+    /// Add a message to the conversation.
+    ///
+    /// Updates the session's `updated_at` timestamp.
+    ///
+    /// # Arguments
+    ///
+    /// * `message` - Message to add
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// session.add_message(Message::user("Hello"));
+    /// assert_eq!(session.messages.len(), 1);
+    /// ```
     pub fn add_message(&mut self, message: Message) {
         self.messages.push(message);
         self.updated_at = Utc::now();
     }
 
     /// Set the todo list for this session
+    /// Set the todo list for this session.
+    ///
+    /// # Arguments
+    ///
+    /// * `todo_list` - Todo list to set
     pub fn set_todo_list(&mut self, todo_list: TodoList) {
         self.todo_list = Some(todo_list);
         self.updated_at = Utc::now();
     }
 
     /// Update a todo item status
+    /// Update a todo item status.
+    ///
+    /// # Arguments
+    ///
+    /// * `item_id` - ID of the todo item to update
+    /// * `status` - New status
+    /// * `notes` - Optional notes to append
+    ///
+    /// # Returns
+    ///
+    /// Success message or error string
     pub fn update_todo_item(
         &mut self,
         item_id: &str,
@@ -218,6 +526,10 @@ impl Session {
     }
 
     /// Format todo list for display in system prompt
+    /// Format todo list for display in system prompt.
+    ///
+    /// Returns a formatted string of the todo list suitable
+    /// for inclusion in the LLM system prompt.
     pub fn format_todo_list_for_prompt(&self) -> String {
         self.todo_list
             .as_ref()
@@ -225,6 +537,17 @@ impl Session {
     }
 
     /// Set a pending question when waiting for user response
+    /// Set a pending question when waiting for user response.
+    ///
+    /// Called when the agent uses the `ask_user` tool to request
+    /// user input before continuing execution.
+    ///
+    /// # Arguments
+    ///
+    /// * `tool_call_id` - ID of the tool call
+    /// * `question` - Question to ask
+    /// * `options` - Predefined response options
+    /// * `allow_custom` - Whether custom responses allowed
     pub fn set_pending_question(
         &mut self,
         tool_call_id: String,
@@ -242,12 +565,21 @@ impl Session {
     }
 
     /// Clear the pending question after receiving user response
+    /// Clear the pending question after receiving user response.
+    ///
+    /// Removes the pending question once the user has submitted
+    /// their response via the API.
     pub fn clear_pending_question(&mut self) {
         self.pending_question = None;
         self.updated_at = Utc::now();
     }
 
     /// Check if there's a pending question waiting for response
+    /// Check if there's a pending question waiting for response.
+    ///
+    /// # Returns
+    ///
+    /// `true` if a pending question exists
     pub fn has_pending_question(&self) -> bool {
         self.pending_question.is_some()
     }

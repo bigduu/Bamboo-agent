@@ -8,6 +8,11 @@ use tokio::fs;
 pub struct WriteFileTool;
 
 impl WriteFileTool {
+    /// Create a new WriteFileTool instance.
+    ///
+    /// This tool writes content to a file, creating the file and any necessary
+    /// parent directories if they don't exist. Overwrites existing files.
+    /// Includes security checks to prevent path traversal attacks.
     pub fn new() -> Self {
         Self
     }

@@ -7,6 +7,11 @@ use tokio::fs;
 pub struct ReadFileRangeTool;
 
 impl ReadFileRangeTool {
+    /// Create a new ReadFileRangeTool instance.
+    ///
+    /// This tool reads a specific line range from a file (1-based line numbers).
+    /// Useful for examining large files without loading them completely.
+    /// If end_line is omitted, reads from start_line to the end of file.
     pub fn new() -> Self {
         Self
     }

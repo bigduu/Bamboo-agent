@@ -7,6 +7,11 @@ use serde_json::json;
 pub struct UpdateTodoItemTool;
 
 impl UpdateTodoItemTool {
+    /// Create a new UpdateTodoItemTool instance.
+    ///
+    /// This tool updates the status of a specific task in a todo list.
+    /// Supports status transitions: pending -> in_progress -> completed (or blocked).
+    /// Can optionally append notes to provide context for status changes.
     pub fn new() -> Self {
         Self
     }

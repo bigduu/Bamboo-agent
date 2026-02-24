@@ -1,3 +1,8 @@
+//! Agent execution API handler.
+//!
+//! This module provides the HTTP endpoint for triggering AI agent execution
+//! on a previously created chat session.
+
 use actix_web::{web, HttpResponse, Responder};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -8,19 +13,101 @@ use crate::agent::core::agent::Role;
 use crate::agent::loop_module::{run_agent_loop_with_config, AgentLoopConfig};
 use crate::agent::server::state::{AgentRunner, AgentStatus, AppState};
 
+/// Response returned after triggering agent execution.
+///
+/// # Fields
+///
+/// * `session_id` - The session identifier
+/// * `status` - Execution status ("started", "completed", "already_running")
+/// * `events_url` - URL endpoint to subscribe to agent events (SSE)
 #[derive(Serialize)]
 pub struct ExecuteResponse {
+    /// Session identifier for tracking this execution
     pub session_id: String,
+    /// Current execution status
     pub status: String,
+    /// SSE endpoint URL for receiving real-time events
     pub events_url: String,
 }
 
+/// Request payload for agent execution.
+///
+/// # Fields
+///
+/// * `model` - Required model identifier for execution
+///
+/// # Note
+///
+/// The `model` parameter is **required** and must be provided in every request.
+/// It is not read from the session. This ensures explicit model selection
+/// for each execution.
+///
+/// # Examples
+///
+/// ```json
+/// {
+///   "model": "claude-3-opus"
+/// }
+/// ```
 #[derive(Deserialize)]
 pub struct ExecuteRequest {
     /// Model to use for execution (required)
     pub model: String,
 }
 
+/// Execute the AI agent on a chat session.
+///
+/// This endpoint triggers the agent loop to process pending messages
+/// in the session. Use this after creating a chat message with `POST /api/v1/chat`.
+///
+/// # HTTP Method
+///
+/// `POST /api/v1/execute/{session_id}`
+///
+/// # Path Parameters
+///
+/// - `session_id` - The session identifier returned from `/api/v1/chat`
+///
+/// # Request Body
+///
+/// JSON-encoded [`ExecuteRequest`] containing the required `model` field
+///
+/// # Response
+///
+/// - `202 Accepted` - Agent execution started successfully, returns [`ExecuteResponse`]
+/// - `400 Bad Request` - Missing or empty `model` parameter
+/// - `404 Not Found` - Session does not exist
+/// - `500 Internal Server Error` - Failed to load session
+///
+/// # Execution Flow
+///
+/// 1. Validates the `model` parameter is provided
+/// 2. Loads the session from memory or storage
+/// 3. Checks for pending user messages
+/// 4. Returns `completed` if no pending messages
+/// 5. Checks if agent is already running (returns `already_running`)
+/// 6. Spawns agent loop in background thread
+/// 7. Returns immediately with events URL
+///
+/// # Event Subscription
+///
+/// After starting execution, subscribe to events using:
+/// ```
+/// GET /api/v1/events/{session_id}
+/// ```
+///
+/// # Concurrency
+///
+/// This endpoint is safe to call multiple times. If the agent is already
+/// running for the session, it returns status `already_running`.
+///
+/// # Example
+///
+/// ```bash
+/// curl -X POST http://localhost:8080/api/v1/execute/session-123 \
+///   -H "Content-Type: application/json" \
+///   -d '{"model": "gpt-4o-mini"}'
+/// ```
 pub async fn handler(
     state: web::Data<AppState>,
     path: web::Path<String>,

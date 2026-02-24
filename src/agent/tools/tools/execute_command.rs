@@ -22,6 +22,13 @@ pub struct CommandResult {
 }
 
 impl ExecuteCommandTool {
+    /// Create a new ExecuteCommandTool instance.
+    ///
+    /// This tool executes system commands with security controls:
+    /// - Blocks dangerous commands (rm -rf /, dd, etc.)
+    /// - Supports both direct execution and shell execution
+    /// - Includes timeout protection (30 seconds default)
+    /// - Cross-platform support (sh on Unix, cmd on Windows)
     pub fn new() -> Self {
         Self
     }

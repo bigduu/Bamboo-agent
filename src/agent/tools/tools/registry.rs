@@ -1,3 +1,5 @@
+//! Tool registry with guide support for enhanced prompting.
+
 use std::sync::Arc;
 
 use crate::agent::core::tools::{
@@ -8,7 +10,30 @@ use dashmap::DashMap;
 
 use crate::agent::tools::guide::{ToolGuide, ToolGuideSpec};
 
-/// Tool registry with guide support for enhanced prompting
+/// Tool registry with guide support for enhanced prompting.
+///
+/// This registry extends the core ToolRegistry with support for tool guides,
+/// which provide enhanced documentation and usage examples for LLM prompting.
+///
+/// # Features
+///
+/// - Register tools with or without guides
+/// - Load guides from JSON or YAML specifications
+/// - Query tools and their associated guides
+/// - Thread-safe concurrent access
+///
+/// # Example
+///
+/// ```no_run
+/// use bamboo_agent::tools::{ToolRegistry, ReadFileTool};
+///
+/// let registry = ToolRegistry::new();
+/// registry.register(ReadFileTool::new()).unwrap();
+///
+/// // Later, add a guide
+/// let guide_spec = r#"{...}"#;
+/// registry.register_guide_from_json("read_file", guide_spec).unwrap();
+/// ```
 pub struct ToolRegistry {
     tools: crate::agent::core::tools::ToolRegistry,
     guides: DashMap<String, Arc<dyn ToolGuide>>,
@@ -21,6 +46,11 @@ impl Default for ToolRegistry {
 }
 
 impl ToolRegistry {
+    /// Create a new empty ToolRegistry instance.
+    ///
+    /// The registry starts with no tools or guides registered.
+    /// Use [`register`](Self::register) or [`register_with_guide`](Self::register_with_guide)
+    /// to add tools.
     pub fn new() -> Self {
         Self {
             tools: crate::agent::core::tools::ToolRegistry::new(),

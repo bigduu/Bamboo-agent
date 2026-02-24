@@ -7,6 +7,16 @@ use tokio::process::Command;
 pub struct GitStatusTool;
 
 impl GitStatusTool {
+    /// Create a new GitStatusTool instance.
+    ///
+    /// This tool checks git repository status showing:
+    /// - Current branch
+    /// - Staged files
+    /// - Modified files
+    /// - Untracked files
+    /// - Deleted files
+    ///
+    /// Provides both detailed and summary views of repository state.
     pub fn new() -> Self {
         Self
     }

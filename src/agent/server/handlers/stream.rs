@@ -1,3 +1,9 @@
+//! Legacy SSE stream handler (DEPRECATED).
+//!
+//! This module provides a deprecated endpoint that combines execution
+//! and event streaming in a single request. Use the new execute + events
+//! endpoints instead.
+
 use actix_web::http::header;
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use chrono::Utc;
@@ -7,8 +13,55 @@ use tokio::sync::mpsc;
 use crate::agent::loop_module::{run_agent_loop_with_config, AgentLoopConfig};
 use crate::agent::server::state::{AgentRunner, AgentStatus, AppState};
 
-/// DEPRECATED: Use POST /execute + GET /events instead
-/// This handler maintains backward compatibility by combining execute + events
+/// Legacy SSE streaming endpoint (DEPRECATED).
+///
+/// **This endpoint is deprecated.** Use the new two-step process instead:
+/// 1. `POST /api/v1/execute/{session_id}` to start execution
+/// 2. `GET /api/v1/events/{session_id}` to subscribe to events
+///
+/// # HTTP Method
+///
+/// `GET /api/v1/stream/{session_id}`
+///
+/// # Deprecation Notice
+///
+/// This endpoint is maintained for backward compatibility only.
+/// It combines execution and event streaming in a single request,
+/// which can lead to timeout issues and doesn't support reconnection.
+///
+/// # Migration Guide
+///
+/// Old (deprecated):
+/// ```javascript
+/// const eventSource = new EventSource('/api/v1/stream/session-123');
+/// ```
+///
+/// New (recommended):
+/// ```javascript
+/// // Step 1: Start execution
+/// await fetch('/api/v1/execute/session-123', {
+///   method: 'POST',
+///   headers: { 'Content-Type': 'application/json' },
+///   body: JSON.stringify({ model: 'gpt-4o-mini' })
+/// });
+///
+/// // Step 2: Subscribe to events
+/// const eventSource = new EventSource('/api/v1/events/session-123');
+/// ```
+///
+/// # Path Parameters
+///
+/// - `session_id` - The session identifier
+///
+/// # Response
+///
+/// - `200 OK` - SSE stream
+/// - `404 Not Found` - Session does not exist
+/// - `500 Internal Server Error` - Failed to load session
+#[deprecated(
+    since = "0.2.0",
+    note = "Use POST /execute + GET /events instead for better reliability"
+)]
 pub async fn handler(
     state: web::Data<AppState>,
     path: web::Path<String>,
