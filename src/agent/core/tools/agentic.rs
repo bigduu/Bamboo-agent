@@ -88,12 +88,34 @@ impl ToolGoal {
         }
     }
 
+    /// Set custom maximum iteration count.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_iterations` - Maximum iterations allowed
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let goal = ToolGoal::new("Complex task", params)
+    ///     .with_max_iterations(50);
+    /// ```
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
         self
     }
 }
 
+/// Role of an interaction participant.
+///
+/// Identifies who generated an interaction in the agentic loop.
+///
+/// # Variants
+///
+/// * `User` - Human user input
+/// * `Assistant` - AI assistant response
+/// * `Tool` - Tool execution result
+/// * `System` - System message
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum InteractionRole {
@@ -103,6 +125,32 @@ pub enum InteractionRole {
     System,
 }
 
+/// Represents a single interaction in the agentic execution loop.
+///
+/// Records exchanges between user, assistant, and tools during
+/// autonomous agent execution.
+///
+/// # Variants
+///
+/// * `User` - User message with timestamp
+/// * `Assistant` - Assistant response with optional metadata
+/// * `ToolAction` - Tool call initiated
+/// * `ToolObservation` - Tool execution result
+/// * `System` - System message
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let user_msg = Interaction::User {
+///     message: "Fix the bug".to_string(),
+///     timestamp: Utc::now(),
+/// };
+///
+/// let tool_action = Interaction::ToolAction {
+///     call: tool_call,
+///     timestamp: Utc::now(),
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Interaction {
@@ -162,14 +210,63 @@ impl Interaction {
     }
 }
 
+/// Execution context for agentic tools.
+///
+/// Maintains state, interaction history, and tool executor reference
+/// for autonomous agent execution loops.
+///
+/// # Fields
+///
+/// * `state` - Shared mutable state for cross-iteration persistence
+/// * `interaction_history` - Record of all interactions
+/// * `base_executor` - Tool executor for running tools
+///
+/// # Thread Safety
+///
+/// The `state` field uses `Arc<RwLock<Value>>` for thread-safe
+/// concurrent access from multiple async tasks.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let executor = Arc::new(BuiltinToolExecutor::new());
+/// let context = AgenticContext::new(executor);
+///
+/// // Record interactions
+/// context.record_interaction(InteractionRole::User, "Hello");
+///
+/// // Update state
+/// context.update_state(json!({"step": 1})).await;
+///
+/// // Check iterations
+/// if !context.increment_iteration(10) {
+///     // Continue execution
+/// }
+/// ```
 pub struct AgenticContext {
+    /// Shared mutable state (thread-safe)
     pub state: Arc<RwLock<Value>>,
+    /// History of all interactions
     pub interaction_history: Vec<Interaction>,
+    /// Tool executor reference
     pub base_executor: Arc<dyn ToolExecutor>,
+    /// Current iteration count
     iteration_count: usize,
 }
 
 impl AgenticContext {
+    /// Create a new agentic context with empty state.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_executor` - Tool executor for running tools
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let executor = Arc::new(MyExecutor::new());
+    /// let context = AgenticContext::new(executor);
+    /// ```
     pub fn new(base_executor: Arc<dyn ToolExecutor>) -> Self {
         Self {
             state: Arc::new(RwLock::new(serde_json::json!({}))),
@@ -179,6 +276,19 @@ impl AgenticContext {
         }
     }
 
+    /// Create context with custom initial state.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_executor` - Tool executor
+    /// * `initial_state` - Initial state value
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let state = json!({"files": ["main.rs"]});
+    /// let context = AgenticContext::with_state(executor, state);
+    /// ```
     pub fn with_state(base_executor: Arc<dyn ToolExecutor>, initial_state: Value) -> Self {
         Self {
             state: Arc::new(RwLock::new(initial_state)),
@@ -188,11 +298,24 @@ impl AgenticContext {
         }
     }
 
+    /// Record a simple interaction without metadata.
+    ///
+    /// # Arguments
+    ///
+    /// * `role` - Role of the interaction source
+    /// * `content` - Interaction content
     pub fn record_interaction(&mut self, role: InteractionRole, content: impl Into<String>) {
         self.interaction_history
             .push(Interaction::from_role(role, content, None));
     }
 
+    /// Record an interaction with metadata.
+    ///
+    /// # Arguments
+    ///
+    /// * `role` - Role of the interaction source
+    /// * `content` - Interaction content
+    /// * `metadata` - Additional metadata
     pub fn record_interaction_with_metadata(
         &mut self,
         role: InteractionRole,
@@ -203,6 +326,11 @@ impl AgenticContext {
             .push(Interaction::from_role(role, content, Some(metadata)));
     }
 
+    /// Record a tool call action.
+    ///
+    /// # Arguments
+    ///
+    /// * `call` - Tool call to record
     pub fn record_tool_action(&mut self, call: ToolCall) {
         self.interaction_history.push(Interaction::ToolAction {
             call,
@@ -210,6 +338,12 @@ impl AgenticContext {
         });
     }
 
+    /// Record a tool execution result.
+    ///
+    /// # Arguments
+    ///
+    /// * `tool_name` - Name of the tool
+    /// * `output` - Tool execution output
     pub fn record_tool_observation(
         &mut self,
         tool_name: impl Into<String>,
@@ -222,32 +356,62 @@ impl AgenticContext {
         });
     }
 
+    /// Increment iteration count and check limit.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_iterations` - Maximum allowed iterations
+    ///
+    /// # Returns
+    ///
+    /// `true` if limit exceeded, `false` if within limit
     pub fn increment_iteration(&mut self, max_iterations: usize) -> bool {
         self.iteration_count += 1;
         self.iteration_count > max_iterations
     }
 
+    /// Get current iteration count.
     pub fn iteration_count(&self) -> usize {
         self.iteration_count
     }
 
+    /// Check if this is the first iteration.
     pub fn is_first_iteration(&self) -> bool {
         self.iteration_count == 0
     }
 
+    /// Read shared state asynchronously.
+    ///
+    /// Returns a read guard that releases when dropped.
     pub async fn read_state(&self) -> tokio::sync::RwLockReadGuard<'_, Value> {
         self.state.read().await
     }
 
+    /// Write shared state asynchronously.
+    ///
+    /// Returns a write guard that releases when dropped.
     pub async fn write_state(&self) -> tokio::sync::RwLockWriteGuard<'_, Value> {
         self.state.write().await
     }
 
+    /// Replace state with a new value.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_state` - New state value
     pub async fn update_state(&self, new_state: Value) {
         let mut state = self.state.write().await;
         *state = new_state;
     }
 
+    /// Merge partial state into existing state.
+    ///
+    /// Only updates keys that exist in the partial value.
+    /// Requires both existing and partial states to be JSON objects.
+    ///
+    /// # Arguments
+    ///
+    /// * `partial` - Partial state to merge
     pub async fn merge_state(&self, partial: Value) {
         let mut state = self.state.write().await;
         if let Value::Object(ref mut existing) = *state {
@@ -260,11 +424,53 @@ impl AgenticContext {
     }
 }
 
+/// Trait for executing tool calls in agentic context.
+///
+/// Implement this trait to provide custom tool execution logic
+/// for agentic tools.
+///
+/// # Required Methods
+///
+/// - `execute` - Execute a tool call
+///
+/// # Example
+///
+/// ```rust,ignore
+/// struct MyExecutor;
+///
+/// #[async_trait]
+/// impl ToolExecutor for MyExecutor {
+///     async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+///         // Execute tool and return result
+///         Ok(ToolResult::success("Done"))
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
+    /// Execute a tool call.
     async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError>;
 }
 
+/// Result from agentic tool execution.
+///
+/// Indicates the outcome of an agentic tool's execution step.
+///
+/// # Variants
+///
+/// * `Success` - Task completed successfully
+/// * `Error` - Execution failed
+/// * `NeedClarification` - Need user input
+/// * `NeedMoreActions` - More tool calls needed
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let result = ToolResult::success("Task completed");
+/// let error = ToolResult::error("Failed to execute");
+/// let clarify = ToolResult::need_clarification("Which file?");
+/// let more = ToolResult::need_more_actions(vec![tool_call], "Need to read file");
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ToolResult {
@@ -279,26 +485,32 @@ pub enum ToolResult {
         options: Option<Vec<String>>,
     },
     NeedMoreActions {
+        /// Tool calls to execute
         actions: Vec<ToolCall>,
+        /// Reason for needing more actions
         reason: String,
     },
 }
 
+/// Type alias for agentic tool results.
 pub type AgenticToolResult = ToolResult;
 
 impl ToolResult {
+    /// Create a success result.
     pub fn success(result: impl Into<String>) -> Self {
         Self::Success {
             result: result.into(),
         }
     }
 
+    /// Create an error result.
     pub fn error(error: impl Into<String>) -> Self {
         Self::Error {
             error: error.into(),
         }
     }
 
+    /// Create a clarification request without options.
     pub fn need_clarification(question: impl Into<String>) -> Self {
         Self::NeedClarification {
             question: question.into(),
@@ -306,6 +518,7 @@ impl ToolResult {
         }
     }
 
+    /// Create a clarification request with predefined options.
     pub fn need_clarification_with_options(
         question: impl Into<String>,
         options: Vec<String>,
@@ -316,6 +529,7 @@ impl ToolResult {
         }
     }
 
+    /// Request more tool executions.
     pub fn need_more_actions(actions: Vec<ToolCall>, reason: impl Into<String>) -> Self {
         Self::NeedMoreActions {
             actions,
@@ -323,14 +537,17 @@ impl ToolResult {
         }
     }
 
+    /// Check if result is successful.
     pub fn is_success(&self) -> bool {
         matches!(self, Self::Success { .. })
     }
 
+    /// Check if result is an error.
     pub fn is_error(&self) -> bool {
         matches!(self, Self::Error { .. })
     }
 
+    /// Check if clarification is needed.
     pub fn needs_clarification(&self) -> bool {
         matches!(self, Self::NeedClarification { .. })
     }
