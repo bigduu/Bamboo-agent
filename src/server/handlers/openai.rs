@@ -6,7 +6,7 @@ use crate::agent::server::state::AppState as AgentAppState;
 use crate::server::{
     error::AppError, model_config_helper::get_default_model_from_config, app_state::AppState,
 };
-use actix_web::{get, post, web, HttpResponse};
+use actix_web::{web, HttpResponse};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -112,7 +112,6 @@ fn has_valid_auth(app_data_dir: &Path) -> bool {
     }
 }
 
-#[get("/models")]
 pub async fn get_models(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     // Check if we have valid authentication before triggering any auth flow
     if !has_valid_auth(&app_state.app_data_dir) {
@@ -297,7 +296,6 @@ fn build_completion_response(
     }
 }
 
-#[post("/chat/completions")]
 pub async fn chat_completions(
     app_state: web::Data<AppState>,
     _agent_state: web::Data<AgentAppState>,
@@ -445,5 +443,6 @@ pub async fn chat_completions(
 }
 
 pub fn config(cfg: &mut web::ServiceConfig) {
-    cfg.service(get_models).service(chat_completions);
+    cfg.route("/models", web::get().to(get_models))
+        .route("/chat/completions", web::post().to(chat_completions));
 }

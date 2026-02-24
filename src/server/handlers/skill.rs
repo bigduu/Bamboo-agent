@@ -1,7 +1,7 @@
 use crate::agent::server::state::AppState as AgentAppState;
 use crate::agent::skill::{SkillDefinition, SkillFilter};
 use crate::agent::tools::BuiltinToolExecutor;
-use actix_web::{get, web, HttpResponse};
+use actix_web::{web, HttpResponse};
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,11 +11,20 @@ use crate::server::app_state::AppState;
 
 /// Configure skill routes
 pub fn config(cfg: &mut web::ServiceConfig) {
-    cfg.service(list_skills)
-        .service(get_skill)
-        .service(get_available_tools)
-        .service(get_filtered_tools)
-        .service(get_available_workflows);
+    cfg.route("/skills", web::get().to(list_skills))
+        .route("/skills/{id}", web::get().to(get_skill))
+        .route(
+            "/skills/available-tools",
+            web::get().to(get_available_tools),
+        )
+        .route(
+            "/skills/filtered-tools",
+            web::get().to(get_filtered_tools),
+        )
+        .route(
+            "/skills/available-workflows",
+            web::get().to(get_available_workflows),
+        );
 }
 
 #[derive(Serialize)]
@@ -25,7 +34,7 @@ struct SkillListResponse {
 }
 
 #[derive(Deserialize)]
-struct ListSkillsQuery {
+pub struct ListSkillsQuery {
     category: Option<String>,
     search: Option<String>,
     refresh: Option<bool>,
@@ -61,7 +70,6 @@ struct AvailableWorkflowsResponse {
 }
 
 /// GET /skills - List all skills
-#[get("/skills")]
 pub async fn list_skills(
     agent_state: web::Data<AgentAppState>,
     query: web::Query<ListSkillsQuery>,
@@ -89,7 +97,6 @@ pub async fn list_skills(
 }
 
 /// GET /skills/{id} - Get skill detail
-#[get("/skills/{id}")]
 pub async fn get_skill(
     agent_state: web::Data<AgentAppState>,
     path: web::Path<String>,
@@ -107,7 +114,6 @@ pub async fn get_skill(
 }
 
 /// GET /skills/available-tools - Get available built-in tools
-#[get("/skills/available-tools")]
 pub async fn get_available_tools(
     _agent_state: web::Data<AgentAppState>,
 ) -> Result<HttpResponse, AppError> {
@@ -120,12 +126,11 @@ pub async fn get_available_tools(
 }
 
 #[derive(Deserialize)]
-struct FilteredToolsQuery {
+pub struct FilteredToolsQuery {
     chat_id: Option<String>,
 }
 
 /// GET /skills/filtered-tools - Get tools filtered by enabled skills
-#[get("/skills/filtered-tools")]
 pub async fn get_filtered_tools(
     agent_state: web::Data<AgentAppState>,
     query: web::Query<FilteredToolsQuery>,
@@ -180,7 +185,6 @@ pub async fn get_filtered_tools(
 }
 
 /// GET /skills/available-workflows - Get available workflows
-#[get("/skills/available-workflows")]
 pub async fn get_available_workflows(
     app_state: web::Data<AppState>,
     _agent_state: web::Data<AgentAppState>,

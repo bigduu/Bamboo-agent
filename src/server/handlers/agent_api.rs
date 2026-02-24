@@ -1,5 +1,5 @@
 use crate::server::error::AppError;
-use actix_web::{get, post, web, HttpResponse};
+use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -80,7 +80,6 @@ fn get_claude_dir() -> Result<PathBuf, AppError> {
 // Endpoints
 
 /// GET /agent/projects - List all projects
-#[get("/projects")]
 pub async fn list_projects() -> Result<HttpResponse, AppError> {
     let claude_dir = get_claude_dir()?;
     let mut projects = Vec::new();
@@ -134,7 +133,6 @@ pub async fn list_projects() -> Result<HttpResponse, AppError> {
 }
 
 /// POST /agent/projects - Create a new project
-#[post("/projects")]
 pub async fn create_project(
     req: web::Json<CreateProjectRequest>,
 ) -> Result<HttpResponse, AppError> {
@@ -181,7 +179,6 @@ pub async fn create_project(
 }
 
 /// GET /agent/projects/{id}/sessions - Get sessions for a project
-#[get("/projects/{project_id}/sessions")]
 pub async fn get_project_sessions(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let claude_dir = get_claude_dir()?;
     let project_id = path.into_inner();
@@ -234,7 +231,6 @@ pub async fn get_project_sessions(path: web::Path<String>) -> Result<HttpRespons
 }
 
 /// GET /agent/settings - Get Claude settings
-#[get("/settings")]
 pub async fn get_claude_settings() -> Result<HttpResponse, AppError> {
     let settings_path = dirs::home_dir()
         .ok_or_else(|| AppError::InternalError(anyhow::anyhow!("Home directory not found")))?
@@ -255,7 +251,6 @@ pub async fn get_claude_settings() -> Result<HttpResponse, AppError> {
 }
 
 /// POST /agent/settings - Save Claude settings
-#[post("/settings")]
 pub async fn save_claude_settings(
     req: web::Json<SaveSettingsRequest>,
 ) -> Result<HttpResponse, AppError> {
@@ -275,7 +270,6 @@ pub async fn save_claude_settings(
 }
 
 /// GET /agent/system-prompt - Get system prompt
-#[get("/system-prompt")]
 pub async fn get_system_prompt() -> Result<HttpResponse, AppError> {
     let prompt_path = dirs::home_dir()
         .ok_or_else(|| AppError::InternalError(anyhow::anyhow!("Home directory not found")))?
@@ -293,7 +287,6 @@ pub async fn get_system_prompt() -> Result<HttpResponse, AppError> {
 }
 
 /// POST /agent/system-prompt - Save system prompt
-#[post("/system-prompt")]
 pub async fn save_system_prompt(
     req: web::Json<SaveSystemPromptRequest>,
 ) -> Result<HttpResponse, AppError> {
@@ -310,7 +303,6 @@ pub async fn save_system_prompt(
 }
 
 /// GET /agent/sessions/running - List running Claude sessions
-#[get("/sessions/running")]
 pub async fn list_running_claude_sessions() -> Result<HttpResponse, AppError> {
     // This would need process registry integration
     // For now, return empty list
@@ -318,7 +310,6 @@ pub async fn list_running_claude_sessions() -> Result<HttpResponse, AppError> {
 }
 
 /// POST /agent/sessions/execute - Execute Claude code
-#[post("/sessions/execute")]
 pub async fn execute_claude_code(
     _req: web::Json<ExecuteRequest>,
 ) -> Result<HttpResponse, AppError> {
@@ -331,7 +322,6 @@ pub async fn execute_claude_code(
 }
 
 /// POST /agent/sessions/cancel - Cancel Claude execution
-#[post("/sessions/cancel")]
 pub async fn cancel_claude_execution(
     _req: web::Json<CancelRequest>,
 ) -> Result<HttpResponse, AppError> {
@@ -343,7 +333,6 @@ pub async fn cancel_claude_execution(
 }
 
 /// GET /agent/sessions/{id}/jsonl - Get session JSONL content
-#[get("/sessions/{session_id}/jsonl")]
 pub async fn get_session_jsonl(
     path: web::Path<String>,
     query: web::Query<std::collections::HashMap<String, String>>,
@@ -377,16 +366,28 @@ pub async fn get_session_jsonl(
 pub fn config(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/agent")
-            .service(list_projects)
-            .service(create_project)
-            .service(get_project_sessions)
-            .service(get_claude_settings)
-            .service(save_claude_settings)
-            .service(get_system_prompt)
-            .service(save_system_prompt)
-            .service(list_running_claude_sessions)
-            .service(execute_claude_code)
-            .service(cancel_claude_execution)
-            .service(get_session_jsonl),
+            .route("/projects", web::get().to(list_projects))
+            .route("/projects", web::post().to(create_project))
+            .route(
+                "/projects/{project_id}/sessions",
+                web::get().to(get_project_sessions),
+            )
+            .route("/settings", web::get().to(get_claude_settings))
+            .route("/settings", web::post().to(save_claude_settings))
+            .route("/system-prompt", web::get().to(get_system_prompt))
+            .route("/system-prompt", web::post().to(save_system_prompt))
+            .route(
+                "/sessions/running",
+                web::get().to(list_running_claude_sessions),
+            )
+            .route("/sessions/execute", web::post().to(execute_claude_code))
+            .route(
+                "/sessions/cancel",
+                web::post().to(cancel_claude_execution),
+            )
+            .route(
+                "/sessions/{session_id}/jsonl",
+                web::get().to(get_session_jsonl),
+            ),
     );
 }

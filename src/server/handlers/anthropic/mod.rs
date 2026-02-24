@@ -10,7 +10,7 @@ use crate::server::services::anthropic_model_mapping_service::load_anthropic_mod
 use crate::server::{
     error::AppError, model_config_helper::get_default_model_from_config, app_state::AppState,
 };
-use actix_web::{get, http::StatusCode, post, web, HttpResponse};
+use actix_web::{http::StatusCode, web, HttpResponse};
 use async_stream::stream;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 #[derive(Deserialize)]
-struct AnthropicMessagesRequest {
+pub struct AnthropicMessagesRequest {
     model: String,
     messages: Vec<AnthropicMessage>,
     #[serde(default)]
@@ -114,7 +114,7 @@ enum AnthropicToolChoice {
 }
 
 #[derive(Deserialize)]
-struct AnthropicCompleteRequest {
+pub struct AnthropicCompleteRequest {
     model: String,
     prompt: String,
     max_tokens_to_sample: u32,
@@ -188,7 +188,6 @@ struct AnthropicErrorDetail {
     message: String,
 }
 
-#[post("/messages")]
 pub async fn messages(
     app_state: web::Data<AppState>,
     _agent_state: web::Data<AgentAppState>,
@@ -428,7 +427,6 @@ pub async fn messages(
     }
 }
 
-#[post("/complete")]
 pub async fn complete(
     app_state: web::Data<AppState>,
     _agent_state: web::Data<AgentAppState>,
@@ -644,7 +642,6 @@ struct AnthropicModel {
     created_at: String,
 }
 
-#[get("/models")]
 pub async fn get_models(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     // Get provider and fetch models
     let provider = app_state.get_provider().await;
@@ -713,7 +710,9 @@ fn format_model_display_name(model_id: &str) -> String {
 }
 
 pub fn config(cfg: &mut web::ServiceConfig) {
-    cfg.service(messages).service(complete).service(get_models);
+    cfg.route("/messages", web::post().to(messages))
+        .route("/complete", web::post().to(complete))
+        .route("/models", web::get().to(get_models));
 }
 
 #[derive(Clone)]

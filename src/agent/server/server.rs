@@ -4,7 +4,7 @@ use std::io;
 use std::path::PathBuf;
 use std::thread;
 
-use crate::agent::server::handlers;
+use crate::server::handlers::agent;
 use crate::agent::server::state::AppState;
 
 #[allow(dead_code)]
@@ -61,104 +61,104 @@ pub async fn run_server_with_config_and_mode(
             .wrap(Cors::permissive())
             .service(
                 web::scope("/api/v1")
-                    .route("/chat", web::post().to(handlers::chat::handler))
+                    .route("/chat", web::post().to(agent::chat::handler))
                     // New separated execute + events endpoints
                     .route(
                         "/execute/{session_id}",
-                        web::post().to(handlers::execute::handler),
+                        web::post().to(agent::execute::handler),
                     )
                     .route(
                         "/events/{session_id}",
-                        web::get().to(handlers::events::handler),
+                        web::get().to(agent::events::handler),
                     )
                     // Legacy stream endpoint (deprecated)
                     .route(
                         "/stream/{session_id}",
-                        web::get().to(handlers::stream::handler),
+                        web::get().to(agent::stream::handler),
                     )
                     .route(
                         "/stop/{session_id}",
-                        web::post().to(handlers::stop::handler),
+                        web::post().to(agent::stop::handler),
                     )
                     .route(
                         "/history/{session_id}",
-                        web::get().to(handlers::history::handler),
+                        web::get().to(agent::history::handler),
                     )
                     .route(
                         "/todo/{session_id}",
-                        web::get().to(handlers::todo::get_todo_list),
+                        web::get().to(agent::todo::get_todo_list),
                     )
                     .route(
                         "/todo/{session_id}/exists",
-                        web::get().to(handlers::todo::has_todo_list),
+                        web::get().to(agent::todo::has_todo_list),
                     )
                     .route(
                         "/respond/{session_id}",
-                        web::post().to(handlers::respond::submit_response),
+                        web::post().to(agent::respond::submit_response),
                     )
                     .route(
                         "/respond/{session_id}/pending",
-                        web::get().to(handlers::respond::get_pending_question),
+                        web::get().to(agent::respond::get_pending_question),
                     )
                     .route(
                         "/sessions/{session_id}",
-                        web::delete().to(handlers::delete::handler),
+                        web::delete().to(agent::delete::handler),
                     )
                     .route(
                         "/metrics/summary",
-                        web::get().to(handlers::metrics::summary),
+                        web::get().to(agent::metrics::summary),
                     )
                     .route(
                         "/metrics/by-model",
-                        web::get().to(handlers::metrics::by_model),
+                        web::get().to(agent::metrics::by_model),
                     )
                     .route(
                         "/metrics/sessions",
-                        web::get().to(handlers::metrics::sessions),
+                        web::get().to(agent::metrics::sessions),
                     )
                     .route(
                         "/metrics/sessions/{session_id}",
-                        web::get().to(handlers::metrics::session_detail),
+                        web::get().to(agent::metrics::session_detail),
                     )
-                    .route("/metrics/daily", web::get().to(handlers::metrics::daily))
+                    .route("/metrics/daily", web::get().to(agent::metrics::daily))
                     // Unified v2 API routes
                     .route(
                         "/metrics/v2/summary",
-                        web::get().to(handlers::metrics::v2_unified_summary),
+                        web::get().to(agent::metrics::v2_unified_summary),
                     )
                     .route(
                         "/metrics/v2/timeline",
-                        web::get().to(handlers::metrics::v2_unified_timeline),
+                        web::get().to(agent::metrics::v2_unified_timeline),
                     )
-                    .route("/health", web::get().to(handlers::health::handler))
+                    .route("/health", web::get().to(agent::health::handler))
                     // MCP routes
                     .service(
                         web::scope("/mcp")
-                            .route("/servers", web::get().to(handlers::mcp::list_servers))
-                            .route("/servers", web::post().to(handlers::mcp::add_server))
-                            .route("/servers/{id}", web::get().to(handlers::mcp::get_server))
-                            .route("/servers/{id}", web::put().to(handlers::mcp::update_server))
+                            .route("/servers", web::get().to(agent::mcp::list_servers))
+                            .route("/servers", web::post().to(agent::mcp::add_server))
+                            .route("/servers/{id}", web::get().to(agent::mcp::get_server))
+                            .route("/servers/{id}", web::put().to(agent::mcp::update_server))
                             .route(
                                 "/servers/{id}",
-                                web::delete().to(handlers::mcp::delete_server),
+                                web::delete().to(agent::mcp::delete_server),
                             )
                             .route(
                                 "/servers/{id}/connect",
-                                web::post().to(handlers::mcp::connect_server),
+                                web::post().to(agent::mcp::connect_server),
                             )
                             .route(
                                 "/servers/{id}/disconnect",
-                                web::post().to(handlers::mcp::disconnect_server),
+                                web::post().to(agent::mcp::disconnect_server),
                             )
                             .route(
                                 "/servers/{id}/refresh",
-                                web::post().to(handlers::mcp::refresh_tools),
+                                web::post().to(agent::mcp::refresh_tools),
                             )
                             .route(
                                 "/servers/{id}/tools",
-                                web::get().to(handlers::mcp::get_server_tools),
+                                web::get().to(agent::mcp::get_server_tools),
                             )
-                            .route("/tools", web::get().to(handlers::mcp::list_tools)),
+                            .route("/tools", web::get().to(agent::mcp::list_tools)),
                     ),
             )
     })

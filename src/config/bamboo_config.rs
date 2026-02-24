@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::xdg_paths;
 
@@ -77,20 +77,7 @@ impl BambooConfig {
     ///
     /// Returns default config if file doesn't exist
     pub fn load() -> Result<Self> {
-        let config_path = xdg_paths::bamboo_config_file();
-
-        if !config_path.exists() {
-            // Return default config if file doesn't exist
-            return Ok(Self::default());
-        }
-
-        let content = fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config file: {:?}", config_path))?;
-
-        let config: BambooConfig = serde_json::from_str(&content)
-            .with_context(|| "Failed to parse config file as JSON")?;
-
-        Ok(config)
+        Self::load_from_path(xdg_paths::bamboo_config_file())
     }
 
     /// Save configuration to XDG config path
@@ -98,12 +85,41 @@ impl BambooConfig {
         // Ensure config directory exists
         xdg_paths::ensure_bamboo_dirs()?;
 
-        let config_path = xdg_paths::bamboo_config_file();
+        self.save_to_path(xdg_paths::bamboo_config_file())
+    }
+
+    /// Load configuration from a specific path.
+    ///
+    /// Returns default config if the file doesn't exist.
+    pub fn load_from_path(config_path: impl AsRef<Path>) -> Result<Self> {
+        let config_path = config_path.as_ref();
+
+        if !config_path.exists() {
+            return Ok(Self::default());
+        }
+
+        let content = fs::read_to_string(config_path)
+            .with_context(|| format!("Failed to read config file: {:?}", config_path))?;
+
+        let config: BambooConfig =
+            serde_json::from_str(&content).with_context(|| "Failed to parse config file as JSON")?;
+
+        Ok(config)
+    }
+
+    /// Save configuration to a specific path.
+    pub fn save_to_path(&self, config_path: impl AsRef<Path>) -> Result<()> {
+        let config_path = config_path.as_ref();
+
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create config dir: {:?}", parent))?;
+        }
 
         let content =
             serde_json::to_string_pretty(self).context("Failed to serialize config to JSON")?;
 
-        fs::write(&config_path, content)
+        fs::write(config_path, content)
             .with_context(|| format!("Failed to write config file: {:?}", config_path))?;
 
         Ok(())
@@ -162,11 +178,14 @@ mod tests {
         config.server.port = 9000;
         config.server.bind = "0.0.0.0".to_string();
 
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("config.json");
+
         // Save
-        config.save().expect("Failed to save config");
+        config.save_to_path(&path).expect("Failed to save config");
 
         // Load
-        let loaded = BambooConfig::load().expect("Failed to load config");
+        let loaded = BambooConfig::load_from_path(&path).expect("Failed to load config");
 
         // Verify
         assert_eq!(loaded.server.port, 9000);

@@ -9,7 +9,7 @@ use crate::server::services::gemini_model_mapping_service::resolve_model;
 use crate::server::{
     error::AppError, model_config_helper::get_default_model_from_config, app_state::AppState,
 };
-use actix_web::{get, post, web, HttpResponse};
+use actix_web::{web, HttpResponse};
 use anyhow::anyhow;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -17,16 +17,18 @@ use serde_json::json;
 
 /// Configure Gemini API routes
 pub fn config(cfg: &mut web::ServiceConfig) {
-    cfg.service(
-        web::scope("/models")
-            .service(generate_content)
-            .service(stream_generate_content)
-            .service(list_models),
-    );
+    cfg.route("/models", web::get().to(list_models))
+        .route(
+            "/models/{model}:generateContent",
+            web::post().to(generate_content),
+        )
+        .route(
+            "/models/{model}:streamGenerateContent",
+            web::post().to(stream_generate_content),
+        );
 }
 
 /// Generate content (non-streaming)
-#[post("/{model}:generateContent")]
 pub async fn generate_content(
     path: web::Path<String>,
     request: web::Json<GeminiRequest>,
@@ -153,7 +155,6 @@ pub async fn generate_content(
 }
 
 /// Stream generate content
-#[post("/{model}:streamGenerateContent")]
 pub async fn stream_generate_content(
     path: web::Path<String>,
     request: web::Json<GeminiRequest>,
@@ -313,7 +314,6 @@ pub async fn stream_generate_content(
 }
 
 /// List available models
-#[get("/models")]
 pub async fn list_models(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let provider = state.get_provider().await;
 

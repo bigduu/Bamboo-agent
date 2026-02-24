@@ -1,5 +1,5 @@
 use crate::server::{error::AppError, app_state::AppState};
-use actix_web::{post, web, HttpResponse};
+use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
@@ -25,7 +25,6 @@ pub struct CompleteAuthRequest {
 }
 
 /// Start Copilot authentication - returns device code info
-#[post("/bamboo/copilot/auth/start")]
 pub async fn start_copilot_auth(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
     use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
@@ -77,7 +76,6 @@ pub async fn start_copilot_auth(app_state: web::Data<AppState>) -> Result<HttpRe
 }
 
 /// Complete Copilot authentication after user enters device code
-#[post("/bamboo/copilot/auth/complete")]
 pub async fn complete_copilot_auth(
     app_state: web::Data<AppState>,
     payload: web::Json<CompleteAuthRequest>,
@@ -145,7 +143,6 @@ pub async fn complete_copilot_auth(
 }
 
 /// Trigger Copilot authentication flow (legacy, for backward compatibility)
-#[post("/bamboo/copilot/authenticate")]
 pub async fn authenticate_copilot(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
@@ -191,7 +188,6 @@ pub async fn authenticate_copilot(
 }
 
 /// Check Copilot authentication status
-#[post("/bamboo/copilot/auth/status")]
 pub async fn get_copilot_auth_status(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
@@ -234,7 +230,6 @@ pub async fn get_copilot_auth_status(
 }
 
 /// Logout from Copilot (delete cached token)
-#[post("/bamboo/copilot/logout")]
 pub async fn logout_copilot(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     use std::fs;
 
@@ -282,9 +277,21 @@ pub async fn logout_copilot(app_state: web::Data<AppState>) -> Result<HttpRespon
 }
 
 pub fn config(cfg: &mut web::ServiceConfig) {
-    cfg.service(start_copilot_auth)
-        .service(complete_copilot_auth)
-        .service(authenticate_copilot)
-        .service(get_copilot_auth_status)
-        .service(logout_copilot);
+    cfg.route(
+        "/bamboo/copilot/auth/start",
+        web::post().to(start_copilot_auth),
+    )
+    .route(
+        "/bamboo/copilot/auth/complete",
+        web::post().to(complete_copilot_auth),
+    )
+    .route(
+        "/bamboo/copilot/authenticate",
+        web::post().to(authenticate_copilot),
+    )
+    .route(
+        "/bamboo/copilot/auth/status",
+        web::post().to(get_copilot_auth_status),
+    )
+    .route("/bamboo/copilot/logout", web::post().to(logout_copilot));
 }

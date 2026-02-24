@@ -550,6 +550,12 @@ mod tests {
     #[tokio::test]
 
     async fn test_http_request_get() {
+        // This test performs a real network request. Run it explicitly with:
+        // `BAMBOO_TEST_NETWORK=1 cargo test --lib`
+        if std::env::var_os("BAMBOO_TEST_NETWORK").is_none() {
+            return;
+        }
+
         let tool = HttpRequestTool::new();
         let result = tool
             .execute(json!({
@@ -641,28 +647,15 @@ mod tests {
     #[tokio::test]
 
     async fn test_ssrf_valid_external_allowed() {
-        let tool = HttpRequestTool::new();
-
-        // This test checks that valid URLs don't trigger SSRF errors
-        // We can't actually make the request in unit tests, so we just verify
-        // the URL parsing and scheme validation passes
-
-        let result = tool
-            .execute(json!({
-                "url": "https://example.com",
-                "timeout_seconds": 1
-            }))
-            .await
-            .unwrap();
-
-        // Either success or a network error, NOT an SSRF error
-        if !result.success {
-            assert!(
-                !result.result.contains("SSRF protection"),
-                "Should not block valid external URL: {}",
-                result.result
-            );
-        }
+        // Validate SSRF checks without making any network requests.
+        //
+        // Use a public IP literal to avoid DNS resolution in unit tests.
+        let parsed_url = url::Url::parse("https://93.184.216.34").expect("valid URL");
+        let result = validate_url_not_internal(&parsed_url).await;
+        assert!(
+            result.is_ok(),
+            "Public IP should be allowed, got error: {result:?}"
+        );
     }
 
     #[tokio::test]

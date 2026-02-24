@@ -1,7 +1,7 @@
 use crate::core::keyword_masking::{KeywordEntry, KeywordMaskingConfig};
 use crate::core::ProxyAuth;
 use crate::server::{error::AppError, app_state::AppState};
-use actix_web::{delete, get, post, web, HttpResponse};
+use actix_web::{web, HttpResponse};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -135,7 +135,6 @@ fn is_safe_workflow_name(name: &str) -> bool {
         .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ' ')
 }
 
-#[get("/bamboo/workflows")]
 pub async fn list_workflows(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let dir = app_state.app_data_dir.join("workflows");
 
@@ -179,7 +178,6 @@ pub async fn list_workflows(app_state: web::Data<AppState>) -> Result<HttpRespon
     Ok(HttpResponse::Ok().json(workflows))
 }
 
-#[get("/bamboo/workflows/{name}")]
 pub async fn get_workflow(
     app_state: web::Data<AppState>,
     workflow_name: web::Path<String>,
@@ -215,12 +213,11 @@ pub async fn get_workflow(
 }
 
 #[derive(Deserialize)]
-struct SaveWorkflowRequest {
+pub struct SaveWorkflowRequest {
     name: String,
     content: String,
 }
 
-#[post("/bamboo/workflows")]
 pub async fn save_workflow(
     app_state: web::Data<AppState>,
     payload: web::Json<SaveWorkflowRequest>,
@@ -242,7 +239,6 @@ pub async fn save_workflow(
     })))
 }
 
-#[delete("/bamboo/workflows/{name}")]
 pub async fn delete_workflow(
     app_state: web::Data<AppState>,
     workflow_name: web::Path<String>,
@@ -339,7 +335,6 @@ fn setup_status_message(
         .to_string()
 }
 
-#[get("/bamboo/setup/status")]
 pub async fn get_setup_status(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let path = config_path(&app_state);
     let config = match fs::read_to_string(&path).await {
@@ -363,7 +358,6 @@ pub async fn get_setup_status(app_state: web::Data<AppState>) -> Result<HttpResp
     }))
 }
 
-#[post("/bamboo/setup/complete")]
 pub async fn mark_setup_complete(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let path = config_path(&app_state);
     if let Some(parent) = path.parent() {
@@ -399,7 +393,6 @@ pub async fn mark_setup_complete(app_state: web::Data<AppState>) -> Result<HttpR
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
 
-#[post("/bamboo/setup/incomplete")]
 pub async fn mark_setup_incomplete(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
@@ -432,7 +425,6 @@ pub async fn mark_setup_incomplete(
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
 
-#[get("/bamboo/config")]
 pub async fn get_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let path = config_path(&app_state);
     match fs::read_to_string(&path).await {
@@ -449,7 +441,6 @@ pub async fn get_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpRes
     }
 }
 
-#[post("/bamboo/config")]
 pub async fn set_bamboo_config(
     app_state: web::Data<AppState>,
     payload: web::Json<Value>,
@@ -481,12 +472,11 @@ pub async fn set_bamboo_config(
 }
 
 #[derive(Deserialize)]
-struct ProxyAuthPayload {
+pub struct ProxyAuthPayload {
     username: Option<String>,
     password: Option<String>,
 }
 
-#[post("/bamboo/proxy-auth")]
 pub async fn set_proxy_auth(
     app_state: web::Data<AppState>,
     payload: web::Json<ProxyAuthPayload>,
@@ -543,7 +533,6 @@ pub async fn set_proxy_auth(
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
 
-#[get("/bamboo/proxy-auth/status")]
 pub async fn get_proxy_auth_status(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
@@ -580,7 +569,6 @@ pub async fn get_proxy_auth_status(
     })))
 }
 
-#[post("/bamboo/config/reset")]
 pub async fn reset_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let path = config_path(&app_state);
     // Try to delete config.json if it exists
@@ -598,7 +586,6 @@ pub async fn reset_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpR
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
 
-#[get("/bamboo/anthropic-model-mapping")]
 pub async fn get_anthropic_model_mapping(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
@@ -607,7 +594,6 @@ pub async fn get_anthropic_model_mapping(
     Ok(HttpResponse::Ok().json(mapping))
 }
 
-#[post("/bamboo/anthropic-model-mapping")]
 pub async fn set_anthropic_model_mapping(
     app_state: web::Data<AppState>,
     payload: web::Json<
@@ -633,7 +619,6 @@ struct ValidationError {
     message: String,
 }
 
-#[get("/bamboo/keyword-masking")]
 pub async fn get_keyword_masking_config(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
@@ -653,7 +638,6 @@ pub async fn get_keyword_masking_config(
     }))
 }
 
-#[post("/bamboo/keyword-masking")]
 pub async fn update_keyword_masking_config(
     app_state: web::Data<AppState>,
     payload: web::Json<Vec<KeywordEntry>>,
@@ -714,7 +698,6 @@ pub async fn update_keyword_masking_config(
     }))
 }
 
-#[post("/bamboo/keyword-masking/validate")]
 pub async fn validate_keyword_entries(
     payload: web::Json<Vec<KeywordEntry>>,
 ) -> Result<HttpResponse, AppError> {
@@ -749,14 +732,13 @@ struct ProviderConfigResponse {
 }
 
 #[derive(Deserialize)]
-struct UpdateProviderRequest {
+pub struct UpdateProviderRequest {
     provider: String,
     #[serde(default)]
     providers: Value,
 }
 
 /// Get current provider configuration
-#[get("/bamboo/settings/provider")]
 pub async fn get_provider_config(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let path = config_path(&app_state);
 
@@ -897,7 +879,6 @@ fn mask_api_keys_in_providers(providers: &Value) -> Value {
 }
 
 /// Update provider configuration
-#[post("/bamboo/settings/provider")]
 pub async fn update_provider_config(
     app_state: web::Data<AppState>,
     payload: web::Json<UpdateProviderRequest>,
@@ -1015,7 +996,6 @@ pub async fn update_provider_config(
 }
 
 /// Fetch available models for a specific provider
-#[post("/bamboo/settings/provider/models")]
 pub async fn fetch_provider_models(
     app_state: web::Data<AppState>,
     payload: web::Json<serde_json::Value>,
@@ -1188,7 +1168,6 @@ async fn fetch_models_from_api(
 }
 
 /// Reload configuration and recreate provider
-#[post("/bamboo/settings/reload")]
 pub async fn reload_provider_config(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
@@ -1220,31 +1199,67 @@ pub async fn reload_provider_config(
 }
 
 pub fn config(cfg: &mut web::ServiceConfig) {
-    cfg.service(list_workflows)
-        .service(get_workflow)
-        .service(save_workflow)
-        .service(delete_workflow)
+    cfg.route("/bamboo/workflows", web::get().to(list_workflows))
+        .route("/bamboo/workflows/{name}", web::get().to(get_workflow))
+        .route("/bamboo/workflows", web::post().to(save_workflow))
+        .route("/bamboo/workflows/{name}", web::delete().to(delete_workflow))
         // Setup status endpoints
-        .service(get_setup_status)
-        .service(mark_setup_complete)
-        .service(mark_setup_incomplete)
+        .route("/bamboo/setup/status", web::get().to(get_setup_status))
+        .route(
+            "/bamboo/setup/complete",
+            web::post().to(mark_setup_complete),
+        )
+        .route(
+            "/bamboo/setup/incomplete",
+            web::post().to(mark_setup_incomplete),
+        )
         // Config endpoints
-        .service(get_bamboo_config)
-        .service(set_bamboo_config)
-        .service(reset_bamboo_config)
+        .route("/bamboo/config", web::get().to(get_bamboo_config))
+        .route("/bamboo/config", web::post().to(set_bamboo_config))
+        .route("/bamboo/config/reset", web::post().to(reset_bamboo_config))
         // Proxy auth endpoints (also registered with rate limiting in production via app_config_with_rate_limiting)
-        .service(set_proxy_auth)
-        .service(get_proxy_auth_status)
+        .route("/bamboo/proxy-auth", web::post().to(set_proxy_auth))
+        .route(
+            "/bamboo/proxy-auth/status",
+            web::get().to(get_proxy_auth_status),
+        )
         // Keyword masking endpoints
-        .service(get_keyword_masking_config)
-        .service(update_keyword_masking_config)
-        .service(validate_keyword_entries)
+        .route(
+            "/bamboo/keyword-masking",
+            web::get().to(get_keyword_masking_config),
+        )
+        .route(
+            "/bamboo/keyword-masking",
+            web::post().to(update_keyword_masking_config),
+        )
+        .route(
+            "/bamboo/keyword-masking/validate",
+            web::post().to(validate_keyword_entries),
+        )
         // Provider configuration endpoints
-        .service(get_provider_config)
-        .service(update_provider_config)
-        .service(reload_provider_config)
-        .service(fetch_provider_models)
+        .route(
+            "/bamboo/settings/provider",
+            web::get().to(get_provider_config),
+        )
+        .route(
+            "/bamboo/settings/provider",
+            web::post().to(update_provider_config),
+        )
+        .route(
+            "/bamboo/settings/provider/models",
+            web::post().to(fetch_provider_models),
+        )
+        .route(
+            "/bamboo/settings/reload",
+            web::post().to(reload_provider_config),
+        )
         // Other endpoints
-        .service(get_anthropic_model_mapping)
-        .service(set_anthropic_model_mapping);
+        .route(
+            "/bamboo/anthropic-model-mapping",
+            web::get().to(get_anthropic_model_mapping),
+        )
+        .route(
+            "/bamboo/anthropic-model-mapping",
+            web::post().to(set_anthropic_model_mapping),
+        );
 }

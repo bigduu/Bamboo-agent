@@ -28,7 +28,7 @@
 //!   }'
 //! ```
 
-use actix_web::{post, web, HttpResponse};
+use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -139,7 +139,6 @@ pub struct ToolExecutionResultPayload {
 ///     ]
 ///   }'
 /// ```
-#[post("/tools/execute")]
 pub async fn execute_tool(
     payload: web::Json<ToolExecutionRequest>,
 ) -> Result<HttpResponse, AppError> {
@@ -185,5 +184,5 @@ pub async fn execute_tool(
 /// This function registers the tool execution endpoint with the Actix-web
 /// service configuration.
 pub fn config(cfg: &mut web::ServiceConfig) {
-    cfg.service(execute_tool);
+    cfg.route("/tools/execute", web::post().to(execute_tool));
 }

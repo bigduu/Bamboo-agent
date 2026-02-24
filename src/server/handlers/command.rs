@@ -2,7 +2,7 @@ use crate::agent::server::state::AppState as AgentAppState;
 use crate::agent::skill::SkillDefinition;
 use crate::server::error::AppError;
 use crate::server::app_state::AppState;
-use actix_web::{get, web, HttpResponse};
+use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -34,7 +34,6 @@ pub struct CommandListResponse {
     pub total: usize,
 }
 
-#[get("/commands")]
 pub async fn list_commands(
     app_state: web::Data<AppState>,
     agent_state: web::Data<AgentAppState>,
@@ -80,7 +79,6 @@ pub async fn list_commands(
     }))
 }
 
-#[get("/commands/{command_type}/{id}")]
 pub async fn get_command(
     app_state: web::Data<AppState>,
     agent_state: web::Data<AgentAppState>,
@@ -237,5 +235,6 @@ async fn list_mcp_tools_as_commands(state: &AgentAppState) -> Result<Vec<Command
 }
 
 pub fn config(cfg: &mut web::ServiceConfig) {
-    cfg.service(list_commands).service(get_command);
+    cfg.route("/commands", web::get().to(list_commands))
+        .route("/commands/{command_type}/{id}", web::get().to(get_command));
 }

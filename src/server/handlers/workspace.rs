@@ -1,4 +1,4 @@
-use actix_web::{get, post, web, HttpResponse};
+use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -36,17 +36,17 @@ fn validate_workspace_path(input_path: &str) -> Result<PathBuf, AppError> {
 }
 
 #[derive(Deserialize)]
-struct WorkspacePathRequest {
+pub struct WorkspacePathRequest {
     path: String,
 }
 
 #[derive(Deserialize)]
-struct BrowseFolderRequest {
+pub struct BrowseFolderRequest {
     path: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct WorkspaceFilesRequest {
+pub struct WorkspaceFilesRequest {
     path: String,
     max_depth: Option<usize>,
     max_entries: Option<usize>,
@@ -117,7 +117,7 @@ struct PathSuggestionsResponse {
 }
 
 #[derive(Deserialize)]
-struct AddRecentWorkspaceRequest {
+pub struct AddRecentWorkspaceRequest {
     path: String,
     metadata: Option<WorkspaceMetadata>,
 }
@@ -243,7 +243,6 @@ async fn build_workspace_info(path: &str) -> WorkspaceInfo {
     }
 }
 
-#[post("/workspace/validate")]
 pub async fn validate_workspace(
     _app_state: web::Data<AppState>,
     payload: web::Json<WorkspacePathRequest>,
@@ -258,7 +257,6 @@ pub async fn validate_workspace(
     Ok(HttpResponse::Ok().json(info))
 }
 
-#[get("/workspace/recent")]
 pub async fn get_recent_workspaces(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
@@ -277,7 +275,6 @@ pub async fn get_recent_workspaces(
     Ok(HttpResponse::Ok().json(infos))
 }
 
-#[post("/workspace/recent")]
 pub async fn add_recent_workspace(
     app_state: web::Data<AppState>,
     payload: web::Json<AddRecentWorkspaceRequest>,
@@ -312,7 +309,6 @@ pub async fn add_recent_workspace(
     Ok(HttpResponse::NoContent().finish())
 }
 
-#[get("/workspace/suggestions")]
 pub async fn get_workspace_suggestions(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
@@ -373,7 +369,6 @@ pub async fn get_workspace_suggestions(
     Ok(HttpResponse::Ok().json(PathSuggestionsResponse { suggestions }))
 }
 
-#[post("/workspace/browse-folder")]
 pub async fn browse_folder(
     _app_state: web::Data<AppState>,
     payload: web::Json<BrowseFolderRequest>,
@@ -423,7 +418,6 @@ pub async fn browse_folder(
     }))
 }
 
-#[post("/workspace/files")]
 pub async fn list_workspace_files(
     _app_state: web::Data<AppState>,
     payload: web::Json<WorkspaceFilesRequest>,
@@ -490,10 +484,13 @@ pub async fn list_workspace_files(
 }
 
 pub fn config(cfg: &mut web::ServiceConfig) {
-    cfg.service(validate_workspace)
-        .service(get_recent_workspaces)
-        .service(add_recent_workspace)
-        .service(get_workspace_suggestions)
-        .service(browse_folder)
-        .service(list_workspace_files);
+    cfg.route("/workspace/validate", web::post().to(validate_workspace))
+        .route("/workspace/recent", web::get().to(get_recent_workspaces))
+        .route("/workspace/recent", web::post().to(add_recent_workspace))
+        .route(
+            "/workspace/suggestions",
+            web::get().to(get_workspace_suggestions),
+        )
+        .route("/workspace/browse-folder", web::post().to(browse_folder))
+        .route("/workspace/files", web::post().to(list_workspace_files));
 }

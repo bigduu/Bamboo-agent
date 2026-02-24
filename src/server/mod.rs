@@ -90,9 +90,11 @@
 
 pub mod app_state;
 pub mod config;
-pub mod controllers;
 pub mod error;
 pub mod handlers;
+// Backward compatibility: "controllers" and "handlers" are unified.
+// Keep the old module name as an alias so existing imports keep working.
+pub use handlers as controllers;
 pub mod logging;
 pub mod metrics;
 pub mod metrics_service;

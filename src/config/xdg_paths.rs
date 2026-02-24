@@ -118,6 +118,7 @@ pub fn ensure_bamboo_dirs() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn test_xdg_paths() {
@@ -134,7 +135,49 @@ mod tests {
 
     #[test]
     fn test_ensure_dirs() {
-        // This test creates directories in the actual filesystem
-        assert!(ensure_bamboo_dirs().is_ok());
+        // Avoid writing to real user directories in unit tests.
+        //
+        // Note: environment variables are process-global, so guard against tests running in
+        // parallel while we temporarily override XDG paths.
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().expect("env lock");
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_home = temp_dir.path().join("config");
+        let data_home = temp_dir.path().join("data");
+        let cache_home = temp_dir.path().join("cache");
+        let runtime_dir = temp_dir.path().join("runtime");
+
+        let old_config_home = env::var("XDG_CONFIG_HOME").ok();
+        let old_data_home = env::var("XDG_DATA_HOME").ok();
+        let old_cache_home = env::var("XDG_CACHE_HOME").ok();
+        let old_runtime_dir = env::var("XDG_RUNTIME_DIR").ok();
+
+        env::set_var("XDG_CONFIG_HOME", &config_home);
+        env::set_var("XDG_DATA_HOME", &data_home);
+        env::set_var("XDG_CACHE_HOME", &cache_home);
+        env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+
+        let result = ensure_bamboo_dirs();
+
+        // Restore environment.
+        match old_config_home {
+            Some(v) => env::set_var("XDG_CONFIG_HOME", v),
+            None => env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match old_data_home {
+            Some(v) => env::set_var("XDG_DATA_HOME", v),
+            None => env::remove_var("XDG_DATA_HOME"),
+        }
+        match old_cache_home {
+            Some(v) => env::set_var("XDG_CACHE_HOME", v),
+            None => env::remove_var("XDG_CACHE_HOME"),
+        }
+        match old_runtime_dir {
+            Some(v) => env::set_var("XDG_RUNTIME_DIR", v),
+            None => env::remove_var("XDG_RUNTIME_DIR"),
+        }
+
+        assert!(result.is_ok());
     }
 }
