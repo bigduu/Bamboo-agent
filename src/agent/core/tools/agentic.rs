@@ -552,17 +552,86 @@ impl ToolResult {
         matches!(self, Self::NeedClarification { .. })
     }
 
+    /// Check if more actions are needed.
     pub fn needs_more_actions(&self) -> bool {
         matches!(self, Self::NeedMoreActions { .. })
     }
 }
 
+/// Trait for implementing autonomous agentic tools.
+///
+/// Agentic tools can execute multiple iterations, maintain state,
+/// and make autonomous decisions about which tools to call.
+///
+/// # Required Methods
+///
+/// - `name()` - Tool identifier
+/// - `description()` - Tool description
+/// - `execute()` - Execute the agentic tool
+///
+/// # Difference from Regular Tools
+///
+/// Unlike regular [`Tool`](crate::agent::core::tools::registry::Tool) trait:
+/// - Receives a [`ToolGoal`] instead of direct arguments
+/// - Has access to [`AgenticContext`] for state and history
+/// - Can execute multiple iterations
+/// - Returns [`ToolResult`] with continuation options
+///
+/// # Example
+///
+/// ```rust,ignore
+/// struct SmartCodeReviewTool;
+///
+/// #[async_trait]
+/// impl AgenticTool for SmartCodeReviewTool {
+///     fn name(&self) -> &str {
+///         "smart_code_review"
+///     }
+///
+///     fn description(&self) -> &str {
+///         "Autonomously review and fix code issues"
+///     }
+///
+///     async fn execute(
+///         &self,
+///         goal: ToolGoal,
+///         context: &mut AgenticContext,
+///     ) -> Result<ToolResult, ToolError> {
+///         // Iterate until goal achieved
+///         loop {
+///             if context.increment_iteration(goal.max_iterations) {
+///                 return Ok(ToolResult::error("Max iterations reached"));
+///             }
+///
+///             // Analyze code and decide actions
+///             // Execute tools via context.base_executor
+///             // Update state and record interactions
+///
+///             if goal_achieved(&context).await {
+///                 return Ok(ToolResult::success("Review complete"));
+///             }
+///         }
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait AgenticTool: Send + Sync {
+    /// Get tool name.
     fn name(&self) -> &str;
 
+    /// Get tool description.
     fn description(&self) -> &str;
 
+    /// Execute the agentic tool with goal and context.
+    ///
+    /// # Arguments
+    ///
+    /// * `goal` - Execution goal and parameters
+    /// * `context` - Execution context with state and history
+    ///
+    /// # Returns
+    ///
+    /// Tool execution result indicating success, error, or need for clarification.
     async fn execute(
         &self,
         goal: ToolGoal,
@@ -570,6 +639,25 @@ pub trait AgenticTool: Send + Sync {
     ) -> Result<ToolResult, ToolError>;
 }
 
+/// Convert agentic tool result to standard tool result.
+///
+/// Maps [`ToolResult`] from this module to the standard
+/// [`crate::agent::core::tools::types::ToolResult`] format.
+///
+/// # Arguments
+///
+/// * `agentic_result` - Agentic tool result to convert
+///
+/// # Returns
+///
+/// Standard tool result with appropriate display preferences.
+///
+/// # Mapping
+///
+/// - `Success` → `success: true, display_preference: None`
+/// - `Error` → `success: false, display_preference: "error"`
+/// - `NeedClarification` → `success: true, display_preference: "clarification"`
+/// - `NeedMoreActions` → `success: true, display_preference: "continuation"`
 pub fn convert_to_standard_result(
     agentic_result: ToolResult,
 ) -> crate::agent::core::tools::types::ToolResult {
@@ -601,6 +689,24 @@ pub fn convert_to_standard_result(
     }
 }
 
+/// Convert standard tool result to agentic tool result.
+///
+/// Inverse of [`convert_to_standard_result`].
+///
+/// # Arguments
+///
+/// * `standard_result` - Standard tool result to convert
+///
+/// # Returns
+///
+/// Agentic tool result based on success and display preference.
+///
+/// # Mapping
+///
+/// - `success: true` + `"clarification"` → `NeedClarification`
+/// - `success: true` + `"actions_needed"` → `NeedMoreActions`
+/// - `success: true` + other → `Success`
+/// - `success: false` → `Error`
 pub fn convert_from_standard_result(
     standard_result: crate::agent::core::tools::types::ToolResult,
 ) -> ToolResult {
@@ -625,8 +731,38 @@ pub fn convert_from_standard_result(
     }
 }
 
+/// Smart code review tool with autonomous execution.
+///
+/// An agentic tool that autonomously reviews code, identifies issues,
+/// and plans fixes using multiple tool calls.
+///
+/// # Capabilities
+///
+/// - Chooses appropriate review strategy
+/// - Asks clarifying questions when needed
+/// - Plans and executes follow-up actions
+/// - Tracks progress across iterations
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use bamboo_agent::agent::core::tools::agentic::*;
+///
+/// let tool = SmartCodeReviewTool::new();
+/// let executor = Arc::new(BuiltinToolExecutor::new());
+/// let mut context = AgenticContext::new(executor);
+///
+/// let goal = ToolGoal::new(
+///     "Review code for bugs",
+///     json!({"files": ["src/main.rs"]})
+/// );
+///
+/// let result = tool.execute(goal, &mut context).await?;
+/// ```
 pub struct SmartCodeReviewTool {
+    /// Tool name
     name: String,
+    /// Tool description
     description: String,
 }
 
@@ -640,10 +776,22 @@ impl Default for SmartCodeReviewTool {
 }
 
 impl SmartCodeReviewTool {
+    /// Create a new smart code review tool.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Collect code findings from content analysis.
+    ///
+    /// Analyzes code for common issues and patterns.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - Code content to analyze
+    ///
+    /// # Returns
+    ///
+    /// Tuple of (findings list, has_critical_issues)
     fn collect_findings(&self, content: &str) -> (Vec<String>, bool) {
         let mut findings = Vec::new();
         let mut has_critical = false;
@@ -672,6 +820,16 @@ impl SmartCodeReviewTool {
         (findings, has_critical)
     }
 
+    /// Choose review strategy based on content and findings.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - Code content
+    /// * `findings` - List of findings
+    ///
+    /// # Returns
+    ///
+    /// Strategy name: "quick", "standard", or "deep"
     fn choose_strategy(&self, content: &str, findings: &[String]) -> &'static str {
         let line_count = content.lines().count();
 
@@ -684,6 +842,17 @@ impl SmartCodeReviewTool {
         }
     }
 
+    /// Build follow-up tool actions for code review.
+    ///
+    /// Creates tool calls for running linters and tests.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_path` - Optional file path to review
+    ///
+    /// # Returns
+    ///
+    /// List of tool calls to execute
     fn build_actions(&self, file_path: Option<&str>) -> Vec<ToolCall> {
         let path_hint = file_path.unwrap_or("<unknown-file>");
 
