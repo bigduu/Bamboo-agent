@@ -57,8 +57,6 @@ fn openai_compatible_v1_scope(
             "/commands/{command_type}/{id}",
             web::get().to(command::get_command),
         )
-        // OpenAI-compatible endpoints
-        .service(openai_routes)
         // Settings routes
         .route("/bamboo/workflows", web::get().to(settings::list_workflows))
         .route(
@@ -198,6 +196,8 @@ fn openai_compatible_v1_scope(
             "/bamboo/copilot/logout",
             web::post().to(copilot_auth::logout_copilot),
         )
+        // OpenAI-compatible endpoints (MUST BE LAST - empty scope will shadow earlier routes)
+        .service(openai_routes)
 }
 
 /// Configure agent API routes (core agent functionality)
