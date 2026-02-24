@@ -1,6 +1,6 @@
 //! Common utilities and helpers for e2e tests
 
-use bamboo_agent::agent::server::state::AppState;
+use bamboo_agent::server::AppState;
 use std::path::PathBuf;
 
 /// Test application configuration
@@ -31,17 +31,7 @@ pub async fn create_test_app() -> actix_web::web::Data<AppState> {
         .expect("Failed to create temp dir")
         .keep();
 
-    actix_web::web::Data::new(
-        AppState::new_with_config(
-            "openai",
-            "http://localhost:12123".to_string(),
-            "test-model".to_string(),
-            "test-api-key".to_string(),
-            Some(temp_dir),
-            false,
-        )
-        .await,
-    )
+    actix_web::web::Data::new(AppState::new(temp_dir.clone()).await)
 }
 
 /// Create a test session ID

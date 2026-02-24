@@ -1,8 +1,8 @@
 //! E2E tests for /api/v1/execute/{session_id} endpoint
 
 use actix_web::{test, web, App};
-use bamboo_agent::agent::server::handlers;
-use bamboo_agent::agent::server::state::AppState;
+use bamboo_agent::server::handlers;
+use bamboo_agent::server::app_state::AppState;
 use serde_json::json;
 
 #[actix_web::test]

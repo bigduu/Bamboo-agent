@@ -4,8 +4,8 @@
 
 #[cfg(test)]
 mod tests {
-    use bamboo_agent::web_service::controllers::*;
-    use bamboo_agent::web_service::server::AppState;
+    use bamboo_agent::server::controllers::*;
+    use bamboo_agent::server::AppState;
 
     // Note: These are placeholder tests that verify the module structure
     // Full integration tests would require starting the server and making HTTP requests
