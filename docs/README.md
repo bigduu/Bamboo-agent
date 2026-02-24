@@ -7,12 +7,17 @@ Welcome to the Bamboo documentation! This directory contains comprehensive guide
 ### For Users
 
 - **[README.md](../README.md)** - Project overview and quick start guide
-- **[MIGRATION_GUIDE.md](../MIGRATION_GUIDE.md)** - Guide for migrating from the monorepo structure
+- **[MIGRATION_GUIDE.md](guides/MIGRATION_GUIDE.md)** - Guide for migrating from the monorepo structure
 - **[CHANGELOG.md](../CHANGELOG.md)** - Version history and release notes
 - **[CONTRIBUTING.md](../CONTRIBUTING.md)** - How to contribute to Bamboo
+- **[CODE_OF_CONDUCT.md](../CODE_OF_CONDUCT.md)** - Community standards
+- **[SECURITY.md](../SECURITY.md)** - Security policy
 
 ### Guides
 
+- **[API Documentation](guides/API.md)** - Complete API reference and usage examples
+- **[Migration Guide](guides/MIGRATION_GUIDE.md)** - Guide for migrating from the monorepo structure
+- **[Windows Troubleshooting](guides/WINDOWS_FIX.md)** - Platform-specific setup and troubleshooting for Windows
 - **[GitHub Actions Setup](guides/GITHUB_ACTIONS_SETUP.md)** - Setting up CI/CD with GitHub Actions
 - **[Auto-Publish Workflow](guides/AUTO_PUBLISH.md)** - Automatic version detection and publishing to crates.io
 
@@ -24,7 +29,27 @@ The `development/` directory is reserved for active development documentation an
 
 The `archive/` directory contains historical documentation from the project development process:
 
-- **[archive/development/](archive/development/)** - Phase completion reports and progress tracking from the crate migration project
+- **[archive/development/](archive/development/)** - Phase completion reports, progress tracking, test summaries, and milestone celebrations from the crate migration project
+
+#### Archived Documents
+
+**Development Progress & Milestones:**
+- [Phase Completion Reports](archive/development/) - PHASE2 through PHASE6 completion documentation
+- [Project Completion](archive/development/PROJECT_COMPLETE.md) - Final project completion report
+- [Progress Reports](archive/development/PROGRESS_REPORT.md) - Overall progress tracking
+- [Milestone Report](archive/development/MILESTONE_REPORT.md) - Key milestones achieved
+
+**Documentation & Testing:**
+- [Documentation Summary](archive/development/DOCUMENTATION_SUMMARY.md) - Documentation completeness tracking
+- [Documentation Tasks](archive/development/DOCUMENTATION_TASKS.md) - Documentation task checklist
+- [Documentation Reorganization](archive/development/DOCUMENTATION_REORG.md) - Docs restructuring notes
+- [Test Coverage Report](archive/development/TEST_COVERAGE_REPORT.md) - Comprehensive test coverage analysis
+- [E2E Test Summary](archive/development/E2E_TEST_SUMMARY.md) - End-to-end testing results
+
+**Release & Celebration:**
+- [Release 0.1.2 Summary](archive/development/RELEASE_0.1.2_SUMMARY.md) - Release notes for v0.1.2
+- [Publication Success](archive/development/PUBLICATION_SUCCESS.md) - crates.io publication celebration
+- [P0 Complete Celebration](archive/development/P0_COMPLETE_CELEBRATION.md) - Priority 0 milestone achievement
 
 ## 🚀 Quick Links
 
@@ -111,10 +136,13 @@ When adding new documentation:
 - **Looking for setup instructions?** → [README.md](../README.md)
 - **Need help contributing?** → [CONTRIBUTING.md](../CONTRIBUTING.md)
 - **Want to see what changed?** → [CHANGELOG.md](../CHANGELOG.md)
-- **Migrating from old version?** → [MIGRATION_GUIDE.md](../MIGRATION_GUIDE.md)
+- **Migrating from old version?** → [Migration Guide](guides/MIGRATION_GUIDE.md)
+- **Need API reference?** → [API Documentation](guides/API.md)
+- **Windows installation issues?** → [Windows Troubleshooting](guides/WINDOWS_FIX.md)
 - **Setting up CI/CD?** → [GitHub Actions Guide](guides/GITHUB_ACTIONS_SETUP.md)
+- **Viewing project history?** → [Development Archive](archive/development/)
 
 ---
 
-**Last Updated**: 2026-02-23
+**Last Updated**: 2026-02-24
 **Maintainer**: Bamboo Contributors
