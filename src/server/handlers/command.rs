@@ -5,35 +5,81 @@ use crate::server::app_state::AppState;
 use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 
+/// Command type enumeration for categorizing different command sources
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum CommandType {
+    /// Workflow commands from markdown files
     Workflow,
+    /// Skill commands defined in the skill system
     Skill,
+    /// MCP (Model Context Protocol) tool commands
     Mcp,
 }
 
+/// Represents a unified command item from various sources (workflows, skills, MCP tools)
 #[derive(Debug, Serialize)]
 pub struct CommandItem {
+    /// Unique identifier for the command (e.g., "workflow-myworkflow", "skill-myskill", "mcp-server-tool")
     pub id: String,
+    /// Short name/identifier for the command
     pub name: String,
+    /// Human-readable display name
     pub display_name: String,
+    /// Description of what the command does
     pub description: String,
+    /// Type of command: "workflow", "skill", or "mcp"
     #[serde(rename = "type")]
-    pub command_type: String, // "workflow" | "skill" | "mcp"
+    pub command_type: String,
+    /// Optional category for grouping commands
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// Optional tags for filtering and search
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    /// Additional metadata specific to the command type
     pub metadata: serde_json::Value,
 }
 
+/// Response structure for listing all available commands
 #[derive(Debug, Serialize)]
 pub struct CommandListResponse {
+    /// List of all available commands
     pub commands: Vec<CommandItem>,
+    /// Total number of commands
     pub total: usize,
 }
 
+/// Lists all available commands from workflows, skills, and MCP tools
+///
+/// # HTTP Route
+/// `GET /commands`
+///
+/// # Response Format
+/// Returns a [`CommandListResponse`] containing all available commands:
+/// ```json
+/// {
+///   "commands": [
+///     {
+///       "id": "workflow-myworkflow",
+///       "name": "myworkflow",
+///       "display_name": "myworkflow",
+///       "description": "Workflow: myworkflow",
+///       "type": "workflow",
+///       "metadata": { ... }
+///     }
+///   ],
+///   "total": 10
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Successfully retrieved command list
+///
+/// # Example
+/// ```bash
+/// curl http://localhost:3000/commands
+/// ```
 pub async fn list_commands(
     app_state: web::Data<AppState>,
     agent_state: web::Data<AgentAppState>,
@@ -79,6 +125,35 @@ pub async fn list_commands(
     }))
 }
 
+/// Retrieves a specific command by type and ID
+///
+/// # HTTP Route
+/// `GET /commands/{command_type}/{id}`
+///
+/// # Path Parameters
+/// - `command_type`: Type of command ("workflow", "skill", or "mcp")
+/// - `id`: Unique identifier of the command
+///
+/// # Response Format
+/// Returns command details including content (for workflows and skills):
+/// ```json
+/// {
+///   "id": "workflow-myworkflow",
+///   "name": "myworkflow",
+///   "content": "# My Workflow\n...",
+///   "type": "workflow"
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Command found and returned
+/// - `404 Not Found`: Command not found or MCP tool (which doesn't support content retrieval)
+///
+/// # Example
+/// ```bash
+/// curl http://localhost:3000/commands/workflow/myworkflow
+/// curl http://localhost:3000/commands/skill/myskill
+/// ```
 pub async fn get_command(
     app_state: web::Data<AppState>,
     agent_state: web::Data<AgentAppState>,
@@ -125,6 +200,9 @@ pub async fn get_command(
     }
 }
 
+/// Internal helper to list all workflow markdown files as command items
+///
+/// Scans the workflows directory and creates command items for each `.md` file
 async fn list_workflows_as_commands(
     data_dir: &std::path::Path,
 ) -> Result<Vec<CommandItem>, AppError> {
@@ -188,6 +266,7 @@ async fn list_workflows_as_commands(
     Ok(commands)
 }
 
+/// Internal helper to convert a skill definition to a command item
 fn skill_to_command(skill: &SkillDefinition) -> CommandItem {
     CommandItem {
         id: format!("skill-{}", skill.id),
@@ -206,6 +285,9 @@ fn skill_to_command(skill: &SkillDefinition) -> CommandItem {
     }
 }
 
+/// Internal helper to list all MCP tools as command items
+///
+/// Retrieves all tool aliases from the MCP manager and converts them to command items
 async fn list_mcp_tools_as_commands(state: &AgentAppState) -> Result<Vec<CommandItem>, AppError> {
     let aliases = state.mcp_manager.tool_index().all_aliases();
 
@@ -234,6 +316,11 @@ async fn list_mcp_tools_as_commands(state: &AgentAppState) -> Result<Vec<Command
     Ok(commands)
 }
 
+/// Configures command-related routes
+///
+/// # Routes
+/// - `GET /commands` - List all commands
+/// - `GET /commands/{command_type}/{id}` - Get specific command details
 pub fn config(cfg: &mut web::ServiceConfig) {
     cfg.route("/commands", web::get().to(list_commands))
         .route("/commands/{command_type}/{id}", web::get().to(get_command));

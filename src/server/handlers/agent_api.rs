@@ -3,29 +3,48 @@ use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-// Types (mirrored from src-tauri/src/command/claude_code.rs)
+// ============================================================================
+// Data Types
+// ============================================================================
+
+/// Represents a Claude Code project with its metadata and sessions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
+    /// Unique project identifier
     pub id: String,
+    /// File system path to the project
     pub path: String,
+    /// List of session IDs associated with this project
     pub sessions: Vec<String>,
+    /// Unix timestamp of project creation
     pub created_at: u64,
+    /// Unix timestamp of most recent session (if any)
     pub most_recent_session: Option<u64>,
 }
 
+/// Represents a Claude Code conversation session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    /// Unique session identifier
     pub id: String,
+    /// ID of the parent project
     pub project_id: String,
+    /// File system path to the project
     pub project_path: String,
+    /// Optional TODO data for the session
     pub todo_data: Option<serde_json::Value>,
+    /// Unix timestamp of session creation
     pub created_at: u64,
+    /// First message content (for preview)
     pub first_message: Option<String>,
+    /// ISO timestamp of first message
     pub message_timestamp: Option<String>,
 }
 
+/// Claude settings configuration wrapper
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeSettings {
+    /// Settings data as JSON
     #[serde(flatten)]
     pub data: serde_json::Value,
 }
@@ -38,35 +57,54 @@ impl Default for ClaudeSettings {
     }
 }
 
-// Request/Response types
+// ============================================================================
+// Request Types
+// ============================================================================
+
+/// Request body for creating a new project
 #[derive(Debug, Deserialize)]
 pub struct CreateProjectRequest {
+    /// File system path to the project directory
     pub path: String,
 }
 
+/// Request body for saving Claude settings
 #[derive(Debug, Deserialize)]
 pub struct SaveSettingsRequest {
+    /// Settings data as JSON
     pub settings: serde_json::Value,
 }
 
+/// Request body for saving system prompt
 #[derive(Debug, Deserialize)]
 pub struct SaveSystemPromptRequest {
+    /// System prompt content (markdown)
     pub content: String,
 }
 
+/// Request body for executing Claude code
 #[derive(Debug, Deserialize)]
 pub struct ExecuteRequest {
+    /// Project directory path
     pub project_path: String,
+    /// User prompt to execute
     pub prompt: String,
+    /// Optional session ID to resume
     pub session_id: Option<String>,
 }
 
+/// Request body for canceling execution
 #[derive(Debug, Deserialize)]
 pub struct CancelRequest {
+    /// Session ID to cancel
     pub session_id: String,
 }
 
-// Helper functions
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Gets the Claude configuration directory (~/.claude)
 fn get_claude_dir() -> Result<PathBuf, AppError> {
     dirs::home_dir()
         .ok_or_else(|| AppError::InternalError(anyhow::anyhow!("Could not find home directory")))?
@@ -77,9 +115,36 @@ fn get_claude_dir() -> Result<PathBuf, AppError> {
         })
 }
 
-// Endpoints
+// ============================================================================
+// HTTP Handlers
+// ============================================================================
 
-/// GET /agent/projects - List all projects
+/// Lists all Claude Code projects
+///
+/// # HTTP Route
+/// `GET /agent/projects`
+///
+/// # Response Format
+/// Returns an array of [`Project`] objects:
+/// ```json
+/// [
+///   {
+///     "id": "-Users-me-projects-myproject",
+///     "path": "/Users/me/projects/myproject",
+///     "sessions": ["session-1", "session-2"],
+///     "created_at": 1234567890,
+///     "most_recent_session": 1234567890
+///   }
+/// ]
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Successfully retrieved project list
+///
+/// # Example
+/// ```bash
+/// curl http://localhost:3000/agent/projects
+/// ```
 pub async fn list_projects() -> Result<HttpResponse, AppError> {
     let claude_dir = get_claude_dir()?;
     let mut projects = Vec::new();
@@ -132,7 +197,40 @@ pub async fn list_projects() -> Result<HttpResponse, AppError> {
     Ok(HttpResponse::Ok().json(projects))
 }
 
-/// POST /agent/projects - Create a new project
+/// Creates a new Claude Code project
+///
+/// # HTTP Route
+/// `POST /agent/projects`
+///
+/// # Request Body
+/// ```json
+/// {
+///   "path": "/Users/me/projects/myproject"
+/// }
+/// ```
+///
+/// # Response Format
+/// Returns the created [`Project`] object:
+/// ```json
+/// {
+///   "id": "-Users-me-projects-myproject",
+///   "path": "/Users/me/projects/myproject",
+///   "sessions": [],
+///   "created_at": 1234567890,
+///   "most_recent_session": null
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Project created successfully
+/// - `500 Internal Server Error`: Path doesn't exist or creation failed
+///
+/// # Example
+/// ```bash
+/// curl -X POST http://localhost:3000/agent/projects \
+///   -H "Content-Type: application/json" \
+///   -d '{"path": "/Users/me/projects/myproject"}'
+/// ```
 pub async fn create_project(
     req: web::Json<CreateProjectRequest>,
 ) -> Result<HttpResponse, AppError> {
@@ -178,7 +276,38 @@ pub async fn create_project(
     Ok(HttpResponse::Ok().json(project))
 }
 
-/// GET /agent/projects/{id}/sessions - Get sessions for a project
+/// Gets all sessions for a specific project
+///
+/// # HTTP Route
+/// `GET /agent/projects/{project_id}/sessions`
+///
+/// # Path Parameters
+/// - `project_id`: Unique project identifier
+///
+/// # Response Format
+/// Returns an array of [`Session`] objects:
+/// ```json
+/// [
+///   {
+///     "id": "session-123",
+///     "project_id": "-Users-me-projects-myproject",
+///     "project_path": "/Users/me/projects/myproject",
+///     "todo_data": null,
+///     "created_at": 1234567890,
+///     "first_message": null,
+///     "message_timestamp": null
+///   }
+/// ]
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Successfully retrieved sessions
+/// - `500 Internal Server Error`: Project not found
+///
+/// # Example
+/// ```bash
+/// curl http://localhost:3000/agent/projects/-Users-me-projects-myproject/sessions
+/// ```
 pub async fn get_project_sessions(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let claude_dir = get_claude_dir()?;
     let project_id = path.into_inner();
@@ -230,7 +359,28 @@ pub async fn get_project_sessions(path: web::Path<String>) -> Result<HttpRespons
     Ok(HttpResponse::Ok().json(sessions))
 }
 
-/// GET /agent/settings - Get Claude settings
+/// Gets Claude Code settings
+///
+/// # HTTP Route
+/// `GET /agent/settings`
+///
+/// # Response Format
+/// Returns [`ClaudeSettings`] object:
+/// ```json
+/// {
+///   "apiKey": "...",
+///   "model": "claude-3-5-sonnet-20241022",
+///   ...
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Settings retrieved (or default empty settings if not configured)
+///
+/// # Example
+/// ```bash
+/// curl http://localhost:3000/agent/settings
+/// ```
 pub async fn get_claude_settings() -> Result<HttpResponse, AppError> {
     let settings_path = dirs::home_dir()
         .ok_or_else(|| AppError::InternalError(anyhow::anyhow!("Home directory not found")))?
@@ -250,7 +400,39 @@ pub async fn get_claude_settings() -> Result<HttpResponse, AppError> {
     }
 }
 
-/// POST /agent/settings - Save Claude settings
+/// Saves Claude Code settings
+///
+/// # HTTP Route
+/// `POST /agent/settings`
+///
+/// # Request Body
+/// ```json
+/// {
+///   "settings": {
+///     "apiKey": "...",
+///     "model": "claude-3-5-sonnet-20241022"
+///   }
+/// }
+/// ```
+///
+/// # Response Format
+/// ```json
+/// {
+///   "success": true,
+///   "path": "/Users/me/.claude/settings.json"
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Settings saved successfully
+/// - `500 Internal Server Error`: Failed to save settings
+///
+/// # Example
+/// ```bash
+/// curl -X POST http://localhost:3000/agent/settings \
+///   -H "Content-Type: application/json" \
+///   -d '{"settings": {"model": "claude-3-5-sonnet-20241022"}}'
+/// ```
 pub async fn save_claude_settings(
     req: web::Json<SaveSettingsRequest>,
 ) -> Result<HttpResponse, AppError> {
@@ -269,7 +451,26 @@ pub async fn save_claude_settings(
     Ok(HttpResponse::Ok().json(serde_json::json!({"success": true, "path": settings_path})))
 }
 
-/// GET /agent/system-prompt - Get system prompt
+/// Gets the custom system prompt
+///
+/// # HTTP Route
+/// `GET /agent/system-prompt`
+///
+/// # Response Format
+/// ```json
+/// {
+///   "content": "# Custom System Prompt\n...",
+///   "path": "/Users/me/.claude/system-prompt.md"
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: System prompt retrieved (empty content if not set)
+///
+/// # Example
+/// ```bash
+/// curl http://localhost:3000/agent/system-prompt
+/// ```
 pub async fn get_system_prompt() -> Result<HttpResponse, AppError> {
     let prompt_path = dirs::home_dir()
         .ok_or_else(|| AppError::InternalError(anyhow::anyhow!("Home directory not found")))?
@@ -286,7 +487,36 @@ pub async fn get_system_prompt() -> Result<HttpResponse, AppError> {
     }
 }
 
-/// POST /agent/system-prompt - Save system prompt
+/// Saves the custom system prompt
+///
+/// # HTTP Route
+/// `POST /agent/system-prompt`
+///
+/// # Request Body
+/// ```json
+/// {
+///   "content": "# Custom System Prompt\n\nYou are a helpful assistant..."
+/// }
+/// ```
+///
+/// # Response Format
+/// ```json
+/// {
+///   "success": true,
+///   "path": "/Users/me/.claude/system-prompt.md"
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: System prompt saved successfully
+/// - `500 Internal Server Error`: Failed to save prompt
+///
+/// # Example
+/// ```bash
+/// curl -X POST http://localhost:3000/agent/system-prompt \
+///   -H "Content-Type: application/json" \
+///   -d '{"content": "# My Prompt"}'
+/// ```
 pub async fn save_system_prompt(
     req: web::Json<SaveSystemPromptRequest>,
 ) -> Result<HttpResponse, AppError> {
@@ -302,14 +532,61 @@ pub async fn save_system_prompt(
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true, "path": prompt_path })))
 }
 
-/// GET /agent/sessions/running - List running Claude sessions
+/// Lists currently running Claude Code sessions
+///
+/// # HTTP Route
+/// `GET /agent/sessions/running`
+///
+/// # Response Format
+/// Returns an array of running session metadata (currently returns empty array):
+/// ```json
+/// []
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Always returns successfully
+///
+/// # Example
+/// ```bash
+/// curl http://localhost:3000/agent/sessions/running
+/// ```
 pub async fn list_running_claude_sessions() -> Result<HttpResponse, AppError> {
     // This would need process registry integration
     // For now, return empty list
     Ok(HttpResponse::Ok().json(Vec::<serde_json::Value>::new()))
 }
 
-/// POST /agent/sessions/execute - Execute Claude code
+/// Executes Claude Code in a project directory
+///
+/// # HTTP Route
+/// `POST /agent/sessions/execute`
+///
+/// # Request Body
+/// ```json
+/// {
+///   "project_path": "/Users/me/projects/myproject",
+///   "prompt": "Help me debug this code",
+///   "session_id": "optional-session-id"
+/// }
+/// ```
+///
+/// # Response Format
+/// ```json
+/// {
+///   "success": true,
+///   "message": "Execution started - streaming not yet implemented"
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Execution started (placeholder implementation)
+///
+/// # Example
+/// ```bash
+/// curl -X POST http://localhost:3000/agent/sessions/execute \
+///   -H "Content-Type: application/json" \
+///   -d '{"project_path": "/tmp", "prompt": "Hello"}'
+/// ```
 pub async fn execute_claude_code(
     _req: web::Json<ExecuteRequest>,
 ) -> Result<HttpResponse, AppError> {
@@ -321,7 +598,35 @@ pub async fn execute_claude_code(
     })))
 }
 
-/// POST /agent/sessions/cancel - Cancel Claude execution
+/// Cancels a running Claude Code execution
+///
+/// # HTTP Route
+/// `POST /agent/sessions/cancel`
+///
+/// # Request Body
+/// ```json
+/// {
+///   "session_id": "session-123"
+/// }
+/// ```
+///
+/// # Response Format
+/// ```json
+/// {
+///   "success": true,
+///   "message": "Cancellation request sent"
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Cancellation request sent
+///
+/// # Example
+/// ```bash
+/// curl -X POST http://localhost:3000/agent/sessions/cancel \
+///   -H "Content-Type: application/json" \
+///   -d '{"session_id": "session-123"}'
+/// ```
 pub async fn cancel_claude_execution(
     _req: web::Json<CancelRequest>,
 ) -> Result<HttpResponse, AppError> {
@@ -332,7 +637,34 @@ pub async fn cancel_claude_execution(
     })))
 }
 
-/// GET /agent/sessions/{id}/jsonl - Get session JSONL content
+/// Gets session JSONL content (conversation history)
+///
+/// # HTTP Route
+/// `GET /agent/sessions/{session_id}/jsonl?project_id={project_id}`
+///
+/// # Path Parameters
+/// - `session_id`: Session identifier
+///
+/// # Query Parameters
+/// - `project_id`: (Required) Project identifier
+///
+/// # Response Format
+/// Returns an array of JSON objects representing conversation messages:
+/// ```json
+/// [
+///   {"role": "user", "content": "Hello"},
+///   {"role": "assistant", "content": "Hi!"}
+/// ]
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Session content retrieved successfully
+/// - `500 Internal Server Error`: Session not found or read error
+///
+/// # Example
+/// ```bash
+/// curl "http://localhost:3000/agent/sessions/session-123/jsonl?project_id=my-project"
+/// ```
 pub async fn get_session_jsonl(
     path: web::Path<String>,
     query: web::Query<std::collections::HashMap<String, String>>,
@@ -363,6 +695,20 @@ pub async fn get_session_jsonl(
     Ok(HttpResponse::Ok().json(lines))
 }
 
+/// Configures agent API routes
+///
+/// # Routes
+/// - `GET /agent/projects` - List all projects
+/// - `POST /agent/projects` - Create a new project
+/// - `GET /agent/projects/{project_id}/sessions` - Get project sessions
+/// - `GET /agent/settings` - Get Claude settings
+/// - `POST /agent/settings` - Save Claude settings
+/// - `GET /agent/system-prompt` - Get system prompt
+/// - `POST /agent/system-prompt` - Save system prompt
+/// - `GET /agent/sessions/running` - List running sessions
+/// - `POST /agent/sessions/execute` - Execute Claude code
+/// - `POST /agent/sessions/cancel` - Cancel execution
+/// - `GET /agent/sessions/{session_id}/jsonl` - Get session content
 pub fn config(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/agent")

@@ -154,26 +154,43 @@ pub enum InteractionRole {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Interaction {
+    /// User message
     User {
+        /// Message content from user
         message: String,
+        /// When the message was sent
         timestamp: DateTime<Utc>,
     },
+    /// Assistant response
     Assistant {
+        /// Response message
         message: String,
+        /// Optional metadata (e.g., confidence, reasoning)
         metadata: Option<Value>,
+        /// When the response was generated
         timestamp: DateTime<Utc>,
     },
+    /// Tool call initiated
     ToolAction {
+        /// The tool call being made
         call: ToolCall,
+        /// When the call was initiated
         timestamp: DateTime<Utc>,
     },
+    /// Tool execution result
     ToolObservation {
+        /// Name of the tool that was executed
         tool_name: String,
+        /// Output/result from the tool
         output: String,
+        /// When the observation was made
         timestamp: DateTime<Utc>,
     },
+    /// System message
     System {
+        /// System message content
         message: String,
+        /// When the message was generated
         timestamp: DateTime<Utc>,
     },
 }

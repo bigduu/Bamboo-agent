@@ -1,81 +1,187 @@
+//! Configuration management for Bamboo agent
+//!
+//! This module provides configuration types and loading logic for the entire
+//! Bamboo agent system. It supports multiple LLM providers, proxy settings,
+//! and both JSON and TOML configuration formats.
+//!
+//! # Configuration File
+//!
+//! Configuration is stored in `config.toml` (preferred) or `config.json` (legacy)
+//! under the XDG-compliant data directory (typically `~/.local/share/bamboo/`).
+//!
+//! # Example (TOML)
+//!
+//! ```toml
+//! provider = "anthropic"
+//!
+//! [providers.anthropic]
+//! api_key = "sk-ant-..."
+//! model = "claude-3-5-sonnet-20241022"
+//!
+//! [providers.openai]
+//! api_key = "sk-..."
+//! base_url = "https://api.openai.com/v1"
+//! ```
+//!
+//! # Environment Variables
+//!
+//! - `BAMBOO_PROVIDER`: Override default provider
+//! - `BAMBOO_HEADLESS_AUTH`: Enable headless authentication mode
+//! - `HTTP_PROXY` / `HTTPS_PROXY`: Proxy settings
+
 use serde::{Deserialize, Serialize};
 
+/// Main configuration structure for Bamboo agent
+///
+/// Contains all settings needed to run the agent, including provider credentials,
+/// proxy settings, and model selection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// HTTP proxy URL (e.g., `http://proxy.example.com:8080`)
     #[serde(default)]
     pub http_proxy: String,
+    /// HTTPS proxy URL (e.g., `https://proxy.example.com:8080`)
     #[serde(default)]
     pub https_proxy: String,
+    /// Proxy authentication credentials
     pub proxy_auth: Option<ProxyAuth>,
+    /// Default model to use (can be overridden per provider)
     pub model: Option<String>,
+    /// Deprecated: Use `providers.copilot.headless_auth` instead
     #[serde(default)]
-    pub headless_auth: bool, // Deprecated: moved to providers.copilot.headless_auth
+    pub headless_auth: bool,
 
-    // Provider configuration
+    /// Default LLM provider to use (e.g., "anthropic", "openai", "gemini", "copilot")
     #[serde(default = "default_provider")]
     pub provider: String,
 
+    /// Provider-specific configurations
     #[serde(default)]
     pub providers: ProviderConfigs,
 }
 
+/// Container for provider-specific configurations
+///
+/// Each field is optional, allowing users to configure only the providers they need.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderConfigs {
+    /// OpenAI provider configuration
     pub openai: Option<OpenAIConfig>,
+    /// Anthropic provider configuration
     pub anthropic: Option<AnthropicConfig>,
+    /// Google Gemini provider configuration
     pub gemini: Option<GeminiConfig>,
+    /// GitHub Copilot provider configuration
     pub copilot: Option<CopilotConfig>,
 }
 
+/// OpenAI provider configuration
+///
+/// # Example
+///
+/// ```toml
+/// [providers.openai]
+/// api_key = "sk-..."
+/// base_url = "https://api.openai.com/v1"  # Optional
+/// model = "gpt-4"  # Optional
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAIConfig {
+    /// OpenAI API key
     pub api_key: String,
+    /// Custom API base URL (for Azure or self-hosted deployments)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Default model to use (e.g., "gpt-4", "gpt-3.5-turbo")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
 
+/// Anthropic provider configuration
+///
+/// # Example
+///
+/// ```toml
+/// [providers.anthropic]
+/// api_key = "sk-ant-..."
+/// model = "claude-3-5-sonnet-20241022"
+/// max_tokens = 4096  # Optional
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicConfig {
+    /// Anthropic API key
     pub api_key: String,
+    /// Custom API base URL
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Default model to use (e.g., "claude-3-5-sonnet-20241022")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Maximum tokens in model response
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
 }
 
+/// Google Gemini provider configuration
+///
+/// # Example
+///
+/// ```toml
+/// [providers.gemini]
+/// api_key = "AIza..."
+/// model = "gemini-2.0-flash-exp"
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiConfig {
+    /// Google AI API key
     pub api_key: String,
+    /// Custom API base URL
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Default model to use (e.g., "gemini-2.0-flash-exp")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
 
+/// GitHub Copilot provider configuration
+///
+/// # Example
+///
+/// ```toml
+/// [providers.copilot]
+/// enabled = true
+/// headless_auth = false  # Set to true for servers without browser
+/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CopilotConfig {
+    /// Whether Copilot provider is enabled
     #[serde(default)]
     pub enabled: bool,
+    /// Print login URL to console instead of opening browser
     #[serde(default)]
-    pub headless_auth: bool, // Print login URL in console instead of opening browser
+    pub headless_auth: bool,
 }
 
+/// Returns the default provider name ("copilot")
 fn default_provider() -> String {
     "copilot".to_string()
 }
 
+/// Proxy authentication credentials
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyAuth {
+    /// Proxy username
     pub username: String,
+    /// Proxy password
     pub password: String,
 }
 
+/// Configuration file name
 const CONFIG_FILE_PATH: &str = "config.toml";
 
+/// Parse a boolean value from environment variable strings
+///
+/// Accepts: "1", "true", "yes", "y", "on" (case-insensitive)
 fn parse_bool_env(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -90,6 +196,18 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Load configuration from file with environment variable overrides
+    ///
+    /// Configuration loading order:
+    /// 1. Try loading from `config.json` (XDG path)
+    /// 2. Migrate old format if detected
+    /// 3. Fallback to `config.toml` in current directory
+    /// 4. Use defaults with environment variable overrides
+    ///
+    /// # Environment Variables
+    ///
+    /// - `MODEL`: Default model name
+    /// - `BAMBOO_HEADLESS`: Enable headless authentication mode
     pub fn new() -> Self {
         use super::paths::config_json_path;
 
@@ -151,7 +269,10 @@ impl Config {
     }
 }
 
-/// Old config format for backward compatibility migration
+/// Legacy configuration format for backward compatibility
+///
+/// This struct is used to migrate old configuration files to the new format.
+/// It supports the previous single-provider model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OldConfig {
     #[serde(default)]
@@ -169,6 +290,10 @@ struct OldConfig {
     headless_auth: bool,
 }
 
+/// Migrate old configuration format to new multi-provider format
+///
+/// Converts the legacy single-provider configuration to the new structure
+/// with explicit provider configurations.
 fn migrate_config(old: OldConfig) -> Config {
     // Log warning about deprecated fields
     if old.api_key.is_some() {

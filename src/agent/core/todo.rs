@@ -17,14 +17,19 @@ pub enum TodoItemStatus {
     Blocked,
 }
 
-/// Todo item
+/// Todo item for task tracking
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoItem {
+    /// Unique identifier for the todo item
     pub id: String,
+    /// Human-readable description of the task
     pub description: String,
+    /// Current status of the item
     pub status: TodoItemStatus,
+    /// IDs of other items this item depends on
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Additional notes or context
     #[serde(default)]
     pub notes: String,
 }
@@ -32,10 +37,15 @@ pub struct TodoItem {
 /// Todo list for a session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoList {
+    /// Session ID this todo list belongs to
     pub session_id: String,
+    /// Title of the todo list
     pub title: String,
+    /// List of todo items
     pub items: Vec<TodoItem>,
+    /// When the list was created
     pub created_at: DateTime<Utc>,
+    /// When the list was last updated
     pub updated_at: DateTime<Utc>,
 }
 

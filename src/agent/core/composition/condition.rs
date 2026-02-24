@@ -1,21 +1,43 @@
+//! Condition predicates for workflow control flow
+//!
+//! This module provides condition types for branching logic in tool compositions.
+
 use crate::agent::core::tools::ToolResult;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 /// Condition for control flow in tool expressions
+///
+/// Conditions are used in `Choice` expressions to determine which branch to execute.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum Condition {
     /// Check if the result was successful
     Success,
     /// Check if JSON path contains a specific value
-    Contains { path: String, value: String },
+    Contains {
+        /// JSON path to check (dot notation, e.g., "data.status")
+        path: String,
+        /// Value to check for
+        value: String,
+    },
     /// Check if value at JSON path matches a regex pattern
-    Matches { path: String, pattern: String },
+    Matches {
+        /// JSON path to check (dot notation)
+        path: String,
+        /// Regex pattern to match
+        pattern: String,
+    },
     /// All conditions must be true
-    And { conditions: Vec<Condition> },
+    And {
+        /// List of conditions (all must be true)
+        conditions: Vec<Condition>,
+    },
     /// At least one condition must be true
-    Or { conditions: Vec<Condition> },
+    Or {
+        /// List of conditions (at least one must be true)
+        conditions: Vec<Condition>,
+    },
 }
 
 impl Condition {

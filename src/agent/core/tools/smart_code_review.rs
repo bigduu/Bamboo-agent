@@ -17,17 +17,24 @@ use crate::agent::core::tools::ToolError;
 /// Language detection result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LanguageInfo {
+    /// Detected programming language
     pub language: String,
+    /// Confidence score (0.0-1.0)
     pub confidence: f64,
+    /// File extension detected
     pub file_extension: String,
 }
 
 /// Complexity metrics for code
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComplexityMetrics {
+    /// Total lines of code
     pub lines_of_code: usize,
+    /// Cyclomatic complexity score
     pub cyclomatic_complexity: usize,
+    /// Number of functions/methods
     pub function_count: usize,
+    /// Lines in the largest function
     pub max_function_lines: usize,
 }
 
@@ -44,8 +51,11 @@ pub enum ReviewStrategy {
 
 /// A smart code review tool that makes autonomous decisions
 pub struct SmartCodeReviewTool {
+    /// Tool name
     name: String,
+    /// Tool description
     description: String,
+    /// Language detection patterns (language -> file extensions)
     language_patterns: HashMap<String, Vec<String>>,
 }
 

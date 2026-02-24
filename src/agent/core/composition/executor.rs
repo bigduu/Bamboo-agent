@@ -1,3 +1,8 @@
+//! Workflow executor for tool composition DSL
+//!
+//! This module provides the execution engine for running tool composition
+//! workflows defined using the ToolExpr DSL.
+
 use crate::agent::core::tools::{normalize_tool_name, ToolError, ToolRegistry, ToolResult};
 use futures::future::join_all;
 use regex::Regex;
@@ -11,17 +16,27 @@ use super::context::ExecutionContext;
 use super::expr::ToolExpr;
 use super::parallel::ParallelWait;
 
+/// Executor for running tool composition workflows
+///
+/// The executor takes a tool registry and executes composition expressions,
+/// managing context, variables, and control flow.
 pub struct CompositionExecutor {
+    /// Tool registry for looking up and executing tools
     registry: Arc<ToolRegistry>,
 }
 
 type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 impl CompositionExecutor {
+    /// Create a new composition executor with the given tool registry
     pub fn new(registry: Arc<ToolRegistry>) -> Self {
         Self { registry }
     }
 
+    /// Execute a tool expression with the given context
+    ///
+    /// This method executes the expression and updates the context with
+    /// the result, binding it to the `_last` variable.
     pub async fn execute(
         &self,
         expr: &ToolExpr,

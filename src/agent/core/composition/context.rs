@@ -25,8 +25,11 @@ pub struct ExecutionContext {
 /// A single step in the execution log
 #[derive(Debug, Clone)]
 pub struct ExecutionStep {
+    /// Type of step (e.g., "call", "sequence", "parallel")
     pub step_type: String,
+    /// Result of this execution step
     pub result: Result<ToolResult, crate::agent::core::tools::ToolError>,
+    /// When this step was executed
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 

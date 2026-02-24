@@ -281,8 +281,10 @@ pub struct ImageUrl {
 /// ```
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Tool {
+    /// Tool type (always "function")
     #[serde(rename = "type")]
-    pub tool_type: String, // Always "function"
+    pub tool_type: String,
+    /// Function definition
     pub function: FunctionDefinition,
 }
 
@@ -337,8 +339,10 @@ pub enum ToolChoice {
     String(String),
     /// Force specific function call
     Object {
+        /// Tool type (always "function")
         #[serde(rename = "type")]
-        tool_type: String, // "function"
+        tool_type: String,
+        /// Function to call
         function: FunctionChoice,
     },
 }
@@ -363,8 +367,9 @@ pub struct FunctionChoice {
 pub struct ToolCall {
     /// Unique tool call identifier
     pub id: String,
+    /// Tool type (always "function")
     #[serde(rename = "type")]
-    pub tool_type: String, // Always "function"
+    pub tool_type: String,
     /// Function call details
     pub function: FunctionCall,
 }
@@ -398,11 +403,15 @@ pub struct FunctionCall {
 /// * `system_fingerprint` - System fingerprint
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ChatCompletionResponse {
+    /// Response identifier
     pub id: String,
+    /// Object type (e.g., "chat.completion")
     #[serde(default)]
     pub object: Option<String>,
+    /// Unix timestamp when response was created
     #[serde(default)]
     pub created: Option<u64>,
+    /// Model name used for generation
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]

@@ -10,27 +10,48 @@ use tokio::fs;
 
 use crate::agent::llm::AVAILABLE_PROVIDERS;
 
+// ============================================================================
+// Response Types
+// ============================================================================
+
+/// Workflow list item for API responses
 #[derive(Serialize)]
 struct WorkflowListItem {
+    /// Workflow name
     name: String,
+    /// Filename (e.g., "myworkflow.md")
     filename: String,
+    /// File size in bytes
     size: u64,
+    /// Last modified timestamp (currently not populated)
     modified_at: Option<String>,
 }
 
+/// Full workflow data with content
 #[derive(Serialize)]
 struct WorkflowGetResponse {
+    /// Workflow name
     name: String,
+    /// Filename
     filename: String,
+    /// Workflow markdown content
     content: String,
+    /// File size in bytes
     size: u64,
+    /// Last modified timestamp (currently not populated)
     modified_at: Option<String>,
 }
 
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Gets the path to the config.json file
 fn config_path(app_state: &AppState) -> PathBuf {
     app_state.app_data_dir.join("config.json")
 }
 
+/// Removes sensitive proxy authentication fields from config JSON
 fn strip_proxy_auth(mut config: Value) -> Value {
     if let Some(obj) = config.as_object_mut() {
         obj.remove("proxy_auth");
@@ -39,7 +60,7 @@ fn strip_proxy_auth(mut config: Value) -> Value {
     config
 }
 
-/// Clean empty proxy fields from config
+/// Removes empty proxy URL fields from config JSON
 fn clean_empty_proxy_fields(mut config: Value) -> Value {
     if let Some(obj) = config.as_object_mut() {
         // Remove empty http_proxy
@@ -58,7 +79,7 @@ fn clean_empty_proxy_fields(mut config: Value) -> Value {
     config
 }
 
-/// Encrypt proxy auth before storing to config file
+/// Encrypts proxy authentication credentials before saving to config
 fn encrypt_proxy_auth(config: &mut Value) -> Result<(), AppError> {
     if let Some(obj) = config.as_object_mut() {
         // Encrypt proxy_auth
@@ -80,7 +101,7 @@ fn encrypt_proxy_auth(config: &mut Value) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Decrypt proxy auth when loading from config file
+/// Decrypts proxy authentication credentials when loading config
 fn decrypt_proxy_auth(config: &mut Value) {
     if let Some(obj) = config.as_object_mut() {
         // Decrypt proxy_auth
@@ -97,6 +118,7 @@ fn decrypt_proxy_auth(config: &mut Value) {
     }
 }
 
+/// Validates workflow names for security (prevents path traversal, etc.)
 fn is_safe_workflow_name(name: &str) -> bool {
     // Check basic constraints
     if name.is_empty() || name.len() > 255 {
@@ -135,6 +157,35 @@ fn is_safe_workflow_name(name: &str) -> bool {
         .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ' ')
 }
 
+// ============================================================================
+// Workflow Handlers
+// ============================================================================
+
+/// Lists all workflow markdown files
+///
+/// # HTTP Route
+/// `GET /bamboo/workflows`
+///
+/// # Response Format
+/// Returns array of [`WorkflowListItem`]:
+/// ```json
+/// [
+///   {
+///     "name": "myworkflow",
+///     "filename": "myworkflow.md",
+///     "size": 1234,
+///     "modified_at": null
+///   }
+/// ]
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Successfully retrieved workflow list
+///
+/// # Example
+/// ```bash
+/// curl http://localhost:3000/bamboo/workflows
+/// ```
 pub async fn list_workflows(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let dir = app_state.app_data_dir.join("workflows");
 
@@ -178,6 +229,35 @@ pub async fn list_workflows(app_state: web::Data<AppState>) -> Result<HttpRespon
     Ok(HttpResponse::Ok().json(workflows))
 }
 
+/// Gets a specific workflow by name
+///
+/// # HTTP Route
+/// `GET /bamboo/workflows/{name}`
+///
+/// # Path Parameters
+/// - `name`: Workflow name (without .md extension)
+///
+/// # Response Format
+/// Returns [`WorkflowGetResponse`] with full content:
+/// ```json
+/// {
+///   "name": "myworkflow",
+///   "filename": "myworkflow.md",
+///   "content": "# My Workflow\n...",
+///   "size": 1234,
+///   "modified_at": null
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Workflow found and returned
+/// - `404 Not Found`: Workflow not found or invalid name
+/// - `500 Internal Server Error`: Failed to read workflow
+///
+/// # Example
+/// ```bash
+/// curl http://localhost:3000/bamboo/workflows/myworkflow
+/// ```
 pub async fn get_workflow(
     app_state: web::Data<AppState>,
     workflow_name: web::Path<String>,
@@ -212,12 +292,47 @@ pub async fn get_workflow(
     }))
 }
 
+/// Request body for saving a workflow
 #[derive(Deserialize)]
 pub struct SaveWorkflowRequest {
+    /// Workflow name
     name: String,
+    /// Workflow markdown content
     content: String,
 }
 
+/// Creates or updates a workflow
+///
+/// # HTTP Route
+/// `POST /bamboo/workflows`
+///
+/// # Request Body
+/// ```json
+/// {
+///   "name": "myworkflow",
+///   "content": "# My Workflow\n\nStep 1: ..."
+/// }
+/// ```
+///
+/// # Response Format
+/// ```json
+/// {
+///   "success": true,
+///   "path": "/path/to/workflows/myworkflow.md"
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Workflow saved successfully
+/// - `400 Bad Request`: Invalid workflow name
+/// - `500 Internal Server Error`: Failed to save workflow
+///
+/// # Example
+/// ```bash
+/// curl -X POST http://localhost:3000/bamboo/workflows \
+///   -H "Content-Type: application/json" \
+///   -d '{"name": "myworkflow", "content": "# My Workflow"}'
+/// ```
 pub async fn save_workflow(
     app_state: web::Data<AppState>,
     payload: web::Json<SaveWorkflowRequest>,
@@ -239,6 +354,31 @@ pub async fn save_workflow(
     })))
 }
 
+/// Deletes a workflow file
+///
+/// # HTTP Route
+/// `DELETE /bamboo/workflows/{name}`
+///
+/// # Path Parameters
+/// - `name`: Workflow name to delete
+///
+/// # Response Format
+/// ```json
+/// {
+///   "success": true
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Workflow deleted successfully
+/// - `400 Bad Request`: Invalid workflow name
+/// - `404 Not Found`: Workflow not found
+/// - `500 Internal Server Error`: Failed to delete workflow
+///
+/// # Example
+/// ```bash
+/// curl -X DELETE http://localhost:3000/bamboo/workflows/myworkflow
+/// ```
 pub async fn delete_workflow(
     app_state: web::Data<AppState>,
     workflow_name: web::Path<String>,
@@ -260,16 +400,24 @@ pub async fn delete_workflow(
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
 
-// Setup status endpoints
+// ============================================================================
+// Setup Status Handlers
+// ============================================================================
 
+/// Setup status response
 #[derive(Serialize)]
 struct SetupStatus {
+    /// Whether setup is complete
     is_complete: bool,
+    /// Whether proxy config exists in config.json
     has_proxy_config: bool,
+    /// Whether proxy env vars are detected
     has_proxy_env: bool,
+    /// Status message
     message: String,
 }
 
+/// Checks if proxy configuration exists in config
 fn has_proxy_config(config: &Value) -> bool {
     let has_http_proxy = config
         .get("http_proxy")
@@ -335,6 +483,28 @@ fn setup_status_message(
         .to_string()
 }
 
+/// Gets the setup completion status
+///
+/// # HTTP Route
+/// `GET /bamboo/setup/status`
+///
+/// # Response Format
+/// ```json
+/// {
+///   "is_complete": true,
+///   "has_proxy_config": false,
+///   "has_proxy_env": false,
+///   "message": "Setup has already been completed in config.json."
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Status retrieved successfully
+///
+/// # Example
+/// ```bash
+/// curl http://localhost:3000/bamboo/setup/status
+/// ```
 pub async fn get_setup_status(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let path = config_path(&app_state);
     let config = match fs::read_to_string(&path).await {
@@ -358,6 +528,26 @@ pub async fn get_setup_status(app_state: web::Data<AppState>) -> Result<HttpResp
     }))
 }
 
+/// Marks the setup as complete
+///
+/// # HTTP Route
+/// `POST /bamboo/setup/complete`
+///
+/// # Response Format
+/// ```json
+/// {
+///   "success": true
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Setup marked as complete
+/// - `500 Internal Server Error`: Failed to update config
+///
+/// # Example
+/// ```bash
+/// curl -X POST http://localhost:3000/bamboo/setup/complete
+/// ```
 pub async fn mark_setup_complete(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let path = config_path(&app_state);
     if let Some(parent) = path.parent() {
@@ -393,6 +583,26 @@ pub async fn mark_setup_complete(app_state: web::Data<AppState>) -> Result<HttpR
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
 
+/// Resets setup status to incomplete
+///
+/// # HTTP Route
+/// `POST /bamboo/setup/incomplete`
+///
+/// # Response Format
+/// ```json
+/// {
+///   "success": true
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Setup marked as incomplete
+/// - `500 Internal Server Error`: Failed to update config
+///
+/// # Example
+/// ```bash
+/// curl -X POST http://localhost:3000/bamboo/setup/incomplete
+/// ```
 pub async fn mark_setup_incomplete(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
@@ -425,6 +635,35 @@ pub async fn mark_setup_incomplete(
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
 
+// ============================================================================
+// Configuration Handlers
+// ============================================================================
+
+/// Gets the Bamboo application configuration
+///
+/// # HTTP Route
+/// `GET /bamboo/config`
+///
+/// # Response Format
+/// Returns the config.json contents (with sensitive fields removed):
+/// ```json
+/// {
+///   "provider": "copilot",
+///   "http_proxy": "http://proxy:8080",
+///   "providers": {...}
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Config retrieved successfully (empty object if not found)
+///
+/// # Security
+/// Proxy authentication credentials are stripped from the response.
+///
+/// # Example
+/// ```bash
+/// curl http://localhost:3000/bamboo/config
+/// ```
 pub async fn get_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let path = config_path(&app_state);
     match fs::read_to_string(&path).await {
@@ -441,6 +680,47 @@ pub async fn get_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpRes
     }
 }
 
+/// Updates the Bamboo application configuration
+///
+/// # HTTP Route
+/// `POST /bamboo/config`
+///
+/// # Request Body
+/// Configuration JSON object:
+/// ```json
+/// {
+///   "provider": "openai",
+///   "http_proxy": "http://proxy:8080",
+///   "providers": {
+///     "openai": {
+///       "api_key": "sk-..."
+///     }
+///   }
+/// }
+/// ```
+///
+/// # Response Format
+/// Returns the saved config (with sensitive fields removed):
+/// ```json
+/// {
+///   "provider": "openai",
+///   ...
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Config saved successfully
+/// - `500 Internal Server Error`: Failed to save config
+///
+/// # Security
+/// Proxy auth fields are automatically encrypted before saving.
+///
+/// # Example
+/// ```bash
+/// curl -X POST http://localhost:3000/bamboo/config \
+///   -H "Content-Type: application/json" \
+///   -d '{"provider": "openai"}'
+/// ```
 pub async fn set_bamboo_config(
     app_state: web::Data<AppState>,
     payload: web::Json<Value>,
@@ -471,12 +751,48 @@ pub async fn set_bamboo_config(
     Ok(HttpResponse::Ok().json(config))
 }
 
+/// Request body for setting proxy authentication
 #[derive(Deserialize)]
 pub struct ProxyAuthPayload {
+    /// Proxy username
     username: Option<String>,
+    /// Proxy password
     password: Option<String>,
 }
 
+/// Sets proxy authentication credentials
+///
+/// # HTTP Route
+/// `POST /bamboo/proxy-auth`
+///
+/// # Request Body
+/// ```json
+/// {
+///   "username": "user",
+///   "password": "pass"
+/// }
+/// ```
+///
+/// # Response Format
+/// ```json
+/// {
+///   "success": true
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Proxy auth saved and provider reloaded
+/// - `500 Internal Server Error`: Failed to save or reload
+///
+/// # Security
+/// Credentials are encrypted before storage in config.json.
+///
+/// # Example
+/// ```bash
+/// curl -X POST http://localhost:3000/bamboo/proxy-auth \
+///   -H "Content-Type: application/json" \
+///   -d '{"username": "user", "password": "pass"}'
+/// ```
 pub async fn set_proxy_auth(
     app_state: web::Data<AppState>,
     payload: web::Json<ProxyAuthPayload>,
@@ -533,6 +849,29 @@ pub async fn set_proxy_auth(
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
 
+/// Gets proxy authentication status
+///
+/// # HTTP Route
+/// `GET /bamboo/proxy-auth/status`
+///
+/// # Response Format
+/// ```json
+/// {
+///   "configured": true,
+///   "username": "myuser"
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Status retrieved successfully
+///
+/// # Note
+/// Password is never returned, only whether auth is configured and the username.
+///
+/// # Example
+/// ```bash
+/// curl http://localhost:3000/bamboo/proxy-auth/status
+/// ```
 pub async fn get_proxy_auth_status(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
@@ -569,6 +908,29 @@ pub async fn get_proxy_auth_status(
     })))
 }
 
+/// Resets (deletes) the Bamboo configuration file
+///
+/// # HTTP Route
+/// `POST /bamboo/config/reset`
+///
+/// # Response Format
+/// ```json
+/// {
+///   "success": true
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Config reset successfully
+/// - `500 Internal Server Error`: Failed to delete config
+///
+/// # Warning
+/// This permanently deletes the config.json file. Use with caution.
+///
+/// # Example
+/// ```bash
+/// curl -X POST http://localhost:3000/bamboo/config/reset
+/// ```
 pub async fn reset_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let path = config_path(&app_state);
     // Try to delete config.json if it exists
@@ -606,19 +968,51 @@ pub async fn set_anthropic_model_mapping(
     Ok(HttpResponse::Ok().json(mapping))
 }
 
-// Keyword masking endpoints
+// ============================================================================
+// Keyword Masking Handlers
+// ============================================================================
 
+/// Response for keyword masking configuration
 #[derive(Debug, Serialize, Deserialize)]
 struct KeywordMaskingResponse {
+    /// List of keyword masking entries
     entries: Vec<KeywordEntry>,
 }
 
+/// Validation error for keyword entries
 #[derive(Debug, Serialize, Deserialize)]
 struct ValidationError {
+    /// Index of the invalid entry
     index: usize,
+    /// Error message
     message: String,
 }
 
+/// Gets keyword masking configuration
+///
+/// # HTTP Route
+/// `GET /bamboo/keyword-masking`
+///
+/// # Response Format
+/// ```json
+/// {
+///   "entries": [
+///     {
+///       "pattern": "secret",
+///       "mask_type": "full",
+///       "case_sensitive": false
+///     }
+///   ]
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Config retrieved successfully
+///
+/// # Example
+/// ```bash
+/// curl http://localhost:3000/bamboo/keyword-masking
+/// ```
 pub async fn get_keyword_masking_config(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
@@ -638,6 +1032,46 @@ pub async fn get_keyword_masking_config(
     }))
 }
 
+/// Updates keyword masking configuration
+///
+/// # HTTP Route
+/// `POST /bamboo/keyword-masking`
+///
+/// # Request Body
+/// Array of keyword entries:
+/// ```json
+/// [
+///   {
+///     "pattern": "secret",
+///     "mask_type": "full",
+///     "case_sensitive": false
+///   }
+/// ]
+/// ```
+///
+/// # Response Format
+/// Returns the saved configuration:
+/// ```json
+/// {
+///   "entries": [...]
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Config saved successfully
+/// - `400 Bad Request`: Validation failed (max 100 entries, max 500 char patterns)
+/// - `500 Internal Server Error`: Failed to save config
+///
+/// # Limits
+/// - Maximum 100 entries
+/// - Maximum 500 characters per pattern
+///
+/// # Example
+/// ```bash
+/// curl -X POST http://localhost:3000/bamboo/keyword-masking \
+///   -H "Content-Type: application/json" \
+///   -d '[{"pattern": "secret", "mask_type": "full"}]'
+/// ```
 pub async fn update_keyword_masking_config(
     app_state: web::Data<AppState>,
     payload: web::Json<Vec<KeywordEntry>>,
@@ -698,6 +1132,44 @@ pub async fn update_keyword_masking_config(
     }))
 }
 
+/// Validates keyword masking entries without saving
+///
+/// # HTTP Route
+/// `POST /bamboo/keyword-masking/validate`
+///
+/// # Request Body
+/// Array of keyword entries to validate
+///
+/// # Response Format
+/// Success:
+/// ```json
+/// {
+///   "valid": true
+/// }
+/// ```
+///
+/// Validation errors:
+/// ```json
+/// {
+///   "valid": false,
+///   "errors": [
+///     {
+///       "index": 0,
+///       "message": "Pattern cannot be empty"
+///     }
+///   ]
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Validation completed (check `valid` field for result)
+///
+/// # Example
+/// ```bash
+/// curl -X POST http://localhost:3000/bamboo/keyword-masking/validate \
+///   -H "Content-Type: application/json" \
+///   -d '[{"pattern": "test", "mask_type": "full"}]'
+/// ```
 pub async fn validate_keyword_entries(
     payload: web::Json<Vec<KeywordEntry>>,
 ) -> Result<HttpResponse, AppError> {
@@ -722,23 +1194,60 @@ pub async fn validate_keyword_entries(
     }
 }
 
-// Provider configuration endpoints
+// ============================================================================
+// Provider Configuration Handlers
+// ============================================================================
 
+/// Response for provider configuration
 #[derive(Serialize)]
 struct ProviderConfigResponse {
+    /// Currently active provider
     provider: String,
+    /// List of available provider types
     available_providers: Vec<String>,
+    /// Provider-specific configurations (API keys masked)
     providers: Value,
 }
 
+/// Request body for updating provider configuration
 #[derive(Deserialize)]
 pub struct UpdateProviderRequest {
+    /// Provider to activate
     provider: String,
+    /// Provider-specific configurations
     #[serde(default)]
     providers: Value,
 }
 
-/// Get current provider configuration
+/// Gets current provider configuration with API keys masked
+///
+/// # HTTP Route
+/// `GET /bamboo/settings/provider`
+///
+/// # Response Format
+/// ```json
+/// {
+///   "provider": "openai",
+///   "available_providers": ["copilot", "openai", "anthropic", "gemini"],
+///   "providers": {
+///     "openai": {
+///       "api_key": "****...****",
+///       "model": "gpt-4"
+///     }
+///   }
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Configuration retrieved successfully
+///
+/// # Security
+/// API keys are masked to prevent exposure.
+///
+/// # Example
+/// ```bash
+/// curl http://localhost:3000/bamboo/settings/provider
+/// ```
 pub async fn get_provider_config(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let path = config_path(&app_state);
 
@@ -856,7 +1365,7 @@ pub async fn get_provider_config(app_state: web::Data<AppState>) -> Result<HttpR
     Ok(HttpResponse::Ok().json(response))
 }
 
-/// Mask API keys in provider config for security
+/// Masks API keys in provider configurations for security
 fn mask_api_keys_in_providers(providers: &Value) -> Value {
     let mut masked = providers.clone();
 
@@ -878,7 +1387,57 @@ fn mask_api_keys_in_providers(providers: &Value) -> Value {
     masked
 }
 
-/// Update provider configuration
+/// Updates provider configuration and reloads the provider
+///
+/// # HTTP Route
+/// `POST /bamboo/settings/provider`
+///
+/// # Request Body
+/// ```json
+/// {
+///   "provider": "openai",
+///   "providers": {
+///     "openai": {
+///       "api_key": "sk-...",
+///       "model": "gpt-4"
+///     }
+///   }
+/// }
+/// ```
+///
+/// # Response Format
+/// Success:
+/// ```json
+/// {
+///   "success": true,
+///   "provider": "openai"
+/// }
+/// ```
+///
+/// Error:
+/// ```json
+/// {
+///   "success": false,
+///   "error": "Configuration saved but invalid: ..."
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Configuration updated (check `success` field)
+/// - `400 Bad Request`: Invalid configuration
+/// - `500 Internal Server Error`: Failed to save or reload
+///
+/// # Features
+/// - Preserves existing API keys if masked values are sent
+/// - Validates configuration before applying
+/// - Automatically reloads provider
+///
+/// # Example
+/// ```bash
+/// curl -X POST http://localhost:3000/bamboo/settings/provider \
+///   -H "Content-Type: application/json" \
+///   -d '{"provider": "openai", "providers": {"openai": {"api_key": "sk-..."}}}'
+/// ```
 pub async fn update_provider_config(
     app_state: web::Data<AppState>,
     payload: web::Json<UpdateProviderRequest>,
@@ -1167,7 +1726,37 @@ async fn fetch_models_from_api(
     Ok(models)
 }
 
-/// Reload configuration and recreate provider
+/// Reloads provider configuration from file and recreates the provider
+///
+/// # HTTP Route
+/// `POST /bamboo/settings/reload`
+///
+/// # Response Format
+/// Success:
+/// ```json
+/// {
+///   "success": true,
+///   "provider": "openai"
+/// }
+/// ```
+///
+/// Error:
+/// ```json
+/// {
+///   "success": false,
+///   "error": "Invalid configuration: ..."
+/// }
+/// ```
+///
+/// # Response Status
+/// - `200 OK`: Reload completed (check `success` field)
+/// - `400 Bad Request`: Invalid configuration
+/// - `500 Internal Server Error`: Failed to reload provider
+///
+/// # Example
+/// ```bash
+/// curl -X POST http://localhost:3000/bamboo/settings/reload
+/// ```
 pub async fn reload_provider_config(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
@@ -1198,6 +1787,41 @@ pub async fn reload_provider_config(
     })))
 }
 
+/// Configures settings-related routes
+///
+/// # Routes
+/// ## Workflows
+/// - `GET /bamboo/workflows` - List all workflows
+/// - `GET /bamboo/workflows/{name}` - Get workflow content
+/// - `POST /bamboo/workflows` - Create/update workflow
+/// - `DELETE /bamboo/workflows/{name}` - Delete workflow
+///
+/// ## Setup
+/// - `GET /bamboo/setup/status` - Get setup status
+/// - `POST /bamboo/setup/complete` - Mark setup complete
+/// - `POST /bamboo/setup/incomplete` - Reset setup status
+///
+/// ## Configuration
+/// - `GET /bamboo/config` - Get application config
+/// - `POST /bamboo/config` - Update application config
+/// - `POST /bamboo/config/reset` - Reset configuration
+/// - `POST /bamboo/proxy-auth` - Set proxy credentials
+/// - `GET /bamboo/proxy-auth/status` - Get proxy auth status
+///
+/// ## Keyword Masking
+/// - `GET /bamboo/keyword-masking` - Get keyword masking config
+/// - `POST /bamboo/keyword-masking` - Update keyword masking
+/// - `POST /bamboo/keyword-masking/validate` - Validate entries
+///
+/// ## Provider Settings
+/// - `GET /bamboo/settings/provider` - Get provider config
+/// - `POST /bamboo/settings/provider` - Update provider config
+/// - `POST /bamboo/settings/provider/models` - Fetch available models
+/// - `POST /bamboo/settings/reload` - Reload provider
+///
+/// ## Other
+/// - `GET /bamboo/anthropic-model-mapping` - Get model mapping
+/// - `POST /bamboo/anthropic-model-mapping` - Update model mapping
 pub fn config(cfg: &mut web::ServiceConfig) {
     cfg.route("/bamboo/workflows", web::get().to(list_workflows))
         .route("/bamboo/workflows/{name}", web::get().to(get_workflow))

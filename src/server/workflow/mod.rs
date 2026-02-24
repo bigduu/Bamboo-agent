@@ -1,3 +1,32 @@
+//! Workflow system for defining and executing agent workflows
+//!
+//! This module provides a workflow engine that allows users to define
+//! complex agent behaviors using a declarative composition syntax.
+//!
+//! # Workflow Definition
+//!
+//! Workflows are defined in YAML or JSON files and support:
+//! - Sequential step execution
+//! - Parallel execution
+//! - Conditional branching
+//! - Tool composition
+//!
+//! # Example
+//!
+//! ```yaml
+//! id: my-workflow
+//! name: Example Workflow
+//! description: Demonstrates workflow capabilities
+//! version: "1.0"
+//! composition:
+//!   type: sequence
+//!   steps:
+//!     - type: tool
+//!       name: read_file
+//!     - type: tool
+//!       name: analyze
+//! ```
+
 mod loader;
 
 #[cfg(test)]

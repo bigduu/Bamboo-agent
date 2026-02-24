@@ -14,9 +14,12 @@
 pub mod cli;
 pub mod core;
 pub mod llm;
+/// Agent execution loop module
 pub mod loop_module;
 pub mod mcp;
+/// Metrics collection and aggregation
 pub mod metrics;
+/// Agent HTTP server implementation
 pub mod server;
 pub mod skill;
 pub mod tools;

@@ -10,44 +10,62 @@ use super::condition::Condition;
 use super::parallel::ParallelWait;
 
 /// Tool expression DSL for composing tool calls
+///
+/// This enum represents the AST (Abstract Syntax Tree) for the tool composition DSL.
+/// Each variant represents a different composition operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ToolExpr {
     /// Execute a single tool call
     Call {
+        /// Name of the tool to execute
         tool: String,
+        /// Arguments to pass to the tool (JSON object)
         args: serde_json::Value,
     },
     /// Execute a sequence of expressions
     Sequence {
+        /// Steps to execute in order
         steps: Vec<ToolExpr>,
+        /// Whether to stop on first error (default: true)
         #[serde(default = "default_fail_fast")]
         fail_fast: bool,
     },
     /// Execute branches in parallel
     Parallel {
+        /// Branches to execute concurrently
         branches: Vec<ToolExpr>,
+        /// Wait strategy: All, First, or Any
         #[serde(default)]
         wait: ParallelWait,
     },
     /// Conditional execution
     Choice {
+        /// Condition to evaluate
         condition: Condition,
+        /// Expression to execute if condition is true
         then_branch: Box<ToolExpr>,
+        /// Expression to execute if condition is false
         else_branch: Option<Box<ToolExpr>>,
     },
     /// Retry with backoff
     Retry {
+        /// Expression to retry
         expr: Box<ToolExpr>,
+        /// Maximum number of retry attempts (default: 3)
         #[serde(default = "default_max_attempts")]
         max_attempts: u32,
+        /// Delay between retries in milliseconds (default: 1000)
         #[serde(default = "default_delay_ms")]
         delay_ms: u64,
     },
     /// Variable binding
     Let {
+        /// Variable name
         var: String,
+        /// Expression to bind
         expr: Box<ToolExpr>,
+        /// Body expression that uses the variable
         body: Box<ToolExpr>,
     },
     /// Variable reference

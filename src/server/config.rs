@@ -1,9 +1,47 @@
+//! Server configuration utilities
+//!
+//! This module provides functions to configure security headers and CORS policies
+//! for the Actix-web server based on the deployment environment.
+//!
+//! # Security Headers
+//!
+//! The server applies production-ready security headers:
+//! - X-Frame-Options: DENY
+//! - X-Content-Type-Options: nosniff
+//! - X-XSS-Protection: 1; mode=block
+//! - Referrer-Policy: strict-origin-when-cross-origin
+//! - Content-Security-Policy: Customizable CSP
+//!
+//! # CORS Configuration
+//!
+//! CORS policies are automatically adjusted based on bind address:
+//! - **localhost**: Development mode with permissive CORS
+//! - **0.0.0.0**: Docker production mode (localhost only via reverse proxy)
+//! - **Custom**: Restrictive CORS for specific addresses
+
 use actix_cors::Cors;
 use actix_web::http::header;
 use actix_web::middleware::DefaultHeaders;
 use log::info;
 
-/// Build security headers for production deployments
+/// Build security headers middleware for production deployments
+///
+/// Applies standard security headers to all HTTP responses:
+/// - Prevents clickjacking (X-Frame-Options)
+/// - Prevents MIME type sniffing (X-Content-Type-Options)
+/// - Enables XSS protection (X-XSS-Protection)
+/// - Controls referrer information (Referrer-Policy)
+/// - Restricts resource loading (Content-Security-Policy)
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use actix_web::App;
+/// use bamboo_agent::server::config::build_security_headers;
+///
+/// let app = App::new()
+///     .wrap(build_security_headers());
+/// ```
 pub fn build_security_headers() -> DefaultHeaders {
     DefaultHeaders::new()
         .add(("X-Frame-Options", "DENY"))
@@ -14,7 +52,44 @@ pub fn build_security_headers() -> DefaultHeaders {
         .add(("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' ws: wss;"))
 }
 
-/// Build CORS configuration based on bind address and port
+/// Build CORS middleware based on bind address and port
+///
+/// Automatically configures CORS policy based on deployment environment:
+///
+/// # Development Mode (localhost)
+///
+/// When binding to `127.0.0.1`, `localhost`, or `::1`:
+/// - Allows all origins, methods, and headers
+/// - Suitable for local development
+/// - Safe because server is only accessible locally
+///
+/// # Docker Production Mode (0.0.0.0)
+///
+/// When binding to `0.0.0.0`:
+/// - Only allows `http://localhost:{port}`
+/// - Requires reverse proxy for external access
+/// - Restrictive CORS for security
+///
+/// # Custom Address
+///
+/// For any other bind address:
+/// - Only allows that specific address
+/// - Most restrictive configuration
+///
+/// # Arguments
+///
+/// * `bind_addr` - The address the server binds to
+/// * `port` - The port number the server listens on
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use actix_web::HttpServer;
+/// use bambooagent::server::config::build_cors;
+///
+/// let cors = build_cors("127.0.0.1", 8080);
+/// // Use cors middleware in HttpServer
+/// ```
 pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
     let cors = if bind_addr == "127.0.0.1" || bind_addr == "localhost" || bind_addr == "::1" {
         // Development/Desktop mode - allow all origins and headers for maximum flexibility

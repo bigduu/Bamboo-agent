@@ -1,3 +1,24 @@
+//! Agent execution loop
+//!
+//! This module implements the main agent execution loop that processes
+//! user requests, executes tools, and manages the conversation flow.
+//!
+//! # Components
+//!
+//! - **Runner**: Main loop implementation
+//! - **Stream**: Streaming response handling
+//! - **TodoContext**: Todo list integration
+//! - **TodoEvaluation**: Progress evaluation logic
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use bamboo_agent::agent::loop_module::{run_agent_loop, AgentLoopConfig};
+//!
+//! let config = AgentLoopConfig::default();
+//! let result = run_agent_loop(session, provider, config).await?;
+//! ```
+
 pub mod config;
 pub mod runner;
 pub mod stream;

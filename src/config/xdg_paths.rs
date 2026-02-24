@@ -1,6 +1,6 @@
 //! XDG Base Directory specification implementation for Bamboo
 //!
-//! Follows the XDG Base Directory specification: https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
+//! Follows the XDG Base Directory specification: <https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html>
 //!
 //! Default paths:
 //! - Config: ~/.config/bamboo/

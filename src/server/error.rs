@@ -1,9 +1,28 @@
+//! Server error types and HTTP response handling
+//!
+//! This module provides a unified error handling system for the Actix-web server.
+//! All errors are converted to HTTP responses with appropriate status codes.
+//!
+//! # Error Types
+//!
+//! - `BadRequest`: Client errors (400)
+//! - `ToolNotFound`: Tool not available (404)
+//! - `ToolExecutionError`: Tool execution failed (400)
+//! - `ToolApprovalRequired`: Tool needs user approval (403)
+//! - `NotFound`: Resource not found (404)
+//! - `ProxyAuthRequired`: Proxy authentication needed (428)
+//! - `InternalError`: Server errors (500)
+//! - `StorageError`: File system errors (500)
+//! - `SerializationError`: JSON serialization errors (500)
+
 use actix_web::{http::StatusCode, HttpResponse, ResponseError};
 use serde::Serialize;
 use thiserror::Error;
 
+/// Result type alias for server operations
 pub type Result<T, E = AppError> = std::result::Result<T, E>;
 
+/// Application error enum with HTTP status code mapping
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("Bad request: {0}")]

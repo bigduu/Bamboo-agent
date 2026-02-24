@@ -54,6 +54,7 @@ pub mod agent;
 pub mod budget;
 pub mod composition;
 pub mod memory;
+/// Persistent storage backends
 pub mod storage;
 pub mod todo;
 pub mod tools;

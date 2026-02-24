@@ -1,3 +1,85 @@
+//! Metrics Storage System
+//!
+//! This module provides persistent storage for agent metrics using SQLite as the backend.
+//! It implements a comprehensive metrics collection and query system for monitoring
+//! agent performance, resource usage, and behavior patterns.
+//!
+//! # Architecture
+//!
+//! The storage system is built around the [`MetricsStorage`] trait, which defines
+//! the interface for storing and retrieving metrics data. The primary implementation
+//! is [`SqliteMetricsStorage`], which uses SQLite with WAL mode for reliable,
+//! concurrent access.
+//!
+//! # Data Model
+//!
+//! Metrics are organized into three main categories:
+//!
+//! ## Session Metrics
+//! Track complete conversation sessions from start to finish, including:
+//! - Total rounds and token usage
+//! - Tool call counts and breakdown
+//! - Session duration and status
+//!
+//! ## Round Metrics
+//! Track individual request-response cycles within sessions:
+//! - Per-round token consumption
+//! - Round status and errors
+//! - Associated tool calls
+//!
+//! ## Forward Metrics
+//! Track HTTP proxy operations to upstream APIs:
+//! - Request/response tracking
+//! - Endpoint-specific metrics
+//! - Token usage per provider
+//!
+//! # Storage Schema
+//!
+//! The SQLite database contains the following tables:
+//! - `session_metrics`: Aggregated session-level metrics
+//! - `round_metrics`: Individual round metrics linked to sessions
+//! - `tool_call_metrics`: Tool invocation details linked to rounds
+//! - `forward_request_metrics`: HTTP proxy request tracking
+//!
+//! # Usage
+//!
+//! ```rust,ignore
+//! use bamboo::agent::metrics::storage::{SqliteMetricsStorage, MetricsStorage};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Initialize storage
+//!     let storage = SqliteMetricsStorage::new("metrics.db");
+//!     storage.init().await?;
+//!
+//!     // Record session start
+//!     storage.upsert_session_start(
+//!         "session-123",
+//!         "gpt-4",
+//!         chrono::Utc::now()
+//!     ).await?;
+//!
+//!     // Query metrics
+//!     let summary = storage.summary(Default::default()).await?;
+//!     println!("Total sessions: {}", summary.total_sessions);
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Performance
+//!
+//! The storage system is optimized for:
+//! - **Concurrent writes**: Uses WAL mode and spawn_blocking for async compatibility
+//! - **Efficient queries**: Indexed by timestamps, models, and endpoints
+//! - **Aggregate caching**: Session metrics are pre-aggregated for fast queries
+//!
+//! # Thread Safety
+//!
+//! All storage operations are thread-safe and can be called from multiple
+//! async tasks concurrently. SQLite connections are opened per-operation
+//! to avoid blocking the async runtime.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -13,37 +95,167 @@ use crate::agent::metrics::types::{
     TokenUsage, ToolCallMetrics,
 };
 
+/// Result type for metrics storage operations.
+///
+/// This is a specialized Result type that uses [`MetricsError`] as the error type,
+/// providing a consistent return type across all storage operations.
 pub type MetricsResult<T> = Result<T, MetricsError>;
 
+/// Errors that can occur during metrics storage operations.
+///
+/// This enum covers all the error cases that can arise when working with
+/// the metrics storage system, from database errors to data validation issues.
 #[derive(Debug, Error)]
 pub enum MetricsError {
+    /// SQLite database operation failed.
+    ///
+    /// This can occur due to SQL syntax errors, constraint violations,
+    /// database corruption, or connection issues.
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    /// Timestamp parsing failed.
+    ///
+    /// This occurs when reading timestamps from the database that don't
+    /// conform to the expected RFC3339 format.
     #[error("time parse error: {0}")]
     Chrono(#[from] chrono::ParseError),
 
+    /// I/O operation failed.
+    ///
+    /// This can occur when creating the database file, directory, or
+    /// during other file system operations.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// Async task failed to complete.
+    ///
+    /// This occurs when a spawned blocking task panics or is cancelled,
+    /// typically indicating a serious system issue.
     #[error("storage task join error: {0}")]
     Task(String),
 
+    /// Data validation failed.
+    ///
+    /// This occurs when retrieved data doesn't match expected constraints,
+    /// such as invalid enum values or malformed data.
     #[error("invalid metrics data: {0}")]
     InvalidData(String),
 }
 
+/// Information about a completed tool call.
+///
+/// This structure contains the completion details for a tool invocation,
+/// including when it finished, whether it succeeded, and any error information.
+///
+/// # Fields
+///
+/// - `completed_at`: Timestamp when the tool finished execution
+/// - `success`: Whether the tool executed successfully
+/// - `error`: Error message if the tool failed, None on success
+///
+/// # Example
+///
+/// ```
+/// use bamboo::agent::metrics::storage::ToolCallCompletion;
+/// use chrono::Utc;
+///
+/// let completion = ToolCallCompletion {
+///     completed_at: Utc::now(),
+///     success: true,
+///     error: None,
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct ToolCallCompletion {
+    /// Timestamp when the tool call completed
     pub completed_at: DateTime<Utc>,
+    /// Whether the tool execution succeeded
     pub success: bool,
+    /// Error message if execution failed, None on success
     pub error: Option<String>,
 }
 
+/// Trait defining the interface for metrics storage backends.
+///
+/// This trait provides an abstract interface for storing and querying metrics data.
+/// The primary implementation is [`SqliteMetricsStorage`], but this trait allows
+/// for alternative backends (e.g., PostgreSQL, TimescaleDB) to be implemented.
+///
+/// # Async Operations
+///
+/// All methods are async to support non-blocking I/O operations. The SQLite
+/// implementation uses `spawn_blocking` to avoid blocking the async runtime
+/// with database operations.
+///
+/// # Thread Safety
+///
+/// Implementations must be `Send + Sync` to allow sharing across async tasks.
+///
+/// # Data Consistency
+///
+/// The storage system maintains referential integrity between:
+/// - Sessions → Rounds → Tool Calls
+/// - Sessions aggregate data from child entities
+/// - Deletions cascade appropriately
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use bamboo::agent::metrics::storage::{MetricsStorage, SqliteMetricsStorage};
+/// use bamboo::agent::metrics::types::{SessionStatus, TokenUsage};
+/// use chrono::Utc;
+///
+/// async fn example(storage: &dyn MetricsStorage) -> Result<(), Box<dyn std::error::Error>> {
+///     // Start a session
+///     storage.upsert_session_start("s1", "gpt-4", Utc::now()).await?;
+///
+///     // Add a round
+///     storage.insert_round_start("r1", "s1", "gpt-4", Utc::now()).await?;
+///
+///     // Complete the round
+///     storage.complete_round(
+///         "r1",
+///         Utc::now(),
+///         bamboo::agent::metrics::types::RoundStatus::Success,
+///         TokenUsage { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+///         None
+///     ).await?;
+///
+///     // Complete the session
+///     storage.complete_session("s1", SessionStatus::Completed, Utc::now()).await?;
+///
+///     Ok(())
+/// }
+/// ```
 #[async_trait]
 pub trait MetricsStorage: Send + Sync {
+    /// Initializes the storage backend.
+    ///
+    /// This must be called before any other storage operations.
+    /// For SQLite, this creates the database schema if it doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be created or initialized.
     async fn init(&self) -> MetricsResult<()>;
 
+    /// Records the start of a new chat session.
+    ///
+    /// If a session with the same ID already exists, it will be reset to
+    /// running status (useful for session recovery scenarios).
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - Unique identifier for the session
+    /// * `model` - AI model being used (e.g., "gpt-4", "claude-3")
+    /// * `started_at` - Timestamp when the session started
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// storage.upsert_session_start("session-123", "gpt-4", Utc::now()).await?;
+    /// ```
     async fn upsert_session_start(
         &self,
         session_id: &str,
@@ -51,6 +263,15 @@ pub trait MetricsStorage: Send + Sync {
         started_at: DateTime<Utc>,
     ) -> MetricsResult<()>;
 
+    /// Updates the message count for a session.
+    ///
+    /// This should be called whenever messages are added to the conversation.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - Session to update
+    /// * `message_count` - New total message count
+    /// * `updated_at` - Timestamp of the update
     async fn update_session_message_count(
         &self,
         session_id: &str,
@@ -58,6 +279,15 @@ pub trait MetricsStorage: Send + Sync {
         updated_at: DateTime<Utc>,
     ) -> MetricsResult<()>;
 
+    /// Marks a session as completed with a final status.
+    ///
+    /// This triggers a final aggregation of all session metrics before closing.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - Session to complete
+    /// * `status` - Final session status (completed, failed, or cancelled)
+    /// * `completed_at` - Timestamp when the session ended
     async fn complete_session(
         &self,
         session_id: &str,
@@ -65,6 +295,17 @@ pub trait MetricsStorage: Send + Sync {
         completed_at: DateTime<Utc>,
     ) -> MetricsResult<()>;
 
+    /// Records the start of a new round within a session.
+    ///
+    /// A round represents a single request-response cycle. This also
+    /// triggers an update to the parent session's aggregate counters.
+    ///
+    /// # Arguments
+    ///
+    /// * `round_id` - Unique identifier for this round
+    /// * `session_id` - Parent session this round belongs to
+    /// * `model` - AI model being used for this round
+    /// * `started_at` - Timestamp when the round started
     async fn insert_round_start(
         &self,
         round_id: &str,
@@ -73,6 +314,18 @@ pub trait MetricsStorage: Send + Sync {
         started_at: DateTime<Utc>,
     ) -> MetricsResult<()>;
 
+    /// Completes a round with final metrics and status.
+    ///
+    /// This records the round's completion and triggers an update to
+    /// the parent session's aggregated metrics.
+    ///
+    /// # Arguments
+    ///
+    /// * `round_id` - Round to complete
+    /// * `completed_at` - Timestamp when the round finished
+    /// * `status` - Final round status (success or failed)
+    /// * `usage` - Token consumption during this round
+    /// * `error` - Error message if the round failed, None on success
     async fn complete_round(
         &self,
         round_id: &str,
@@ -82,6 +335,18 @@ pub trait MetricsStorage: Send + Sync {
         error: Option<String>,
     ) -> MetricsResult<()>;
 
+    /// Records the start of a tool invocation.
+    ///
+    /// Tools are called during rounds to perform specific actions
+    /// (e.g., reading files, executing commands).
+    ///
+    /// # Arguments
+    ///
+    /// * `tool_call_id` - Unique identifier for this tool call
+    /// * `round_id` - Round this tool call belongs to
+    /// * `session_id` - Session this tool call belongs to
+    /// * `tool_name` - Name of the tool being invoked
+    /// * `started_at` - Timestamp when the tool was invoked
     async fn insert_tool_start(
         &self,
         tool_call_id: &str,
@@ -91,6 +356,15 @@ pub trait MetricsStorage: Send + Sync {
         started_at: DateTime<Utc>,
     ) -> MetricsResult<()>;
 
+    /// Records the completion of a tool call.
+    ///
+    /// This updates the tool call record with completion details and
+    /// triggers an update to the parent session's tool call count.
+    ///
+    /// # Arguments
+    ///
+    /// * `tool_call_id` - Tool call to complete
+    /// * `completion` - Completion details including success status and timing
     async fn complete_tool_call(
         &self,
         tool_call_id: &str,
@@ -98,6 +372,18 @@ pub trait MetricsStorage: Send + Sync {
     ) -> MetricsResult<()>;
 
     // Forward request metrics methods
+
+    /// Records the start of a forwarded HTTP request to an upstream API.
+    ///
+    /// This tracks requests proxied to external API providers like OpenAI or Anthropic.
+    ///
+    /// # Arguments
+    ///
+    /// * `forward_id` - Unique identifier for this forwarded request
+    /// * `endpoint` - API endpoint identifier (e.g., "openai.chat_completions")
+    /// * `model` - AI model being requested
+    /// * `is_stream` - Whether this is a streaming (SSE) request
+    /// * `started_at` - Timestamp when the request was initiated
     async fn insert_forward_start(
         &self,
         forward_id: &str,
@@ -107,6 +393,19 @@ pub trait MetricsStorage: Send + Sync {
         started_at: DateTime<Utc>,
     ) -> MetricsResult<()>;
 
+    /// Completes a forwarded request with response details.
+    ///
+    /// This records the response from the upstream API, including status,
+    /// token usage, and any errors.
+    ///
+    /// # Arguments
+    ///
+    /// * `forward_id` - Forwarded request to complete
+    /// * `completed_at` - Timestamp when the response was received
+    /// * `status_code` - HTTP status code from the upstream API
+    /// * `status` - Classified status (success, error, or timeout)
+    /// * `usage` - Token usage if provided in the response
+    /// * `error` - Error message if the request failed
     async fn complete_forward(
         &self,
         forward_id: &str,
@@ -117,50 +416,410 @@ pub trait MetricsStorage: Send + Sync {
         error: Option<String>,
     ) -> MetricsResult<()>;
 
+    /// Retrieves aggregated summary statistics for forwarded requests.
+    ///
+    /// Returns counts of total/successful/failed requests, token usage,
+    /// and average latency for requests matching the filter criteria.
+    ///
+    /// # Arguments
+    ///
+    /// * `filter` - Filter criteria for date range, endpoint, and model
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use bamboo::agent::metrics::types::ForwardMetricsFilter;
+    ///
+    /// let filter = ForwardMetricsFilter {
+    ///     start_date: Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap()),
+    ///     end_date: Some(NaiveDate::from_ymd_opt(2026, 2, 28).unwrap()),
+    ///     endpoint: Some("openai.chat_completions".to_string()),
+    ///     model: None,
+    ///     limit: None,
+    /// };
+    ///
+    /// let summary = storage.forward_summary(filter).await?;
+    /// println!("Total requests: {}", summary.total_requests);
+    /// println!("Success rate: {:.2}%",
+    ///     (summary.successful_requests as f64 / summary.total_requests as f64) * 100.0);
+    /// ```
     async fn forward_summary(
         &self,
         filter: ForwardMetricsFilter,
     ) -> MetricsResult<ForwardMetricsSummary>;
+
+    /// Retrieves metrics grouped by endpoint.
+    ///
+    /// Returns per-endpoint statistics including request counts,
+    /// success rates, token usage, and average latency.
+    ///
+    /// # Arguments
+    ///
+    /// * `filter` - Filter criteria (endpoint filter is ignored, grouped by all endpoints)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let endpoints = storage.forward_by_endpoint(filter).await?;
+    /// for endpoint in endpoints {
+    ///     println!("{}: {} requests, {:.2}ms avg",
+    ///         endpoint.endpoint,
+    ///         endpoint.requests,
+    ///         endpoint.avg_duration_ms.unwrap_or(0) as f64
+    ///     );
+    /// }
+    /// ```
     async fn forward_by_endpoint(
         &self,
         filter: ForwardMetricsFilter,
     ) -> MetricsResult<Vec<ForwardEndpointMetrics>>;
+
+    /// Retrieves individual forward request records.
+    ///
+    /// Returns detailed information about each forwarded request,
+    /// including timing, status, and token usage.
+    ///
+    /// # Arguments
+    ///
+    /// * `filter` - Filter criteria including pagination via `limit`
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let filter = ForwardMetricsFilter {
+    ///     limit: Some(50),
+    ///     ..Default::default()
+    /// };
+    ///
+    /// let requests = storage.forward_requests(filter).await?;
+    /// for req in requests {
+    ///     println!("{}: {} - {:?}", req.forward_id, req.endpoint, req.status);
+    /// }
+    /// ```
     async fn forward_requests(
         &self,
         filter: ForwardMetricsFilter,
     ) -> MetricsResult<Vec<ForwardRequestMetrics>>;
 
+    /// Retrieves daily aggregated metrics for forwarded requests.
+    ///
+    /// Returns per-day statistics for the specified date range,
+    /// useful for trend analysis and reporting.
+    ///
+    /// # Arguments
+    ///
+    /// * `days` - Number of days to include
+    /// * `end_date` - End date for the range (defaults to today)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let daily = storage.forward_daily_metrics(7, None).await?;
+    /// for day in daily {
+    ///     println!("{}: {} requests, {} tokens",
+    ///         day.date,
+    ///         day.total_sessions,
+    ///         day.total_token_usage.total_tokens
+    ///     );
+    /// }
+    /// ```
     async fn forward_daily_metrics(
         &self,
         days: u32,
         end_date: Option<NaiveDate>,
     ) -> MetricsResult<Vec<DailyMetrics>>;
 
+    /// Retrieves aggregated summary statistics for chat sessions.
+    ///
+    /// Returns total sessions, token usage, tool call counts, and
+    /// active session count for sessions matching the filter.
+    ///
+    /// # Arguments
+    ///
+    /// * `filter` - Date range filter criteria
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use bamboo::agent::metrics::types::MetricsDateFilter;
+    ///
+    /// let filter = MetricsDateFilter {
+    ///     start_date: Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap()),
+    ///     end_date: Some(NaiveDate::from_ymd_opt(2026, 2, 28).unwrap()),
+    /// };
+    ///
+    /// let summary = storage.summary(filter).await?;
+    /// println!("Active sessions: {}", summary.active_sessions);
+    /// println!("Total tokens: {}", summary.total_tokens.total_tokens);
+    /// ```
     async fn summary(&self, filter: MetricsDateFilter) -> MetricsResult<MetricsSummary>;
+
+    /// Retrieves metrics grouped by AI model.
+    ///
+    /// Returns per-model statistics including session counts,
+    /// rounds, token usage, and tool calls.
+    ///
+    /// # Arguments
+    ///
+    /// * `filter` - Date range filter criteria
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let models = storage.by_model(filter).await?;
+    /// for model in models {
+    ///     println!("{}: {} sessions, {} tokens",
+    ///         model.model,
+    ///         model.sessions,
+    ///         model.tokens.total_tokens
+    ///     );
+    /// }
+    /// ```
     async fn by_model(&self, filter: MetricsDateFilter) -> MetricsResult<Vec<ModelMetrics>>;
+
+    /// Retrieves session metrics with filtering and pagination.
+    ///
+    /// Returns detailed information about sessions matching the filter criteria,
+    /// including token usage, tool breakdown, and status.
+    ///
+    /// # Arguments
+    ///
+    /// * `filter` - Filter criteria including date range, model, and pagination
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use bamboo::agent::metrics::types::SessionMetricsFilter;
+    ///
+    /// let filter = SessionMetricsFilter {
+    ///     model: Some("gpt-4".to_string()),
+    ///     limit: Some(100),
+    ///     ..Default::default()
+    /// };
+    ///
+    /// let sessions = storage.sessions(filter).await?;
+    /// for session in sessions {
+    ///     println!("{}: {} rounds, {} tools",
+    ///         session.session_id,
+    ///         session.total_rounds,
+    ///         session.tool_call_count
+    ///     );
+    /// }
+    /// ```
     async fn sessions(&self, filter: SessionMetricsFilter) -> MetricsResult<Vec<SessionMetrics>>;
+
+    /// Retrieves complete details for a specific session.
+    ///
+    /// Returns the session metrics along with all associated rounds
+    /// and their tool calls for detailed analysis.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - Session to retrieve
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(None)` if the session doesn't exist.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// if let Some(detail) = storage.session_detail("session-123").await? {
+    ///     println!("Session: {}", detail.session.session_id);
+    ///     for round in detail.rounds {
+    ///         println!("  Round {}: {} tokens, {} tools",
+    ///             round.round_id,
+    ///             round.token_usage.total_tokens,
+    ///             round.tool_calls.len()
+    ///         );
+    ///     }
+    /// }
+    /// ```
     async fn session_detail(&self, session_id: &str) -> MetricsResult<Option<SessionDetail>>;
+
+    /// Retrieves daily aggregated metrics for chat sessions.
+    ///
+    /// Returns per-day statistics including session counts, token usage,
+    /// model breakdown, and tool breakdown for trend analysis.
+    ///
+    /// # Arguments
+    ///
+    /// * `days` - Number of days to include
+    /// * `end_date` - End date for the range (defaults to today)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let daily = storage.daily_metrics(30, None).await?;
+    /// for day in daily {
+    ///     println!("{}: {} sessions, {} tokens",
+    ///         day.date,
+    ///         day.total_sessions,
+    ///         day.total_token_usage.total_tokens
+    ///     );
+    ///
+    ///     // Model breakdown
+    ///     for (model, usage) in day.model_breakdown {
+    ///         println!("  {}: {} tokens", model, usage.total_tokens);
+    ///     }
+    /// }
+    /// ```
     async fn daily_metrics(
         &self,
         days: u32,
         end_date: Option<NaiveDate>,
     ) -> MetricsResult<Vec<DailyMetrics>>;
 
+    /// Deletes old round records before a cutoff date.
+    ///
+    /// This is used for data retention and cleanup. After deleting rounds,
+    /// it triggers a refresh of affected session aggregates.
+    ///
+    /// # Arguments
+    ///
+    /// * `cutoff` - Delete rounds started before this timestamp
+    ///
+    /// # Returns
+    ///
+    /// Returns the number of rounds deleted.
+    ///
+    /// # Warning
+    ///
+    /// This operation is irreversible. Ensure you have backups if needed.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use chrono::{Duration, Utc};
+    ///
+    /// // Delete rounds older than 90 days
+    /// let cutoff = Utc::now() - Duration::days(90);
+    /// let deleted = storage.prune_rounds_before(cutoff).await?;
+    /// println!("Deleted {} old rounds", deleted);
+    /// ```
     async fn prune_rounds_before(&self, cutoff: DateTime<Utc>) -> MetricsResult<u64>;
 }
 
+/// SQLite-based implementation of the MetricsStorage trait.
+///
+/// This is the primary storage backend for the metrics system, using SQLite
+/// with WAL (Write-Ahead Logging) mode for reliable concurrent access.
+///
+/// # Features
+///
+/// - **WAL Mode**: Enables concurrent readers with writers
+/// - **Foreign Keys**: Enforces referential integrity
+/// - **Async Compatible**: Uses `spawn_blocking` to avoid blocking the async runtime
+/// - **Automatic Schema Migration**: Creates tables on initialization
+///
+/// # Database Schema
+///
+/// The database contains four main tables:
+///
+/// ## session_metrics
+/// Stores aggregated session-level metrics with columns for:
+/// - Session identification (session_id, model)
+/// - Timing (started_at, completed_at, updated_at)
+/// - Aggregates (total_rounds, prompt_tokens, completion_tokens, total_tokens, tool_call_count)
+/// - Status and message count
+///
+/// ## round_metrics
+/// Stores individual round metrics with foreign keys to sessions:
+/// - Round identification (round_id, session_id, model)
+/// - Timing and status
+/// - Token usage per round
+/// - Error information
+///
+/// ## tool_call_metrics
+/// Stores tool invocation details with foreign keys to rounds and sessions:
+/// - Tool identification (tool_call_id, round_id, session_id, tool_name)
+/// - Execution timing and success status
+/// - Error details
+///
+/// ## forward_request_metrics
+/// Stores HTTP proxy request tracking:
+/// - Request identification (forward_id, endpoint, model)
+/// - Request type (is_stream)
+/// - Response details (status_code, status, token usage)
+/// - Error information
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use bamboo::agent::metrics::storage::SqliteMetricsStorage;
+/// use bamboo::agent::metrics::storage::MetricsStorage;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     // Create storage instance
+///     let storage = SqliteMetricsStorage::new("path/to/metrics.db");
+///
+///     // Initialize database schema
+///     storage.init().await?;
+///
+///     // Now ready to use
+///     storage.upsert_session_start("s1", "gpt-4", chrono::Utc::now()).await?;
+///
+///     Ok(())
+/// }
+/// ```
+///
+/// # Thread Safety
+///
+/// The storage can be safely cloned and shared across threads. Each operation
+/// opens its own database connection to avoid blocking and ensure thread safety.
 #[derive(Debug, Clone)]
 pub struct SqliteMetricsStorage {
+    /// Path to the SQLite database file
     db_path: PathBuf,
 }
 
 impl SqliteMetricsStorage {
+    /// Creates a new SQLite storage instance.
+    ///
+    /// The database file will be created when [`init`](MetricsStorage::init) is called.
+    /// If the file already exists, it will be used as-is.
+    ///
+    /// # Arguments
+    ///
+    /// * `db_path` - Path to the SQLite database file (will create parent directories if needed)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bamboo::agent::metrics::storage::SqliteMetricsStorage;
+    ///
+    /// let storage = SqliteMetricsStorage::new("metrics.db");
+    /// let storage = SqliteMetricsStorage::new("/var/data/bamboo/metrics.db");
+    /// ```
     pub fn new(db_path: impl AsRef<Path>) -> Self {
         Self {
             db_path: db_path.as_ref().to_path_buf(),
         }
     }
 
+    /// Executes a function with a database connection in a blocking context.
+    ///
+    /// This helper method handles:
+    /// 1. Opening a connection to the database
+    /// 2. Running the provided function in `spawn_blocking` to avoid blocking async runtime
+    /// 3. Proper error handling and task joining
+    ///
+    /// # Type Parameters
+    ///
+    /// * `T` - Return type of the function (must be Send + 'static)
+    /// * `F` - Function type (must be Send + 'static)
+    ///
+    /// # Arguments
+    ///
+    /// * `func` - Function to execute with the database connection
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The database connection fails to open
+    /// - The function returns an error
+    /// - The blocking task fails to complete
     async fn with_connection<T, F>(&self, func: F) -> MetricsResult<T>
     where
         T: Send + 'static,
@@ -1079,6 +1738,26 @@ impl MetricsStorage for SqliteMetricsStorage {
     }
 }
 
+/// Opens a connection to the SQLite database with proper configuration.
+///
+/// This function:
+/// 1. Creates parent directories if they don't exist
+/// 2. Opens the database file (creates if doesn't exist)
+/// 3. Configures optimal SQLite settings:
+///    - WAL mode for concurrent access
+///    - Foreign key enforcement
+///    - Normal synchronous mode for performance
+///
+/// # Arguments
+///
+/// * `path` - Path to the SQLite database file
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Parent directories cannot be created
+/// - Database file cannot be opened
+/// - PRAGMA settings fail to apply
 fn open_connection(path: &Path) -> MetricsResult<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1094,18 +1773,56 @@ fn open_connection(path: &Path) -> MetricsResult<Connection> {
     Ok(connection)
 }
 
+/// Formats a timestamp as RFC3339 string for database storage.
+///
+/// # Arguments
+///
+/// * `timestamp` - DateTime to format
+///
+/// # Returns
+///
+/// RFC3339 formatted string (e.g., "2026-02-24T12:34:56.789+00:00")
 fn format_timestamp(timestamp: DateTime<Utc>) -> String {
     timestamp.to_rfc3339()
 }
 
+/// Parses an RFC3339 timestamp string from the database.
+///
+/// # Arguments
+///
+/// * `raw` - RFC3339 formatted string
+///
+/// # Errors
+///
+/// Returns an error if the string doesn't conform to RFC3339 format.
 fn parse_timestamp(raw: String) -> MetricsResult<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(&raw)?.with_timezone(&Utc))
 }
 
+/// Parses an optional RFC3339 timestamp string.
+///
+/// # Arguments
+///
+/// * `raw` - Optional RFC3339 formatted string
+///
+/// # Returns
+///
+/// Returns `Ok(None)` if the input is None, otherwise parses the timestamp.
 fn parse_optional_timestamp(raw: Option<String>) -> MetricsResult<Option<DateTime<Utc>>> {
     raw.map(parse_timestamp).transpose()
 }
 
+/// Computes the duration in milliseconds between two timestamps.
+///
+/// # Arguments
+///
+/// * `started_at` - Start timestamp
+/// * `completed_at` - Optional end timestamp
+///
+/// # Returns
+///
+/// Returns `None` if `completed_at` is None, otherwise returns the duration in milliseconds.
+/// Returns `None` if the duration is negative or too large to fit in u64.
 fn compute_duration_ms(
     started_at: DateTime<Utc>,
     completed_at: Option<DateTime<Utc>>,
@@ -1118,6 +1835,22 @@ fn compute_duration_ms(
     })
 }
 
+/// Builds a SQL WHERE clause for session metrics queries.
+///
+/// Constructs a WHERE clause based on the provided filter criteria,
+/// appending parameters to the params vector in the correct order.
+///
+/// # Arguments
+///
+/// * `start_date` - Optional start date filter (inclusive)
+/// * `end_date` - Optional end date filter (inclusive)
+/// * `required_status` - Optional status filter (e.g., "running", "completed")
+/// * `params_vec` - Vector to append SQL parameters to
+///
+/// # Returns
+///
+/// Returns an empty string if no filters are applied, otherwise returns
+/// a WHERE clause starting with "WHERE ".
 fn build_session_where_clause(
     start_date: Option<NaiveDate>,
     end_date: Option<NaiveDate>,
@@ -1148,6 +1881,23 @@ fn build_session_where_clause(
     }
 }
 
+/// Builds a SQL WHERE clause for forward request metrics queries.
+///
+/// Constructs a WHERE clause based on the provided filter criteria,
+/// appending parameters to the params vector in the correct order.
+///
+/// # Arguments
+///
+/// * `start_date` - Optional start date filter (inclusive)
+/// * `end_date` - Optional end date filter (inclusive)
+/// * `endpoint` - Optional endpoint filter
+/// * `model` - Optional model filter
+/// * `params_vec` - Vector to append SQL parameters to
+///
+/// # Returns
+///
+/// Returns an empty string if no filters are applied, otherwise returns
+/// a WHERE clause starting with "WHERE ".
 fn build_forward_where_clause(
     start_date: Option<NaiveDate>,
     end_date: Option<NaiveDate>,
@@ -1184,6 +1934,30 @@ fn build_forward_where_clause(
     }
 }
 
+/// Refreshes aggregated metrics for a session by recalculating from child entities.
+///
+/// This function updates the session's aggregate columns by summing values
+/// from all associated rounds and counting tool calls. It should be called
+/// whenever a round or tool call is added or modified.
+///
+/// # Updated Columns
+///
+/// - `total_rounds`: Count of rounds in the session
+/// - `prompt_tokens`: Sum of prompt tokens from all rounds
+/// - `completion_tokens`: Sum of completion tokens from all rounds
+/// - `total_tokens`: Sum of total tokens from all rounds
+/// - `tool_call_count`: Count of tool calls in the session
+/// - `updated_at`: Timestamp of this update
+///
+/// # Arguments
+///
+/// * `connection` - Database connection to use
+/// * `session_id` - Session to refresh
+/// * `updated_at` - Timestamp for the updated_at column
+///
+/// # Errors
+///
+/// Returns an error if the SQL execution fails.
 fn refresh_session_aggregates(
     connection: &Connection,
     session_id: &str,
@@ -1207,6 +1981,26 @@ fn refresh_session_aggregates(
     Ok(())
 }
 
+/// Loads tool call breakdown (tool_name -> count) for a session.
+///
+/// Retrieves the count of tool invocations grouped by tool name
+/// for the specified session.
+///
+/// # Arguments
+///
+/// * `connection` - Database connection to use
+/// * `session_id` - Session to get tool breakdown for
+///
+/// # Returns
+///
+/// A HashMap mapping tool names to their invocation counts.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let breakdown = load_tool_breakdown(&conn, "session-123")?;
+/// // breakdown might be: {"read_file": 5, "execute_command": 2}
+/// ```
 fn load_tool_breakdown(
     connection: &Connection,
     session_id: &str,
@@ -1226,6 +2020,26 @@ fn load_tool_breakdown(
     Ok(breakdown)
 }
 
+/// Loads all rounds for a session with their associated tool calls.
+///
+/// Retrieves complete round metrics including token usage, status,
+/// and all tool calls made during each round.
+///
+/// # Arguments
+///
+/// * `connection` - Database connection to use
+/// * `session_id` - Session to get rounds for
+///
+/// # Returns
+///
+/// A vector of RoundMetrics ordered by started_at ascending.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - SQL execution fails
+/// - Timestamp parsing fails
+/// - Status values are invalid
 fn load_rounds(connection: &Connection, session_id: &str) -> MetricsResult<Vec<RoundMetrics>> {
     let mut stmt = connection.prepare(
         "SELECT round_id, session_id, model, started_at, completed_at, status, prompt_tokens, completion_tokens, total_tokens, error FROM round_metrics WHERE session_id = ?1 ORDER BY started_at ASC",
@@ -1263,6 +2077,19 @@ fn load_rounds(connection: &Connection, session_id: &str) -> MetricsResult<Vec<R
     Ok(rounds)
 }
 
+/// Loads all tool calls for a specific round.
+///
+/// Retrieves tool invocation details including timing, success status,
+/// and error information.
+///
+/// # Arguments
+///
+/// * `connection` - Database connection to use
+/// * `round_id` - Round to get tool calls for
+///
+/// # Returns
+///
+/// A vector of ToolCallMetrics ordered by started_at ascending.
 fn load_tool_calls(connection: &Connection, round_id: &str) -> MetricsResult<Vec<ToolCallMetrics>> {
     let mut stmt = connection.prepare(
         "SELECT tool_call_id, tool_name, started_at, completed_at, success, error FROM tool_call_metrics WHERE round_id = ?1 ORDER BY started_at ASC",
@@ -1289,6 +2116,26 @@ fn load_tool_calls(connection: &Connection, round_id: &str) -> MetricsResult<Vec
     Ok(tools)
 }
 
+/// Loads model-level token usage breakdown for a specific date.
+///
+/// Retrieves aggregated token usage grouped by AI model for all
+/// sessions that started on the specified date.
+///
+/// # Arguments
+///
+/// * `connection` - Database connection to use
+/// * `date` - Date to get model breakdown for
+///
+/// # Returns
+///
+/// A HashMap mapping model names to their total token usage.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let breakdown = load_daily_model_breakdown(&conn, NaiveDate::from_ymd_opt(2026, 2, 24).unwrap())?;
+/// // breakdown might be: {"gpt-4": TokenUsage{...}, "claude-3": TokenUsage{...}}
+/// ```
 fn load_daily_model_breakdown(
     connection: &Connection,
     date: NaiveDate,
@@ -1322,6 +2169,26 @@ fn load_daily_model_breakdown(
     Ok(breakdown)
 }
 
+/// Loads tool call count breakdown for a specific date.
+///
+/// Retrieves the count of tool invocations grouped by tool name
+/// for all tool calls that occurred on the specified date.
+///
+/// # Arguments
+///
+/// * `connection` - Database connection to use
+/// * `date` - Date to get tool breakdown for
+///
+/// # Returns
+///
+/// A HashMap mapping tool names to their invocation counts.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let breakdown = load_daily_tool_breakdown(&conn, NaiveDate::from_ymd_opt(2026, 2, 24).unwrap())?;
+/// // breakdown might be: {"read_file": 10, "write_file": 5, "execute_command": 3}
+/// ```
 fn load_daily_tool_breakdown(
     connection: &Connection,
     date: NaiveDate,

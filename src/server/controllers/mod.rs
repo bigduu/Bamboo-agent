@@ -1,3 +1,8 @@
+//! HTTP request controllers (handlers)
+//!
+//! This module organizes HTTP request handlers by domain/feature area.
+//! Each controller handles a specific set of related endpoints.
+
 pub mod agent_controller;
 pub mod anthropic;
 pub use anthropic::*;

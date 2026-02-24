@@ -66,6 +66,7 @@
 //! 4. Register in the module's `mod.rs`
 //! 5. Re-export from the parent module
 
+// File operation tools
 pub mod apply_patch;
 pub mod ask_user;
 pub mod create_todo_list;
@@ -90,26 +91,60 @@ pub mod terminal_session;
 pub mod update_todo_item;
 pub mod write_file;
 
+// Re-export file operation tools
+/// Tool for applying unified diff patches to files.
 pub use apply_patch::ApplyPatchTool;
+/// Tool for asking users questions during execution.
 pub use ask_user::AskUserTool;
+/// Tool for creating todo lists to track task progress.
 pub use create_todo_list::CreateTodoListTool;
+/// Tool for executing shell commands with sandboxing.
 pub use execute_command::ExecuteCommandTool;
+/// Tool for checking if a file exists at a given path.
 pub use file_exists::FileExistsTool;
+/// Tool for getting the current working directory.
 pub use get_current_dir::GetCurrentDirTool;
+/// Tool for getting file metadata (size, permissions, timestamps).
 pub use get_file_info::GetFileInfoTool;
+
+// Re-export git operation tools
+/// Tool for showing git diff between commits, staged changes, or working directory.
 pub use git_diff::GitDiffTool;
+/// Tool for checking git repository status (modified files, branch info).
 pub use git_status::GitStatusTool;
+/// Tool for performing git write operations (commit, push, branch, etc.).
 pub use git_write::GitWriteTool;
+
+// Re-export utility tools
+/// Tool for glob pattern matching file search.
 pub use glob_search::GlobSearchTool;
+/// Tool for making HTTP requests to external APIs.
 pub use http_request::HttpRequestTool;
+/// Tool for listing directory contents with optional filtering.
 pub use list_directory::ListDirectoryTool;
+/// Tool for reading entire file contents.
 pub use read_file::ReadFileTool;
+/// Tool for reading specific line ranges from a file.
 pub use read_file_range::ReadFileRangeTool;
+
+// Re-export core registry
+/// Registry for managing and looking up available tools.
 pub use registry::ToolRegistry;
+
+// Re-export search tools
+/// Tool for searching patterns within a single file using regex.
 pub use search_in_file::SearchInFileTool;
+/// Tool for searching patterns across all files in a project.
 pub use search_in_project::SearchInProjectTool;
+
+// Re-export workspace and utility tools
+/// Tool for setting the current workspace directory.
 pub use set_workspace::SetWorkspaceTool;
+/// Tool for introducing delays in execution.
 pub use sleep::SleepTool;
+/// Tool for creating and managing interactive terminal sessions.
 pub use terminal_session::TerminalSessionTool;
+/// Tool for updating todo list items.
 pub use update_todo_item::UpdateTodoItemTool;
+/// Tool for writing content to files.
 pub use write_file::WriteFileTool;

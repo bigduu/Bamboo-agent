@@ -5,6 +5,73 @@
 //! - Graceful and forceful termination
 //! - Live output capture
 //! - Cross-platform process killing
+//!
+//! # Overview
+//!
+//! The process registry maintains a centralized record of all running agent processes
+//! and Claude sessions. It provides thread-safe access to process information and
+//! handles cross-platform process termination.
+//!
+//! # Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────┐
+//! │       ProcessRegistry (Central)         │
+//! │  ┌───────────────────────────────────┐  │
+//! │  │   HashMap<run_id, ProcessHandle>  │  │
+//! │  │  - Process metadata               │  │
+//! │  │  - Child process handle           │  │
+//! │  │  - Live output buffer             │  │
+//! │  └───────────────────────────────────┘  │
+//! └─────────────────────────────────────────┘
+//!            ▲                    ▲
+//!            │                    │
+//!     ┌──────┴─────┐      ┌──────┴─────┐
+//!     │ Agent Run  │      │  Claude    │
+//!     │   Process  │      │  Session   │
+//!     └────────────┘      └────────────┘
+//! ```
+//!
+//! # Usage Example
+//!
+//! ```rust,no_run
+//! use bamboo::process::registry::{ProcessRegistry, ProcessRegistrationConfig};
+//! use std::sync::{Arc, Mutex};
+//! use tokio::process::Command;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), String> {
+//!     // Create registry
+//!     let registry = ProcessRegistry::new();
+//!
+//!     // Spawn a process
+//!     let mut child = Command::new("my-agent")
+//!         .arg("--task")
+//!         .arg("analyze")
+//!         .spawn()
+//!         .map_err(|e| e.to_string())?;
+//!
+//!     let pid = child.id().unwrap_or(0);
+//!
+//!     // Register the process
+//!     let config = ProcessRegistrationConfig {
+//!         run_id: 1000001,
+//!         agent_id: 1,
+//!         agent_name: "CodeAnalyzer".to_string(),
+//!         pid,
+//!         project_path: "/project".to_string(),
+//!         task: "analyze code".to_string(),
+//!         model: "claude-3-5-sonnet".to_string(),
+//!     };
+//!
+//!     registry.register_process(config, child).await?;
+//!
+//!     // Later, kill the process
+//!     registry.kill_process(1000001).await?;
+//!
+//!     Ok(())
+//! }
+//! ```
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -13,47 +80,148 @@ use std::sync::{Arc, Mutex};
 use tokio::process::Child;
 use tokio::sync::Mutex as AsyncMutex;
 
+/// Type of process being tracked in the registry
+///
+/// This enum distinguishes between different types of processes that
+/// can be managed by the registry, each with their own metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProcessType {
-    AgentRun { agent_id: i64, agent_name: String },
-    ClaudeSession { session_id: String },
+    /// An agent run process spawned by the server
+    AgentRun {
+        /// Unique identifier for the agent
+        agent_id: i64,
+        /// Human-readable name of the agent
+        agent_name: String,
+    },
+
+    /// A Claude interactive session process
+    ClaudeSession {
+        /// Session identifier for the Claude conversation
+        session_id: String,
+    },
 }
 
+/// Metadata about a registered process
+///
+/// Contains all the information needed to track, monitor, and manage
+/// a running process throughout its lifecycle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessInfo {
+    /// Unique run identifier for this process execution
     pub run_id: i64,
+
+    /// Type of process (agent run or Claude session)
     pub process_type: ProcessType,
+
+    /// Operating system process ID
     pub pid: u32,
+
+    /// Timestamp when the process was started
     pub started_at: DateTime<Utc>,
+
+    /// Project directory where the process is running
     pub project_path: String,
+
+    /// Task description or prompt being executed
     pub task: String,
+
+    /// Model identifier being used (e.g., "claude-3-5-sonnet")
     pub model: String,
 }
 
+/// Configuration for registering a new agent process
+///
+/// This struct contains all the parameters needed to register
+/// an agent run process in the registry.
 #[derive(Debug, Clone)]
 pub struct ProcessRegistrationConfig {
+    /// Unique run identifier
     pub run_id: i64,
+
+    /// Agent identifier
     pub agent_id: i64,
+
+    /// Human-readable agent name
     pub agent_name: String,
+
+    /// Operating system process ID
     pub pid: u32,
+
+    /// Project directory path
     pub project_path: String,
+
+    /// Task description
     pub task: String,
+
+    /// Model being used
     pub model: String,
 }
 
+/// Internal handle to a registered process
+///
+/// Combines process metadata with runtime resources needed to
+/// manage the process lifecycle and capture output.
 #[allow(dead_code)]
 pub struct ProcessHandle {
+    /// Process metadata and configuration
     pub info: ProcessInfo,
+
+    /// Handle to the child process (if available)
+    ///
+    /// This is wrapped in Arc<Mutex> to allow shared ownership
+    /// and thread-safe access for process management operations.
     pub child: Arc<Mutex<Option<Child>>>,
+
+    /// Buffer for capturing live process output
+    ///
+    /// Stores stdout/stderr output as it's generated, allowing
+    /// clients to retrieve recent output at any time.
     pub live_output: Arc<Mutex<String>>,
 }
 
+/// Central registry for managing running agent processes
+///
+/// The ProcessRegistry maintains a thread-safe map of all running processes,
+/// providing lifecycle management, monitoring, and termination capabilities.
+///
+/// # Thread Safety
+///
+/// The registry uses async-aware locking (`tokio::sync::Mutex`) for the
+/// process map to avoid blocking async tasks. Process handles use
+/// standard `std::sync::Mutex` for synchronous operations.
+///
+/// # Process Lifecycle
+///
+/// ```text
+/// 1. Register → Process added to registry with metadata
+/// 2. Running  → Process executes, output is captured
+/// 3. Kill     → Graceful shutdown attempted, then force kill
+/// 4. Cleanup  → Process removed from registry
+/// ```
 pub struct ProcessRegistry {
+    /// Map of run IDs to process handles
     processes: Arc<AsyncMutex<HashMap<i64, ProcessHandle>>>,
+
+    /// Counter for generating unique run IDs
+    ///
+    /// Starts at 1,000,000 to distinguish from lower numbered IDs
+    /// that might be used elsewhere in the system.
     next_id: Arc<Mutex<i64>>,
 }
 
 impl ProcessRegistry {
+    /// Create a new empty process registry
+    ///
+    /// Initializes the registry with an empty process map and
+    /// sets the ID counter to start at 1,000,000.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use bamboo::process::registry::ProcessRegistry;
+    ///
+    /// let registry = ProcessRegistry::new();
+    /// ```
     pub fn new() -> Self {
         Self {
             processes: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -61,6 +229,24 @@ impl ProcessRegistry {
         }
     }
 
+    /// Generate a unique run ID
+    ///
+    /// Returns the next available run ID and increments the counter.
+    /// IDs start at 1,000,000 and increase sequentially.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ID counter mutex is poisoned.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use bamboo::process::registry::ProcessRegistry;
+    ///
+    /// let registry = ProcessRegistry::new();
+    /// let id = registry.generate_id().unwrap();
+    /// assert!(id >= 1000000);
+    /// ```
     pub fn generate_id(&self) -> Result<i64, String> {
         let mut next_id = self.next_id.lock().map_err(|e| e.to_string())?;
         let id = *next_id;
@@ -68,6 +254,51 @@ impl ProcessRegistry {
         Ok(id)
     }
 
+    /// Register a new agent run process
+    ///
+    /// Adds a newly spawned agent process to the registry with its
+    /// configuration and process handle.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Registration configuration with agent metadata
+    /// * `child` - The spawned child process handle
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if registration succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process map lock fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use bamboo::process::registry::{ProcessRegistry, ProcessRegistrationConfig};
+    /// use tokio::process::Command;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), String> {
+    ///     let registry = ProcessRegistry::new();
+    ///
+    ///     let mut child = Command::new("agent-binary")
+    ///         .spawn()
+    ///         .map_err(|e| e.to_string())?;
+    ///
+    ///     let config = ProcessRegistrationConfig {
+    ///         run_id: 1000001,
+    ///         agent_id: 1,
+    ///         agent_name: "MyAgent".to_string(),
+    ///         pid: child.id().unwrap_or(0),
+    ///         project_path: "/project".to_string(),
+    ///         task: "Analyze code".to_string(),
+    ///         model: "claude-3-5-sonnet".to_string(),
+    ///     };
+    ///
+    ///     registry.register_process(config, child).await
+    /// }
+    /// ```
     pub async fn register_process(
         &self,
         config: ProcessRegistrationConfig,
@@ -100,6 +331,22 @@ impl ProcessRegistry {
             .await
     }
 
+    /// Register a sidecar process without a direct child handle
+    ///
+    /// Used for processes that are managed externally (e.g., by Tauri)
+    /// but still need to be tracked in the registry for monitoring.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Registration configuration with agent metadata
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if registration succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process map lock fails.
     pub async fn register_sidecar_process(
         &self,
         config: ProcessRegistrationConfig,
@@ -139,6 +386,27 @@ impl ProcessRegistry {
         Ok(())
     }
 
+    /// Register a Claude interactive session process
+    ///
+    /// Adds a Claude session to the registry, generating a unique run ID
+    /// if one isn't provided.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - Claude session identifier
+    /// * `pid` - Operating system process ID
+    /// * `project_path` - Project directory path
+    /// * `task` - Task description
+    /// * `model` - Model identifier
+    /// * `child` - Optional child process handle wrapped in Arc<Mutex>
+    ///
+    /// # Returns
+    ///
+    /// Returns the generated or provided run ID on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if ID generation or process map lock fails.
     pub async fn register_claude_session(
         &self,
         session_id: String,
@@ -172,6 +440,7 @@ impl ProcessRegistry {
         Ok(run_id)
     }
 
+    /// Internal helper to register a process in the map
     async fn register_process_internal(
         &self,
         run_id: i64,
@@ -190,6 +459,18 @@ impl ProcessRegistry {
         Ok(())
     }
 
+    /// Get all running Claude session processes
+    ///
+    /// Returns a list of all registered Claude sessions that are
+    /// currently tracked in the registry.
+    ///
+    /// # Returns
+    ///
+    /// Vector of `ProcessInfo` for all Claude sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process map lock fails.
     pub async fn get_running_claude_sessions(&self) -> Result<Vec<ProcessInfo>, String> {
         let processes = self.processes.lock().await;
         Ok(processes
@@ -201,6 +482,22 @@ impl ProcessRegistry {
             .collect())
     }
 
+    /// Find a Claude session by its session ID
+    ///
+    /// Searches the registry for a Claude session matching the
+    /// provided session identifier.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The Claude session ID to search for
+    ///
+    /// # Returns
+    ///
+    /// `Some(ProcessInfo)` if found, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process map lock fails.
     pub async fn get_claude_session_by_id(
         &self,
         session_id: &str,
@@ -215,6 +512,22 @@ impl ProcessRegistry {
             .map(|handle| handle.info.clone()))
     }
 
+    /// Remove a process from the registry
+    ///
+    /// Unregisters a process by its run ID. This does NOT kill the process;
+    /// it only removes it from tracking.
+    ///
+    /// # Arguments
+    ///
+    /// * `run_id` - The run ID of the process to remove
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` whether or not the process existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process map lock fails.
     pub async fn unregister_process(&self, run_id: i64) -> Result<(), String> {
         let mut processes = self.processes.lock().await;
         processes.remove(&run_id);
@@ -222,6 +535,9 @@ impl ProcessRegistry {
     }
 
     /// Synchronous version for use in non-async contexts
+    ///
+    /// Uses `try_lock` to avoid blocking. If the lock is held,
+    /// the operation is skipped (process will be cleaned up later).
     #[allow(dead_code)]
     fn unregister_process_sync(&self, run_id: i64) -> Result<(), String> {
         // Use try_lock to avoid blocking in sync context
@@ -232,6 +548,17 @@ impl ProcessRegistry {
         Ok(())
     }
 
+    /// Get all registered processes (agent runs and Claude sessions)
+    ///
+    /// Returns a list of all processes currently in the registry.
+    ///
+    /// # Returns
+    ///
+    /// Vector of `ProcessInfo` for all registered processes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process map lock fails.
     #[allow(dead_code)]
     pub async fn get_running_processes(&self) -> Result<Vec<ProcessInfo>, String> {
         let processes = self.processes.lock().await;
@@ -241,6 +568,18 @@ impl ProcessRegistry {
             .collect())
     }
 
+    /// Get all running agent run processes
+    ///
+    /// Returns a list of all agent run processes (excluding Claude sessions)
+    /// currently tracked in the registry.
+    ///
+    /// # Returns
+    ///
+    /// Vector of `ProcessInfo` for agent run processes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process map lock fails.
     pub async fn get_running_agent_processes(&self) -> Result<Vec<ProcessInfo>, String> {
         let processes = self.processes.lock().await;
         Ok(processes
@@ -252,12 +591,56 @@ impl ProcessRegistry {
             .collect())
     }
 
+    /// Get process information by run ID
+    ///
+    /// Retrieves metadata for a specific process.
+    ///
+    /// # Arguments
+    ///
+    /// * `run_id` - The run ID to look up
+    ///
+    /// # Returns
+    ///
+    /// `Some(ProcessInfo)` if found, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process map lock fails.
     #[allow(dead_code)]
     pub async fn get_process(&self, run_id: i64) -> Result<Option<ProcessInfo>, String> {
         let processes = self.processes.lock().await;
         Ok(processes.get(&run_id).map(|handle| handle.info.clone()))
     }
 
+    /// Kill a process by run ID
+    ///
+    /// Attempts graceful shutdown first using the child process handle,
+    /// then falls back to system-level process termination if needed.
+    ///
+    /// # Process
+    ///
+    /// 1. Send kill signal via child handle
+    /// 2. Wait up to 5 seconds for graceful exit
+    /// 3. If timeout, use system kill command (kill -KILL or taskkill)
+    /// 4. Remove process from registry
+    ///
+    /// # Arguments
+    ///
+    /// * `run_id` - The run ID of the process to kill
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` if the process was killed successfully,
+    /// `Ok(false)` if the process wasn't found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if process termination fails critically.
+    ///
+    /// # Cross-Platform
+    ///
+    /// - Unix: Uses SIGTERM first, then SIGKILL if needed
+    /// - Windows: Uses taskkill /F
     pub async fn kill_process(&self, run_id: i64) -> Result<bool, String> {
         use log::{error, info, warn};
 
@@ -366,6 +749,28 @@ impl ProcessRegistry {
         Ok(true)
     }
 
+    /// Kill a process by its operating system PID
+    ///
+    /// Uses system commands to terminate a process when the child
+    /// handle is not available or has already been dropped.
+    ///
+    /// # Arguments
+    ///
+    /// * `run_id` - Run ID for registry cleanup
+    /// * `pid` - Operating system process ID
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` if kill succeeded, `Ok(false)` if it failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kill command cannot be executed.
+    ///
+    /// # Cross-Platform Behavior
+    ///
+    /// - Unix: Tries SIGTERM first, waits 2 seconds, then SIGKILL
+    /// - Windows: Uses taskkill /F immediately
     pub async fn kill_process_by_pid(&self, run_id: i64, pid: u32) -> Result<bool, String> {
         use log::{error, info, warn};
 
@@ -433,6 +838,22 @@ impl ProcessRegistry {
         }
     }
 
+    /// Check if a process is still running
+    ///
+    /// Uses `try_wait()` to check if the process has exited without blocking.
+    ///
+    /// # Arguments
+    ///
+    /// * `run_id` - The run ID to check
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` if the process is still running,
+    /// `Ok(false)` if it has exited or doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if lock acquisition fails.
     #[allow(dead_code)]
     pub async fn is_process_running(&self, run_id: i64) -> Result<bool, String> {
         let processes = self.processes.lock().await;
@@ -462,6 +883,22 @@ impl ProcessRegistry {
         }
     }
 
+    /// Append output to a process's live output buffer
+    ///
+    /// Adds a line of output to the process's output buffer for later retrieval.
+    ///
+    /// # Arguments
+    ///
+    /// * `run_id` - The run ID of the process
+    /// * `output` - The output text to append
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` whether or not the process exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if lock acquisition fails.
     pub async fn append_live_output(&self, run_id: i64, output: &str) -> Result<(), String> {
         let processes = self.processes.lock().await;
         if let Some(handle) = processes.get(&run_id) {
@@ -472,6 +909,21 @@ impl ProcessRegistry {
         Ok(())
     }
 
+    /// Retrieve the live output buffer for a process
+    ///
+    /// Gets all captured output for the specified process.
+    ///
+    /// # Arguments
+    ///
+    /// * `run_id` - The run ID of the process
+    ///
+    /// # Returns
+    ///
+    /// The accumulated output string, or empty string if process not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if lock acquisition fails.
     pub async fn get_live_output(&self, run_id: i64) -> Result<String, String> {
         let processes = self.processes.lock().await;
         if let Some(handle) = processes.get(&run_id) {
@@ -482,6 +934,18 @@ impl ProcessRegistry {
         }
     }
 
+    /// Remove all finished processes from the registry
+    ///
+    /// Checks each registered process and removes those that have exited.
+    /// Useful for periodic cleanup.
+    ///
+    /// # Returns
+    ///
+    /// Vector of run IDs that were removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if process checks or lock acquisition fails.
     #[allow(dead_code)]
     pub async fn cleanup_finished_processes(&self) -> Result<Vec<i64>, String> {
         let mut finished_runs = Vec::new();

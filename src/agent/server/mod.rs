@@ -1,3 +1,8 @@
+//! Agent server module (deprecated)
+//!
+//! This module provides backward compatibility re-exports.
+//! All functionality has been moved to `crate::server`.
+
 // Deprecated: These modules have been moved to crate::server
 // Re-exports provided for backward compatibility
 

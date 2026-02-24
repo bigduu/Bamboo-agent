@@ -40,10 +40,15 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 // New expression DSL modules
+/// Condition predicates for workflow branching
 pub mod condition;
+/// Execution context and state management
 pub mod context;
+/// Workflow executor implementation
 pub mod executor;
+/// Tool expression AST types
 pub mod expr;
+/// Parallel execution strategies
 pub mod parallel;
 
 // Re-export new DSL types

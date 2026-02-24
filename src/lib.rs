@@ -78,32 +78,69 @@ impl BambooServer {
 }
 
 /// Builder pattern for creating BambooServer
+///
+/// Provides a fluent API for configuring and instantiating a BambooServer.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use bamboo::{BambooBuilder, BambooServer};
+/// use std::path::PathBuf;
+///
+/// let server = BambooBuilder::new()
+///     .port(8080)
+///     .bind("127.0.0.1")
+///     .data_dir(PathBuf::from("~/.local/share/bamboo"))
+///     .build()
+///     .unwrap();
+/// ```
 pub struct BambooBuilder {
     config: BambooConfig,
 }
 
 impl BambooBuilder {
+    /// Create a new BambooBuilder with default configuration
     pub fn new() -> Self {
         Self {
             config: BambooConfig::default(),
         }
     }
 
+    /// Set the server port
+    ///
+    /// # Arguments
+    ///
+    /// * `port` - Port number to listen on
     pub fn port(mut self, port: u16) -> Self {
         self.config.server.port = port;
         self
     }
 
+    /// Set the bind address
+    ///
+    /// # Arguments
+    ///
+    /// * `addr` - IP address to bind to (e.g., "127.0.0.1", "0.0.0.0")
     pub fn bind(mut self, addr: &str) -> Self {
         self.config.server.bind = addr.to_string();
         self
     }
 
+    /// Set the data directory for storing configuration and data
+    ///
+    /// # Arguments
+    ///
+    /// * `dir` - Path to the data directory
     pub fn data_dir(mut self, dir: PathBuf) -> Self {
         self.config.data_dir = dir;
         self
     }
 
+    /// Build the BambooServer instance
+    ///
+    /// # Returns
+    ///
+    /// A Result containing the configured BambooServer or an error
     pub fn build(self) -> Result<BambooServer> {
         Ok(BambooServer::new(self.config))
     }

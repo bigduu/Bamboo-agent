@@ -1,3 +1,55 @@
+//! Slash command management for Bamboo agents.
+//!
+//! This module provides functionality for discovering, loading, and managing
+//! slash commands from both project-level and user-level directories.
+//!
+//! # Command Discovery
+//!
+//! Commands are discovered from multiple locations:
+//! - **Default commands**: Built-in commands like `/add-dir`, `/init`, `/review`
+//! - **Project commands**: `.claude/commands/` directory in the project root
+//! - **User commands**: `~/.claude/commands/` directory in the user's home
+//!
+//! # Command Format
+//!
+//! Commands are Markdown files with optional YAML frontmatter:
+//!
+//! ```markdown
+//! ---
+//! description: Build the project
+//! allowed-tools:
+//!   - execute_command
+//!   - read_file
+//! ---
+//!
+//! Run the following command to build:
+//! !`cargo build --release`
+//! ```
+//!
+//! # Namespaced Commands
+//!
+//! Commands can be organized in subdirectories to create namespaces:
+//! - `commands/dev/build.md` → `/dev:build`
+//! - `commands/team/review.md` → `/team:review`
+//!
+//! # Example
+//!
+//! ```no_run
+//! use bamboo_commands::{slash_commands_list, slash_command_get};
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     // List all available commands
+//!     let commands = slash_commands_list(Some("./my-project".to_string()))
+//!         .await
+//!         .unwrap();
+//!
+//!     for cmd in commands {
+//!         println!("{}: {:?}", cmd.full_command, cmd.description);
+//!     }
+//! }
+//! ```
+
 use anyhow::{Context, Result};
 use dirs;
 use log::{debug, error, info};
@@ -5,29 +57,89 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Represents a slash command with its metadata and content.
+///
+/// A slash command is a reusable prompt template that can be invoked
+/// by the user using the `/` prefix. Commands can be namespaced and
+/// may include special syntax for bash commands, file references,
+/// and argument placeholders.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlashCommand {
+    /// Unique identifier for the command (e.g., "project-commands-build-md").
     pub id: String,
+
+    /// The command name without namespace (e.g., "build").
     pub name: String,
+
+    /// The full command including namespace prefix (e.g., "/dev:build").
     pub full_command: String,
+
+    /// The scope where the command is defined: "default", "project", or "user".
     pub scope: String,
+
+    /// Optional namespace for the command (e.g., "dev" for "/dev:build").
     pub namespace: Option<String>,
+
+    /// Absolute path to the command file on disk.
     pub file_path: String,
+
+    /// The Markdown content of the command (body only, without frontmatter).
     pub content: String,
+
+    /// Human-readable description of what the command does.
     pub description: Option<String>,
+
+    /// List of tool names that this command is allowed to use.
+    /// If empty, all tools are allowed.
     pub allowed_tools: Vec<String>,
+
+    /// Whether the command contains bash command syntax (!`...`).
     pub has_bash_commands: bool,
+
+    /// Whether the command contains file reference syntax (@file).
     pub has_file_references: bool,
+
+    /// Whether the command accepts $ARGUMENTS placeholder.
     pub accepts_arguments: bool,
 }
 
+/// YAML frontmatter metadata for a command.
+///
+/// This structure represents the optional YAML frontmatter that can
+/// appear at the beginning of a command Markdown file, enclosed by `---`.
 #[derive(Debug, Deserialize)]
 struct CommandFrontmatter {
+    /// List of tool names that this command is allowed to invoke.
     #[serde(rename = "allowed-tools")]
     allowed_tools: Option<Vec<String>>,
+
+    /// Human-readable description of the command's purpose.
     description: Option<String>,
 }
 
+/// Parse Markdown content with optional YAML frontmatter.
+///
+/// Extracts YAML metadata enclosed between `---` delimiters at the
+/// beginning of the file, returning both the parsed frontmatter
+/// and the remaining body content.
+///
+/// # Arguments
+///
+/// * `content` - The raw file content to parse.
+///
+/// # Returns
+///
+/// A tuple containing:
+/// - `Option<CommandFrontmatter>` - Parsed frontmatter if present and valid.
+/// - `String` - The body content (everything after the frontmatter).
+///
+/// # Example
+///
+/// ```ignore
+/// let content = "---\ndescription: Test\n---\nBody content";
+/// let (frontmatter, body) = parse_markdown_with_frontmatter(content)?;
+/// assert_eq!(body, "Body content");
+/// ```
 fn parse_markdown_with_frontmatter(content: &str) -> Result<(Option<CommandFrontmatter>, String)> {
     let lines: Vec<&str> = content.lines().collect();
 
@@ -59,6 +171,28 @@ fn parse_markdown_with_frontmatter(content: &str) -> Result<(Option<CommandFront
     }
 }
 
+/// Extract command name and namespace from file path.
+///
+/// Parses the file path relative to the base commands directory to
+/// determine the command name and optional namespace hierarchy.
+///
+/// # Arguments
+///
+/// * `file_path` - Absolute path to the command file.
+/// * `base_path` - Base directory for commands (e.g., `.claude/commands`).
+///
+/// # Returns
+///
+/// A tuple of `(name, namespace)` where:
+/// - `name` is the command name (filename without extension).
+/// - `namespace` is `None` for top-level commands, or `Some("ns1:ns2")`
+///   for nested commands.
+///
+/// # Examples
+///
+/// - `commands/build.md` → `("build", None)`
+/// - `commands/dev/build.md` → `("build", Some("dev"))`
+/// - `commands/team/dev/build.md` → `("build", Some("team:dev"))`
 fn extract_command_info(file_path: &Path, base_path: &Path) -> Result<(String, Option<String>)> {
     let relative_path = file_path
         .strip_prefix(base_path)
@@ -84,6 +218,27 @@ fn extract_command_info(file_path: &Path, base_path: &Path) -> Result<(String, O
     }
 }
 
+/// Load a slash command from a Markdown file.
+///
+/// Reads the file content, parses frontmatter, extracts command metadata,
+/// and constructs a complete `SlashCommand` instance.
+///
+/// # Arguments
+///
+/// * `file_path` - Path to the command Markdown file.
+/// * `base_path` - Base commands directory for calculating relative paths.
+/// * `scope` - The command scope ("default", "project", or "user").
+///
+/// # Returns
+///
+/// A `SlashCommand` with all metadata populated.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The file cannot be read.
+/// - The file path is invalid.
+/// - YAML frontmatter is malformed (logs warning and continues without it).
 fn load_command_from_file(file_path: &Path, base_path: &Path, scope: &str) -> Result<SlashCommand> {
     debug!("Loading command from: {:?}", file_path);
 
@@ -130,6 +285,19 @@ fn load_command_from_file(file_path: &Path, base_path: &Path, scope: &str) -> Re
     })
 }
 
+/// Recursively find all Markdown files in a directory.
+///
+/// Traverses the directory tree and collects all `.md` files,
+/// skipping hidden files and directories (starting with `.`).
+///
+/// # Arguments
+///
+/// * `dir` - Directory to search.
+/// * `files` - Vector to collect found file paths.
+///
+/// # Returns
+///
+/// `Ok(())` on success, or an error if directory traversal fails.
 fn find_markdown_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     if !dir.exists() {
         return Ok(());
@@ -159,6 +327,12 @@ fn find_markdown_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Create the list of default built-in commands.
+///
+/// These commands are always available and do not require files on disk:
+/// - `/add-dir` - Add additional working directories.
+/// - `/init` - Initialize project with CLAUDE.md guide.
+/// - `/review` - Request code review.
 fn create_default_commands() -> Vec<SlashCommand> {
     vec![
         SlashCommand {
@@ -206,6 +380,36 @@ fn create_default_commands() -> Vec<SlashCommand> {
     ]
 }
 
+/// List all available slash commands.
+///
+/// Discovers and loads slash commands from:
+/// 1. Default built-in commands.
+/// 2. Project-level commands in `.claude/commands/`.
+/// 3. User-level commands in `~/.claude/commands/`.
+///
+/// Commands from all sources are merged, with project and user commands
+/// taking precedence over defaults.
+///
+/// # Arguments
+///
+/// * `project_path` - Optional path to the project root directory.
+///
+/// # Returns
+///
+/// A vector of all discovered `SlashCommand` instances.
+///
+/// # Errors
+///
+/// Returns an error string if command loading fails critically.
+///
+/// # Example
+///
+/// ```no_run
+/// let commands = slash_commands_list(Some("./my-project".to_string())).await?;
+/// for cmd in commands {
+///     println!("{} - {:?}", cmd.full_command, cmd.description);
+/// }
+/// ```
 pub async fn slash_commands_list(
     project_path: Option<String>,
 ) -> Result<Vec<SlashCommand>, String> {
@@ -266,6 +470,31 @@ pub async fn slash_commands_list(
     Ok(commands)
 }
 
+/// Get a specific slash command by its ID.
+///
+/// Searches through all available commands to find one matching
+/// the given command ID.
+///
+/// # Arguments
+///
+/// * `command_id` - The unique identifier of the command (e.g., "project-commands-build-md").
+///
+/// # Returns
+///
+/// The matching `SlashCommand` if found.
+///
+/// # Errors
+///
+/// Returns an error string if:
+/// - The command ID format is invalid.
+/// - No command with the given ID is found.
+///
+/// # Example
+///
+/// ```no_run
+/// let command = slash_command_get("project-commands-build-md".to_string()).await?;
+/// println!("Command: {}", command.full_command);
+/// ```
 pub async fn slash_command_get(command_id: String) -> Result<SlashCommand, String> {
     debug!("Getting slash command: {}", command_id);
 
@@ -282,6 +511,46 @@ pub async fn slash_command_get(command_id: String) -> Result<SlashCommand, Strin
         .ok_or_else(|| format!("Command not found: {}", command_id))
 }
 
+/// Save a new slash command to disk.
+///
+/// Creates a new command file with optional YAML frontmatter and
+/// writes it to the appropriate directory based on scope.
+///
+/// # Arguments
+///
+/// * `scope` - Where to save the command: "project" or "user".
+/// * `name` - The command name (filename without extension).
+/// * `namespace` - Optional namespace hierarchy (e.g., "dev" for `/dev:build`).
+/// * `content` - The Markdown body content of the command.
+/// * `description` - Optional description for the frontmatter.
+/// * `allowed_tools` - List of tools the command can use (empty = all).
+/// * `project_path` - Required if scope is "project".
+///
+/// # Returns
+///
+/// The newly created `SlashCommand` instance.
+///
+/// # Errors
+///
+/// Returns an error string if:
+/// - The command name is empty.
+/// - The scope is invalid (not "project" or "user").
+/// - The project path is missing for project scope.
+/// - Directory creation or file writing fails.
+///
+/// # Example
+///
+/// ```no_run
+/// let command = slash_command_save(
+///     "project".to_string(),
+///     "build".to_string(),
+///     Some("dev".to_string()),
+///     "Run cargo build".to_string(),
+///     Some("Build the project".to_string()),
+///     vec!["execute_command".to_string()],
+///     Some("./my-project".to_string()),
+/// ).await?;
+/// ```
 pub async fn slash_command_save(
     scope: String,
     name: String,
@@ -353,6 +622,36 @@ pub async fn slash_command_save(
         .map_err(|e| format!("Failed to load saved command: {}", e))
 }
 
+/// Delete a slash command from disk.
+///
+/// Removes the command file and cleans up any empty parent directories
+/// that were created for namespacing.
+///
+/// # Arguments
+///
+/// * `command_id` - The unique identifier of the command to delete.
+/// * `project_path` - Required if deleting a project-scoped command.
+///
+/// # Returns
+///
+/// A success message indicating which command was deleted.
+///
+/// # Errors
+///
+/// Returns an error string if:
+/// - The command is not found.
+/// - A project command is deleted without providing project_path.
+/// - File deletion fails.
+///
+/// # Example
+///
+/// ```no_run
+/// let result = slash_command_delete(
+///     "project-commands-build-md".to_string(),
+///     Some("./my-project".to_string()),
+/// ).await?;
+/// println!("{}", result); // "Deleted command: /dev:build"
+/// ```
 pub async fn slash_command_delete(
     command_id: String,
     project_path: Option<String>,
@@ -382,6 +681,18 @@ pub async fn slash_command_delete(
     Ok(format!("Deleted command: {}", command.full_command))
 }
 
+/// Recursively remove empty directories after command deletion.
+///
+/// Walks up the directory tree from the deleted command's location
+/// and removes any empty parent directories created for namespacing.
+///
+/// # Arguments
+///
+/// * `dir` - Directory to check and potentially remove.
+///
+/// # Returns
+///
+/// `Ok(())` on success, or an error if directory operations fail.
 fn remove_empty_dirs(dir: &Path) -> Result<()> {
     if !dir.exists() {
         return Ok(());
