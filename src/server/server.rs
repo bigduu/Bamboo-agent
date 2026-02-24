@@ -64,11 +64,7 @@ pub async fn run(app_data_dir: PathBuf, port: u16) -> Result<(), String> {
 /// * `app_data_dir` - Application data directory
 /// * `port` - Port to listen on
 /// * `bind` - Bind address (127.0.0.1, 0.0.0.0, or custom)
-pub async fn run_with_bind(
-    app_data_dir: PathBuf,
-    port: u16,
-    bind: &str,
-) -> Result<(), String> {
+pub async fn run_with_bind(app_data_dir: PathBuf, port: u16, bind: &str) -> Result<(), String> {
     info!("Starting unified server on {}:{}", bind, port);
 
     let app_state = web::Data::new(AppState::new(app_data_dir.clone()).await);
@@ -263,7 +259,10 @@ impl WebService {
         self.shutdown_tx = Some(shutdown_tx);
         self.server_handle = Some(server_handle);
 
-        info!("Web service started successfully on http://127.0.0.1:{}", port);
+        info!(
+            "Web service started successfully on http://127.0.0.1:{}",
+            port
+        );
         Ok(())
     }
 

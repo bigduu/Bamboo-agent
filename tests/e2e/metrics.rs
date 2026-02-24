@@ -1,8 +1,8 @@
 //! E2E tests for /api/v1/metrics/* endpoints
 
 use actix_web::{test, web, App};
-use bamboo_agent::server::handlers;
 use bamboo_agent::server::app_state::AppState;
+use bamboo_agent::server::handlers;
 
 #[actix_web::test]
 async fn test_metrics_summary_endpoint() {

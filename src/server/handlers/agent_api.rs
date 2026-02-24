@@ -727,10 +727,7 @@ pub fn config(cfg: &mut web::ServiceConfig) {
                 web::get().to(list_running_claude_sessions),
             )
             .route("/sessions/execute", web::post().to(execute_claude_code))
-            .route(
-                "/sessions/cancel",
-                web::post().to(cancel_claude_execution),
-            )
+            .route("/sessions/cancel", web::post().to(cancel_claude_execution))
             .route(
                 "/sessions/{session_id}/jsonl",
                 web::get().to(get_session_jsonl),

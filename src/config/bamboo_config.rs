@@ -101,8 +101,8 @@ impl BambooConfig {
         let content = fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read config file: {:?}", config_path))?;
 
-        let config: BambooConfig =
-            serde_json::from_str(&content).with_context(|| "Failed to parse config file as JSON")?;
+        let config: BambooConfig = serde_json::from_str(&content)
+            .with_context(|| "Failed to parse config file as JSON")?;
 
         Ok(config)
     }

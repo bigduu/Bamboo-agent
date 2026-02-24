@@ -7,7 +7,7 @@ use crate::agent::llm::protocol::FromProvider;
 use crate::agent::llm::LLMChunk;
 use crate::server::services::gemini_model_mapping_service::resolve_model;
 use crate::server::{
-    error::AppError, model_config_helper::get_default_model_from_config, app_state::AppState,
+    app_state::AppState, error::AppError, model_config_helper::get_default_model_from_config,
 };
 use actix_web::{web, HttpResponse};
 use anyhow::anyhow;

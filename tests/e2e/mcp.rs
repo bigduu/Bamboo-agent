@@ -1,8 +1,8 @@
 //! E2E tests for /api/v1/mcp/* endpoints
 
 use actix_web::{test, web, App};
-use bamboo_agent::server::handlers;
 use bamboo_agent::server::app_state::AppState;
+use bamboo_agent::server::handlers;
 use serde_json::json;
 
 #[actix_web::test]

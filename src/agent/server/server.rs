@@ -4,8 +4,8 @@ use std::io;
 use std::path::PathBuf;
 use std::thread;
 
-use crate::server::handlers::agent;
 use crate::agent::server::state::AppState;
+use crate::server::handlers::agent;
 
 #[allow(dead_code)]
 pub async fn run_server(port: u16) -> io::Result<()> {
@@ -76,10 +76,7 @@ pub async fn run_server_with_config_and_mode(
                         "/stream/{session_id}",
                         web::get().to(agent::stream::handler),
                     )
-                    .route(
-                        "/stop/{session_id}",
-                        web::post().to(agent::stop::handler),
-                    )
+                    .route("/stop/{session_id}", web::post().to(agent::stop::handler))
                     .route(
                         "/history/{session_id}",
                         web::get().to(agent::history::handler),
@@ -104,18 +101,9 @@ pub async fn run_server_with_config_and_mode(
                         "/sessions/{session_id}",
                         web::delete().to(agent::delete::handler),
                     )
-                    .route(
-                        "/metrics/summary",
-                        web::get().to(agent::metrics::summary),
-                    )
-                    .route(
-                        "/metrics/by-model",
-                        web::get().to(agent::metrics::by_model),
-                    )
-                    .route(
-                        "/metrics/sessions",
-                        web::get().to(agent::metrics::sessions),
-                    )
+                    .route("/metrics/summary", web::get().to(agent::metrics::summary))
+                    .route("/metrics/by-model", web::get().to(agent::metrics::by_model))
+                    .route("/metrics/sessions", web::get().to(agent::metrics::sessions))
                     .route(
                         "/metrics/sessions/{session_id}",
                         web::get().to(agent::metrics::session_detail),
@@ -138,10 +126,7 @@ pub async fn run_server_with_config_and_mode(
                             .route("/servers", web::post().to(agent::mcp::add_server))
                             .route("/servers/{id}", web::get().to(agent::mcp::get_server))
                             .route("/servers/{id}", web::put().to(agent::mcp::update_server))
-                            .route(
-                                "/servers/{id}",
-                                web::delete().to(agent::mcp::delete_server),
-                            )
+                            .route("/servers/{id}", web::delete().to(agent::mcp::delete_server))
                             .route(
                                 "/servers/{id}/connect",
                                 web::post().to(agent::mcp::connect_server),

@@ -6,7 +6,10 @@
 use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::{dev::HttpServiceFactory, web};
 
-use crate::server::handlers::{agent, agent_api, anthropic, command, copilot_auth, gemini, openai, settings, skill, tools, workspace};
+use crate::server::handlers::{
+    agent, agent_api, anthropic, command, copilot_auth, gemini, openai, settings, skill, tools,
+    workspace,
+};
 
 fn openai_compatible_v1_scope(
     openai_routes: impl HttpServiceFactory + 'static,
@@ -22,10 +25,7 @@ fn openai_compatible_v1_scope(
                     web::get().to(agent_api::get_project_sessions),
                 )
                 .route("/settings", web::get().to(agent_api::get_claude_settings))
-                .route(
-                    "/settings",
-                    web::post().to(agent_api::save_claude_settings),
-                )
+                .route("/settings", web::post().to(agent_api::save_claude_settings))
                 .route(
                     "/system-prompt",
                     web::get().to(agent_api::get_system_prompt),
@@ -60,18 +60,12 @@ fn openai_compatible_v1_scope(
         // OpenAI-compatible endpoints
         .service(openai_routes)
         // Settings routes
-        .route(
-            "/bamboo/workflows",
-            web::get().to(settings::list_workflows),
-        )
+        .route("/bamboo/workflows", web::get().to(settings::list_workflows))
         .route(
             "/bamboo/workflows/{name}",
             web::get().to(settings::get_workflow),
         )
-        .route(
-            "/bamboo/workflows",
-            web::post().to(settings::save_workflow),
-        )
+        .route("/bamboo/workflows", web::post().to(settings::save_workflow))
         .route(
             "/bamboo/workflows/{name}",
             web::delete().to(settings::delete_workflow),
@@ -227,10 +221,7 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 "/stream/{session_id}",
                 web::get().to(agent::stream::handler),
             )
-            .route(
-                "/stop/{session_id}",
-                web::post().to(agent::stop::handler),
-            )
+            .route("/stop/{session_id}", web::post().to(agent::stop::handler))
             .route(
                 "/history/{session_id}",
                 web::get().to(agent::history::handler),
@@ -257,26 +248,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             )
             .route("/health", web::get().to(agent::health::handler))
             // Metrics routes (agent metrics)
-            .route(
-                "/metrics/summary",
-                web::get().to(agent::metrics::summary),
-            )
-            .route(
-                "/metrics/by-model",
-                web::get().to(agent::metrics::by_model),
-            )
-            .route(
-                "/metrics/sessions",
-                web::get().to(agent::metrics::sessions),
-            )
+            .route("/metrics/summary", web::get().to(agent::metrics::summary))
+            .route("/metrics/by-model", web::get().to(agent::metrics::by_model))
+            .route("/metrics/sessions", web::get().to(agent::metrics::sessions))
             .route(
                 "/metrics/sessions/{session_id}",
                 web::get().to(agent::metrics::session_detail),
             )
-            .route(
-                "/metrics/daily",
-                web::get().to(agent::metrics::daily),
-            )
+            .route("/metrics/daily", web::get().to(agent::metrics::daily))
             // Forward metrics routes (API proxy metrics)
             .route(
                 "/metrics/forward/summary",
@@ -295,18 +274,9 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 web::scope("/mcp")
                     .route("/servers", web::get().to(agent::mcp::list_servers))
                     .route("/servers", web::post().to(agent::mcp::add_server))
-                    .route(
-                        "/servers/{id}",
-                        web::get().to(agent::mcp::get_server),
-                    )
-                    .route(
-                        "/servers/{id}",
-                        web::put().to(agent::mcp::update_server),
-                    )
-                    .route(
-                        "/servers/{id}",
-                        web::delete().to(agent::mcp::delete_server),
-                    )
+                    .route("/servers/{id}", web::get().to(agent::mcp::get_server))
+                    .route("/servers/{id}", web::put().to(agent::mcp::update_server))
+                    .route("/servers/{id}", web::delete().to(agent::mcp::delete_server))
                     .route(
                         "/servers/{id}/connect",
                         web::post().to(agent::mcp::connect_server),
@@ -333,7 +303,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
 /// Routes for OpenAI chat completions, agent management, commands, settings, skills, tools, workspace
 pub fn openai_compatible_routes(cfg: &mut web::ServiceConfig) {
     let openai_routes = web::scope("")
-        .route("/chat/completions", web::post().to(openai::chat_completions))
+        .route(
+            "/chat/completions",
+            web::post().to(openai::chat_completions),
+        )
         .route("/models", web::get().to(openai::get_models));
 
     cfg.service(openai_compatible_v1_scope(openai_routes));
@@ -352,7 +325,10 @@ pub fn openai_compatible_routes_with_rate_limiting(cfg: &mut web::ServiceConfig)
 
     let openai_routes = web::scope("")
         .wrap(Governor::new(&rate_limiter))
-        .route("/chat/completions", web::post().to(openai::chat_completions))
+        .route(
+            "/chat/completions",
+            web::post().to(openai::chat_completions),
+        )
         .route("/models", web::get().to(openai::get_models));
 
     cfg.service(openai_compatible_v1_scope(openai_routes));
@@ -364,7 +340,7 @@ pub fn anthropic_routes(cfg: &mut web::ServiceConfig) {
         web::scope("/anthropic/v1")
             .route("/messages", web::post().to(anthropic::messages))
             .route("/complete", web::post().to(anthropic::complete))
-            .route("/models", web::get().to(anthropic::get_models))
+            .route("/models", web::get().to(anthropic::get_models)),
     );
 }
 
@@ -373,8 +349,14 @@ pub fn gemini_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/gemini/v1beta")
             .route("/models", web::get().to(gemini::list_models))
-            .route("/models/{model}:generateContent", web::post().to(gemini::generate_content))
-            .route("/models/{model}:streamGenerateContent", web::post().to(gemini::stream_generate_content))
+            .route(
+                "/models/{model}:generateContent",
+                web::post().to(gemini::generate_content),
+            )
+            .route(
+                "/models/{model}:streamGenerateContent",
+                web::post().to(gemini::stream_generate_content),
+            ),
     );
 }
 

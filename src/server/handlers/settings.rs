@@ -1,6 +1,6 @@
 use crate::core::keyword_masking::{KeywordEntry, KeywordMaskingConfig};
 use crate::core::ProxyAuth;
-use crate::server::{error::AppError, app_state::AppState};
+use crate::server::{app_state::AppState, error::AppError};
 use actix_web::{web, HttpResponse};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -1826,7 +1826,10 @@ pub fn config(cfg: &mut web::ServiceConfig) {
     cfg.route("/bamboo/workflows", web::get().to(list_workflows))
         .route("/bamboo/workflows/{name}", web::get().to(get_workflow))
         .route("/bamboo/workflows", web::post().to(save_workflow))
-        .route("/bamboo/workflows/{name}", web::delete().to(delete_workflow))
+        .route(
+            "/bamboo/workflows/{name}",
+            web::delete().to(delete_workflow),
+        )
         // Setup status endpoints
         .route("/bamboo/setup/status", web::get().to(get_setup_status))
         .route(

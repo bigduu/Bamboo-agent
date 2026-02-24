@@ -321,11 +321,21 @@ impl AppState {
         let config = Config::new();
 
         // Create provider with direct access (no HTTP proxy)
-        let provider = match crate::agent::llm::create_provider_with_dir(&config, app_data_dir.clone()).await {
+        let provider = match crate::agent::llm::create_provider_with_dir(
+            &config,
+            app_data_dir.clone(),
+        )
+        .await
+        {
             Ok(p) => p,
             Err(e) => {
-                log::error!("Failed to create provider: {}. Using OpenAI as fallback.", e);
-                Arc::new(crate::agent::llm::OpenAIProvider::new("sk-test".to_string()))
+                log::error!(
+                    "Failed to create provider: {}. Using OpenAI as fallback.",
+                    e
+                );
+                Arc::new(crate::agent::llm::OpenAIProvider::new(
+                    "sk-test".to_string(),
+                ))
             }
         };
 
@@ -383,7 +393,8 @@ impl AppState {
         log::info!("Storage initialized successfully at: {:?}", sessions_dir);
 
         // Initialize built-in tools
-        let builtin_tools: Arc<dyn ToolExecutor> = Arc::new(crate::agent::tools::BuiltinToolExecutor::new());
+        let builtin_tools: Arc<dyn ToolExecutor> =
+            Arc::new(crate::agent::tools::BuiltinToolExecutor::new());
 
         // Initialize MCP manager
         let mcp_manager = Arc::new(McpServerManager::new());
@@ -397,8 +408,10 @@ impl AppState {
             mcp_manager.clone(),
             mcp_manager.tool_index(),
         ));
-        let tools: Arc<dyn ToolExecutor> =
-            Arc::new(crate::agent::mcp::CompositeToolExecutor::new(builtin_tools, mcp_tools));
+        let tools: Arc<dyn ToolExecutor> = Arc::new(crate::agent::mcp::CompositeToolExecutor::new(
+            builtin_tools,
+            mcp_tools,
+        ));
 
         // Initialize skill manager
         let skill_manager = Arc::new(SkillManager::with_config(SkillStoreConfig {

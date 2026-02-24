@@ -1,4 +1,4 @@
-use crate::server::{error::AppError, app_state::AppState};
+use crate::server::{app_state::AppState, error::AppError};
 use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 

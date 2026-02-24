@@ -110,7 +110,7 @@ pub use config::{build_cors, build_security_headers};
 pub use error::AppError;
 pub use metrics::MetricsInfrastructure;
 pub use routes::{
-    configure_routes, configure_routes_with_rate_limiting, agent_routes,
-    openai_compatible_routes, anthropic_routes, gemini_routes,
+    agent_routes, anthropic_routes, configure_routes, configure_routes_with_rate_limiting,
+    gemini_routes, openai_compatible_routes,
 };
 pub use server::{run, run_with_bind, run_with_bind_and_static, WebService};

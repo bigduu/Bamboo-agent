@@ -1,8 +1,8 @@
 //! E2E tests for /api/v1/sessions/{session_id} DELETE endpoint
 
 use actix_web::{test, web, App};
-use bamboo_agent::server::handlers;
 use bamboo_agent::server::app_state::AppState;
+use bamboo_agent::server::handlers;
 
 #[actix_web::test]
 async fn test_delete_session_endpoint() {

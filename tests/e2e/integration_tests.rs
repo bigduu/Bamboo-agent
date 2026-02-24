@@ -3,8 +3,8 @@
 //! Tests that verify all endpoints are properly registered and accessible
 
 use actix_web::{test, web, App};
-use bamboo_agent::server::handlers;
 use bamboo_agent::server::app_state::AppState;
+use bamboo_agent::server::handlers;
 
 /// Helper to create the full API scope for testing
 fn create_api_scope() -> actix_web::Scope {

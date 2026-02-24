@@ -8,7 +8,7 @@ use crate::agent::llm::protocol::FromProvider;
 use crate::agent::server::state::AppState as AgentAppState;
 use crate::server::services::anthropic_model_mapping_service::load_anthropic_model_mapping;
 use crate::server::{
-    error::AppError, model_config_helper::get_default_model_from_config, app_state::AppState,
+    app_state::AppState, error::AppError, model_config_helper::get_default_model_from_config,
 };
 use actix_web::{http::StatusCode, web, HttpResponse};
 use async_stream::stream;
