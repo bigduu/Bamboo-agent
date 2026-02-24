@@ -331,7 +331,7 @@ mod tests {
         let state = AppState::new(temp_dir.path().to_path_buf()).await;
 
         // Verify basic fields
-        assert!(state.sessions.blocking_read().is_empty());
+        assert!(state.sessions.read().await.is_empty());
         assert!(!state.model_name.is_empty());
     }
 }
