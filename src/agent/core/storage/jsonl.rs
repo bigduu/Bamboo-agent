@@ -158,12 +158,26 @@ impl JsonlStorage {
     }
 }
 
+/// Trait for session and event storage backends.
+///
+/// Provides an abstract interface for persisting and retrieving session data
+/// and event streams. Implementations can use different storage backends
+/// (e.g., JSONL files, databases, cloud storage).
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
+    /// Saves a session's metadata.
     async fn save_session(&self, session: &Session) -> std::io::Result<()>;
+
+    /// Loads a session by ID, returns None if not found.
     async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>>;
+
+    /// Appends an event to the session's event stream.
     async fn append_event(&self, session_id: &str, event: &AgentEvent) -> std::io::Result<()>;
+
+    /// Loads all events for a session.
     async fn load_events(&self, session_id: &str) -> std::io::Result<Vec<AgentEvent>>;
+
+    /// Deletes a session and its events, returns true if anything was deleted.
     async fn delete_session(&self, session_id: &str) -> std::io::Result<bool>;
 }
 

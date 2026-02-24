@@ -1,3 +1,8 @@
+//! OpenAI API provider implementation.
+//!
+//! This module provides integration with OpenAI's chat completion API,
+//! including support for streaming responses and function calling.
+
 use async_trait::async_trait;
 use reqwest::Client;
 
@@ -8,6 +13,7 @@ use crate::agent::llm::types::LLMChunk;
 use super::common::openai_compat::{build_openai_compat_body, parse_openai_compat_sse_data_strict};
 use super::common::sse::llm_stream_from_sse;
 
+/// OpenAI API provider for chat completions.
 pub struct OpenAIProvider {
     client: Client,
     api_key: String,
@@ -15,6 +21,7 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
+    /// Creates a new OpenAI provider with an API key.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
@@ -23,6 +30,7 @@ impl OpenAIProvider {
         }
     }
 
+    /// Sets a custom base URL (e.g., for proxies or alternative endpoints).
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self

@@ -1,3 +1,9 @@
+//! Context for building tool usage guides.
+//!
+//! This module provides language detection and context building for generating
+//! localized tool usage guidelines that match the language of the system prompt.
+
+/// Language options for guide generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuideLanguage {
     Chinese,
@@ -5,6 +11,9 @@ pub enum GuideLanguage {
 }
 
 impl GuideLanguage {
+    /// Detects the language from source text.
+    ///
+    /// Returns `Chinese` if CJK characters are detected, otherwise `English`.
     pub fn detect(source: &str) -> Self {
         if source.chars().any(is_cjk) {
             Self::Chinese
@@ -14,10 +23,16 @@ impl GuideLanguage {
     }
 }
 
+/// Build context for generating tool guides.
+///
+/// Contains language settings and configuration options for guide generation.
 #[derive(Debug, Clone)]
 pub struct GuideBuildContext {
+    /// Detected or configured language for guide content
     pub language: GuideLanguage,
+    /// Whether to include best practices section
     pub include_best_practices: bool,
+    /// Maximum number of examples to include per tool
     pub max_examples_per_tool: usize,
 }
 
@@ -32,6 +47,11 @@ impl Default for GuideBuildContext {
 }
 
 impl GuideBuildContext {
+    /// Creates a build context by detecting language from a system prompt.
+    ///
+    /// # Arguments
+    ///
+    /// * `prompt` - The system prompt to analyze for language detection
     pub fn from_system_prompt(prompt: &str) -> Self {
         Self {
             language: GuideLanguage::detect(prompt),
@@ -39,6 +59,7 @@ impl GuideBuildContext {
         }
     }
 
+    /// Returns best practices appropriate for the configured language.
     pub fn best_practices(&self) -> &'static [&'static str] {
         match self.language {
             GuideLanguage::Chinese => &[

@@ -1,3 +1,8 @@
+//! Agent loop runner implementation.
+//!
+//! This module provides the core agent execution loop that orchestrates LLM interactions,
+//! tool execution, and event streaming for conversational AI agents.
+
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -25,8 +30,28 @@ use crate::agent::loop_module::config::AgentLoopConfig;
 use crate::agent::loop_module::stream::handler::consume_llm_stream;
 use crate::agent::loop_module::todo_context::TodoLoopContext;
 
+/// Result type for agent loop operations.
 pub type Result<T> = std::result::Result<T, AgentError>;
 
+/// Runs the agent loop with a custom configuration.
+///
+/// This is the primary entry point for executing an agent conversation loop.
+/// It manages LLM streaming, tool execution, todo list tracking, metrics collection,
+/// and event emission throughout the conversation lifecycle.
+///
+/// # Arguments
+///
+/// * `session` - The conversation session to operate on
+/// * `initial_message` - The user's initial message to process
+/// * `event_tx` - Channel sender for agent events
+/// * `llm` - The LLM provider to use for generation
+/// * `tools` - The tool executor for handling tool calls
+/// * `cancel_token` - Token for cancelling the operation
+/// * `config` - Configuration controlling loop behavior
+///
+/// # Returns
+///
+/// Returns `Ok(())` on successful completion, or an error if the loop fails.
 pub async fn run_agent_loop_with_config(
     session: &mut Session,
     initial_message: String,

@@ -1,9 +1,16 @@
+//! Built-in tool guides for Bamboo's standard tool suite.
+//!
+//! This module provides usage guidelines, best practices, and examples for all
+//! built-in tools available in Bamboo. These guides help the LLM understand
+//! when and how to use each tool effectively.
+
 use std::sync::Arc;
 
 use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
+/// Names of all built-in tools that have usage guides.
 pub const BUILTIN_GUIDE_NAMES: [&str; 17] = [
     "read_file",
     "write_file",
@@ -24,10 +31,16 @@ pub const BUILTIN_GUIDE_NAMES: [&str; 17] = [
     "ask_user",
 ];
 
+/// Retrieves a built-in tool guide by name.
+///
+/// Returns an `Arc<dyn ToolGuide>` for the specified tool, or `None` if not found.
 pub fn builtin_tool_guide(tool_name: &str) -> Option<Arc<dyn ToolGuide>> {
     builtin_guide_spec(tool_name).map(|guide| Arc::new(guide) as Arc<dyn ToolGuide>)
 }
 
+/// Retrieves the full guide specification for a built-in tool.
+///
+/// Returns a `ToolGuideSpec` with detailed usage information, or `None` if not found.
 pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
     match tool_name {
         "read_file" => Some(guide(
@@ -280,6 +293,9 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
     }
 }
 
+/// Returns all built-in tool guide specifications.
+///
+/// Collects and returns the complete set of built-in tool guides.
 pub fn builtin_guides() -> Vec<ToolGuideSpec> {
     BUILTIN_GUIDE_NAMES
         .iter()
