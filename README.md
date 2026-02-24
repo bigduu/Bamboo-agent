@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/crates/l/bamboo-agent.svg)](https://crates.io/crates/bamboo-agent)
 [![Build Status](https://github.com/bigduu/Bamboo-agent/workflows/CI/badge.svg)](https://github.com/bigduu/Bamboo-agent/actions/workflows/ci.yml)
 [![Documentation](https://github.com/bigduu/Bamboo-agent/workflows/Documentation/badge.svg)](https://github.com/bigduu/Bamboo-agent/actions/workflows/docs.yml)
-[![Test Coverage](https://img.shields.io/badge/tests-806%20passing-brightgreen)](https://github.com/bigduu/Bamboo-agent)
+[![Test Coverage](https://img.shields.io/badge/tests-867%20passing-brightgreen)](https://github.com/bigduu/Bamboo-agent)
 
 **A fully self-contained AI agent backend framework with built-in web services.**
 
@@ -24,7 +24,7 @@ Bamboo provides everything you need to build, deploy, and scale AI-powered appli
 - 🔄 **Session Management**: Persistent conversation history
 - ⚡ **Workflow System**: Automate complex tasks with YAML workflows
 - 🤝 **Claude Integration**: Seamless Claude Code binary discovery and management
-- 🧪 **Well Tested**: 806 tests with 100% pass rate
+- 🧪 **Well Tested**: 867 tests with 100% pass rate
 
 ## Installation
 

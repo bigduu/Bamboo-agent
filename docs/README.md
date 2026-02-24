@@ -88,7 +88,7 @@ See the [main README](../README.md#architecture) for more details.
 
 ### Testing
 
-Bamboo has comprehensive test coverage with 806 tests:
+Bamboo has comprehensive test coverage with 867 tests:
 
 ```bash
 # Run all tests

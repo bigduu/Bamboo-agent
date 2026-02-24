@@ -114,16 +114,23 @@ use bamboo::agent::metrics::{MetricsBus, MetricsWorker};
 
 #### Web Service
 
-**Before:**
-```rust
-use web_service::WebService;
-use web_service::controllers::agent_controller;
-```
-
-**After:**
+**Before (v0.1.x):**
 ```rust
 use bamboo::web_service::WebService;
 use bamboo::web_service::controllers::agent_controller;
+```
+
+**After (v0.1.x):**
+```rust
+use bamboo::web_service::WebService;
+use bamboo::web_service::controllers::agent_controller;
+```
+
+**Latest (v0.2.0+):**
+```rust
+use bamboo::server::WebService;
+use bamboo::server::handlers;  // Unified handlers
+// Note: controllers are now part of handlers module
 ```
 
 #### Claude Integration
@@ -356,7 +363,74 @@ If you encounter issues during migration:
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for a complete list of changes.
+See [CHANGELOG.md](../../CHANGELOG.md) for a complete list of changes.
+
+## v0.2.0 Server Consolidation
+
+Version 0.2.0 introduces a major refactoring that consolidates the dual server architecture into a unified module.
+
+### Key Changes
+
+1. **Unified server module**: `web_service` and `agent::server` → `server`
+2. **Explicit routing**: All routes now explicitly registered in `routes.rs` (~120 routes)
+3. **Unified handlers**: Controllers and handlers merged into `server::handlers`
+4. **Direct provider access**: Eliminated proxy pattern with HTTP callbacks
+
+### Migration from v0.1.x to v0.2.0
+
+#### Server Imports
+
+**Before (v0.1.x):**
+```rust
+use bamboo::agent::server::state::AppState;
+use bamboo::agent::server::handlers;
+use bamboo::web_service::WebService;
+use bamboo::web_service::controllers::*;
+```
+
+**After (v0.2.0+):**
+```rust
+use bamboo::server::AppState;
+use bamboo::server::handlers;
+use bamboo::server::WebService;
+// Note: controllers::* → handlers::*
+```
+
+#### Handler Organization
+
+**Agent handlers** (moved to `handlers/agent/`):
+- `chat`, `execute`, `events`, `stream`, `stop`, `history`, `respond`, `delete`, `health`, `metrics`, `todo`, `mcp`
+
+**Provider handlers** (moved to `handlers/`):
+- `openai`, `anthropic`, `gemini`, `copilot_auth`, `agent_api`, `command`, `settings`, `skill`, `tools`, `workspace`
+
+### Backward Compatibility
+
+All old import paths still work with deprecation warnings:
+
+```rust
+// Old (deprecated but functional)
+use bamboo::agent::server::AppState;
+use bamboo::web_service::WebService;
+use bamboo::server::controllers::agent_api;
+
+// New (recommended)
+use bamboo::server::AppState;
+use bamboo::server::WebService;
+use bamboo::server::handlers::agent_api;
+```
+
+### Benefits
+
+- ✅ **No route duplication**: Single source of truth for all routes
+- ✅ **Clearer architecture**: One unified server module
+- ✅ **Better performance**: Direct provider access (no HTTP callbacks)
+- ✅ **Easier maintenance**: All routes visible in `routes.rs`
+- ✅ **-430 lines of code**: Cleaner, more maintainable codebase
+
+### For More Details
+
+See [MIGRATION.md](../../MIGRATION.md) for comprehensive migration documentation.
 
 ---
 

@@ -477,13 +477,24 @@ bamboo serve --port 8080 --data-dir ~/.local/share/bamboo
 
 ## Architecture
 
-Bamboo follows a session-based architecture:
+Bamboo follows a session-based architecture with unified server implementation:
 
 1. **Session**: Contains conversation history and state
 2. **Agent Loop**: Processes messages and executes tools
-3. **LLM Provider**: Communicates with AI model APIs
-4. **Tool Executor**: Runs built-in tools
-5. **Event Broadcaster**: Streams real-time events via SSE
+3. **LLM Provider**: Communicates with AI model APIs (OpenAI, Anthropic, Gemini, Copilot)
+4. **Tool Executor**: Runs built-in tools (read, write, execute, etc.)
+5. **Event Broadcaster**: Streams real-time events via Server-Sent Events
+6. **Unified Server**: Single HTTP server with explicit routing (~120 routes)
+
+### Server Architecture
+
+- **Unified `server/` module**: Single implementation instead of dual servers
+- **Explicit routing**: All routes registered in `routes.rs` (no routing macros)
+- **Direct provider access**: No HTTP callbacks to self (eliminates proxy pattern)
+- **Handler organization**:
+  - Core agent handlers in `handlers/agent/`
+  - Provider handlers in `handlers/` (openai, anthropic, gemini, etc.)
+  - Feature handlers in `handlers/` (settings, workspace, tools, etc.)
 
 ---
 
