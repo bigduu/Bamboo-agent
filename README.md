@@ -138,36 +138,35 @@ Bamboo follows the [XDG Base Directory specification](https://specifications.fre
 
 ### 📁 Default Paths
 
-- **Config**: `$XDG_CONFIG_HOME/bamboo/config.toml` (default: `~/.config/bamboo/`)
+- **Config**: `$XDG_CONFIG_HOME/bamboo/config.json` (default: `~/.config/bamboo/`)
 - **Data**: `$XDG_DATA_HOME/bamboo/` (default: `~/.local/share/bamboo/`)
 - **Cache**: `$XDG_CACHE_HOME/bamboo/` (default: `~/.cache/bamboo/`)
 - **Runtime**: `$XDG_RUNTIME_DIR/bamboo/` (default: `/tmp/bamboo-$UID/`)
 
 ### 📝 Configuration File
 
-Edit `~/.config/bamboo/config.toml` (TOML format):
+Edit `~/.config/bamboo/config.json` (JSON format):
 
-```toml
-# Server configuration
-[server]
-port = 8080
-bind = "127.0.0.1"
-workers = 10
-
-# Data storage location
-data_dir = "~/.local/share/bamboo"
-
-# Provider configuration (optional)
-provider = "anthropic"
-
-[providers.anthropic]
-api_key = "sk-ant-..."
-model = "claude-3-5-sonnet-20241022"
-
-[providers.openai]
-api_key = "sk-..."
-model = "gpt-4"
+```json
+{
+  "http_proxy": "",
+  "https_proxy": "",
+  "provider": "anthropic",
+  "providers": {
+    "anthropic": {
+      "api_key": "sk-ant-...",
+      "model": "claude-3-5-sonnet-20241022",
+      "max_tokens": 4096
+    },
+    "openai": {
+      "api_key": "sk-...",
+      "model": "gpt-4"
+    }
+  }
+}
 ```
+
+> **💡 Tip**: Bamboo automatically migrates legacy `config.toml` files to the new JSON format.
 
 ### 🔧 Environment Variables
 
