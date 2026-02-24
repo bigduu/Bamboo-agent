@@ -40,6 +40,8 @@ pub mod logging;
 pub mod metrics;
 pub mod metrics_service;
 pub mod model_config_helper;
+pub mod routes;
+pub mod server;
 pub mod services;
 pub mod workflow;
 
@@ -48,3 +50,8 @@ pub use app_state::{AgentRunner, AgentStatus, AppState};
 pub use config::{build_cors, build_security_headers};
 pub use error::AppError;
 pub use metrics::MetricsInfrastructure;
+pub use routes::{
+    configure_routes, configure_routes_with_rate_limiting, agent_routes,
+    openai_compatible_routes, anthropic_routes, gemini_routes,
+};
+pub use server::{run, run_with_bind, run_with_bind_and_static, WebService};
