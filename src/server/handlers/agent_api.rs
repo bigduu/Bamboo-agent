@@ -105,14 +105,23 @@ pub struct CancelRequest {
 // ============================================================================
 
 /// Gets the Claude configuration directory (~/.claude)
+///
+/// Creates the directory if it doesn't exist.
 fn get_claude_dir() -> Result<PathBuf, AppError> {
-    dirs::home_dir()
+    let dir = dirs::home_dir()
         .ok_or_else(|| AppError::InternalError(anyhow::anyhow!("Could not find home directory")))?
-        .join(".claude")
-        .canonicalize()
-        .map_err(|e| {
-            AppError::InternalError(anyhow::anyhow!("Could not find ~/.claude directory: {}", e))
-        })
+        .join(".claude");
+
+    // Create directory if it doesn't exist
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            AppError::InternalError(anyhow::anyhow!("Could not create ~/.claude directory: {}", e))
+        })?;
+    }
+
+    dir.canonicalize().map_err(|e| {
+        AppError::InternalError(anyhow::anyhow!("Could not canonicalize ~/.claude directory: {}", e))
+    })
 }
 
 // ============================================================================
