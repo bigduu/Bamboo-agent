@@ -328,23 +328,21 @@ impl AppState {
         let config = Config::new();
 
         // Create provider with direct access (no HTTP proxy)
-        let provider = match crate::agent::llm::create_provider_with_dir(
-            &config,
-            bamboo_home_dir.clone(),
-        )
-        .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                log::error!(
-                    "Failed to create provider: {}. Using OpenAI as fallback.",
-                    e
-                );
-                Arc::new(crate::agent::llm::OpenAIProvider::new(
-                    "sk-test".to_string(),
-                ))
-            }
-        };
+        let provider =
+            match crate::agent::llm::create_provider_with_dir(&config, bamboo_home_dir.clone())
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    log::error!(
+                        "Failed to create provider: {}. Using OpenAI as fallback.",
+                        e
+                    );
+                    Arc::new(crate::agent::llm::OpenAIProvider::new(
+                        "sk-test".to_string(),
+                    ))
+                }
+            };
 
         Self::new_with_provider(bamboo_home_dir, config, provider).await
     }

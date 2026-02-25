@@ -4,13 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Bamboo Agent is a fully self-contained AI agent backend framework built in Rust. It provides a complete backend system for AI agents with built-in HTTP server, multi-LLM provider support, and comprehensive tool execution capabilities.
+Bamboo Agent v0.2.5 is a fully self-contained AI agent backend framework built in Rust. It provides a complete backend system for AI agents with built-in HTTP server, multi-LLM provider support, and comprehensive tool execution capabilities.
 
 **Key Characteristics:**
 - Dual mode: Binary (standalone server) or library (embedded in applications)
 - Production-ready with CORS, rate limiting, and security headers
-- XDG-compliant configuration management
+- Unified ~/.bamboo directory for configuration and data
 - Zero external runtime dependencies - everything runs locally
+- **100% E2E test coverage** with 959+ tests (175 E2E, 784 unit)
 
 ## Development Commands
 

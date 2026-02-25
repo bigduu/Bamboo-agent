@@ -5,7 +5,8 @@
 [![License](https://img.shields.io/crates/l/bamboo-agent.svg)](https://crates.io/crates/bamboo-agent)
 [![Build Status](https://github.com/bigduu/Bamboo-agent/workflows/CI/badge.svg)](https://github.com/bigduu/Bamboo-agent/actions/workflows/ci.yml)
 [![Documentation](https://github.com/bigduu/Bamboo-agent/workflows/Documentation/badge.svg)](https://github.com/bigduu/Bamboo-agent/actions/workflows/docs.yml)
-[![Test Coverage](https://img.shields.io/badge/tests-867%20passing-brightgreen)](https://github.com/bigduu/Bamboo-agent)
+[![Test Coverage](https://img.shields.io/badge/tests-959%20passing-brightgreen)](https://github.com/bigduu/Bamboo-agent)
+[![E2E Coverage](https://img.shields.io/badge/e2e%20coverage-100%25-brightgreen)](https://github.com/bigduu/Bamboo-agent)
 
 **🚀 A Complete, Self-Contained AI Agent Backend Framework Built with Rust** 🦀
 
@@ -18,7 +19,7 @@ Bamboo is a **production-ready**, **high-performance** AI agent framework that r
 - 🎯 **All-in-One** - Complete agent system with built-in HTTP server, no microservices needed
 - 🦀 **Rust-Native** - Leverages Rust's safety guarantees and async ecosystem
 - 📦 **Zero Config** - Works out of the box with sensible defaults
-- 🏭 **Production-Ready** - Battle-tested with 867+ tests, CORS, rate limiting, security headers
+- 🏭 **Production-Ready** - Battle-tested with 959+ tests, CORS, rate limiting, security headers
 
 📖 **[Full Documentation](docs/README.md)** | 🚀 **[Getting Started](#quick-start)** | 📚 **[API Docs](https://docs.rs/bamboo-agent)**
 
@@ -59,8 +60,9 @@ Bamboo is a **production-ready**, **high-performance** AI agent framework that r
 - **Plugin System** 🔌 - MCP (Model Context Protocol) for external tools
 
 ### 🧪 Quality & Testing
-- **867 Tests** ✅ - Comprehensive test coverage with 100% pass rate
-- **Unit Tests** 🧪 - Every module thoroughly tested
+- **959 Tests** ✅ - Comprehensive test coverage with 100% pass rate
+- **175 E2E Tests** 🎯 - Complete API endpoint coverage (100%)
+- **784 Unit Tests** 🧪 - Every module thoroughly tested
 - **Integration Tests** 🔗 - End-to-end API testing
 - **Documentation Tests** 📚 - Code examples verified in docs
 

@@ -107,11 +107,7 @@ fn migrate_directory(from: &Path, to: &Path) -> std::io::Result<()> {
         // Only move if destination doesn't exist
         if !dest.exists() {
             if let Err(e) = std::fs::rename(&entry.path(), &dest) {
-                eprintln!(
-                    "Warning: Could not migrate {:?}: {}",
-                    entry.path(),
-                    e
-                );
+                eprintln!("Warning: Could not migrate {:?}: {}", entry.path(), e);
             } else {
                 println!("Migrated: {:?}", entry.file_name());
             }

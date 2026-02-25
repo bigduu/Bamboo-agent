@@ -1,4 +1,3 @@
-use crate::agent::server::state::AppState as AgentAppState;
 use crate::agent::skill::{SkillDefinition, SkillFilter};
 use crate::agent::tools::BuiltinToolExecutor;
 use actix_web::{web, HttpResponse};
@@ -68,7 +67,7 @@ struct AvailableWorkflowsResponse {
 
 /// GET /skills - List all skills
 pub async fn list_skills(
-    agent_state: web::Data<AgentAppState>,
+    state: web::Data<AppState>,
     query: web::Query<ListSkillsQuery>,
 ) -> Result<HttpResponse, AppError> {
     let mut filter = SkillFilter::new();
@@ -80,7 +79,7 @@ pub async fn list_skills(
     }
 
     let refresh = query.refresh.unwrap_or(false);
-    let skills = agent_state
+    let skills = state
         .skill_manager
         .as_ref()
         .store()
@@ -95,11 +94,11 @@ pub async fn list_skills(
 
 /// GET /skills/{id} - Get skill detail
 pub async fn get_skill(
-    agent_state: web::Data<AgentAppState>,
+    state: web::Data<AppState>,
     path: web::Path<String>,
 ) -> Result<HttpResponse, AppError> {
     let id = path.into_inner();
-    let skill = agent_state
+    let skill = state
         .skill_manager
         .as_ref()
         .store()
@@ -111,9 +110,7 @@ pub async fn get_skill(
 }
 
 /// GET /skills/available-tools - Get available built-in tools
-pub async fn get_available_tools(
-    _agent_state: web::Data<AgentAppState>,
-) -> Result<HttpResponse, AppError> {
+pub async fn get_available_tools(_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let tool_names: Vec<String> = BuiltinToolExecutor::tool_schemas()
         .into_iter()
         .map(|tool| tool.function.name)
@@ -129,10 +126,10 @@ pub struct FilteredToolsQuery {
 
 /// GET /skills/filtered-tools - Get tools filtered by enabled skills
 pub async fn get_filtered_tools(
-    agent_state: web::Data<AgentAppState>,
+    state: web::Data<AppState>,
     query: web::Query<FilteredToolsQuery>,
 ) -> Result<HttpResponse, AppError> {
-    let allowed_tools = agent_state
+    let allowed_tools = state
         .skill_manager
         .as_ref()
         .get_allowed_tools(query.chat_id.as_deref())
@@ -182,11 +179,8 @@ pub async fn get_filtered_tools(
 }
 
 /// GET /skills/available-workflows - Get available workflows
-pub async fn get_available_workflows(
-    app_state: web::Data<AppState>,
-    _agent_state: web::Data<AgentAppState>,
-) -> Result<HttpResponse, AppError> {
-    let workflows = crate::server::services::skill_service::list_workflows(&app_state.app_data_dir)
+pub async fn get_available_workflows(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
+    let workflows = crate::server::services::skill_service::list_workflows(&state.app_data_dir)
         .await
         .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to list workflows: {}", e)))?;
 
