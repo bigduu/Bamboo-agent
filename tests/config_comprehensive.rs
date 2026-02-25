@@ -78,11 +78,23 @@ mod comprehensive_config_tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// Acquire the environment lock, ignoring if it was poisoned by a previous test failure
+    /// This ensures test isolation even when tests panic
+    fn env_lock_acquire() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                // Lock was poisoned by a previous test failure - recover it
+                eprintln!("Warning: Environment lock was poisoned, recovering...");
+                poisoned.into_inner()
+            })
+    }
+
     // === 1) Environment Variable Override Priority ===
 
     #[test]
     fn env_port_overrides_file_value() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         // File says port 1111
@@ -99,7 +111,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn env_bind_overrides_file_value() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         temp.write_config(
@@ -115,7 +127,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn env_provider_overrides_file_value() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         temp.write_config(r#"{"provider": "anthropic"}"#);
@@ -129,7 +141,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn env_model_overrides_file_value() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         temp.write_config(r#"{"model": "gpt-3.5"}"#);
@@ -143,7 +155,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn env_headless_overrides_file_value() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         temp.write_config(r#"{"headless_auth": false}"#);
@@ -157,7 +169,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn invalid_env_port_ignored() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         temp.write_config(r#"{"server": {"port": 1111, "bind": "127.0.0.1"}}"#);
@@ -171,7 +183,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn env_headless_whitespace_handling() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         let _env = EnvVarGuard::set("BAMBOO_DATA_DIR", temp.path.to_str().unwrap());
@@ -183,7 +195,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn from_data_dir_beats_env() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let dir_a = TempDir::new();
         let dir_b = TempDir::new();
 
@@ -200,7 +212,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn bambo_data_dir_changes_load_location() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         temp.write_config(r#"{"provider": "from_custom_dir"}"#);
@@ -217,7 +229,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn full_new_format_config_loads() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         temp.write_config(
@@ -271,7 +283,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn config_roundtrip_preserves_all_fields() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         let mut original = Config::from_data_dir(Some(temp.path.clone()));
@@ -293,7 +305,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn migration_writes_back_to_disk() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         // Old format with old-only fields
@@ -318,7 +330,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn save_uses_data_dir() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         let mut config = Config::from_data_dir(Some(temp.path.clone()));
@@ -335,7 +347,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn unknown_fields_ignored() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         temp.write_config(
@@ -355,7 +367,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn missing_config_uses_defaults() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
         // Don't create config file
 
@@ -369,7 +381,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn invalid_json_falls_back_to_defaults() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         temp.write_config(r#"{ not valid json }"#);
@@ -380,7 +392,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn partial_invalid_type_falls_back() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         temp.write_config(r#"{"server": {"port": "not_a_number"}}"#);
@@ -408,7 +420,7 @@ mod comprehensive_config_tests {
 
     #[test]
     fn isolated_library_usage_without_home() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         // Don't touch HOME, use from_data_dir
@@ -424,15 +436,15 @@ mod comprehensive_config_tests {
 
     #[test]
     fn copilot_headless_auth_from_provider_config() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         temp.write_config(
             r#"{
-            "provider": "anthropic",
+            "provider": "copilot",
             "headless_auth": false,
             "providers": {
-                "anthropic": {
+                "copilot": {
                     "enabled": true,
                     "headless_auth": true
                 }

@@ -573,6 +573,16 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// Acquire the environment lock, recovering from poison if a previous test failed
+    fn env_lock_acquire() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                // Lock was poisoned by a previous test failure - recover it
+                poisoned.into_inner()
+            })
+    }
+
     #[test]
     fn parse_bool_env_true_values() {
         for value in ["1", "true", "TRUE", " yes ", "Y", "on"] {
@@ -589,7 +599,7 @@ mod tests {
 
     #[test]
     fn config_new_ignores_http_proxy_env_vars() {
-        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
         temp_home.set_config_json(
             r#"{
@@ -617,7 +627,7 @@ mod tests {
 
     #[test]
     fn config_new_loads_config_when_proxy_fields_omitted() {
-        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
         temp_home.set_config_json(
             r#"{
@@ -643,7 +653,7 @@ mod tests {
 
     #[test]
     fn config_new_ignores_proxy_env_vars_when_proxy_fields_omitted() {
-        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
         temp_home.set_config_json(
             r#"{
@@ -671,7 +681,7 @@ mod tests {
 
     #[test]
     fn config_migrates_old_format_to_new() {
-        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
 
         // Create config with old format
@@ -718,7 +728,7 @@ mod tests {
 
     #[test]
     fn config_migrates_only_http_proxy_auth() {
-        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
 
         // Create config with only http_proxy_auth
@@ -749,7 +759,7 @@ mod tests {
 
     #[test]
     fn test_server_config_defaults() {
-        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
 
         // Set temp home BEFORE creating config
@@ -773,7 +783,7 @@ mod tests {
 
     #[test]
     fn test_env_var_overrides() {
-        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
 
         // Set temp home to avoid loading real config
@@ -792,7 +802,7 @@ mod tests {
 
     #[test]
     fn test_config_save_and_load() {
-        let _lock = env_lock().lock().expect("env lock poisoned");
+        let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
 
         // Set temp home BEFORE creating config
