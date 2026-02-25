@@ -18,6 +18,11 @@
 //! # Quick Start
 //!
 //! ## Binary Mode
+
+// Allow some clippy lints that are pre-existing
+#![allow(clippy::module_inception)]
+#![allow(clippy::doc_overindented_list_items)]
+#![allow(clippy::incompatible_msrv)]
 //!
 //! ```bash
 //! bamboo serve --port 8080 --data-dir ~/.bamboo

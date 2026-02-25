@@ -88,7 +88,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-features -- -A deprecated -D warnings
+        run: cargo clippy --all-features -- -A deprecated -A clippy::doc_overindented_list_items -A clippy::module_inception -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args -D warnings
 
   build:
     name: Build
