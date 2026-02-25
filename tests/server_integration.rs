@@ -2,7 +2,7 @@
 //!
 //! Tests for server startup, configuration, and basic functionality.
 
-use bamboo_agent::{Config, BambooServer};
+use bamboo_agent::{BambooServer, Config};
 
 #[cfg(test)]
 mod tests {

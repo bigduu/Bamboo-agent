@@ -169,8 +169,11 @@ async fn test_copilot_authenticate_endpoint_not_copilot() {
 
     // Default provider is "anthropic", so should return 400 Bad Request
     let status = resp.status();
-    assert!(status.is_client_error(),
-            "Expected client error (400), got status: {}", status);
+    assert!(
+        status.is_client_error(),
+        "Expected client error (400), got status: {}",
+        status
+    );
 
     let body = test::read_body(resp).await;
     let json: serde_json::Value =

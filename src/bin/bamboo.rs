@@ -93,7 +93,9 @@ async fn main() {
                 config.data_dir.clone(),
                 config.server.port,
                 &config.server.bind,
-            ).await {
+            )
+            .await
+            {
                 eprintln!("Failed to start server: {}", e);
                 std::process::exit(1);
             }
@@ -101,7 +103,10 @@ async fn main() {
 
         Commands::Config { path, show_secrets } => {
             if path {
-                println!("{}", bamboo_agent::core::paths::config_json_path().display());
+                println!(
+                    "{}",
+                    bamboo_agent::core::paths::config_json_path().display()
+                );
             } else {
                 let config = bamboo_agent::core::Config::new();
                 let mut config_value = serde_json::to_value(&config).unwrap();
@@ -113,7 +118,10 @@ async fn main() {
                             for (_, provider) in providers_obj.iter_mut() {
                                 if let Some(provider_obj) = provider.as_object_mut() {
                                     if provider_obj.contains_key("api_key") {
-                                        provider_obj.insert("api_key".to_string(), serde_json::json!("***REDACTED***"));
+                                        provider_obj.insert(
+                                            "api_key".to_string(),
+                                            serde_json::json!("***REDACTED***"),
+                                        );
                                     }
                                 }
                             }

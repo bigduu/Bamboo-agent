@@ -4,7 +4,7 @@
 
 #[cfg(test)]
 mod comprehensive_config_tests {
-    use bamboo_agent::{Config, BambooBuilder};
+    use bamboo_agent::{BambooBuilder, Config};
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -86,7 +86,9 @@ mod comprehensive_config_tests {
         let temp = TempDir::new();
 
         // File says port 1111
-        temp.write_config(r#"{"server": {"port": 1111, "bind": "127.0.0.1"}, "provider": "anthropic"}"#);
+        temp.write_config(
+            r#"{"server": {"port": 1111, "bind": "127.0.0.1"}, "provider": "anthropic"}"#,
+        );
 
         let _env = EnvVarGuard::set("BAMBOO_DATA_DIR", temp.path.to_str().unwrap());
         let _port = EnvVarGuard::set("BAMBOO_PORT", "2222");
@@ -100,7 +102,9 @@ mod comprehensive_config_tests {
         let _lock = env_lock().lock().unwrap();
         let temp = TempDir::new();
 
-        temp.write_config(r#"{"server": {"port": 8080, "bind": "127.0.0.1"}, "provider": "anthropic"}"#);
+        temp.write_config(
+            r#"{"server": {"port": 8080, "bind": "127.0.0.1"}, "provider": "anthropic"}"#,
+        );
 
         let _env = EnvVarGuard::set("BAMBOO_DATA_DIR", temp.path.to_str().unwrap());
         let _bind = EnvVarGuard::set("BAMBOO_BIND", "0.0.0.0");
@@ -216,7 +220,8 @@ mod comprehensive_config_tests {
         let _lock = env_lock().lock().unwrap();
         let temp = TempDir::new();
 
-        temp.write_config(r#"{
+        temp.write_config(
+            r#"{
             "http_proxy": "http://proxy:8080",
             "https_proxy": "https://proxy:8443",
             "model": "gpt-4-turbo",
@@ -244,7 +249,8 @@ mod comprehensive_config_tests {
                 "workers": 16
             },
             "data_dir": "/should/be/ignored"
-        }"#);
+        }"#,
+        );
 
         let _env = EnvVarGuard::set("BAMBOO_DATA_DIR", temp.path.to_str().unwrap());
         let config = Config::new();
@@ -291,11 +297,13 @@ mod comprehensive_config_tests {
         let temp = TempDir::new();
 
         // Old format with old-only fields
-        temp.write_config(r#"{
+        temp.write_config(
+            r#"{
             "http_proxy": "http://old.proxy",
             "http_proxy_auth": {"username": "old", "password": "old"},
             "api_key": "deprecated_key"
-        }"#);
+        }"#,
+        );
 
         let _env = EnvVarGuard::set("BAMBOO_DATA_DIR", temp.path.to_str().unwrap());
         let _config = Config::new();
@@ -330,11 +338,13 @@ mod comprehensive_config_tests {
         let _lock = env_lock().lock().unwrap();
         let temp = TempDir::new();
 
-        temp.write_config(r#"{
+        temp.write_config(
+            r#"{
             "provider": "anthropic",
             "unknown_key": 123,
             "future_field": "value"
-        }"#);
+        }"#,
+        );
 
         let _env = EnvVarGuard::set("BAMBOO_DATA_DIR", temp.path.to_str().unwrap());
         let config = Config::new();
@@ -417,7 +427,8 @@ mod comprehensive_config_tests {
         let _lock = env_lock().lock().unwrap();
         let temp = TempDir::new();
 
-        temp.write_config(r#"{
+        temp.write_config(
+            r#"{
             "provider": "anthropic",
             "headless_auth": false,
             "providers": {
@@ -426,7 +437,8 @@ mod comprehensive_config_tests {
                     "headless_auth": true
                 }
             }
-        }"#);
+        }"#,
+        );
 
         let _env = EnvVarGuard::set("BAMBOO_DATA_DIR", temp.path.to_str().unwrap());
         let config = Config::new();

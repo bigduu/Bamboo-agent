@@ -51,8 +51,8 @@ pub mod server;
 pub mod web_service;
 
 // Re-export core Config as the primary configuration type
-pub use core::Config;
 pub use core::config::ServerConfig;
+pub use core::Config;
 
 // Deprecated: Use core::Config instead
 #[allow(deprecated)]

@@ -48,9 +48,9 @@
 //! - `BAMBOO_HEADLESS`: Enable headless authentication mode
 //! - `MODEL`: Override default model
 
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use anyhow::{Context, Result};
 
 /// Main configuration structure for Bamboo agent
 ///
@@ -332,11 +332,13 @@ impl Config {
                         migrated
                     } else {
                         // Try to parse as new Config format
-                        serde_json::from_str::<Config>(&content).unwrap_or_else(|_| Self::create_default())
+                        serde_json::from_str::<Config>(&content)
+                            .unwrap_or_else(|_| Self::create_default())
                     }
                 } else {
                     // Try to parse as new Config format
-                    serde_json::from_str::<Config>(&content).unwrap_or_else(|_| Self::create_default())
+                    serde_json::from_str::<Config>(&content)
+                        .unwrap_or_else(|_| Self::create_default())
                 }
             } else {
                 Self::create_default()
@@ -417,8 +419,8 @@ impl Config {
                 .with_context(|| format!("Failed to create config dir: {:?}", parent))?;
         }
 
-        let content = serde_json::to_string_pretty(self)
-            .context("Failed to serialize config to JSON")?;
+        let content =
+            serde_json::to_string_pretty(self).context("Failed to serialize config to JSON")?;
 
         std::fs::write(&path, content)
             .with_context(|| format!("Failed to write config file: {:?}", path))?;

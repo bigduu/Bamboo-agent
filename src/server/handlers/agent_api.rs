@@ -115,12 +115,18 @@ fn get_claude_dir() -> Result<PathBuf, AppError> {
     // Create directory if it doesn't exist
     if !dir.exists() {
         std::fs::create_dir_all(&dir).map_err(|e| {
-            AppError::InternalError(anyhow::anyhow!("Could not create ~/.claude directory: {}", e))
+            AppError::InternalError(anyhow::anyhow!(
+                "Could not create ~/.claude directory: {}",
+                e
+            ))
         })?;
     }
 
     dir.canonicalize().map_err(|e| {
-        AppError::InternalError(anyhow::anyhow!("Could not canonicalize ~/.claude directory: {}", e))
+        AppError::InternalError(anyhow::anyhow!(
+            "Could not canonicalize ~/.claude directory: {}",
+            e
+        ))
     })
 }
 
