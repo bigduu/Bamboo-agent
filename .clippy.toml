@@ -1,0 +1,11 @@
+# Clippy configuration
+
+# Allow deprecated items for backward compatibility with legacy endpoints
+# This is intentional - we maintain deprecated endpoints for existing users
+#
+# Specific deprecated items:
+# - agent::stream::handler - Legacy /stream endpoint, replaced by /execute + /events
+# - BambooConfig - Legacy config format, replaced by core::Config
+
+# Allow these lints globally
+msrv = "1.70"
