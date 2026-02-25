@@ -7,8 +7,8 @@
 //! # Example
 //!
 //! ```
-//! use bamboo::agent::core::tools::accumulator::ToolCallAccumulator;
-//! use bamboo::agent::core::tools::ToolCall;
+//! use bamboo_agent::agent::core::tools::accumulator::ToolCallAccumulator;
+//! use bamboo_agent::agent::core::tools::ToolCall;
 //!
 //! let mut accumulator = ToolCallAccumulator::new();
 //!
@@ -151,8 +151,8 @@ impl ToolCallAccumulator {
 /// # Example
 ///
 /// ```
-/// use bamboo::agent::core::tools::accumulator::{update_partial_tool_call, PartialToolCall};
-/// use bamboo::agent::core::tools::ToolCall;
+/// use bamboo_agent::agent::core::tools::accumulator::{update_partial_tool_call, PartialToolCall};
+/// use bamboo_agent::agent::core::tools::ToolCall;
 ///
 /// let mut parts = Vec::new();
 ///
@@ -247,7 +247,7 @@ pub fn update_partial_tool_call(parts: &mut Vec<PartialToolCall>, call: ToolCall
 /// # Example
 ///
 /// ```
-/// use bamboo::agent::core::tools::accumulator::{finalize_tool_calls, PartialToolCall};
+/// use bamboo_agent::agent::core::tools::accumulator::{finalize_tool_calls, PartialToolCall};
 ///
 /// let parts = vec![
 ///     PartialToolCall {

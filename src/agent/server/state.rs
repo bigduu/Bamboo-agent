@@ -34,7 +34,7 @@
 //! # Usage Example
 //!
 //! ```rust,no_run
-//! use bamboo::agent::server::state::AppState;
+//! use bamboo_agent::agent::server::state::AppState;
 //!
 //! #[tokio::main]
 //! async fn main() {
@@ -298,7 +298,7 @@ impl AppState {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use bamboo::agent::server::state::AppState;
+    /// use bamboo_agent::agent::server::state::AppState;
     ///
     /// #[tokio::main]
     /// async fn main() {

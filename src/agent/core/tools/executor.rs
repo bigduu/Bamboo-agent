@@ -41,7 +41,7 @@ pub type Result<T> = std::result::Result<T, ToolError>;
 /// # Example
 ///
 /// ```ignore
-/// use bamboo::agent::core::tools::executor::ToolExecutor;
+/// use bamboo_agent::agent::core::tools::executor::ToolExecutor;
 ///
 /// struct MyExecutor {
 ///     tools: HashMap<String, Box<dyn Tool>>,
@@ -104,7 +104,7 @@ pub trait ToolExecutor: Send + Sync {
 /// # Example
 ///
 /// ```ignore
-/// use bamboo::agent::core::tools::executor::execute_tool_call;
+/// use bamboo_agent::agent::core::tools::executor::execute_tool_call;
 ///
 /// let result = execute_tool_call(
 ///     &tool_call,

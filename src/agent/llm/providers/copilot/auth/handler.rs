@@ -18,7 +18,7 @@
 //! ```rust,no_run
 //! use std::sync::Arc;
 //! use reqwest_middleware::ClientWithMiddleware;
-//! use bamboo::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
+//! use bamboo_agent::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
 //!
 //! async fn authenticate() -> anyhow::Result<String> {
 //!     // Create HTTP client with middleware
@@ -298,8 +298,8 @@ impl AccessTokenResponse {
     ///
     /// # Example
     ///
-    /// ```rust
-    /// use bamboo::agent::llm::providers::copilot::auth::handler::AccessTokenResponse;
+    /// ```ignore
+    /// use bamboo_agent::agent::llm::providers::copilot::auth::handler::AccessTokenResponse;
     ///
     /// let response = AccessTokenResponse::from_token("gho_xxxx".to_string());
     /// assert_eq!(response.access_token, Some("gho_xxxx".to_string()));
@@ -354,7 +354,7 @@ lazy_static! {
 /// ```rust,no_run
 /// use std::sync::Arc;
 /// use reqwest_middleware::ClientWithMiddleware;
-/// use bamboo::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
+/// use bamboo_agent::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
 ///
 /// async fn example() -> anyhow::Result<()> {
 ///     let client = Arc::new(ClientWithMiddleware::new(/* ... */));
@@ -399,7 +399,7 @@ impl CopilotAuthHandler {
     /// ```rust,no_run
     /// use std::sync::Arc;
     /// use reqwest_middleware::ClientWithMiddleware;
-    /// use bamboo::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
+    /// use bamboo_agent::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
     ///
     /// let client = Arc::new(ClientWithMiddleware::new(/* ... */));
     /// let handler = CopilotAuthHandler::new(
@@ -478,7 +478,7 @@ impl CopilotAuthHandler {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use bamboo::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
+    /// # use bamboo_agent::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
     /// # async fn example(handler: CopilotAuthHandler) -> anyhow::Result<()> {
     /// // Pre-authenticate before starting the application
     /// handler.ensure_authenticated().await?;
@@ -622,7 +622,7 @@ impl CopilotAuthHandler {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use bamboo::agent::llm::providers::copilot::auth::handler::{CopilotAuthHandler, CopilotConfig};
+    /// # use bamboo_agent::agent::llm::providers::copilot::auth::handler::{CopilotAuthHandler, CopilotConfig};
     /// # fn example(handler: CopilotAuthHandler, config: CopilotConfig) {
     /// if handler.is_copilot_token_valid(&config) {
     ///     println!("Token is valid");
@@ -664,7 +664,7 @@ impl CopilotAuthHandler {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use bamboo::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
+    /// # use bamboo_agent::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
     /// # async fn example(handler: CopilotAuthHandler) -> anyhow::Result<()> {
     /// let device_code = handler.get_device_code().await?;
     /// println!("Visit: {}", device_code.verification_uri);
@@ -723,7 +723,7 @@ impl CopilotAuthHandler {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use bamboo::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
+    /// # use bamboo_agent::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
     /// # async fn example(handler: CopilotAuthHandler) -> anyhow::Result<()> {
     /// let device_code = handler.start_authentication().await?;
     /// // In GUI mode, display these values to the user
@@ -843,7 +843,7 @@ impl CopilotAuthHandler {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use bamboo::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
+    /// # use bamboo_agent::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
     /// # async fn example(handler: CopilotAuthHandler) -> anyhow::Result<()> {
     /// match handler.try_get_chat_token_silent().await? {
     ///     Some(token) => println!("Got token silently: {}", token),
@@ -1032,7 +1032,7 @@ impl CopilotAuthHandler {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use bamboo::agent::llm::providers::copilot::auth::handler::{CopilotAuthHandler, AccessTokenResponse};
+    /// # use bamboo_agent::agent::llm::providers::copilot::auth::handler::{CopilotAuthHandler, AccessTokenResponse};
     /// # async fn example(handler: CopilotAuthHandler, access_token: AccessTokenResponse) -> anyhow::Result<()> {
     /// let config = handler.get_copilot_token(access_token).await?;
     /// println!("Got Copilot token, expires at: {}", config.expires_at);

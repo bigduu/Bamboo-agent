@@ -46,7 +46,7 @@
 //! # Usage Example
 //!
 //! ```rust,no_run
-//! use bamboo::server::app_state::AppState;
+//! use bamboo_agent::server::app_state::AppState;
 //! use std::path::PathBuf;
 //!
 //! #[tokio::main]
@@ -315,7 +315,7 @@ impl AppState {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use bamboo::server::app_state::AppState;
+    /// use bamboo_agent::server::app_state::AppState;
     /// use std::path::PathBuf;
     ///
     /// #[tokio::main]
@@ -527,7 +527,7 @@ impl AppState {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use bamboo::server::app_state::AppState;
+    /// use bamboo_agent::server::app_state::AppState;
     /// use std::path::PathBuf;
     ///
     /// #[tokio::main]
@@ -574,7 +574,7 @@ impl AppState {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use bamboo::server::app_state::AppState;
+    /// use bamboo_agent::server::app_state::AppState;
     /// use std::path::PathBuf;
     ///
     /// #[tokio::main]
@@ -607,7 +607,7 @@ impl AppState {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use bamboo::server::app_state::AppState;
+    /// use bamboo_agent::server::app_state::AppState;
     /// use std::path::PathBuf;
     ///
     /// #[tokio::main]

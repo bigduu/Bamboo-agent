@@ -92,7 +92,7 @@ pub struct CompositionResult {
 /// # Example
 ///
 /// ```ignore
-/// use bamboo::agent::core::composition::{Sequence, Parallel, ToolComposition};
+/// use bamboo_agent::agent::core::composition::{Sequence, Parallel, ToolComposition};
 ///
 /// let workflow = Sequence::builder()
 ///     .step(ToolComposition::new(tool1, args))

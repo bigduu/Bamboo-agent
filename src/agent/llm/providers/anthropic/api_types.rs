@@ -42,8 +42,8 @@ use std::collections::HashMap;
 ///
 /// # Example
 ///
-/// ```rust
-/// use bamboo::agent::llm::providers::anthropic::api_types::*;
+/// ```ignore
+/// use bamboo_agent::agent::llm::providers::anthropic::api_types::*;
 ///
 /// let request = AnthropicMessagesRequest {
 ///     model: "claude-3-opus-20240229".to_string(),

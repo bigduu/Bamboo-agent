@@ -44,7 +44,7 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! use bamboo::agent::metrics::storage::{SqliteMetricsStorage, MetricsStorage};
+//! use bamboo_agent::agent::metrics::storage::{SqliteMetricsStorage, MetricsStorage};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -157,7 +157,7 @@ pub enum MetricsError {
 /// # Example
 ///
 /// ```
-/// use bamboo::agent::metrics::storage::ToolCallCompletion;
+/// use bamboo_agent::agent::metrics::storage::ToolCallCompletion;
 /// use chrono::Utc;
 ///
 /// let completion = ToolCallCompletion {
@@ -202,8 +202,8 @@ pub struct ToolCallCompletion {
 /// # Example
 ///
 /// ```rust,ignore
-/// use bamboo::agent::metrics::storage::{MetricsStorage, SqliteMetricsStorage};
-/// use bamboo::agent::metrics::types::{SessionStatus, TokenUsage};
+/// use bamboo_agent::agent::metrics::storage::{MetricsStorage, SqliteMetricsStorage};
+/// use bamboo_agent::agent::metrics::types::{SessionStatus, TokenUsage};
 /// use chrono::Utc;
 ///
 /// async fn example(storage: &dyn MetricsStorage) -> Result<(), Box<dyn std::error::Error>> {
@@ -428,7 +428,7 @@ pub trait MetricsStorage: Send + Sync {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use bamboo::agent::metrics::types::ForwardMetricsFilter;
+    /// use bamboo_agent::agent::metrics::types::ForwardMetricsFilter;
     ///
     /// let filter = ForwardMetricsFilter {
     ///     start_date: Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap()),
@@ -541,7 +541,7 @@ pub trait MetricsStorage: Send + Sync {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use bamboo::agent::metrics::types::MetricsDateFilter;
+    /// use bamboo_agent::agent::metrics::types::MetricsDateFilter;
     ///
     /// let filter = MetricsDateFilter {
     ///     start_date: Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap()),
@@ -589,7 +589,7 @@ pub trait MetricsStorage: Send + Sync {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use bamboo::agent::metrics::types::SessionMetricsFilter;
+    /// use bamboo_agent::agent::metrics::types::SessionMetricsFilter;
     ///
     /// let filter = SessionMetricsFilter {
     ///     model: Some("gpt-4".to_string()),
@@ -746,8 +746,8 @@ pub trait MetricsStorage: Send + Sync {
 /// # Example
 ///
 /// ```rust,ignore
-/// use bamboo::agent::metrics::storage::SqliteMetricsStorage;
-/// use bamboo::agent::metrics::storage::MetricsStorage;
+/// use bamboo_agent::agent::metrics::storage::SqliteMetricsStorage;
+/// use bamboo_agent::agent::metrics::storage::MetricsStorage;
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -787,7 +787,7 @@ impl SqliteMetricsStorage {
     /// # Example
     ///
     /// ```
-    /// use bamboo::agent::metrics::storage::SqliteMetricsStorage;
+    /// use bamboo_agent::agent::metrics::storage::SqliteMetricsStorage;
     ///
     /// let storage = SqliteMetricsStorage::new("metrics.db");
     /// let storage = SqliteMetricsStorage::new("/var/data/bamboo/metrics.db");

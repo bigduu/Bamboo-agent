@@ -56,7 +56,7 @@ use crate::agent::metrics::types::{ForwardStatus, RoundStatus, SessionStatus, To
 /// # Example
 ///
 /// ```
-/// use bamboo::agent::metrics::events::EventMeta;
+/// use bamboo_agent::agent::metrics::events::EventMeta;
 ///
 /// // Create event metadata without trace ID
 /// let meta = EventMeta::new();
@@ -86,7 +86,7 @@ impl EventMeta {
     /// # Example
     ///
     /// ```
-    /// use bamboo::agent::metrics::events::EventMeta;
+    /// use bamboo_agent::agent::metrics::events::EventMeta;
     ///
     /// let meta = EventMeta::new();
     /// assert!(!meta.event_id.is_empty());
@@ -112,7 +112,7 @@ impl EventMeta {
     /// # Example
     ///
     /// ```
-    /// use bamboo::agent::metrics::events::EventMeta;
+    /// use bamboo_agent::agent::metrics::events::EventMeta;
     ///
     /// let meta = EventMeta::with_trace_id("req-12345");
     /// assert_eq!(meta.trace_id, Some("req-12345".to_string()));

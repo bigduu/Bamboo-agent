@@ -60,7 +60,7 @@ pub type LLMStream = Pin<Box<dyn Stream<Item = Result<LLMChunk>> + Send>>;
 /// # Example
 ///
 /// ```ignore
-/// use bamboo::agent::llm::provider::LLMProvider;
+/// use bamboo_agent::agent::llm::provider::LLMProvider;
 ///
 /// async fn use_provider(provider: &dyn LLMProvider) {
 ///     let stream = provider.chat_stream(

@@ -26,7 +26,7 @@
 //! ## Library Mode
 //!
 //! ```rust,ignore
-//! use bamboo::{BambooServer, core::Config};
+//! use bamboo_agent::{BambooServer, core::Config};
 //!
 //! #[tokio::main]
 //! async fn main() {
@@ -90,7 +90,7 @@ impl BambooServer {
 /// # Example
 ///
 /// ```rust,ignore
-/// use bamboo::{BambooBuilder, BambooServer};
+/// use bamboo_agent::{BambooBuilder, BambooServer};
 /// use std::path::PathBuf;
 ///
 /// let server = BambooBuilder::new()

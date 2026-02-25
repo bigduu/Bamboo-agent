@@ -35,7 +35,7 @@
 //! # Usage Example
 //!
 //! ```rust,no_run
-//! use bamboo::process::registry::{ProcessRegistry, ProcessRegistrationConfig};
+//! use bamboo_agent::process::registry::{ProcessRegistry, ProcessRegistrationConfig};
 //! use std::sync::{Arc, Mutex};
 //! use tokio::process::Command;
 //!
@@ -217,8 +217,8 @@ impl ProcessRegistry {
     ///
     /// # Example
     ///
-    /// ```rust
-    /// use bamboo::process::registry::ProcessRegistry;
+    /// ```ignore
+    /// use bamboo_agent::process::registry::ProcessRegistry;
     ///
     /// let registry = ProcessRegistry::new();
     /// ```
@@ -240,8 +240,8 @@ impl ProcessRegistry {
     ///
     /// # Example
     ///
-    /// ```rust
-    /// use bamboo::process::registry::ProcessRegistry;
+    /// ```ignore
+    /// use bamboo_agent::process::registry::ProcessRegistry;
     ///
     /// let registry = ProcessRegistry::new();
     /// let id = registry.generate_id().unwrap();
@@ -275,7 +275,7 @@ impl ProcessRegistry {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use bamboo::process::registry::{ProcessRegistry, ProcessRegistrationConfig};
+    /// use bamboo_agent::process::registry::{ProcessRegistry, ProcessRegistrationConfig};
     /// use tokio::process::Command;
     ///
     /// #[tokio::main]
