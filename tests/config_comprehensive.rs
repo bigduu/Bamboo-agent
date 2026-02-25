@@ -237,7 +237,7 @@ mod comprehensive_config_tests {
                     "api_key": "sk-ant-test",
                     "model": "claude-3"
                 },
-                "anthropic": {
+                "copilot": {
                     "enabled": true,
                     "headless_auth": false
                 }

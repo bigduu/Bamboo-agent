@@ -317,13 +317,14 @@ impl Config {
             if let Ok(content) = std::fs::read_to_string(&config_path) {
                 // Try to parse as old format first (for migration)
                 if let Ok(old_config) = serde_json::from_str::<OldConfig>(&content) {
-                    // Check if it has old-only fields
+                    // Check if it has old-only fields (indicating a true old config that needs migration)
                     let has_old_fields = old_config.http_proxy_auth.is_some()
                         || old_config.https_proxy_auth.is_some()
                         || old_config.api_key.is_some()
                         || old_config.api_base.is_some();
 
                     if has_old_fields {
+                        log::info!("Migrating old config format to new format");
                         let migrated = migrate_config(old_config);
                         // Save migrated config
                         if let Ok(new_content) = serde_json::to_string_pretty(&migrated) {
@@ -331,12 +332,19 @@ impl Config {
                         }
                         migrated
                     } else {
-                        // Try to parse as new Config format
-                        serde_json::from_str::<Config>(&content)
-                            .unwrap_or_else(|_| Self::create_default())
+                        // No old fields, so try to parse as new Config
+                        // OldConfig successfully parsed common fields like http_proxy, model, provider, etc.
+                        // Try Config, but if it fails (e.g., due to syntax errors), use OldConfig values
+                        match serde_json::from_str::<Config>(&content) {
+                            Ok(config) => config,
+                            Err(_) => {
+                                // Config parse failed, but OldConfig worked, so preserve those values
+                                migrate_config(old_config)
+                            }
+                        }
                     }
                 } else {
-                    // Try to parse as new Config format
+                    // Couldn't parse as OldConfig, try as Config
                     serde_json::from_str::<Config>(&content)
                         .unwrap_or_else(|_| Self::create_default())
                 }
@@ -448,6 +456,15 @@ struct OldConfig {
     model: Option<String>,
     #[serde(default)]
     headless_auth: bool,
+    // Also capture new fields so we don't lose them during fallback
+    #[serde(default = "default_provider")]
+    provider: String,
+    #[serde(default)]
+    server: ServerConfig,
+    #[serde(default)]
+    providers: ProviderConfigs,
+    #[serde(default)]
+    data_dir: Option<PathBuf>,
 }
 
 /// Migrate old configuration format to new multi-provider format
@@ -474,10 +491,10 @@ fn migrate_config(old: OldConfig) -> Config {
         proxy_auth: old.https_proxy_auth.or(old.http_proxy_auth),
         model: old.model,
         headless_auth: old.headless_auth,
-        provider: default_provider(),
-        providers: ProviderConfigs::default(),
-        server: ServerConfig::default(),
-        data_dir: default_data_dir(),
+        provider: old.provider,
+        providers: old.providers,
+        server: old.server,
+        data_dir: old.data_dir.unwrap_or_else(default_data_dir),
     }
 }
 
