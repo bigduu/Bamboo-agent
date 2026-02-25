@@ -60,10 +60,18 @@ pub async fn create_provider_with_dir(
 
     match config.provider.as_str() {
         "copilot" => {
+            // Get headless_auth from providers.copilot config, with fallback to deprecated root field
+            let headless_auth = config
+                .providers
+                .copilot
+                .as_ref()
+                .map(|c| c.headless_auth)
+                .unwrap_or(config.headless_auth);
+
             let mut provider = CopilotProvider::with_auth_handler(
                 reqwest::Client::new(),
                 app_data_dir,
-                config.headless_auth,
+                headless_auth,
             );
 
             // Try to authenticate (using cache if available)
@@ -228,7 +236,9 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::config::ServerConfig;
     use crate::core::{AnthropicConfig, GeminiConfig, OpenAIConfig, ProviderConfigs};
+    use std::path::PathBuf;
 
     #[tokio::test]
     async fn test_create_copilot_provider() {
@@ -240,6 +250,8 @@ mod tests {
             proxy_auth: None,
             model: None,
             headless_auth: false,
+            server: ServerConfig::default(),
+            data_dir: PathBuf::from("/tmp/test"),
         };
 
         let result = create_provider(&config).await;
@@ -256,6 +268,8 @@ mod tests {
             proxy_auth: None,
             model: None,
             headless_auth: false,
+            server: ServerConfig::default(),
+            data_dir: PathBuf::from("/tmp/test"),
         };
 
         let result = create_provider(&config).await;
@@ -287,6 +301,8 @@ mod tests {
             proxy_auth: None,
             model: None,
             headless_auth: false,
+            server: ServerConfig::default(),
+            data_dir: PathBuf::from("/tmp/test"),
         };
 
         let result = create_provider(&config).await;
@@ -318,6 +334,8 @@ mod tests {
             proxy_auth: None,
             model: None,
             headless_auth: false,
+            server: ServerConfig::default(),
+            data_dir: PathBuf::from("/tmp/test"),
         };
 
         let result = create_provider(&config).await;
@@ -344,6 +362,8 @@ mod tests {
             proxy_auth: None,
             model: None,
             headless_auth: false,
+            server: ServerConfig::default(),
+            data_dir: PathBuf::from("/tmp/test"),
         };
 
         let result = create_provider(&config).await;
@@ -369,6 +389,8 @@ mod tests {
             proxy_auth: None,
             model: None,
             headless_auth: false,
+            server: ServerConfig::default(),
+            data_dir: PathBuf::from("/tmp/test"),
         };
 
         let result = create_provider(&config).await;
@@ -385,6 +407,8 @@ mod tests {
             proxy_auth: None,
             model: None,
             headless_auth: false,
+            server: ServerConfig::default(),
+            data_dir: PathBuf::from("/tmp/test"),
         };
 
         let result = create_provider(&config).await;
@@ -407,6 +431,8 @@ mod tests {
             proxy_auth: None,
             model: None,
             headless_auth: false,
+            server: ServerConfig::default(),
+            data_dir: PathBuf::from("/tmp/test"),
         };
 
         assert!(validate_provider_config(&config).is_ok());
@@ -422,6 +448,8 @@ mod tests {
             proxy_auth: None,
             model: None,
             headless_auth: false,
+            server: ServerConfig::default(),
+            data_dir: PathBuf::from("/tmp/test"),
         };
 
         let result = validate_provider_config(&config);

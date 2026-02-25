@@ -1,6 +1,9 @@
 //! Bamboo configuration management
 //!
 //! Handles loading/saving configuration from ~/.bamboo/config.json
+//!
+//! **DEPRECATED**: This module is deprecated. Use `bamboo_agent::core::Config` instead.
+//! This module will be removed in a future version.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -10,6 +13,12 @@ use std::path::{Path, PathBuf};
 use super::paths;
 
 /// Main configuration for Bamboo server
+///
+/// **DEPRECATED**: Use `bamboo_agent::core::Config` instead.
+#[deprecated(
+    since = "0.2.6",
+    note = "Use `bamboo_agent::core::Config` instead. This module will be removed in a future version."
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BambooConfig {
     /// Server configuration
@@ -21,6 +30,12 @@ pub struct BambooConfig {
 }
 
 /// HTTP server configuration
+///
+/// **DEPRECATED**: Use `bamboo_agent::core::ServerConfig` instead.
+#[deprecated(
+    since = "0.2.6",
+    note = "Use `bamboo_agent::core::ServerConfig` instead."
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// Port to listen on

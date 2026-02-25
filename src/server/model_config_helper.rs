@@ -67,15 +67,9 @@ mod tests {
                     base_url: None,
                     model: Some("gpt-4o".to_string()),
                 }),
-                anthropic: None,
-                gemini: None,
-                copilot: None,
+                ..ProviderConfigs::default()
             },
-            http_proxy: String::new(),
-            https_proxy: String::new(),
-            proxy_auth: None,
-            model: None,
-            headless_auth: false,
+            ..Config::default()
         };
 
         let result = get_default_model_from_config(&config);
@@ -93,15 +87,9 @@ mod tests {
                     base_url: None,
                     model: None, // No model configured
                 }),
-                anthropic: None,
-                gemini: None,
-                copilot: None,
+                ..ProviderConfigs::default()
             },
-            http_proxy: String::new(),
-            https_proxy: String::new(),
-            proxy_auth: None,
-            model: None,
-            headless_auth: false,
+            ..Config::default()
         };
 
         let result = get_default_model_from_config(&config);

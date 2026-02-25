@@ -2,7 +2,7 @@
 //!
 //! Tests for server startup, configuration, and basic functionality.
 
-use bamboo_agent::{BambooConfig, BambooServer};
+use bamboo_agent::{Config, BambooServer};
 
 #[cfg(test)]
 mod tests {
@@ -10,7 +10,7 @@ mod tests {
 
     #[test]
     fn test_bamboo_config_default() {
-        let config = BambooConfig::default();
+        let config = Config::default();
         assert!(config.server.port > 0);
         assert!(!config.server.bind.is_empty());
         assert!(config.data_dir.exists() || config.data_dir.to_string_lossy().len() > 0);
@@ -18,15 +18,9 @@ mod tests {
 
     #[test]
     fn test_bamboo_config_custom_port() {
-        let config = BambooConfig {
-            server: bamboo_agent::ServerConfig {
-                port: 9090,
-                bind: "127.0.0.1".to_string(),
-                static_dir: None,
-                workers: 4,
-            },
-            ..Default::default()
-        };
+        let mut config = Config::default();
+        config.server.port = 9090;
+        config.server.bind = "127.0.0.1".to_string();
 
         assert_eq!(config.server.port, 9090);
         assert_eq!(config.server.bind, "127.0.0.1");
@@ -34,22 +28,16 @@ mod tests {
 
     #[test]
     fn test_bamboo_server_creation() {
-        let config = BambooConfig::default();
+        let config = Config::default();
         let server = BambooServer::new(config);
         assert!(!server.server_addr().is_empty());
     }
 
     #[test]
     fn test_bamboo_server_addr() {
-        let config = BambooConfig {
-            server: bamboo_agent::ServerConfig {
-                port: 8080,
-                bind: "127.0.0.1".to_string(),
-                static_dir: None,
-                workers: 4,
-            },
-            ..Default::default()
-        };
+        let mut config = Config::default();
+        config.server.port = 8080;
+        config.server.bind = "127.0.0.1".to_string();
 
         let server = BambooServer::new(config);
         assert!(server.server_addr().contains("127.0.0.1"));
@@ -58,16 +46,10 @@ mod tests {
 
     #[test]
     fn test_bamboo_paths() {
-        use bamboo_agent::config::paths::*;
+        use bamboo_agent::core::paths::*;
 
-        let bamboo_home = bamboo_home();
+        let bamboo_home = bamboo_dir();
         assert!(bamboo_home.to_string_lossy().ends_with(".bamboo"));
-
-        let bamboo_config = bamboo_config_dir();
-        assert!(bamboo_config.to_string_lossy().ends_with(".bamboo"));
-
-        let bamboo_data = bamboo_data_dir();
-        assert!(bamboo_data.to_string_lossy().ends_with(".bamboo"));
     }
 
     #[test]

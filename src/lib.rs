@@ -12,7 +12,7 @@
 //! # Features
 //!
 //! - **Dual mode**: Binary (standalone server) or library (embedded)
-//! - **XDG-compliant**: Follows XDG Base Directory specification
+//! - **Unified directory**: All data in ~/.bamboo directory
 //! - **Production-ready**: Built-in CORS, rate limiting, security headers
 //!
 //! # Quick Start
@@ -20,17 +20,17 @@
 //! ## Binary Mode
 //!
 //! ```bash
-//! bamboo serve --port 8080 --data-dir ~/.local/share/bamboo
+//! bamboo serve --port 8080 --data-dir ~/.bamboo
 //! ```
 //!
 //! ## Library Mode
 //!
 //! ```rust,ignore
-//! use bamboo::{BambooServer, BambooConfig};
+//! use bamboo::{BambooServer, core::Config};
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let config = BambooConfig::default();
+//!     let config = Config::new();
 //!     let server = BambooServer::new(config);
 //!     // server.start().await.unwrap(); // Not yet implemented
 //! }
@@ -50,18 +50,24 @@ pub mod process;
 pub mod server;
 pub mod web_service;
 
-pub use config::{BambooConfig, ServerConfig};
+// Re-export core Config as the primary configuration type
+pub use core::Config;
+pub use core::config::ServerConfig;
+
+// Deprecated: Use core::Config instead
+#[allow(deprecated)]
+pub use config::{BambooConfig, ServerConfig as LegacyServerConfig};
 pub use error::{BambooError, Result};
 pub use process::ProcessRegistry;
 
 /// Main Bamboo server instance
 pub struct BambooServer {
-    config: BambooConfig,
+    config: core::Config,
 }
 
 impl BambooServer {
     /// Create a new Bamboo server with configuration
-    pub fn new(config: BambooConfig) -> Self {
+    pub fn new(config: core::Config) -> Self {
         Self { config }
     }
 
@@ -90,19 +96,19 @@ impl BambooServer {
 /// let server = BambooBuilder::new()
 ///     .port(8080)
 ///     .bind("127.0.0.1")
-///     .data_dir(PathBuf::from("~/.local/share/bamboo"))
+///     .data_dir(PathBuf::from("~/.bamboo"))
 ///     .build()
 ///     .unwrap();
 /// ```
 pub struct BambooBuilder {
-    config: BambooConfig,
+    config: core::Config,
 }
 
 impl BambooBuilder {
     /// Create a new BambooBuilder with default configuration
     pub fn new() -> Self {
         Self {
-            config: BambooConfig::default(),
+            config: core::Config::new(),
         }
     }
 
@@ -121,8 +127,8 @@ impl BambooBuilder {
     /// # Arguments
     ///
     /// * `addr` - IP address to bind to (e.g., "127.0.0.1", "0.0.0.0")
-    pub fn bind(mut self, addr: &str) -> Self {
-        self.config.server.bind = addr.to_string();
+    pub fn bind(mut self, addr: impl Into<String>) -> Self {
+        self.config.server.bind = addr.into();
         self
     }
 
@@ -133,6 +139,26 @@ impl BambooBuilder {
     /// * `dir` - Path to the data directory
     pub fn data_dir(mut self, dir: PathBuf) -> Self {
         self.config.data_dir = dir;
+        self
+    }
+
+    /// Set the static files directory
+    ///
+    /// # Arguments
+    ///
+    /// * `dir` - Path to static files directory
+    pub fn static_dir(mut self, dir: PathBuf) -> Self {
+        self.config.server.static_dir = Some(dir);
+        self
+    }
+
+    /// Set the number of workers
+    ///
+    /// # Arguments
+    ///
+    /// * `workers` - Number of worker threads
+    pub fn workers(mut self, workers: usize) -> Self {
+        self.config.server.workers = workers;
         self
     }
 

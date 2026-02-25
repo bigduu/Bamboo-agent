@@ -2,7 +2,6 @@
 //!
 //! Standalone HTTP server for Bamboo
 
-use bamboo_agent::{BambooBuilder, BambooConfig};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -18,15 +17,15 @@ struct Cli {
 enum Commands {
     /// Start the Bamboo HTTP server
     Serve {
-        /// Port to listen on
-        #[arg(short, long, default_value = "8080")]
-        port: u16,
+        /// Port to listen on (overrides config file)
+        #[arg(short, long)]
+        port: Option<u16>,
 
-        /// Bind address
-        #[arg(short, long, default_value = "127.0.0.1")]
-        bind: String,
+        /// Bind address (overrides config file)
+        #[arg(short, long)]
+        bind: Option<String>,
 
-        /// Data directory (defaults to ~/.bamboo)
+        /// Data directory (overrides config file)
         #[arg(short, long)]
         data_dir: Option<PathBuf>,
 
@@ -34,9 +33,9 @@ enum Commands {
         #[arg(short, long)]
         static_dir: Option<PathBuf>,
 
-        /// Number of worker threads
-        #[arg(short, long, default_value = "10")]
-        workers: usize,
+        /// Number of worker threads (overrides config file)
+        #[arg(short, long)]
+        workers: Option<usize>,
     },
 
     /// Show Bamboo configuration
@@ -44,6 +43,10 @@ enum Commands {
         /// Show config file path
         #[arg(short, long)]
         path: bool,
+
+        /// Show sensitive values (API keys, etc.)
+        #[arg(long)]
+        show_secrets: bool,
     },
 }
 
@@ -59,45 +62,66 @@ async fn main() {
             port,
             bind,
             data_dir,
-            static_dir: _,
-            workers: _,
+            static_dir,
+            workers,
         } => {
-            let mut builder = BambooBuilder::new().port(port).bind(&bind);
+            // Load config (with env var overrides already applied)
+            // If --data-dir is specified, load from that directory
+            let mut config = if let Some(ref d) = data_dir {
+                bamboo_agent::core::Config::from_data_dir(Some(d.clone()))
+            } else {
+                bamboo_agent::core::Config::new()
+            };
 
-            if let Some(dir) = data_dir {
-                builder = builder.data_dir(dir);
+            // Apply CLI argument overrides (highest priority)
+            if let Some(p) = port {
+                config.server.port = p;
+            }
+            if let Some(b) = bind {
+                config.server.bind = b;
+            }
+            if let Some(s) = static_dir {
+                config.server.static_dir = Some(s);
+            }
+            if let Some(w) = workers {
+                config.server.workers = w;
             }
 
-            // Note: static_dir and workers need to be added to BambooConfig
-
-            match builder.build() {
-                Ok(server) => {
-                    println!("Starting Bamboo server at {}", server.server_addr());
-                    if let Err(e) = server.start().await {
-                        eprintln!("Server error: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to build server: {}", e);
-                    std::process::exit(1);
-                }
+            // Start server using the unified config
+            println!("Starting Bamboo server at {}", config.server_addr());
+            if let Err(e) = bamboo_agent::server::run_with_bind(
+                config.data_dir.clone(),
+                config.server.port,
+                &config.server.bind,
+            ).await {
+                eprintln!("Failed to start server: {}", e);
+                std::process::exit(1);
             }
         }
 
-        Commands::Config { path } => {
+        Commands::Config { path, show_secrets } => {
             if path {
-                println!("{}", bamboo_agent::config::bamboo_config_file().display());
+                println!("{}", bamboo_agent::core::paths::config_json_path().display());
             } else {
-                match BambooConfig::load() {
-                    Ok(config) => {
-                        println!("{}", serde_json::to_string_pretty(&config).unwrap());
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to load config: {}", e);
-                        std::process::exit(1);
+                let config = bamboo_agent::core::Config::new();
+                let mut config_value = serde_json::to_value(&config).unwrap();
+
+                if !show_secrets {
+                    // Redact sensitive fields
+                    if let Some(providers) = config_value.get_mut("providers") {
+                        if let Some(providers_obj) = providers.as_object_mut() {
+                            for (_, provider) in providers_obj.iter_mut() {
+                                if let Some(provider_obj) = provider.as_object_mut() {
+                                    if provider_obj.contains_key("api_key") {
+                                        provider_obj.insert("api_key".to_string(), serde_json::json!("***REDACTED***"));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+
+                println!("{}", serde_json::to_string_pretty(&config_value).unwrap());
             }
         }
     }

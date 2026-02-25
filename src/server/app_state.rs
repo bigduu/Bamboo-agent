@@ -325,7 +325,8 @@ impl AppState {
     /// }
     /// ```
     pub async fn new(bamboo_home_dir: PathBuf) -> Self {
-        let config = Config::new();
+        // Load config from the specified data directory
+        let config = Config::from_data_dir(Some(bamboo_home_dir.clone()));
 
         // Create provider with direct access (no HTTP proxy)
         let provider =
@@ -588,7 +589,7 @@ impl AppState {
     /// }
     /// ```
     pub async fn reload_config(&self) -> Config {
-        let new_config = Config::new();
+        let new_config = Config::from_data_dir(Some(self.app_data_dir.clone()));
         let mut config = self.config.write().await;
         *config = new_config.clone();
         new_config

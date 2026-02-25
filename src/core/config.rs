@@ -1,40 +1,61 @@
 //! Configuration management for Bamboo agent
 //!
-//! This module provides configuration types and loading logic for the entire
+//! This module provides unified configuration types and loading logic for the entire
 //! Bamboo agent system. It supports multiple LLM providers, proxy settings,
-//! and both JSON and TOML configuration formats.
+//! and JSON configuration format.
 //!
 //! # Configuration File
 //!
-//! Configuration is stored in `config.toml` (preferred) or `config.json` (legacy)
-//! under the XDG-compliant data directory (typically `~/.local/share/bamboo/`).
+//! Configuration is stored in `config.json` under the unified data directory
+//! (defaults to `~/.bamboo/`). Environment variables can override file values.
 //!
-//! # Example (TOML)
+//! # Example (JSON)
 //!
-//! ```toml
-//! provider = "anthropic"
-//!
-//! [providers.anthropic]
-//! api_key = "sk-ant-..."
-//! model = "claude-3-5-sonnet-20241022"
-//!
-//! [providers.openai]
-//! api_key = "sk-..."
-//! base_url = "https://api.openai.com/v1"
+//! ```json
+//! {
+//!   "provider": "anthropic",
+//!   "server": {
+//!     "port": 8080,
+//!     "bind": "127.0.0.1"
+//!   },
+//!   "providers": {
+//!     "anthropic": {
+//!       "api_key": "sk-ant-...",
+//!       "model": "claude-3-5-sonnet-20241022"
+//!     },
+//!     "openai": {
+//!       "api_key": "sk-...",
+//!       "base_url": "https://api.openai.com/v1"
+//!     }
+//!   }
+//! }
 //! ```
+//!
+//! # Priority Order
+//!
+//! Configuration values are loaded in this order (later overrides earlier):
+//! 1. Code defaults (hardcoded default values)
+//! 2. Config file values (from `~/.bamboo/config.json`)
+//! 3. Environment variables (e.g., `BAMBOO_PORT`)
+//! 4. CLI arguments (e.g., `--port 9000`)
 //!
 //! # Environment Variables
 //!
+//! - `BAMBOO_DATA_DIR`: Override data directory location
+//! - `BAMBOO_PORT`: Override server port
+//! - `BAMBOO_BIND`: Override server bind address
 //! - `BAMBOO_PROVIDER`: Override default provider
-//! - `BAMBOO_HEADLESS_AUTH`: Enable headless authentication mode
-//! - `HTTP_PROXY` / `HTTPS_PROXY`: Proxy settings
+//! - `BAMBOO_HEADLESS`: Enable headless authentication mode
+//! - `MODEL`: Override default model
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use anyhow::{Context, Result};
 
 /// Main configuration structure for Bamboo agent
 ///
 /// Contains all settings needed to run the agent, including provider credentials,
-/// proxy settings, and model selection.
+/// proxy settings, model selection, and server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// HTTP proxy URL (e.g., `http://proxy.example.com:8080`)
@@ -58,6 +79,14 @@ pub struct Config {
     /// Provider-specific configurations
     #[serde(default)]
     pub providers: ProviderConfigs,
+
+    /// HTTP server configuration
+    #[serde(default)]
+    pub server: ServerConfig,
+
+    /// Data directory path (defaults to ~/.bamboo)
+    #[serde(default = "default_data_dir")]
+    pub data_dir: PathBuf,
 }
 
 /// Container for provider-specific configurations
@@ -79,11 +108,12 @@ pub struct ProviderConfigs {
 ///
 /// # Example
 ///
-/// ```toml
-/// [providers.openai]
-/// api_key = "sk-..."
-/// base_url = "https://api.openai.com/v1"  # Optional
-/// model = "gpt-4"  # Optional
+/// ```json
+/// "openai": {
+///   "api_key": "sk-...",
+///   "base_url": "https://api.openai.com/v1",
+///   "model": "gpt-4"
+/// }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAIConfig {
@@ -101,11 +131,12 @@ pub struct OpenAIConfig {
 ///
 /// # Example
 ///
-/// ```toml
-/// [providers.anthropic]
-/// api_key = "sk-ant-..."
-/// model = "claude-3-5-sonnet-20241022"
-/// max_tokens = 4096  # Optional
+/// ```json
+/// "anthropic": {
+///   "api_key": "sk-ant-...",
+///   "model": "claude-3-5-sonnet-20241022",
+///   "max_tokens": 4096
+/// }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicConfig {
@@ -126,10 +157,11 @@ pub struct AnthropicConfig {
 ///
 /// # Example
 ///
-/// ```toml
-/// [providers.gemini]
-/// api_key = "AIza..."
-/// model = "gemini-2.0-flash-exp"
+/// ```json
+/// "gemini": {
+///   "api_key": "AIza...",
+///   "model": "gemini-2.0-flash-exp"
+/// }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiConfig {
@@ -147,10 +179,11 @@ pub struct GeminiConfig {
 ///
 /// # Example
 ///
-/// ```toml
-/// [providers.copilot]
-/// enabled = true
-/// headless_auth = false  # Set to true for servers without browser
+/// ```json
+/// "copilot": {
+///   "enabled": true,
+///   "headless_auth": false
+/// }
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CopilotConfig {
@@ -165,6 +198,56 @@ pub struct CopilotConfig {
 /// Returns the default provider name ("copilot")
 fn default_provider() -> String {
     "copilot".to_string()
+}
+
+/// Returns the default server port (8080)
+fn default_port() -> u16 {
+    8080
+}
+
+/// Returns the default bind address (127.0.0.1)
+fn default_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
+/// Returns the default worker count (10)
+fn default_workers() -> usize {
+    10
+}
+
+/// Returns the default data directory (~/.bamboo)
+fn default_data_dir() -> PathBuf {
+    super::paths::bamboo_dir()
+}
+
+/// HTTP server configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// Port to listen on
+    #[serde(default = "default_port")]
+    pub port: u16,
+
+    /// Bind address (127.0.0.1, 0.0.0.0, etc.)
+    #[serde(default = "default_bind")]
+    pub bind: String,
+
+    /// Static files directory (for Docker mode)
+    pub static_dir: Option<PathBuf>,
+
+    /// Worker count for Actix-web
+    #[serde(default = "default_workers")]
+    pub workers: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            port: default_port(),
+            bind: default_bind(),
+            static_dir: None,
+            workers: default_workers(),
+        }
+    }
 }
 
 /// Proxy authentication credentials
@@ -199,21 +282,39 @@ impl Config {
     /// Load configuration from file with environment variable overrides
     ///
     /// Configuration loading order:
-    /// 1. Try loading from `config.json` (XDG path)
+    /// 1. Try loading from `config.json` (data_dir/config.json)
     /// 2. Migrate old format if detected
     /// 3. Fallback to `config.toml` in current directory
-    /// 4. Use defaults with environment variable overrides
+    /// 4. Use defaults
+    /// 5. Apply environment variable overrides (highest priority)
     ///
     /// # Environment Variables
     ///
+    /// - `BAMBOO_PORT`: Override server port
+    /// - `BAMBOO_BIND`: Override bind address
+    /// - `BAMBOO_DATA_DIR`: Override data directory
+    /// - `BAMBOO_PROVIDER`: Override default provider
     /// - `MODEL`: Default model name
     /// - `BAMBOO_HEADLESS`: Enable headless authentication mode
     pub fn new() -> Self {
-        use super::paths::config_json_path;
+        Self::from_data_dir(None)
+    }
 
-        let json_path = config_json_path();
-        if json_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&json_path) {
+    /// Load configuration from a specific data directory
+    ///
+    /// # Arguments
+    ///
+    /// * `data_dir` - Optional data directory path. If None, uses default (~/.bamboo)
+    pub fn from_data_dir(data_dir: Option<PathBuf>) -> Self {
+        // Determine data_dir early (needed to find config file)
+        let data_dir = data_dir
+            .or_else(|| std::env::var("BAMBOO_DATA_DIR").ok().map(PathBuf::from))
+            .unwrap_or_else(default_data_dir);
+
+        let config_path = data_dir.join("config.json");
+
+        let mut config = if config_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&config_path) {
                 // Try to parse as old format first (for migration)
                 if let Ok(old_config) = serde_json::from_str::<OldConfig>(&content) {
                     // Check if it has old-only fields
@@ -226,30 +327,70 @@ impl Config {
                         let migrated = migrate_config(old_config);
                         // Save migrated config
                         if let Ok(new_content) = serde_json::to_string_pretty(&migrated) {
-                            let _ = std::fs::write(&json_path, new_content);
+                            let _ = std::fs::write(&config_path, new_content);
                         }
-                        return migrated;
+                        migrated
+                    } else {
+                        // Try to parse as new Config format
+                        serde_json::from_str::<Config>(&content).unwrap_or_else(|_| Self::create_default())
                     }
+                } else {
+                    // Try to parse as new Config format
+                    serde_json::from_str::<Config>(&content).unwrap_or_else(|_| Self::create_default())
                 }
+            } else {
+                Self::create_default()
+            }
+        } else {
+            // Fallback to legacy config.toml
+            if std::path::Path::new(CONFIG_FILE_PATH).exists() {
+                if let Ok(content) = std::fs::read_to_string(CONFIG_FILE_PATH) {
+                    if let Ok(old_config) = toml::from_str::<OldConfig>(&content) {
+                        migrate_config(old_config)
+                    } else {
+                        Self::create_default()
+                    }
+                } else {
+                    Self::create_default()
+                }
+            } else {
+                Self::create_default()
+            }
+        };
 
-                // Try to parse as new Config format
-                if let Ok(config) = serde_json::from_str::<Config>(&content) {
-                    return config;
-                }
+        // Ensure data_dir is set correctly
+        config.data_dir = data_dir;
+
+        // Apply environment variable overrides (highest priority)
+        if let Ok(port) = std::env::var("BAMBOO_PORT") {
+            if let Ok(port) = port.parse() {
+                config.server.port = port;
             }
         }
 
-        // Fallback to legacy config.toml
-        if std::path::Path::new(CONFIG_FILE_PATH).exists() {
-            if let Ok(content) = std::fs::read_to_string(CONFIG_FILE_PATH) {
-                if let Ok(old_config) = toml::from_str::<OldConfig>(&content) {
-                    return migrate_config(old_config);
-                }
-            }
+        if let Ok(bind) = std::env::var("BAMBOO_BIND") {
+            config.server.bind = bind;
         }
 
-        // Default config with environment variable overrides
-        let mut config = Config {
+        // Note: BAMBOO_DATA_DIR already handled above
+        if let Ok(provider) = std::env::var("BAMBOO_PROVIDER") {
+            config.provider = provider;
+        }
+
+        if let Ok(model) = std::env::var("MODEL") {
+            config.model = Some(model);
+        }
+
+        if let Ok(headless) = std::env::var("BAMBOO_HEADLESS") {
+            config.headless_auth = parse_bool_env(&headless);
+        }
+
+        config
+    }
+
+    /// Create a default configuration without loading from file
+    fn create_default() -> Self {
+        Config {
             http_proxy: String::new(),
             https_proxy: String::new(),
             proxy_auth: None,
@@ -257,15 +398,32 @@ impl Config {
             headless_auth: false,
             provider: default_provider(),
             providers: ProviderConfigs::default(),
-        };
+            server: ServerConfig::default(),
+            data_dir: default_data_dir(),
+        }
+    }
 
-        if let Ok(model) = std::env::var("MODEL") {
-            config.model = Some(model);
+    /// Get the full server address (bind:port)
+    pub fn server_addr(&self) -> String {
+        format!("{}:{}", self.server.bind, self.server.port)
+    }
+
+    /// Save configuration to disk
+    pub fn save(&self) -> Result<()> {
+        let path = self.data_dir.join("config.json");
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create config dir: {:?}", parent))?;
         }
-        if let Ok(headless) = std::env::var("BAMBOO_HEADLESS") {
-            config.headless_auth = parse_bool_env(&headless);
-        }
-        config
+
+        let content = serde_json::to_string_pretty(self)
+            .context("Failed to serialize config to JSON")?;
+
+        std::fs::write(&path, content)
+            .with_context(|| format!("Failed to write config file: {:?}", path))?;
+
+        Ok(())
     }
 }
 
@@ -316,6 +474,8 @@ fn migrate_config(old: OldConfig) -> Config {
         headless_auth: old.headless_auth,
         provider: default_provider(),
         providers: ProviderConfigs::default(),
+        server: ServerConfig::default(),
+        data_dir: default_data_dir(),
     }
 }
 
@@ -566,5 +726,74 @@ mod tests {
         let auth = config.proxy_auth.unwrap();
         assert_eq!(auth.username, "http_user");
         assert_eq!(auth.password, "http_pass");
+    }
+
+    #[test]
+    fn test_server_config_defaults() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let temp_home = TempHome::new();
+
+        // Set temp home BEFORE creating config
+        let home = temp_home.path.to_string_lossy().to_string();
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let config = Config::default();
+        assert_eq!(config.server.port, 8080);
+        assert_eq!(config.server.bind, "127.0.0.1");
+        assert_eq!(config.server.workers, 10);
+        assert!(config.server.static_dir.is_none());
+    }
+
+    #[test]
+    fn test_server_addr() {
+        let mut config = Config::default();
+        config.server.port = 9000;
+        config.server.bind = "0.0.0.0".to_string();
+        assert_eq!(config.server_addr(), "0.0.0.0:9000");
+    }
+
+    #[test]
+    fn test_env_var_overrides() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let temp_home = TempHome::new();
+
+        // Set temp home to avoid loading real config
+        let home = temp_home.path.to_string_lossy().to_string();
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let _port = EnvVarGuard::set("BAMBOO_PORT", "9999");
+        let _bind = EnvVarGuard::set("BAMBOO_BIND", "192.168.1.1");
+        let _provider = EnvVarGuard::set("BAMBOO_PROVIDER", "openai");
+
+        let config = Config::new();
+        assert_eq!(config.server.port, 9999);
+        assert_eq!(config.server.bind, "192.168.1.1");
+        assert_eq!(config.provider, "openai");
+    }
+
+    #[test]
+    fn test_config_save_and_load() {
+        let _lock = env_lock().lock().expect("env lock poisoned");
+        let temp_home = TempHome::new();
+
+        // Set temp home BEFORE creating config
+        let home = temp_home.path.to_string_lossy().to_string();
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let mut config = Config::default();
+        config.server.port = 9000;
+        config.server.bind = "0.0.0.0".to_string();
+        config.provider = "anthropic".to_string();
+
+        // Save
+        config.save().expect("Failed to save config");
+
+        // Load again
+        let loaded = Config::new();
+
+        // Verify
+        assert_eq!(loaded.server.port, 9000);
+        assert_eq!(loaded.server.bind, "0.0.0.0");
+        assert_eq!(loaded.provider, "anthropic");
     }
 }
