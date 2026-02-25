@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Converted all provider configuration examples from TOML to JSON
 
 ### Changed
+
+#### Default Provider
+- **CHANGED**: Default provider reverted from "copilot" to "anthropic"
+  - **Reason**: Copilot OAuth2 authentication is difficult to test and mock in CI/CD environments
+  - **Impact**: New installations will use Anthropic by default (requires API key)
+  - **Migration**: Users wanting Copilot should explicitly set `provider: "copilot"` in config
+  - **Future**: Copilot will be re-introduced as default in v0.3.0 with proper test infrastructure
+
 - Configuration documentation now accurately reflects implementation behavior
 - All provider configuration examples use JSON format consistently
 
@@ -44,13 +52,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - These are documented and can be addressed in future release
 
 ### Files Modified
+- `src/core/config.rs` - Reverted default provider to "anthropic"
 - `src/server/app_state.rs` - Fixed data_dir usage in config loading
+- `src/server/handlers/agent_api.rs` - Fixed `get_claude_dir()` to create directory if missing
 - `src/bin/bamboo.rs` - Added `--show-secrets` flag and secret redaction
-- `src/core/config.rs` - Fixed all documentation to match implementation
+- `tests/e2e/copilot_auth.rs` - Updated test for new default provider
 - `Cargo.toml` - Version bump to 0.2.6
 
 ### Migration Notes
-- No breaking changes - 100% backward compatible
+- **Default Provider Change**: If you relied on implicit "copilot" default, explicitly set in config:
+  ```json
+  {
+    "provider": "copilot"
+  }
+  ```
+- **No other breaking changes** - 100% backward compatible for existing configurations
 - Users can optionally add `server` section to config.json (defaults used if omitted)
 - Environment variable `BAMBOO_HEADLESS_AUTH` deprecated, use `BAMBOO_HEADLESS`
 

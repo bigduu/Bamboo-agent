@@ -195,9 +195,9 @@ pub struct CopilotConfig {
     pub headless_auth: bool,
 }
 
-/// Returns the default provider name ("copilot")
+/// Returns the default provider name ("anthropic")
 fn default_provider() -> String {
-    "copilot".to_string()
+    "anthropic".to_string()
 }
 
 /// Returns the default server port (8080)

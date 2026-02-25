@@ -86,7 +86,7 @@ mod comprehensive_config_tests {
         let temp = TempDir::new();
 
         // File says port 1111
-        temp.write_config(r#"{"server": {"port": 1111, "bind": "127.0.0.1"}, "provider": "copilot"}"#);
+        temp.write_config(r#"{"server": {"port": 1111, "bind": "127.0.0.1"}, "provider": "anthropic"}"#);
 
         let _env = EnvVarGuard::set("BAMBOO_DATA_DIR", temp.path.to_str().unwrap());
         let _port = EnvVarGuard::set("BAMBOO_PORT", "2222");
@@ -100,7 +100,7 @@ mod comprehensive_config_tests {
         let _lock = env_lock().lock().unwrap();
         let temp = TempDir::new();
 
-        temp.write_config(r#"{"server": {"port": 8080, "bind": "127.0.0.1"}, "provider": "copilot"}"#);
+        temp.write_config(r#"{"server": {"port": 8080, "bind": "127.0.0.1"}, "provider": "anthropic"}"#);
 
         let _env = EnvVarGuard::set("BAMBOO_DATA_DIR", temp.path.to_str().unwrap());
         let _bind = EnvVarGuard::set("BAMBOO_BIND", "0.0.0.0");
@@ -114,7 +114,7 @@ mod comprehensive_config_tests {
         let _lock = env_lock().lock().unwrap();
         let temp = TempDir::new();
 
-        temp.write_config(r#"{"provider": "copilot"}"#);
+        temp.write_config(r#"{"provider": "anthropic"}"#);
 
         let _env = EnvVarGuard::set("BAMBOO_DATA_DIR", temp.path.to_str().unwrap());
         let _provider = EnvVarGuard::set("BAMBOO_PROVIDER", "anthropic");
@@ -232,7 +232,7 @@ mod comprehensive_config_tests {
                     "api_key": "sk-ant-test",
                     "model": "claude-3"
                 },
-                "copilot": {
+                "anthropic": {
                     "enabled": true,
                     "headless_auth": false
                 }
@@ -331,14 +331,14 @@ mod comprehensive_config_tests {
         let temp = TempDir::new();
 
         temp.write_config(r#"{
-            "provider": "copilot",
+            "provider": "anthropic",
             "unknown_key": 123,
             "future_field": "value"
         }"#);
 
         let _env = EnvVarGuard::set("BAMBOO_DATA_DIR", temp.path.to_str().unwrap());
         let config = Config::new();
-        assert_eq!(config.provider, "copilot");
+        assert_eq!(config.provider, "anthropic");
     }
 
     // === 5) Edge Cases ===
@@ -354,7 +354,7 @@ mod comprehensive_config_tests {
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.bind, "127.0.0.1");
         assert_eq!(config.server.workers, 10);
-        assert_eq!(config.provider, "copilot");
+        assert_eq!(config.provider, "anthropic");
     }
 
     #[test]
@@ -418,10 +418,10 @@ mod comprehensive_config_tests {
         let temp = TempDir::new();
 
         temp.write_config(r#"{
-            "provider": "copilot",
+            "provider": "anthropic",
             "headless_auth": false,
             "providers": {
-                "copilot": {
+                "anthropic": {
                     "enabled": true,
                     "headless_auth": true
                 }
