@@ -4,9 +4,6 @@
 
 #[cfg(test)]
 mod tests {
-    use bamboo_agent::server::controllers::*;
-    use bamboo_agent::server::AppState;
-
     // Note: These are placeholder tests that verify the module structure
     // Full integration tests would require starting the server and making HTTP requests
 
@@ -20,11 +17,7 @@ mod tests {
     #[test]
     fn test_app_state_creation() {
         // Test that we can create app state with test configuration
-        use bamboo_agent::agent::llm::LLMProvider;
-        use bamboo_agent::core::Config;
         use std::path::PathBuf;
-        use std::sync::Arc;
-        use tokio::sync::RwLock;
 
         // Note: This is a simplified test
         // In practice, we'd need to mock the LLM provider
@@ -67,13 +60,13 @@ mod tests {
     fn test_message_creation() {
         use bamboo_agent::agent::Message;
 
-        let user_msg = Message::user("Hello".to_string());
+        let user_msg = Message::user("Hello");
         assert_eq!(user_msg.role, bamboo_agent::agent::Role::User);
 
-        let assistant_msg = Message::assistant("Hi there".to_string(), None);
+        let assistant_msg = Message::assistant("Hi there", None);
         assert_eq!(assistant_msg.role, bamboo_agent::agent::Role::Assistant);
 
-        let system_msg = Message::system("You are helpful".to_string());
+        let system_msg = Message::system("You are helpful");
         assert_eq!(system_msg.role, bamboo_agent::agent::Role::System);
     }
 
@@ -89,18 +82,15 @@ mod tests {
 
     #[test]
     fn test_workflow_operations() {
-        use bamboo_agent::commands::workflows::{delete_workflow, save_workflow};
-
-        // These would need to be async in practice
-        // This is just verifying the module structure
+        // These would need to be async in practice; we just verify symbols exist.
+        let _ = bamboo_agent::commands::save_workflow;
+        let _ = bamboo_agent::commands::delete_workflow;
         assert!(true);
     }
 
     #[test]
     fn test_keyword_masking_config() {
         use bamboo_agent::commands::keyword_masking::load_keyword_masking_config;
-        use bamboo_agent::core::keyword_masking::KeywordMaskingConfig;
-        use std::path::Path;
 
         let temp_dir = tempfile::TempDir::new().unwrap();
         let config_path = temp_dir.path().join("keyword_masking.json");

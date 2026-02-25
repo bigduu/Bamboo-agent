@@ -315,7 +315,8 @@ Version 0.2.0 consolidated `web_service` and `agent::server` into unified `serve
 
 **Old imports (still work with deprecation warnings):**
 ```rust
-use bamboo_agent::agent::server::state::AppState;
+// NOTE: this legacy import path was removed in v0.2.8.
+// use bamboo_agent::agent::server::state::AppState;
 use bamboo_agent::web_service::WebService;
 use bamboo_agent::web_service::controllers::*;
 ```
@@ -332,6 +333,8 @@ Key changes:
 - Removed HTTP callback proxy pattern
 - Direct provider access through unified `AppState`
 - All functionality preserved, cleaner architecture
+
+Note: the legacy `bamboo_agent::agent::server::state::AppState` import path was removed in v0.2.8.
 
 ## Performance Characteristics
 

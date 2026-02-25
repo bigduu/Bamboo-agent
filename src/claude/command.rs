@@ -77,8 +77,6 @@ pub fn create_command_with_env(program: &str) -> Command {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_join_paths_with_env_functions() {
         // Test that std::env::join_paths and split_paths work correctly

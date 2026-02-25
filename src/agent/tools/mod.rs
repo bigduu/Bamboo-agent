@@ -23,12 +23,12 @@
 //! ```no_run
 //! use bamboo_agent::tools::{ToolRegistry, ReadFileTool, WriteFileTool};
 //!
-//! let mut registry = ToolRegistry::new();
-//! registry.register(ReadFileTool::new());
-//! registry.register(WriteFileTool::new());
+//! let registry = ToolRegistry::new();
+//! registry.register(ReadFileTool::new()).unwrap();
+//! registry.register(WriteFileTool::new()).unwrap();
 //!
 //! // Look up and execute tools
-//! let tool = registry.get("read_file")?;
+//! let _tool = registry.get("read_file").expect("tool registered");
 //! ```
 //!
 //! ## Built-in Tool Executor
@@ -61,15 +61,10 @@
 //! # Example
 //!
 //! ```no_run
-//! use bamboo_agent::tools::{BuiltinToolExecutor, ToolOutputManager};
+//! use bamboo_agent::tools::BuiltinToolExecutor;
 //!
-//! let output_manager = ToolOutputManager::new();
-//! let executor = BuiltinToolExecutor::builder()
-//!     .output_manager(output_manager)
-//!     .build()?;
-//!
-//! // Execute a tool
-//! let result = executor.execute("read_file", r#"{"path": "/tmp/test.txt"}"#).await?;
+//! let executor = BuiltinToolExecutor::new();
+//! let _schemas = executor.registry().list_tools();
 //! ```
 //!
 //! # Re-exports

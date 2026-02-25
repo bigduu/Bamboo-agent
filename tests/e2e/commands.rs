@@ -1,19 +1,16 @@
 //! E2E tests for /v1/commands/* endpoints
 
 use actix_web::{test, web, App};
-use bamboo_agent::server::app_state::AppState;
 use bamboo_agent::server::handlers::command;
 use serde_json::Value;
 
 #[actix_web::test]
 async fn test_list_commands_endpoint() {
     let state = crate::e2e::common::create_test_app().await;
-    let agent_state = create_agent_state(&state).await;
 
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
-            .app_data(agent_state)
             .route("/v1/commands", web::get().to(command::list_commands)),
     )
     .await;
@@ -28,12 +25,10 @@ async fn test_list_commands_endpoint() {
 #[actix_web::test]
 async fn test_list_commands_returns_json() {
     let state = crate::e2e::common::create_test_app().await;
-    let agent_state = create_agent_state(&state).await;
 
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
-            .app_data(agent_state)
             .route("/v1/commands", web::get().to(command::list_commands)),
     )
     .await;
@@ -69,17 +64,10 @@ async fn test_get_command_by_id_workflow() {
         .await
         .expect("Failed to write workflow");
 
-    let agent_state = create_agent_state(&state).await;
-
-    let app = test::init_service(
-        App::new()
-            .app_data(state.clone())
-            .app_data(agent_state)
-            .route(
-                "/v1/commands/{command_type}/{id}",
-                web::get().to(command::get_command),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state.clone()).route(
+        "/v1/commands/{command_type}/{id}",
+        web::get().to(command::get_command),
+    ))
     .await;
 
     let req = test::TestRequest::get()
@@ -101,17 +89,11 @@ async fn test_get_command_by_id_workflow() {
 #[actix_web::test]
 async fn test_get_nonexistent_command() {
     let state = crate::e2e::common::create_test_app().await;
-    let agent_state = create_agent_state(&state).await;
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state.clone())
-            .app_data(agent_state)
-            .route(
-                "/v1/commands/{command_type}/{id}",
-                web::get().to(command::get_command),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state.clone()).route(
+        "/v1/commands/{command_type}/{id}",
+        web::get().to(command::get_command),
+    ))
     .await;
 
     // Test nonexistent workflow
@@ -142,17 +124,11 @@ async fn test_get_nonexistent_command() {
 #[actix_web::test]
 async fn test_get_mcp_command_returns_404() {
     let state = crate::e2e::common::create_test_app().await;
-    let agent_state = create_agent_state(&state).await;
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state.clone())
-            .app_data(agent_state)
-            .route(
-                "/v1/commands/{command_type}/{id}",
-                web::get().to(command::get_command),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state.clone()).route(
+        "/v1/commands/{command_type}/{id}",
+        web::get().to(command::get_command),
+    ))
     .await;
 
     // MCP tools don't support content retrieval
@@ -179,12 +155,9 @@ async fn test_list_commands_includes_workflows_and_skills() {
         .await
         .expect("Failed to write workflow");
 
-    let agent_state = create_agent_state(&state).await;
-
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
-            .app_data(agent_state)
             .route("/v1/commands", web::get().to(command::list_commands)),
     )
     .await;
@@ -206,25 +179,4 @@ async fn test_list_commands_includes_workflows_and_skills() {
         .iter()
         .any(|cmd| cmd["type"] == "workflow" && cmd["name"] == "example");
     assert!(has_workflow, "Should include the example workflow");
-}
-
-/// Helper function to create agent state from app state
-async fn create_agent_state(
-    _app_state: &actix_web::web::Data<AppState>,
-) -> actix_web::web::Data<bamboo_agent::agent::server::state::AppState> {
-    use bamboo_agent::agent::server::state::AppState as AgentAppState;
-
-    // Create a minimal agent state for testing
-    // The agent state shares the same underlying components as the app state
-    let agent_state = AgentAppState::new_with_config(
-        "openai",
-        "https://api.openai.com/v1".to_string(),
-        "gpt-4".to_string(),
-        "sk-test".to_string(),
-        None,
-        false,
-    )
-    .await;
-
-    actix_web::web::Data::new(agent_state)
 }

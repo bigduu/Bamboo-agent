@@ -312,7 +312,7 @@ mod tests {
             content: AnthropicContent::Text("Hello".to_string()),
         };
 
-        let internal: Message = Message::from_provider(anthropic_msg).unwrap();
+        let internal: Message = anthropic_msg.into_internal().unwrap();
 
         assert_eq!(internal.role, Role::User);
         assert_eq!(internal.content, "Hello");

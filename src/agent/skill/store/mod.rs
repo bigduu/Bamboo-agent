@@ -78,7 +78,7 @@ use crate::agent::skill::types::{
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```rust,ignore
 /// let store = SkillStore::new(SkillStoreConfig::default());
 /// store.initialize().await?;
 ///
@@ -143,7 +143,7 @@ impl SkillStore {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```rust,ignore
     /// let store = SkillStore::new(SkillStoreConfig::default());
     /// store.initialize().await.expect("Failed to initialize");
     /// ```
@@ -241,7 +241,7 @@ impl SkillStore {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```rust,ignore
     /// // After editing a skill file externally
     /// let count = store.reload().await?;
     /// println!("Loaded {} skills", count);
@@ -267,7 +267,7 @@ impl SkillStore {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```rust,ignore
     /// // List all public skills, refreshing from disk
     /// let filter = SkillFilter {
     ///     visibility: Some(SkillVisibility::Public),
@@ -320,7 +320,7 @@ impl SkillStore {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```rust,ignore
     /// let skill = store.get_skill("my-skill").await?;
     /// println!("Description: {}", skill.description);
     /// ```
@@ -445,7 +445,7 @@ impl SkillStore {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```rust,ignore
     /// let skills = store.get_all_skills().await;
     /// println!("Total skills: {}", skills.len());
     /// ```
@@ -477,7 +477,7 @@ impl SkillStore {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```rust,ignore
     /// let categories = store.get_categories().await;
     /// for category in categories {
     ///     println!("Category: {}", category);
@@ -508,7 +508,7 @@ impl SkillStore {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```rust,ignore
     /// let tags = store.get_all_tags().await;
     /// println!("Available tags: {:?}", tags);
     /// ```
@@ -546,7 +546,7 @@ impl SkillStore {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```rust,ignore
     /// // Export specific skills
     /// let markdown = store.export_to_markdown(
     ///     Some(vec!["skill-creator".to_string()])

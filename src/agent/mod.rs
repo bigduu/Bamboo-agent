@@ -19,8 +19,6 @@ pub mod loop_module;
 pub mod mcp;
 /// Metrics collection and aggregation
 pub mod metrics;
-/// Agent HTTP server implementation
-pub mod server;
 pub mod skill;
 pub mod tools;
 

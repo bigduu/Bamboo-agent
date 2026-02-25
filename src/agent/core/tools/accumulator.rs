@@ -6,9 +6,9 @@
 //!
 //! # Example
 //!
-//! ```
+//! ```rust
 //! use bamboo_agent::agent::core::tools::accumulator::ToolCallAccumulator;
-//! use bamboo_agent::agent::core::tools::ToolCall;
+//! use bamboo_agent::agent::core::tools::{FunctionCall, ToolCall};
 //!
 //! let mut accumulator = ToolCallAccumulator::new();
 //!
@@ -150,9 +150,9 @@ impl ToolCallAccumulator {
 ///
 /// # Example
 ///
-/// ```
-/// use bamboo_agent::agent::core::tools::accumulator::{update_partial_tool_call, PartialToolCall};
-/// use bamboo_agent::agent::core::tools::ToolCall;
+/// ```rust
+/// use bamboo_agent::agent::core::tools::accumulator::update_partial_tool_call;
+/// use bamboo_agent::agent::core::tools::{FunctionCall, ToolCall};
 ///
 /// let mut parts = Vec::new();
 ///

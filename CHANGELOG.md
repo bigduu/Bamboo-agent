@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.8] - 2026-02-25
+
+### Removed (Breaking)
+- Removed the legacy `bamboo_agent::agent::server::state::AppState` type/module; Bamboo now has a single unified `AppState`.
+  - **Migration**: use `bamboo_agent::server::app_state::AppState` (or `bamboo_agent::server::AppState`) everywhere.
+- Removed legacy server implementations/modules:
+  - `bamboo_agent::agent::server` (legacy Actix server)
+  - `bamboo_agent::web_service` (proxy server)
+- Removed the legacy `/api/v1/stream/{session_id}` endpoint. Use `POST /api/v1/execute/{session_id}` + `GET /api/v1/events/{session_id}`.
+
+### Fixed
+- Fixed Actix `Data<T>` extractor mismatches that could cause runtime failures (e.g. `/anthropic/v1/messages`) when the wrong `AppState` type was required by handlers.
+
 ## [0.2.6] - 2025-02-25
 
 ### Fixed - Critical Production Blockers
@@ -155,7 +168,8 @@ and unifies all HTTP handlers with explicit routing.
 
 Old (deprecated but still works):
 ```rust
-use bamboo_agent::agent::server::state::AppState;
+// NOTE: this legacy import path was removed in v0.2.8.
+// use bamboo_agent::agent::server::state::AppState;
 use bamboo_agent::web_service::WebService;
 use bamboo_agent::agent::server::handlers;
 ```

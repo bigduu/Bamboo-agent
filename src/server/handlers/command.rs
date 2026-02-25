@@ -1,4 +1,3 @@
-use crate::agent::server::state::AppState as AgentAppState;
 use crate::agent::skill::SkillDefinition;
 use crate::server::app_state::AppState;
 use crate::server::error::AppError;
@@ -80,10 +79,7 @@ pub struct CommandListResponse {
 /// ```bash
 /// curl http://localhost:3000/commands
 /// ```
-pub async fn list_commands(
-    app_state: web::Data<AppState>,
-    agent_state: web::Data<AgentAppState>,
-) -> Result<HttpResponse, AppError> {
+pub async fn list_commands(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let mut commands = Vec::new();
 
     // 1. Load Workflows
@@ -96,7 +92,7 @@ pub async fn list_commands(
     }
 
     // 2. Load Skills
-    let skills = agent_state
+    let skills = app_state
         .skill_manager
         .store()
         .list_skills(None, false)
@@ -109,7 +105,7 @@ pub async fn list_commands(
     commands.extend(skill_commands);
 
     // 3. Load MCP Tools
-    match list_mcp_tools_as_commands(&agent_state).await {
+    match list_mcp_tools_as_commands(app_state.get_ref()).await {
         Ok(mcp_tools) => commands.extend(mcp_tools),
         Err(e) => {
             log::warn!("Failed to load MCP tools: {}", e);
@@ -156,7 +152,6 @@ pub async fn list_commands(
 /// ```
 pub async fn get_command(
     app_state: web::Data<AppState>,
-    agent_state: web::Data<AgentAppState>,
     path: web::Path<(String, String)>,
 ) -> Result<HttpResponse, AppError> {
     let (command_type, id) = path.into_inner();
@@ -183,7 +178,7 @@ pub async fn get_command(
                 "type": "workflow"
             })))
         }
-        "skill" => match agent_state.skill_manager.store().get_skill(&id).await {
+        "skill" => match app_state.skill_manager.store().get_skill(&id).await {
             Ok(skill) => Ok(HttpResponse::Ok().json(skill)),
             Err(e) => Err(AppError::NotFound(format!("Skill {} not found: {}", id, e))),
         },
@@ -288,7 +283,7 @@ fn skill_to_command(skill: &SkillDefinition) -> CommandItem {
 /// Internal helper to list all MCP tools as command items
 ///
 /// Retrieves all tool aliases from the MCP manager and converts them to command items
-async fn list_mcp_tools_as_commands(state: &AgentAppState) -> Result<Vec<CommandItem>, AppError> {
+async fn list_mcp_tools_as_commands(state: &AppState) -> Result<Vec<CommandItem>, AppError> {
     let aliases = state.mcp_manager.tool_index().all_aliases();
 
     let commands: Vec<CommandItem> = aliases

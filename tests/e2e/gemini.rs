@@ -1,7 +1,6 @@
 //! E2E tests for Gemini-compatible API endpoints
 
 use actix_web::{test, web, App};
-use bamboo_agent::server::app_state::AppState;
 use bamboo_agent::server::handlers::gemini;
 use serde_json::json;
 

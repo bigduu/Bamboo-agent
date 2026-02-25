@@ -13,5 +13,4 @@ pub mod mcp;
 pub mod metrics;
 pub mod respond;
 pub mod stop;
-pub mod stream;
 pub mod todo;

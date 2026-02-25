@@ -216,11 +216,6 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 "/events/{session_id}",
                 web::get().to(agent::events::handler),
             )
-            // Legacy stream endpoint (deprecated)
-            .route(
-                "/stream/{session_id}",
-                web::get().to(agent::stream::handler),
-            )
             .route("/stop/{session_id}", web::post().to(agent::stop::handler))
             .route(
                 "/history/{session_id}",
@@ -382,8 +377,6 @@ pub fn configure_routes_with_rate_limiting(cfg: &mut web::ServiceConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_route_count() {
         // Verify we have all expected route configuration functions

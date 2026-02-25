@@ -382,7 +382,8 @@ Version 0.2.0 introduces a major refactoring that consolidates the dual server a
 
 **Before (v0.1.x):**
 ```rust
-use bamboo::agent::server::state::AppState;
+// NOTE: this legacy import path was removed in v0.2.8.
+// use bamboo::agent::server::state::AppState;
 use bamboo::agent::server::handlers;
 use bamboo::web_service::WebService;
 use bamboo::web_service::controllers::*;
@@ -405,14 +406,13 @@ use bamboo::server::WebService;
 - `openai`, `anthropic`, `gemini`, `copilot_auth`, `agent_api`, `command`, `settings`, `skill`, `tools`, `workspace`
 
 ### Backward Compatibility
-
-All old import paths still work with deprecation warnings:
+Legacy import paths were deprecated in v0.2.0 and removed in v0.2.8.
 
 ```rust
-// Old (deprecated but functional)
-use bamboo::agent::server::AppState;
-use bamboo::web_service::WebService;
-use bamboo::server::controllers::agent_api;
+// Old (removed in v0.2.8)
+// use bamboo::agent::server::state::AppState;
+// use bamboo::web_service::WebService;
+// use bamboo::server::controllers::agent_api;
 
 // New (recommended)
 use bamboo::server::AppState;

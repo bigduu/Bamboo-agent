@@ -181,7 +181,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
 
     HttpResponse::Created().json(ChatResponse {
         session_id: session_id.clone(),
-        stream_url: format!("/api/v1/stream/{}", session_id),
+        stream_url: format!("/api/v1/events/{}", session_id),
         status: "streaming".to_string(),
     })
 }

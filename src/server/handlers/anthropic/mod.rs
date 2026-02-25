@@ -5,7 +5,6 @@ use crate::agent::llm::api::models::{
     ContentPart, FunctionCall, ImageUrl, Role, StreamToolCall, Tool, ToolCall, ToolChoice, Usage,
 };
 use crate::agent::llm::protocol::FromProvider;
-use crate::agent::server::state::AppState as AgentAppState;
 use crate::server::services::anthropic_model_mapping_service::load_anthropic_model_mapping;
 use crate::server::{
     app_state::AppState, error::AppError, model_config_helper::get_default_model_from_config,
@@ -190,7 +189,6 @@ struct AnthropicErrorDetail {
 
 pub async fn messages(
     app_state: web::Data<AppState>,
-    _agent_state: web::Data<AgentAppState>,
     req: web::Json<AnthropicMessagesRequest>,
 ) -> Result<HttpResponse, AppError> {
     let stream = req.stream.unwrap_or(false);
@@ -429,7 +427,6 @@ pub async fn messages(
 
 pub async fn complete(
     app_state: web::Data<AppState>,
-    _agent_state: web::Data<AgentAppState>,
     req: web::Json<AnthropicCompleteRequest>,
 ) -> Result<HttpResponse, AppError> {
     let stream = req.stream.unwrap_or(false);

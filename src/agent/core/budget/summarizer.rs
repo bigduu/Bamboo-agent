@@ -283,7 +283,6 @@ mod tests {
     #[test]
     fn summary_trigger_on_truncation() {
         let trigger = SummaryTrigger::OnTruncation;
-        let messages = vec![Message::user("Test")];
 
         assert!(matches!(trigger, SummaryTrigger::OnTruncation));
         // When truncation_occurred is true

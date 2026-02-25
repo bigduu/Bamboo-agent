@@ -4,8 +4,6 @@
 
 #[cfg(test)]
 mod tests {
-    use bamboo_agent::agent::llm::*;
-
     #[test]
     fn test_provider_types_exist() {
         // Verify that provider types are accessible
@@ -22,15 +20,18 @@ mod tests {
 
     #[test]
     fn test_message_conversion() {
-        use bamboo_agent::agent::llm::protocol::{OpenAIProtocol, ToProvider};
+        use bamboo_agent::agent::llm::api::models::ChatMessage as OpenAIChatMessage;
+        use bamboo_agent::agent::llm::protocol::ToProvider;
         use bamboo_agent::agent::Message;
 
-        let msg = Message::user("Test message".to_string());
+        let msg = Message::user("Test message");
+        let openai_msg: OpenAIChatMessage = msg.to_provider().unwrap();
 
-        // Test that we can convert messages to OpenAI format
-        // In practice, this would require the full protocol implementation
-        assert_eq!(msg.role, bamboo_agent::agent::Role::User);
-        assert!(!msg.content.is_empty());
+        // Verify we can convert internal messages to the OpenAI-compatible API model.
+        assert_eq!(
+            openai_msg.role,
+            bamboo_agent::agent::llm::api::models::Role::User
+        );
     }
 
     #[test]
@@ -107,12 +108,11 @@ mod tests {
 
     #[test]
     fn test_protocol_enums() {
-        use bamboo_agent::agent::llm::protocol::{
-            AnthropicProtocol, GeminiProtocol, OpenAIProtocol,
-        };
-
         // Test that protocol types exist and can be referenced
         // This verifies the module structure
+        let _openai: Option<bamboo_agent::agent::llm::protocol::OpenAIProtocol> = None;
+        let _anthropic: Option<bamboo_agent::agent::llm::protocol::AnthropicProtocol> = None;
+        let _gemini: Option<bamboo_agent::agent::llm::protocol::GeminiProtocol> = None;
         assert!(true);
     }
 

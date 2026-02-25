@@ -92,7 +92,7 @@ pub struct ExecuteRequest {
 /// # Event Subscription
 ///
 /// After starting execution, subscribe to events using:
-/// ```
+/// ```text
 /// GET /api/v1/events/{session_id}
 /// ```
 ///
@@ -219,12 +219,12 @@ pub async fn handler(
     let (mpsc_tx, mut mpsc_rx) = mpsc::channel::<crate::agent::core::AgentEvent>(100);
 
     // Start agent loop in background
-    let state_clone = state.get_ref().clone();
+    let state_clone = state.clone();
     let session_id_clone = session_id.clone();
 
     // Spawn event forwarder: mpsc -> broadcast
     let session_id_forwarder = session_id.clone();
-    let state_for_forwarder = state.get_ref().clone();
+    let state_for_forwarder = state.clone();
     tokio::spawn(async move {
         while let Some(event) = mpsc_rx.recv().await {
             // Store budget events for late subscribers

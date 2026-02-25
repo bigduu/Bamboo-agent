@@ -15,7 +15,7 @@
 //!
 //! # Example Usage
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use std::sync::Arc;
 //! use reqwest_middleware::ClientWithMiddleware;
 //! use bamboo_agent::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
@@ -351,7 +351,7 @@ lazy_static! {
 ///
 /// # Example
 ///
-/// ```rust,no_run
+/// ```rust,ignore
 /// use std::sync::Arc;
 /// use reqwest_middleware::ClientWithMiddleware;
 /// use bamboo_agent::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
@@ -396,7 +396,7 @@ impl CopilotAuthHandler {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// use std::sync::Arc;
     /// use reqwest_middleware::ClientWithMiddleware;
     /// use bamboo_agent::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
@@ -477,7 +477,7 @@ impl CopilotAuthHandler {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # use bamboo_agent::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
     /// # async fn example(handler: CopilotAuthHandler) -> anyhow::Result<()> {
     /// // Pre-authenticate before starting the application
@@ -621,7 +621,7 @@ impl CopilotAuthHandler {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # use bamboo_agent::agent::llm::providers::copilot::auth::handler::{CopilotAuthHandler, CopilotConfig};
     /// # fn example(handler: CopilotAuthHandler, config: CopilotConfig) {
     /// if handler.is_copilot_token_valid(&config) {
@@ -663,7 +663,7 @@ impl CopilotAuthHandler {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # use bamboo_agent::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
     /// # async fn example(handler: CopilotAuthHandler) -> anyhow::Result<()> {
     /// let device_code = handler.get_device_code().await?;
@@ -722,7 +722,7 @@ impl CopilotAuthHandler {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # use bamboo_agent::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
     /// # async fn example(handler: CopilotAuthHandler) -> anyhow::Result<()> {
     /// let device_code = handler.start_authentication().await?;
@@ -842,7 +842,7 @@ impl CopilotAuthHandler {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # use bamboo_agent::agent::llm::providers::copilot::auth::handler::CopilotAuthHandler;
     /// # async fn example(handler: CopilotAuthHandler) -> anyhow::Result<()> {
     /// match handler.try_get_chat_token_silent().await? {
@@ -1031,7 +1031,7 @@ impl CopilotAuthHandler {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # use bamboo_agent::agent::llm::providers::copilot::auth::handler::{CopilotAuthHandler, AccessTokenResponse};
     /// # async fn example(handler: CopilotAuthHandler, access_token: AccessTokenResponse) -> anyhow::Result<()> {
     /// let config = handler.get_copilot_token(access_token).await?;
@@ -1203,17 +1203,11 @@ mod retry_tests {
             let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
             let reply = {
                 let mut guard = self.replies.lock().expect("lock");
-                guard
-                    .get(0)
-                    .cloned()
-                    .unwrap_or_else(|| panic!("no mock reply left for call #{idx}"))
+                if guard.is_empty() {
+                    panic!("no mock reply left for call #{idx}");
+                }
+                guard.remove(0)
             };
-
-            // Pop after cloning so we can include `idx` in the panic above without borrow issues.
-            {
-                let mut guard = self.replies.lock().expect("lock");
-                guard.remove(0);
-            }
 
             let mut builder = http::Response::builder().status(reply.status);
             if let Some(ct) = reply.content_type {

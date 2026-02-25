@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::agent::metrics::MetricsCollector;
-use crate::agent::server::metrics_service::MetricsService;
+use crate::server::metrics_service::MetricsService;
 
 /// Unified metrics infrastructure supporting both MetricsBus and MetricsService
 ///

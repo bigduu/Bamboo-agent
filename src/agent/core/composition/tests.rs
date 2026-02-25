@@ -182,6 +182,17 @@ mod sequence_tests {
         assert_eq!(tool1.call_count(), 1);
         assert_eq!(tool2.call_count(), 1);
     }
+
+    #[tokio::test]
+    async fn test_sequence_propagates_tool_error() {
+        let failing_tool = Arc::new(MockTool::failing("tool1"));
+        let seq = Sequence::builder()
+            .step(ToolComposition::new(failing_tool, json!({"input": "test"})))
+            .build();
+
+        let err = seq.execute(ExecutionContext::new()).await.unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)));
+    }
 }
 
 mod parallel_tests {

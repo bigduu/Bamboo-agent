@@ -388,9 +388,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_send_request_receives_response() {
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: 1,
+            result: Some(serde_json::json!({"status": "ok"})),
+            error: None,
+        };
+        let message = serde_json::to_string(&response).unwrap();
+
+        let transport = Box::new(MockTransport::with_response(message));
+        let mut client = McpProtocolClient::new(transport);
+        client.connect().await.unwrap();
+
+        let result = client
+            .send_request("test/method", None, 1000)
+            .await
+            .unwrap();
+        assert_eq!(result.id, 1);
+        assert!(result.result.is_some());
+    }
+
     #[test]
     fn test_pending_request() {
-        let (tx, rx) = oneshot::channel();
+        let (tx, _rx) = oneshot::channel();
         let _pending = PendingRequest { sender: tx };
 
         // Send a response

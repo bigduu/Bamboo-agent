@@ -1,21 +1,14 @@
 //! E2E tests for OpenAI-compatible endpoints (/v1/chat/completions and /v1/models)
 
 use actix_web::{test, web, App};
-use bamboo_agent::agent::server::state::AppState as AgentAppState;
 use bamboo_agent::server::handlers::openai;
 use serde_json::json;
-
-/// Create test AgentAppState
-async fn create_agent_app_state() -> web::Data<AgentAppState> {
-    web::Data::new(AgentAppState::new().await)
-}
 
 #[actix_web::test]
 async fn test_chat_completions_endpoint() {
     let state = crate::e2e::common::create_test_app().await;
-    let agent_state = create_agent_app_state().await;
 
-    let app = test::init_service(App::new().app_data(state).app_data(agent_state).route(
+    let app = test::init_service(App::new().app_data(state).route(
         "/v1/chat/completions",
         web::post().to(openai::chat_completions),
     ))
@@ -47,9 +40,8 @@ async fn test_chat_completions_endpoint() {
 #[actix_web::test]
 async fn test_chat_completions_with_valid_request() {
     let state = crate::e2e::common::create_test_app().await;
-    let agent_state = create_agent_app_state().await;
 
-    let app = test::init_service(App::new().app_data(state).app_data(agent_state).route(
+    let app = test::init_service(App::new().app_data(state).route(
         "/v1/chat/completions",
         web::post().to(openai::chat_completions),
     ))
@@ -87,9 +79,8 @@ async fn test_chat_completions_with_valid_request() {
 #[actix_web::test]
 async fn test_chat_completions_with_stream() {
     let state = crate::e2e::common::create_test_app().await;
-    let agent_state = create_agent_app_state().await;
 
-    let app = test::init_service(App::new().app_data(state).app_data(agent_state).route(
+    let app = test::init_service(App::new().app_data(state).route(
         "/v1/chat/completions",
         web::post().to(openai::chat_completions),
     ))
@@ -135,9 +126,8 @@ async fn test_chat_completions_with_stream() {
 #[actix_web::test]
 async fn test_chat_completions_requires_json_body() {
     let state = crate::e2e::common::create_test_app().await;
-    let agent_state = create_agent_app_state().await;
 
-    let app = test::init_service(App::new().app_data(state).app_data(agent_state).route(
+    let app = test::init_service(App::new().app_data(state).route(
         "/v1/chat/completions",
         web::post().to(openai::chat_completions),
     ))
@@ -157,9 +147,8 @@ async fn test_chat_completions_requires_json_body() {
 #[actix_web::test]
 async fn test_chat_completions_with_tools() {
     let state = crate::e2e::common::create_test_app().await;
-    let agent_state = create_agent_app_state().await;
 
-    let app = test::init_service(App::new().app_data(state).app_data(agent_state).route(
+    let app = test::init_service(App::new().app_data(state).route(
         "/v1/chat/completions",
         web::post().to(openai::chat_completions),
     ))
@@ -210,9 +199,8 @@ async fn test_chat_completions_with_tools() {
 #[actix_web::test]
 async fn test_chat_completions_missing_required_fields() {
     let state = crate::e2e::common::create_test_app().await;
-    let agent_state = create_agent_app_state().await;
 
-    let app = test::init_service(App::new().app_data(state).app_data(agent_state).route(
+    let app = test::init_service(App::new().app_data(state).route(
         "/v1/chat/completions",
         web::post().to(openai::chat_completions),
     ))
@@ -335,9 +323,8 @@ async fn test_models_endpoint_method_not_allowed() {
 #[actix_web::test]
 async fn test_chat_completions_with_empty_messages() {
     let state = crate::e2e::common::create_test_app().await;
-    let agent_state = create_agent_app_state().await;
 
-    let app = test::init_service(App::new().app_data(state).app_data(agent_state).route(
+    let app = test::init_service(App::new().app_data(state).route(
         "/v1/chat/completions",
         web::post().to(openai::chat_completions),
     ))
@@ -364,9 +351,8 @@ async fn test_chat_completions_with_empty_messages() {
 #[actix_web::test]
 async fn test_chat_completions_with_different_roles() {
     let state = crate::e2e::common::create_test_app().await;
-    let agent_state = create_agent_app_state().await;
 
-    let app = test::init_service(App::new().app_data(state).app_data(agent_state).route(
+    let app = test::init_service(App::new().app_data(state).route(
         "/v1/chat/completions",
         web::post().to(openai::chat_completions),
     ))
@@ -410,9 +396,8 @@ async fn test_chat_completions_with_different_roles() {
 #[actix_web::test]
 async fn test_chat_completions_with_multimodal_content() {
     let state = crate::e2e::common::create_test_app().await;
-    let agent_state = create_agent_app_state().await;
 
-    let app = test::init_service(App::new().app_data(state).app_data(agent_state).route(
+    let app = test::init_service(App::new().app_data(state).route(
         "/v1/chat/completions",
         web::post().to(openai::chat_completions),
     ))
@@ -455,9 +440,8 @@ async fn test_chat_completions_with_multimodal_content() {
 #[actix_web::test]
 async fn test_chat_completions_with_default_model() {
     let state = crate::e2e::common::create_test_app().await;
-    let agent_state = create_agent_app_state().await;
 
-    let app = test::init_service(App::new().app_data(state).app_data(agent_state).route(
+    let app = test::init_service(App::new().app_data(state).route(
         "/v1/chat/completions",
         web::post().to(openai::chat_completions),
     ))

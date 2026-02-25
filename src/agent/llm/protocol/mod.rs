@@ -86,8 +86,8 @@ mod tests {
         {
         }
 
-        // These will be implemented in the specific protocol modules
-        // assert_from_provider::<Message, crate::models::ChatMessage>();
-        // assert_to_provider::<Message, crate::models::ChatMessage>();
+        // Ensure at least one concrete spoke type satisfies the bounds.
+        assert_from_provider::<Message, crate::agent::llm::api::models::ChatMessage>();
+        assert_to_provider::<Message, crate::agent::llm::api::models::ChatMessage>();
     }
 }

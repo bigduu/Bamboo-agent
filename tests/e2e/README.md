@@ -106,8 +106,7 @@ When adding new endpoints, create a corresponding test file:
 2. Import necessary modules:
    ```rust
    use actix_web::{test, web, App};
-   use bamboo_agent::agent::server::handlers;
-   use bamboo_agent::agent::server::state::AppState;
+   use bamboo_agent::server::handlers;
    ```
 3. Use the `create_test_app()` helper from `common`
 4. Add the module to `tests/e2e/mod.rs`
@@ -117,8 +116,6 @@ When adding new endpoints, create a corresponding test file:
 The `common` module provides:
 
 - `create_test_app()` - Creates a test AppState with temporary directory
-- `test_session_id()` - Generates a unique session ID
-- `wait_for()` - Async helper to wait for conditions
 
 ## Notes
 

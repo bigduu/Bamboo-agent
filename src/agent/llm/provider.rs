@@ -112,8 +112,6 @@ pub trait LLMProvider: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // ========== MODEL REQUIREMENT ARCHITECTURE TESTS ==========
     // These tests ensure the design principle:
     // "Provider chat_stream must require model parameter, not have default model field"

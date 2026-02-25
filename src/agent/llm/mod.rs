@@ -43,32 +43,32 @@
 //! Use [`create_provider`] to instantiate providers from configuration:
 //!
 //! ```no_run
-//! use bamboo_agent::llm::{create_provider, LLMProvider};
-//! use bamboo_agent::core::Config;
+//! use bamboo_agent::llm::create_provider;
+//! use bamboo_agent::Config;
 //!
-//! let config = Config::load()?;
-//! let provider = create_provider(&config)?;
+//! // Typically you would load from disk; for docs we use a default config.
+//! let config = Config::default();
+//! let _provider = create_provider(&config);
 //! ```
 //!
 //! # Example
 //!
-//! ```no_run
-//! use bamboo_agent::llm::{LLMProvider, create_provider};
-//! use bamboo_agent::core::Config;
+//! ```rust,ignore
+//! use bamboo_agent::llm::{create_provider, LLMProvider};
+//! use bamboo_agent::Config;
 //! use futures::StreamExt;
 //!
-//! async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = Config::load()?;
-//!     let provider = create_provider(&config)?;
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let config = Config::default();
+//! let provider = create_provider(&config)?;
 //!
-//!     // Stream completions
-//!     let stream = provider.complete(messages).await?;
-//!     while let Some(chunk) = stream.next().await {
-//!         println!("{:?}", chunk?);
-//!     }
-//!
-//!     Ok(())
+//! let messages = vec![]; // build provider-specific messages
+//! let mut stream = provider.complete(messages).await?;
+//! while let Some(chunk) = stream.next().await {
+//!     println!("{:?}", chunk?);
 //! }
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Re-exports

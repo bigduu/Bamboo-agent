@@ -4,10 +4,11 @@
 
 #[cfg(test)]
 mod tests {
-    use bamboo_agent::commands::workflows::{delete_workflow, save_workflow};
     use bamboo_agent::core::paths::workflows_dir;
-    use std::fs;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[tokio::test]
     async fn test_save_workflow() {
@@ -17,24 +18,60 @@ mod tests {
         let name = "test-workflow".to_string();
         let content = "# Test Workflow\n\nThis is a test workflow.".to_string();
 
-        // Note: save_workflow uses the XDG path, so this test verifies the module structure
-        // In practice, we'd need to mock the path or use a test directory
-        let result = std::panic::catch_unwind(|| {
-            assert!(!name.is_empty());
-            assert!(!content.is_empty());
-        });
-        assert!(result.is_ok());
+        // Use the async API while the env var is set (guarded by the lock).
+        let saved_path = {
+            let _guard = ENV_LOCK.lock().expect("env lock");
+            let original = std::env::var_os("BAMBOO_DATA_DIR");
+            std::env::set_var("BAMBOO_DATA_DIR", temp_dir.path());
+
+            let saved_path = bamboo_agent::commands::save_workflow(name.clone(), content.clone())
+                .await
+                .unwrap();
+
+            if let Some(val) = original {
+                std::env::set_var("BAMBOO_DATA_DIR", val);
+            } else {
+                std::env::remove_var("BAMBOO_DATA_DIR");
+            }
+
+            saved_path
+        };
+
+        let workflows = temp_dir.path().join("workflows");
+        assert!(saved_path.starts_with(workflows.to_string_lossy().as_ref()));
+        assert!(std::path::Path::new(&saved_path).exists());
+        let read_back = std::fs::read_to_string(&saved_path).unwrap();
+        assert_eq!(read_back, content);
     }
 
     #[tokio::test]
     async fn test_delete_workflow() {
+        let temp_dir = TempDir::new().unwrap();
         let name = "test-workflow-to-delete".to_string();
+        let content = "# Workflow To Delete".to_string();
 
-        // Verify name validation
-        assert!(!name.is_empty());
-        assert!(!name.contains('/'));
-        assert!(!name.contains('\\'));
-        assert!(!name.contains(".."));
+        // Save then delete under a temporary bamboo dir.
+        let (saved_path, delete_result) = {
+            let _guard = ENV_LOCK.lock().expect("env lock");
+            let original = std::env::var_os("BAMBOO_DATA_DIR");
+            std::env::set_var("BAMBOO_DATA_DIR", temp_dir.path());
+
+            let saved_path = bamboo_agent::commands::save_workflow(name.clone(), content)
+                .await
+                .unwrap();
+            let delete_result = bamboo_agent::commands::delete_workflow(name.clone()).await;
+
+            if let Some(val) = original {
+                std::env::set_var("BAMBOO_DATA_DIR", val);
+            } else {
+                std::env::remove_var("BAMBOO_DATA_DIR");
+            }
+
+            (saved_path, delete_result)
+        };
+
+        delete_result.unwrap();
+        assert!(!std::path::Path::new(&saved_path).exists());
     }
 
     #[test]

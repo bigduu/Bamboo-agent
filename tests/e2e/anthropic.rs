@@ -1,7 +1,6 @@
 //! E2E tests for Anthropic-compatible API endpoints
 
 use actix_web::{test, web, App};
-use bamboo_agent::server::app_state::AppState;
 use bamboo_agent::server::handlers::anthropic;
 use serde_json::json;
 
@@ -56,7 +55,9 @@ async fn test_anthropic_messages_requires_json_body() {
     let resp = test::call_service(&app, req).await;
 
     // Should reject requests without proper JSON body
-    assert!(resp.status().is_client_error() || resp.status().is_server_error());
+    // If app state wiring is wrong (missing `Data<AppState>`), Actix returns 500.
+    // We want this test to specifically ensure extractor wiring is correct.
+    assert!(resp.status().is_client_error());
 }
 
 #[actix_web::test]

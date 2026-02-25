@@ -118,7 +118,6 @@ impl Tool for ListDirectoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::fs;
 
     #[tokio::test]
     async fn test_list_directory_success() {

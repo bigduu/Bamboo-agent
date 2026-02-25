@@ -198,7 +198,7 @@ mod tests {
             tool_call_id: None,
         };
 
-        let internal_msg: Message = Message::from_provider(openai_msg).unwrap();
+        let internal_msg: Message = openai_msg.into_internal().unwrap();
 
         assert_eq!(internal_msg.role, Role::User);
         assert_eq!(internal_msg.content, "Hello");
@@ -209,7 +209,7 @@ mod tests {
     fn test_internal_to_openai_simple_message() {
         let internal_msg = Message::user("Hello");
 
-        let openai_msg: OpenAIChatMessage = internal_msg.to_provider().unwrap();
+        let openai_msg: OpenAIChatMessage = internal_msg.to_openai().unwrap();
 
         assert_eq!(openai_msg.role, OpenAIRole::User);
         assert!(matches!(openai_msg.content, OpenAIContent::Text(ref t) if t == "Hello"));

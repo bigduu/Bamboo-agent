@@ -40,9 +40,14 @@
 //! Binds to localhost only, No rate limiting. Perfect for local development.
 //!
 //! ```no_run
+//! use std::path::PathBuf;
 //! use bamboo_agent::server::run;
 //!
-//! run(data_dir, 8080).await?;
+//! #[tokio::main]
+//! async fn main() -> Result<(), String> {
+//!     let data_dir = PathBuf::from("./.bamboo");
+//!     run(data_dir, 8080).await
+//! }
 //! ```
 //!
 //! ## 2. Docker Mode
@@ -50,9 +55,14 @@
 //! Custom bind address with rate limiting. For containerized deployments.
 //!
 //! ```no_run
+//! use std::path::PathBuf;
 //! use bamboo_agent::server::run_with_bind;
 //!
-//! run_with_bind(data_dir, 8080, "0.0.0.0").await?;
+//! #[tokio::main]
+//! async fn main() -> Result<(), String> {
+//!     let data_dir = PathBuf::from("./.bamboo");
+//!     run_with_bind(data_dir, 8080, "0.0.0.0").await
+//! }
 //! ```
 //!
 //! ## 3. Production Mode with Frontend
@@ -60,14 +70,20 @@
 //! Serves static files alongside API. Full production setup.
 //!
 //! ```no_run
+//! use std::path::PathBuf;
 //! use bamboo_agent::server::run_with_bind_and_static;
 //!
-//! run_with_bind_and_static(
-//!     data_dir,
-//!     8080,
-//!     "0.0.0.0",
-//!     Some(PathBuf::from("./dist"))
-//! ).await?;
+//! #[tokio::main]
+//! async fn main() -> Result<(), String> {
+//!     let data_dir = PathBuf::from("./.bamboo");
+//!     run_with_bind_and_static(
+//!         data_dir,
+//!         8080,
+//!         "0.0.0.0",
+//!         Some(PathBuf::from("./dist")),
+//!     )
+//!     .await
+//! }
 //! ```
 //!
 //! # Route Organization

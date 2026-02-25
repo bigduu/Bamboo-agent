@@ -43,7 +43,6 @@
 
 use std::path::PathBuf;
 
-pub mod config;
 pub mod error;
 
 // Placeholder modules (will be populated during migration)
@@ -53,15 +52,14 @@ pub mod commands;
 pub mod core;
 pub mod process;
 pub mod server;
-pub mod web_service;
+
+// Ergonomic module re-exports for the agent subsystem (keeps docs and external
+// imports stable without forcing callers through `bamboo_agent::agent::*`).
+pub use agent::{llm, skill, tools};
 
 // Re-export core Config as the primary configuration type
 pub use core::config::ServerConfig;
 pub use core::Config;
-
-// Deprecated: Use core::Config instead
-#[allow(deprecated)]
-pub use config::{BambooConfig, ServerConfig as LegacyServerConfig};
 pub use error::{BambooError, Result};
 pub use process::ProcessRegistry;
 

@@ -2,58 +2,42 @@
 
 use bamboo_agent::server::AppState;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
-/// Test application configuration
-pub struct TestApp {
-    pub port: u16,
-    pub base_url: String,
-    pub temp_dir: PathBuf,
+static TEST_HOME_DIR: OnceLock<PathBuf> = OnceLock::new();
+static CLAUDE_FS_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+/// Ensure test process has a writable HOME directory.
+///
+/// Some endpoints (Claude Code integration) use `dirs::home_dir()` and write to `~/.claude`.
+/// In our sandboxed test environment the real home directory may not be writable, so we
+/// redirect HOME to a temp directory once per test process.
+pub fn ensure_test_home_dir() -> PathBuf {
+    TEST_HOME_DIR
+        .get_or_init(|| {
+            let dir = tempfile::tempdir()
+                .expect("Failed to create test HOME temp dir")
+                .keep();
+            std::env::set_var("HOME", &dir);
+            dir
+        })
+        .clone()
 }
 
-impl TestApp {
-    /// Create a new test application instance
-    pub async fn new() -> Self {
-        let temp_dir = tempfile::tempdir()
-            .expect("Failed to create temp dir")
-            .keep();
-
-        Self {
-            port: 0, // Let OS assign a random port
-            base_url: "http://localhost".to_string(),
-            temp_dir,
-        }
-    }
+/// Serialize tests that touch `~/.claude/*` (which is shared process-wide).
+pub fn claude_fs_lock() -> std::sync::MutexGuard<'static, ()> {
+    CLAUDE_FS_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .expect("claude fs lock poisoned")
 }
 
 /// Create a test app with AppState
 pub async fn create_test_app() -> actix_web::web::Data<AppState> {
+    ensure_test_home_dir();
     let temp_dir = tempfile::tempdir()
         .expect("Failed to create temp dir")
         .keep();
 
     actix_web::web::Data::new(AppState::new(temp_dir.clone()).await)
-}
-
-/// Create a test session ID
-pub fn test_session_id() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
-/// Wait for a condition to be true with timeout
-pub async fn wait_for<F, Fut>(mut condition: F, timeout_ms: u64)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_millis(timeout_ms);
-
-    while start.elapsed() < timeout {
-        if condition().await {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-
-    panic!("Timeout waiting for condition");
 }

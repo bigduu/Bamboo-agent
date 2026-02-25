@@ -2,7 +2,6 @@ use crate::agent::llm::api::models::{
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamChunk,
 };
 use crate::agent::llm::protocol::FromProvider;
-use crate::agent::server::state::AppState as AgentAppState;
 use crate::server::{
     app_state::AppState, error::AppError, model_config_helper::get_default_model_from_config,
 };
@@ -298,7 +297,6 @@ fn build_completion_response(
 
 pub async fn chat_completions(
     app_state: web::Data<AppState>,
-    _agent_state: web::Data<AgentAppState>,
     req: web::Json<ChatCompletionRequest>,
 ) -> Result<HttpResponse, AppError> {
     let stream = req.stream.unwrap_or(false);

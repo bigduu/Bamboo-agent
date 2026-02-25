@@ -46,16 +46,38 @@
 //! # Example
 //!
 //! ```no_run
-//! use bamboo_agent::core::tools::{ToolExecutor, ToolCall, ToolResult};
-//!
-//! // Execute a tool call
-//! let call = ToolCall {
-//!     id: "call-1".to_string(),
-//!     name: "read_file".to_string(),
-//!     arguments: r#"{"path": "/tmp/test.txt"}"#.to_string(),
+//! use async_trait::async_trait;
+//! use bamboo_agent::agent::core::tools::{
+//!     execute_tool_call, FunctionCall, ToolCall, ToolError, ToolExecutor, ToolResult, ToolSchema,
 //! };
 //!
-//! let result = execute_tool_call(&call, &executor)?;
+//! struct NoopExecutor;
+//!
+//! #[async_trait]
+//! impl ToolExecutor for NoopExecutor {
+//!     async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+//!         Err(ToolError::NotFound(call.function.name.clone()))
+//!     }
+//!
+//!     fn list_tools(&self) -> Vec<ToolSchema> {
+//!         Vec::new()
+//!     }
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     // Execute a tool call (this example uses a no-op executor).
+//!     let call = ToolCall {
+//!         id: "call-1".to_string(),
+//!         tool_type: "function".to_string(),
+//!         function: FunctionCall {
+//!             name: "read_file".to_string(),
+//!             arguments: r#"{\"path\":\"/tmp/test.txt\"}"#.to_string(),
+//!         },
+//!     };
+//!
+//!     let _ = execute_tool_call(&call, &NoopExecutor, None).await;
+//! }
 //! ```
 //!
 //! # Re-exports

@@ -79,9 +79,9 @@ use crate::agent::core::tools::ToolExecutor;
 use crate::agent::core::AgentEvent;
 use crate::agent::llm::LLMProvider;
 use crate::agent::mcp::McpServerManager;
-use crate::agent::server::metrics_service::MetricsService;
 use crate::agent::skill::{SkillManager, SkillStoreConfig};
 use crate::core::Config;
+use crate::server::metrics_service::MetricsService;
 
 /// Default system prompt for agent interactions
 pub const DEFAULT_BASE_PROMPT: &str =
@@ -297,12 +297,12 @@ impl AppState {
     ///
     /// * `bamboo_home_dir` - Bamboo home directory containing all application data.
     ///                        This is the root directory (e.g., ~/.bamboo) that contains:
-  ///                        - config.json: Configuration file
-  ///                        - sessions/: Conversation history
-  ///                        - skills/: Skill definitions
-  ///                        - workflows/: Workflow definitions
-  ///                        - cache/: Cached data
-  ///                        - runtime/: Runtime files
+    ///                        - config.json: Configuration file
+    ///                        - sessions/: Conversation history
+    ///                        - skills/: Skill definitions
+    ///                        - workflows/: Workflow definitions
+    ///                        - cache/: Cached data
+    ///                        - runtime/: Runtime files
     ///
     /// # Returns
     ///
@@ -365,9 +365,7 @@ impl AppState {
     ///
     /// # Initialization Steps
     ///
-    /// 1. Migrate from old XDG paths to ~/.bamboo (if needed)
-    /// 2. Migrate session files from old location (if needed)
-    /// 3. Initialize JSONL storage in `{bamboo_home_dir}/sessions`
+    /// 1. Initialize JSONL storage in `{bamboo_home_dir}/sessions`
     /// 4. Load built-in tools
     /// 5. Initialize MCP manager and load configured servers
     /// 6. Create composite tool executor (builtin + MCP)
@@ -385,20 +383,6 @@ impl AppState {
     ) -> Self {
         let data_dir = bamboo_home_dir.clone();
         let sessions_dir = data_dir.join("sessions");
-
-        // Migrate from old XDG paths to ~/.bamboo if needed
-        // This is a temporary migration function that will be removed in v0.3.0
-        #[allow(deprecated)]
-        if let Err(e) = crate::core::migrate_from_xdg() {
-            log::warn!("Failed to migrate from XDG paths: {}", e);
-        }
-
-        // Migrate session files from old location if needed
-        // This is a temporary migration function that will be removed in v0.3.0
-        #[allow(deprecated)]
-        if let Err(e) = crate::core::migrate_session_files() {
-            log::warn!("Failed to migrate session files: {}", e);
-        }
 
         log::info!("Initializing storage at: {:?}", sessions_dir);
         let storage = JsonlStorage::new(&sessions_dir);

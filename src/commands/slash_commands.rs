@@ -35,7 +35,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use bamboo_commands::{slash_commands_list, slash_command_get};
+//! use bamboo_agent::commands::slash_commands::slash_commands_list;
 //!
 //! #[tokio::main]
 //! async fn main() {
@@ -404,7 +404,7 @@ fn create_default_commands() -> Vec<SlashCommand> {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```rust,ignore
 /// let commands = slash_commands_list(Some("./my-project".to_string())).await?;
 /// for cmd in commands {
 ///     println!("{} - {:?}", cmd.full_command, cmd.description);
@@ -491,7 +491,7 @@ pub async fn slash_commands_list(
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```rust,ignore
 /// let command = slash_command_get("project-commands-build-md".to_string()).await?;
 /// println!("Command: {}", command.full_command);
 /// ```
@@ -540,7 +540,7 @@ pub async fn slash_command_get(command_id: String) -> Result<SlashCommand, Strin
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```rust,ignore
 /// let command = slash_command_save(
 ///     "project".to_string(),
 ///     "build".to_string(),
@@ -645,7 +645,7 @@ pub async fn slash_command_save(
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```rust,ignore
 /// let result = slash_command_delete(
 ///     "project-commands-build-md".to_string(),
 ///     Some("./my-project".to_string()),

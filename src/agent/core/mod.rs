@@ -27,16 +27,14 @@
 //! # Example
 //!
 //! ```no_run
-//! use bamboo_agent::core::{Session, Message, Role};
+//! use bamboo_agent::agent::{Session, Message, Role};
 //!
 //! // Create a new session
-//! let session = Session::new("session-id".to_string());
+//! let session = Session::new("session-id", "gpt-4o-mini");
 //!
 //! // Add a message
-//! let message = Message {
-//!     role: Role::User,
-//!     content: vec![], // MessageContent items
-//! };
+//! let message = Message::user("Hello!");
+//! assert_eq!(message.role, Role::User);
 //! ```
 //!
 //! # Re-exports

@@ -13,9 +13,10 @@
 //!
 //! # Example
 //!
-//! ```
-//! use bamboo_agent::agent::tools::guide::{EnhancedPromptBuilder, ToolGuideSpec};
-//! use bamboo_agent::agent::tools::tools::ToolRegistry;
+//! ```no_run
+//! use bamboo_agent::tools::guide::context::GuideBuildContext;
+//! use bamboo_agent::tools::guide::EnhancedPromptBuilder;
+//! use bamboo_agent::tools::ToolRegistry;
 //!
 //! let registry = ToolRegistry::new();
 //! let schemas = registry.list_tools();

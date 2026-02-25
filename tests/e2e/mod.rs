@@ -24,7 +24,7 @@ mod respond;
 mod settings;
 mod skills;
 mod stop;
-mod stream;
 mod todo;
 mod tools;
+mod wiring;
 mod workspace;

@@ -42,7 +42,7 @@ Create a new chat session or add a message to an existing session.
 ```json
 {
   "session_id": "uuid-string",
-  "stream_url": "/api/v1/stream/session-id",
+  "stream_url": "/api/v1/events/session-id",
   "status": "streaming"
 }
 ```
@@ -129,18 +129,6 @@ eventSource.onmessage = (event) => {
   }
 };
 ```
-
----
-
-#### Legacy Stream Endpoint (Deprecated)
-
-```http
-GET /api/v1/stream/{session_id}
-```
-
-**⚠️ Deprecated:** Use `POST /execute` + `GET /events` instead.
-
-This endpoint combines execution and streaming in a single request.
 
 ---
 

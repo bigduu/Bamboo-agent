@@ -193,7 +193,8 @@ Version 0.2.0 consolidates `web_service` and `agent::server` into a unified `ser
 
 #### Before v0.2.0
 ```rust
-use bamboo_agent::agent::server::state::AppState;
+// NOTE: this legacy import path was removed in v0.2.8.
+// use bamboo_agent::agent::server::state::AppState;
 use bamboo_agent::agent::server::handlers;
 use bamboo_agent::web_service::WebService;
 use bamboo_agent::web_service::controllers::*;
@@ -207,7 +208,7 @@ use bamboo_agent::server::WebService;
 use bamboo_agent::server::controllers::*;
 ```
 
-All other code works without changes. The old import paths still work but will show deprecation warnings.
+All other code works without changes. The legacy import paths were deprecated in v0.2.0 and removed in v0.2.8.
 
 ### What Changed
 

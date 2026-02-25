@@ -109,7 +109,7 @@ mod tests {
         let messages = vec![Message::user("This is secret")];
         let tools: Vec<ToolSchema> = Vec::new();
 
-        decorator
+        let _stream = decorator
             .chat_stream(&messages, &tools, None, "test-model")
             .await
             .expect("chat_stream");
@@ -130,7 +130,7 @@ mod tests {
         let messages = vec![Message::user("This is secret")];
         let tools: Vec<ToolSchema> = Vec::new();
 
-        decorator
+        let _stream = decorator
             .chat_stream(&messages, &tools, None, "test-model")
             .await
             .expect("chat_stream");

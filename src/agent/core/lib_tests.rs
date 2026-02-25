@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::agent::core::agent::{Message, Role, Session};
     use crate::agent::core::tools::{
         FunctionCall, FunctionSchema, ToolCall, ToolResult, ToolSchema,
@@ -120,8 +119,6 @@ mod tests {
 
     #[test]
     fn test_assistant_with_tool_calls_serialization() {
-        use crate::agent::core::tools::{FunctionCall, ToolCall};
-
         let tool_calls = vec![ToolCall {
             id: "call_yyaeEH9yC4MEL0kc5fWJwOZv".to_string(),
             tool_type: "function".to_string(),

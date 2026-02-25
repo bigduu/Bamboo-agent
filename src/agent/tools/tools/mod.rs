@@ -49,11 +49,11 @@
 //! use bamboo_agent::tools::{ToolRegistry, ReadFileTool};
 //!
 //! let registry = ToolRegistry::new();
-//! registry.register(ReadFileTool::new());
+//! registry.register(ReadFileTool::new()).unwrap();
 //!
 //! // Look up a tool
-//! let tool = registry.get("read_file")?;
-//! println!("Tool schema: {:?}", tool.schema());
+//! let tool = registry.get("read_file").expect("tool registered");
+//! println!("Tool schema: {:?}", tool.to_schema());
 //! ```
 //!
 //! # Adding New Tools

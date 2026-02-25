@@ -162,8 +162,6 @@ impl ToolRegistry {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
     use crate::agent::tools::tools::ReadFileTool;
 

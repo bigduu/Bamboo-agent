@@ -31,7 +31,7 @@ pub mod agent;
 // Re-export core agent handlers at the top level for backward compatibility.
 // Historically these lived at `crate::server::handlers::{chat, execute, ...}`.
 pub use agent::{
-    chat, delete, events, execute, health, history, mcp, metrics, respond, stop, stream, todo,
+    chat, delete, events, execute, health, history, mcp, metrics, respond, stop, todo,
 };
 
 // Multi-provider API handlers
