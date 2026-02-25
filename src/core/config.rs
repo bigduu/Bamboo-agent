@@ -575,12 +575,10 @@ mod tests {
 
     /// Acquire the environment lock, recovering from poison if a previous test failed
     fn env_lock_acquire() -> std::sync::MutexGuard<'static, ()> {
-        env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                // Lock was poisoned by a previous test failure - recover it
-                poisoned.into_inner()
-            })
+        env_lock().lock().unwrap_or_else(|poisoned| {
+            // Lock was poisoned by a previous test failure - recover it
+            poisoned.into_inner()
+        })
     }
 
     #[test]

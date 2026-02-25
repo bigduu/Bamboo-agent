@@ -81,13 +81,11 @@ mod comprehensive_config_tests {
     /// Acquire the environment lock, ignoring if it was poisoned by a previous test failure
     /// This ensures test isolation even when tests panic
     fn env_lock_acquire() -> std::sync::MutexGuard<'static, ()> {
-        env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                // Lock was poisoned by a previous test failure - recover it
-                eprintln!("Warning: Environment lock was poisoned, recovering...");
-                poisoned.into_inner()
-            })
+        env_lock().lock().unwrap_or_else(|poisoned| {
+            // Lock was poisoned by a previous test failure - recover it
+            eprintln!("Warning: Environment lock was poisoned, recovering...");
+            poisoned.into_inner()
+        })
     }
 
     // === 1) Environment Variable Override Priority ===
