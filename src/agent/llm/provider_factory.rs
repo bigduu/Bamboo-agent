@@ -10,6 +10,7 @@ use crate::agent::llm::providers::{
 use crate::core::keyword_masking::KeywordMaskingConfig;
 use crate::core::paths::{bamboo_dir, keyword_masking_json_path};
 use crate::core::Config;
+use reqwest::{Client, Proxy};
 use std::sync::Arc;
 
 /// Available provider types
@@ -44,6 +45,35 @@ fn load_masking_config() -> KeywordMaskingConfig {
     }
 }
 
+fn build_proxy(config: &Config) -> Result<Option<Proxy>, LLMError> {
+    let http_proxy = config.http_proxy.trim();
+    let https_proxy = config.https_proxy.trim();
+
+    // User requested: no need to distinguish between HTTP/HTTPS. Pick a single proxy URL.
+    let proxy_url = if !http_proxy.is_empty() {
+        http_proxy
+    } else if !https_proxy.is_empty() {
+        https_proxy
+    } else {
+        return Ok(None);
+    };
+
+    let mut proxy = Proxy::all(proxy_url)?;
+    if let Some(auth) = config.proxy_auth.as_ref() {
+        proxy = proxy.basic_auth(&auth.username, &auth.password);
+    }
+
+    Ok(Some(proxy))
+}
+
+fn build_http_client(config: &Config) -> Result<Client, LLMError> {
+    let mut builder = Client::builder();
+    if let Some(proxy) = build_proxy(config)? {
+        builder = builder.proxy(proxy);
+    }
+    Ok(builder.build()?)
+}
+
 /// Create a provider based on the current configuration
 pub async fn create_provider(config: &Config) -> Result<Arc<dyn LLMProvider>, LLMError> {
     let app_data_dir = bamboo_dir();
@@ -57,6 +87,7 @@ pub async fn create_provider_with_dir(
 ) -> Result<Arc<dyn LLMProvider>, LLMError> {
     // Load masking config once (applies to all providers).
     let masking_config = load_masking_config();
+    let http_client = build_http_client(config)?;
 
     match config.provider.as_str() {
         "copilot" => {
@@ -69,7 +100,7 @@ pub async fn create_provider_with_dir(
                 .unwrap_or(config.headless_auth);
 
             let mut provider = CopilotProvider::with_auth_handler(
-                reqwest::Client::new(),
+                http_client.clone(),
                 app_data_dir,
                 headless_auth,
             );
@@ -105,7 +136,8 @@ pub async fn create_provider_with_dir(
                 return Err(LLMError::Auth("OpenAI API key is required".to_string()));
             }
 
-            let mut provider = OpenAIProvider::new(&openai_config.api_key);
+            let mut provider =
+                OpenAIProvider::new(&openai_config.api_key).with_client(http_client.clone());
 
             if let Some(base_url) = &openai_config.base_url {
                 if !base_url.is_empty() {
@@ -129,7 +161,8 @@ pub async fn create_provider_with_dir(
                 return Err(LLMError::Auth("Anthropic API key is required".to_string()));
             }
 
-            let mut provider = AnthropicProvider::new(&anthropic_config.api_key);
+            let mut provider =
+                AnthropicProvider::new(&anthropic_config.api_key).with_client(http_client.clone());
 
             if let Some(base_url) = &anthropic_config.base_url {
                 if !base_url.is_empty() {
@@ -158,7 +191,8 @@ pub async fn create_provider_with_dir(
                 return Err(LLMError::Auth("Gemini API key is required".to_string()));
             }
 
-            let mut provider = GeminiProvider::new(&gemini_config.api_key);
+            let mut provider =
+                GeminiProvider::new(&gemini_config.api_key).with_client(http_client.clone());
 
             if let Some(base_url) = &gemini_config.base_url {
                 if !base_url.is_empty() {
@@ -248,6 +282,7 @@ mod tests {
             http_proxy: String::new(),
             https_proxy: String::new(),
             proxy_auth: None,
+            proxy_auth_encrypted: None,
             model: None,
             headless_auth: false,
             server: ServerConfig::default(),
@@ -266,6 +301,7 @@ mod tests {
             http_proxy: String::new(),
             https_proxy: String::new(),
             proxy_auth: None,
+            proxy_auth_encrypted: None,
             model: None,
             headless_auth: false,
             server: ServerConfig::default(),
@@ -299,6 +335,7 @@ mod tests {
             http_proxy: String::new(),
             https_proxy: String::new(),
             proxy_auth: None,
+            proxy_auth_encrypted: None,
             model: None,
             headless_auth: false,
             server: ServerConfig::default(),
@@ -332,6 +369,7 @@ mod tests {
             http_proxy: String::new(),
             https_proxy: String::new(),
             proxy_auth: None,
+            proxy_auth_encrypted: None,
             model: None,
             headless_auth: false,
             server: ServerConfig::default(),
@@ -360,6 +398,7 @@ mod tests {
             http_proxy: String::new(),
             https_proxy: String::new(),
             proxy_auth: None,
+            proxy_auth_encrypted: None,
             model: None,
             headless_auth: false,
             server: ServerConfig::default(),
@@ -387,6 +426,7 @@ mod tests {
             http_proxy: String::new(),
             https_proxy: String::new(),
             proxy_auth: None,
+            proxy_auth_encrypted: None,
             model: None,
             headless_auth: false,
             server: ServerConfig::default(),
@@ -405,6 +445,7 @@ mod tests {
             http_proxy: String::new(),
             https_proxy: String::new(),
             proxy_auth: None,
+            proxy_auth_encrypted: None,
             model: None,
             headless_auth: false,
             server: ServerConfig::default(),
@@ -429,6 +470,7 @@ mod tests {
             http_proxy: String::new(),
             https_proxy: String::new(),
             proxy_auth: None,
+            proxy_auth_encrypted: None,
             model: None,
             headless_auth: false,
             server: ServerConfig::default(),
@@ -446,6 +488,7 @@ mod tests {
             http_proxy: String::new(),
             https_proxy: String::new(),
             proxy_auth: None,
+            proxy_auth_encrypted: None,
             model: None,
             headless_auth: false,
             server: ServerConfig::default(),

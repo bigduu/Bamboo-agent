@@ -231,6 +231,23 @@ mod tests {
         assert!(handler.is_copilot_token_valid(&valid));
         assert!(!handler.is_copilot_token_valid(&stale));
     }
+
+    #[test]
+    fn access_token_should_only_be_discarded_on_auth_errors() {
+        let err_401 =
+            anyhow::Error::msg("Copilot token request failed: HTTP 401 - bad credentials");
+        assert!(CopilotAuthHandler::should_discard_access_token(&err_401));
+
+        let err_403 = anyhow::Error::msg("Copilot token request failed: HTTP 403 - forbidden");
+        assert!(CopilotAuthHandler::should_discard_access_token(&err_403));
+
+        let err_407 = anyhow::Error::new(ProxyAuthRequiredError);
+        assert!(!CopilotAuthHandler::should_discard_access_token(&err_407));
+
+        let err_503 =
+            anyhow::Error::msg("Copilot token request failed: HTTP 503 - service unavailable");
+        assert!(!CopilotAuthHandler::should_discard_access_token(&err_503));
+    }
 }
 
 /// API endpoint configuration for Copilot services.
@@ -879,14 +896,62 @@ impl CopilotAuthHandler {
                     self.write_cached_copilot_config(&copilot_token_path, &copilot_config)?;
                     return Ok(Some(copilot_config.token));
                 }
-                Err(_) => {
-                    // Invalid access token, remove it
-                    let _ = std::fs::remove_file(&token_path);
+                Err(e) => {
+                    // Only discard the cached access token when we are confident it is invalid.
+                    // Copilot tokens are short-lived; the GitHub OAuth access token should be
+                    // long-lived, so removing it on transient failures causes unnecessary re-auth.
+                    if Self::should_discard_access_token(&e) {
+                        let _ = std::fs::remove_file(&token_path);
+                    }
                 }
             }
         }
 
         Ok(None)
+    }
+
+    /// Force refresh a Copilot token using the cached GitHub OAuth access token.
+    ///
+    /// This bypasses the `.copilot_token.json` cache and is useful when the cached
+    /// Copilot token is rejected early (e.g. revoked) even if it hasn't reached
+    /// `expires_at` yet.
+    ///
+    /// Returns:
+    /// - `Ok(Some(token))` if the refresh succeeded
+    /// - `Ok(None)` if no cached access token exists
+    pub async fn force_refresh_chat_token(&self) -> anyhow::Result<Option<String>> {
+        let token_path = self.app_data_dir.join(".token");
+        let Some(access_token_str) = Self::read_access_token(&token_path) else {
+            return Ok(None);
+        };
+
+        let access_token = AccessTokenResponse::from_token(access_token_str);
+        match self.get_copilot_token(access_token).await {
+            Ok(copilot_config) => {
+                let copilot_token_path = self.app_data_dir.join(".copilot_token.json");
+                self.write_cached_copilot_config(&copilot_token_path, &copilot_config)?;
+                Ok(Some(copilot_config.token))
+            }
+            Err(e) => {
+                if Self::should_discard_access_token(&e) {
+                    let _ = std::fs::remove_file(&token_path);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn should_discard_access_token_message(msg: &str) -> bool {
+        // get_copilot_token formats errors like:
+        // "Copilot token request failed: HTTP {status} - {text}"
+        msg.contains("HTTP 401") || msg.contains("HTTP 403")
+    }
+
+    fn should_discard_access_token(err: &anyhow::Error) -> bool {
+        if err.downcast_ref::<ProxyAuthRequiredError>().is_some() {
+            return false;
+        }
+        Self::should_discard_access_token_message(&err.to_string())
     }
 
     /// Polls GitHub for an access token after user completes device flow.

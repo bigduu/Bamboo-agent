@@ -9,9 +9,16 @@ use crate::core::Config;
 pub fn get_default_model_from_config(config: &Config) -> Result<String, LLMError> {
     match config.provider.as_str() {
         "copilot" => {
-            // Copilot has default models, but can be overridden
-            // If no model is specified, use a sensible default
-            Ok(config.model.clone().unwrap_or_else(|| "gpt-4o".to_string()))
+            // Copilot supports multiple upstream model IDs; prefer provider-specific config.
+            let provider_model = config
+                .providers
+                .copilot
+                .as_ref()
+                .and_then(|c| c.model.clone());
+
+            Ok(provider_model
+                .or_else(|| config.model.clone())
+                .unwrap_or_else(|| "gpt-4o".to_string()))
         }
         "openai" => {
             let openai_config = config
@@ -55,7 +62,7 @@ pub fn get_default_model_from_config(config: &Config) -> Result<String, LLMError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{OpenAIConfig, ProviderConfigs};
+    use crate::core::{CopilotConfig, OpenAIConfig, ProviderConfigs};
 
     #[test]
     fn test_get_model_from_openai_config() {
@@ -98,5 +105,54 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("model must be specified"));
+    }
+
+    #[test]
+    fn test_get_model_from_copilot_provider_config() {
+        let config = Config {
+            provider: "copilot".to_string(),
+            providers: ProviderConfigs {
+                copilot: Some(CopilotConfig {
+                    enabled: true,
+                    headless_auth: false,
+                    model: Some("gpt-4o-mini".to_string()),
+                }),
+                ..ProviderConfigs::default()
+            },
+            model: Some("gpt-4o".to_string()),
+            ..Config::default()
+        };
+
+        let result = get_default_model_from_config(&config);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "gpt-4o-mini");
+    }
+
+    #[test]
+    fn test_get_model_from_copilot_root_model_fallback() {
+        let config = Config {
+            provider: "copilot".to_string(),
+            providers: ProviderConfigs::default(),
+            model: Some("gpt-4o-mini".to_string()),
+            ..Config::default()
+        };
+
+        let result = get_default_model_from_config(&config);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "gpt-4o-mini");
+    }
+
+    #[test]
+    fn test_get_model_from_copilot_default_fallback() {
+        let config = Config {
+            provider: "copilot".to_string(),
+            providers: ProviderConfigs::default(),
+            model: None,
+            ..Config::default()
+        };
+
+        let result = get_default_model_from_config(&config);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "gpt-4o");
     }
 }

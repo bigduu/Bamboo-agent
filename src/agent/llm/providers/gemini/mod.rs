@@ -30,6 +30,12 @@ impl GeminiProvider {
         }
     }
 
+    /// Overrides the internal HTTP client (e.g., to enable a proxy).
+    pub fn with_client(mut self, client: Client) -> Self {
+        self.client = client;
+        self
+    }
+
     /// Set a custom base URL (e.g., for proxies or alternative endpoints).
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();

@@ -65,7 +65,16 @@ pub struct Config {
     #[serde(default)]
     pub https_proxy: String,
     /// Proxy authentication credentials
+    ///
+    /// Note: this is kept in-memory only. On disk we store `proxy_auth_encrypted`.
+    #[serde(skip_serializing)]
     pub proxy_auth: Option<ProxyAuth>,
+    /// Encrypted proxy authentication credentials (nonce:ciphertext)
+    ///
+    /// This is the at-rest storage representation. When present, Bamboo will
+    /// decrypt it into `proxy_auth` at load time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_auth_encrypted: Option<String>,
     /// Default model to use (can be overridden per provider)
     pub model: Option<String>,
     /// Deprecated: Use `providers.copilot.headless_auth` instead
@@ -182,7 +191,8 @@ pub struct GeminiConfig {
 /// ```json
 /// "copilot": {
 ///   "enabled": true,
-///   "headless_auth": false
+///   "headless_auth": false,
+///   "model": "gpt-4o"
 /// }
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -193,6 +203,9 @@ pub struct CopilotConfig {
     /// Print login URL to console instead of opening browser
     #[serde(default)]
     pub headless_auth: bool,
+    /// Default model to use for Copilot (used when clients request the "default" model)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Returns the default provider name ("anthropic")
@@ -336,7 +349,10 @@ impl Config {
                         // OldConfig successfully parsed common fields like http_proxy, model, provider, etc.
                         // Try Config, but if it fails (e.g., due to syntax errors), use OldConfig values
                         match serde_json::from_str::<Config>(&content) {
-                            Ok(config) => config,
+                            Ok(mut config) => {
+                                config.hydrate_proxy_auth();
+                                config
+                            }
                             Err(_) => {
                                 // Config parse failed, but OldConfig worked, so preserve those values
                                 migrate_config(old_config)
@@ -346,6 +362,10 @@ impl Config {
                 } else {
                     // Couldn't parse as OldConfig, try as Config
                     serde_json::from_str::<Config>(&content)
+                        .map(|mut config| {
+                            config.hydrate_proxy_auth();
+                            config
+                        })
                         .unwrap_or_else(|_| Self::create_default())
                 }
             } else {
@@ -370,6 +390,8 @@ impl Config {
 
         // Ensure data_dir is set correctly
         config.data_dir = data_dir;
+        // Decrypt encrypted proxy auth into in-memory plaintext form.
+        config.hydrate_proxy_auth();
 
         // Apply environment variable overrides (highest priority)
         if let Ok(port) = std::env::var("BAMBOO_PORT") {
@@ -398,12 +420,47 @@ impl Config {
         config
     }
 
+    fn hydrate_proxy_auth(&mut self) {
+        if self.proxy_auth.is_some() {
+            return;
+        }
+
+        let Some(encrypted) = self.proxy_auth_encrypted.as_deref() else {
+            return;
+        };
+
+        match crate::core::encryption::decrypt(encrypted) {
+            Ok(decrypted) => match serde_json::from_str::<ProxyAuth>(&decrypted) {
+                Ok(auth) => self.proxy_auth = Some(auth),
+                Err(e) => log::warn!("Failed to parse decrypted proxy auth JSON: {}", e),
+            },
+            Err(e) => log::warn!("Failed to decrypt proxy auth: {}", e),
+        }
+    }
+
+    fn encrypt_proxy_auth_for_storage(&mut self) -> Result<()> {
+        if self.proxy_auth_encrypted.is_some() || self.proxy_auth.is_none() {
+            return Ok(());
+        }
+
+        let auth = self
+            .proxy_auth
+            .as_ref()
+            .context("proxy_auth missing when trying to encrypt")?;
+        let auth_str = serde_json::to_string(auth).context("Failed to serialize proxy auth")?;
+        let encrypted =
+            crate::core::encryption::encrypt(&auth_str).context("Failed to encrypt proxy auth")?;
+        self.proxy_auth_encrypted = Some(encrypted);
+        Ok(())
+    }
+
     /// Create a default configuration without loading from file
     fn create_default() -> Self {
         Config {
             http_proxy: String::new(),
             https_proxy: String::new(),
             proxy_auth: None,
+            proxy_auth_encrypted: None,
             model: None,
             headless_auth: false,
             provider: default_provider(),
@@ -427,8 +484,10 @@ impl Config {
                 .with_context(|| format!("Failed to create config dir: {:?}", parent))?;
         }
 
+        let mut to_save = self.clone();
+        to_save.encrypt_proxy_auth_for_storage()?;
         let content =
-            serde_json::to_string_pretty(self).context("Failed to serialize config to JSON")?;
+            serde_json::to_string_pretty(&to_save).context("Failed to serialize config to JSON")?;
 
         std::fs::write(&path, content)
             .with_context(|| format!("Failed to write config file: {:?}", path))?;
@@ -484,11 +543,18 @@ fn migrate_config(old: OldConfig) -> Config {
         );
     }
 
+    let proxy_auth = old.https_proxy_auth.or(old.http_proxy_auth);
+    let proxy_auth_encrypted = proxy_auth
+        .as_ref()
+        .and_then(|auth| serde_json::to_string(auth).ok())
+        .and_then(|auth_str| crate::core::encryption::encrypt(&auth_str).ok());
+
     Config {
         http_proxy: old.http_proxy,
         https_proxy: old.https_proxy,
         // Use https_proxy_auth if available, otherwise fallback to http_proxy_auth
-        proxy_auth: old.https_proxy_auth.or(old.http_proxy_auth),
+        proxy_auth,
+        proxy_auth_encrypted,
         model: old.model,
         headless_auth: old.headless_auth,
         provider: old.provider,
@@ -822,5 +888,77 @@ mod tests {
         assert_eq!(loaded.server.port, 9000);
         assert_eq!(loaded.server.bind, "0.0.0.0");
         assert_eq!(loaded.provider, "anthropic");
+    }
+
+    #[test]
+    fn config_decrypts_proxy_auth_from_encrypted_field() {
+        let _lock = env_lock_acquire();
+        let temp_home = TempHome::new();
+
+        // Use a stable encryption key so this test doesn't depend on host identifiers.
+        let _key = EnvVarGuard::set(
+            "BAMBOO_CONFIG_ENCRYPTION_KEY",
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        );
+
+        let auth = ProxyAuth {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        };
+        let auth_str = serde_json::to_string(&auth).expect("serialize proxy auth");
+        let encrypted = crate::core::encryption::encrypt(&auth_str).expect("encrypt proxy auth");
+
+        temp_home.set_config_json(&format!(
+            r#"{{
+  "http_proxy": "http://proxy.example.com:8080",
+  "proxy_auth_encrypted": "{encrypted}"
+}}"#
+        ));
+
+        let home = temp_home.path.to_string_lossy().to_string();
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let config = Config::new();
+        let loaded_auth = config.proxy_auth.expect("proxy auth should be hydrated");
+        assert_eq!(loaded_auth.username, "user");
+        assert_eq!(loaded_auth.password, "pass");
+    }
+
+    #[test]
+    fn config_save_encrypts_proxy_auth_and_load_hydrates_plaintext() {
+        let _lock = env_lock_acquire();
+        let temp_home = TempHome::new();
+
+        // Use a stable encryption key so this test doesn't depend on host identifiers.
+        let _key = EnvVarGuard::set(
+            "BAMBOO_CONFIG_ENCRYPTION_KEY",
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        );
+
+        let home = temp_home.path.to_string_lossy().to_string();
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let mut config = Config::default();
+        config.proxy_auth = Some(ProxyAuth {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        });
+        config.save().expect("save should encrypt proxy auth");
+
+        let content = std::fs::read_to_string(temp_home.path.join(".bamboo").join("config.json"))
+            .expect("read config.json");
+        assert!(
+            content.contains("proxy_auth_encrypted"),
+            "config.json should store encrypted proxy auth"
+        );
+        assert!(
+            !content.contains("\"proxy_auth\""),
+            "config.json should not store plaintext proxy_auth"
+        );
+
+        let loaded = Config::new();
+        let loaded_auth = loaded.proxy_auth.expect("proxy auth should be hydrated");
+        assert_eq!(loaded_auth.username, "user");
+        assert_eq!(loaded_auth.password, "pass");
     }
 }

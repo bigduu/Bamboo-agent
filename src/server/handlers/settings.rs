@@ -60,6 +60,17 @@ fn strip_proxy_auth(mut config: Value) -> Value {
     config
 }
 
+/// Removes only plaintext proxy authentication from config JSON.
+///
+/// This keeps `proxy_auth_encrypted` so clients can see that proxy auth exists
+/// without receiving the plaintext credentials.
+fn strip_proxy_auth_plaintext(mut config: Value) -> Value {
+    if let Some(obj) = config.as_object_mut() {
+        obj.remove("proxy_auth");
+    }
+    config
+}
+
 /// Removes empty proxy URL fields from config JSON
 fn clean_empty_proxy_fields(mut config: Value) -> Value {
     if let Some(obj) = config.as_object_mut() {
@@ -669,9 +680,13 @@ pub async fn get_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpRes
     match fs::read_to_string(&path).await {
         Ok(content) => {
             let mut config = serde_json::from_str::<Value>(&content)?;
-            // Decrypt proxy auth for internal use, but strip before returning to client
-            decrypt_proxy_auth(&mut config);
-            Ok(HttpResponse::Ok().json(strip_proxy_auth(config.clone())))
+
+            // If a legacy plaintext `proxy_auth` is present, encrypt it for the response
+            // (do not persist as a side-effect of GET).
+            encrypt_proxy_auth(&mut config)?;
+
+            // Never return plaintext credentials; keep encrypted field.
+            Ok(HttpResponse::Ok().json(strip_proxy_auth_plaintext(config)))
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             Ok(HttpResponse::Ok().json(serde_json::json!({})))
@@ -1430,7 +1445,7 @@ fn mask_api_keys_in_providers(providers: &Value) -> Value {
 /// # Features
 /// - Preserves existing API keys if masked values are sent
 /// - Validates configuration before applying
-/// - Automatically reloads provider
+/// - Automatically reloads provider (no separate reload call required)
 ///
 /// # Example
 /// ```bash
@@ -1757,6 +1772,10 @@ async fn fetch_models_from_api(
 /// ```bash
 /// curl -X POST http://localhost:3000/bamboo/settings/reload
 /// ```
+///
+/// # Notes
+/// In most cases you should not need to call this endpoint, because
+/// `POST /bamboo/settings/provider` already saves the config and reloads the provider.
 pub async fn reload_provider_config(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {

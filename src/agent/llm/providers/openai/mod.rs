@@ -35,6 +35,12 @@ impl OpenAIProvider {
         self.base_url = url.into();
         self
     }
+
+    /// Overrides the internal HTTP client (e.g., to enable a proxy).
+    pub fn with_client(mut self, client: Client) -> Self {
+        self.client = client;
+        self
+    }
 }
 
 #[async_trait]

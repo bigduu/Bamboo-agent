@@ -187,13 +187,10 @@ impl CopilotProvider {
     }
 
     /// Build request headers to mimic VS Code Copilot extension
-    fn build_headers(&self) -> std::result::Result<reqwest::header::HeaderMap, LLMError> {
+    fn build_headers_with_token(
+        token: &str,
+    ) -> std::result::Result<reqwest::header::HeaderMap, LLMError> {
         use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-
-        let token = self
-            .token
-            .as_ref()
-            .ok_or_else(|| LLMError::Auth("Not authenticated".to_string()))?;
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -225,6 +222,35 @@ impl CopilotProvider {
 
         Ok(headers)
     }
+
+    /// Build request headers using the in-memory token (primarily for tests and manual token mode).
+    #[allow(dead_code)] // Used by unit tests + handy for debugging token formatting.
+    fn build_headers(&self) -> std::result::Result<reqwest::header::HeaderMap, LLMError> {
+        let token = self
+            .token
+            .as_ref()
+            .ok_or_else(|| LLMError::Auth("Not authenticated".to_string()))?;
+        Self::build_headers_with_token(token)
+    }
+
+    async fn get_token_for_request(&self) -> std::result::Result<String, LLMError> {
+        // Prefer the auth handler (cached token / env var / access token exchange).
+        if let Some(handler) = &self.auth_handler {
+            match handler.try_get_chat_token_silent().await {
+                Ok(Some(token)) => return Ok(token),
+                Ok(None) => { /* fall back to in-memory token */ }
+                Err(e) => return Err(LLMError::Auth(e.to_string())),
+            }
+        }
+
+        if let Some(token) = self.token.as_ref() {
+            return Ok(token.clone());
+        }
+
+        Err(LLMError::Auth(
+            "Not authenticated. Please run authenticate() first.".to_string(),
+        ))
+    }
 }
 
 impl Default for CopilotProvider {
@@ -242,21 +268,22 @@ impl LLMProvider for CopilotProvider {
         max_output_tokens: Option<u32>,
         model: &str,
     ) -> Result<LLMStream> {
-        // Ensure authenticated
-        if !self.is_authenticated() {
-            return Err(LLMError::Auth(
-                "Not authenticated. Please run authenticate() first.".to_string(),
-            ));
-        }
+        let token = self.get_token_for_request().await?;
 
-        // Copilot uses a fixed upstream model; keep the required `model` parameter for trait consistency.
-        log::debug!(
-            "Copilot provider ignoring requested model (fixed upstream model): {}",
-            model
-        );
+        // Copilot supports multiple upstream model IDs. We don't store a default model in the provider
+        // instance (it is resolved by the caller and passed in per request).
+        let requested_model = model.trim();
+        let upstream_model = if requested_model.is_empty() {
+            // Back-compat default (previous behavior hard-coded this).
+            "copilot-chat"
+        } else {
+            requested_model
+        };
+
+        log::debug!("Copilot provider using upstream model: {}", upstream_model);
 
         let mut body = json!({
-            "model": "copilot-chat",
+            "model": upstream_model,
             "messages": messages_to_openai_compat_json(messages),
             "stream": true,
         });
@@ -277,12 +304,12 @@ impl LLMProvider for CopilotProvider {
             tools.len()
         );
 
-        let headers = self.build_headers()?;
+        let url = "https://api.githubcopilot.com/chat/completions";
 
-        let response = self
+        let mut response = self
             .client
-            .post("https://api.githubcopilot.com/chat/completions")
-            .headers(headers)
+            .post(url)
+            .headers(Self::build_headers_with_token(&token)?)
             .json(&body)
             .send()
             .await
@@ -290,18 +317,38 @@ impl LLMProvider for CopilotProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let text = response.text().await.unwrap_or_default();
 
-            // Check for auth errors
-            if status == 401 || status == 403 {
-                return Err(LLMError::Auth(format!(
-                    "Authentication failed: {}. Please run authenticate() again.",
-                    text
-                )));
+            // On auth failures, try a one-time forced refresh via the cached access token.
+            if (status == 401 || status == 403) && self.auth_handler.is_some() {
+                if let Some(handler) = &self.auth_handler {
+                    if let Ok(Some(refreshed)) = handler.force_refresh_chat_token().await {
+                        response = self
+                            .client
+                            .post(url)
+                            .headers(Self::build_headers_with_token(&refreshed)?)
+                            .json(&body)
+                            .send()
+                            .await
+                            .map_err(LLMError::Http)?;
+                    }
+                }
             }
 
-            log::error!("Copilot API error: HTTP {} - {}", status, text);
-            return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+
+                // Check for auth errors
+                if status == 401 || status == 403 {
+                    return Err(LLMError::Auth(format!(
+                        "Authentication failed: {}. Please run authenticate() again.",
+                        text
+                    )));
+                }
+
+                log::error!("Copilot API error: HTTP {} - {}", status, text);
+                return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
+            }
         }
 
         let stream = llm_stream_from_sse(response, |_event, data| {
@@ -316,37 +363,49 @@ impl LLMProvider for CopilotProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {
-        // Ensure authenticated
-        if !self.is_authenticated() {
-            return Err(LLMError::Auth(
-                "Not authenticated. Please run authenticate() first.".to_string(),
-            ));
-        }
+        let token = self.get_token_for_request().await?;
+        let url = "https://api.githubcopilot.com/models";
 
-        let headers = self.build_headers()?;
-
-        let response = self
+        let mut response = self
             .client
-            .get("https://api.githubcopilot.com/models")
-            .headers(headers)
+            .get(url)
+            .headers(Self::build_headers_with_token(&token)?)
             .send()
             .await
             .map_err(LLMError::Http)?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let text = response.text().await.unwrap_or_default();
 
-            // Check for auth errors
-            if status == 401 || status == 403 {
-                return Err(LLMError::Auth(format!(
-                    "Authentication failed: {}. Please run authenticate() again.",
-                    text
-                )));
+            if (status == 401 || status == 403) && self.auth_handler.is_some() {
+                if let Some(handler) = &self.auth_handler {
+                    if let Ok(Some(refreshed)) = handler.force_refresh_chat_token().await {
+                        response = self
+                            .client
+                            .get(url)
+                            .headers(Self::build_headers_with_token(&refreshed)?)
+                            .send()
+                            .await
+                            .map_err(LLMError::Http)?;
+                    }
+                }
             }
 
-            log::error!("Copilot API error: HTTP {} - {}", status, text);
-            return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+
+                // Check for auth errors
+                if status == 401 || status == 403 {
+                    return Err(LLMError::Auth(format!(
+                        "Authentication failed: {}. Please run authenticate() again.",
+                        text
+                    )));
+                }
+
+                log::error!("Copilot API error: HTTP {} - {}", status, text);
+                return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
+            }
         }
 
         // Parse the response
@@ -755,7 +814,7 @@ mod tests {
         let provider = CopilotProvider::with_token("test_token");
 
         // There is NO .with_model("copilot-chat") method
-        // Model is passed to chat_stream() as a parameter (though Copilot uses a fixed upstream model)
+        // Model is passed to chat_stream() as a parameter (resolved by the caller per request).
 
         assert!(provider.is_authenticated());
     }
