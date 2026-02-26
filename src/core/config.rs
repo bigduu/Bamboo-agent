@@ -172,8 +172,14 @@ pub struct ProviderConfigs {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAIConfig {
-    /// OpenAI API key
+    /// OpenAI API key (plaintext, in-memory only).
+    ///
+    /// On disk this is stored as `api_key_encrypted` and hydrated on load.
+    #[serde(default, skip_serializing)]
     pub api_key: String,
+    /// Encrypted OpenAI API key (nonce:ciphertext).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_encrypted: Option<String>,
     /// Custom API base URL (for Azure or self-hosted deployments)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -199,8 +205,14 @@ pub struct OpenAIConfig {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicConfig {
-    /// Anthropic API key
+    /// Anthropic API key (plaintext, in-memory only).
+    ///
+    /// On disk this is stored as `api_key_encrypted` and hydrated on load.
+    #[serde(default, skip_serializing)]
     pub api_key: String,
+    /// Encrypted Anthropic API key (nonce:ciphertext).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_encrypted: Option<String>,
     /// Custom API base URL
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -228,8 +240,14 @@ pub struct AnthropicConfig {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiConfig {
-    /// Google AI API key
+    /// Google AI API key (plaintext, in-memory only).
+    ///
+    /// On disk this is stored as `api_key_encrypted` and hydrated on load.
+    #[serde(default, skip_serializing)]
     pub api_key: String,
+    /// Encrypted Google AI API key (nonce:ciphertext).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_encrypted: Option<String>,
     /// Custom API base URL
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -418,6 +436,8 @@ impl Config {
                         match serde_json::from_str::<Config>(&content) {
                             Ok(mut config) => {
                                 config.hydrate_proxy_auth_from_encrypted();
+                                config.hydrate_provider_api_keys_from_encrypted();
+                                config.hydrate_mcp_secrets_from_encrypted();
                                 config
                             }
                             Err(_) => {
@@ -431,6 +451,8 @@ impl Config {
                     serde_json::from_str::<Config>(&content)
                         .map(|mut config| {
                             config.hydrate_proxy_auth_from_encrypted();
+                            config.hydrate_provider_api_keys_from_encrypted();
+                            config.hydrate_mcp_secrets_from_encrypted();
                             config
                         })
                         .unwrap_or_else(|_| Self::create_default())
@@ -459,6 +481,10 @@ impl Config {
         config.data_dir = data_dir;
         // Decrypt encrypted proxy auth into in-memory plaintext form.
         config.hydrate_proxy_auth_from_encrypted();
+        // Decrypt encrypted provider API keys into in-memory plaintext form.
+        config.hydrate_provider_api_keys_from_encrypted();
+        // Decrypt encrypted MCP secrets into in-memory plaintext form.
+        config.hydrate_mcp_secrets_from_encrypted();
 
         // Best-effort migration from legacy sidecar config files into unified config.json.
         // This keeps config state globally unified going forward without breaking existing installs.
@@ -534,6 +560,164 @@ impl Config {
         Ok(())
     }
 
+    pub fn hydrate_provider_api_keys_from_encrypted(&mut self) {
+        if let Some(openai) = self.providers.openai.as_mut() {
+            if openai.api_key.trim().is_empty() {
+                if let Some(encrypted) = openai.api_key_encrypted.as_deref() {
+                    match crate::core::encryption::decrypt(encrypted) {
+                        Ok(value) => openai.api_key = value,
+                        Err(e) => log::warn!("Failed to decrypt OpenAI api_key: {}", e),
+                    }
+                }
+            }
+        }
+
+        if let Some(anthropic) = self.providers.anthropic.as_mut() {
+            if anthropic.api_key.trim().is_empty() {
+                if let Some(encrypted) = anthropic.api_key_encrypted.as_deref() {
+                    match crate::core::encryption::decrypt(encrypted) {
+                        Ok(value) => anthropic.api_key = value,
+                        Err(e) => log::warn!("Failed to decrypt Anthropic api_key: {}", e),
+                    }
+                }
+            }
+        }
+
+        if let Some(gemini) = self.providers.gemini.as_mut() {
+            if gemini.api_key.trim().is_empty() {
+                if let Some(encrypted) = gemini.api_key_encrypted.as_deref() {
+                    match crate::core::encryption::decrypt(encrypted) {
+                        Ok(value) => gemini.api_key = value,
+                        Err(e) => log::warn!("Failed to decrypt Gemini api_key: {}", e),
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn refresh_provider_api_keys_encrypted(&mut self) -> Result<()> {
+        if let Some(openai) = self.providers.openai.as_mut() {
+            let api_key = openai.api_key.trim();
+            openai.api_key_encrypted = if api_key.is_empty() {
+                None
+            } else {
+                Some(
+                    crate::core::encryption::encrypt(api_key)
+                        .context("Failed to encrypt OpenAI api_key")?,
+                )
+            };
+        }
+
+        if let Some(anthropic) = self.providers.anthropic.as_mut() {
+            let api_key = anthropic.api_key.trim();
+            anthropic.api_key_encrypted = if api_key.is_empty() {
+                None
+            } else {
+                Some(
+                    crate::core::encryption::encrypt(api_key)
+                        .context("Failed to encrypt Anthropic api_key")?,
+                )
+            };
+        }
+
+        if let Some(gemini) = self.providers.gemini.as_mut() {
+            let api_key = gemini.api_key.trim();
+            gemini.api_key_encrypted = if api_key.is_empty() {
+                None
+            } else {
+                Some(
+                    crate::core::encryption::encrypt(api_key)
+                        .context("Failed to encrypt Gemini api_key")?,
+                )
+            };
+        }
+
+        Ok(())
+    }
+
+    pub fn hydrate_mcp_secrets_from_encrypted(&mut self) {
+        for server in self.mcp.servers.iter_mut() {
+            match &mut server.transport {
+                crate::agent::mcp::TransportConfig::Stdio(stdio) => {
+                    if stdio.env_encrypted.is_empty() {
+                        continue;
+                    }
+
+                    // Avoid borrow-checker gymnastics by iterating a cloned map.
+                    for (key, encrypted) in stdio.env_encrypted.clone() {
+                        let should_hydrate = stdio
+                            .env
+                            .get(&key)
+                            .map(|v| v.trim().is_empty())
+                            .unwrap_or(true);
+                        if !should_hydrate {
+                            continue;
+                        }
+
+                        match crate::core::encryption::decrypt(&encrypted) {
+                            Ok(value) => {
+                                stdio.env.insert(key, value);
+                            }
+                            Err(e) => log::warn!("Failed to decrypt MCP stdio env var: {}", e),
+                        }
+                    }
+                }
+                crate::agent::mcp::TransportConfig::Sse(sse) => {
+                    for header in sse.headers.iter_mut() {
+                        if !header.value.trim().is_empty() {
+                            continue;
+                        }
+                        let Some(encrypted) = header.value_encrypted.as_deref() else {
+                            continue;
+                        };
+                        match crate::core::encryption::decrypt(encrypted) {
+                            Ok(value) => header.value = value,
+                            Err(e) => log::warn!("Failed to decrypt MCP SSE header value: {}", e),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn refresh_mcp_secrets_encrypted(&mut self) -> Result<()> {
+        for server in self.mcp.servers.iter_mut() {
+            match &mut server.transport {
+                crate::agent::mcp::TransportConfig::Stdio(stdio) => {
+                    stdio.env_encrypted.clear();
+                    for (key, value) in &stdio.env {
+                        let encrypted =
+                            crate::core::encryption::encrypt(value).with_context(|| {
+                                format!("Failed to encrypt MCP stdio env var '{key}'")
+                            })?;
+                        stdio.env_encrypted.insert(key.clone(), encrypted);
+                    }
+                }
+                crate::agent::mcp::TransportConfig::Sse(sse) => {
+                    for header in sse.headers.iter_mut() {
+                        let configured = !header.value.trim().is_empty();
+                        header.value_encrypted = if !configured {
+                            None
+                        } else {
+                            Some(
+                                crate::core::encryption::encrypt(&header.value).with_context(
+                                    || {
+                                        format!(
+                                            "Failed to encrypt MCP SSE header '{}'",
+                                            header.name
+                                        )
+                                    },
+                                )?,
+                            )
+                        };
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Create a default configuration without loading from file
     fn create_default() -> Self {
         Config {
@@ -571,6 +755,8 @@ impl Config {
 
         let mut to_save = self.clone();
         to_save.refresh_proxy_auth_encrypted()?;
+        to_save.refresh_provider_api_keys_encrypted()?;
+        to_save.refresh_mcp_secrets_encrypted()?;
         let content =
             serde_json::to_string_pretty(&to_save).context("Failed to serialize config to JSON")?;
         write_atomic(&path, content.as_bytes())
@@ -1202,6 +1388,166 @@ mod tests {
         let loaded_auth = loaded.proxy_auth.expect("proxy auth should be hydrated");
         assert_eq!(loaded_auth.username, "user");
         assert_eq!(loaded_auth.password, "pass");
+        drop(key_guard);
+    }
+
+    #[test]
+    fn config_save_encrypts_provider_api_keys_and_does_not_persist_plaintext() {
+        let _lock = env_lock_acquire();
+        let temp_home = TempHome::new();
+
+        // Use a stable encryption key so this test doesn't depend on host identifiers.
+        let key_guard = crate::core::encryption::set_test_encryption_key([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ]);
+
+        let mut config = Config::from_data_dir(Some(temp_home.path.clone()));
+        config.provider = "openai".to_string();
+        config.providers.openai = Some(OpenAIConfig {
+            api_key: "sk-test-provider-key".to_string(),
+            api_key_encrypted: None,
+            base_url: None,
+            model: None,
+            extra: Default::default(),
+        });
+
+        config
+            .save()
+            .expect("save should encrypt provider api keys");
+
+        let content =
+            std::fs::read_to_string(temp_home.path.join("config.json")).expect("read config.json");
+        assert!(
+            content.contains("\"api_key_encrypted\""),
+            "config.json should store encrypted provider keys"
+        );
+        assert!(
+            !content.contains("\"api_key\""),
+            "config.json should not store plaintext provider keys"
+        );
+
+        let loaded = Config::from_data_dir(Some(temp_home.path.clone()));
+        let openai = loaded
+            .providers
+            .openai
+            .expect("openai config should be present");
+        assert_eq!(openai.api_key, "sk-test-provider-key");
+
+        drop(key_guard);
+    }
+
+    #[test]
+    fn config_save_encrypts_mcp_secrets_and_does_not_persist_plaintext() {
+        let _lock = env_lock_acquire();
+        let temp_home = TempHome::new();
+
+        // Use a stable encryption key so this test doesn't depend on host identifiers.
+        let key_guard = crate::core::encryption::set_test_encryption_key([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ]);
+
+        let mut config = Config::from_data_dir(Some(temp_home.path.clone()));
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("TOKEN".to_string(), "supersecret".to_string());
+
+        config.mcp.servers = vec![
+            crate::agent::mcp::McpServerConfig {
+                id: "stdio-secret".to_string(),
+                name: None,
+                enabled: true,
+                transport: crate::agent::mcp::TransportConfig::Stdio(
+                    crate::agent::mcp::StdioConfig {
+                        command: "echo".to_string(),
+                        args: vec![],
+                        cwd: None,
+                        env,
+                        env_encrypted: std::collections::HashMap::new(),
+                        startup_timeout_ms: 5000,
+                    },
+                ),
+                request_timeout_ms: 5000,
+                healthcheck_interval_ms: 1000,
+                reconnect: crate::agent::mcp::ReconnectConfig::default(),
+                allowed_tools: vec![],
+                denied_tools: vec![],
+            },
+            crate::agent::mcp::McpServerConfig {
+                id: "sse-secret".to_string(),
+                name: None,
+                enabled: true,
+                transport: crate::agent::mcp::TransportConfig::Sse(crate::agent::mcp::SseConfig {
+                    url: "http://localhost:8080/sse".to_string(),
+                    headers: vec![crate::agent::mcp::HeaderConfig {
+                        name: "Authorization".to_string(),
+                        value: "Bearer token123".to_string(),
+                        value_encrypted: None,
+                    }],
+                    connect_timeout_ms: 5000,
+                }),
+                request_timeout_ms: 5000,
+                healthcheck_interval_ms: 1000,
+                reconnect: crate::agent::mcp::ReconnectConfig::default(),
+                allowed_tools: vec![],
+                denied_tools: vec![],
+            },
+        ];
+
+        config.save().expect("save should encrypt MCP secrets");
+
+        let content =
+            std::fs::read_to_string(temp_home.path.join("config.json")).expect("read config.json");
+        assert!(
+            content.contains("\"env_encrypted\""),
+            "config.json should store encrypted MCP stdio env"
+        );
+        assert!(
+            content.contains("\"value_encrypted\""),
+            "config.json should store encrypted MCP SSE headers"
+        );
+        assert!(
+            !content.contains("supersecret"),
+            "config.json must not contain plaintext env values"
+        );
+        assert!(
+            !content.contains("Bearer token123"),
+            "config.json must not contain plaintext header values"
+        );
+
+        let loaded = Config::from_data_dir(Some(temp_home.path.clone()));
+        let stdio = loaded
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.id == "stdio-secret")
+            .expect("stdio server should exist");
+        match &stdio.transport {
+            crate::agent::mcp::TransportConfig::Stdio(stdio) => {
+                assert_eq!(
+                    stdio.env.get("TOKEN").map(|s| s.as_str()),
+                    Some("supersecret")
+                );
+            }
+            _ => panic!("Expected stdio transport"),
+        }
+
+        let sse = loaded
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.id == "sse-secret")
+            .expect("sse server should exist");
+        match &sse.transport {
+            crate::agent::mcp::TransportConfig::Sse(sse) => {
+                assert_eq!(sse.headers[0].value, "Bearer token123");
+            }
+            _ => panic!("Expected SSE transport"),
+        }
+
         drop(key_guard);
     }
 }

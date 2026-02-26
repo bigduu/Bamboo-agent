@@ -257,6 +257,7 @@ mod tests {
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
                     api_key: "".to_string(),
+                    api_key_encrypted: None,
                     base_url: None,
                     model: None,
                     extra: Default::default(),
@@ -284,6 +285,7 @@ mod tests {
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
                     api_key: "sk-test123".to_string(),
+                    api_key_encrypted: None,
                     base_url: Some("https://custom.openai.com/v1".to_string()),
                     model: Some("gpt-4o".to_string()),
                     extra: Default::default(),
@@ -305,6 +307,7 @@ mod tests {
             providers: ProviderConfigs {
                 anthropic: Some(AnthropicConfig {
                     api_key: "sk-ant-test123".to_string(),
+                    api_key_encrypted: None,
                     base_url: None,
                     model: Some("claude-3-5-sonnet-20241022".to_string()),
                     max_tokens: Some(4096),
@@ -327,6 +330,7 @@ mod tests {
             providers: ProviderConfigs {
                 gemini: Some(GeminiConfig {
                     api_key: "AIza-test123".to_string(),
+                    api_key_encrypted: None,
                     base_url: None,
                     model: Some("gemini-pro".to_string()),
                     extra: Default::default(),

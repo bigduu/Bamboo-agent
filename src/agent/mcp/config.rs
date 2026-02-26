@@ -84,9 +84,14 @@ pub struct StdioConfig {
     /// Working directory
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Environment variables
-    #[serde(default)]
+    /// Environment variables (plaintext, in-memory only).
+    ///
+    /// Persisted to disk as `env_encrypted` and hydrated on load.
+    #[serde(default, skip_serializing)]
     pub env: HashMap<String, String>,
+    /// Encrypted environment variables values (nonce:ciphertext), keyed by env var name.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env_encrypted: HashMap<String, String>,
     /// Startup timeout in milliseconds
     #[serde(default = "default_startup_timeout")]
     pub startup_timeout_ms: u64,
@@ -117,7 +122,14 @@ fn default_connect_timeout() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeaderConfig {
     pub name: String,
+    /// Header value (plaintext, in-memory only).
+    ///
+    /// Persisted to disk as `value_encrypted` and hydrated on load.
+    #[serde(default, skip_serializing)]
     pub value: String,
+    /// Encrypted header value (nonce:ciphertext).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_encrypted: Option<String>,
 }
 
 /// Reconnection configuration
@@ -356,6 +368,7 @@ mod tests {
         let header = HeaderConfig {
             name: "Content-Type".to_string(),
             value: "application/json".to_string(),
+            value_encrypted: None,
         };
         assert_eq!(header.name, "Content-Type");
         assert_eq!(header.value, "application/json");

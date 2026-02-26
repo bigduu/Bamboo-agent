@@ -180,6 +180,7 @@ mod tests {
             args: vec![],
             cwd: None,
             env: HashMap::new(),
+            env_encrypted: HashMap::new(),
             startup_timeout_ms: 5000,
         }
     }
@@ -260,6 +261,7 @@ mod tests {
             args: vec![],
             cwd: None,
             env: HashMap::new(),
+            env_encrypted: HashMap::new(),
             startup_timeout_ms: 5000,
         };
 
@@ -284,6 +286,7 @@ mod tests {
             args: vec![],
             cwd: None,
             env: HashMap::new(),
+            env_encrypted: HashMap::new(),
             startup_timeout_ms: 5000,
         };
 
@@ -299,6 +302,7 @@ mod tests {
             args: vec!["test".to_string()],
             cwd: None,
             env: HashMap::new(),
+            env_encrypted: HashMap::new(),
             startup_timeout_ms: 5000,
         };
 
@@ -319,6 +323,7 @@ mod tests {
             args: vec![],
             cwd: None,
             env,
+            env_encrypted: HashMap::new(),
             startup_timeout_ms: 5000,
         };
 

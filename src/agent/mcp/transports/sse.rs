@@ -41,7 +41,7 @@ impl SseTransport {
             "text/event-stream".parse().unwrap(),
         );
 
-        for HeaderConfig { name, value } in &self.config.headers {
+        for HeaderConfig { name, value, .. } in &self.config.headers {
             let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|e| McpError::InvalidConfig(format!("Invalid header name: {}", e)))?;
             let header_value = value
@@ -229,6 +229,7 @@ mod tests {
             headers: vec![HeaderConfig {
                 name: "Authorization".to_string(),
                 value: "Bearer token123".to_string(),
+                value_encrypted: None,
             }],
             connect_timeout_ms: 5000,
         };
@@ -245,6 +246,7 @@ mod tests {
             headers: vec![HeaderConfig {
                 name: "Invalid Header Name\n".to_string(), // Invalid
                 value: "test".to_string(),
+                value_encrypted: None,
             }],
             connect_timeout_ms: 5000,
         };
@@ -339,6 +341,7 @@ mod tests {
         let header = HeaderConfig {
             name: "Content-Type".to_string(),
             value: "application/json".to_string(),
+            value_encrypted: None,
         };
         assert_eq!(header.name, "Content-Type");
         assert_eq!(header.value, "application/json");

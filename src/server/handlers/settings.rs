@@ -45,6 +45,187 @@ struct WorkflowGetResponse {
 // Helper Functions
 // ============================================================================
 
+fn is_masked_api_key(value: &str) -> bool {
+    let v = value.trim();
+    v.is_empty() || v.contains("***") || v.contains("...") || v == "****...****"
+}
+
+fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
+    // Never send decrypted secrets. Also avoid sending encrypted key material.
+    if let Some(root) = value.as_object_mut() {
+        root.remove("proxy_auth_encrypted");
+
+        if let Some(providers) = root.get_mut("providers").and_then(|v| v.as_object_mut()) {
+            for (name, provider_cfg) in providers.iter_mut() {
+                let Some(provider_obj) = provider_cfg.as_object_mut() else {
+                    continue;
+                };
+
+                provider_obj.remove("api_key_encrypted");
+
+                let configured = match name.as_str() {
+                    "openai" => config
+                        .providers
+                        .openai
+                        .as_ref()
+                        .map(|c| !c.api_key.trim().is_empty() || c.api_key_encrypted.is_some())
+                        .unwrap_or(false),
+                    "anthropic" => config
+                        .providers
+                        .anthropic
+                        .as_ref()
+                        .map(|c| !c.api_key.trim().is_empty() || c.api_key_encrypted.is_some())
+                        .unwrap_or(false),
+                    "gemini" => config
+                        .providers
+                        .gemini
+                        .as_ref()
+                        .map(|c| !c.api_key.trim().is_empty() || c.api_key_encrypted.is_some())
+                        .unwrap_or(false),
+                    _ => false,
+                };
+
+                if configured {
+                    provider_obj.insert(
+                        "api_key".to_string(),
+                        Value::String("****...****".to_string()),
+                    );
+                } else {
+                    provider_obj.remove("api_key");
+                }
+            }
+        }
+
+        // MCP config may contain credentials in env vars / headers. Do not return either plaintext
+        // or encrypted blobs to clients; return masked placeholders instead.
+        if let Some(mcp) = root.get_mut("mcp").and_then(|v| v.as_object_mut()) {
+            if let Some(servers) = mcp.get_mut("servers").and_then(|v| v.as_array_mut()) {
+                for server in servers.iter_mut() {
+                    let Some(server_obj) = server.as_object_mut() else {
+                        continue;
+                    };
+                    let server_id = server_obj
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+
+                    let Some(transport) = server_obj
+                        .get_mut("transport")
+                        .and_then(|v| v.as_object_mut())
+                    else {
+                        continue;
+                    };
+
+                    let transport_type = transport
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+
+                    match transport_type {
+                        "stdio" => {
+                            // `env` is kept in-memory only; `env_encrypted` is persisted. We strip
+                            // encrypted values and return env keys with masked placeholders.
+                            let mut keys: Vec<String> = transport
+                                .get("env_encrypted")
+                                .and_then(|v| v.as_object())
+                                .map(|obj| obj.keys().cloned().collect())
+                                .unwrap_or_default();
+
+                            if keys.is_empty() {
+                                // Best-effort: fall back to hydrated in-memory env keys.
+                                if let Some(cfg_server) =
+                                    config.mcp.servers.iter().find(|s| s.id == server_id)
+                                {
+                                    if let crate::agent::mcp::TransportConfig::Stdio(stdio) =
+                                        &cfg_server.transport
+                                    {
+                                        keys = stdio.env.keys().cloned().collect();
+                                    }
+                                }
+                            }
+
+                            transport.remove("env_encrypted");
+                            let env_obj = keys
+                                .into_iter()
+                                .map(|k| (k, Value::String("****...****".to_string())))
+                                .collect::<serde_json::Map<String, Value>>();
+                            transport.insert("env".to_string(), Value::Object(env_obj));
+                        }
+                        "sse" => {
+                            if let Some(headers) =
+                                transport.get_mut("headers").and_then(|v| v.as_array_mut())
+                            {
+                                for header in headers.iter_mut() {
+                                    let Some(header_obj) = header.as_object_mut() else {
+                                        continue;
+                                    };
+                                    header_obj.remove("value_encrypted");
+                                    // Always mask header values.
+                                    header_obj.insert(
+                                        "value".to_string(),
+                                        Value::String("****...****".to_string()),
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    value
+}
+
+fn redact_providers_for_api(mut value: Value, config: &Config) -> Value {
+    let Some(obj) = value.as_object_mut() else {
+        return value;
+    };
+
+    for (name, provider_cfg) in obj.iter_mut() {
+        let Some(provider_obj) = provider_cfg.as_object_mut() else {
+            continue;
+        };
+
+        provider_obj.remove("api_key_encrypted");
+
+        let configured = match name.as_str() {
+            "openai" => config
+                .providers
+                .openai
+                .as_ref()
+                .map(|c| !c.api_key.trim().is_empty() || c.api_key_encrypted.is_some())
+                .unwrap_or(false),
+            "anthropic" => config
+                .providers
+                .anthropic
+                .as_ref()
+                .map(|c| !c.api_key.trim().is_empty() || c.api_key_encrypted.is_some())
+                .unwrap_or(false),
+            "gemini" => config
+                .providers
+                .gemini
+                .as_ref()
+                .map(|c| !c.api_key.trim().is_empty() || c.api_key_encrypted.is_some())
+                .unwrap_or(false),
+            _ => false,
+        };
+
+        if configured {
+            provider_obj.insert(
+                "api_key".to_string(),
+                Value::String("****...****".to_string()),
+            );
+        } else {
+            provider_obj.remove("api_key");
+        }
+    }
+
+    value
+}
+
 /// Validates workflow names for security (prevents path traversal, etc.)
 fn is_safe_workflow_name(name: &str) -> bool {
     // Check basic constraints
@@ -591,8 +772,9 @@ pub async fn get_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpRes
 
     let mut config = app_state.config.read().await.clone();
     config.refresh_proxy_auth_encrypted()?;
+    config.refresh_provider_api_keys_encrypted()?;
     let value = serde_json::to_value(&config)?;
-    Ok(HttpResponse::Ok().json(value))
+    Ok(HttpResponse::Ok().json(redact_config_for_api(value, &config)))
 }
 
 /// Updates the Bamboo application configuration
@@ -640,11 +822,6 @@ pub async fn set_bamboo_config(
     app_state: web::Data<AppState>,
     payload: web::Json<Value>,
 ) -> Result<HttpResponse, AppError> {
-    fn is_masked_api_key(value: &str) -> bool {
-        let v = value.trim();
-        v.is_empty() || v.contains("***") || v.contains("...") || v == "****...****"
-    }
-
     let mut patch = payload.into_inner();
     let patch_obj = patch
         .as_object_mut()
@@ -655,34 +832,83 @@ pub async fn set_bamboo_config(
     patch_obj.remove("proxy_auth_encrypted");
     patch_obj.remove("data_dir");
 
+    // Never allow clients to set encrypted secret material directly.
+    if let Some(servers) = patch
+        .get_mut("mcp")
+        .and_then(|m| m.get_mut("servers"))
+        .and_then(|v| v.as_array_mut())
+    {
+        for server in servers.iter_mut() {
+            let Some(server_obj) = server.as_object_mut() else {
+                continue;
+            };
+            let Some(transport) = server_obj
+                .get_mut("transport")
+                .and_then(|v| v.as_object_mut())
+            else {
+                continue;
+            };
+
+            match transport.get("type").and_then(|v| v.as_str()) {
+                Some("stdio") => {
+                    transport.remove("env_encrypted");
+                }
+                Some("sse") => {
+                    if let Some(headers) =
+                        transport.get_mut("headers").and_then(|v| v.as_array_mut())
+                    {
+                        for header in headers.iter_mut() {
+                            let Some(header_obj) = header.as_object_mut() else {
+                                continue;
+                            };
+                            header_obj.remove("value_encrypted");
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     let current = app_state.config.read().await.clone();
     let mut merged = serde_json::to_value(&current)?;
 
     // Preserve existing API keys when the client sends masked placeholders.
-    if let (Some(patch_providers), Some(existing_providers)) =
-        (patch.get_mut("providers"), merged.get("providers"))
-    {
-        if let (Some(patch_obj), Some(existing_obj)) = (
-            patch_providers.as_object_mut(),
-            existing_providers.as_object(),
-        ) {
-            for (provider_name, provider_patch) in patch_obj.iter_mut() {
-                let Some(patch_cfg_obj) = provider_patch.as_object_mut() else {
-                    continue;
-                };
-                let Some(api_key) = patch_cfg_obj.get("api_key").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                if !is_masked_api_key(api_key) {
-                    continue;
+    if let Some(patch_providers) = patch.get_mut("providers").and_then(|v| v.as_object_mut()) {
+        for (provider_name, provider_patch) in patch_providers.iter_mut() {
+            let Some(patch_cfg_obj) = provider_patch.as_object_mut() else {
+                continue;
+            };
+
+            // Do not allow clients to directly set encrypted key material.
+            patch_cfg_obj.remove("api_key_encrypted");
+
+            let Some(api_key) = patch_cfg_obj.get("api_key").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !is_masked_api_key(api_key) {
+                continue;
+            }
+
+            let existing_plain = match provider_name.as_str() {
+                "openai" => current.providers.openai.as_ref().map(|c| c.api_key.clone()),
+                "anthropic" => current
+                    .providers
+                    .anthropic
+                    .as_ref()
+                    .map(|c| c.api_key.clone()),
+                "gemini" => current.providers.gemini.as_ref().map(|c| c.api_key.clone()),
+                _ => None,
+            };
+
+            if let Some(existing_plain) = existing_plain {
+                if !existing_plain.trim().is_empty() {
+                    patch_cfg_obj.insert("api_key".to_string(), Value::String(existing_plain));
+                } else {
+                    patch_cfg_obj.remove("api_key");
                 }
-                if let Some(existing_key) = existing_obj
-                    .get(provider_name)
-                    .and_then(|v| v.get("api_key"))
-                    .cloned()
-                {
-                    patch_cfg_obj.insert("api_key".to_string(), existing_key);
-                }
+            } else {
+                patch_cfg_obj.remove("api_key");
             }
         }
     }
@@ -692,6 +918,7 @@ pub async fn set_bamboo_config(
     let mut new_config: Config = serde_json::from_value(merged)?;
     new_config.data_dir = app_state.app_data_dir.clone();
     new_config.hydrate_proxy_auth_from_encrypted();
+    new_config.hydrate_provider_api_keys_from_encrypted();
 
     // Validate before persisting.
     if let Err(e) = crate::agent::llm::validate_provider_config(&new_config) {
@@ -710,7 +937,11 @@ pub async fn set_bamboo_config(
         ))
     })?;
 
-    Ok(HttpResponse::Ok().json(serde_json::to_value(&new_config)?))
+    let mut config_for_response = new_config.clone();
+    config_for_response.refresh_proxy_auth_encrypted()?;
+    config_for_response.refresh_provider_api_keys_encrypted()?;
+    let value = serde_json::to_value(&config_for_response)?;
+    Ok(HttpResponse::Ok().json(redact_config_for_api(value, &config_for_response)))
 }
 
 /// Request body for setting proxy authentication
@@ -1178,10 +1409,11 @@ pub struct UpdateProviderRequest {
 /// curl http://localhost:3000/bamboo/settings/provider
 /// ```
 pub async fn get_provider_config(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
-    let config = app_state.config.read().await.clone();
+    let mut config = app_state.config.read().await.clone();
     let provider = config.provider.clone();
+    config.refresh_provider_api_keys_encrypted()?;
     let providers = serde_json::to_value(&config.providers)?;
-    let masked_providers = mask_api_keys_in_providers(&providers);
+    let masked_providers = redact_providers_for_api(providers, &config);
 
     let response = ProviderConfigResponse {
         provider,
@@ -1190,28 +1422,6 @@ pub async fn get_provider_config(app_state: web::Data<AppState>) -> Result<HttpR
     };
 
     Ok(HttpResponse::Ok().json(response))
-}
-
-/// Masks API keys in provider configurations for security
-fn mask_api_keys_in_providers(providers: &Value) -> Value {
-    let mut masked = providers.clone();
-
-    if let Some(obj) = masked.as_object_mut() {
-        for (_, provider_config) in obj.iter_mut() {
-            if let Some(config_obj) = provider_config.as_object_mut() {
-                if let Some(api_key) = config_obj.get_mut("api_key") {
-                    if let Some(key_str) = api_key.as_str() {
-                        // Always use fixed-length mask to prevent information disclosure
-                        if !key_str.is_empty() {
-                            *api_key = Value::String("****...****".to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    masked
 }
 
 /// Updates provider configuration and reloads the provider
@@ -1269,11 +1479,6 @@ pub async fn update_provider_config(
     app_state: web::Data<AppState>,
     payload: web::Json<UpdateProviderRequest>,
 ) -> Result<HttpResponse, AppError> {
-    fn is_masked_api_key(value: &str) -> bool {
-        let v = value.trim();
-        v.is_empty() || v.contains("***") || v.contains("...") || v == "****...****"
-    }
-
     let current = app_state.config.read().await.clone();
     let mut merged = serde_json::to_value(&current)?;
 
@@ -1284,30 +1489,41 @@ pub async fn update_provider_config(
         "providers": payload.providers,
     });
 
-    if let (Some(patch_providers), Some(existing_providers)) =
-        (patch.get_mut("providers"), merged.get("providers"))
-    {
-        if let (Some(patch_obj), Some(existing_obj)) = (
-            patch_providers.as_object_mut(),
-            existing_providers.as_object(),
-        ) {
-            for (provider_name, provider_patch) in patch_obj.iter_mut() {
-                let Some(patch_cfg_obj) = provider_patch.as_object_mut() else {
-                    continue;
-                };
-                let Some(api_key) = patch_cfg_obj.get("api_key").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                if !is_masked_api_key(api_key) {
-                    continue;
+    if let Some(patch_providers) = patch.get_mut("providers").and_then(|v| v.as_object_mut()) {
+        for (provider_name, provider_patch) in patch_providers.iter_mut() {
+            let Some(patch_cfg_obj) = provider_patch.as_object_mut() else {
+                continue;
+            };
+
+            // Do not allow clients to directly set encrypted key material.
+            patch_cfg_obj.remove("api_key_encrypted");
+
+            let Some(api_key) = patch_cfg_obj.get("api_key").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !is_masked_api_key(api_key) {
+                continue;
+            }
+
+            let existing_plain = match provider_name.as_str() {
+                "openai" => current.providers.openai.as_ref().map(|c| c.api_key.clone()),
+                "anthropic" => current
+                    .providers
+                    .anthropic
+                    .as_ref()
+                    .map(|c| c.api_key.clone()),
+                "gemini" => current.providers.gemini.as_ref().map(|c| c.api_key.clone()),
+                _ => None,
+            };
+
+            if let Some(existing_plain) = existing_plain {
+                if !existing_plain.trim().is_empty() {
+                    patch_cfg_obj.insert("api_key".to_string(), Value::String(existing_plain));
+                } else {
+                    patch_cfg_obj.remove("api_key");
                 }
-                if let Some(existing_key) = existing_obj
-                    .get(provider_name)
-                    .and_then(|v| v.get("api_key"))
-                    .cloned()
-                {
-                    patch_cfg_obj.insert("api_key".to_string(), existing_key);
-                }
+            } else {
+                patch_cfg_obj.remove("api_key");
             }
         }
     }
@@ -1317,6 +1533,7 @@ pub async fn update_provider_config(
     let mut new_config: Config = serde_json::from_value(merged)?;
     new_config.data_dir = app_state.app_data_dir.clone();
     new_config.hydrate_proxy_auth_from_encrypted();
+    new_config.hydrate_provider_api_keys_from_encrypted();
 
     if let Err(e) = crate::agent::llm::validate_provider_config(&new_config) {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({

@@ -666,6 +666,7 @@ mod tests {
                 args: vec![],
                 cwd: None,
                 env: std::collections::HashMap::new(),
+                env_encrypted: std::collections::HashMap::new(),
                 startup_timeout_ms: 5000,
             }),
             request_timeout_ms: 5000,

@@ -71,6 +71,7 @@ mod tests {
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
                     api_key: "test".to_string(),
+                    api_key_encrypted: None,
                     base_url: None,
                     model: Some("gpt-4o".to_string()),
                     extra: Default::default(),
@@ -92,6 +93,7 @@ mod tests {
             providers: ProviderConfigs {
                 openai: Some(OpenAIConfig {
                     api_key: "test".to_string(),
+                    api_key_encrypted: None,
                     base_url: None,
                     model: None, // No model configured
                     extra: Default::default(),
