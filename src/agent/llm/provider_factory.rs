@@ -245,7 +245,6 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::config::ServerConfig;
     use crate::core::{AnthropicConfig, GeminiConfig, OpenAIConfig, ProviderConfigs};
     use std::path::PathBuf;
 
@@ -254,14 +253,8 @@ mod tests {
         let config = Config {
             provider: "copilot".to_string(),
             providers: ProviderConfigs::default(),
-            http_proxy: String::new(),
-            https_proxy: String::new(),
-            proxy_auth: None,
-            proxy_auth_encrypted: None,
-            model: None,
-            headless_auth: false,
-            server: ServerConfig::default(),
             data_dir: PathBuf::from("/tmp/test"),
+            ..Config::default()
         };
 
         let result = create_provider(&config).await;
@@ -273,14 +266,8 @@ mod tests {
         let config = Config {
             provider: "openai".to_string(),
             providers: ProviderConfigs::default(),
-            http_proxy: String::new(),
-            https_proxy: String::new(),
-            proxy_auth: None,
-            proxy_auth_encrypted: None,
-            model: None,
-            headless_auth: false,
-            server: ServerConfig::default(),
             data_dir: PathBuf::from("/tmp/test"),
+            ..Config::default()
         };
 
         let result = create_provider(&config).await;
@@ -302,19 +289,12 @@ mod tests {
                     api_key: "".to_string(),
                     base_url: None,
                     model: None,
+                    extra: Default::default(),
                 }),
-                anthropic: None,
-                gemini: None,
-                copilot: None,
+                ..ProviderConfigs::default()
             },
-            http_proxy: String::new(),
-            https_proxy: String::new(),
-            proxy_auth: None,
-            proxy_auth_encrypted: None,
-            model: None,
-            headless_auth: false,
-            server: ServerConfig::default(),
             data_dir: PathBuf::from("/tmp/test"),
+            ..Config::default()
         };
 
         let result = create_provider(&config).await;
@@ -336,19 +316,12 @@ mod tests {
                     api_key: "sk-test123".to_string(),
                     base_url: Some("https://custom.openai.com/v1".to_string()),
                     model: Some("gpt-4o".to_string()),
+                    extra: Default::default(),
                 }),
-                anthropic: None,
-                gemini: None,
-                copilot: None,
+                ..ProviderConfigs::default()
             },
-            http_proxy: String::new(),
-            https_proxy: String::new(),
-            proxy_auth: None,
-            proxy_auth_encrypted: None,
-            model: None,
-            headless_auth: false,
-            server: ServerConfig::default(),
             data_dir: PathBuf::from("/tmp/test"),
+            ..Config::default()
         };
 
         let result = create_provider(&config).await;
@@ -360,24 +333,17 @@ mod tests {
         let config = Config {
             provider: "anthropic".to_string(),
             providers: ProviderConfigs {
-                openai: None,
                 anthropic: Some(AnthropicConfig {
                     api_key: "sk-ant-test123".to_string(),
                     base_url: None,
                     model: Some("claude-3-5-sonnet-20241022".to_string()),
                     max_tokens: Some(4096),
+                    extra: Default::default(),
                 }),
-                gemini: None,
-                copilot: None,
+                ..ProviderConfigs::default()
             },
-            http_proxy: String::new(),
-            https_proxy: String::new(),
-            proxy_auth: None,
-            proxy_auth_encrypted: None,
-            model: None,
-            headless_auth: false,
-            server: ServerConfig::default(),
             data_dir: PathBuf::from("/tmp/test"),
+            ..Config::default()
         };
 
         let result = create_provider(&config).await;
@@ -389,23 +355,16 @@ mod tests {
         let config = Config {
             provider: "gemini".to_string(),
             providers: ProviderConfigs {
-                openai: None,
-                anthropic: None,
                 gemini: Some(GeminiConfig {
                     api_key: "AIza-test123".to_string(),
                     base_url: None,
                     model: Some("gemini-pro".to_string()),
+                    extra: Default::default(),
                 }),
-                copilot: None,
+                ..ProviderConfigs::default()
             },
-            http_proxy: String::new(),
-            https_proxy: String::new(),
-            proxy_auth: None,
-            proxy_auth_encrypted: None,
-            model: None,
-            headless_auth: false,
-            server: ServerConfig::default(),
             data_dir: PathBuf::from("/tmp/test"),
+            ..Config::default()
         };
 
         let result = create_provider(&config).await;
@@ -417,14 +376,8 @@ mod tests {
         let config = Config {
             provider: "unknown".to_string(),
             providers: ProviderConfigs::default(),
-            http_proxy: String::new(),
-            https_proxy: String::new(),
-            proxy_auth: None,
-            proxy_auth_encrypted: None,
-            model: None,
-            headless_auth: false,
-            server: ServerConfig::default(),
             data_dir: PathBuf::from("/tmp/test"),
+            ..Config::default()
         };
 
         let result = create_provider(&config).await;
@@ -442,14 +395,8 @@ mod tests {
         let config = Config {
             provider: "copilot".to_string(),
             providers: ProviderConfigs::default(),
-            http_proxy: String::new(),
-            https_proxy: String::new(),
-            proxy_auth: None,
-            proxy_auth_encrypted: None,
-            model: None,
-            headless_auth: false,
-            server: ServerConfig::default(),
             data_dir: PathBuf::from("/tmp/test"),
+            ..Config::default()
         };
 
         assert!(validate_provider_config(&config).is_ok());
@@ -460,14 +407,8 @@ mod tests {
         let config = Config {
             provider: "openai".to_string(),
             providers: ProviderConfigs::default(),
-            http_proxy: String::new(),
-            https_proxy: String::new(),
-            proxy_auth: None,
-            proxy_auth_encrypted: None,
-            model: None,
-            headless_auth: false,
-            server: ServerConfig::default(),
             data_dir: PathBuf::from("/tmp/test"),
+            ..Config::default()
         };
 
         let result = validate_provider_config(&config);

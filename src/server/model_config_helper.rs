@@ -73,6 +73,7 @@ mod tests {
                     api_key: "test".to_string(),
                     base_url: None,
                     model: Some("gpt-4o".to_string()),
+                    extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()
             },
@@ -93,6 +94,7 @@ mod tests {
                     api_key: "test".to_string(),
                     base_url: None,
                     model: None, // No model configured
+                    extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()
             },
@@ -116,6 +118,7 @@ mod tests {
                     enabled: true,
                     headless_auth: false,
                     model: Some("gpt-4o-mini".to_string()),
+                    extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()
             },

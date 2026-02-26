@@ -18,7 +18,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
+
+use crate::core::Config;
 
 /// HTTP method
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,22 +192,44 @@ impl HttpRequestArgs {
 
 /// Tool for making HTTP requests
 pub struct HttpRequestTool {
-    client: reqwest::Client,
+    config: Option<Arc<RwLock<Config>>>,
 }
 
 impl HttpRequestTool {
-    /// Create a new HTTP request tool
+    /// Create a new HTTP request tool.
+    ///
+    /// Prefer [`Self::new_with_config`] when running inside the Bamboo server so
+    /// the request client can honor proxy settings from the hot-reloadable config.
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent("Bamboo-Agent-Tools/0.1.0")
-            // Disable automatic redirects to prevent bypassing domain whitelist checks
-            // If redirects are needed, the application should handle them explicitly
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("Failed to build HTTP client");
+        Self { config: None }
+    }
 
-        Self { client }
+    /// Create a new HTTP request tool backed by the shared, hot-reloadable config.
+    pub fn new_with_config(config: Arc<RwLock<Config>>) -> Self {
+        Self {
+            config: Some(config),
+        }
+    }
+
+    async fn build_client(&self) -> Result<reqwest::Client, String> {
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent(format!("Bamboo-Agent-Tools/{}", env!("CARGO_PKG_VERSION")))
+            // Disable automatic redirects to prevent bypassing domain whitelist checks.
+            .redirect(reqwest::redirect::Policy::none());
+
+        if let Some(config) = self.config.as_ref() {
+            let config = config.read().await;
+            let proxy = crate::agent::llm::http_client::build_proxy(&config)
+                .map_err(|e| format!("Failed to build proxy from config: {e}"))?;
+            if let Some(proxy) = proxy {
+                builder = builder.proxy(proxy);
+            }
+        }
+
+        builder
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {e}"))
     }
 
     /// Execute an HTTP request
@@ -226,9 +252,11 @@ impl HttpRequestTool {
         // Validate SSRF protection - block internal/private IP addresses
         validate_url_not_internal(&parsed_url).await?;
 
+        let client = self.build_client().await?;
+
         // Build request
         let method = args.method.to_reqwest();
-        let mut request_builder = self.client.request(method, url_str);
+        let mut request_builder = client.request(method, url_str);
 
         // Set timeout
         request_builder = request_builder.timeout(Duration::from_secs(args.timeout_seconds));

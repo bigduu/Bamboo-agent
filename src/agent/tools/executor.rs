@@ -16,6 +16,8 @@ use crate::agent::tools::tools::{
     SearchInProjectTool, SetWorkspaceTool, SleepTool, TerminalSessionTool, ToolRegistry,
     UpdateTodoItemTool, WriteFileTool,
 };
+use crate::core::Config;
+use tokio::sync::RwLock;
 
 /// List of all built-in tool names.
 ///
@@ -84,7 +86,7 @@ impl BuiltinToolExecutor {
     /// Creates a new executor with all built-in tools registered
     pub fn new() -> Self {
         let registry = ToolRegistry::new();
-        Self::register_builtin_tools(&registry);
+        Self::register_builtin_tools(&registry, None);
         Self {
             registry,
             permission_checker: None,
@@ -94,7 +96,33 @@ impl BuiltinToolExecutor {
     /// Creates a new executor with a permission checker
     pub fn new_with_permissions(permission_checker: Arc<dyn PermissionChecker>) -> Self {
         let registry = ToolRegistry::new();
-        Self::register_builtin_tools(&registry);
+        Self::register_builtin_tools(&registry, None);
+        Self {
+            registry,
+            permission_checker: Some(permission_checker),
+        }
+    }
+
+    /// Creates a new executor that can read the shared, hot-reloadable config.
+    ///
+    /// Use this when running inside the Bamboo server so tools (notably
+    /// `http_request`) honor proxy settings from `config.json`.
+    pub fn new_with_config(config: Arc<RwLock<Config>>) -> Self {
+        let registry = ToolRegistry::new();
+        Self::register_builtin_tools(&registry, Some(config));
+        Self {
+            registry,
+            permission_checker: None,
+        }
+    }
+
+    /// Creates a new executor with both shared config and a permission checker.
+    pub fn new_with_config_and_permissions(
+        config: Arc<RwLock<Config>>,
+        permission_checker: Arc<dyn PermissionChecker>,
+    ) -> Self {
+        let registry = ToolRegistry::new();
+        Self::register_builtin_tools(&registry, Some(config));
         Self {
             registry,
             permission_checker: Some(permission_checker),
@@ -115,7 +143,7 @@ impl BuiltinToolExecutor {
     }
 
     /// Registers all built-in tools to the given registry
-    fn register_builtin_tools(registry: &ToolRegistry) {
+    fn register_builtin_tools(registry: &ToolRegistry, config: Option<Arc<RwLock<Config>>>) {
         // Register filesystem tools
         let _ = registry.register(ReadFileTool::new());
         let _ = registry.register(WriteFileTool::new());
@@ -150,7 +178,10 @@ impl BuiltinToolExecutor {
 
         // Register new utility tools
         let _ = registry.register(GlobSearchTool::new());
-        let _ = registry.register(HttpRequestTool::new());
+        let _ = match config {
+            Some(config) => registry.register(HttpRequestTool::new_with_config(config)),
+            None => registry.register(HttpRequestTool::new()),
+        };
         let _ = registry.register(SleepTool::new());
         let _ = registry.register(TerminalSessionTool::new());
     }
@@ -158,7 +189,7 @@ impl BuiltinToolExecutor {
     /// Returns all built-in tool schemas
     pub fn tool_schemas() -> Vec<ToolSchema> {
         let registry = ToolRegistry::new();
-        Self::register_builtin_tools(&registry);
+        Self::register_builtin_tools(&registry, None);
         registry.list_tools()
     }
 
@@ -278,7 +309,7 @@ impl BuiltinToolExecutorBuilder {
 
     /// Registers all default built-in tools
     pub fn with_default_tools(self) -> Self {
-        BuiltinToolExecutor::register_builtin_tools(&self.registry);
+        BuiltinToolExecutor::register_builtin_tools(&self.registry, None);
         self
     }
 

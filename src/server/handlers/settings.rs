@@ -1,11 +1,10 @@
 use crate::core::keyword_masking::{KeywordEntry, KeywordMaskingConfig};
-use crate::core::ProxyAuth;
+use crate::core::{Config, ProxyAuth};
 use crate::server::{app_state::AppState, error::AppError};
 use actix_web::{web, HttpResponse};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
 use tokio::fs;
 
 use crate::agent::llm::AVAILABLE_PROVIDERS;
@@ -45,89 +44,6 @@ struct WorkflowGetResponse {
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-/// Gets the path to the config.json file
-fn config_path(app_state: &AppState) -> PathBuf {
-    app_state.app_data_dir.join("config.json")
-}
-
-/// Removes sensitive proxy authentication fields from config JSON
-fn strip_proxy_auth(mut config: Value) -> Value {
-    if let Some(obj) = config.as_object_mut() {
-        obj.remove("proxy_auth");
-        obj.remove("proxy_auth_encrypted");
-    }
-    config
-}
-
-/// Removes only plaintext proxy authentication from config JSON.
-///
-/// This keeps `proxy_auth_encrypted` so clients can see that proxy auth exists
-/// without receiving the plaintext credentials.
-fn strip_proxy_auth_plaintext(mut config: Value) -> Value {
-    if let Some(obj) = config.as_object_mut() {
-        obj.remove("proxy_auth");
-    }
-    config
-}
-
-/// Removes empty proxy URL fields from config JSON
-fn clean_empty_proxy_fields(mut config: Value) -> Value {
-    if let Some(obj) = config.as_object_mut() {
-        // Remove empty http_proxy
-        if let Some(http_proxy) = obj.get("http_proxy") {
-            if http_proxy.as_str().is_none_or(|s| s.is_empty()) {
-                obj.remove("http_proxy");
-            }
-        }
-        // Remove empty https_proxy
-        if let Some(https_proxy) = obj.get("https_proxy") {
-            if https_proxy.as_str().is_none_or(|s| s.is_empty()) {
-                obj.remove("https_proxy");
-            }
-        }
-    }
-    config
-}
-
-/// Encrypts proxy authentication credentials before saving to config
-fn encrypt_proxy_auth(config: &mut Value) -> Result<(), AppError> {
-    if let Some(obj) = config.as_object_mut() {
-        // Encrypt proxy_auth
-        if let Some(auth) = obj.get("proxy_auth").cloned() {
-            if let Ok(auth_str) = serde_json::to_string(&auth) {
-                match crate::core::encryption::encrypt(&auth_str) {
-                    Ok(encrypted) => {
-                        obj.insert(
-                            "proxy_auth_encrypted".to_string(),
-                            serde_json::Value::String(encrypted),
-                        );
-                        obj.remove("proxy_auth");
-                    }
-                    Err(e) => log::warn!("Failed to encrypt proxy_auth: {}", e),
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Decrypts proxy authentication credentials when loading config
-fn decrypt_proxy_auth(config: &mut Value) {
-    if let Some(obj) = config.as_object_mut() {
-        // Decrypt proxy_auth
-        if let Some(encrypted) = obj.get("proxy_auth_encrypted").and_then(|v| v.as_str()) {
-            match crate::core::encryption::decrypt(encrypted) {
-                Ok(decrypted) => {
-                    if let Ok(auth) = serde_json::from_str::<serde_json::Value>(&decrypted) {
-                        obj.insert("proxy_auth".to_string(), auth);
-                    }
-                }
-                Err(e) => log::warn!("Failed to decrypt proxy_auth: {}", e),
-            }
-        }
-    }
-}
 
 /// Validates workflow names for security (prevents path traversal, etc.)
 fn is_safe_workflow_name(name: &str) -> bool {
@@ -430,18 +346,14 @@ struct SetupStatus {
 
 /// Checks if proxy configuration exists in config
 fn has_proxy_config(config: &Value) -> bool {
-    let has_http_proxy = config
+    config
         .get("http_proxy")
         .and_then(|value| value.as_str())
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    let has_https_proxy = config
-        .get("https_proxy")
-        .and_then(|value| value.as_str())
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-
-    has_http_proxy || has_https_proxy
+        .is_some_and(|value| !value.trim().is_empty())
+        || config
+            .get("https_proxy")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn collect_proxy_environment_flags() -> Vec<&'static str> {
@@ -457,12 +369,34 @@ fn collect_proxy_environment_flags() -> Vec<&'static str> {
         .collect()
 }
 
-fn is_setup_completed(config: &Value) -> bool {
+fn is_setup_completed_from_typed(config: &Config) -> bool {
     config
+        .extra
         .get("setup")
         .and_then(|setup| setup.get("completed"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+}
+
+async fn persist_config(config: Config) -> Result<(), AppError> {
+    tokio::task::spawn_blocking(move || config.save())
+        .await
+        .map_err(|e| AppError::InternalError(anyhow::anyhow!("Config save task failed: {e}")))?
+        .map_err(AppError::InternalError)?;
+    Ok(())
+}
+
+fn deep_merge_json(dst: &mut Value, src: Value) {
+    match (dst, src) {
+        (Value::Object(dst_obj), Value::Object(src_obj)) => {
+            for (k, v) in src_obj {
+                deep_merge_json(dst_obj.entry(k).or_insert(Value::Null), v);
+            }
+        }
+        (dst_slot, src_val) => {
+            *dst_slot = src_val;
+        }
+    }
 }
 
 fn should_show_setup(setup_completed: bool, _has_proxy_config: bool, _has_proxy_env: bool) -> bool {
@@ -517,16 +451,12 @@ fn setup_status_message(
 /// curl http://localhost:3000/bamboo/setup/status
 /// ```
 pub async fn get_setup_status(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
-    let path = config_path(&app_state);
-    let config = match fs::read_to_string(&path).await {
-        Ok(content) => serde_json::from_str::<Value>(&content)?,
-        Err(_) => serde_json::json!({}),
-    };
-
-    let has_proxy_config = has_proxy_config(&config);
+    let config = app_state.config.read().await.clone();
+    let config_value = serde_json::to_value(&config)?;
+    let has_proxy_config = has_proxy_config(&config_value);
     let proxy_environment_flags = collect_proxy_environment_flags();
     let has_proxy_env = !proxy_environment_flags.is_empty();
-    let setup_completed = is_setup_completed(&config);
+    let setup_completed = is_setup_completed_from_typed(&config);
 
     let is_complete = !should_show_setup(setup_completed, has_proxy_config, has_proxy_env);
     let message = setup_status_message(setup_completed, has_proxy_config, &proxy_environment_flags);
@@ -560,36 +490,25 @@ pub async fn get_setup_status(app_state: web::Data<AppState>) -> Result<HttpResp
 /// curl -X POST http://localhost:3000/bamboo/setup/complete
 /// ```
 pub async fn mark_setup_complete(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
-    let path = config_path(&app_state);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
+    let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let config_to_save = {
+        let mut config = app_state.config.write().await;
+        let setup_entry = config
+            .extra
+            .entry("setup".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let setup_obj = setup_entry.as_object_mut().ok_or_else(|| {
+            AppError::BadRequest("config.setup must be a JSON object".to_string())
+        })?;
 
-    let mut config = match fs::read_to_string(&path).await {
-        Ok(content) => serde_json::from_str::<Value>(&content)?,
-        Err(_) => serde_json::json!({}),
+        setup_obj.insert("completed".to_string(), Value::Bool(true));
+        setup_obj.insert("completed_at".to_string(), Value::String(completed_at));
+        setup_obj.insert("version".to_string(), Value::Number(1.into()));
+
+        config.clone()
     };
 
-    let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-
-    // Mark setup complete in config
-    let config_obj = config
-        .as_object_mut()
-        .ok_or_else(|| AppError::BadRequest("config.json must be a JSON object".to_string()))?;
-
-    let setup_entry = config_obj
-        .entry("setup".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    let setup_obj = setup_entry
-        .as_object_mut()
-        .ok_or_else(|| AppError::BadRequest("config.setup must be a JSON object".to_string()))?;
-
-    setup_obj.insert("completed".to_string(), Value::Bool(true));
-    setup_obj.insert("completed_at".to_string(), Value::String(completed_at));
-    setup_obj.insert("version".to_string(), Value::Number(1.into()));
-
-    let content = serde_json::to_string_pretty(&config)?;
-    fs::write(&path, content).await?;
+    persist_config(config_to_save).await?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
@@ -617,31 +536,19 @@ pub async fn mark_setup_complete(app_state: web::Data<AppState>) -> Result<HttpR
 pub async fn mark_setup_incomplete(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
-    let path = config_path(&app_state);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-
-    let mut config = match fs::read_to_string(&path).await {
-        Ok(content) => serde_json::from_str::<Value>(&content)?,
-        Err(_) => serde_json::json!({}),
-    };
-
-    // If setup field exists and is an object, set completed to false
-    if let Some(config_obj) = config.as_object_mut() {
-        if let Some(setup_entry) = config_obj.get_mut("setup") {
+    let reset_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let config_to_save = {
+        let mut config = app_state.config.write().await;
+        if let Some(setup_entry) = config.extra.get_mut("setup") {
             if let Some(setup_obj) = setup_entry.as_object_mut() {
                 setup_obj.insert("completed".to_string(), Value::Bool(false));
-                setup_obj.insert(
-                    "reset_at".to_string(),
-                    Value::String(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
-                );
+                setup_obj.insert("reset_at".to_string(), Value::String(reset_at));
             }
         }
-    }
+        config.clone()
+    };
 
-    let content = serde_json::to_string_pretty(&config)?;
-    fs::write(&path, content).await?;
+    persist_config(config_to_save).await?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
@@ -676,23 +583,15 @@ pub async fn mark_setup_incomplete(
 /// curl http://localhost:3000/bamboo/config
 /// ```
 pub async fn get_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
-    let path = config_path(&app_state);
-    match fs::read_to_string(&path).await {
-        Ok(content) => {
-            let mut config = serde_json::from_str::<Value>(&content)?;
-
-            // If a legacy plaintext `proxy_auth` is present, encrypt it for the response
-            // (do not persist as a side-effect of GET).
-            encrypt_proxy_auth(&mut config)?;
-
-            // Never return plaintext credentials; keep encrypted field.
-            Ok(HttpResponse::Ok().json(strip_proxy_auth_plaintext(config)))
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            Ok(HttpResponse::Ok().json(serde_json::json!({})))
-        }
-        Err(err) => Err(AppError::StorageError(err)),
+    let path = app_state.app_data_dir.join("config.json");
+    if !path.exists() {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({})));
     }
+
+    let mut config = app_state.config.read().await.clone();
+    config.refresh_proxy_auth_encrypted()?;
+    let value = serde_json::to_value(&config)?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 /// Updates the Bamboo application configuration
@@ -740,30 +639,76 @@ pub async fn set_bamboo_config(
     app_state: web::Data<AppState>,
     payload: web::Json<Value>,
 ) -> Result<HttpResponse, AppError> {
-    let path = config_path(&app_state);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
+    fn is_masked_api_key(value: &str) -> bool {
+        let v = value.trim();
+        v.is_empty() || v.contains("***") || v.contains("...") || v == "****...****"
     }
 
-    // Preserve existing encrypted proxy auth field before processing
-    let existing_encrypted_auth = fs::read_to_string(&path).await.ok().and_then(|content| {
-        let existing: Value = serde_json::from_str(&content).ok()?;
-        existing.get("proxy_auth_encrypted").cloned()
-    });
+    let mut patch = payload.into_inner();
+    let patch_obj = patch.as_object_mut().ok_or_else(|| {
+        AppError::BadRequest("config.json must be a JSON object".to_string())
+    })?;
 
-    let config = strip_proxy_auth(payload.into_inner());
-    let mut config = clean_empty_proxy_fields(config);
+    // Never allow clients to modify proxy auth fields or data_dir via this endpoint.
+    patch_obj.remove("proxy_auth");
+    patch_obj.remove("proxy_auth_encrypted");
+    patch_obj.remove("data_dir");
 
-    // Restore encrypted proxy auth field if it existed
-    if let Some(encrypted_val) = existing_encrypted_auth {
-        if let Some(obj) = config.as_object_mut() {
-            obj.insert("proxy_auth_encrypted".to_string(), encrypted_val);
+    let current = app_state.config.read().await.clone();
+    let mut merged = serde_json::to_value(&current)?;
+
+    // Preserve existing API keys when the client sends masked placeholders.
+    if let (Some(patch_providers), Some(existing_providers)) =
+        (patch.get_mut("providers"), merged.get("providers"))
+    {
+        if let (Some(patch_obj), Some(existing_obj)) =
+            (patch_providers.as_object_mut(), existing_providers.as_object())
+        {
+            for (provider_name, provider_patch) in patch_obj.iter_mut() {
+                let Some(patch_cfg_obj) = provider_patch.as_object_mut() else {
+                    continue;
+                };
+                let Some(api_key) = patch_cfg_obj.get("api_key").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if !is_masked_api_key(api_key) {
+                    continue;
+                }
+                if let Some(existing_key) = existing_obj
+                    .get(provider_name)
+                    .and_then(|v| v.get("api_key"))
+                    .cloned()
+                {
+                    patch_cfg_obj.insert("api_key".to_string(), existing_key);
+                }
+            }
         }
     }
 
-    let content = serde_json::to_string_pretty(&config)?;
-    fs::write(path, content).await?;
-    Ok(HttpResponse::Ok().json(config))
+    deep_merge_json(&mut merged, patch);
+
+    let mut new_config: Config = serde_json::from_value(merged)?;
+    new_config.data_dir = app_state.app_data_dir.clone();
+    new_config.hydrate_proxy_auth_from_encrypted();
+
+    // Validate before persisting.
+    if let Err(e) = crate::agent::llm::validate_provider_config(&new_config) {
+        return Err(AppError::BadRequest(format!("Invalid configuration: {e}")));
+    }
+
+    // Update in-memory config first, then persist and reload provider.
+    {
+        let mut cfg = app_state.config.write().await;
+        *cfg = new_config.clone();
+    }
+    persist_config(new_config.clone()).await?;
+    app_state.reload_provider().await.map_err(|e| {
+        AppError::InternalError(anyhow::anyhow!(
+            "Failed to reload provider after updating config: {e}"
+        ))
+    })?;
+
+    Ok(HttpResponse::Ok().json(serde_json::to_value(&new_config)?))
 }
 
 /// Request body for setting proxy authentication
@@ -822,37 +767,14 @@ pub async fn set_proxy_auth(
         Some(ProxyAuth { username, password })
     };
 
-    // Update config file
-    let path = config_path(&app_state);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-
-    // Read existing config
-    let mut config_value: Value = match fs::read_to_string(&path).await {
-        Ok(content) => {
-            let mut config: Value = serde_json::from_str(&content)?;
-            decrypt_proxy_auth(&mut config);
-            config
-        }
-        Err(_) => serde_json::json!({}),
+    let config_to_save = {
+        let mut config = app_state.config.write().await;
+        config.proxy_auth = auth;
+        config.refresh_proxy_auth_encrypted()?;
+        config.clone()
     };
 
-    // Update proxy auth
-    if let Some(obj) = config_value.as_object_mut() {
-        if let Some(auth) = auth {
-            obj.insert("proxy_auth".to_string(), serde_json::to_value(&auth)?);
-        } else {
-            obj.remove("proxy_auth");
-            obj.remove("proxy_auth_encrypted");
-        }
-    }
-
-    // Encrypt and save
-    let mut config_to_save = config_value.clone();
-    encrypt_proxy_auth(&mut config_to_save)?;
-    let content = serde_json::to_string_pretty(&config_to_save)?;
-    fs::write(&path, content).await?;
+    persist_config(config_to_save).await?;
 
     // Reload provider to apply new proxy settings
     app_state.reload_provider().await.map_err(|e| {
@@ -890,31 +812,12 @@ pub async fn set_proxy_auth(
 pub async fn get_proxy_auth_status(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
-    let path = config_path(&app_state);
-
-    if !path.exists() {
+    let config = app_state.config.read().await;
+    if let Some(auth) = config.proxy_auth.as_ref() {
         return Ok(HttpResponse::Ok().json(serde_json::json!({
-            "configured": false,
-            "username": serde_json::Value::Null
+            "configured": true,
+            "username": auth.username,
         })));
-    }
-
-    let content = fs::read_to_string(&path).await?;
-    let config: serde_json::Value = serde_json::from_str(&content)?;
-
-    // Check for encrypted proxy auth
-    if let Some(encrypted) = config.get("proxy_auth_encrypted").and_then(|v| v.as_str()) {
-        match crate::core::encryption::decrypt(encrypted) {
-            Ok(decrypted) => {
-                if let Ok(auth) = serde_json::from_str::<crate::core::ProxyAuth>(&decrypted) {
-                    return Ok(HttpResponse::Ok().json(serde_json::json!({
-                        "configured": true,
-                        "username": auth.username
-                    })));
-                }
-            }
-            Err(e) => log::warn!("Failed to decrypt proxy auth: {}", e),
-        }
     }
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
@@ -947,7 +850,7 @@ pub async fn get_proxy_auth_status(
 /// curl -X POST http://localhost:3000/bamboo/config/reset
 /// ```
 pub async fn reset_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
-    let path = config_path(&app_state);
+    let path = app_state.app_data_dir.join("config.json");
     // Try to delete config.json if it exists
     match fs::try_exists(&path).await {
         Ok(true) => {
@@ -959,6 +862,16 @@ pub async fn reset_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpR
             // Config file doesn't exist, nothing to do
         }
         Err(err) => return Err(AppError::StorageError(err)),
+    }
+
+    // Reset in-memory config and best-effort reload provider.
+    let new_config = app_state.reload_config().await;
+    if let Err(e) = app_state.reload_provider().await {
+        log::warn!(
+            "Config reset updated config to provider={}, but provider reload failed: {}",
+            new_config.provider,
+            e
+        );
     }
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
@@ -1264,111 +1177,9 @@ pub struct UpdateProviderRequest {
 /// curl http://localhost:3000/bamboo/settings/provider
 /// ```
 pub async fn get_provider_config(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
-    let path = config_path(&app_state);
-
-    let config_value = match fs::read_to_string(&path).await {
-        Ok(content) => {
-            let mut config: Value = serde_json::from_str(&content)?;
-            decrypt_proxy_auth(&mut config);
-
-            let mut needs_save = false;
-
-            // Migration 1: Move root-level "model" field to provider-specific config
-            if let Some(old_model) = config
-                .get("model")
-                .and_then(|m| m.as_str())
-                .map(|s| s.to_string())
-            {
-                let provider = config
-                    .get("provider")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("copilot")
-                    .to_string();
-
-                // Only migrate for non-Copilot providers
-                if provider != "copilot" {
-                    if let Some(providers) = config.get_mut("providers") {
-                        if let Some(provider_config) = providers.get_mut(&provider) {
-                            // Only set if not already present
-                            if provider_config.get("model").is_none() {
-                                provider_config["model"] = Value::String(old_model.clone());
-                                log::info!(
-                                    "Migrated root-level model '{}' to provider '{}' config",
-                                    old_model,
-                                    provider
-                                );
-
-                                // Remove root-level model field
-                                if let Some(obj) = config.as_object_mut() {
-                                    obj.remove("model");
-                                }
-                                needs_save = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Migration 2: Move root-level "headless_auth" to providers.copilot.headless_auth
-            if let Some(headless_auth) = config.get("headless_auth").and_then(|h| h.as_bool()) {
-                if let Some(providers) = config.get_mut("providers") {
-                    // Ensure copilot config exists
-                    if providers.get("copilot").is_none() {
-                        providers["copilot"] = Value::Object(serde_json::Map::new());
-                    }
-
-                    if let Some(copilot_config) = providers.get_mut("copilot") {
-                        // Only set if not already present
-                        if copilot_config.get("headless_auth").is_none() {
-                            copilot_config["headless_auth"] = Value::Bool(headless_auth);
-                            log::info!(
-                                "Migrated root-level headless_auth to providers.copilot config"
-                            );
-
-                            // Remove root-level headless_auth field
-                            if let Some(obj) = config.as_object_mut() {
-                                obj.remove("headless_auth");
-                            }
-                            needs_save = true;
-                        }
-                    }
-                }
-            }
-
-            // Save migrated config if needed
-            if needs_save {
-                let mut config_to_save = config.clone();
-                encrypt_proxy_auth(&mut config_to_save)?;
-                let content = serde_json::to_string_pretty(&config_to_save)?;
-                fs::write(&path, content).await?;
-                log::info!("Saved migrated configuration to file");
-            }
-
-            config
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // Return default config if file doesn't exist
-            serde_json::json!({
-                "provider": "copilot",
-                "providers": {}
-            })
-        }
-        Err(err) => return Err(AppError::StorageError(err)),
-    };
-
-    let provider = config_value
-        .get("provider")
-        .and_then(|v| v.as_str())
-        .unwrap_or("copilot")
-        .to_string();
-
-    // Get providers config (mask API keys for security)
-    let providers = config_value
-        .get("providers")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    // Mask API keys in the response
+    let config = app_state.config.read().await.clone();
+    let provider = config.provider.clone();
+    let providers = serde_json::to_value(&config.providers)?;
     let masked_providers = mask_api_keys_in_providers(&providers);
 
     let response = ProviderConfigResponse {
@@ -1457,115 +1268,76 @@ pub async fn update_provider_config(
     app_state: web::Data<AppState>,
     payload: web::Json<UpdateProviderRequest>,
 ) -> Result<HttpResponse, AppError> {
-    let path = config_path(&app_state);
-
-    // Ensure parent directory exists
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
+    fn is_masked_api_key(value: &str) -> bool {
+        let v = value.trim();
+        v.is_empty() || v.contains("***") || v.contains("...") || v == "****...****"
     }
 
-    // Read existing config
-    let mut existing_config: Value = match fs::read_to_string(&path).await {
-        Ok(content) => {
-            let mut config: Value = serde_json::from_str(&content)?;
-            decrypt_proxy_auth(&mut config);
-            config
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            serde_json::json!({})
-        }
-        Err(err) => return Err(AppError::StorageError(err)),
-    };
+    let current = app_state.config.read().await.clone();
+    let mut merged = serde_json::to_value(&current)?;
 
-    // Update provider
-    if let Some(obj) = existing_config.as_object_mut() {
-        obj.insert(
-            "provider".to_string(),
-            Value::String(payload.provider.clone()),
-        );
+    // Build a patch like { provider: "...", providers: { ... } } and preserve existing
+    // API keys when the client sends masked placeholders.
+    let mut patch = serde_json::json!({
+        "provider": payload.provider,
+        "providers": payload.providers,
+    });
 
-        // Merge providers config
-        if let Some(existing_providers) = obj.get_mut("providers") {
-            if let Some(existing_obj) = existing_providers.as_object_mut() {
-                if let Some(new_providers) = payload.providers.as_object() {
-                    for (key, value) in new_providers.iter() {
-                        // Don't overwrite with masked values
-                        if let Some(new_obj) = value.as_object() {
-                            if let Some(api_key) = new_obj.get("api_key") {
-                                if let Some(key_str) = api_key.as_str() {
-                                    if key_str.contains("***") || key_str.contains("...") {
-                                        // This is a masked key, preserve the existing one
-                                        if let Some(existing_provider) = existing_obj.get(key) {
-                                            if let Some(existing_key) =
-                                                existing_provider.get("api_key")
-                                            {
-                                                let mut merged = value.clone();
-                                                if let Some(merged_obj) = merged.as_object_mut() {
-                                                    merged_obj.insert(
-                                                        "api_key".to_string(),
-                                                        existing_key.clone(),
-                                                    );
-                                                }
-                                                existing_obj.insert(key.clone(), merged);
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        existing_obj.insert(key.clone(), value.clone());
-                    }
+    if let (Some(patch_providers), Some(existing_providers)) = (
+        patch.get_mut("providers"),
+        merged.get("providers"),
+    ) {
+        if let (Some(patch_obj), Some(existing_obj)) =
+            (patch_providers.as_object_mut(), existing_providers.as_object())
+        {
+            for (provider_name, provider_patch) in patch_obj.iter_mut() {
+                let Some(patch_cfg_obj) = provider_patch.as_object_mut() else {
+                    continue;
+                };
+                let Some(api_key) = patch_cfg_obj.get("api_key").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if !is_masked_api_key(api_key) {
+                    continue;
                 }
-            } else {
-                obj.insert("providers".to_string(), payload.providers.clone());
+                if let Some(existing_key) = existing_obj
+                    .get(provider_name)
+                    .and_then(|v| v.get("api_key"))
+                    .cloned()
+                {
+                    patch_cfg_obj.insert("api_key".to_string(), existing_key);
+                }
             }
-        } else {
-            obj.insert("providers".to_string(), payload.providers.clone());
         }
     }
 
-    // Clean empty proxy fields
-    let mut config_to_save = clean_empty_proxy_fields(existing_config.clone());
+    deep_merge_json(&mut merged, patch);
 
-    // Encrypt proxy auth if present
-    encrypt_proxy_auth(&mut config_to_save)?;
+    let mut new_config: Config = serde_json::from_value(merged)?;
+    new_config.data_dir = app_state.app_data_dir.clone();
+    new_config.hydrate_proxy_auth_from_encrypted();
 
-    // Save to file
-    let content = serde_json::to_string_pretty(&config_to_save)?;
-    fs::write(&path, content).await?;
-
-    log::info!("Provider configuration updated to: {}", payload.provider);
-
-    // First, reload the configuration from file into AppState
-    let new_config = app_state.reload_config().await;
-
-    // Validate the configuration
     if let Err(e) = crate::agent::llm::validate_provider_config(&new_config) {
-        log::error!("Invalid configuration after update: {}", e);
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
             "success": false,
-            "error": format!("Configuration saved but invalid: {}", e)
+            "error": format!("Invalid configuration: {}", e)
         })));
     }
 
-    // Reload provider to apply new configuration
-    if let Err(e) = app_state.reload_provider().await {
-        log::error!(
-            "Failed to reload provider after updating configuration: {}",
-            e
-        );
-        return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
-            "success": false,
-            "error": format!("Configuration saved but failed to reload provider: {}", e)
-        })));
+    {
+        let mut cfg = app_state.config.write().await;
+        *cfg = new_config.clone();
     }
-
-    log::info!("Provider reloaded successfully after configuration update");
+    persist_config(new_config.clone()).await?;
+    app_state.reload_provider().await.map_err(|e| {
+        AppError::InternalError(anyhow::anyhow!(
+            "Failed to reload provider after updating configuration: {e}"
+        ))
+    })?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
-        "provider": payload.provider
+        "provider": new_config.provider
     })))
 }
 
@@ -1574,55 +1346,76 @@ pub async fn fetch_provider_models(
     app_state: web::Data<AppState>,
     payload: web::Json<serde_json::Value>,
 ) -> Result<HttpResponse, AppError> {
+    let config = app_state.config.read().await.clone();
     let provider_type = payload
         .get("provider")
         .and_then(|v| v.as_str())
-        .unwrap_or("openai");
+        .unwrap_or(config.provider.as_str());
 
-    // Read current config to get the real API key
-    let path = config_path(&app_state);
-    let config_value = match fs::read_to_string(&path).await {
-        Ok(content) => {
-            let mut config: Value = serde_json::from_str(&content)?;
-            decrypt_proxy_auth(&mut config);
-            config
+    // Build a proxy-aware HTTP client for all outbound calls.
+    let client = crate::agent::llm::http_client::build_http_client(&config)
+        .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to build HTTP client: {e}")))?;
+
+    let models = match provider_type {
+        "copilot" => {
+            let provider = app_state.get_provider().await;
+            provider.list_models().await.map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("proxy") || msg.contains("407") {
+                    AppError::ProxyAuthRequired
+                } else {
+                    AppError::InternalError(anyhow::anyhow!("Failed to fetch models: {e}"))
+                }
+            })?
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(AppError::NotFound(
-                "Configuration file not found".to_string(),
-            ));
+        "openai" => {
+            let openai = config.providers.openai.as_ref().ok_or_else(|| {
+                AppError::BadRequest("OpenAI configuration required".to_string())
+            })?;
+            if openai.api_key.trim().is_empty() {
+                return Err(AppError::BadRequest("API key not configured".to_string()));
+            }
+            fetch_models_from_api(&client, "openai", &openai.api_key, openai.base_url.as_deref())
+                .await?
         }
-        Err(err) => return Err(AppError::StorageError(err)),
+        "anthropic" => {
+            let anthropic = config.providers.anthropic.as_ref().ok_or_else(|| {
+                AppError::BadRequest("Anthropic configuration required".to_string())
+            })?;
+            if anthropic.api_key.trim().is_empty() {
+                return Err(AppError::BadRequest("API key not configured".to_string()));
+            }
+            fetch_models_from_api(
+                &client,
+                "anthropic",
+                &anthropic.api_key,
+                anthropic.base_url.as_deref(),
+            )
+            .await?
+        }
+        "gemini" => {
+            let gemini = config.providers.gemini.as_ref().ok_or_else(|| {
+                AppError::BadRequest("Gemini configuration required".to_string())
+            })?;
+            if gemini.api_key.trim().is_empty() {
+                return Err(AppError::BadRequest("API key not configured".to_string()));
+            }
+            fetch_models_from_api(&client, "gemini", &gemini.api_key, gemini.base_url.as_deref())
+                .await?
+        }
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "Unsupported provider: {other}"
+            )));
+        }
     };
 
-    // Get provider-specific config
-    let provider_config = config_value
-        .get("providers")
-        .and_then(|p| p.get(provider_type))
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    let api_key = provider_config
-        .get("api_key")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if api_key.is_empty() {
-        return Err(AppError::BadRequest("API key not configured".to_string()));
-    }
-
-    let base_url = provider_config.get("base_url").and_then(|v| v.as_str());
-
-    // Fetch models from the API
-    let models = fetch_models_from_api(provider_type, api_key, base_url).await?;
-
-    Ok(HttpResponse::Ok().json(serde_json::json!({
-        "models": models
-    })))
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "models": models })))
 }
 
 /// Fetch models from external API
 async fn fetch_models_from_api(
+    client: &reqwest::Client,
     provider: &str,
     api_key: &str,
     base_url: Option<&str>,
@@ -1668,7 +1461,6 @@ async fn fetch_models_from_api(
 
     log::info!("Fetching models from: {}", url);
 
-    let client = reqwest::Client::new();
     let mut request = client.get(&url);
 
     // Set appropriate authentication header based on provider (not for Gemini)

@@ -50,6 +50,9 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::PathBuf;
 
 /// Main configuration structure for Bamboo agent
@@ -96,6 +99,14 @@ pub struct Config {
     /// Data directory path (defaults to ~/.bamboo)
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+
+    /// Extension fields stored at the root of `config.json`.
+    ///
+    /// This keeps the config forward-compatible and allows unrelated subsystems
+    /// (e.g. setup UI state) to persist their own keys without getting dropped by
+    /// typed (de)serialization.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// Container for provider-specific configurations
@@ -104,13 +115,21 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderConfigs {
     /// OpenAI provider configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub openai: Option<OpenAIConfig>,
     /// Anthropic provider configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub anthropic: Option<AnthropicConfig>,
     /// Google Gemini provider configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gemini: Option<GeminiConfig>,
     /// GitHub Copilot provider configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub copilot: Option<CopilotConfig>,
+
+    /// Preserve unknown provider keys (forward compatibility).
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// OpenAI provider configuration
@@ -134,6 +153,10 @@ pub struct OpenAIConfig {
     /// Default model to use (e.g., "gpt-4", "gpt-3.5-turbo")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+
+    /// Preserve unknown keys under `providers.openai`.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// Anthropic provider configuration
@@ -160,6 +183,10 @@ pub struct AnthropicConfig {
     /// Maximum tokens in model response
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+
+    /// Preserve unknown keys under `providers.anthropic`.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// Google Gemini provider configuration
@@ -182,6 +209,10 @@ pub struct GeminiConfig {
     /// Default model to use (e.g., "gemini-2.0-flash-exp")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+
+    /// Preserve unknown keys under `providers.gemini`.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// GitHub Copilot provider configuration
@@ -206,6 +237,10 @@ pub struct CopilotConfig {
     /// Default model to use for Copilot (used when clients request the "default" model)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+
+    /// Preserve unknown keys under `providers.copilot`.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// Returns the default provider name ("anthropic")
@@ -250,6 +285,10 @@ pub struct ServerConfig {
     /// Worker count for Actix-web
     #[serde(default = "default_workers")]
     pub workers: usize,
+
+    /// Preserve unknown keys under `server`.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 impl Default for ServerConfig {
@@ -259,6 +298,7 @@ impl Default for ServerConfig {
             bind: default_bind(),
             static_dir: None,
             workers: default_workers(),
+            extra: BTreeMap::new(),
         }
     }
 }
@@ -350,7 +390,7 @@ impl Config {
                         // Try Config, but if it fails (e.g., due to syntax errors), use OldConfig values
                         match serde_json::from_str::<Config>(&content) {
                             Ok(mut config) => {
-                                config.hydrate_proxy_auth();
+                                config.hydrate_proxy_auth_from_encrypted();
                                 config
                             }
                             Err(_) => {
@@ -363,7 +403,7 @@ impl Config {
                     // Couldn't parse as OldConfig, try as Config
                     serde_json::from_str::<Config>(&content)
                         .map(|mut config| {
-                            config.hydrate_proxy_auth();
+                            config.hydrate_proxy_auth_from_encrypted();
                             config
                         })
                         .unwrap_or_else(|_| Self::create_default())
@@ -391,7 +431,7 @@ impl Config {
         // Ensure data_dir is set correctly
         config.data_dir = data_dir;
         // Decrypt encrypted proxy auth into in-memory plaintext form.
-        config.hydrate_proxy_auth();
+        config.hydrate_proxy_auth_from_encrypted();
 
         // Apply environment variable overrides (highest priority)
         if let Ok(port) = std::env::var("BAMBOO_PORT") {
@@ -420,7 +460,12 @@ impl Config {
         config
     }
 
-    fn hydrate_proxy_auth(&mut self) {
+    /// Populate `proxy_auth` (plaintext) from `proxy_auth_encrypted` if present.
+    ///
+    /// Many parts of the code rely on `proxy_auth` being hydrated in-memory so
+    /// we can re-encrypt deterministically on save without ever persisting
+    /// plaintext credentials.
+    pub fn hydrate_proxy_auth_from_encrypted(&mut self) {
         if self.proxy_auth.is_some() {
             return;
         }
@@ -438,15 +483,19 @@ impl Config {
         }
     }
 
-    fn encrypt_proxy_auth_for_storage(&mut self) -> Result<()> {
-        if self.proxy_auth_encrypted.is_some() || self.proxy_auth.is_none() {
+    /// Refresh `proxy_auth_encrypted` from the current in-memory `proxy_auth`.
+    ///
+    /// This is used both when persisting the config to disk and when generating
+    /// API responses that should never include plaintext proxy credentials.
+    pub fn refresh_proxy_auth_encrypted(&mut self) -> Result<()> {
+        // Keep on-disk representation fully derived from the in-memory plaintext:
+        // - Some(auth)  => always (re-)encrypt and store `proxy_auth_encrypted`
+        // - None        => remove `proxy_auth_encrypted`
+        let Some(auth) = self.proxy_auth.as_ref() else {
+            self.proxy_auth_encrypted = None;
             return Ok(());
-        }
+        };
 
-        let auth = self
-            .proxy_auth
-            .as_ref()
-            .context("proxy_auth missing when trying to encrypt")?;
         let auth_str = serde_json::to_string(auth).context("Failed to serialize proxy auth")?;
         let encrypted =
             crate::core::encryption::encrypt(&auth_str).context("Failed to encrypt proxy auth")?;
@@ -467,6 +516,7 @@ impl Config {
             providers: ProviderConfigs::default(),
             server: ServerConfig::default(),
             data_dir: default_data_dir(),
+            extra: BTreeMap::new(),
         }
     }
 
@@ -485,15 +535,44 @@ impl Config {
         }
 
         let mut to_save = self.clone();
-        to_save.encrypt_proxy_auth_for_storage()?;
+        to_save.refresh_proxy_auth_encrypted()?;
         let content =
             serde_json::to_string_pretty(&to_save).context("Failed to serialize config to JSON")?;
-
-        std::fs::write(&path, content)
+        write_atomic(&path, content.as_bytes())
             .with_context(|| format!("Failed to write config file: {:?}", path))?;
 
         Ok(())
     }
+}
+
+fn write_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return std::fs::write(path, content);
+    };
+
+    std::fs::create_dir_all(parent)?;
+
+    // Write to a temp file in the same directory then rename to ensure atomic replace.
+    // (Rename is atomic on Unix when source/dest are on the same filesystem.)
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("config.json");
+    let tmp_name = format!(
+        ".{}.tmp.{}",
+        file_name,
+        std::process::id()
+    );
+    let tmp_path = parent.join(tmp_name);
+
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+    }
+
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
 }
 
 /// Legacy configuration format for backward compatibility
@@ -524,6 +603,10 @@ struct OldConfig {
     providers: ProviderConfigs,
     #[serde(default)]
     data_dir: Option<PathBuf>,
+
+    /// Preserve unknown root keys for forward compatibility.
+    #[serde(default, flatten)]
+    extra: BTreeMap<String, Value>,
 }
 
 /// Migrate old configuration format to new multi-provider format
@@ -561,6 +644,7 @@ fn migrate_config(old: OldConfig) -> Config {
         providers: old.providers,
         server: old.server,
         data_dir: old.data_dir.unwrap_or_else(default_data_dir),
+        extra: old.extra,
     }
 }
 
@@ -620,11 +704,10 @@ mod tests {
         }
 
         fn set_config_json(&self, content: &str) {
-            // Use .bamboo directory
-            let config_dir = self.path.join(".bamboo");
-            std::fs::create_dir_all(&config_dir).expect("failed to create config dir");
-            std::fs::write(config_dir.join("config.json"), content)
-                .expect("failed to write config.json");
+            // Treat `path` as the Bamboo data dir and write `config.json` into it.
+            // Tests should prefer BAMBOO_DATA_DIR over HOME to avoid global env contention.
+            std::fs::create_dir_all(&self.path).expect("failed to create config dir");
+            std::fs::write(self.path.join("config.json"), content).expect("failed to write config.json");
         }
     }
 
@@ -672,12 +755,10 @@ mod tests {
 }"#,
         );
 
-        let home = temp_home.path.to_string_lossy().to_string();
-        let _home = EnvVarGuard::set("HOME", &home);
         let _http_proxy = EnvVarGuard::set("HTTP_PROXY", "http://env-proxy.example.com:8080");
         let _https_proxy = EnvVarGuard::set("HTTPS_PROXY", "http://env-proxy.example.com:8443");
 
-        let config = Config::new();
+        let config = Config::from_data_dir(Some(temp_home.path.clone()));
 
         assert!(
             config.http_proxy.is_empty(),
@@ -699,12 +780,10 @@ mod tests {
 }"#,
         );
 
-        let home = temp_home.path.to_string_lossy().to_string();
-        let _home = EnvVarGuard::set("HOME", &home);
         let _http_proxy = EnvVarGuard::unset("HTTP_PROXY");
         let _https_proxy = EnvVarGuard::unset("HTTPS_PROXY");
 
-        let config = Config::new();
+        let config = Config::from_data_dir(Some(temp_home.path.clone()));
 
         assert_eq!(
             config.model.as_deref(),
@@ -725,12 +804,10 @@ mod tests {
 }"#,
         );
 
-        let home = temp_home.path.to_string_lossy().to_string();
-        let _home = EnvVarGuard::set("HOME", &home);
         let _http_proxy = EnvVarGuard::set("HTTP_PROXY", "http://env-proxy.example.com:8080");
         let _https_proxy = EnvVarGuard::set("HTTPS_PROXY", "http://env-proxy.example.com:8443");
 
-        let config = Config::new();
+        let config = Config::from_data_dir(Some(temp_home.path.clone()));
 
         assert_eq!(config.model.as_deref(), Some("gpt-4"));
         assert!(
@@ -768,10 +845,7 @@ mod tests {
 }"#,
         );
 
-        let home = temp_home.path.to_string_lossy().to_string();
-        let _home = EnvVarGuard::set("HOME", &home);
-
-        let config = Config::new();
+        let config = Config::from_data_dir(Some(temp_home.path.clone()));
 
         // Verify migration
         assert_eq!(config.http_proxy, "http://proxy.example.com:8080");
@@ -806,10 +880,7 @@ mod tests {
 }"#,
         );
 
-        let home = temp_home.path.to_string_lossy().to_string();
-        let _home = EnvVarGuard::set("HOME", &home);
-
-        let config = Config::new();
+        let config = Config::from_data_dir(Some(temp_home.path.clone()));
 
         // Should fallback to http_proxy_auth when https_proxy_auth is absent
         assert!(
@@ -826,11 +897,7 @@ mod tests {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
 
-        // Set temp home BEFORE creating config
-        let home = temp_home.path.to_string_lossy().to_string();
-        let _home = EnvVarGuard::set("HOME", &home);
-
-        let config = Config::default();
+        let config = Config::from_data_dir(Some(temp_home.path.clone()));
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.bind, "127.0.0.1");
         assert_eq!(config.server.workers, 10);
@@ -850,15 +917,11 @@ mod tests {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
 
-        // Set temp home to avoid loading real config
-        let home = temp_home.path.to_string_lossy().to_string();
-        let _home = EnvVarGuard::set("HOME", &home);
-
         let _port = EnvVarGuard::set("BAMBOO_PORT", "9999");
         let _bind = EnvVarGuard::set("BAMBOO_BIND", "192.168.1.1");
         let _provider = EnvVarGuard::set("BAMBOO_PROVIDER", "openai");
 
-        let config = Config::new();
+        let config = Config::from_data_dir(Some(temp_home.path.clone()));
         assert_eq!(config.server.port, 9999);
         assert_eq!(config.server.bind, "192.168.1.1");
         assert_eq!(config.provider, "openai");
@@ -869,11 +932,7 @@ mod tests {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
 
-        // Set temp home BEFORE creating config
-        let home = temp_home.path.to_string_lossy().to_string();
-        let _home = EnvVarGuard::set("HOME", &home);
-
-        let mut config = Config::default();
+        let mut config = Config::from_data_dir(Some(temp_home.path.clone()));
         config.server.port = 9000;
         config.server.bind = "0.0.0.0".to_string();
         config.provider = "anthropic".to_string();
@@ -882,7 +941,7 @@ mod tests {
         config.save().expect("Failed to save config");
 
         // Load again
-        let loaded = Config::new();
+        let loaded = Config::from_data_dir(Some(temp_home.path.clone()));
 
         // Verify
         assert_eq!(loaded.server.port, 9000);
@@ -896,10 +955,11 @@ mod tests {
         let temp_home = TempHome::new();
 
         // Use a stable encryption key so this test doesn't depend on host identifiers.
-        let _key = EnvVarGuard::set(
-            "BAMBOO_CONFIG_ENCRYPTION_KEY",
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
+        let key_guard = crate::core::encryption::set_test_encryption_key([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+            0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
+            0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        ]);
 
         let auth = ProxyAuth {
             username: "user".to_string(),
@@ -914,14 +974,11 @@ mod tests {
   "proxy_auth_encrypted": "{encrypted}"
 }}"#
         ));
-
-        let home = temp_home.path.to_string_lossy().to_string();
-        let _home = EnvVarGuard::set("HOME", &home);
-
-        let config = Config::new();
+        let config = Config::from_data_dir(Some(temp_home.path.clone()));
         let loaded_auth = config.proxy_auth.expect("proxy auth should be hydrated");
         assert_eq!(loaded_auth.username, "user");
         assert_eq!(loaded_auth.password, "pass");
+        drop(key_guard);
     }
 
     #[test]
@@ -930,22 +987,20 @@ mod tests {
         let temp_home = TempHome::new();
 
         // Use a stable encryption key so this test doesn't depend on host identifiers.
-        let _key = EnvVarGuard::set(
-            "BAMBOO_CONFIG_ENCRYPTION_KEY",
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
+        let key_guard = crate::core::encryption::set_test_encryption_key([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+            0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
+            0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        ]);
 
-        let home = temp_home.path.to_string_lossy().to_string();
-        let _home = EnvVarGuard::set("HOME", &home);
-
-        let mut config = Config::default();
+        let mut config = Config::from_data_dir(Some(temp_home.path.clone()));
         config.proxy_auth = Some(ProxyAuth {
             username: "user".to_string(),
             password: "pass".to_string(),
         });
         config.save().expect("save should encrypt proxy auth");
 
-        let content = std::fs::read_to_string(temp_home.path.join(".bamboo").join("config.json"))
+        let content = std::fs::read_to_string(temp_home.path.join("config.json"))
             .expect("read config.json");
         assert!(
             content.contains("proxy_auth_encrypted"),
@@ -956,9 +1011,10 @@ mod tests {
             "config.json should not store plaintext proxy_auth"
         );
 
-        let loaded = Config::new();
+        let loaded = Config::from_data_dir(Some(temp_home.path.clone()));
         let loaded_auth = loaded.proxy_auth.expect("proxy auth should be hydrated");
         assert_eq!(loaded_auth.username, "user");
         assert_eq!(loaded_auth.password, "pass");
+        drop(key_guard);
     }
 }

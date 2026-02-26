@@ -423,8 +423,19 @@ impl AppState {
             log::warn!("Claude Code CLI not found; Claude integration disabled");
         }
 
+        // Wrap config early so tools can reference the hot-reloadable config (e.g. proxy settings).
+        let model_name = config
+            .providers
+            .anthropic
+            .as_ref()
+            .and_then(|p| p.model.as_ref())
+            .cloned()
+            .unwrap_or_else(|| "claude-3-5-sonnet-20241022".to_string());
+
+        let config = Arc::new(RwLock::new(config));
+
         // Initialize built-in tools (with optional Claude Code tool)
-        let builtin_executor = crate::agent::tools::BuiltinToolExecutor::new();
+        let builtin_executor = crate::agent::tools::BuiltinToolExecutor::new_with_config(config.clone());
         if let Some(ref path) = claude_cli_path {
             if let Err(e) = builtin_executor
                 .register_tool(crate::agent::tools::tools::ClaudeCodeTool::new(path.clone()))
@@ -541,18 +552,9 @@ impl AppState {
         // Initialize process registry (external process lifecycle)
         let process_registry = Arc::new(ProcessRegistry::new());
 
-        // Get model name from config
-        let model_name = config
-            .providers
-            .anthropic
-            .as_ref()
-            .and_then(|p| p.model.as_ref())
-            .cloned()
-            .unwrap_or_else(|| "claude-3-5-sonnet-20241022".to_string());
-
         Self {
             app_data_dir: bamboo_home_dir,
-            config: Arc::new(RwLock::new(config)),
+            config,
             provider: Arc::new(RwLock::new(provider.clone())),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             storage,

@@ -10,9 +10,25 @@ use std::process::Command;
 const KEY_ENV_VAR: &str = "BAMBOO_CONFIG_ENCRYPTION_KEY";
 const KEY_DERIVATION_CONTEXT: &[u8] = b"bamboo-config-encryption-v1";
 
+#[cfg(test)]
+use std::cell::RefCell;
+
+// Test-only override to avoid mutating process-wide environment variables (which
+// is not thread-safe under concurrent test execution). Thread-local to prevent
+// cross-test interference under `cargo test` parallelism.
+#[cfg(test)]
+thread_local! {
+    static TEST_KEY_OVERRIDE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
 /// Get the encryption key.
 /// Priority: environment variable, machine-derived key, then random fallback.
 pub fn get_encryption_key() -> Vec<u8> {
+    #[cfg(test)]
+    if let Some(key) = TEST_KEY_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return key;
+    }
+
     if let Some(key) = read_env_key() {
         return key;
     }
@@ -23,6 +39,26 @@ pub fn get_encryption_key() -> Vec<u8> {
 
     // Last-resort fallback keeps behavior safe if host identifiers are unavailable.
     rand::thread_rng().gen::<[u8; 32]>().to_vec()
+}
+
+#[cfg(test)]
+pub struct TestKeyGuard {
+    previous: Option<Vec<u8>>,
+}
+
+#[cfg(test)]
+impl Drop for TestKeyGuard {
+    fn drop(&mut self) {
+        TEST_KEY_OVERRIDE.with(|cell| {
+            *cell.borrow_mut() = self.previous.clone();
+        });
+    }
+}
+
+#[cfg(test)]
+pub fn set_test_encryption_key(key: [u8; 32]) -> TestKeyGuard {
+    let previous = TEST_KEY_OVERRIDE.with(|cell| cell.replace(Some(key.to_vec())));
+    TestKeyGuard { previous }
 }
 
 fn read_env_key() -> Option<Vec<u8>> {

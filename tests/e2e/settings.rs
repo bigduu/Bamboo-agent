@@ -222,7 +222,12 @@ async fn test_set_bamboo_config() {
         .uri("/v1/bamboo/config")
         .set_json(&json!({
             "provider": "openai",
-            "http_proxy": "http://proxy:8080"
+            "http_proxy": "http://proxy:8080",
+            "providers": {
+                "openai": {
+                    "api_key": "sk-test"
+                }
+            }
         }))
         .to_request();
 
@@ -268,7 +273,12 @@ async fn test_update_bamboo_config_merges() {
         .uri("/v1/bamboo/config")
         .set_json(&json!({
             "provider": "openai",
-            "field1": "value1"
+            "field1": "value1",
+            "providers": {
+                "openai": {
+                    "api_key": "sk-test"
+                }
+            }
         }))
         .to_request();
 
@@ -280,7 +290,12 @@ async fn test_update_bamboo_config_merges() {
         .uri("/v1/bamboo/config")
         .set_json(&json!({
             "provider": "anthropic",
-            "field2": "value2"
+            "field2": "value2",
+            "providers": {
+                "anthropic": {
+                    "api_key": "sk-ant-test"
+                }
+            }
         }))
         .to_request();
 

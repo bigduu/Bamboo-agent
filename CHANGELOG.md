@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Copilot auth endpoints now honor configured HTTP/HTTPS proxy settings (company network support).
+- Built-in `http_request` tool now honors the same configured proxy settings (consistent outbound networking).
 
 ## [0.2.10] - 2026-02-26
 

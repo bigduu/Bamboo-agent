@@ -33,9 +33,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent::core::tools::{FunctionCall, ToolCall};
-use crate::agent::core::ToolExecutor;
-use crate::agent::tools::{normalize_tool_ref, BuiltinToolExecutor};
+use crate::agent::tools::normalize_tool_ref;
 
+use crate::server::app_state::AppState;
 use crate::server::error::AppError;
 
 /// Request payload for tool execution.
@@ -140,6 +140,7 @@ pub struct ToolExecutionResultPayload {
 ///   }'
 /// ```
 pub async fn execute_tool(
+    app_state: web::Data<AppState>,
     payload: web::Json<ToolExecutionRequest>,
 ) -> Result<HttpResponse, AppError> {
     let request = payload.into_inner();
@@ -161,8 +162,8 @@ pub async fn execute_tool(
         },
     };
 
-    let executor = BuiltinToolExecutor::new();
-    let result = executor
+    let result = app_state
+        .tools
         .execute(&call)
         .await
         .map_err(|err| AppError::ToolExecutionError(err.to_string()))?;
