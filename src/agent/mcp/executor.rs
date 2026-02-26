@@ -1,4 +1,6 @@
-use crate::agent::core::tools::{ToolCall, ToolError, ToolExecutor, ToolResult, ToolSchema};
+use crate::agent::core::tools::{
+    ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult, ToolSchema,
+};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::{debug, error};
@@ -150,6 +152,24 @@ impl ToolExecutor for CompositeToolExecutor {
 
         // Try MCP
         self.mcp.execute(call).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> std::result::Result<ToolResult, ToolError> {
+        // Try built-in first (preserve context for streaming tools).
+        match self.builtin.execute_with_context(call, ctx).await {
+            Ok(result) => return Ok(result),
+            Err(ToolError::NotFound(_)) => {
+                // Fall through to MCP
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Try MCP (context ignored by default).
+        self.mcp.execute_with_context(call, ctx).await
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {

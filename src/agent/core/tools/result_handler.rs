@@ -4,9 +4,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::agent::core::composition::CompositionExecutor;
-use crate::agent::core::tools::executor::execute_tool_call;
+use crate::agent::core::tools::executor::execute_tool_call_with_context;
 use crate::agent::core::tools::{
-    convert_from_standard_result, AgenticToolResult, ToolCall, ToolError, ToolExecutor, ToolResult,
+    convert_from_standard_result, AgenticToolResult, ToolCall, ToolError, ToolExecutionContext,
+    ToolExecutor, ToolResult,
 };
 use crate::agent::core::{AgentEvent, Message, Session};
 
@@ -150,7 +151,15 @@ pub async fn execute_sub_actions(
             })
             .await;
 
-        match execute_tool_call(&action, tools, composition_executor.clone()).await {
+        let tool_ctx = ToolExecutionContext {
+            session_id: Some(&session.id),
+            tool_call_id: &action.id,
+            event_tx: Some(event_tx),
+        };
+
+        match execute_tool_call_with_context(&action, tools, composition_executor.clone(), tool_ctx)
+            .await
+        {
             Ok(result) => {
                 let _ = event_tx
                     .send(AgentEvent::ToolComplete {

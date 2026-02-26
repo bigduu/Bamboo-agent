@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.10] - 2026-02-26
+
+### Added
+- Tool execution streaming: tools can now emit incremental output events while running (SSE `tool_token`).
+- Claude Code CLI integration: optional built-in `claude_code` tool (auto-enabled when `claude` is discoverable) that runs with `--output-format stream-json` and streams output.
+
+### Changed
+- Streaming: tool-emitted `token` events are treated as tool-scoped output (`tool_token`) instead of mixing into assistant text streaming.
+- Model limits: added a built-in context window entry for `gpt-4.1` (defaults to 128k; override via user config if needed).
+
+### Fixed
+- Claude Code CLI: always pass `--verbose` when using `-p/--print` with `--output-format=stream-json` (required by Claude Code).
+
 ## [0.2.9] - 2026-02-25
 
 ### Added

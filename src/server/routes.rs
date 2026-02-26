@@ -36,7 +36,7 @@ fn openai_compatible_v1_scope(
                 )
                 .route(
                     "/sessions/running",
-                    web::get().to(agent_api::list_running_claude_sessions),
+                    web::get().to(agent_api::list_running_claude_sessions_stateful),
                 )
                 .route(
                     "/sessions/execute",
@@ -45,6 +45,10 @@ fn openai_compatible_v1_scope(
                 .route(
                     "/sessions/cancel",
                     web::post().to(agent_api::cancel_claude_execution),
+                )
+                .route(
+                    "/sessions/{session_id}/events",
+                    web::get().to(agent_api::claude_events),
                 )
                 .route(
                     "/sessions/{session_id}/jsonl",

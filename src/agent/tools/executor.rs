@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use crate::agent::core::tools::{
-    normalize_tool_name, Tool, ToolCall, ToolError, ToolExecutor, ToolResult, ToolSchema,
+    normalize_tool_name, Tool, ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult,
+    ToolSchema,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -16,7 +17,11 @@ use crate::agent::tools::tools::{
     UpdateTodoItemTool, WriteFileTool,
 };
 
-/// List of all built-in tool names
+/// List of all built-in tool names.
+///
+/// This list intentionally includes only tools that are always registered by
+/// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
+/// depend on host binaries) should NOT be added here.
 pub const BUILTIN_TOOL_NAMES: [&str; 22] = [
     "read_file",
     "write_file",
@@ -56,7 +61,8 @@ pub fn normalize_tool_ref(value: &str) -> Option<String> {
         "run_command" => "execute_command",
         _ => raw_tool_name,
     };
-    if BUILTIN_TOOL_NAMES.iter().any(|name| name == &tool_name) {
+    // `claude_code` is an optional integration tool that may be registered at runtime.
+    if BUILTIN_TOOL_NAMES.iter().any(|name| name == &tool_name) || tool_name == "claude_code" {
         Some(tool_name.to_string())
     } else {
         None
@@ -201,6 +207,15 @@ impl Default for BuiltinToolExecutor {
 #[async_trait]
 impl ToolExecutor for BuiltinToolExecutor {
     async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        self.execute_with_context(call, ToolExecutionContext::none(&call.id))
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let args_raw = call.function.arguments.trim();
         let args: serde_json::Value = if args_raw.is_empty() {
             json!({})
@@ -238,8 +253,7 @@ impl ToolExecutor for BuiltinToolExecutor {
             }
         }
 
-        // Execute the tool
-        tool.execute(args).await
+        tool.execute_with_context(args, ctx).await
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
@@ -326,9 +340,12 @@ impl Default for BuiltinToolExecutorBuilder {
 mod tests {
     use super::*;
     use crate::agent::core::tools::FunctionCall;
+    use crate::agent::core::tools::ToolExecutionContext;
+    use crate::agent::core::AgentEvent;
     use serde_json::json;
     use std::sync::Arc;
     use tokio::fs;
+    use tokio::sync::mpsc;
 
     use crate::agent::tools::tools::WriteFileTool;
 
@@ -443,5 +460,71 @@ mod tests {
 
         assert!(matches!(result, Err(ToolError::Execution(_))));
         assert!(fs::metadata(path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn tool_can_stream_events_via_execute_with_context() {
+        struct StreamingTool;
+
+        #[async_trait]
+        impl Tool for StreamingTool {
+            fn name(&self) -> &str {
+                "streaming_tool"
+            }
+
+            fn description(&self) -> &str {
+                "streams one token"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type":"object","properties":{}})
+            }
+
+            async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
+                Ok(ToolResult {
+                    success: true,
+                    result: "ok".to_string(),
+                    display_preference: None,
+                })
+            }
+
+            async fn execute_with_context(
+                &self,
+                args: serde_json::Value,
+                ctx: ToolExecutionContext<'_>,
+            ) -> Result<ToolResult, ToolError> {
+                ctx.emit(AgentEvent::Token {
+                    content: "stream".to_string(),
+                })
+                .await;
+                self.execute(args).await
+            }
+        }
+
+        let executor = BuiltinToolExecutor::new();
+        executor
+            .register_tool(StreamingTool)
+            .expect("register streaming tool");
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let call = make_tool_call("streaming_tool", json!({}));
+
+        let result = executor
+            .execute_with_context(
+                &call,
+                ToolExecutionContext {
+                    session_id: Some("s1"),
+                    tool_call_id: &call.id,
+                    event_tx: Some(&tx),
+                },
+            )
+            .await
+            .expect("execute tool");
+
+        assert!(result.success);
+        assert_eq!(result.result, "ok");
+
+        let ev = rx.recv().await.expect("expected streamed event");
+        assert!(matches!(ev, AgentEvent::ToolToken { tool_call_id, content } if tool_call_id == "call_1" && content == "stream"));
     }
 }

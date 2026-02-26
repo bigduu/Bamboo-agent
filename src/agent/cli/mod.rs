@@ -71,6 +71,11 @@ enum AgentEvent {
     Token {
         content: String,
     },
+    ToolToken {
+        #[allow(dead_code)]
+        tool_call_id: String,
+        content: String,
+    },
     ToolStart {
         #[allow(dead_code)]
         tool_call_id: String,
@@ -324,6 +329,11 @@ async fn stream_message(
                             print!("{}", content.green());
                             io::stdout().flush()?;
                             content_buffer.push_str(content);
+                        }
+                        AgentEvent::ToolToken { content, .. } => {
+                            // Don't mix tool output into the assistant content buffer.
+                            print!("{}", content.dimmed());
+                            io::stdout().flush()?;
                         }
                         AgentEvent::ToolStart {
                             tool_name,

@@ -1,7 +1,11 @@
+use crate::agent::core::AgentEvent;
+use crate::server::app_state::{AgentStatus, AppState};
 use crate::server::error::AppError;
-use actix_web::{web, HttpResponse};
+use actix_web::http::header;
+use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use uuid::Uuid;
 
 // ============================================================================
 // Data Types
@@ -91,6 +95,17 @@ pub struct ExecuteRequest {
     pub prompt: String,
     /// Optional session ID to resume
     pub session_id: Option<String>,
+    /// Optional override for Claude's Anthropic base URL.
+    ///
+    /// If omitted, Bamboo defaults to `http://127.0.0.1:{port}/anthropic` so the
+    /// Claude Code CLI talks to Bamboo's embedded Anthropic-compatible API.
+    pub anthropic_base_url: Option<String>,
+    /// Optional JSON schema for structured output (passed to `claude --json-schema`).
+    pub json_schema: Option<String>,
+    /// If omitted, defaults to `true` (skip Claude's user confirmation prompts).
+    pub dangerously_skip_permissions: Option<bool>,
+    /// If omitted, defaults to `true` (better streaming UX).
+    pub include_partial_messages: Option<bool>,
 }
 
 /// Request body for canceling execution
@@ -566,9 +581,94 @@ pub async fn save_system_prompt(
 /// curl http://localhost:3000/agent/sessions/running
 /// ```
 pub async fn list_running_claude_sessions() -> Result<HttpResponse, AppError> {
-    // This would need process registry integration
-    // For now, return empty list
+    // Kept for backward compatibility (legacy signature). Prefer the stateful variant below.
     Ok(HttpResponse::Ok().json(Vec::<serde_json::Value>::new()))
+}
+
+/// Lists currently running Claude Code sessions (stateful).
+pub async fn list_running_claude_sessions_stateful(
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, AppError> {
+    let sessions = state
+        .process_registry
+        .get_running_claude_sessions()
+        .await
+        .map_err(|e| AppError::InternalError(anyhow::anyhow!(e)))?;
+    Ok(HttpResponse::Ok().json(sessions))
+}
+
+/// Subscribe to Claude Code streaming events via SSE.
+///
+/// `GET /agent/sessions/{session_id}/events`
+pub async fn claude_events(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    _req: HttpRequest,
+) -> impl Responder {
+    let session_id = path.into_inner();
+
+    let (event_receiver, runner_status) = {
+        let runners = state.claude_runners.read().await;
+        match runners.get(&session_id) {
+            Some(runner) => (Some(runner.event_sender.subscribe()), Some(runner.status.clone())),
+            None => (None, None),
+        }
+    };
+
+    match event_receiver {
+        Some(mut receiver) => {
+            // If already terminal, send immediate event and close.
+            match runner_status {
+                Some(AgentStatus::Completed) => {
+                    return HttpResponse::Ok()
+                        .append_header((header::CONTENT_TYPE, "text/event-stream"))
+                        .append_header((header::CACHE_CONTROL, "no-cache"))
+                        .streaming(async_stream::stream! {
+                            let event = AgentEvent::Complete {
+                                usage: crate::agent::core::TokenUsage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+                            };
+                            let event_json = serde_json::to_string(&event).unwrap();
+                            yield Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(format!("data: {event_json}\n\n")));
+                        });
+                }
+                Some(AgentStatus::Error(err)) => {
+                    return HttpResponse::Ok()
+                        .append_header((header::CONTENT_TYPE, "text/event-stream"))
+                        .append_header((header::CACHE_CONTROL, "no-cache"))
+                        .streaming(async_stream::stream! {
+                            let event = AgentEvent::Error { message: err.clone() };
+                            let event_json = serde_json::to_string(&event).unwrap();
+                            yield Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(format!("data: {event_json}\n\n")));
+                        });
+                }
+                _ => {}
+            }
+
+            HttpResponse::Ok()
+                .append_header((header::CONTENT_TYPE, "text/event-stream"))
+                .append_header((header::CACHE_CONTROL, "no-cache"))
+                .append_header((header::CONNECTION, "keep-alive"))
+                .streaming(async_stream::stream! {
+                    while let Ok(event) = receiver.recv().await {
+                        let event_json = match serde_json::to_string(&event) {
+                            Ok(json) => json,
+                            Err(_) => continue,
+                        };
+
+                        yield Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(format!("data: {event_json}\n\n")));
+
+                        match &event {
+                            AgentEvent::Complete { .. } | AgentEvent::Error { .. } => break,
+                            _ => {}
+                        }
+                    }
+                })
+        }
+        None => HttpResponse::NotFound().json(serde_json::json!({
+            "error": "Claude session not running",
+            "session_id": session_id
+        })),
+    }
 }
 
 /// Executes Claude Code in a project directory
@@ -603,13 +703,120 @@ pub async fn list_running_claude_sessions() -> Result<HttpResponse, AppError> {
 ///   -d '{"project_path": "/tmp", "prompt": "Hello"}'
 /// ```
 pub async fn execute_claude_code(
-    _req: web::Json<ExecuteRequest>,
+    state: web::Data<AppState>,
+    req: web::Json<ExecuteRequest>,
 ) -> Result<HttpResponse, AppError> {
-    // This requires process management and streaming
-    // Placeholder implementation
+    let Some(claude_path) = state.claude_cli_path.clone() else {
+        log::warn!("Claude Code CLI not available; refusing to execute");
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "success": false,
+            "message": "Claude Code CLI not found; integration disabled"
+        })));
+    };
+
+    let project_path = PathBuf::from(req.project_path.trim());
+    if !project_path.is_dir() {
+        return Err(AppError::BadRequest(format!(
+            "project_path is not a directory: {}",
+            project_path.display()
+        )));
+    }
+
+    // Client-visible session id (can be an alias).
+    let client_session_id = req
+        .session_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    // Claude Code requires UUID session ids; if the client provides a non-UUID,
+    // accept it as an alias and generate a UUID for Claude.
+    let (claude_session_id, alias_used) = match Uuid::parse_str(&client_session_id) {
+        Ok(_) => (client_session_id.clone(), false),
+        Err(_) => (Uuid::new_v4().to_string(), true),
+    };
+
+    if alias_used {
+        log::warn!(
+            "Non-UUID session_id provided ({}); using generated Claude session UUID ({})",
+            client_session_id,
+            claude_session_id
+        );
+        let mut aliases = state.claude_session_aliases.write().await;
+        aliases.insert(client_session_id.clone(), claude_session_id.clone());
+    }
+
+    let include_partial_messages = req.include_partial_messages.unwrap_or(true);
+    let dangerously_skip_permissions = req.dangerously_skip_permissions.unwrap_or(true);
+
+    // Default Anthropic base URL points back to Bamboo itself.
+    let port = state.config.read().await.server.port;
+    let anthropic_base_url = req
+        .anthropic_base_url
+        .clone()
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}/anthropic", port));
+
+    // Create and register a runner for SSE streaming.
+    let mut runner = crate::server::app_state::AgentRunner::new();
+    runner.status = AgentStatus::Running;
+
+    let event_sender = runner.event_sender.clone();
+    let cancel_token = runner.cancel_token.clone();
+
+    {
+        let mut runners = state.claude_runners.write().await;
+        runners.insert(client_session_id.clone(), runner.clone());
+    }
+
+    // Spawn Claude process + streaming conversion.
+    let run_id = crate::claude::spawn_claude_code_cli(
+        state.process_registry.clone(),
+        event_sender.clone(),
+        cancel_token.clone(),
+        crate::claude::ClaudeCodeCliConfig {
+            claude_path,
+            project_path: project_path.clone(),
+            prompt: req.prompt.clone(),
+            session_id: claude_session_id.clone(),
+            anthropic_base_url,
+            json_schema: req.json_schema.clone(),
+            skip_permissions: dangerously_skip_permissions,
+            include_partial_messages,
+        },
+    )
+    .await
+    .map_err(|e| AppError::InternalError(anyhow::anyhow!(e)))?;
+
+    // Update runner status on terminal events.
+    {
+        let runners = state.claude_runners.clone();
+        let session_id_clone = client_session_id.clone();
+        let mut rx = event_sender.subscribe();
+        tokio::spawn(async move {
+            while let Ok(event) = rx.recv().await {
+                let terminal = match &event {
+                    AgentEvent::Complete { .. } => Some(AgentStatus::Completed),
+                    AgentEvent::Error { message } => Some(AgentStatus::Error(message.clone())),
+                    _ => None,
+                };
+                if let Some(status) = terminal {
+                    let mut guard = runners.write().await;
+                    if let Some(runner) = guard.get_mut(&session_id_clone) {
+                        runner.status = status;
+                        runner.completed_at = Some(chrono::Utc::now());
+                    }
+                    break;
+                }
+            }
+        });
+    }
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
-        "message": "Execution started - streaming not yet implemented"
+        "session_id": client_session_id,
+        "claude_session_id": claude_session_id,
+        "run_id": run_id,
+        "events_url": format!("/v1/agent/sessions/{}/events", client_session_id),
+        "message": "Claude Code execution started"
     })))
 }
 
@@ -643,13 +850,65 @@ pub async fn execute_claude_code(
 ///   -d '{"session_id": "session-123"}'
 /// ```
 pub async fn cancel_claude_execution(
-    _req: web::Json<CancelRequest>,
+    state: web::Data<AppState>,
+    req: web::Json<CancelRequest>,
 ) -> Result<HttpResponse, AppError> {
-    // This requires process registry integration
-    Ok(HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "message": "Cancellation request sent"
-    })))
+    let session_id = req.session_id.trim().to_string();
+    if session_id.is_empty() {
+        return Err(AppError::BadRequest("session_id is required".to_string()));
+    }
+
+    // Signal cancellation to any active runner (best-effort).
+    {
+        let runners = state.claude_runners.read().await;
+        if let Some(runner) = runners.get(&session_id) {
+            runner.cancel_token.cancel();
+        }
+    }
+
+    // Resolve aliases to Claude UUID session ids.
+    let claude_session_id = match Uuid::parse_str(&session_id) {
+        Ok(_) => Some(session_id.clone()),
+        Err(_) => {
+            let aliases = state.claude_session_aliases.read().await;
+            aliases.get(&session_id).cloned()
+        }
+    };
+
+    // Kill the process if it's tracked.
+    let run_id = if let Some(ref claude_session_id) = claude_session_id {
+        state
+            .process_registry
+            .get_claude_session_by_id(claude_session_id)
+            .await
+            .map_err(|e| AppError::InternalError(anyhow::anyhow!(e)))?
+            .map(|info| info.run_id)
+    } else {
+        None
+    };
+
+    if let Some(run_id) = run_id {
+        let _ = state
+            .process_registry
+            .kill_process(run_id)
+            .await
+            .map_err(|e| AppError::InternalError(anyhow::anyhow!(e)))?;
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": "Cancellation request sent",
+            "session_id": session_id,
+            "claude_session_id": claude_session_id,
+            "run_id": run_id
+        })))
+    } else {
+        // Treat "not running" as an accepted cancellation (no-op) to keep API ergonomic.
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": "Session not found or not running",
+            "session_id": session_id,
+            "claude_session_id": claude_session_id
+        })))
+    }
 }
 
 /// Gets session JSONL content (conversation history)

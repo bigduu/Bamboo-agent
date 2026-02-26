@@ -81,6 +81,7 @@ use crate::agent::llm::LLMProvider;
 use crate::agent::mcp::McpServerManager;
 use crate::agent::skill::{SkillManager, SkillStoreConfig};
 use crate::core::Config;
+use crate::process::ProcessRegistry;
 use crate::server::metrics_service::MetricsService;
 
 /// Default system prompt for agent interactions
@@ -280,6 +281,23 @@ pub struct AppState {
     /// for an active agent execution.
     pub agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
 
+    /// Registry for tracking external processes (e.g., Claude Code CLI sessions)
+    pub process_registry: Arc<ProcessRegistry>,
+
+    /// Discovered Claude Code CLI binary path (if installed)
+    pub claude_cli_path: Option<String>,
+
+    /// Active Claude Code CLI runners indexed by Claude session ID
+    ///
+    /// These are streamed to clients via SSE under the `/v1/agent/...` endpoints.
+    pub claude_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+
+    /// Maps client-provided session ids (aliases) to real Claude UUID session ids.
+    ///
+    /// Claude Code requires session ids to be UUIDs, but some clients/tests use
+    /// human-readable strings. We accept those as aliases and generate a UUID.
+    pub claude_session_aliases: Arc<RwLock<HashMap<String, String>>>,
+
     /// Optional metrics bus for event streaming
     ///
     /// When enabled, allows subscribing to metrics events
@@ -392,9 +410,29 @@ impl AppState {
         }
         log::info!("Storage initialized successfully at: {:?}", sessions_dir);
 
-        // Initialize built-in tools
-        let builtin_tools: Arc<dyn ToolExecutor> =
-            Arc::new(crate::agent::tools::BuiltinToolExecutor::new());
+        // Discover Claude Code CLI once at startup. This is optional.
+        // We do it early so we can conditionally register the `claude_code` tool.
+        let claude_cli_path = tokio::task::spawn_blocking(|| crate::claude::try_find_claude_binary())
+            .await
+            .ok()
+            .flatten();
+
+        if let Some(ref path) = claude_cli_path {
+            log::info!("Claude Code CLI enabled (found at: {})", path);
+        } else {
+            log::warn!("Claude Code CLI not found; Claude integration disabled");
+        }
+
+        // Initialize built-in tools (with optional Claude Code tool)
+        let builtin_executor = crate::agent::tools::BuiltinToolExecutor::new();
+        if let Some(ref path) = claude_cli_path {
+            if let Err(e) = builtin_executor
+                .register_tool(crate::agent::tools::tools::ClaudeCodeTool::new(path.clone()))
+            {
+                log::warn!("Failed to register claude_code tool: {}", e);
+            }
+        }
+        let builtin_tools: Arc<dyn ToolExecutor> = Arc::new(builtin_executor);
 
         // Initialize MCP manager
         let mcp_manager = Arc::new(McpServerManager::new());
@@ -466,6 +504,43 @@ impl AppState {
             });
         }
 
+        // Initialize Claude runners with cleanup task
+        let claude_runners: Arc<RwLock<HashMap<String, AgentRunner>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        {
+            let runners = claude_runners.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+
+                    let mut runners_guard = runners.write().await;
+                    let now = Utc::now();
+
+                    runners_guard.retain(|session_id, runner| {
+                        let should_keep = match &runner.status {
+                            AgentStatus::Running => true,
+                            _ => {
+                                let age = now.signed_duration_since(
+                                    runner.completed_at.unwrap_or(runner.started_at),
+                                );
+                                age.num_seconds() < 300 // 5 minute TTL
+                            }
+                        };
+
+                        if !should_keep {
+                            log::debug!("[claude:{}] Cleaning up completed runner", session_id);
+                        }
+
+                        should_keep
+                    });
+                }
+            });
+        }
+
+        // Initialize process registry (external process lifecycle)
+        let process_registry = Arc::new(ProcessRegistry::new());
+
         // Get model name from config
         let model_name = config
             .providers
@@ -489,6 +564,10 @@ impl AppState {
             metrics_service,
             model_name,
             agent_runners,
+            process_registry,
+            claude_cli_path,
+            claude_runners,
+            claude_session_aliases: Arc::new(RwLock::new(HashMap::new())),
             metrics_bus: None, // Will be set by server if needed
         }
     }

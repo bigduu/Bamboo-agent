@@ -16,6 +16,9 @@ pub const KNOWN_MODEL_LIMITS: &[(&str, u32)] = &[
     ("gpt-4o", 128_000),
     ("gpt-4o-mini", 128_000),
     ("gpt-4-turbo", 128_000),
+    // Treat gpt-4.1 as a modern long-context OpenAI model by default.
+    // If your provider exposes a different context size, override via ~/.bamboo/model_limits.json.
+    ("gpt-4.1", 128_000),
     ("gpt-4", 8_192),
     ("gpt-3.5-turbo", 16_385),
     // Anthropic models

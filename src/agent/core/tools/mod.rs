@@ -92,6 +92,7 @@
 
 pub mod accumulator;
 pub mod agentic;
+pub mod context;
 pub mod executor;
 pub mod registry;
 pub mod result_handler;
@@ -105,7 +106,8 @@ pub use agentic::{
     convert_from_standard_result, convert_to_standard_result, AgenticContext, AgenticTool,
     AgenticToolResult, Interaction, InteractionRole, ToolExecutor as AgenticToolExecutor, ToolGoal,
 };
-pub use executor::{execute_tool_call, ToolError, ToolExecutor};
+pub use context::ToolExecutionContext;
+pub use executor::{execute_tool_call, execute_tool_call_with_context, ToolError, ToolExecutor};
 pub use registry::{global_registry, normalize_tool_name, RegistryError, Tool, ToolRegistry};
 pub use result_handler::{
     execute_sub_actions, handle_tool_result_with_agentic_support, parse_tool_args,

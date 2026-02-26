@@ -69,6 +69,7 @@
 // File operation tools
 pub mod apply_patch;
 pub mod ask_user;
+pub mod claude_code;
 pub mod create_todo_list;
 pub mod execute_command;
 pub mod file_exists;
@@ -96,6 +97,8 @@ pub mod write_file;
 pub use apply_patch::ApplyPatchTool;
 /// Tool for asking users questions during execution.
 pub use ask_user::AskUserTool;
+/// Tool for running Claude Code CLI.
+pub use claude_code::ClaudeCodeTool;
 /// Tool for creating todo lists to track task progress.
 pub use create_todo_list::CreateTodoListTool;
 /// Tool for executing shell commands with sandboxing.

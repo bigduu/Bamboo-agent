@@ -4,9 +4,11 @@
 
 mod command;
 mod discovery;
+mod runner;
+mod stream_json;
 mod version;
 
-use log::{error, info};
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
@@ -37,7 +39,7 @@ pub fn find_claude_binary() -> Result<String, String> {
     let installations = discover_system_installations();
 
     if installations.is_empty() {
-        error!("Could not find claude binary in any location");
+        warn!("Could not find claude binary in any location");
         return Err("Claude Code not found. Please ensure it's installed in one of these locations: PATH, /usr/local/bin, /opt/homebrew/bin, ~/.nvm/versions/node/*/bin, ~/.claude/local, ~/.local/bin".to_string());
     }
 
@@ -54,6 +56,14 @@ pub fn find_claude_binary() -> Result<String, String> {
     } else {
         Err("No valid Claude installation found".to_string())
     }
+}
+
+/// Best-effort Claude Code binary discovery.
+///
+/// Returns `None` if Claude Code is not installed or not discoverable.
+/// This is useful when Claude Code is an optional integration.
+pub fn try_find_claude_binary() -> Option<String> {
+    find_claude_binary().ok()
 }
 
 /// Discover all Claude installations on the system
@@ -95,3 +105,6 @@ fn select_best_installation(installations: Vec<ClaudeInstallation>) -> Option<Cl
 }
 
 pub use command::create_command_with_env;
+pub use command::create_tokio_command_with_env;
+pub use runner::{spawn_claude_code_cli, ClaudeCodeCliConfig};
+pub(crate) use stream_json::ClaudeStreamJsonParser;

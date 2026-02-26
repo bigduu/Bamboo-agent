@@ -44,7 +44,7 @@ use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
 use thiserror::Error;
 
-use crate::agent::core::tools::{FunctionSchema, ToolError, ToolResult, ToolSchema};
+use crate::agent::core::tools::{FunctionSchema, ToolError, ToolExecutionContext, ToolResult, ToolSchema};
 
 /// Trait for implementing executable tools.
 ///
@@ -106,6 +106,18 @@ pub trait Tool: Send + Sync {
     fn parameters_schema(&self) -> serde_json::Value;
     /// Execute the tool with given arguments.
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError>;
+
+    /// Execute the tool with a streaming-capable context.
+    ///
+    /// Default implementation falls back to `execute()` for tools that don't
+    /// need streaming.
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        _ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        self.execute(args).await
+    }
 
     /// Convert tool to LLM-compatible schema.
     ///

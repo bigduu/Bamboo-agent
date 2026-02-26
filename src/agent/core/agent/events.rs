@@ -89,6 +89,17 @@ pub enum AgentEvent {
         content: String,
     },
 
+    /// Streaming output emitted while a specific tool call is running.
+    ///
+    /// This is used to render "live output" inside a tool-call card in the UI
+    /// without mixing tool output into the assistant's main token stream.
+    ToolToken {
+        /// Tool call identifier that this output belongs to.
+        tool_call_id: String,
+        /// Output chunk.
+        content: String,
+    },
+
     /// Tool execution started.
     ToolStart {
         /// Unique tool call identifier

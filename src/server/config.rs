@@ -23,6 +23,38 @@ use actix_cors::Cors;
 use actix_web::http::header;
 use actix_web::middleware::DefaultHeaders;
 use log::info;
+use log::warn;
+
+// Keep the default CSP strict (no `unsafe-*`) to avoid weakening XSS protections.
+// If your UI requires inline scripts/styles or eval-like behavior, override with
+// `BAMBOO_CSP` at runtime.
+const DEFAULT_CSP: &str = concat!(
+    "default-src 'self'; ",
+    "base-uri 'self'; ",
+    "object-src 'none'; ",
+    "frame-ancestors 'none'; ",
+    "script-src 'self'; ",
+    "style-src 'self'; ",
+    "img-src 'self' data: https:; ",
+    "font-src 'self' data:; ",
+    "connect-src 'self' ws: wss:; ",
+    "form-action 'self';"
+);
+
+fn resolve_csp_header_value(override_value: Option<&str>) -> header::HeaderValue {
+    let csp = override_value.unwrap_or(DEFAULT_CSP);
+    match header::HeaderValue::from_str(csp) {
+        Ok(v) => v,
+        Err(e) => {
+            // Avoid failing to start due to a malformed override; fall back to the safe default.
+            warn!(
+                "Invalid BAMBOO_CSP value ({}); falling back to DEFAULT_CSP",
+                e
+            );
+            header::HeaderValue::from_static(DEFAULT_CSP)
+        }
+    }
+}
 
 /// Build security headers middleware for production deployments
 ///
@@ -43,13 +75,16 @@ use log::info;
 ///     .wrap(build_security_headers());
 /// ```
 pub fn build_security_headers() -> DefaultHeaders {
+    let csp_override = std::env::var("BAMBOO_CSP").ok();
+    let csp_value = resolve_csp_header_value(csp_override.as_deref());
+
     DefaultHeaders::new()
         .add(("X-Frame-Options", "DENY"))
         .add(("X-Content-Type-Options", "nosniff"))
         .add(("X-XSS-Protection", "1; mode=block"))
         .add(("Referrer-Policy", "strict-origin-when-cross-origin"))
-        // Note: CSP should be customized based on your specific needs
-        .add(("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' ws: wss;"))
+        // Note: customize at runtime via `BAMBOO_CSP` if your frontend requires a relaxed policy.
+        .add((header::CONTENT_SECURITY_POLICY, csp_value))
 }
 
 /// Build CORS middleware based on bind address and port
@@ -127,4 +162,22 @@ pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
     };
 
     cors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_csp_has_no_unsafe_keywords() {
+        assert!(!DEFAULT_CSP.contains("unsafe-inline"));
+        assert!(!DEFAULT_CSP.contains("unsafe-eval"));
+    }
+
+    #[test]
+    fn invalid_override_falls_back_to_default() {
+        // Header values cannot contain newlines.
+        let v = resolve_csp_header_value(Some("default-src 'self'\nscript-src 'self'"));
+        assert_eq!(v, header::HeaderValue::from_static(DEFAULT_CSP));
+    }
 }

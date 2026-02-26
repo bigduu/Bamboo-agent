@@ -1,10 +1,7 @@
 use log::{debug, info};
-use std::process::Command;
 
-pub fn create_command_with_env(program: &str) -> Command {
-    let mut cmd = Command::new(program);
-
-    info!("Creating command for: {}", program);
+fn collect_inherited_env(program: &str) -> Vec<(String, String)> {
+    let mut envs: Vec<(String, String)> = Vec::new();
 
     for (key, value) in std::env::vars() {
         if key == "PATH"
@@ -25,10 +22,61 @@ pub fn create_command_with_env(program: &str) -> Command {
             || key == "ALL_PROXY"
         {
             debug!("Inheriting env var: {}={}", key, value);
-            cmd.env(&key, &value);
+            envs.push((key, value));
         }
     }
 
+    // Ensure PATH contains the directory of the selected binary for common install layouts.
+    let mut path_value = envs
+        .iter()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+
+    if program.contains("/.nvm/versions/node/") {
+        if let Some(node_bin_dir) = std::path::Path::new(program).parent() {
+            let node_bin_str = node_bin_dir.to_string_lossy();
+            if !path_value.contains(node_bin_str.as_ref()) {
+                let joined = std::env::join_paths(
+                    std::iter::once(node_bin_dir.to_path_buf()).chain(std::env::split_paths(
+                        &path_value,
+                    )),
+                )
+                .map(|os| os.to_string_lossy().to_string())
+                .unwrap_or_else(|_| format!("{}:{}", node_bin_str, path_value));
+                debug!("Adding NVM bin directory to PATH: {}", node_bin_str);
+                path_value = joined;
+            }
+        }
+    }
+
+    if program.contains("/homebrew/") || program.contains("/opt/homebrew/") {
+        if let Some(program_dir) = std::path::Path::new(program).parent() {
+            let homebrew_bin_str = program_dir.to_string_lossy();
+            if !path_value.contains(homebrew_bin_str.as_ref()) {
+                let joined = std::env::join_paths(
+                    std::iter::once(program_dir.to_path_buf()).chain(std::env::split_paths(
+                        &path_value,
+                    )),
+                )
+                .map(|os| os.to_string_lossy().to_string())
+                .unwrap_or_else(|_| format!("{}:{}", homebrew_bin_str, path_value));
+                debug!("Adding Homebrew bin directory to PATH: {}", homebrew_bin_str);
+                path_value = joined;
+            }
+        }
+    }
+
+    if let Some((_, v)) = envs.iter_mut().find(|(k, _)| k == "PATH") {
+        *v = path_value;
+    } else if !path_value.is_empty() {
+        envs.push(("PATH".to_string(), path_value));
+    }
+
+    envs
+}
+
+fn log_proxy_settings() {
     info!("Command will use proxy settings:");
     if let Ok(http_proxy) = std::env::var("HTTP_PROXY") {
         info!("  HTTP_PROXY={}", http_proxy);
@@ -36,41 +84,25 @@ pub fn create_command_with_env(program: &str) -> Command {
     if let Ok(https_proxy) = std::env::var("HTTPS_PROXY") {
         info!("  HTTPS_PROXY={}", https_proxy);
     }
+}
 
-    if program.contains("/.nvm/versions/node/") {
-        if let Some(node_bin_dir) = std::path::Path::new(program).parent() {
-            let current_path = std::env::var("PATH").unwrap_or_default();
-            let node_bin_str = node_bin_dir.to_string_lossy();
-            if !current_path.contains(node_bin_str.as_ref()) {
-                let new_path = std::env::join_paths(
-                    std::iter::once(node_bin_dir.to_path_buf())
-                        .chain(std::env::split_paths(&current_path)),
-                )
-                .unwrap_or_else(|_| format!("{}:{}", node_bin_str, current_path).into());
-                debug!("Adding NVM bin directory to PATH: {}", node_bin_str);
-                cmd.env("PATH", new_path);
-            }
-        }
+pub fn create_command_with_env(program: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    info!("Creating command for: {}", program);
+    for (key, value) in collect_inherited_env(program) {
+        cmd.env(&key, &value);
     }
+    log_proxy_settings();
+    cmd
+}
 
-    if program.contains("/homebrew/") || program.contains("/opt/homebrew/") {
-        if let Some(program_dir) = std::path::Path::new(program).parent() {
-            let current_path = std::env::var("PATH").unwrap_or_default();
-            let homebrew_bin_str = program_dir.to_string_lossy();
-            if !current_path.contains(homebrew_bin_str.as_ref()) {
-                let new_path = std::env::join_paths(
-                    std::iter::once(program_dir.to_path_buf())
-                        .chain(std::env::split_paths(&current_path)),
-                )
-                .unwrap_or_else(|_| format!("{}:{}", homebrew_bin_str, current_path).into());
-                debug!(
-                    "Adding Homebrew bin directory to PATH: {}",
-                    homebrew_bin_str
-                );
-                cmd.env("PATH", new_path);
-            }
-        }
+pub fn create_tokio_command_with_env(program: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    info!("Creating tokio command for: {}", program);
+    for (key, value) in collect_inherited_env(program) {
+        cmd.env(&key, &value);
     }
+    log_proxy_settings();
 
     cmd
 }

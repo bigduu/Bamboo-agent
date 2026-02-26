@@ -12,6 +12,7 @@ use crate::agent::core::composition::{CompositionExecutor, ExecutionContext, Too
 use crate::agent::core::tools::{ToolCall, ToolResult, ToolSchema};
 
 use super::result_handler::parse_tool_args;
+use super::ToolExecutionContext;
 
 /// Errors that can occur during tool execution
 #[derive(Error, Debug, Clone)]
@@ -74,6 +75,18 @@ pub trait ToolExecutor: Send + Sync {
     /// The tool execution result or an error
     async fn execute(&self, call: &ToolCall) -> Result<ToolResult>;
 
+    /// Executes a tool call with streaming-capable context.
+    ///
+    /// Default implementation falls back to `execute()` for executors that don't
+    /// support streaming (e.g. remote MCP tools).
+    async fn execute_with_context(
+        &self,
+        call: &ToolCall,
+        _ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolResult> {
+        self.execute(call).await
+    }
+
     /// Lists all available tools and their schemas
     ///
     /// Returns schemas for all tools that can be executed via this executor
@@ -117,19 +130,35 @@ pub async fn execute_tool_call(
     tools: &dyn ToolExecutor,
     composition_executor: Option<Arc<CompositionExecutor>>,
 ) -> Result<ToolResult> {
+    execute_tool_call_with_context(
+        tool_call,
+        tools,
+        composition_executor,
+        ToolExecutionContext::none(&tool_call.id),
+    )
+    .await
+}
+
+/// Like [`execute_tool_call`], but provides a context to support streaming tools.
+pub async fn execute_tool_call_with_context(
+    tool_call: &ToolCall,
+    tools: &dyn ToolExecutor,
+    composition_executor: Option<Arc<CompositionExecutor>>,
+    ctx: ToolExecutionContext<'_>,
+) -> Result<ToolResult> {
     if let Some(executor) = composition_executor {
         let args = parse_tool_args(&tool_call.function.arguments)?;
         let expr = ToolExpr::call(tool_call.function.name.clone(), args);
-        let mut ctx = ExecutionContext::new();
+        let mut exec_ctx = ExecutionContext::new();
 
-        match executor.execute(&expr, &mut ctx).await {
+        match executor.execute(&expr, &mut exec_ctx).await {
             Ok(result) => return Ok(result),
             Err(ToolError::NotFound(_)) => {}
             Err(error) => return Err(error),
         }
     }
 
-    tools.execute(tool_call).await
+    tools.execute_with_context(tool_call, ctx).await
 }
 
 #[cfg(test)]
