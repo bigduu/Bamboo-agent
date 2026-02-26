@@ -105,7 +105,9 @@ impl ClaudeStreamJsonParser {
                     .iter()
                     .filter_map(|b| {
                         if b.get("type").and_then(|v| v.as_str()) == Some("text") {
-                            b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                            b.get("text")
+                                .and_then(|t| t.as_str())
+                                .map(|s| s.to_string())
                         } else {
                             None
                         }
@@ -211,7 +213,9 @@ mod tests {
 
         let b = r#"{"type":"assistant","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"Hello world"}]}}"#;
         let events = p.parse_line(b);
-        assert!(matches!(events.as_slice(), [AgentEvent::Token { content }] if content == " world"));
+        assert!(
+            matches!(events.as_slice(), [AgentEvent::Token { content }] if content == " world")
+        );
     }
 
     #[test]

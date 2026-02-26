@@ -44,7 +44,9 @@ use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
 use thiserror::Error;
 
-use crate::agent::core::tools::{FunctionSchema, ToolError, ToolExecutionContext, ToolResult, ToolSchema};
+use crate::agent::core::tools::{
+    FunctionSchema, ToolError, ToolExecutionContext, ToolResult, ToolSchema,
+};
 
 /// Trait for implementing executable tools.
 ///

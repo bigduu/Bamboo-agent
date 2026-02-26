@@ -85,7 +85,8 @@ impl Tool for ClaudeCodeTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("claude_code")).await
+        self.execute_with_context(args, ToolExecutionContext::none("claude_code"))
+            .await
     }
 
     async fn execute_with_context(
@@ -145,9 +146,9 @@ impl Tool for ClaudeCodeTool {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| {
-            ToolError::Execution(format!("Failed to spawn Claude Code CLI: {e}"))
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ToolError::Execution(format!("Failed to spawn Claude Code CLI: {e}")))?;
 
         let stdout = child
             .stdout

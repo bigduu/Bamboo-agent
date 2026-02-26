@@ -412,10 +412,11 @@ impl AppState {
 
         // Discover Claude Code CLI once at startup. This is optional.
         // We do it early so we can conditionally register the `claude_code` tool.
-        let claude_cli_path = tokio::task::spawn_blocking(|| crate::claude::try_find_claude_binary())
-            .await
-            .ok()
-            .flatten();
+        let claude_cli_path =
+            tokio::task::spawn_blocking(|| crate::claude::try_find_claude_binary())
+                .await
+                .ok()
+                .flatten();
 
         if let Some(ref path) = claude_cli_path {
             log::info!("Claude Code CLI enabled (found at: {})", path);
@@ -435,11 +436,12 @@ impl AppState {
         let config = Arc::new(RwLock::new(config));
 
         // Initialize built-in tools (with optional Claude Code tool)
-        let builtin_executor = crate::agent::tools::BuiltinToolExecutor::new_with_config(config.clone());
+        let builtin_executor =
+            crate::agent::tools::BuiltinToolExecutor::new_with_config(config.clone());
         if let Some(ref path) = claude_cli_path {
-            if let Err(e) = builtin_executor
-                .register_tool(crate::agent::tools::tools::ClaudeCodeTool::new(path.clone()))
-            {
+            if let Err(e) = builtin_executor.register_tool(
+                crate::agent::tools::tools::ClaudeCodeTool::new(path.clone()),
+            ) {
                 log::warn!("Failed to register claude_code tool: {}", e);
             }
         }
@@ -449,7 +451,7 @@ impl AppState {
         let mcp_manager = Arc::new(McpServerManager::new());
 
         // Try to load MCP config and initialize servers
-        let mcp_config = Self::load_mcp_config(&data_dir).await;
+        let mcp_config = config.read().await.mcp.clone();
         mcp_manager.initialize_from_config(&mcp_config).await;
 
         // Create composite tool executor (builtin + MCP)
@@ -660,6 +662,17 @@ impl AppState {
         new_config
     }
 
+    /// Persist the current in-memory config to disk (`{app_data_dir}/config.json`).
+    ///
+    /// This is the single "exit" for configuration writes in the server runtime.
+    pub async fn persist_config(&self) -> anyhow::Result<()> {
+        let config = self.config.read().await.clone();
+        tokio::task::spawn_blocking(move || config.save())
+            .await
+            .map_err(|e| anyhow::anyhow!("Config save task failed: {e}"))??;
+        Ok(())
+    }
+
     /// Get a clone of the current provider
     ///
     /// Returns a thread-safe reference to the current LLM provider.
@@ -735,48 +748,6 @@ impl AppState {
     /// Vector of tool schemas in Anthropic's tool definition format.
     pub fn get_all_tool_schemas(&self) -> Vec<crate::agent::core::tools::ToolSchema> {
         self.tools.list_tools()
-    }
-
-    /// Load MCP configuration from file
-    ///
-    /// Reads the MCP server configuration from `{app_data_dir}/mcp.json`.
-    /// Returns a default (empty) configuration if the file doesn't exist
-    /// or cannot be parsed.
-    ///
-    /// # Arguments
-    ///
-    /// * `app_data_root` - Root directory containing mcp.json
-    ///
-    /// # Returns
-    ///
-    /// The loaded MCP configuration, or default if loading fails.
-    async fn load_mcp_config(app_data_root: &std::path::Path) -> crate::agent::mcp::McpConfig {
-        let config_path = app_data_root.join("mcp.json");
-
-        if !config_path.exists() {
-            log::info!(
-                "No MCP config file found at {:?}, using default",
-                config_path
-            );
-            return crate::agent::mcp::McpConfig::default();
-        }
-
-        match tokio::fs::read_to_string(&config_path).await {
-            Ok(content) => match serde_json::from_str::<crate::agent::mcp::McpConfig>(&content) {
-                Ok(config) => {
-                    log::info!("Loaded MCP config with {} servers", config.servers.len());
-                    config
-                }
-                Err(e) => {
-                    log::error!("Failed to parse MCP config: {}", e);
-                    crate::agent::mcp::McpConfig::default()
-                }
-            },
-            Err(e) => {
-                log::error!("Failed to read MCP config: {}", e);
-                crate::agent::mcp::McpConfig::default()
-            }
-        }
     }
 }
 

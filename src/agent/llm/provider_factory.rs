@@ -7,43 +7,13 @@ use crate::agent::llm::providers::common::MaskingProviderDecorator;
 use crate::agent::llm::providers::{
     AnthropicProvider, CopilotProvider, GeminiProvider, OpenAIProvider,
 };
-use crate::core::keyword_masking::KeywordMaskingConfig;
-use crate::core::paths::{bamboo_dir, keyword_masking_json_path};
+use crate::core::paths::bamboo_dir;
 use crate::core::Config;
 use reqwest::Client;
 use std::sync::Arc;
 
 /// Available provider types
 pub const AVAILABLE_PROVIDERS: &[&str] = &["copilot", "openai", "anthropic", "gemini"];
-
-/// Load keyword masking configuration.
-fn load_masking_config() -> KeywordMaskingConfig {
-    let path = keyword_masking_json_path();
-    if !path.exists() {
-        log::debug!("No keyword masking config found, using default");
-        return KeywordMaskingConfig::default();
-    }
-
-    match std::fs::read_to_string(&path) {
-        Ok(content) => match serde_json::from_str::<KeywordMaskingConfig>(&content) {
-            Ok(config) => {
-                log::info!(
-                    "Loaded keyword masking config with {} entries",
-                    config.entries.len()
-                );
-                config
-            }
-            Err(e) => {
-                log::warn!("Failed to parse masking config: {}", e);
-                KeywordMaskingConfig::default()
-            }
-        },
-        Err(e) => {
-            log::warn!("Failed to read masking config: {}", e);
-            KeywordMaskingConfig::default()
-        }
-    }
-}
 
 fn build_http_client(config: &Config) -> Result<Client, LLMError> {
     crate::agent::llm::http_client::build_http_client(config)
@@ -61,7 +31,7 @@ pub async fn create_provider_with_dir(
     app_data_dir: std::path::PathBuf,
 ) -> Result<Arc<dyn LLMProvider>, LLMError> {
     // Load masking config once (applies to all providers).
-    let masking_config = load_masking_config();
+    let masking_config = config.keyword_masking.clone();
     let http_client = build_http_client(config)?;
 
     match config.provider.as_str() {

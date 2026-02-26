@@ -5,7 +5,7 @@ use crate::agent::llm::api::models::{
     ContentPart, FunctionCall, ImageUrl, Role, StreamToolCall, Tool, ToolCall, ToolChoice, Usage,
 };
 use crate::agent::llm::protocol::FromProvider;
-use crate::server::services::anthropic_model_mapping_service::load_anthropic_model_mapping;
+use crate::core::model_mapping::AnthropicModelMapping;
 use crate::server::{
     app_state::AppState, error::AppError, model_config_helper::get_default_model_from_config,
 };
@@ -195,11 +195,9 @@ pub async fn messages(
     let request = req.into_inner();
     let response_model = request.model.clone();
 
-    let resolution = match resolve_model(&app_state.app_data_dir, &response_model).await {
-        Ok(resolution) => resolution,
-        Err(err) => {
-            return Ok(anthropic_error_response(err));
-        }
+    let resolution = {
+        let config = app_state.config.read().await;
+        resolve_model(&config.anthropic_model_mapping, &response_model)
     };
 
     let mut openai_request = match convert_messages_request(request) {
@@ -433,11 +431,9 @@ pub async fn complete(
     let request = req.into_inner();
     let response_model = request.model.clone();
 
-    let resolution = match resolve_model(&app_state.app_data_dir, &response_model).await {
-        Ok(resolution) => resolution,
-        Err(err) => {
-            return Ok(anthropic_error_response(err));
-        }
+    let resolution = {
+        let config = app_state.config.read().await;
+        resolve_model(&config.anthropic_model_mapping, &response_model)
     };
 
     let mut openai_request = match convert_complete_request(request) {
@@ -734,20 +730,7 @@ impl AnthropicError {
     }
 }
 
-async fn resolve_model(
-    data_dir: &std::path::Path,
-    model: &str,
-) -> Result<ModelResolution, AnthropicError> {
-    let mapping = load_anthropic_model_mapping(data_dir)
-        .await
-        .map_err(|err| {
-            AnthropicError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "api_error",
-                format!("Failed to load model mapping: {}", err),
-            )
-        })?;
-
+fn resolve_model(mapping: &AnthropicModelMapping, model: &str) -> ModelResolution {
     log::info!(
         "Resolving model '{}', available mappings: {:?}",
         model,
@@ -768,10 +751,10 @@ async fn resolve_model(
             "No Anthropic model mapping found for '{}', falling back to default model",
             model
         );
-        return Ok(ModelResolution {
+        return ModelResolution {
             mapped_model: String::new(),
             response_model: model.to_string(),
-        });
+        };
     };
 
     if let Some(mapped) = mapping
@@ -785,10 +768,10 @@ async fn resolve_model(
             model_type,
             mapped
         );
-        return Ok(ModelResolution {
+        return ModelResolution {
             mapped_model: mapped.to_string(),
             response_model: model.to_string(),
-        });
+        };
     }
 
     log::warn!(
@@ -796,10 +779,10 @@ async fn resolve_model(
         model_type
     );
 
-    Ok(ModelResolution {
+    ModelResolution {
         mapped_model: String::new(),
         response_model: model.to_string(),
-    })
+    }
 }
 
 fn anthropic_error_response(error: AnthropicError) -> HttpResponse {

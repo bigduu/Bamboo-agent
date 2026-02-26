@@ -1,47 +1,10 @@
-use crate::server::error::AppError;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::Path;
-use tokio::fs;
+use crate::core::model_mapping::GeminiModelMapping;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct GeminiModelMapping {
-    #[serde(default)]
-    pub mappings: HashMap<String, String>,
-}
-
-pub async fn load_gemini_model_mapping(data_dir: &Path) -> Result<GeminiModelMapping, AppError> {
-    let path = data_dir.join("gemini-model-mapping.json");
-    match fs::read(&path).await {
-        Ok(content) => {
-            let mapping = serde_json::from_slice::<GeminiModelMapping>(&content)?;
-            Ok(mapping)
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // Return default mapping if file doesn't exist
-            Ok(GeminiModelMapping::default())
-        }
-        Err(err) => Err(AppError::StorageError(err)),
-    }
-}
-
-pub async fn save_gemini_model_mapping(
-    data_dir: &Path,
-    mapping: GeminiModelMapping,
-) -> Result<GeminiModelMapping, AppError> {
-    let path = data_dir.join("gemini-model-mapping.json");
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    let data = serde_json::to_vec_pretty(&mapping)?;
-    fs::write(path, data).await?;
-    Ok(mapping)
-}
-
-/// Resolve a Gemini model name to the actual backend model
-pub async fn resolve_model(data_dir: &Path, gemini_model: &str) -> anyhow::Result<ModelResolution> {
-    let mapping = load_gemini_model_mapping(data_dir).await?;
-
+/// Resolve a Gemini model name to the actual backend model.
+///
+/// This no longer performs any file I/O. The mapping should be sourced from the
+/// unified `Config` (`config.gemini_model_mapping`) and passed in.
+pub fn resolve_model(mapping: &GeminiModelMapping, gemini_model: &str) -> ModelResolution {
     log::info!(
         "Resolving Gemini model '{}', available mappings: {:?}",
         gemini_model,
@@ -68,10 +31,10 @@ pub async fn resolve_model(data_dir: &Path, gemini_model: &str) -> anyhow::Resul
             "No Gemini model mapping found for '{}', falling back to default model",
             gemini_model
         );
-        return Ok(ModelResolution {
+        return ModelResolution {
             mapped_model: String::new(),
             response_model: gemini_model.to_string(),
-        });
+        };
     };
 
     if let Some(mapped) = mapping
@@ -85,10 +48,10 @@ pub async fn resolve_model(data_dir: &Path, gemini_model: &str) -> anyhow::Resul
             model_type,
             mapped
         );
-        return Ok(ModelResolution {
+        return ModelResolution {
             mapped_model: mapped.to_string(),
             response_model: gemini_model.to_string(),
-        });
+        };
     }
 
     log::warn!(
@@ -96,10 +59,10 @@ pub async fn resolve_model(data_dir: &Path, gemini_model: &str) -> anyhow::Resul
         model_type
     );
 
-    Ok(ModelResolution {
+    ModelResolution {
         mapped_model: String::new(),
         response_model: gemini_model.to_string(),
-    })
+    }
 }
 
 #[derive(Clone)]

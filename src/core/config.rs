@@ -55,6 +55,9 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 
+use crate::core::keyword_masking::KeywordMaskingConfig;
+use crate::core::model_mapping::{AnthropicModelMapping, GeminiModelMapping};
+
 /// Main configuration structure for Bamboo agent
 ///
 /// Contains all settings needed to run the agent, including provider credentials,
@@ -99,6 +102,30 @@ pub struct Config {
     /// Data directory path (defaults to ~/.bamboo)
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+
+    /// Global keyword masking configuration.
+    ///
+    /// Previously persisted in `keyword_masking.json` (now unified into `config.json`).
+    #[serde(default)]
+    pub keyword_masking: KeywordMaskingConfig,
+
+    /// Anthropic model mapping configuration.
+    ///
+    /// Previously persisted in `anthropic-model-mapping.json` (now unified into `config.json`).
+    #[serde(default)]
+    pub anthropic_model_mapping: AnthropicModelMapping,
+
+    /// Gemini model mapping configuration.
+    ///
+    /// Previously persisted in `gemini-model-mapping.json` (now unified into `config.json`).
+    #[serde(default)]
+    pub gemini_model_mapping: GeminiModelMapping,
+
+    /// MCP server configuration.
+    ///
+    /// Previously persisted in `mcp.json` (now unified into `config.json`).
+    #[serde(default)]
+    pub mcp: crate::agent::mcp::McpConfig,
 
     /// Extension fields stored at the root of `config.json`.
     ///
@@ -433,6 +460,10 @@ impl Config {
         // Decrypt encrypted proxy auth into in-memory plaintext form.
         config.hydrate_proxy_auth_from_encrypted();
 
+        // Best-effort migration from legacy sidecar config files into unified config.json.
+        // This keeps config state globally unified going forward without breaking existing installs.
+        config.migrate_legacy_sidecar_configs();
+
         // Apply environment variable overrides (highest priority)
         if let Ok(port) = std::env::var("BAMBOO_PORT") {
             if let Ok(port) = port.parse() {
@@ -516,6 +547,10 @@ impl Config {
             providers: ProviderConfigs::default(),
             server: ServerConfig::default(),
             data_dir: default_data_dir(),
+            keyword_masking: KeywordMaskingConfig::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            gemini_model_mapping: GeminiModelMapping::default(),
+            mcp: crate::agent::mcp::McpConfig::default(),
             extra: BTreeMap::new(),
         }
     }
@@ -543,6 +578,133 @@ impl Config {
 
         Ok(())
     }
+
+    fn migrate_legacy_sidecar_configs(&mut self) {
+        let data_dir = self.data_dir.clone();
+        let mut changed = false;
+
+        // keyword_masking.json -> config.keyword_masking
+        if self.keyword_masking.entries.is_empty() {
+            let path = data_dir.join("keyword_masking.json");
+            if path.exists() {
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => match serde_json::from_str::<KeywordMaskingConfig>(&content) {
+                        Ok(km) => {
+                            self.keyword_masking = km;
+                            changed = true;
+                            let _ = backup_legacy_file(&path);
+                        }
+                        Err(e) => log::warn!(
+                            "Failed to migrate keyword_masking.json into config.json: {}",
+                            e
+                        ),
+                    },
+                    Err(e) => {
+                        log::warn!("Failed to read keyword_masking.json for migration: {}", e)
+                    }
+                }
+            }
+        }
+
+        // anthropic-model-mapping.json -> config.anthropic_model_mapping
+        if self.anthropic_model_mapping.mappings.is_empty() {
+            let path = data_dir.join("anthropic-model-mapping.json");
+            if path.exists() {
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => match serde_json::from_str::<AnthropicModelMapping>(&content) {
+                        Ok(mapping) => {
+                            self.anthropic_model_mapping = mapping;
+                            changed = true;
+                            let _ = backup_legacy_file(&path);
+                        }
+                        Err(e) => log::warn!(
+                            "Failed to migrate anthropic-model-mapping.json into config.json: {}",
+                            e
+                        ),
+                    },
+                    Err(e) => log::warn!(
+                        "Failed to read anthropic-model-mapping.json for migration: {}",
+                        e
+                    ),
+                }
+            }
+        }
+
+        // gemini-model-mapping.json -> config.gemini_model_mapping
+        if self.gemini_model_mapping.mappings.is_empty() {
+            let path = data_dir.join("gemini-model-mapping.json");
+            if path.exists() {
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => match serde_json::from_str::<GeminiModelMapping>(&content) {
+                        Ok(mapping) => {
+                            self.gemini_model_mapping = mapping;
+                            changed = true;
+                            let _ = backup_legacy_file(&path);
+                        }
+                        Err(e) => log::warn!(
+                            "Failed to migrate gemini-model-mapping.json into config.json: {}",
+                            e
+                        ),
+                    },
+                    Err(e) => log::warn!(
+                        "Failed to read gemini-model-mapping.json for migration: {}",
+                        e
+                    ),
+                }
+            }
+        }
+
+        // mcp.json -> config.mcp
+        if self.mcp.servers.is_empty() {
+            let path = data_dir.join("mcp.json");
+            if path.exists() {
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => {
+                        match serde_json::from_str::<crate::agent::mcp::McpConfig>(&content) {
+                            Ok(mcp) => {
+                                self.mcp = mcp;
+                                changed = true;
+                                let _ = backup_legacy_file(&path);
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to migrate mcp.json into config.json: {}", e)
+                            }
+                        }
+                    }
+                    Err(e) => log::warn!("Failed to read mcp.json for migration: {}", e),
+                }
+            }
+        }
+
+        // permissions.json -> config.extra["permissions"]
+        if !self.extra.contains_key("permissions") {
+            let path = data_dir.join("permissions.json");
+            if path.exists() {
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => match serde_json::from_str::<Value>(&content) {
+                        Ok(value) => {
+                            self.extra.insert("permissions".to_string(), value);
+                            changed = true;
+                            let _ = backup_legacy_file(&path);
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to migrate permissions.json into config.json: {}", e)
+                        }
+                    },
+                    Err(e) => log::warn!("Failed to read permissions.json for migration: {}", e),
+                }
+            }
+        }
+
+        if changed {
+            if let Err(e) = self.save() {
+                log::warn!(
+                    "Failed to persist unified config.json after migration: {}",
+                    e
+                );
+            }
+        }
+    }
 }
 
 fn write_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
@@ -558,11 +720,7 @@ fn write_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("config.json");
-    let tmp_name = format!(
-        ".{}.tmp.{}",
-        file_name,
-        std::process::id()
-    );
+    let tmp_name = format!(".{}.tmp.{}", file_name, std::process::id());
     let tmp_path = parent.join(tmp_name);
 
     {
@@ -572,6 +730,21 @@ fn write_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     }
 
     std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+fn backup_legacy_file(path: &std::path::Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return Ok(());
+    };
+    let backup = parent.join(format!("{name}.migrated.bak"));
+    if backup.exists() {
+        return Ok(());
+    }
+    std::fs::rename(path, backup)?;
     Ok(())
 }
 
@@ -603,6 +776,15 @@ struct OldConfig {
     providers: ProviderConfigs,
     #[serde(default)]
     data_dir: Option<PathBuf>,
+
+    #[serde(default)]
+    keyword_masking: KeywordMaskingConfig,
+    #[serde(default)]
+    anthropic_model_mapping: AnthropicModelMapping,
+    #[serde(default)]
+    gemini_model_mapping: GeminiModelMapping,
+    #[serde(default)]
+    mcp: crate::agent::mcp::McpConfig,
 
     /// Preserve unknown root keys for forward compatibility.
     #[serde(default, flatten)]
@@ -644,6 +826,10 @@ fn migrate_config(old: OldConfig) -> Config {
         providers: old.providers,
         server: old.server,
         data_dir: old.data_dir.unwrap_or_else(default_data_dir),
+        keyword_masking: old.keyword_masking,
+        anthropic_model_mapping: old.anthropic_model_mapping,
+        gemini_model_mapping: old.gemini_model_mapping,
+        mcp: old.mcp,
         extra: old.extra,
     }
 }
@@ -707,7 +893,8 @@ mod tests {
             // Treat `path` as the Bamboo data dir and write `config.json` into it.
             // Tests should prefer BAMBOO_DATA_DIR over HOME to avoid global env contention.
             std::fs::create_dir_all(&self.path).expect("failed to create config dir");
-            std::fs::write(self.path.join("config.json"), content).expect("failed to write config.json");
+            std::fs::write(self.path.join("config.json"), content)
+                .expect("failed to write config.json");
         }
     }
 
@@ -956,9 +1143,9 @@ mod tests {
 
         // Use a stable encryption key so this test doesn't depend on host identifiers.
         let key_guard = crate::core::encryption::set_test_encryption_key([
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
-            0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
-            0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
         ]);
 
         let auth = ProxyAuth {
@@ -988,9 +1175,9 @@ mod tests {
 
         // Use a stable encryption key so this test doesn't depend on host identifiers.
         let key_guard = crate::core::encryption::set_test_encryption_key([
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
-            0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
-            0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
         ]);
 
         let mut config = Config::from_data_dir(Some(temp_home.path.clone()));
@@ -1000,8 +1187,8 @@ mod tests {
         });
         config.save().expect("save should encrypt proxy auth");
 
-        let content = std::fs::read_to_string(temp_home.path.join("config.json"))
-            .expect("read config.json");
+        let content =
+            std::fs::read_to_string(temp_home.path.join("config.json")).expect("read config.json");
         assert!(
             content.contains("proxy_auth_encrypted"),
             "config.json should store encrypted proxy auth"

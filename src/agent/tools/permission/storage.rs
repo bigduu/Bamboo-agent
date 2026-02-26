@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use crate::agent::tools::permission::config::{PermissionConfig, SerializablePermissionConfig};
+use crate::core::Config;
 
 /// Storage for permission configuration
 ///
@@ -39,6 +40,11 @@ impl PermissionStorage {
 
     /// Get the full path to the permission config file
     pub fn config_path(&self) -> PathBuf {
+        // Unified configuration: permissions are stored in `config.json`.
+        self.config_dir.join("config.json")
+    }
+
+    fn legacy_permissions_path(&self) -> PathBuf {
         self.config_dir.join(&self.filename)
     }
 
@@ -47,28 +53,69 @@ impl PermissionStorage {
     /// Returns `Ok(None)` if the file doesn't exist.
     /// Returns an error if the file exists but cannot be read or parsed.
     pub async fn load(&self) -> Result<Option<PermissionConfig>, PermissionStorageError> {
-        let path = self.config_path();
+        const KEY: &str = "permissions";
 
-        if !path.exists() {
+        // Load unified config.json first.
+        let config = Config::from_data_dir(Some(self.config_dir.clone()));
+        if let Some(value) = config.extra.get(KEY).cloned() {
+            let serializable: SerializablePermissionConfig = serde_json::from_value(value)
+                .map_err(|e| PermissionStorageError::ParseError {
+                    path: self.config_path(),
+                    source: e,
+                })?;
+            return Ok(Some(PermissionConfig::from_serializable(serializable)));
+        }
+
+        // Legacy migration: permissions.json -> config.json["permissions"]
+        let legacy = self.legacy_permissions_path();
+        if !legacy.exists() {
             return Ok(None);
         }
 
-        let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
+        let content = tokio::fs::read_to_string(&legacy).await.map_err(|e| {
             PermissionStorageError::ReadError {
-                path: path.clone(),
+                path: legacy.clone(),
                 source: e,
             }
         })?;
-
         if content.trim().is_empty() {
             return Ok(None);
         }
 
         let serializable: SerializablePermissionConfig =
             serde_json::from_str(&content).map_err(|e| PermissionStorageError::ParseError {
-                path: path.clone(),
+                path: legacy.clone(),
                 source: e,
             })?;
+
+        let mut config = config;
+        config.extra.insert(
+            KEY.to_string(),
+            serde_json::to_value(&serializable).map_err(|e| {
+                PermissionStorageError::SerializationError {
+                    path: self.config_path(),
+                    source: e,
+                }
+            })?,
+        );
+
+        // Persist unified config.
+        tokio::task::spawn_blocking(move || config.save())
+            .await
+            .map_err(|e| PermissionStorageError::WriteError {
+                path: self.config_path(),
+                source: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+            })?
+            .map_err(|e| PermissionStorageError::WriteError {
+                path: self.config_path(),
+                source: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+            })?;
+
+        // Best-effort backup legacy file.
+        if let Some(name) = legacy.file_name().and_then(|s| s.to_str()) {
+            let backup = legacy.with_file_name(format!("{name}.migrated.bak"));
+            let _ = tokio::fs::rename(&legacy, backup).await;
+        }
 
         Ok(Some(PermissionConfig::from_serializable(serializable)))
     }
@@ -87,31 +134,39 @@ impl PermissionStorage {
 
     /// Save permission configuration to storage
     pub async fn save(&self, config: &PermissionConfig) -> Result<(), PermissionStorageError> {
-        let path = self.config_path();
+        const KEY: &str = "permissions";
 
         // Ensure the config directory exists
         if !self.config_dir.exists() {
             tokio::fs::create_dir_all(&self.config_dir)
                 .await
                 .map_err(|e| PermissionStorageError::WriteError {
-                    path: path.clone(),
+                    path: self.config_path(),
                     source: e,
                 })?;
         }
 
         let serializable = config.to_serializable();
-        let content = serde_json::to_string_pretty(&serializable).map_err(|e| {
-            PermissionStorageError::SerializationError {
-                path: path.clone(),
-                source: e,
-            }
-        })?;
+        let mut root = Config::from_data_dir(Some(self.config_dir.clone()));
+        root.extra.insert(
+            KEY.to_string(),
+            serde_json::to_value(&serializable).map_err(|e| {
+                PermissionStorageError::SerializationError {
+                    path: self.config_path(),
+                    source: e,
+                }
+            })?,
+        );
 
-        tokio::fs::write(&path, content)
+        tokio::task::spawn_blocking(move || root.save())
             .await
             .map_err(|e| PermissionStorageError::WriteError {
-                path: path.clone(),
-                source: e,
+                path: self.config_path(),
+                source: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+            })?
+            .map_err(|e| PermissionStorageError::WriteError {
+                path: self.config_path(),
+                source: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
             })?;
 
         Ok(())

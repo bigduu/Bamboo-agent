@@ -3,6 +3,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::server::app_state::AppState;
 
+fn persist_config_error(message: impl Into<String>) -> HttpResponse {
+    HttpResponse::InternalServerError().json(serde_json::json!({
+        "error": message.into()
+    }))
+}
+
 // ============================================================================
 // Response Types
 // ============================================================================
@@ -101,29 +107,32 @@ pub struct ServerRequest {
 /// curl http://localhost:3000/mcp/servers
 /// ```
 pub async fn list_servers(state: web::Data<AppState>) -> impl Responder {
-    let server_ids = state.mcp_manager.list_servers();
-
-    let servers: Vec<ServerInfo> = server_ids
+    let config = state.config.read().await.clone();
+    let servers: Vec<ServerInfo> = config
+        .mcp
+        .servers
         .into_iter()
-        .filter_map(|id| {
-            state.mcp_manager.get_server_info(&id).map(|info| {
-                let _config = state
-                    .mcp_manager
-                    .list_servers()
-                    .into_iter()
-                    .find(|s| s == &id)
-                    .map(|_| id.clone());
-
-                ServerInfo {
-                    id: id.clone(),
-                    name: id.clone(), // TODO: get from config
-                    enabled: true,    // TODO: get from config
-                    status: info.status.to_string(),
-                    tool_count: info.tool_count,
-                    last_error: info.last_error,
-                    restart_count: info.restart_count,
-                }
-            })
+        .map(|server_cfg| {
+            let info = state.mcp_manager.get_server_info(&server_cfg.id);
+            let status = info
+                .as_ref()
+                .map(|i| i.status.to_string())
+                .unwrap_or_else(|| "disconnected".to_string());
+            let tool_count = info.as_ref().map(|i| i.tool_count).unwrap_or(0);
+            let last_error = info.as_ref().and_then(|i| i.last_error.clone());
+            let restart_count = info.as_ref().map(|i| i.restart_count).unwrap_or(0);
+            ServerInfo {
+                id: server_cfg.id.clone(),
+                name: server_cfg
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| server_cfg.id.clone()),
+                enabled: server_cfg.enabled,
+                status,
+                tool_count,
+                last_error,
+                restart_count,
+            }
         })
         .collect();
 
@@ -163,23 +172,35 @@ pub async fn list_servers(state: web::Data<AppState>) -> impl Responder {
 pub async fn get_server(state: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let server_id = path.into_inner();
 
-    match state.mcp_manager.get_server_info(&server_id) {
-        Some(info) => {
-            let server_info = ServerInfo {
-                id: server_id.clone(),
-                name: server_id.clone(),
-                enabled: true,
-                status: info.status.to_string(),
-                tool_count: info.tool_count,
-                last_error: info.last_error,
-                restart_count: info.restart_count,
-            };
-            HttpResponse::Ok().json(server_info)
-        }
-        None => HttpResponse::NotFound().json(serde_json::json!({
+    let config = state.config.read().await.clone();
+    let Some(server_cfg) = config.mcp.servers.iter().find(|s| s.id == server_id) else {
+        return HttpResponse::NotFound().json(serde_json::json!({
             "error": format!("Server '{}' not found", server_id)
-        })),
-    }
+        }));
+    };
+
+    let info = state.mcp_manager.get_server_info(&server_id);
+    let status = info
+        .as_ref()
+        .map(|i| i.status.to_string())
+        .unwrap_or_else(|| "disconnected".to_string());
+    let tool_count = info.as_ref().map(|i| i.tool_count).unwrap_or(0);
+    let last_error = info.as_ref().and_then(|i| i.last_error.clone());
+    let restart_count = info.as_ref().map(|i| i.restart_count).unwrap_or(0);
+    let server_info = ServerInfo {
+        id: server_cfg.id.clone(),
+        name: server_cfg
+            .name
+            .clone()
+            .unwrap_or_else(|| server_cfg.id.clone()),
+        enabled: server_cfg.enabled,
+        status,
+        tool_count,
+        last_error,
+        restart_count,
+    };
+
+    HttpResponse::Ok().json(server_info)
 }
 
 /// Adds a new MCP server
@@ -223,15 +244,32 @@ pub async fn add_server(
     let config = req.into_inner().config;
     let server_id = config.id.clone();
 
-    match state.mcp_manager.start_server(config).await {
-        Ok(_) => HttpResponse::Created().json(serde_json::json!({
-            "message": "Server started",
-            "server_id": server_id
-        })),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": format!("Failed to start server: {}", e)
-        })),
+    {
+        let mut root = state.config.write().await;
+        let existing = root.mcp.servers.iter_mut().find(|s| s.id == server_id);
+        if let Some(slot) = existing {
+            *slot = config.clone();
+        } else {
+            root.mcp.servers.push(config.clone());
+        }
     }
+
+    if let Err(e) = state.persist_config().await {
+        return persist_config_error(format!("Failed to save config: {e}"));
+    }
+
+    if config.enabled {
+        if let Err(e) = state.mcp_manager.start_server(config).await {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("Failed to start server: {}", e)
+            }));
+        }
+    }
+
+    HttpResponse::Created().json(serde_json::json!({
+        "message": "Server saved",
+        "server_id": server_id
+    }))
 }
 
 /// Updates an existing MCP server configuration
@@ -280,19 +318,34 @@ pub async fn update_server(
     let mut config = req.into_inner().config;
     config.id = server_id.clone();
 
-    // Stop existing server if running
-    let _ = state.mcp_manager.stop_server(&server_id).await;
-
-    // Start with new config
-    match state.mcp_manager.start_server(config).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({
-            "message": "Server updated",
-            "server_id": server_id
-        })),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": format!("Failed to update server: {}", e)
-        })),
+    {
+        let mut root = state.config.write().await;
+        let existing = root.mcp.servers.iter_mut().find(|s| s.id == server_id);
+        if let Some(slot) = existing {
+            *slot = config.clone();
+        } else {
+            root.mcp.servers.push(config.clone());
+        }
     }
+
+    if let Err(e) = state.persist_config().await {
+        return persist_config_error(format!("Failed to save config: {e}"));
+    }
+
+    // Apply runtime: stop existing server if running, then (re)start if enabled.
+    let _ = state.mcp_manager.stop_server(&server_id).await;
+    if config.enabled {
+        if let Err(e) = state.mcp_manager.start_server(config).await {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("Failed to update server: {}", e)
+            }));
+        }
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "message": "Server updated",
+        "server_id": server_id
+    }))
 }
 
 /// Deletes an MCP server (stops and removes it)
@@ -322,15 +375,20 @@ pub async fn update_server(
 pub async fn delete_server(state: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let server_id = path.into_inner();
 
-    match state.mcp_manager.stop_server(&server_id).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({
-            "message": "Server stopped and removed",
-            "server_id": server_id
-        })),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": format!("Failed to stop server: {}", e)
-        })),
+    {
+        let mut root = state.config.write().await;
+        root.mcp.servers.retain(|s| s.id != server_id);
     }
+
+    if let Err(e) = state.persist_config().await {
+        return persist_config_error(format!("Failed to save config: {e}"));
+    }
+
+    let _ = state.mcp_manager.stop_server(&server_id).await;
+    HttpResponse::Ok().json(serde_json::json!({
+        "message": "Server removed",
+        "server_id": server_id
+    }))
 }
 
 /// Connects/reconnects to an MCP server
@@ -359,17 +417,35 @@ pub async fn delete_server(state: web::Data<AppState>, path: web::Path<String>) 
 /// ```bash
 /// curl -X POST http://localhost:3000/mcp/servers/my-server/connect
 /// ```
-pub async fn connect_server(
-    _state: web::Data<AppState>,
-    path: web::Path<String>,
-) -> impl Responder {
+pub async fn connect_server(state: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let server_id = path.into_inner();
 
-    // TODO: Implement reconnect using stored config
-    HttpResponse::Ok().json(serde_json::json!({
-        "message": "Connect not fully implemented",
-        "server_id": server_id
-    }))
+    // Enable + start using the stored config.
+    let server_cfg = {
+        let mut root = state.config.write().await;
+        let Some(cfg) = root.mcp.servers.iter_mut().find(|s| s.id == server_id) else {
+            return HttpResponse::NotFound().json(serde_json::json!({
+                "error": format!("Server '{}' not found", server_id)
+            }));
+        };
+        cfg.enabled = true;
+        cfg.clone()
+    };
+
+    if let Err(e) = state.persist_config().await {
+        return persist_config_error(format!("Failed to save config: {e}"));
+    }
+
+    let _ = state.mcp_manager.stop_server(&server_id).await;
+    match state.mcp_manager.start_server(server_cfg).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({
+            "message": "Server connected",
+            "server_id": server_id
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("Failed to start server: {}", e)
+        })),
+    }
 }
 
 /// Disconnects an MCP server
@@ -401,6 +477,20 @@ pub async fn disconnect_server(
     path: web::Path<String>,
 ) -> impl Responder {
     let server_id = path.into_inner();
+
+    {
+        let mut root = state.config.write().await;
+        let Some(cfg) = root.mcp.servers.iter_mut().find(|s| s.id == server_id) else {
+            return HttpResponse::NotFound().json(serde_json::json!({
+                "error": format!("Server '{}' not found", server_id)
+            }));
+        };
+        cfg.enabled = false;
+    }
+
+    if let Err(e) = state.persist_config().await {
+        return persist_config_error(format!("Failed to save config: {e}"));
+    }
 
     match state.mcp_manager.stop_server(&server_id).await {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({

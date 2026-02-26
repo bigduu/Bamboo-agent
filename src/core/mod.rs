@@ -10,6 +10,7 @@
 pub mod config;
 pub mod encryption;
 pub mod keyword_masking;
+pub mod model_mapping;
 pub mod paths;
 pub mod todo;
 
@@ -19,5 +20,6 @@ pub use config::{
 };
 pub use encryption::{decrypt, encrypt};
 pub use keyword_masking::{KeywordEntry, KeywordMaskingConfig, MatchType};
+pub use model_mapping::{AnthropicModelMapping, GeminiModelMapping};
 pub use paths::*;
 pub use todo::{TodoExecution, TodoItem, TodoItemType, TodoList, TodoListStatus, TodoStatus};

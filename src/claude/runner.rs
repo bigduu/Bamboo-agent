@@ -5,11 +5,11 @@
 //! `ProcessRegistry` for cancellation and monitoring.
 
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
-use std::process::Stdio;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast;
@@ -115,7 +115,10 @@ pub async fn spawn_claude_code_cli(
                 let _ = registry.append_live_output(run_id, &line).await;
 
                 for event in parser.parse_line(&line) {
-                    if matches!(event, AgentEvent::Complete { .. } | AgentEvent::Error { .. }) {
+                    if matches!(
+                        event,
+                        AgentEvent::Complete { .. } | AgentEvent::Error { .. }
+                    ) {
                         terminal_sent.store(true, Ordering::SeqCst);
                     }
                     let _ = event_sender.send(event);
@@ -130,7 +133,9 @@ pub async fn spawn_claude_code_cli(
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let _ = registry.append_live_output(run_id, &format!("[stderr] {line}")).await;
+                let _ = registry
+                    .append_live_output(run_id, &format!("[stderr] {line}"))
+                    .await;
             }
         });
     }
@@ -151,7 +156,11 @@ pub async fn spawn_claude_code_cli(
 
                 let mut child = match child {
                     Some(c) => c,
-                    None => return Err::<std::process::ExitStatus, String>("Child already taken".to_string()),
+                    None => {
+                        return Err::<std::process::ExitStatus, String>(
+                            "Child already taken".to_string(),
+                        )
+                    }
                 };
 
                 child

@@ -378,12 +378,11 @@ fn is_setup_completed_from_typed(config: &Config) -> bool {
         .unwrap_or(false)
 }
 
-async fn persist_config(config: Config) -> Result<(), AppError> {
-    tokio::task::spawn_blocking(move || config.save())
+async fn persist_app_config(app_state: &AppState) -> Result<(), AppError> {
+    app_state
+        .persist_config()
         .await
-        .map_err(|e| AppError::InternalError(anyhow::anyhow!("Config save task failed: {e}")))?
-        .map_err(AppError::InternalError)?;
-    Ok(())
+        .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}")))
 }
 
 fn deep_merge_json(dst: &mut Value, src: Value) {
@@ -508,7 +507,8 @@ pub async fn mark_setup_complete(app_state: web::Data<AppState>) -> Result<HttpR
         config.clone()
     };
 
-    persist_config(config_to_save).await?;
+    let _ = config_to_save;
+    persist_app_config(app_state.get_ref()).await?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
@@ -548,7 +548,8 @@ pub async fn mark_setup_incomplete(
         config.clone()
     };
 
-    persist_config(config_to_save).await?;
+    let _ = config_to_save;
+    persist_app_config(app_state.get_ref()).await?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
@@ -645,9 +646,9 @@ pub async fn set_bamboo_config(
     }
 
     let mut patch = payload.into_inner();
-    let patch_obj = patch.as_object_mut().ok_or_else(|| {
-        AppError::BadRequest("config.json must be a JSON object".to_string())
-    })?;
+    let patch_obj = patch
+        .as_object_mut()
+        .ok_or_else(|| AppError::BadRequest("config.json must be a JSON object".to_string()))?;
 
     // Never allow clients to modify proxy auth fields or data_dir via this endpoint.
     patch_obj.remove("proxy_auth");
@@ -661,9 +662,10 @@ pub async fn set_bamboo_config(
     if let (Some(patch_providers), Some(existing_providers)) =
         (patch.get_mut("providers"), merged.get("providers"))
     {
-        if let (Some(patch_obj), Some(existing_obj)) =
-            (patch_providers.as_object_mut(), existing_providers.as_object())
-        {
+        if let (Some(patch_obj), Some(existing_obj)) = (
+            patch_providers.as_object_mut(),
+            existing_providers.as_object(),
+        ) {
             for (provider_name, provider_patch) in patch_obj.iter_mut() {
                 let Some(patch_cfg_obj) = provider_patch.as_object_mut() else {
                     continue;
@@ -701,7 +703,7 @@ pub async fn set_bamboo_config(
         let mut cfg = app_state.config.write().await;
         *cfg = new_config.clone();
     }
-    persist_config(new_config.clone()).await?;
+    persist_app_config(app_state.get_ref()).await?;
     app_state.reload_provider().await.map_err(|e| {
         AppError::InternalError(anyhow::anyhow!(
             "Failed to reload provider after updating config: {e}"
@@ -774,7 +776,8 @@ pub async fn set_proxy_auth(
         config.clone()
     };
 
-    persist_config(config_to_save).await?;
+    let _ = config_to_save;
+    persist_app_config(app_state.get_ref()).await?;
 
     // Reload provider to apply new proxy settings
     app_state.reload_provider().await.map_err(|e| {
@@ -879,20 +882,22 @@ pub async fn reset_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpR
 pub async fn get_anthropic_model_mapping(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
-    use crate::server::services::anthropic_model_mapping_service::load_anthropic_model_mapping;
-    let mapping = load_anthropic_model_mapping(&app_state.app_data_dir).await?;
-    Ok(HttpResponse::Ok().json(mapping))
+    let config = app_state.config.read().await;
+    Ok(HttpResponse::Ok().json(config.anthropic_model_mapping.clone()))
 }
 
 pub async fn set_anthropic_model_mapping(
     app_state: web::Data<AppState>,
-    payload: web::Json<
-        crate::server::services::anthropic_model_mapping_service::AnthropicModelMapping,
-    >,
+    payload: web::Json<crate::core::model_mapping::AnthropicModelMapping>,
 ) -> Result<HttpResponse, AppError> {
-    use crate::server::services::anthropic_model_mapping_service::save_anthropic_model_mapping;
-    let mapping =
-        save_anthropic_model_mapping(&app_state.app_data_dir, payload.into_inner()).await?;
+    let mapping = payload.into_inner();
+    let config_to_save = {
+        let mut config = app_state.config.write().await;
+        config.anthropic_model_mapping = mapping.clone();
+        config.clone()
+    };
+    let _ = config_to_save;
+    persist_app_config(app_state.get_ref()).await?;
     Ok(HttpResponse::Ok().json(mapping))
 }
 
@@ -944,19 +949,9 @@ struct ValidationError {
 pub async fn get_keyword_masking_config(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
-    let path = app_state.app_data_dir.join("keyword_masking.json");
-
-    if !path.exists() {
-        return Ok(HttpResponse::Ok().json(KeywordMaskingResponse {
-            entries: Vec::new(),
-        }));
-    }
-
-    let content = fs::read_to_string(&path).await?;
-    let config: KeywordMaskingConfig = serde_json::from_str(&content)?;
-
+    let config = app_state.config.read().await;
     Ok(HttpResponse::Ok().json(KeywordMaskingResponse {
-        entries: config.entries,
+        entries: config.keyword_masking.entries.clone(),
     }))
 }
 
@@ -1047,13 +1042,19 @@ pub async fn update_keyword_masking_config(
         )));
     }
 
-    let path = app_state.app_data_dir.join("keyword_masking.json");
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-
-    let content = serde_json::to_string_pretty(&config)?;
-    fs::write(&path, content).await?;
+    let config_to_save = {
+        let mut current = app_state.config.write().await;
+        current.keyword_masking = config.clone();
+        current.clone()
+    };
+    let _ = config_to_save;
+    persist_app_config(app_state.get_ref()).await?;
+    // Keyword masking is applied via provider decorator; reload to make it effective immediately.
+    app_state.reload_provider().await.map_err(|e| {
+        AppError::InternalError(anyhow::anyhow!(
+            "Failed to reload provider after updating keyword masking: {e}"
+        ))
+    })?;
 
     Ok(HttpResponse::Ok().json(KeywordMaskingResponse {
         entries: config.entries,
@@ -1283,13 +1284,13 @@ pub async fn update_provider_config(
         "providers": payload.providers,
     });
 
-    if let (Some(patch_providers), Some(existing_providers)) = (
-        patch.get_mut("providers"),
-        merged.get("providers"),
-    ) {
-        if let (Some(patch_obj), Some(existing_obj)) =
-            (patch_providers.as_object_mut(), existing_providers.as_object())
-        {
+    if let (Some(patch_providers), Some(existing_providers)) =
+        (patch.get_mut("providers"), merged.get("providers"))
+    {
+        if let (Some(patch_obj), Some(existing_obj)) = (
+            patch_providers.as_object_mut(),
+            existing_providers.as_object(),
+        ) {
             for (provider_name, provider_patch) in patch_obj.iter_mut() {
                 let Some(patch_cfg_obj) = provider_patch.as_object_mut() else {
                     continue;
@@ -1328,7 +1329,7 @@ pub async fn update_provider_config(
         let mut cfg = app_state.config.write().await;
         *cfg = new_config.clone();
     }
-    persist_config(new_config.clone()).await?;
+    persist_app_config(app_state.get_ref()).await?;
     app_state.reload_provider().await.map_err(|e| {
         AppError::InternalError(anyhow::anyhow!(
             "Failed to reload provider after updating configuration: {e}"
@@ -1353,62 +1354,74 @@ pub async fn fetch_provider_models(
         .unwrap_or(config.provider.as_str());
 
     // Build a proxy-aware HTTP client for all outbound calls.
-    let client = crate::agent::llm::http_client::build_http_client(&config)
-        .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to build HTTP client: {e}")))?;
+    let client = crate::agent::llm::http_client::build_http_client(&config).map_err(|e| {
+        AppError::InternalError(anyhow::anyhow!("Failed to build HTTP client: {e}"))
+    })?;
 
-    let models = match provider_type {
-        "copilot" => {
-            let provider = app_state.get_provider().await;
-            provider.list_models().await.map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("proxy") || msg.contains("407") {
-                    AppError::ProxyAuthRequired
-                } else {
-                    AppError::InternalError(anyhow::anyhow!("Failed to fetch models: {e}"))
+    let models =
+        match provider_type {
+            "copilot" => {
+                let provider = app_state.get_provider().await;
+                provider.list_models().await.map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.contains("proxy") || msg.contains("407") {
+                        AppError::ProxyAuthRequired
+                    } else {
+                        AppError::InternalError(anyhow::anyhow!("Failed to fetch models: {e}"))
+                    }
+                })?
+            }
+            "openai" => {
+                let openai = config.providers.openai.as_ref().ok_or_else(|| {
+                    AppError::BadRequest("OpenAI configuration required".to_string())
+                })?;
+                if openai.api_key.trim().is_empty() {
+                    return Err(AppError::BadRequest("API key not configured".to_string()));
                 }
-            })?
-        }
-        "openai" => {
-            let openai = config.providers.openai.as_ref().ok_or_else(|| {
-                AppError::BadRequest("OpenAI configuration required".to_string())
-            })?;
-            if openai.api_key.trim().is_empty() {
-                return Err(AppError::BadRequest("API key not configured".to_string()));
-            }
-            fetch_models_from_api(&client, "openai", &openai.api_key, openai.base_url.as_deref())
+                fetch_models_from_api(
+                    &client,
+                    "openai",
+                    &openai.api_key,
+                    openai.base_url.as_deref(),
+                )
                 .await?
-        }
-        "anthropic" => {
-            let anthropic = config.providers.anthropic.as_ref().ok_or_else(|| {
-                AppError::BadRequest("Anthropic configuration required".to_string())
-            })?;
-            if anthropic.api_key.trim().is_empty() {
-                return Err(AppError::BadRequest("API key not configured".to_string()));
             }
-            fetch_models_from_api(
-                &client,
-                "anthropic",
-                &anthropic.api_key,
-                anthropic.base_url.as_deref(),
-            )
-            .await?
-        }
-        "gemini" => {
-            let gemini = config.providers.gemini.as_ref().ok_or_else(|| {
-                AppError::BadRequest("Gemini configuration required".to_string())
-            })?;
-            if gemini.api_key.trim().is_empty() {
-                return Err(AppError::BadRequest("API key not configured".to_string()));
-            }
-            fetch_models_from_api(&client, "gemini", &gemini.api_key, gemini.base_url.as_deref())
+            "anthropic" => {
+                let anthropic = config.providers.anthropic.as_ref().ok_or_else(|| {
+                    AppError::BadRequest("Anthropic configuration required".to_string())
+                })?;
+                if anthropic.api_key.trim().is_empty() {
+                    return Err(AppError::BadRequest("API key not configured".to_string()));
+                }
+                fetch_models_from_api(
+                    &client,
+                    "anthropic",
+                    &anthropic.api_key,
+                    anthropic.base_url.as_deref(),
+                )
                 .await?
-        }
-        other => {
-            return Err(AppError::BadRequest(format!(
-                "Unsupported provider: {other}"
-            )));
-        }
-    };
+            }
+            "gemini" => {
+                let gemini = config.providers.gemini.as_ref().ok_or_else(|| {
+                    AppError::BadRequest("Gemini configuration required".to_string())
+                })?;
+                if gemini.api_key.trim().is_empty() {
+                    return Err(AppError::BadRequest("API key not configured".to_string()));
+                }
+                fetch_models_from_api(
+                    &client,
+                    "gemini",
+                    &gemini.api_key,
+                    gemini.base_url.as_deref(),
+                )
+                .await?
+            }
+            other => {
+                return Err(AppError::BadRequest(format!(
+                    "Unsupported provider: {other}"
+                )));
+            }
+        };
 
     Ok(HttpResponse::Ok().json(serde_json::json!({ "models": models })))
 }

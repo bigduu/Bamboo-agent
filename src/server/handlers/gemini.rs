@@ -37,20 +37,9 @@ pub async fn generate_content(
     let gemini_model = path.into_inner();
 
     // Resolve model mapping
-    let resolution = match resolve_model(&state.app_data_dir, &gemini_model).await {
-        Ok(res) => res,
-        Err(e) => {
-            log::warn!(
-                "Failed to resolve model mapping for '{}': {}",
-                gemini_model,
-                e
-            );
-            // Continue with empty mapping (will use default model)
-            crate::server::services::gemini_model_mapping_service::ModelResolution {
-                mapped_model: String::new(),
-                response_model: gemini_model.clone(),
-            }
-        }
+    let resolution = {
+        let config = state.config.read().await;
+        resolve_model(&config.gemini_model_mapping, &gemini_model)
     };
 
     log::info!(
@@ -163,20 +152,9 @@ pub async fn stream_generate_content(
     let gemini_model = path.into_inner();
 
     // Resolve model mapping
-    let resolution = match resolve_model(&state.app_data_dir, &gemini_model).await {
-        Ok(res) => res,
-        Err(e) => {
-            log::warn!(
-                "Failed to resolve model mapping for '{}': {}",
-                gemini_model,
-                e
-            );
-            // Continue with empty mapping (will use default model)
-            crate::server::services::gemini_model_mapping_service::ModelResolution {
-                mapped_model: String::new(),
-                response_model: gemini_model.clone(),
-            }
-        }
+    let resolution = {
+        let config = state.config.read().await;
+        resolve_model(&config.gemini_model_mapping, &gemini_model)
     };
 
     log::info!(

@@ -556,6 +556,8 @@ mod tests {
         assert_eq!(result.result, "ok");
 
         let ev = rx.recv().await.expect("expected streamed event");
-        assert!(matches!(ev, AgentEvent::ToolToken { tool_call_id, content } if tool_call_id == "call_1" && content == "stream"));
+        assert!(
+            matches!(ev, AgentEvent::ToolToken { tool_call_id, content } if tool_call_id == "call_1" && content == "stream")
+        );
     }
 }

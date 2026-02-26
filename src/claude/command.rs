@@ -38,9 +38,8 @@ fn collect_inherited_env(program: &str) -> Vec<(String, String)> {
             let node_bin_str = node_bin_dir.to_string_lossy();
             if !path_value.contains(node_bin_str.as_ref()) {
                 let joined = std::env::join_paths(
-                    std::iter::once(node_bin_dir.to_path_buf()).chain(std::env::split_paths(
-                        &path_value,
-                    )),
+                    std::iter::once(node_bin_dir.to_path_buf())
+                        .chain(std::env::split_paths(&path_value)),
                 )
                 .map(|os| os.to_string_lossy().to_string())
                 .unwrap_or_else(|_| format!("{}:{}", node_bin_str, path_value));
@@ -55,13 +54,15 @@ fn collect_inherited_env(program: &str) -> Vec<(String, String)> {
             let homebrew_bin_str = program_dir.to_string_lossy();
             if !path_value.contains(homebrew_bin_str.as_ref()) {
                 let joined = std::env::join_paths(
-                    std::iter::once(program_dir.to_path_buf()).chain(std::env::split_paths(
-                        &path_value,
-                    )),
+                    std::iter::once(program_dir.to_path_buf())
+                        .chain(std::env::split_paths(&path_value)),
                 )
                 .map(|os| os.to_string_lossy().to_string())
                 .unwrap_or_else(|_| format!("{}:{}", homebrew_bin_str, path_value));
-                debug!("Adding Homebrew bin directory to PATH: {}", homebrew_bin_str);
+                debug!(
+                    "Adding Homebrew bin directory to PATH: {}",
+                    homebrew_bin_str
+                );
                 path_value = joined;
             }
         }

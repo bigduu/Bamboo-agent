@@ -35,4 +35,3 @@ pub(crate) fn build_http_client(config: &Config) -> Result<Client, LLMError> {
     }
     Ok(builder.build()?)
 }
-

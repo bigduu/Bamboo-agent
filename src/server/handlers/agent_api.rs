@@ -610,7 +610,10 @@ pub async fn claude_events(
     let (event_receiver, runner_status) = {
         let runners = state.claude_runners.read().await;
         match runners.get(&session_id) {
-            Some(runner) => (Some(runner.event_sender.subscribe()), Some(runner.status.clone())),
+            Some(runner) => (
+                Some(runner.event_sender.subscribe()),
+                Some(runner.status.clone()),
+            ),
             None => (None, None),
         }
     };

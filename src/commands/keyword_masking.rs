@@ -2,7 +2,7 @@ use crate::core::keyword_masking::{KeywordEntry, KeywordMaskingConfig};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::core::paths::keyword_masking_json_path;
+use crate::core::Config;
 
 /// Response for keyword masking configuration
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,11 +40,10 @@ pub fn save_keyword_masking_config(
 pub async fn get_keyword_masking_config() -> Result<KeywordMaskingResponse, String> {
     log::info!("Getting keyword masking configuration");
 
-    let path = keyword_masking_json_path();
-    let config = load_keyword_masking_config(&path)?;
+    let config = Config::new();
 
     Ok(KeywordMaskingResponse {
-        entries: config.entries,
+        entries: config.keyword_masking.entries,
     })
 }
 
@@ -68,8 +67,9 @@ pub async fn update_keyword_masking_config(
         return Err(format!("Validation failed: {}", error_messages.join(", ")));
     }
 
-    let path = keyword_masking_json_path();
-    save_keyword_masking_config(&path, &config)?;
+    let mut root = Config::new();
+    root.keyword_masking = config.clone();
+    root.save().map_err(|e| e.to_string())?;
 
     log::info!("Keyword masking configuration saved successfully");
 
