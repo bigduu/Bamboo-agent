@@ -4,38 +4,22 @@
 
 After implementing the unified config system, Codex review found **4 CRITICAL** and **4 MAJOR** issues that need immediate attention.
 
+## Status Update (2026-02-26)
+
+- ✅ **Fixed**: `--data-dir` now loads config from the specified directory (and runtime paths are aligned via `BAMBOO_DATA_DIR`).
+- ✅ **Fixed**: `AppState::new(data_dir)` and `reload_config()` now load from the provided directory.
+- ✅ **Fixed**: Legacy `config.toml` fallback has been removed.
+- ✅ **Fixed**: Unknown root keys are preserved via `Config.extra` (and unknown keys under `providers` / `server` are also preserved).
+
 ## Critical Issues
 
 ### 1. 🔴 CLI --data-dir Doesn't Actually Load Config from Specified Directory
 
-**Problem**: `bamboo serve --data-dir /path` doesn't load config from `/path/config.json`
-- Code: `src/bin/bamboo.rs:65-82` loads `Config::new()` first, then just sets `config.data_dir`
-- Impact: Users expect config to be loaded from the specified directory, but it's not
-
-**Fix Needed**:
-```rust
-// Instead of:
-let mut config = Config::new();
-if let Some(d) = data_dir {
-    config.data_dir = d;
-}
-
-// Should be:
-let config = if let Some(ref d) = data_dir {
-    Config::from_data_dir(Some(d.clone()))
-} else {
-    Config::new()
-};
-```
+**Status**: ✅ Fixed.
 
 ### 2. 🔴 AppState Ignores data_dir for Config Loading
 
-**Problem**: `AppState::new(bamboo_home_dir)` doesn't load config from that directory
-- Code: `src/server/app_state.rs:327-348` uses `Config::new()` (global)
-- Code: `src/server/app_state.rs:590-595` `reload_config()` also uses `Config::new()`
-- Impact: Server can run with one data_dir but config from another (inconsistent state)
-
-**Fix Needed**: Use `Config::from_data_dir(Some(bamboo_home_dir))` in AppState
+**Status**: ✅ Fixed.
 
 ### 3. 🔴 Hot-Reload Doesn't Update Provider (llm is Stale)
 
@@ -67,20 +51,11 @@ let config = if let Some(ref d) = data_dir {
 
 ### 6. 🟡 TOML Support Confusing
 
-**Problem**: Docs say "config.toml preferred" but code uses `config.json` in data_dir
-- TOML fallback only checks `./config.toml` in current directory (surprising)
-- Impact: Confusing for users, potential security issue (stray config files)
-
-**Fix Needed**: Remove TOML support or clarify it's legacy-only
+**Status**: ✅ Resolved by removing legacy `config.toml` fallback entirely.
 
 ### 7. 🟡 Config.save() Drops Unknown Fields
 
-**Problem**: `Config::save()` serializes only known fields
-- Settings endpoints write `proxy_auth_encrypted` which Config ignores
-- Impact: Can erase fields written by other parts of code
-- This re-introduces "two writers, incompatible schema" problem
-
-**Fix Needed**: Preserve unknown fields using `#[serde(flatten)]` or read-modify-write pattern
+**Status**: ✅ Fixed (unknown fields preserved via `#[serde(flatten)]`).
 
 ### 8. 🟡 --static-dir and --workers CLI Args Ignored
 
@@ -104,7 +79,7 @@ Missing tests for:
 3. `AppState` with custom data_dir loads from that dir
 4. Hot-reload updates all cached fields (provider, llm, etc.)
 5. Env override of provider-specific values
-6. TOML fallback behavior (or test that it's removed)
+6. (Removed) TOML fallback behavior
 
 ## Recommended Fix Priority
 
@@ -126,7 +101,6 @@ Missing tests for:
 
 ## Questions for Discussion
 
-1. Should we remove TOML support entirely or keep as legacy fallback?
-2. Should `Config::save()` preserve unknown fields (more complex) or is dropping them acceptable?
+1. Should `Config::default()` remain I/O-based or become pure defaults (with a separate loader)?
 3. Should we remove the cached `llm` field from AppState or update it on reload?
 4. Do we need a `try_from_data_dir()` that returns Result for better error handling?

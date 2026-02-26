@@ -50,6 +50,13 @@ pub async fn create_provider_with_dir(
                 headless_auth,
             );
 
+            if let Some(copilot_cfg) = config.providers.copilot.as_ref() {
+                if !copilot_cfg.responses_only_models.is_empty() {
+                    provider = provider
+                        .with_responses_only_models(copilot_cfg.responses_only_models.clone());
+                }
+            }
+
             // Try to authenticate (using cache if available)
             match provider.try_authenticate_silent().await {
                 Ok(true) => {
@@ -88,6 +95,11 @@ pub async fn create_provider_with_dir(
                 if !base_url.is_empty() {
                     provider = provider.with_base_url(base_url);
                 }
+            }
+
+            if !openai_config.responses_only_models.is_empty() {
+                provider = provider
+                    .with_responses_only_models(openai_config.responses_only_models.clone());
             }
 
             Ok(Arc::new(MaskingProviderDecorator::new(
@@ -216,14 +228,12 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
 mod tests {
     use super::*;
     use crate::core::{AnthropicConfig, GeminiConfig, OpenAIConfig, ProviderConfigs};
-    use std::path::PathBuf;
 
     #[tokio::test]
     async fn test_create_copilot_provider() {
         let config = Config {
             provider: "copilot".to_string(),
             providers: ProviderConfigs::default(),
-            data_dir: PathBuf::from("/tmp/test"),
             ..Config::default()
         };
 
@@ -236,7 +246,6 @@ mod tests {
         let config = Config {
             provider: "openai".to_string(),
             providers: ProviderConfigs::default(),
-            data_dir: PathBuf::from("/tmp/test"),
             ..Config::default()
         };
 
@@ -260,11 +269,11 @@ mod tests {
                     api_key_encrypted: None,
                     base_url: None,
                     model: None,
+                    responses_only_models: vec![],
                     extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()
             },
-            data_dir: PathBuf::from("/tmp/test"),
             ..Config::default()
         };
 
@@ -288,11 +297,11 @@ mod tests {
                     api_key_encrypted: None,
                     base_url: Some("https://custom.openai.com/v1".to_string()),
                     model: Some("gpt-4o".to_string()),
+                    responses_only_models: vec![],
                     extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()
             },
-            data_dir: PathBuf::from("/tmp/test"),
             ..Config::default()
         };
 
@@ -315,7 +324,6 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            data_dir: PathBuf::from("/tmp/test"),
             ..Config::default()
         };
 
@@ -337,7 +345,6 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            data_dir: PathBuf::from("/tmp/test"),
             ..Config::default()
         };
 
@@ -350,7 +357,6 @@ mod tests {
         let config = Config {
             provider: "unknown".to_string(),
             providers: ProviderConfigs::default(),
-            data_dir: PathBuf::from("/tmp/test"),
             ..Config::default()
         };
 
@@ -369,7 +375,6 @@ mod tests {
         let config = Config {
             provider: "copilot".to_string(),
             providers: ProviderConfigs::default(),
-            data_dir: PathBuf::from("/tmp/test"),
             ..Config::default()
         };
 
@@ -381,7 +386,6 @@ mod tests {
         let config = Config {
             provider: "openai".to_string(),
             providers: ProviderConfigs::default(),
-            data_dir: PathBuf::from("/tmp/test"),
             ..Config::default()
         };
 

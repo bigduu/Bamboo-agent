@@ -62,10 +62,10 @@ After the Codex review, I've added comprehensive test coverage for all critical 
 ✅ `partial_invalid_type_falls_back`
 - Tests partial invalid types fall back to defaults gracefully
 
-### 4. Config.data_dir Usage (2 new tests)
+### 4. Save Location / Data Dir Handling (2 new tests)
 
-✅ `save_uses_data_dir`
-- Tests that `save()` writes to `self.data_dir/config.json`
+✅ `save_to_dir_writes_to_directory`
+- Tests that `save_to_dir(dir)` writes to `{dir}/config.json`
 
 ✅ `isolated_library_usage_without_home`
 - Tests library usage with `from_data_dir()` without touching HOME
@@ -124,7 +124,6 @@ After the Codex review, I've added comprehensive test coverage for all critical 
 
 ### Remaining Minor Gaps (Not Critical):
 - CLI argument override tests (requires binary integration testing)
-- `config.toml` legacy format tests (deprecated format, low priority)
 - Error path tests for `Config::save()` (requires filesystem mocking)
 
 ## Test File Locations
@@ -167,7 +166,7 @@ Codex identified 9 major categories of missing tests. We now have coverage for:
 |----------|----------|
 | 1. Env var override priority | ✅ Complete (7 tests) |
 | 2. Config file loading/saving | ✅ Complete (4 tests) |
-| 3. Config.data_dir usage | ✅ Complete (2 tests) |
+| 3. Save location / data dir handling | ✅ Complete (2 tests) |
 | 4. Provider configuration | ✅ Complete (1 test) |
 | 5. Backward compatibility | ✅ Complete (3 tests) |
 | 6. Edge cases | ✅ Complete (2 tests) |

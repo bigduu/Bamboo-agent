@@ -237,8 +237,7 @@ impl Default for ModelLimitsRegistry {
 /// Returns `~/.bamboo/model_limits.json` on Unix systems,
 /// or the appropriate equivalent on Windows.
 pub fn get_default_config_path() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".bamboo").join("model_limits.json")
+    crate::core::paths::bamboo_dir().join("model_limits.json")
 }
 
 /// Create a token budget for a specific model.

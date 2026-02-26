@@ -54,6 +54,9 @@ fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
     // Never send decrypted secrets. Also avoid sending encrypted key material.
     if let Some(root) = value.as_object_mut() {
         root.remove("proxy_auth_encrypted");
+        // Back-compat: older Bodhi/Tauri stored proxy auth using these keys.
+        root.remove("http_proxy_auth_encrypted");
+        root.remove("https_proxy_auth_encrypted");
 
         if let Some(providers) = root.get_mut("providers").and_then(|v| v.as_object_mut()) {
             for (name, provider_cfg) in providers.iter_mut() {
@@ -98,7 +101,71 @@ fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
 
         // MCP config may contain credentials in env vars / headers. Do not return either plaintext
         // or encrypted blobs to clients; return masked placeholders instead.
-        if let Some(mcp) = root.get_mut("mcp").and_then(|v| v.as_object_mut()) {
+        //
+        // On disk / API we use the mainstream `mcpServers` key (map form). We still support
+        // older installs that may have been serialized as `mcp` (legacy list form).
+        if let Some(mcp_servers) = root.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
+            for (_server_id, server_cfg) in mcp_servers.iter_mut() {
+                let Some(server_obj) = server_cfg.as_object_mut() else {
+                    continue;
+                };
+
+                // stdio server: env values masked
+                if server_obj.get("command").is_some() {
+                    // Drop legacy encrypted blobs if present.
+                    let mut keys: Vec<String> = server_obj
+                        .get("env_encrypted")
+                        .and_then(|v| v.as_object())
+                        .map(|obj| obj.keys().cloned().collect())
+                        .unwrap_or_default();
+                    server_obj.remove("env_encrypted");
+
+                    if let Some(env_obj) = server_obj.get_mut("env").and_then(|v| v.as_object_mut())
+                    {
+                        for (_k, v) in env_obj.iter_mut() {
+                            *v = Value::String("****...****".to_string());
+                        }
+                    } else if !keys.is_empty() {
+                        // If the config only had encrypted env vars, still expose the keys so
+                        // clients can see which variables are configured.
+                        let env_obj = keys
+                            .drain(..)
+                            .map(|k| (k, Value::String("****...****".to_string())))
+                            .collect::<serde_json::Map<String, Value>>();
+                        server_obj.insert("env".to_string(), Value::Object(env_obj));
+                    }
+                }
+
+                // sse server: header values masked
+                if server_obj.get("url").is_some() {
+                    // Mainstream style: headers is an object map.
+                    if let Some(headers_obj) =
+                        server_obj.get_mut("headers").and_then(|v| v.as_object_mut())
+                    {
+                        for (_k, v) in headers_obj.iter_mut() {
+                            *v = Value::String("****...****".to_string());
+                        }
+                    }
+
+                    // Legacy style: headers is an array of {name,value,value_encrypted}.
+                    if let Some(headers) =
+                        server_obj.get_mut("headers").and_then(|v| v.as_array_mut())
+                    {
+                        for header in headers.iter_mut() {
+                            let Some(header_obj) = header.as_object_mut() else {
+                                continue;
+                            };
+                            header_obj.remove("value_encrypted");
+                            header_obj.insert(
+                                "value".to_string(),
+                                Value::String("****...****".to_string()),
+                            );
+                        }
+                    }
+                }
+            }
+        } else if let Some(mcp) = root.get_mut("mcp").and_then(|v| v.as_object_mut()) {
+            // Legacy list-form redaction (best-effort).
             if let Some(servers) = mcp.get_mut("servers").and_then(|v| v.as_array_mut()) {
                 for server in servers.iter_mut() {
                     let Some(server_obj) = server.as_object_mut() else {
@@ -124,8 +191,6 @@ fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
 
                     match transport_type {
                         "stdio" => {
-                            // `env` is kept in-memory only; `env_encrypted` is persisted. We strip
-                            // encrypted values and return env keys with masked placeholders.
                             let mut keys: Vec<String> = transport
                                 .get("env_encrypted")
                                 .and_then(|v| v.as_object())
@@ -133,7 +198,6 @@ fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
                                 .unwrap_or_default();
 
                             if keys.is_empty() {
-                                // Best-effort: fall back to hydrated in-memory env keys.
                                 if let Some(cfg_server) =
                                     config.mcp.servers.iter().find(|s| s.id == server_id)
                                 {
@@ -161,7 +225,6 @@ fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
                                         continue;
                                     };
                                     header_obj.remove("value_encrypted");
-                                    // Always mask header values.
                                     header_obj.insert(
                                         "value".to_string(),
                                         Value::String("****...****".to_string()),
@@ -830,6 +893,9 @@ pub async fn set_bamboo_config(
     // Never allow clients to modify proxy auth fields or data_dir via this endpoint.
     patch_obj.remove("proxy_auth");
     patch_obj.remove("proxy_auth_encrypted");
+    // Legacy/compat proxy auth keys (written by older Bodhi/Tauri builds).
+    patch_obj.remove("http_proxy_auth_encrypted");
+    patch_obj.remove("https_proxy_auth_encrypted");
     patch_obj.remove("data_dir");
 
     // Never allow clients to set encrypted secret material directly.
@@ -916,9 +982,12 @@ pub async fn set_bamboo_config(
     deep_merge_json(&mut merged, patch);
 
     let mut new_config: Config = serde_json::from_value(merged)?;
-    new_config.data_dir = app_state.app_data_dir.clone();
     new_config.hydrate_proxy_auth_from_encrypted();
     new_config.hydrate_provider_api_keys_from_encrypted();
+    // Config serialization never includes decrypted MCP secrets (env/header values). After
+    // round-tripping through JSON we must re-hydrate them from the encrypted blobs, otherwise
+    // a subsequent save would overwrite secrets with empty placeholders.
+    new_config.hydrate_mcp_secrets_from_encrypted();
 
     // Validate before persisting.
     if let Err(e) = crate::agent::llm::validate_provider_config(&new_config) {
@@ -936,6 +1005,11 @@ pub async fn set_bamboo_config(
             "Failed to reload provider after updating config: {e}"
         ))
     })?;
+    // Best-effort reconcile of MCP runtimes with the updated config (no restart required).
+    app_state
+        .mcp_manager
+        .reconcile_from_config(&new_config.mcp)
+        .await;
 
     let mut config_for_response = new_config.clone();
     config_for_response.refresh_proxy_auth_encrypted()?;
@@ -1046,7 +1120,11 @@ pub async fn set_proxy_auth(
 pub async fn get_proxy_auth_status(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
-    let config = app_state.config.read().await;
+    // Defensive: ensure in-memory proxy_auth is hydrated from encrypted fields.
+    // Some call paths update config via JSON patching and may only carry encrypted values.
+    let mut config = app_state.config.write().await;
+    config.hydrate_proxy_auth_from_encrypted();
+
     if let Some(auth) = config.proxy_auth.as_ref() {
         return Ok(HttpResponse::Ok().json(serde_json::json!({
             "configured": true,
@@ -1107,6 +1185,11 @@ pub async fn reset_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpR
             e
         );
     }
+    // Config reset may remove/disable MCP servers; reconcile to stop any running servers.
+    app_state
+        .mcp_manager
+        .reconcile_from_config(&new_config.mcp)
+        .await;
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
 
@@ -1531,9 +1614,11 @@ pub async fn update_provider_config(
     deep_merge_json(&mut merged, patch);
 
     let mut new_config: Config = serde_json::from_value(merged)?;
-    new_config.data_dir = app_state.app_data_dir.clone();
     new_config.hydrate_proxy_auth_from_encrypted();
     new_config.hydrate_provider_api_keys_from_encrypted();
+    // See note in `set_bamboo_config`: avoid losing decrypted MCP runtime secrets during
+    // provider-only updates.
+    new_config.hydrate_mcp_secrets_from_encrypted();
 
     if let Err(e) = crate::agent::llm::validate_provider_config(&new_config) {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
@@ -1552,6 +1637,11 @@ pub async fn update_provider_config(
             "Failed to reload provider after updating configuration: {e}"
         ))
     })?;
+    // Best-effort reconcile of MCP runtimes with the updated config.
+    app_state
+        .mcp_manager
+        .reconcile_from_config(&new_config.mcp)
+        .await;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
@@ -1820,12 +1910,152 @@ pub async fn reload_provider_config(
         })));
     }
 
+    // Reconcile MCP runtimes in case the file-based config changed (e.g. manual edit).
+    app_state
+        .mcp_manager
+        .reconcile_from_config(&new_config.mcp)
+        .await;
+
     log::info!("Provider reloaded successfully: {}", new_config.provider);
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "provider": new_config.provider
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::agent::mcp::{HeaderConfig, McpServerConfig, SseConfig, StdioConfig, TransportConfig};
+    use crate::core::encryption::set_test_encryption_key;
+    use crate::core::{OpenAIConfig, ProviderConfigs};
+    use std::collections::HashMap;
+
+    fn build_config_with_mcp_secrets(temp_dir: &std::path::Path) -> Config {
+        let mut cfg = Config {
+            provider: "openai".to_string(),
+            providers: ProviderConfigs {
+                openai: Some(OpenAIConfig {
+                    api_key: "sk-test".to_string(),
+                    api_key_encrypted: None,
+                    base_url: None,
+                    model: Some("gpt-4o".to_string()),
+                    responses_only_models: vec![],
+                    extra: Default::default(),
+                }),
+                ..ProviderConfigs::default()
+            },
+            ..Config::default()
+        };
+
+        cfg.mcp.servers = vec![
+            McpServerConfig {
+                id: "stdio-secret".to_string(),
+                name: Some("Stdio Secret".to_string()),
+                enabled: false, // tests must not spawn actual MCP servers
+                transport: TransportConfig::Stdio(StdioConfig {
+                    command: "echo".to_string(),
+                    args: vec!["hello".to_string()],
+                    cwd: None,
+                    env: HashMap::from([("TOKEN".to_string(), "super-secret".to_string())]),
+                    env_encrypted: HashMap::new(),
+                    startup_timeout_ms: 5000,
+                }),
+                request_timeout_ms: 5000,
+                healthcheck_interval_ms: 1000,
+                reconnect: Default::default(),
+                allowed_tools: vec![],
+                denied_tools: vec![],
+            },
+            McpServerConfig {
+                id: "sse-secret".to_string(),
+                name: Some("SSE Secret".to_string()),
+                enabled: false,
+                transport: TransportConfig::Sse(SseConfig {
+                    url: "http://localhost:9999/sse".to_string(),
+                    headers: vec![HeaderConfig {
+                        name: "Authorization".to_string(),
+                        value: "Bearer super-secret".to_string(),
+                        value_encrypted: None,
+                    }],
+                    connect_timeout_ms: 1000,
+                }),
+                request_timeout_ms: 5000,
+                healthcheck_interval_ms: 1000,
+                reconnect: Default::default(),
+                allowed_tools: vec![],
+                denied_tools: vec![],
+            },
+        ];
+
+        // Ensure encrypted-at-rest blobs exist on disk (what the settings endpoints round-trip).
+        cfg.refresh_provider_api_keys_encrypted().unwrap();
+        cfg.refresh_mcp_secrets_encrypted().unwrap();
+
+        cfg.save_to_dir(temp_dir.to_path_buf()).unwrap();
+        Config::from_data_dir(Some(temp_dir.to_path_buf()))
+    }
+
+    #[test]
+    fn update_provider_config_preserves_mcp_secrets() {
+        let _key_guard = set_test_encryption_key([7u8; 32]);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let current = build_config_with_mcp_secrets(temp_dir.path());
+
+        // Mimic `update_provider_config`'s core flow (JSON round-trip + hydrate + save).
+        let mut merged = serde_json::to_value(&current).unwrap();
+        let patch = serde_json::json!({
+            "provider": "openai",
+            "providers": {
+                "openai": {
+                    "api_key": "****...****",
+                    "model": "gpt-4o"
+                }
+            }
+        });
+        deep_merge_json(&mut merged, patch);
+
+        let mut new_config: Config = serde_json::from_value(merged).unwrap();
+        new_config.hydrate_proxy_auth_from_encrypted();
+        new_config.hydrate_provider_api_keys_from_encrypted();
+        new_config.hydrate_mcp_secrets_from_encrypted();
+
+        // This is the critical part: if MCP secrets weren't hydrated, the save would
+        // re-encrypt empty placeholders and permanently lose credentials.
+        new_config.save_to_dir(temp_dir.path().to_path_buf()).unwrap();
+
+        // Reload from disk and ensure secrets survive.
+        let reloaded = Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
+
+        let stdio = reloaded
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.id == "stdio-secret")
+            .unwrap();
+        match &stdio.transport {
+            TransportConfig::Stdio(stdio) => {
+                assert_eq!(stdio.env.get("TOKEN").map(|v| v.as_str()), Some("super-secret"));
+            }
+            _ => panic!("expected stdio transport"),
+        }
+
+        let sse = reloaded
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.id == "sse-secret")
+            .unwrap();
+        match &sse.transport {
+            TransportConfig::Sse(sse) => {
+                let header = sse.headers.iter().find(|h| h.name == "Authorization").unwrap();
+                assert_eq!(header.value.as_str(), "Bearer super-secret");
+            }
+            _ => panic!("expected sse transport"),
+        }
+    }
 }
 
 /// Configures settings-related routes

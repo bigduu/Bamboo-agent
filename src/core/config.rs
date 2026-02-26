@@ -99,10 +99,6 @@ pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
 
-    /// Data directory path (defaults to ~/.bamboo)
-    #[serde(default = "default_data_dir")]
-    pub data_dir: PathBuf,
-
     /// Global keyword masking configuration.
     ///
     /// Previously persisted in `keyword_masking.json` (now unified into `config.json`).
@@ -124,7 +120,9 @@ pub struct Config {
     /// MCP server configuration.
     ///
     /// Previously persisted in `mcp.json` (now unified into `config.json`).
-    #[serde(default)]
+    // On disk we use the mainstream `mcpServers` key (matching Claude Desktop / MCP ecosystem
+    // conventions). We still accept the legacy `mcp` key for backward compatibility.
+    #[serde(default, rename = "mcpServers", alias = "mcp")]
     pub mcp: crate::agent::mcp::McpConfig,
 
     /// Extension fields stored at the root of `config.json`.
@@ -186,6 +184,15 @@ pub struct OpenAIConfig {
     /// Default model to use (e.g., "gpt-4", "gpt-3.5-turbo")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+
+    /// Models that must use the OpenAI Responses API upstream (instead of chat/completions).
+    ///
+    /// Example:
+    /// ```json
+    /// "responses_only_models": ["gpt-5.3-codex", "gpt-5*"]
+    /// ```
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub responses_only_models: Vec<String>,
 
     /// Preserve unknown keys under `providers.openai`.
     #[serde(default, flatten)]
@@ -283,6 +290,17 @@ pub struct CopilotConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// Models that must use the OpenAI Responses API upstream (instead of chat/completions).
+    ///
+    /// This is useful for newer Copilot models that only support Responses-style requests.
+    ///
+    /// Example:
+    /// ```json
+    /// "responses_only_models": ["gpt-5.3-codex", "gpt-5*"]
+    /// ```
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub responses_only_models: Vec<String>,
+
     /// Preserve unknown keys under `providers.copilot`.
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -357,9 +375,6 @@ pub struct ProxyAuth {
     pub password: String,
 }
 
-/// Configuration file name
-const CONFIG_FILE_PATH: &str = "config.toml";
-
 /// Parse a boolean value from environment variable strings
 ///
 /// Accepts: "1", "true", "yes", "y", "on" (case-insensitive)
@@ -380,11 +395,10 @@ impl Config {
     /// Load configuration from file with environment variable overrides
     ///
     /// Configuration loading order:
-    /// 1. Try loading from `config.json` (data_dir/config.json)
+    /// 1. Try loading from `config.json` (`{data_dir}/config.json`)
     /// 2. Migrate old format if detected
-    /// 3. Fallback to `config.toml` in current directory
-    /// 4. Use defaults
-    /// 5. Apply environment variable overrides (highest priority)
+    /// 3. Use defaults
+    /// 4. Apply environment variable overrides (highest priority)
     ///
     /// # Environment Variables
     ///
@@ -461,24 +475,9 @@ impl Config {
                 Self::create_default()
             }
         } else {
-            // Fallback to legacy config.toml
-            if std::path::Path::new(CONFIG_FILE_PATH).exists() {
-                if let Ok(content) = std::fs::read_to_string(CONFIG_FILE_PATH) {
-                    if let Ok(old_config) = toml::from_str::<OldConfig>(&content) {
-                        migrate_config(old_config)
-                    } else {
-                        Self::create_default()
-                    }
-                } else {
-                    Self::create_default()
-                }
-            } else {
-                Self::create_default()
-            }
+            Self::create_default()
         };
 
-        // Ensure data_dir is set correctly
-        config.data_dir = data_dir;
         // Decrypt encrypted proxy auth into in-memory plaintext form.
         config.hydrate_proxy_auth_from_encrypted();
         // Decrypt encrypted provider API keys into in-memory plaintext form.
@@ -486,9 +485,13 @@ impl Config {
         // Decrypt encrypted MCP secrets into in-memory plaintext form.
         config.hydrate_mcp_secrets_from_encrypted();
 
+        // Legacy: `data_dir` is no longer a persisted config field. The data directory is
+        // derived from runtime (BAMBOO_DATA_DIR or ~/.bamboo).
+        config.extra.remove("data_dir");
+
         // Best-effort migration from legacy sidecar config files into unified config.json.
         // This keeps config state globally unified going forward without breaking existing installs.
-        config.migrate_legacy_sidecar_configs();
+        config.migrate_legacy_sidecar_configs(&data_dir);
 
         // Apply environment variable overrides (highest priority)
         if let Ok(port) = std::env::var("BAMBOO_PORT") {
@@ -527,13 +530,49 @@ impl Config {
             return;
         }
 
+        // Backward compatibility:
+        // Older Bodhi/Tauri builds persisted proxy auth as per-scheme encrypted fields:
+        // `http_proxy_auth_encrypted` / `https_proxy_auth_encrypted`.
+        //
+        // Those live under `extra` (flatten) in the unified config. Seed the new
+        // `proxy_auth_encrypted` field so the rest of the code can stay uniform.
+        if self
+            .proxy_auth_encrypted
+            .as_deref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+        {
+            let legacy = self
+                .extra
+                .get("https_proxy_auth_encrypted")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    self.extra
+                        .get("http_proxy_auth_encrypted")
+                        .and_then(|v| v.as_str())
+                })
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+
+            if let Some(legacy) = legacy {
+                self.proxy_auth_encrypted = Some(legacy);
+            }
+        }
+
         let Some(encrypted) = self.proxy_auth_encrypted.as_deref() else {
             return;
         };
 
         match crate::core::encryption::decrypt(encrypted) {
             Ok(decrypted) => match serde_json::from_str::<ProxyAuth>(&decrypted) {
-                Ok(auth) => self.proxy_auth = Some(auth),
+                Ok(auth) => {
+                    self.proxy_auth = Some(auth);
+                    // Once hydrated successfully, drop legacy keys so a future save writes only
+                    // the canonical `proxy_auth_encrypted` field.
+                    self.extra.remove("http_proxy_auth_encrypted");
+                    self.extra.remove("https_proxy_auth_encrypted");
+                }
                 Err(e) => log::warn!("Failed to parse decrypted proxy auth JSON: {}", e),
             },
             Err(e) => log::warn!("Failed to decrypt proxy auth: {}", e),
@@ -730,7 +769,6 @@ impl Config {
             provider: default_provider(),
             providers: ProviderConfigs::default(),
             server: ServerConfig::default(),
-            data_dir: default_data_dir(),
             keyword_masking: KeywordMaskingConfig::default(),
             anthropic_model_mapping: AnthropicModelMapping::default(),
             gemini_model_mapping: GeminiModelMapping::default(),
@@ -746,7 +784,14 @@ impl Config {
 
     /// Save configuration to disk
     pub fn save(&self) -> Result<()> {
-        let path = self.data_dir.join("config.json");
+        self.save_to_dir(default_data_dir())
+    }
+
+    /// Save configuration to disk under the provided data directory.
+    ///
+    /// Configuration is always stored as `{data_dir}/config.json`.
+    pub fn save_to_dir(&self, data_dir: PathBuf) -> Result<()> {
+        let path = data_dir.join("config.json");
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -754,9 +799,10 @@ impl Config {
         }
 
         let mut to_save = self.clone();
+        // Never persist `data_dir` into config.json (data dir is runtime-derived).
+        to_save.extra.remove("data_dir");
         to_save.refresh_proxy_auth_encrypted()?;
         to_save.refresh_provider_api_keys_encrypted()?;
-        to_save.refresh_mcp_secrets_encrypted()?;
         let content =
             serde_json::to_string_pretty(&to_save).context("Failed to serialize config to JSON")?;
         write_atomic(&path, content.as_bytes())
@@ -765,8 +811,7 @@ impl Config {
         Ok(())
     }
 
-    fn migrate_legacy_sidecar_configs(&mut self) {
-        let data_dir = self.data_dir.clone();
+    fn migrate_legacy_sidecar_configs(&mut self, data_dir: &std::path::Path) {
         let mut changed = false;
 
         // keyword_masking.json -> config.keyword_masking
@@ -883,7 +928,7 @@ impl Config {
         }
 
         if changed {
-            if let Err(e) = self.save() {
+            if let Err(e) = self.save_to_dir(data_dir.to_path_buf()) {
                 log::warn!(
                     "Failed to persist unified config.json after migration: {}",
                     e
@@ -1011,7 +1056,6 @@ fn migrate_config(old: OldConfig) -> Config {
         provider: old.provider,
         providers: old.providers,
         server: old.server,
-        data_dir: old.data_dir.unwrap_or_else(default_data_dir),
         keyword_masking: old.keyword_masking,
         anthropic_model_mapping: old.anthropic_model_mapping,
         gemini_model_mapping: old.gemini_model_mapping,
@@ -1311,7 +1355,9 @@ mod tests {
         config.provider = "anthropic".to_string();
 
         // Save
-        config.save().expect("Failed to save config");
+        config
+            .save_to_dir(temp_home.path.clone())
+            .expect("Failed to save config");
 
         // Load again
         let loaded = Config::from_data_dir(Some(temp_home.path.clone()));
@@ -1355,6 +1401,41 @@ mod tests {
     }
 
     #[test]
+    fn config_decrypts_proxy_auth_from_legacy_scheme_encrypted_fields() {
+        let _lock = env_lock_acquire();
+        let temp_home = TempHome::new();
+
+        // Use a stable encryption key so this test doesn't depend on host identifiers.
+        let key_guard = crate::core::encryption::set_test_encryption_key([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ]);
+
+        let auth = ProxyAuth {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        };
+        let auth_str = serde_json::to_string(&auth).expect("serialize proxy auth");
+        let encrypted = crate::core::encryption::encrypt(&auth_str).expect("encrypt proxy auth");
+
+        // Simulate older Bodhi/Tauri persisted config keys.
+        temp_home.set_config_json(&format!(
+            r#"{{
+  "http_proxy": "http://proxy.example.com:8080",
+  "http_proxy_auth_encrypted": "{encrypted}",
+  "https_proxy_auth_encrypted": "{encrypted}"
+}}"#
+        ));
+
+        let config = Config::from_data_dir(Some(temp_home.path.clone()));
+        let loaded_auth = config.proxy_auth.expect("proxy auth should be hydrated");
+        assert_eq!(loaded_auth.username, "user");
+        assert_eq!(loaded_auth.password, "pass");
+        drop(key_guard);
+    }
+
+    #[test]
     fn config_save_encrypts_proxy_auth_and_load_hydrates_plaintext() {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
@@ -1371,7 +1452,9 @@ mod tests {
             username: "user".to_string(),
             password: "pass".to_string(),
         });
-        config.save().expect("save should encrypt proxy auth");
+        config
+            .save_to_dir(temp_home.path.clone())
+            .expect("save should encrypt proxy auth");
 
         let content =
             std::fs::read_to_string(temp_home.path.join("config.json")).expect("read config.json");
@@ -1410,11 +1493,12 @@ mod tests {
             api_key_encrypted: None,
             base_url: None,
             model: None,
+            responses_only_models: vec![],
             extra: Default::default(),
         });
 
         config
-            .save()
+            .save_to_dir(temp_home.path.clone())
             .expect("save should encrypt provider api keys");
 
         let content =
@@ -1439,16 +1523,9 @@ mod tests {
     }
 
     #[test]
-    fn config_save_encrypts_mcp_secrets_and_does_not_persist_plaintext() {
+    fn config_save_persists_mcp_servers_in_mainstream_format() {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
-
-        // Use a stable encryption key so this test doesn't depend on host identifiers.
-        let key_guard = crate::core::encryption::set_test_encryption_key([
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
-            0x1c, 0x1d, 0x1e, 0x1f,
-        ]);
 
         let mut config = Config::from_data_dir(Some(temp_home.path.clone()));
 
@@ -1497,25 +1574,31 @@ mod tests {
             },
         ];
 
-        config.save().expect("save should encrypt MCP secrets");
+        config
+            .save_to_dir(temp_home.path.clone())
+            .expect("save should persist MCP servers");
 
         let content =
             std::fs::read_to_string(temp_home.path.join("config.json")).expect("read config.json");
         assert!(
-            content.contains("\"env_encrypted\""),
-            "config.json should store encrypted MCP stdio env"
+            content.contains("\"mcpServers\""),
+            "config.json should store MCP servers under the mainstream 'mcpServers' key"
         );
         assert!(
-            content.contains("\"value_encrypted\""),
-            "config.json should store encrypted MCP SSE headers"
+            content.contains("supersecret"),
+            "config.json should persist MCP stdio env in mainstream format"
         );
         assert!(
-            !content.contains("supersecret"),
-            "config.json must not contain plaintext env values"
+            content.contains("Bearer token123"),
+            "config.json should persist MCP SSE headers in mainstream format"
         );
         assert!(
-            !content.contains("Bearer token123"),
-            "config.json must not contain plaintext header values"
+            !content.contains("\"env_encrypted\""),
+            "config.json should not persist legacy env_encrypted fields"
+        );
+        assert!(
+            !content.contains("\"value_encrypted\""),
+            "config.json should not persist legacy value_encrypted fields"
         );
 
         let loaded = Config::from_data_dir(Some(temp_home.path.clone()));
@@ -1547,7 +1630,5 @@ mod tests {
             }
             _ => panic!("Expected SSE transport"),
         }
-
-        drop(key_guard);
     }
 }

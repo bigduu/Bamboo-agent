@@ -27,7 +27,9 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
     context.push_str("1. Analyze the user's request\n");
     context
         .push_str("2. Match it against the available skills below based on their descriptions\n");
-    context.push_str("3. If there's a match, read the skill file: `read_file({\"path\": \"~/.bamboo/skills/<skill_id>/SKILL.md\"})`\n");
+    context.push_str(
+        "3. If there's a match, read the skill file (under BAMBOO_DATA_DIR; default ~/.bamboo): `read_file({\"path\": \"~/.bamboo/skills/<skill_id>/SKILL.md\"})`\n",
+    );
     context.push_str("4. Follow the instructions in the skill file to help the user\n\n");
     context.push_str("### Available Skills\n");
 
@@ -57,7 +59,7 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
 
         // Tell AI where to find the full skill content
         context.push_str(&format!(
-            "- Skill file: `~/.bamboo/skills/{}/SKILL.md`\n",
+            "- Skill file (default): `~/.bamboo/skills/{}/SKILL.md`\n",
             skill.id
         ));
     }
@@ -107,7 +109,7 @@ mod tests {
         assert!(context.contains("Category: demo"));
         assert!(context.contains("Tags: test"));
         assert!(context.contains("Provides tools: read_file"));
-        assert!(context.contains("Skill file: `~/.bamboo/skills/demo-skill/SKILL.md`"));
+        assert!(context.contains("Skill file (default): `~/.bamboo/skills/demo-skill/SKILL.md`"));
 
         // Should NOT contain the detailed prompt
         assert!(!context.contains("This detailed prompt should NOT appear"));

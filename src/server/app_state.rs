@@ -70,14 +70,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::core::{tools::ToolSchema, Message};
 use crate::agent::core::storage::JsonlStorage;
 use crate::agent::core::tools::ToolExecutor;
 use crate::agent::core::AgentEvent;
-use crate::agent::llm::LLMProvider;
+use crate::agent::llm::{LLMError, LLMProvider, LLMStream};
 use crate::agent::mcp::McpServerManager;
 use crate::agent::skill::{SkillManager, SkillStoreConfig};
 use crate::core::Config;
@@ -91,6 +93,37 @@ pub const DEFAULT_BASE_PROMPT: &str =
 /// Guidance for workspace-based interactions
 pub const WORKSPACE_PROMPT_GUIDANCE: &str =
     "If you need to inspect files, check the workspace first, then ~/.bamboo.";
+
+/// Placeholder provider used when the configured provider cannot be initialized.
+///
+/// This keeps the server usable for configuration/UX flows while ensuring we fail fast
+/// (instead of silently switching to a different provider or model).
+struct UnconfiguredProvider {
+    message: String,
+}
+
+#[async_trait]
+impl LLMProvider for UnconfiguredProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> crate::agent::llm::provider::Result<LLMStream> {
+        Err(LLMError::Auth(format!(
+            "LLM provider is not configured: {}",
+            self.message
+        )))
+    }
+
+    async fn list_models(&self) -> crate::agent::llm::provider::Result<Vec<String>> {
+        Err(LLMError::Auth(format!(
+            "LLM provider is not configured: {}",
+            self.message
+        )))
+    }
+}
 
 /// Status of an agent execution runner
 ///
@@ -222,6 +255,11 @@ pub struct AppState {
     /// that called back to web_service via HTTP. Now we have direct provider access.
     pub provider: Arc<RwLock<Arc<dyn LLMProvider>>>,
 
+    /// Stable handle that always delegates to the latest provider in `provider`.
+    ///
+    /// This avoids stale provider snapshots after runtime config updates.
+    provider_handle: Arc<dyn LLMProvider>,
+
     /// Active conversation sessions (in-memory cache)
     ///
     /// Maps session IDs to Session objects. Persisted to storage
@@ -232,12 +270,6 @@ pub struct AppState {
     ///
     /// Uses JSONL format for append-only event logging.
     pub storage: JsonlStorage,
-
-    /// Direct LLM provider reference
-    ///
-    /// This is equivalent to `provider.read().await.clone()`, but stored
-    /// separately for convenience and to avoid lock overhead.
-    pub llm: Arc<dyn LLMProvider>,
 
     /// Composite tool executor (builtin + MCP tools)
     ///
@@ -268,12 +300,6 @@ pub struct AppState {
     /// Tracks token usage, costs, and performance metrics
     /// across all sessions.
     pub metrics_service: Arc<MetricsService>,
-
-    /// Default model name for LLM requests
-    ///
-    /// Read from configuration, used as fallback when not
-    /// specified in individual requests.
-    pub model_name: String,
 
     /// Active agent runners indexed by session ID
     ///
@@ -339,7 +365,8 @@ impl AppState {
     /// #[tokio::main]
     /// async fn main() {
     ///     let state = AppState::new(PathBuf::from("/path/to/.bamboo")).await;
-    ///     println!("Initialized with model: {}", state.model_name);
+    ///     let provider = state.get_provider().await;
+    ///     let _models = provider.list_models().await.ok();
     /// }
     /// ```
     pub async fn new(bamboo_home_dir: PathBuf) -> Self {
@@ -353,13 +380,12 @@ impl AppState {
             {
                 Ok(p) => p,
                 Err(e) => {
-                    log::error!(
-                        "Failed to create provider: {}. Using OpenAI as fallback.",
-                        e
-                    );
-                    Arc::new(crate::agent::llm::OpenAIProvider::new(
-                        "sk-test".to_string(),
-                    ))
+                    // Keep the server usable for configuration/UI even when provider init fails,
+                    // but do not silently fall back to a different provider.
+                    log::error!("Failed to create provider: {}.", e);
+                    Arc::new(UnconfiguredProvider {
+                        message: e.to_string(),
+                    })
                 }
             };
 
@@ -423,15 +449,6 @@ impl AppState {
         } else {
             log::warn!("Claude Code CLI not found; Claude integration disabled");
         }
-
-        // Wrap config early so tools can reference the hot-reloadable config (e.g. proxy settings).
-        let model_name = config
-            .providers
-            .anthropic
-            .as_ref()
-            .and_then(|p| p.model.as_ref())
-            .cloned()
-            .unwrap_or_else(|| "claude-3-5-sonnet-20241022".to_string());
 
         let config = Arc::new(RwLock::new(config));
 
@@ -554,19 +571,23 @@ impl AppState {
         // Initialize process registry (external process lifecycle)
         let process_registry = Arc::new(ProcessRegistry::new());
 
+        let provider_lock: Arc<RwLock<Arc<dyn LLMProvider>>> = Arc::new(RwLock::new(provider));
+        let provider_handle: Arc<dyn LLMProvider> = Arc::new(
+            crate::server::reloadable_provider::ReloadableProvider::new(provider_lock.clone()),
+        );
+
         Self {
             app_data_dir: bamboo_home_dir,
             config,
-            provider: Arc::new(RwLock::new(provider.clone())),
+            provider: provider_lock,
+            provider_handle,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             storage,
-            llm: provider,
             tools,
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             skill_manager,
             mcp_manager,
             metrics_service,
-            model_name,
             agent_runners,
             process_registry,
             claude_cli_path,
@@ -608,14 +629,34 @@ impl AppState {
     pub async fn reload_provider(&self) -> Result<(), crate::agent::llm::LLMError> {
         let config = self.config.read().await.clone();
 
-        log::info!(
-            "Reloading provider: type={}, model={:?}",
-            config.provider,
-            config
+        let configured_model = match config.provider.as_str() {
+            "copilot" => config
+                .providers
+                .copilot
+                .as_ref()
+                .and_then(|p| p.model.as_ref()),
+            "openai" => config
+                .providers
+                .openai
+                .as_ref()
+                .and_then(|p| p.model.as_ref()),
+            "anthropic" => config
                 .providers
                 .anthropic
                 .as_ref()
-                .and_then(|p| p.model.as_ref())
+                .and_then(|p| p.model.as_ref()),
+            "gemini" => config
+                .providers
+                .gemini
+                .as_ref()
+                .and_then(|p| p.model.as_ref()),
+            _ => None,
+        };
+
+        log::info!(
+            "Reloading provider: type={}, model={:?}",
+            config.provider,
+            configured_model
         );
 
         let new_provider =
@@ -667,7 +708,8 @@ impl AppState {
     /// This is the single "exit" for configuration writes in the server runtime.
     pub async fn persist_config(&self) -> anyhow::Result<()> {
         let config = self.config.read().await.clone();
-        tokio::task::spawn_blocking(move || config.save())
+        let data_dir = self.app_data_dir.clone();
+        tokio::task::spawn_blocking(move || config.save_to_dir(data_dir))
             .await
             .map_err(|e| anyhow::anyhow!("Config save task failed: {e}"))??;
         Ok(())
@@ -697,7 +739,9 @@ impl AppState {
     /// }
     /// ```
     pub async fn get_provider(&self) -> Arc<dyn LLMProvider> {
-        self.provider.read().await.clone()
+        // Important: return the reloadable handle, not a snapshot clone of the current provider.
+        // This ensures config/provider switches take effect without restarting the server.
+        self.provider_handle.clone()
     }
 
     /// Shutdown all MCP servers gracefully
@@ -762,6 +806,5 @@ mod tests {
 
         // Verify basic fields
         assert!(state.sessions.read().await.is_empty());
-        assert!(!state.model_name.is_empty());
     }
 }

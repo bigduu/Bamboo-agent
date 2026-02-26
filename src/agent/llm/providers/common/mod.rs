@@ -2,6 +2,7 @@
 
 pub mod masking_decorator;
 pub mod openai_compat;
+pub mod openai_responses;
 pub mod sse;
 pub mod stream_tool_accumulator;
 

@@ -90,8 +90,10 @@ Commands::Config { path, show_secrets } => {
 
 ### 6. TOML/XDG Docs Don't Match Reality
 
-**Problem**: Docs mention config.toml and XDG, but primary is `data_dir/config.json`
-- **Impact**: Confusing for users
+**Status (2026-02-26)**: Resolved.
+- Legacy `config.toml` fallback removed.
+- Runtime data dir is derived from `BAMBOO_DATA_DIR` (or defaults to `~/.bamboo`).
+- Configuration is always `{data_dir}/config.json`.
 
 ## 🟠 MEDIUM: Error Handling Issues
 

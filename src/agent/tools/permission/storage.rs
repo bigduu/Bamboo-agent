@@ -100,7 +100,8 @@ impl PermissionStorage {
         );
 
         // Persist unified config.
-        tokio::task::spawn_blocking(move || config.save())
+        let data_dir = self.config_dir.clone();
+        tokio::task::spawn_blocking(move || config.save_to_dir(data_dir))
             .await
             .map_err(|e| PermissionStorageError::WriteError {
                 path: self.config_path(),
@@ -158,7 +159,8 @@ impl PermissionStorage {
             })?,
         );
 
-        tokio::task::spawn_blocking(move || root.save())
+        let data_dir = self.config_dir.clone();
+        tokio::task::spawn_blocking(move || root.save_to_dir(data_dir))
             .await
             .map_err(|e| PermissionStorageError::WriteError {
                 path: self.config_path(),
@@ -228,20 +230,20 @@ pub enum PermissionStorageError {
 
 /// Get the default permission storage location for Tauri apps
 ///
-/// Returns `None` if the config directory cannot be determined.
+/// Returns `None` if the Bamboo data directory cannot be determined.
 pub fn default_storage() -> Option<PermissionStorage> {
-    dirs::config_dir().map(|config_dir| {
-        let app_config_dir = config_dir.join("bamboo");
-        PermissionStorage::new(app_config_dir)
-    })
+    // Keep storage consistent with the unified config.json location:
+    // all persisted state lives under `paths::bamboo_dir()` (BAMBOO_DATA_DIR or ~/.bamboo).
+    Some(PermissionStorage::new(crate::core::paths::bamboo_dir()))
 }
 
 /// Get the default permission storage for a specific app name
 pub fn app_storage(app_name: &str) -> Option<PermissionStorage> {
-    dirs::config_dir().map(|config_dir| {
-        let app_config_dir = config_dir.join(app_name);
-        PermissionStorage::new(app_config_dir)
-    })
+    // App-specific storage is a legacy escape hatch; prefer `default_storage()` to
+    // avoid splitting persisted config across multiple roots.
+    Some(PermissionStorage::new(
+        crate::core::paths::bamboo_dir().join(app_name),
+    ))
 }
 
 #[cfg(test)]

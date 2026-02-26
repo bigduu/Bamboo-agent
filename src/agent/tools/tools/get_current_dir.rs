@@ -17,7 +17,7 @@ impl GetCurrentDirTool {
     /// Internal implementation for getting current directory
     pub async fn get_current_dir() -> Result<String, String> {
         std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
+            .map(|p| crate::core::paths::path_to_display_string(&p))
             .map_err(|e| format!("Failed to get current directory: {}", e))
     }
 }

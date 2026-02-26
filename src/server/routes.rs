@@ -273,6 +273,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 web::scope("/mcp")
                     .route("/servers", web::get().to(agent::mcp::list_servers))
                     .route("/servers", web::post().to(agent::mcp::add_server))
+                    .route(
+                        "/servers/import",
+                        web::post().to(agent::mcp::import_servers),
+                    )
                     .route("/servers/{id}", web::get().to(agent::mcp::get_server))
                     .route("/servers/{id}", web::put().to(agent::mcp::update_server))
                     .route("/servers/{id}", web::delete().to(agent::mcp::delete_server))
@@ -306,6 +310,7 @@ pub fn openai_compatible_routes(cfg: &mut web::ServiceConfig) {
             "/chat/completions",
             web::post().to(openai::chat_completions),
         )
+        .route("/responses", web::post().to(openai::responses_create))
         .route("/models", web::get().to(openai::get_models));
 
     cfg.service(openai_compatible_v1_scope(openai_routes));
@@ -328,6 +333,7 @@ pub fn openai_compatible_routes_with_rate_limiting(cfg: &mut web::ServiceConfig)
             "/chat/completions",
             web::post().to(openai::chat_completions),
         )
+        .route("/responses", web::post().to(openai::responses_create))
         .route("/models", web::get().to(openai::get_models));
 
     cfg.service(openai_compatible_v1_scope(openai_routes));

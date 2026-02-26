@@ -90,13 +90,12 @@ mod tests {
 
     #[test]
     fn test_keyword_masking_config() {
-        use bamboo_agent::commands::keyword_masking::load_keyword_masking_config;
+        use bamboo_agent::core::Config;
 
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("keyword_masking.json");
 
-        // Load from non-existent file should return default
-        let config = load_keyword_masking_config(&config_path).unwrap();
-        assert!(config.entries.is_empty());
+        // Unified config: keyword masking lives under config.json.
+        let config = Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
+        assert!(config.keyword_masking.entries.is_empty());
     }
 }

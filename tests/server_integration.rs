@@ -13,7 +13,9 @@ mod tests {
         let config = Config::default();
         assert!(config.server.port > 0);
         assert!(!config.server.bind.is_empty());
-        assert!(config.data_dir.exists() || config.data_dir.to_string_lossy().len() > 0);
+        assert!(!bamboo_agent::core::paths::bamboo_dir()
+            .to_string_lossy()
+            .is_empty());
     }
 
     #[test]

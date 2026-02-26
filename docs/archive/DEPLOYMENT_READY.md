@@ -1,5 +1,10 @@
 # ✅ Final Summary - Ready for Deployment
 
+> **Archived note (2026-02-26)**: This document is kept for history. Bamboo no longer loads legacy
+> `config.toml`, and `Config` no longer has a persisted `data_dir` field. The runtime data directory
+> is derived from `BAMBOO_DATA_DIR` (or defaults to `~/.bamboo`), and `config.json` is always stored
+> under that directory.
+
 ## Implementation Complete
 
 I've successfully implemented a **production-ready unified configuration system** with comprehensive testing!
@@ -11,7 +16,7 @@ I've successfully implemented a **production-ready unified configuration system*
 1. ✅ **Environment variable override logic** - Env vars ALWAYS override file values
 2. ✅ **CLI argument handling** - Arguments use `Option<T>`, only override when provided
 3. ✅ **--data-dir loads from specified directory** - Uses `Config::from_data_dir()`
-4. ✅ **Config.data_dir is source of truth** - All file operations use it
+4. ✅ **Runtime data dir is source of truth** - All file operations use `{data_dir}/config.json`
 5. ✅ **Provider configuration** - Reads from `providers.copilot.headless_auth`
 6. ✅ **Stack overflow in tests** - Fixed with `Config::create_default()`
 7. ✅ **Deprecation versions** - Updated to `0.2.6`
@@ -36,7 +41,7 @@ I've successfully implemented a **production-ready unified configuration system*
 **Highest to Lowest:**
 1. **CLI arguments** (e.g., `--port 7777`)
 2. **Environment variables** (e.g., `BAMBOO_PORT=9000`)
-3. **Config file values** (from `data_dir/config.json`)
+3. **Config file values** (from `{data_dir}/config.json`)
 4. **Code defaults** (hardcoded defaults)
 
 ## Verified Working
@@ -79,20 +84,19 @@ bamboo serve --data-dir /custom/path  # Loads from /custom/path/config.json
 
 These are documented for future work but don't block deployment:
 
-1. **AppState consistency** - AppState could use config.data_dir more consistently
-2. **Hot-reload llm cache** - Cached llm field doesn't update on reload
+1. **Hot-reload llm cache** - Cached llm field doesn't update on reload
 3. **Config::default() does I/O** - Could be pure function instead
-4. **TOML support** - Legacy fallback exists but confusing
+4. **(Resolved)** TOML support - legacy fallback removed
 
 **Status: Low priority, doesn't affect normal usage**
 
 ## Backward Compatibility
 
-✅ **100% backward compatible**
+✅ **Backward compatible (legacy JSON formats)**
 - Old config files work without changes
 - Deprecated APIs still work with warnings
 - Migration happens automatically
-- No breaking changes
+- Note: legacy `config.toml` is no longer supported
 
 ## Production Readiness Checklist
 

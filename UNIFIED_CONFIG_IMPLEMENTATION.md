@@ -4,20 +4,26 @@
 
 Successfully merged the two independent configuration systems into a single unified `Config` structure in `src/core/config.rs`.
 
+> **Update (2026-02-26)**:
+> - Legacy `config.toml` fallback has been removed.
+> - `Config` no longer contains a persisted `data_dir` field. The data directory is runtime-derived
+>   via `BAMBOO_DATA_DIR` (or defaults to `~/.bamboo`), and configuration is stored as
+>   `{data_dir}/config.json`.
+
 ## Changes Made
 
 ### 1. Core Configuration (src/core/config.rs)
 - ✅ Added `ServerConfig` struct with fields: `port`, `bind`, `static_dir`, `workers`
-- ✅ Extended `Config` struct with `server: ServerConfig` and `data_dir: PathBuf` fields
+- ✅ Extended `Config` struct with `server: ServerConfig`
 - ✅ Implemented `Default` trait for `ServerConfig` with sensible defaults
-- ✅ Added default value functions: `default_port()`, `default_bind()`, `default_workers()`, `default_data_dir()`
+- ✅ Added default value functions: `default_port()`, `default_bind()`, `default_workers()`
 - ✅ Updated `Config::new()` to support server configuration environment variables:
   - `BAMBOO_PORT` - Server port (default: 8080)
   - `BAMBOO_BIND` - Bind address (default: 127.0.0.1)
   - `BAMBOO_DATA_DIR` - Data directory (default: ~/.bamboo)
   - `BAMBOO_PROVIDER` - Default LLM provider
 - ✅ Added `server_addr()` helper method to get formatted "bind:port" string
-- ✅ Added `save()` method for persisting configuration to disk
+- ✅ Added `save_to_dir(dir)` method for persisting configuration to disk (writes to `{dir}/config.json`)
 - ✅ Updated `migrate_config()` to include new fields for backward compatibility
 - ✅ Added comprehensive unit tests for server configuration
 
@@ -53,11 +59,12 @@ All tests passing:
 
 ## Backward Compatibility
 
-✅ **Fully Backward Compatible**
+✅ **Backward compatible (legacy JSON formats)**
 - Old config files without `server` field work correctly (uses defaults)
 - Serde `#[serde(default)]` attributes ensure smooth migration
 - Environment variable priority preserved: File < Environment Variables
 - Old API still works with deprecation warnings
+- Note: legacy `config.toml` fallback is no longer supported
 
 ## Configuration Schema
 
@@ -77,10 +84,9 @@ All tests passing:
     "static_dir": null,
     "workers": 10
   },
-  "data_dir": "~/.bamboo",
   "http_proxy": "",
   "https_proxy": "",
-  "proxy_auth": null,
+  "proxy_auth_encrypted": null,
   "model": null,
   "headless_auth": false
 }
@@ -113,7 +119,9 @@ let config = Config::new();
 ```
 
 ### For Direct Config File Users
-No changes required - old config files work without modification. New `server` and `data_dir` fields will be added with defaults when saved.
+No changes required - old config files work without modification. Note that the data directory is
+selected at runtime (via `BAMBOO_DATA_DIR` or CLI `--data-dir`), not via a `data_dir` field in
+`config.json` (any legacy `data_dir` key is ignored and stripped on save).
 
 ## Benefits Achieved
 

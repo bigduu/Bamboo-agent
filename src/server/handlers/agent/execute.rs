@@ -292,7 +292,9 @@ pub async fn handler(
             &mut session,
             initial_message,
             mpsc_tx.clone(),
-            state_clone.llm.clone(),
+            // Use the reloadable provider handle so config/provider switches take effect
+            // without requiring a server restart.
+            state_clone.get_provider().await,
             state_clone.tools.clone(),
             cancel_token,
             AgentLoopConfig {

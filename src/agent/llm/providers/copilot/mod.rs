@@ -13,6 +13,7 @@ use super::common::openai_compat::{
     messages_to_openai_compat_json, parse_openai_compat_sse_data_lenient,
     tools_to_openai_compat_json,
 };
+use super::common::openai_responses::{build_responses_body, ResponsesSseParser};
 use super::common::sse::llm_stream_from_sse;
 
 /// GitHub Copilot Provider with Device Code Authentication
@@ -34,6 +35,8 @@ pub struct CopilotProvider {
     token: Option<String>,
     token_expires_at: Option<u64>,
     auth_handler: Option<CopilotAuthHandler>,
+    // Patterns (case-insensitive) for models that require Responses API upstream.
+    responses_only_models: Vec<String>,
 }
 
 impl CopilotProvider {
@@ -44,6 +47,7 @@ impl CopilotProvider {
             token: None,
             token_expires_at: None,
             auth_handler: None,
+            responses_only_models: vec![],
         }
     }
 
@@ -54,6 +58,7 @@ impl CopilotProvider {
             token: Some(token.into()),
             token_expires_at: None,
             auth_handler: None,
+            responses_only_models: vec![],
         }
     }
 
@@ -83,7 +88,14 @@ impl CopilotProvider {
             token: None,
             token_expires_at: None,
             auth_handler: Some(auth_handler),
+            responses_only_models: vec![],
         }
+    }
+
+    /// Configure models that must use Responses API upstream.
+    pub fn with_responses_only_models(mut self, models: Vec<String>) -> Self {
+        self.responses_only_models = models;
+        self
     }
 
     /// Check if already authenticated
@@ -259,6 +271,108 @@ impl Default for CopilotProvider {
     }
 }
 
+impl CopilotProvider {
+    fn matches_model_pattern(pattern: &str, model: &str) -> bool {
+        let p = pattern.trim().to_ascii_lowercase();
+        if p.is_empty() {
+            return false;
+        }
+
+        let m = model.trim().to_ascii_lowercase();
+
+        // Support a single trailing wildcard for simple prefix matching: "gpt-5*"
+        if let Some(prefix) = p.strip_suffix('*') {
+            return m.starts_with(prefix);
+        }
+
+        m == p
+    }
+
+    fn uses_responses_api(&self, model: &str) -> bool {
+        self.responses_only_models
+            .iter()
+            .any(|p| Self::matches_model_pattern(p, model))
+    }
+
+    fn looks_like_responses_only_error(status: reqwest::StatusCode, body: &str) -> bool {
+        if !(status == 400
+            || status == 404
+            || status == 405
+            || status == 409
+            || status == 415
+            || status == 422)
+        {
+            return false;
+        }
+
+        let b = body.to_ascii_lowercase();
+        b.contains("/responses") || b.contains("responses api") || b.contains("use responses")
+    }
+
+    async fn chat_stream_via_responses(
+        &self,
+        token: &str,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream> {
+        let url = "https://api.githubcopilot.com/responses";
+        let body = build_responses_body(model, messages, tools, max_output_tokens);
+
+        log::debug!("Copilot provider using Responses API model: {}", model);
+
+        let mut response = self
+            .client
+            .post(url)
+            .headers(Self::build_headers_with_token(token)?)
+            .json(&body)
+            .send()
+            .await
+            .map_err(LLMError::Http)?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+
+            if (status == 401 || status == 403) && self.auth_handler.is_some() {
+                if let Some(handler) = &self.auth_handler {
+                    if let Ok(Some(refreshed)) = handler.force_refresh_chat_token().await {
+                        response = self
+                            .client
+                            .post(url)
+                            .headers(Self::build_headers_with_token(&refreshed)?)
+                            .json(&body)
+                            .send()
+                            .await
+                            .map_err(LLMError::Http)?;
+                    }
+                }
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+
+                if status == 401 || status == 403 {
+                    return Err(LLMError::Auth(format!(
+                        "Authentication failed: {}. Please run authenticate() again.",
+                        text
+                    )));
+                }
+
+                log::error!("Copilot Responses API error: HTTP {} - {}", status, text);
+                return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
+            }
+        }
+
+        let mut parser = ResponsesSseParser::new();
+        let stream = llm_stream_from_sse(response, move |event, data| {
+            parser.handle_event(event, data)
+        });
+        Ok(stream)
+    }
+}
+
 #[async_trait]
 impl LLMProvider for CopilotProvider {
     async fn chat_stream(
@@ -272,15 +386,27 @@ impl LLMProvider for CopilotProvider {
 
         // Copilot supports multiple upstream model IDs. We don't store a default model in the provider
         // instance (it is resolved by the caller and passed in per request).
-        let requested_model = model.trim();
-        let upstream_model = if requested_model.is_empty() {
-            // Back-compat default (previous behavior hard-coded this).
-            "copilot-chat"
-        } else {
-            requested_model
-        };
+        let upstream_model = model.trim();
+        if upstream_model.is_empty() {
+            return Err(LLMError::Api(
+                "model is required for Copilot requests (no default model fallback)".to_string(),
+            ));
+        }
 
         log::debug!("Copilot provider using upstream model: {}", upstream_model);
+
+        // Some models only support Responses API.
+        if self.uses_responses_api(upstream_model) {
+            return self
+                .chat_stream_via_responses(
+                    &token,
+                    messages,
+                    tools,
+                    max_output_tokens,
+                    upstream_model,
+                )
+                .await;
+        }
 
         let mut body = json!({
             "model": upstream_model,
@@ -344,6 +470,23 @@ impl LLMProvider for CopilotProvider {
                         "Authentication failed: {}. Please run authenticate() again.",
                         text
                     )));
+                }
+
+                // If this model only supports Responses API, retry with /responses.
+                if Self::looks_like_responses_only_error(status, &text) {
+                    log::info!(
+                        "Copilot chat/completions rejected model '{}'; retrying via /responses",
+                        upstream_model
+                    );
+                    return self
+                        .chat_stream_via_responses(
+                            &token,
+                            messages,
+                            tools,
+                            max_output_tokens,
+                            upstream_model,
+                        )
+                        .await;
                 }
 
                 log::error!("Copilot API error: HTTP {} - {}", status, text);
@@ -462,6 +605,16 @@ mod tests {
         let provider = CopilotProvider::with_token("test_token");
         assert!(provider.is_authenticated());
         assert_eq!(provider.token(), Some("test_token"));
+    }
+
+    #[test]
+    fn responses_only_models_matches_exact_and_prefix() {
+        let provider = CopilotProvider::new()
+            .with_responses_only_models(vec!["gpt-5.3-codex".to_string(), "gpt-5*".to_string()]);
+
+        assert!(provider.uses_responses_api("gpt-5.3-codex"));
+        assert!(provider.uses_responses_api("gpt-5.4-whatever"));
+        assert!(!provider.uses_responses_api("gpt-4o"));
     }
 
     // ============================================

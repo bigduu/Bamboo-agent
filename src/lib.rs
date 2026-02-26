@@ -66,12 +66,22 @@ pub use process::ProcessRegistry;
 /// Main Bamboo server instance
 pub struct BambooServer {
     config: core::Config,
+    #[allow(dead_code)]
+    data_dir: PathBuf,
 }
 
 impl BambooServer {
     /// Create a new Bamboo server with configuration
     pub fn new(config: core::Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            data_dir: core::paths::bamboo_dir(),
+        }
+    }
+
+    /// Create a new Bamboo server with an explicit data directory.
+    pub fn new_with_data_dir(config: core::Config, data_dir: PathBuf) -> Self {
+        Self { config, data_dir }
     }
 
     /// Start the HTTP server (blocking)
@@ -105,6 +115,7 @@ impl BambooServer {
 /// ```
 pub struct BambooBuilder {
     config: core::Config,
+    data_dir: PathBuf,
 }
 
 impl BambooBuilder {
@@ -112,6 +123,7 @@ impl BambooBuilder {
     pub fn new() -> Self {
         Self {
             config: core::Config::new(),
+            data_dir: core::paths::bamboo_dir(),
         }
     }
 
@@ -141,7 +153,7 @@ impl BambooBuilder {
     ///
     /// * `dir` - Path to the data directory
     pub fn data_dir(mut self, dir: PathBuf) -> Self {
-        self.config.data_dir = dir;
+        self.data_dir = dir;
         self
     }
 
@@ -171,7 +183,7 @@ impl BambooBuilder {
     ///
     /// A Result containing the configured BambooServer or an error
     pub fn build(self) -> Result<BambooServer> {
-        Ok(BambooServer::new(self.config))
+        Ok(BambooServer::new_with_data_dir(self.config, self.data_dir))
     }
 }
 

@@ -25,8 +25,7 @@ impl ExternalMemory {
     ///
     /// Uses `~/.bamboo/notes` as the storage directory.
     pub fn with_defaults() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let notes_dir = home.join(".bamboo").join("notes");
+        let notes_dir = crate::core::paths::bamboo_dir().join("notes");
         Self::new(notes_dir)
     }
 

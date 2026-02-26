@@ -85,11 +85,57 @@ fn read_machine_id() -> Option<String> {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(machine_id) = read_windows_machine_guid() {
+            return Some(machine_id);
+        }
+    }
+
     #[cfg(target_os = "macos")]
     {
         if let Some(machine_id) = read_macos_platform_uuid() {
             return Some(machine_id);
         }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_machine_guid() -> Option<String> {
+    // Prefer a stable host identifier on Windows so secrets can be decrypted across
+    // restarts/builds. Falling back to derived identifiers (like current_exe()) can
+    // break decryption when paths change (e.g. Tauri dev builds).
+    //
+    // Registry: HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
+    let output = Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Cryptography",
+            "/v",
+            "MachineGuid",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    for line in stdout.lines() {
+        // Example:
+        // MachineGuid    REG_SZ    01234567-89ab-cdef-0123-456789abcdef
+        if !line.to_ascii_lowercase().contains("machineguid") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let guid = parts.last()?.trim();
+        if guid.is_empty() {
+            continue;
+        }
+        return Some(guid.to_string());
     }
 
     None

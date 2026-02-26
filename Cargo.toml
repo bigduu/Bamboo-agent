@@ -1,6 +1,6 @@
 [package]
 name = "bamboo-agent"
-version = "0.2.13"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 authors = ["mugeng.du@gmail.com"]
@@ -40,7 +40,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 log = "0.4"
 env_logger = "0.11"
-toml = "0.8"
 
 # Error handling
 anyhow = "1"

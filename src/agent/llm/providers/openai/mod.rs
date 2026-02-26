@@ -11,6 +11,7 @@ use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
 use crate::agent::llm::types::LLMChunk;
 
 use super::common::openai_compat::{build_openai_compat_body, parse_openai_compat_sse_data_strict};
+use super::common::openai_responses::{build_responses_body, ResponsesSseParser};
 use super::common::sse::llm_stream_from_sse;
 
 /// OpenAI API provider for chat completions.
@@ -18,6 +19,7 @@ pub struct OpenAIProvider {
     client: Client,
     api_key: String,
     base_url: String,
+    responses_only_models: Vec<String>,
 }
 
 impl OpenAIProvider {
@@ -27,6 +29,7 @@ impl OpenAIProvider {
             client: Client::new(),
             api_key: api_key.into(),
             base_url: "https://api.openai.com/v1".to_string(),
+            responses_only_models: vec![],
         }
     }
 
@@ -41,6 +44,79 @@ impl OpenAIProvider {
         self.client = client;
         self
     }
+
+    /// Configure models that must use Responses API upstream.
+    pub fn with_responses_only_models(mut self, models: Vec<String>) -> Self {
+        self.responses_only_models = models;
+        self
+    }
+
+    fn matches_model_pattern(pattern: &str, model: &str) -> bool {
+        let p = pattern.trim().to_ascii_lowercase();
+        if p.is_empty() {
+            return false;
+        }
+
+        let m = model.trim().to_ascii_lowercase();
+
+        // Support a single trailing wildcard for simple prefix matching: "gpt-5*"
+        if let Some(prefix) = p.strip_suffix('*') {
+            return m.starts_with(prefix);
+        }
+
+        m == p
+    }
+
+    fn uses_responses_api(&self, model: &str) -> bool {
+        self.responses_only_models
+            .iter()
+            .any(|p| Self::matches_model_pattern(p, model))
+    }
+
+    fn looks_like_responses_only_error(status: reqwest::StatusCode, body: &str) -> bool {
+        if !(status == 400
+            || status == 404
+            || status == 405
+            || status == 409
+            || status == 415
+            || status == 422)
+        {
+            return false;
+        }
+
+        let b = body.to_ascii_lowercase();
+        b.contains("/responses") || b.contains("responses api") || b.contains("use responses")
+    }
+
+    async fn chat_stream_via_responses(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream> {
+        let body = build_responses_body(model, messages, tools, max_output_tokens);
+
+        let response = self
+            .client
+            .post(format!("{}/responses", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await?;
+            return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
+        }
+
+        let mut parser = ResponsesSseParser::new();
+        let stream = llm_stream_from_sse(response, move |event, data| {
+            parser.handle_event(event, data)
+        });
+        Ok(stream)
+    }
 }
 
 #[async_trait]
@@ -53,6 +129,12 @@ impl LLMProvider for OpenAIProvider {
         model: &str,
     ) -> Result<LLMStream> {
         log::debug!("OpenAI provider using model: {}", model);
+
+        if self.uses_responses_api(model) {
+            return self
+                .chat_stream_via_responses(messages, tools, max_output_tokens, model)
+                .await;
+        }
 
         let body = build_openai_compat_body(model, messages, tools, None, max_output_tokens);
 
@@ -67,6 +149,17 @@ impl LLMProvider for OpenAIProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await?;
+
+            if Self::looks_like_responses_only_error(status, &text) {
+                log::info!(
+                    "OpenAI chat/completions rejected model '{}'; retrying via /responses",
+                    model
+                );
+                return self
+                    .chat_stream_via_responses(messages, tools, max_output_tokens, model)
+                    .await;
+            }
+
             return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
         }
 
@@ -121,6 +214,16 @@ mod tests {
 
         assert_eq!(provider.api_key, "test_key");
         assert_eq!(provider.base_url, "https://custom.openai.com/v1");
+    }
+
+    #[test]
+    fn responses_only_models_matches_exact_and_prefix() {
+        let provider = OpenAIProvider::new("k")
+            .with_responses_only_models(vec!["gpt-5.3-codex".to_string(), "gpt-5*".to_string()]);
+
+        assert!(provider.uses_responses_api("gpt-5.3-codex"));
+        assert!(provider.uses_responses_api("gpt-5.0-any"));
+        assert!(!provider.uses_responses_api("gpt-4o-mini"));
     }
 
     // ===== Request Building Tests (4 tests) =====

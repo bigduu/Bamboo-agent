@@ -1,5 +1,9 @@
 # Codex Review - Issues Fixed
 
+> **Update (2026-02-26)**: `Config` no longer contains a persisted `data_dir` field and Bamboo no longer
+> loads legacy `config.toml`. The data directory is runtime-derived via `BAMBOO_DATA_DIR` (or defaults
+> to `~/.bamboo`), and `config.json` is always stored under that directory.
+
 ## Summary of Critical Fixes Applied
 
 This document summarizes the critical issues identified by Codex review and how they were fixed.
@@ -10,12 +14,12 @@ This document summarizes the critical issues identified by Codex review and how 
 **Fix**: Refactored `Config::new()` to:
 1. Load config from file (if exists)
 2. Apply environment variable overrides (highest priority)
-3. Ensure data_dir is respected for config file path
+3. Keep config writes scoped to the selected runtime data directory
 
 **Code Changes**:
 - Created `Config::from_data_dir()` method to support custom data directories
 - Modified `Config::new()` to always apply env var overrides after loading from file
-- Fixed `Config::save()` to use `self.data_dir` for config file path
+- Added `Config::save_to_dir(dir)` for explicit persistence (server runtime uses `AppState.app_data_dir`)
 
 **Files**: `src/core/config.rs`
 
@@ -66,14 +70,13 @@ let headless_auth = config
 ### ✅ Issue #5: Config File Path Consistency (CRITICAL)
 **Problem**: Different parts of code used different config paths:
 - `Config::new()` used global `core::paths::config_json_path()`
-- Settings endpoints used `app_state.app_data_dir/config.json`
+- Settings endpoints used `{data_dir}/config.json` (server runtime: `app_state.app_data_dir/config.json`)
 - Would diverge when `data_dir` is customized
 
-**Fix**: Made Config aware of and use `data_dir`:
-- Added `Config::from_data_dir()` method
-- `Config::new()` calls `from_data_dir(None)`
-- `Config::save()` uses `self.data_dir.join("config.json")`
-- Ensures single source of truth for config file location
+**Fix**: Made config location runtime-derived:
+- `Config::from_data_dir(Some(dir))` loads from `{dir}/config.json` (parameter beats env)
+- `core::paths::bamboo_dir()` derives runtime data dir from `BAMBOO_DATA_DIR` (or `~/.bamboo`)
+- Server persists via `AppState.app_data_dir` to ensure a single source of truth
 
 **Files**: `src/core/config.rs`
 
@@ -123,10 +126,11 @@ All tests passing:
 
 ## Priority Order Applied
 
-1. **Environment variables** (highest priority)
-2. **CLI arguments** (when explicitly provided)
-3. **Config file values**
-4. **Code defaults** (lowest priority)
+Binary mode:
+1. **CLI arguments** (when explicitly provided; includes `--data-dir`)
+2. **Environment variables**
+3. **Config file values** (`{data_dir}/config.json`)
+4. **Code defaults**
 
 ## Backward Compatibility
 
@@ -155,7 +159,7 @@ These were identified by Codex but are not critical:
 ## Success Criteria Met
 
 - [x] Environment variables override file values
-- [x] Config.data_dir replaces bamboo_home_dir parameter
+- [x] Config storage is scoped to the runtime data directory (no `config.data_dir` field)
 - [x] Copilot headless mode reads from providers.copilot.headless_auth
 - [x] All tests passing
 - [x] No compilation errors

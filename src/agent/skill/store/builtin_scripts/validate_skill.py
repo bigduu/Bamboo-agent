@@ -48,7 +48,8 @@ def validate_timestamp(timestamp_str):
 
 def validate_skill(skill_dir):
     """Validate a skill directory."""
-    skill_path = Path(skill_dir)
+    # Expand "~" so docs/examples work on Windows too.
+    skill_path = Path(skill_dir).expanduser().resolve()
     errors = []
     warnings = []
 

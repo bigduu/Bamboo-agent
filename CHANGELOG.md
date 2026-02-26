@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.13] - 2026-02-26
+## [0.3.0] - 2026-02-26
 
 ### Security
 - Provider API keys are now encrypted at rest in `config.json` and are never returned via API (masked placeholders only).
@@ -91,7 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Reason**: Copilot OAuth2 authentication is difficult to test and mock in CI/CD environments
   - **Impact**: New installations will use Anthropic by default (requires API key)
   - **Migration**: Users wanting Copilot should explicitly set `provider: "copilot"` in config
-  - **Future**: Copilot will be re-introduced as default in v0.3.0 with proper test infrastructure
+  - **Future**: Copilot will be re-introduced as default in v0.4.0 with proper test infrastructure
 
 - Configuration documentation now accurately reflects implementation behavior
 - All provider configuration examples use JSON format consistently

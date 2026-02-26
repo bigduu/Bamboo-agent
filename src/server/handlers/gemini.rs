@@ -6,9 +6,7 @@ use crate::agent::llm::protocol::gemini::{
 use crate::agent::llm::protocol::FromProvider;
 use crate::agent::llm::LLMChunk;
 use crate::server::services::gemini_model_mapping_service::resolve_model;
-use crate::server::{
-    app_state::AppState, error::AppError, model_config_helper::get_default_model_from_config,
-};
+use crate::server::{app_state::AppState, error::AppError};
 use actix_web::{web, HttpResponse};
 use anyhow::anyhow;
 use bytes::Bytes;
@@ -62,13 +60,12 @@ pub async fn generate_content(
     let provider = state.get_provider().await;
 
     // 4. Call provider with mapped model
-    let model_to_use = if resolution.mapped_model.trim().is_empty() {
-        let config = state.config.read().await.clone();
-        get_default_model_from_config(&config)
-            .map_err(|e| AppError::InternalError(anyhow!("No default model configured: {}", e)))?
-    } else {
-        resolution.mapped_model.clone()
-    };
+    let model_to_use = resolution.mapped_model.trim().to_string();
+    if model_to_use.is_empty() {
+        return Err(AppError::BadRequest(
+            "No Gemini model mapping configured for requested model. Please configure gemini_model_mapping.".to_string(),
+        ));
+    }
 
     let mut stream = provider
         .chat_stream(
@@ -174,13 +171,12 @@ pub async fn stream_generate_content(
     let internal_tools = convert_gemini_tools(&request.tools)?;
 
     // 3. Get provider and create stream
-    let model_to_use = if resolution.mapped_model.trim().is_empty() {
-        let config = state.config.read().await.clone();
-        get_default_model_from_config(&config)
-            .map_err(|e| AppError::InternalError(anyhow!("No default model configured: {}", e)))?
-    } else {
-        resolution.mapped_model.clone()
-    };
+    let model_to_use = resolution.mapped_model.trim().to_string();
+    if model_to_use.is_empty() {
+        return Err(AppError::BadRequest(
+            "No Gemini model mapping configured for requested model. Please configure gemini_model_mapping.".to_string(),
+        ));
+    }
 
     let mut stream = state
         .get_provider()

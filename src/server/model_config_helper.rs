@@ -74,6 +74,7 @@ mod tests {
                     api_key_encrypted: None,
                     base_url: None,
                     model: Some("gpt-4o".to_string()),
+                    responses_only_models: vec![],
                     extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()
@@ -96,6 +97,7 @@ mod tests {
                     api_key_encrypted: None,
                     base_url: None,
                     model: None, // No model configured
+                    responses_only_models: vec![],
                     extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()
@@ -120,6 +122,7 @@ mod tests {
                     enabled: true,
                     headless_auth: false,
                     model: Some("gpt-4o-mini".to_string()),
+                    responses_only_models: vec![],
                     extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()

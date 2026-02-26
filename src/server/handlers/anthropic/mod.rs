@@ -6,9 +6,7 @@ use crate::agent::llm::api::models::{
 };
 use crate::agent::llm::protocol::FromProvider;
 use crate::core::model_mapping::AnthropicModelMapping;
-use crate::server::{
-    app_state::AppState, error::AppError, model_config_helper::get_default_model_from_config,
-};
+use crate::server::{app_state::AppState, error::AppError};
 use actix_web::{http::StatusCode, web, HttpResponse};
 use async_stream::stream;
 use bytes::Bytes;
@@ -213,36 +211,11 @@ pub async fn messages(
     };
     openai_request.model = resolution.mapped_model.clone();
     if openai_request.model.trim().is_empty() {
-        let config = app_state.config.read().await.clone();
-        openai_request.model = match get_default_model_from_config(&config) {
-            Ok(model) => model,
-            Err(err) => {
-                return Ok(anthropic_error_response(AnthropicError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    format!(
-                        "No default model configured. Please set a model in config.json. Details: {}",
-                        err
-                    ),
-                )));
-            }
-        };
-    }
-    if openai_request.model.trim().is_empty() {
-        let config = app_state.config.read().await.clone();
-        openai_request.model = match get_default_model_from_config(&config) {
-            Ok(model) => model,
-            Err(err) => {
-                return Ok(anthropic_error_response(AnthropicError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    format!(
-                        "No default model configured. Please set a model in config.json. Details: {}",
-                        err
-                    ),
-                )));
-            }
-        };
+        return Ok(anthropic_error_response(AnthropicError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "model is required (no default model fallback)".to_string(),
+        )));
     }
 
     // Enable usage tracking for streaming requests

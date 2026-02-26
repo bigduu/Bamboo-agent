@@ -207,7 +207,10 @@ def create_resource_dirs(skill_dir, skill_name, skill_title, resources, include_
 
 def init_skill(skill_name, path, resources, include_examples):
     """Initialize a new skill directory."""
-    skill_dir = Path(path).resolve() / skill_name
+    # On Windows, "~" is not expanded automatically by Path.resolve().
+    # Use expanduser() so `--path ~/.bamboo/skills` works cross-platform.
+    skills_root = Path(path).expanduser().resolve()
+    skill_dir = skills_root / skill_name
 
     if skill_dir.exists():
         print(f"[ERROR] Skill directory already exists: {skill_dir}")
@@ -249,7 +252,8 @@ def init_skill(skill_name, path, resources, include_examples):
     print("2. Update the description field - this determines when the skill triggers")
     print("3. Add resources to scripts/, references/, assets/ as needed")
     print("4. Run the validator when ready:")
-    print(f"   python3 ~/.bamboo/skills/skill-creator/scripts/validate_skill.py {skill_dir}")
+    validator = skills_root / "skill-creator" / "scripts" / "validate_skill.py"
+    print(f"   python3 {validator} {skill_dir}")
 
     return skill_dir
 

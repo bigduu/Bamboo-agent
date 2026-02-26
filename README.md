@@ -107,9 +107,6 @@ bamboo serve
 # Custom configuration
 bamboo serve --port 9000 --bind 0.0.0.0 --data-dir /var/lib/bamboo
 
-# With specific config file
-bamboo serve --config /path/to/config.toml
-
 # Enable debug logging
 RUST_LOG=debug bamboo serve
 ```
@@ -171,7 +168,7 @@ Edit `~/.bamboo/config.json` (JSON format):
 }
 ```
 
-> **💡 Tip**: Bamboo automatically migrates legacy `config.toml` files to the new JSON format.
+> **Note**: Legacy `config.toml` is no longer loaded. Please migrate to `config.json`.
 
 ### 🔧 Environment Variables
 

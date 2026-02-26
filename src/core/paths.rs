@@ -1,5 +1,28 @@
 use std::path::{Path, PathBuf};
 
+/// Convert a filesystem path to a user-facing string.
+///
+/// On Windows, `std::fs::canonicalize()` may produce verbatim paths like `\\?\C:\...`
+/// which are valid for Win32 APIs but confusing for users and sometimes incompatible
+/// with external tools. We strip the verbatim prefix for display and API payloads.
+pub fn path_to_display_string(path: &Path) -> String {
+    let s = path.to_string_lossy().to_string();
+
+    #[cfg(windows)]
+    {
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            // \\?\UNC\server\share\path -> \\server\share\path
+            return format!(r"\\{}", rest);
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            // \\?\C:\path -> C:\path
+            return rest.to_string();
+        }
+    }
+
+    s
+}
+
 /// Get Bamboo data directory (~/.bamboo)
 pub fn bamboo_dir() -> PathBuf {
     std::env::var("BAMBOO_DATA_DIR")

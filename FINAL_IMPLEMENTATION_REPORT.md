@@ -5,9 +5,14 @@
 Successfully implemented a **unified configuration system** for Bamboo Agent, merging two independent config systems into one. The implementation includes:
 
 - ✅ **All critical Codex review issues fixed**
-- ✅ **819 tests passing** (788 unit + 20 comprehensive + 11 integration)
-- ✅ **100% backward compatibility maintained**
+- ✅ **All tests passing** (unit + integration + comprehensive)
+- ✅ **Backward compatibility maintained** (legacy JSON config formats auto-migrate; `config.toml` is no longer supported)
 - ✅ **Comprehensive documentation created**
+
+> **Update (2026-02-26)**:
+> - Bamboo no longer loads legacy `config.toml` fallback.
+> - `Config` no longer has a persisted `data_dir` field; the data directory is runtime-derived via
+>   `BAMBOO_DATA_DIR` (or defaults to `~/.bamboo`), and `config.json` is always stored under that dir.
 
 ## Changes Implemented
 
@@ -15,10 +20,9 @@ Successfully implemented a **unified configuration system** for Bamboo Agent, me
 
 **Added:**
 - `ServerConfig` struct (port, bind, static_dir, workers)
-- `data_dir: PathBuf` field to Config
 - `Config::from_data_dir()` method for explicit directory control
 - `Config::create_default()` helper to avoid infinite recursion
-- `Config::save()` method that respects `self.data_dir`
+- `Config::save_to_dir(dir)` for explicit persistence (writes to `{dir}/config.json`)
 
 **Fixed:**
 - Environment variables now ALWAYS override file values (highest priority)
@@ -29,7 +33,7 @@ Successfully implemented a **unified configuration system** for Bamboo Agent, me
 
 **Changed:**
 - CLI arguments to `Option<T>` (only override when explicitly provided)
-- `--data-dir` now actually loads config from specified directory
+- `--data-dir` now actually loads config from specified directory (and sets `BAMBOO_DATA_DIR` for consistent runtime paths)
 - Proper priority: CLI > Env > File > Defaults
 
 ### 3. Provider Factory (src/agent/llm/provider_factory.rs)
@@ -77,7 +81,7 @@ Successfully implemented a **unified configuration system** for Bamboo Agent, me
 14. `partial_invalid_type_falls_back` ✅
 
 **Data Directory Usage:**
-15. `save_uses_data_dir` ✅
+15. `save_to_dir_writes_to_directory` ✅
 16. `isolated_library_usage_without_home` ✅
 
 **Other Critical Scenarios:**
@@ -99,9 +103,9 @@ Failed:               0
 
 **Highest to Lowest:**
 1. CLI arguments (when explicitly provided)
-2. Environment variables (`BAMBOO_*`, `MODEL`)
-3. Explicit parameters (`from_data_dir()`)
-4. Config file values (`data_dir/config.json`)
+2. Explicit parameters (`from_data_dir()`, `--data-dir`)
+3. Environment variables (`BAMBOO_*`, `MODEL`)
+4. Config file values (`{data_dir}/config.json`)
 5. Code defaults
 
 ## Documentation Created
@@ -129,14 +133,11 @@ Failed:               0
 ## Remaining Issues (From Second Review)
 
 ### Critical (To Fix Next)
-1. AppState doesn't use passed data_dir for config loading
-2. Hot-reload doesn't update cached llm provider
-3. Provider-specific env overrides don't work correctly
+1. Hot-reload doesn't update cached llm provider
+2. Provider-specific env override doesn't work correctly
 
 ### Major (Important but Not Blocking)
 4. `Config::default()` does I/O (surprising)
-5. TOML support confusing (hybrid approach)
-6. Unknown fields dropped on save
 7. `--static-dir` and `--workers` CLI args ignored
 
 ### Minor (Can Wait)

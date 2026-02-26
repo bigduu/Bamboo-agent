@@ -1,5 +1,6 @@
 use chrono::Utc;
 use dashmap::DashMap;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -30,6 +31,71 @@ pub struct McpServerManager {
     event_tx: Option<tokio::sync::mpsc::Sender<McpEvent>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveHeaderConfig {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EffectiveTransportConfig {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        cwd: Option<String>,
+        env: BTreeMap<String, String>,
+        startup_timeout_ms: u64,
+    },
+    Sse {
+        url: String,
+        headers: Vec<EffectiveHeaderConfig>,
+        connect_timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveServerConfig {
+    transport: EffectiveTransportConfig,
+    request_timeout_ms: u64,
+    healthcheck_interval_ms: u64,
+    reconnect: crate::agent::mcp::ReconnectConfig,
+    allowed_tools: Vec<String>,
+    denied_tools: Vec<String>,
+}
+
+fn effective_server_config(config: &McpServerConfig) -> EffectiveServerConfig {
+    let transport = match &config.transport {
+        TransportConfig::Stdio(stdio) => EffectiveTransportConfig::Stdio {
+            command: stdio.command.clone(),
+            args: stdio.args.clone(),
+            cwd: stdio.cwd.clone(),
+            env: stdio.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            startup_timeout_ms: stdio.startup_timeout_ms,
+        },
+        TransportConfig::Sse(sse) => EffectiveTransportConfig::Sse {
+            url: sse.url.clone(),
+            headers: sse
+                .headers
+                .iter()
+                .map(|h| EffectiveHeaderConfig {
+                    name: h.name.clone(),
+                    value: h.value.clone(),
+                })
+                .collect(),
+            connect_timeout_ms: sse.connect_timeout_ms,
+        },
+    };
+
+    EffectiveServerConfig {
+        transport,
+        request_timeout_ms: config.request_timeout_ms,
+        healthcheck_interval_ms: config.healthcheck_interval_ms,
+        reconnect: config.reconnect.clone(),
+        allowed_tools: config.allowed_tools.clone(),
+        denied_tools: config.denied_tools.clone(),
+    }
+}
+
 impl Clone for McpServerManager {
     fn clone(&self) -> Self {
         Self {
@@ -56,6 +122,73 @@ impl McpServerManager {
 
     pub fn tool_index(&self) -> Arc<ToolIndex> {
         self.index.clone()
+    }
+
+    /// Reconcile running MCP servers with the desired configuration.
+    ///
+    /// This is best-effort and will:
+    /// - Stop servers that are running but removed/disabled in config.
+    /// - Start enabled servers that are not running.
+    /// - Restart servers whose effective runtime config changed.
+    ///
+    /// Secrets are compared by their hydrated plaintext (env/header values), not by the
+    /// encrypted-at-rest blobs (which can change on every save due to random nonces).
+    pub async fn reconcile_from_config(&self, config: &McpConfig) {
+        // Stop or restart existing runtimes.
+        for running_id in self.list_servers() {
+            let desired = config.servers.iter().find(|s| s.id == running_id);
+
+            let Some(desired) = desired else {
+                info!(
+                    "Stopping MCP server '{}' (removed from configuration)",
+                    running_id
+                );
+                if let Err(e) = self.stop_server(&running_id).await {
+                    warn!("Failed to stop MCP server '{}': {}", running_id, e);
+                }
+                continue;
+            };
+
+            if !desired.enabled {
+                info!("Stopping MCP server '{}' (disabled in config)", running_id);
+                if let Err(e) = self.stop_server(&running_id).await {
+                    warn!("Failed to stop MCP server '{}': {}", running_id, e);
+                }
+                continue;
+            }
+
+            let needs_restart = self
+                .runtimes
+                .get(&running_id)
+                .map(|runtime| effective_server_config(&runtime.config) != effective_server_config(desired))
+                .unwrap_or(false);
+
+            if needs_restart {
+                info!("Restarting MCP server '{}' (config changed)", running_id);
+                let _ = self.stop_server(&running_id).await;
+                if let Err(e) = self.start_server(desired.clone()).await {
+                    error!("Failed to restart MCP server '{}': {}", running_id, e);
+                }
+            }
+        }
+
+        // Start any enabled servers that are not running.
+        for desired in &config.servers {
+            if !desired.enabled {
+                continue;
+            }
+            if self.is_server_running(&desired.id) {
+                continue;
+            }
+
+            info!(
+                "Starting MCP server '{}' (enabled in configuration)",
+                desired.id
+            );
+            if let Err(e) = self.start_server(desired.clone()).await {
+                error!("Failed to start MCP server '{}': {}", desired.id, e);
+            }
+        }
     }
 
     /// Initialize from configuration

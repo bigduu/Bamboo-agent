@@ -214,8 +214,8 @@ impl GlobSearchTool {
             }
 
             // Convert to string
-            if let Some(path_str) = path.to_str() {
-                results.push(path_str.to_string());
+            if !path.as_os_str().is_empty() {
+                results.push(crate::core::paths::path_to_display_string(path));
 
                 // Check limit
                 if results.len() >= args.limit {

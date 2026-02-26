@@ -640,6 +640,21 @@ pub async fn run_agent_loop_with_config(
                                 session_id, tool_call.id, tool_result_msg.id);
                             session.add_message(tool_result_msg);
 
+                            // Ensure the UI/tooling pipeline sees this tool call as completed.
+                            // (ToolStart was already emitted above; without a ToolComplete, some
+                            // clients may keep the tool in an in-progress state.)
+                            send_event_with_metrics(
+                                &event_tx,
+                                metrics_collector.as_ref(),
+                                &session_id,
+                                &round_id,
+                                AgentEvent::ToolComplete {
+                                    tool_call_id: tool_call.id.clone(),
+                                    result: result.clone(),
+                                },
+                            )
+                            .await;
+
                             // Emit NeedClarification event with options
                             let _ = event_tx
                                 .send(AgentEvent::NeedClarification {

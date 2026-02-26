@@ -1,12 +1,13 @@
-use serde::{Deserialize, Serialize};
+use serde::de;
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use std::collections::HashMap;
 
 /// Root MCP configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct McpConfig {
-    #[serde(default = "default_version")]
     pub version: u32,
-    #[serde(default)]
     pub servers: Vec<McpServerConfig>,
 }
 
@@ -20,6 +21,294 @@ impl Default for McpConfig {
             version: 1,
             servers: Vec::new(),
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// On-disk format compatibility
+// -----------------------------------------------------------------------------
+//
+// The MCP ecosystem "mainstream" config format (e.g. Claude Desktop) uses:
+//
+//   "mcpServers": {
+//     "filesystem": { "command": "...", "args": [...], "env": {...} }
+//   }
+//
+// Our internal runtime format historically used:
+//
+//   { "version": 1, "servers": [ { "id": "...", "transport": {...} } ] }
+//
+// We support reading BOTH formats, and we serialize to the mainstream map format
+// (the Config layer maps this struct under the `mcpServers` key).
+
+#[derive(Debug, Clone, Deserialize)]
+struct McpConfigLegacyDisk {
+    #[serde(default = "default_version")]
+    version: u32,
+    #[serde(default)]
+    servers: Vec<McpServerConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct McpServerConfigFlatDisk {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    disabled: bool,
+
+    // stdio (mainstream) shape
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
+    env_encrypted: HashMap<String, String>,
+    #[serde(default)]
+    startup_timeout_ms: Option<u64>,
+
+    // sse shape
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_headers")]
+    headers: Vec<HeaderConfig>,
+    #[serde(default)]
+    connect_timeout_ms: Option<u64>,
+
+    // Bamboo extras (optional)
+    #[serde(default)]
+    request_timeout_ms: Option<u64>,
+    #[serde(default)]
+    healthcheck_interval_ms: Option<u64>,
+    #[serde(default)]
+    reconnect: Option<ReconnectConfig>,
+    #[serde(default)]
+    allowed_tools: Vec<String>,
+    #[serde(default)]
+    denied_tools: Vec<String>,
+}
+
+fn deserialize_headers<'de, D>(deserializer: D) -> Result<Vec<HeaderConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+
+    // Mainstream/Claude Desktop style: "headers": { "Authorization": "Bearer ..." }
+    if let Some(map) = value.as_object() {
+        let mut headers = Vec::with_capacity(map.len());
+        for (name, raw) in map.iter() {
+            let value = raw.as_str().unwrap_or("").to_string();
+            headers.push(HeaderConfig {
+                name: name.clone(),
+                value,
+                value_encrypted: None,
+            });
+        }
+        return Ok(headers);
+    }
+
+    // Alternate style: "headers": [{ "name": "...", "value": "..." }, ...]
+    if value.is_array() {
+        return serde_json::from_value::<Vec<HeaderConfig>>(value).map_err(de::Error::custom);
+    }
+
+    Err(de::Error::custom(
+        "MCP SSE headers must be an object map or an array",
+    ))
+}
+
+impl McpServerConfigFlatDisk {
+    fn into_internal(self) -> Result<McpServerConfig, String> {
+        let enabled = self.enabled.unwrap_or(!self.disabled);
+
+        let request_timeout_ms = self
+            .request_timeout_ms
+            .unwrap_or_else(default_request_timeout);
+        let healthcheck_interval_ms = self
+            .healthcheck_interval_ms
+            .unwrap_or_else(default_healthcheck_interval);
+        let reconnect = self.reconnect.unwrap_or_default();
+
+        let transport = match (self.command, self.url) {
+            (Some(command), None) => TransportConfig::Stdio(StdioConfig {
+                command,
+                args: self.args,
+                cwd: self.cwd,
+                env: self.env,
+                env_encrypted: self.env_encrypted,
+                startup_timeout_ms: self
+                    .startup_timeout_ms
+                    .unwrap_or_else(default_startup_timeout),
+            }),
+            (None, Some(url)) => TransportConfig::Sse(SseConfig {
+                url,
+                headers: self.headers,
+                connect_timeout_ms: self
+                    .connect_timeout_ms
+                    .unwrap_or_else(default_connect_timeout),
+            }),
+            (Some(_), Some(_)) => {
+                return Err("MCP server config cannot contain both 'command' and 'url'".to_string())
+            }
+            (None, None) => {
+                return Err(
+                    "MCP server config must contain either 'command' (stdio) or 'url' (sse)"
+                        .to_string(),
+                )
+            }
+        };
+
+        Ok(McpServerConfig {
+            id: self.id,
+            name: self.name,
+            enabled,
+            transport,
+            request_timeout_ms,
+            healthcheck_interval_ms,
+            reconnect,
+            allowed_tools: self.allowed_tools,
+            denied_tools: self.denied_tools,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct McpServerDiskOut {
+    // Claude Desktop / mainstream MCP config convention:
+    // - The server id is the map key under `mcpServers`.
+    // - A server is disabled by setting `"disabled": true`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    disabled: bool,
+
+    // stdio transport shape
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    env: HashMap<String, String>,
+
+    // sse transport shape
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    headers: HashMap<String, String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl From<&McpServerConfig> for McpServerDiskOut {
+    fn from(server: &McpServerConfig) -> Self {
+        let mut out = Self {
+            disabled: !server.enabled,
+            command: None,
+            args: Vec::new(),
+            cwd: None,
+            env: HashMap::new(),
+            url: None,
+            headers: HashMap::new(),
+        };
+
+        match &server.transport {
+            TransportConfig::Stdio(stdio) => {
+                out.command = Some(stdio.command.clone());
+                out.args = stdio.args.clone();
+                out.cwd = stdio.cwd.clone();
+                out.env = stdio.env.clone();
+            }
+            TransportConfig::Sse(sse) => {
+                out.url = Some(sse.url.clone());
+                out.headers = sse
+                    .headers
+                    .iter()
+                    .filter(|h| !h.name.trim().is_empty())
+                    .map(|h| (h.name.clone(), h.value.clone()))
+                    .collect();
+            }
+        }
+
+        out
+    }
+}
+
+impl Serialize for McpConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.servers.len()))?;
+        for server in &self.servers {
+            let entry = McpServerDiskOut::from(server);
+            map.serialize_entry(&server.id, &entry)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for McpConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+
+        // Legacy format: { "version": 1, "servers": [ ... ] }
+        if value.get("servers").is_some() {
+            let legacy: McpConfigLegacyDisk =
+                serde_json::from_value(value).map_err(de::Error::custom)?;
+            return Ok(Self {
+                version: legacy.version,
+                servers: legacy.servers,
+            });
+        }
+
+        // Mainstream map format: { "<server_id>": { ... }, ... }
+        let Some(obj) = value.as_object() else {
+            return Err(de::Error::custom(
+                "MCP config must be an object (legacy {version,servers} or a server map)",
+            ));
+        };
+
+        let mut servers = Vec::with_capacity(obj.len());
+        for (id, raw_entry) in obj.iter() {
+            let mut entry = raw_entry.clone();
+            let entry_obj = entry
+                .as_object_mut()
+                .ok_or_else(|| de::Error::custom("MCP server entry must be an object"))?;
+            // Inject id from the map key.
+            entry_obj.insert("id".to_string(), Value::String(id.clone()));
+
+            // Accept either our internal full shape or the mainstream flattened shape.
+            if let Ok(server) = serde_json::from_value::<McpServerConfig>(entry.clone()) {
+                servers.push(server);
+                continue;
+            }
+
+            let flat: McpServerConfigFlatDisk =
+                serde_json::from_value(entry).map_err(de::Error::custom)?;
+            let server = flat.into_internal().map_err(de::Error::custom)?;
+            servers.push(server);
+        }
+
+        Ok(Self {
+            version: default_version(),
+            servers,
+        })
     }
 }
 
@@ -57,11 +346,11 @@ fn default_true() -> bool {
     true
 }
 
-fn default_request_timeout() -> u64 {
+pub(crate) fn default_request_timeout() -> u64 {
     60000 // 60 seconds
 }
 
-fn default_healthcheck_interval() -> u64 {
+pub(crate) fn default_healthcheck_interval() -> u64 {
     30000 // 30 seconds
 }
 
@@ -85,19 +374,21 @@ pub struct StdioConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     /// Environment variables (plaintext, in-memory only).
-    ///
-    /// Persisted to disk as `env_encrypted` and hydrated on load.
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
     /// Encrypted environment variables values (nonce:ciphertext), keyed by env var name.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    ///
+    /// Legacy/back-compat only: older Bamboo builds stored secrets encrypted-at-rest.
+    /// We still accept these values so existing configs keep working, but we no longer
+    /// persist them (standard MCP config stores plaintext env vars).
+    #[serde(default, skip_serializing)]
     pub env_encrypted: HashMap<String, String>,
     /// Startup timeout in milliseconds
     #[serde(default = "default_startup_timeout")]
     pub startup_timeout_ms: u64,
 }
 
-fn default_startup_timeout() -> u64 {
+pub(crate) fn default_startup_timeout() -> u64 {
     20000 // 20 seconds
 }
 
@@ -114,7 +405,7 @@ pub struct SseConfig {
     pub connect_timeout_ms: u64,
 }
 
-fn default_connect_timeout() -> u64 {
+pub(crate) fn default_connect_timeout() -> u64 {
     10000 // 10 seconds
 }
 
@@ -122,18 +413,20 @@ fn default_connect_timeout() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeaderConfig {
     pub name: String,
-    /// Header value (plaintext, in-memory only).
-    ///
-    /// Persisted to disk as `value_encrypted` and hydrated on load.
-    #[serde(default, skip_serializing)]
+    /// Header value (plaintext).
+    #[serde(default)]
     pub value: String,
     /// Encrypted header value (nonce:ciphertext).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Legacy/back-compat only: older Bamboo builds stored secrets encrypted-at-rest.
+    /// We still accept these values so existing configs keep working, but we no longer
+    /// persist them (standard MCP config stores plaintext headers).
+    #[serde(default, skip_serializing)]
     pub value_encrypted: Option<String>,
 }
 
 /// Reconnection configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReconnectConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -399,6 +692,63 @@ mod tests {
         assert_eq!(config.servers.len(), 2);
         assert_eq!(config.servers[0].id, "fs-server");
         assert_eq!(config.servers[1].id, "web-server");
+    }
+
+    #[test]
+    fn test_mcp_config_deserialization_mainstream_map_stdio() {
+        let json = r#"{
+            "filesystem": {
+                "command": "node",
+                "args": ["server.js"],
+                "env": {"MCP_ROOT": "/tmp"}
+            }
+        }"#;
+
+        let config: McpConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.version, 1);
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].id, "filesystem");
+
+        match &config.servers[0].transport {
+            TransportConfig::Stdio(stdio) => {
+                assert_eq!(stdio.command, "node");
+                assert_eq!(stdio.args, vec!["server.js"]);
+                assert_eq!(stdio.env.get("MCP_ROOT").map(|s| s.as_str()), Some("/tmp"));
+            }
+            _ => panic!("Expected stdio transport"),
+        }
+    }
+
+    #[test]
+    fn test_mcp_config_serialization_is_map() {
+        let mut env_encrypted = HashMap::new();
+        env_encrypted.insert("TOKEN".to_string(), "nonce:ciphertext".to_string());
+
+        let cfg = McpConfig {
+            version: 1,
+            servers: vec![McpServerConfig {
+                id: "demo".to_string(),
+                name: Some("Demo".to_string()),
+                enabled: true,
+                transport: TransportConfig::Stdio(StdioConfig {
+                    command: "node".to_string(),
+                    args: vec!["server.js".to_string()],
+                    cwd: None,
+                    env: HashMap::new(),
+                    env_encrypted,
+                    startup_timeout_ms: default_startup_timeout(),
+                }),
+                request_timeout_ms: default_request_timeout(),
+                healthcheck_interval_ms: default_healthcheck_interval(),
+                reconnect: ReconnectConfig::default(),
+                allowed_tools: vec![],
+                denied_tools: vec![],
+            }],
+        };
+
+        let value = serde_json::to_value(&cfg).unwrap();
+        assert!(value.get("servers").is_none());
+        assert!(value.get("demo").is_some());
     }
 
     #[test]

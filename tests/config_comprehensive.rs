@@ -205,7 +205,6 @@ mod comprehensive_config_tests {
         // Explicit param should beat env
         let config = Config::from_data_dir(Some(dir_a.path.clone()));
         assert_eq!(config.provider, "from_dir_a");
-        assert_eq!(config.data_dir, dir_a.path);
     }
 
     #[test]
@@ -220,7 +219,7 @@ mod comprehensive_config_tests {
 
         let config = Config::new();
         assert_eq!(config.provider, "from_custom_dir");
-        assert_eq!(config.data_dir, temp.path);
+        assert_eq!(bamboo_agent::core::paths::bamboo_dir(), temp.path);
     }
 
     // === 2) Config File Loading and Saving ===
@@ -252,14 +251,13 @@ mod comprehensive_config_tests {
                     "headless_auth": false
                 }
             },
-            "server": {
-                "port": 9999,
-                "bind": "0.0.0.0",
-                "static_dir": "/static",
-                "workers": 16
-            },
-            "data_dir": "/should/be/ignored"
-        }"#,
+	            "server": {
+	                "port": 9999,
+	                "bind": "0.0.0.0",
+	                "static_dir": "/static",
+	                "workers": 16
+	            }
+	        }"#,
         );
 
         let _env = EnvVarGuard::set("BAMBOO_DATA_DIR", temp.path.to_str().unwrap());
@@ -276,7 +274,6 @@ mod comprehensive_config_tests {
         assert_eq!(config.server.bind, "0.0.0.0");
         assert_eq!(config.server.workers, 16);
         assert_eq!(config.server.static_dir, Some(PathBuf::from("/static")));
-        assert_eq!(config.data_dir, temp.path);
     }
 
     #[test]
@@ -291,7 +288,7 @@ mod comprehensive_config_tests {
         original.server.workers = 8;
         original.server.static_dir = Some(PathBuf::from("/app/static"));
 
-        original.save().unwrap();
+        original.save_to_dir(temp.path.clone()).unwrap();
 
         let loaded = Config::from_data_dir(Some(temp.path.clone()));
         assert_eq!(loaded.provider, "anthropic");
@@ -324,16 +321,16 @@ mod comprehensive_config_tests {
         assert!(!written.contains("http_proxy_auth"));
     }
 
-    // === 3) Config.data_dir Usage ===
+    // === 3) Saving behavior ===
 
     #[test]
-    fn save_uses_data_dir() {
+    fn save_to_dir_writes_to_directory() {
         let _lock = env_lock_acquire();
         let temp = TempDir::new();
 
         let mut config = Config::from_data_dir(Some(temp.path.clone()));
         config.server.port = 7777;
-        config.save().unwrap();
+        config.save_to_dir(temp.path.clone()).unwrap();
 
         assert!(temp.path.join("config.json").exists());
 
@@ -424,7 +421,7 @@ mod comprehensive_config_tests {
         // Don't touch HOME, use from_data_dir
         let mut config = Config::from_data_dir(Some(temp.path.clone()));
         config.provider = "test".to_string();
-        config.save().unwrap();
+        config.save_to_dir(temp.path.clone()).unwrap();
 
         let reloaded = Config::from_data_dir(Some(temp.path.clone()));
         assert_eq!(reloaded.provider, "test");

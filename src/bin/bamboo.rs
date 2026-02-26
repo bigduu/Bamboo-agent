@@ -65,13 +65,17 @@ async fn main() {
             static_dir,
             workers,
         } => {
+            let bamboo_home_dir = data_dir
+                .clone()
+                .unwrap_or_else(|| bamboo_agent::core::paths::bamboo_dir());
+            // Keep runtime path resolution consistent: most helpers derive their base dir from
+            // BAMBOO_DATA_DIR / ~/.bamboo via `core::paths::bamboo_dir()`.
+            std::env::set_var("BAMBOO_DATA_DIR", bamboo_home_dir.as_os_str());
+
             // Load config (with env var overrides already applied)
-            // If --data-dir is specified, load from that directory
-            let mut config = if let Some(ref d) = data_dir {
-                bamboo_agent::core::Config::from_data_dir(Some(d.clone()))
-            } else {
-                bamboo_agent::core::Config::new()
-            };
+            // If --data-dir is specified, load from that directory.
+            let mut config =
+                bamboo_agent::core::Config::from_data_dir(Some(bamboo_home_dir.clone()));
 
             // Apply CLI argument overrides (highest priority)
             if let Some(p) = port {
@@ -90,7 +94,7 @@ async fn main() {
             // Start server using the unified config
             println!("Starting Bamboo server at {}", config.server_addr());
             if let Err(e) = bamboo_agent::server::run_with_bind(
-                config.data_dir.clone(),
+                bamboo_home_dir,
                 config.server.port,
                 &config.server.bind,
             )

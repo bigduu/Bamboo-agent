@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncWriteExt;
 
 use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use crate::agent::core::AgentEvent;
@@ -127,7 +128,10 @@ impl Tool for ClaudeCodeTool {
         cmd.current_dir(&project_path);
         cmd.env("ANTHROPIC_BASE_URL", &base_url);
 
-        cmd.arg("-p").arg(&parsed.prompt);
+        // Prefer stdin for the prompt (instead of passing a potentially multi-line string
+        // as a command-line argument). This is especially important on Windows when the
+        // `claude` entrypoint is a `.cmd`/`.bat` shim with stricter argument parsing.
+        cmd.arg("-p");
         cmd.arg("--output-format").arg("stream-json");
         // Claude Code requires `--verbose` when using `--print/-p` with `--output-format=stream-json`.
         cmd.arg("--verbose");
@@ -143,12 +147,25 @@ impl Tool for ClaudeCodeTool {
             cmd.arg("--json-schema").arg(schema);
         }
 
+        cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
         let mut child = cmd
             .spawn()
             .map_err(|e| ToolError::Execution(format!("Failed to spawn Claude Code CLI: {e}")))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(parsed.prompt.as_bytes())
+                .await
+                .map_err(|e| ToolError::Execution(format!("Failed writing Claude stdin: {e}")))?;
+            stdin
+                .write_all(b"\n")
+                .await
+                .map_err(|e| ToolError::Execution(format!("Failed writing Claude stdin: {e}")))?;
+            let _ = stdin.shutdown().await;
+        }
 
         let stdout = child
             .stdout

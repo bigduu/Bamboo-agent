@@ -48,8 +48,7 @@ impl ToolOutputManager {
     ///
     /// Uses `~/.bamboo/artifacts` as the storage directory and 1000 tokens as the limit.
     pub fn with_defaults() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let artifacts_dir = home.join(".bamboo").join("artifacts");
+        let artifacts_dir = crate::core::paths::bamboo_dir().join("artifacts");
         Self::new(artifacts_dir, 1000)
     }
 

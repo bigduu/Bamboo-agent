@@ -1,5 +1,6 @@
 use actix_web::{web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::server::app_state::AppState;
 
@@ -17,16 +18,60 @@ fn persist_config_error(message: impl Into<String>) -> HttpResponse {
 #[derive(Debug, Serialize)]
 pub struct ServerListResponse {
     /// List of server information
-    pub servers: Vec<ServerInfo>,
+    pub servers: Vec<McpServerApiRecord>,
 }
 
-/// Information about an MCP server
 #[derive(Debug, Serialize)]
-pub struct ServerInfo {
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum TransportConfigApi {
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+        startup_timeout_ms: u64,
+    },
+    Sse {
+        url: String,
+        #[serde(default)]
+        headers: Vec<HeaderConfigApi>,
+        connect_timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct HeaderConfigApi {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct McpServerConfigApi {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub enabled: bool,
+    pub transport: TransportConfigApi,
+    pub request_timeout_ms: u64,
+    pub healthcheck_interval_ms: u64,
+    pub reconnect: crate::agent::mcp::ReconnectConfig,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
+}
+
+/// API record for an MCP server (matches Bodhi frontend expectations).
+#[derive(Debug, Serialize)]
+pub struct McpServerApiRecord {
     /// Server identifier
     pub id: String,
-    /// Server display name
-    pub name: String,
+    /// Server display name (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Whether the server is enabled
     pub enabled: bool,
     /// Server connection status
@@ -38,6 +83,10 @@ pub struct ServerInfo {
     pub last_error: Option<String>,
     /// Number of restart attempts
     pub restart_count: u32,
+    /// Persisted server config (secrets are encrypted / redacted by serde attrs)
+    pub config: McpServerConfigApi,
+    /// Runtime info (status, timestamps, tool_count, etc.)
+    pub runtime: crate::agent::mcp::RuntimeInfo,
 }
 
 /// Response for listing MCP tools
@@ -64,12 +113,175 @@ pub struct ToolInfo {
 // Request Types
 // ============================================================================
 
-/// Request for adding or updating an MCP server
+/// Add/update request body: accept both "Bamboo internal" and "mainstream" MCP shapes.
 #[derive(Debug, Deserialize)]
-pub struct ServerRequest {
-    /// Server configuration (flattened)
-    #[serde(flatten)]
-    pub config: crate::agent::mcp::McpServerConfig,
+#[serde(untagged)]
+pub enum ServerRequest {
+    Internal(crate::agent::mcp::McpServerConfig),
+    Mainstream(MainstreamServerRequest),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MainstreamServerRequest {
+    /// Server id (required for POST; ignored for PUT where path param wins)
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Mainstream config often uses `disabled`; we also accept `enabled`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub disabled: bool,
+
+    // stdio transport
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub env_encrypted: HashMap<String, String>,
+    #[serde(default)]
+    pub startup_timeout_ms: Option<u64>,
+
+    // sse transport
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: Vec<crate::agent::mcp::HeaderConfig>,
+    #[serde(default)]
+    pub connect_timeout_ms: Option<u64>,
+
+    // Bamboo extras
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub healthcheck_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub reconnect: Option<crate::agent::mcp::ReconnectConfig>,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
+}
+
+impl MainstreamServerRequest {
+    fn into_internal(
+        mut self,
+        id_override: Option<String>,
+    ) -> Result<crate::agent::mcp::McpServerConfig, String> {
+        if let Some(id) = id_override {
+            self.id = id;
+        }
+
+        let enabled = self.enabled.unwrap_or(!self.disabled);
+        let request_timeout_ms = self
+            .request_timeout_ms
+            .unwrap_or(crate::agent::mcp::config::default_request_timeout());
+        let healthcheck_interval_ms = self
+            .healthcheck_interval_ms
+            .unwrap_or(crate::agent::mcp::config::default_healthcheck_interval());
+        let reconnect = self.reconnect.unwrap_or_default();
+
+        let transport = match (self.command, self.url) {
+            (Some(command), None) => {
+                crate::agent::mcp::TransportConfig::Stdio(crate::agent::mcp::StdioConfig {
+                    command,
+                    args: self.args,
+                    cwd: self.cwd,
+                    env: self.env,
+                    env_encrypted: self.env_encrypted,
+                    startup_timeout_ms: self
+                        .startup_timeout_ms
+                        .unwrap_or(crate::agent::mcp::config::default_startup_timeout()),
+                })
+            }
+            (None, Some(url)) => {
+                crate::agent::mcp::TransportConfig::Sse(crate::agent::mcp::SseConfig {
+                    url,
+                    headers: self.headers,
+                    connect_timeout_ms: self
+                        .connect_timeout_ms
+                        .unwrap_or(crate::agent::mcp::config::default_connect_timeout()),
+                })
+            }
+            (Some(_), Some(_)) => {
+                return Err("MCP server config cannot contain both 'command' and 'url'".to_string())
+            }
+            (None, None) => {
+                return Err(
+                    "MCP server config must contain either 'command' (stdio) or 'url' (sse)"
+                        .to_string(),
+                )
+            }
+        };
+
+        Ok(crate::agent::mcp::McpServerConfig {
+            id: self.id,
+            name: self.name,
+            enabled,
+            transport,
+            request_timeout_ms,
+            healthcheck_interval_ms,
+            reconnect,
+            allowed_tools: self.allowed_tools,
+            denied_tools: self.denied_tools,
+        })
+    }
+}
+
+fn mask() -> String {
+    "****...****".to_string()
+}
+
+fn to_api_config(server: &crate::agent::mcp::McpServerConfig) -> McpServerConfigApi {
+    let transport = match &server.transport {
+        crate::agent::mcp::TransportConfig::Stdio(stdio) => {
+            // Never return plaintext; only return keys so users can see which env vars exist.
+            let mut keys: Vec<String> = stdio.env_encrypted.keys().cloned().collect();
+            keys.extend(stdio.env.keys().cloned());
+            keys.sort();
+            keys.dedup();
+
+            let env = keys.into_iter().map(|k| (k, mask())).collect();
+
+            TransportConfigApi::Stdio {
+                command: stdio.command.clone(),
+                args: stdio.args.clone(),
+                cwd: stdio.cwd.clone(),
+                env,
+                startup_timeout_ms: stdio.startup_timeout_ms,
+            }
+        }
+        crate::agent::mcp::TransportConfig::Sse(sse) => TransportConfigApi::Sse {
+            url: sse.url.clone(),
+            headers: sse
+                .headers
+                .iter()
+                .map(|h| HeaderConfigApi {
+                    name: h.name.clone(),
+                    value: mask(),
+                })
+                .collect(),
+            connect_timeout_ms: sse.connect_timeout_ms,
+        },
+    };
+
+    McpServerConfigApi {
+        id: server.id.clone(),
+        name: server.name.clone(),
+        enabled: server.enabled,
+        transport,
+        request_timeout_ms: server.request_timeout_ms,
+        healthcheck_interval_ms: server.healthcheck_interval_ms,
+        reconnect: server.reconnect.clone(),
+        allowed_tools: server.allowed_tools.clone(),
+        denied_tools: server.denied_tools.clone(),
+    }
 }
 
 // ============================================================================
@@ -108,30 +320,25 @@ pub struct ServerRequest {
 /// ```
 pub async fn list_servers(state: web::Data<AppState>) -> impl Responder {
     let config = state.config.read().await.clone();
-    let servers: Vec<ServerInfo> = config
+    let servers: Vec<McpServerApiRecord> = config
         .mcp
         .servers
         .into_iter()
         .map(|server_cfg| {
-            let info = state.mcp_manager.get_server_info(&server_cfg.id);
-            let status = info
-                .as_ref()
-                .map(|i| i.status.to_string())
-                .unwrap_or_else(|| "disconnected".to_string());
-            let tool_count = info.as_ref().map(|i| i.tool_count).unwrap_or(0);
-            let last_error = info.as_ref().and_then(|i| i.last_error.clone());
-            let restart_count = info.as_ref().map(|i| i.restart_count).unwrap_or(0);
-            ServerInfo {
+            let runtime = state
+                .mcp_manager
+                .get_server_info(&server_cfg.id)
+                .unwrap_or_default();
+            McpServerApiRecord {
                 id: server_cfg.id.clone(),
-                name: server_cfg
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| server_cfg.id.clone()),
+                name: server_cfg.name.clone(),
                 enabled: server_cfg.enabled,
-                status,
-                tool_count,
-                last_error,
-                restart_count,
+                status: runtime.status.to_string(),
+                tool_count: runtime.tool_count,
+                last_error: runtime.last_error.clone(),
+                restart_count: runtime.restart_count,
+                config: to_api_config(&server_cfg),
+                runtime,
             }
         })
         .collect();
@@ -179,28 +386,170 @@ pub async fn get_server(state: web::Data<AppState>, path: web::Path<String>) -> 
         }));
     };
 
-    let info = state.mcp_manager.get_server_info(&server_id);
-    let status = info
-        .as_ref()
-        .map(|i| i.status.to_string())
-        .unwrap_or_else(|| "disconnected".to_string());
-    let tool_count = info.as_ref().map(|i| i.tool_count).unwrap_or(0);
-    let last_error = info.as_ref().and_then(|i| i.last_error.clone());
-    let restart_count = info.as_ref().map(|i| i.restart_count).unwrap_or(0);
-    let server_info = ServerInfo {
+    let runtime = state
+        .mcp_manager
+        .get_server_info(&server_id)
+        .unwrap_or_default();
+    let server_info = McpServerApiRecord {
         id: server_cfg.id.clone(),
-        name: server_cfg
-            .name
-            .clone()
-            .unwrap_or_else(|| server_cfg.id.clone()),
+        name: server_cfg.name.clone(),
         enabled: server_cfg.enabled,
-        status,
-        tool_count,
-        last_error,
-        restart_count,
+        status: runtime.status.to_string(),
+        tool_count: runtime.tool_count,
+        last_error: runtime.last_error.clone(),
+        restart_count: runtime.restart_count,
+        config: to_api_config(server_cfg),
+        runtime,
     };
 
     HttpResponse::Ok().json(server_info)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportServersRequest {
+    #[serde(rename = "mcpServers")]
+    pub mcp_servers: crate::agent::mcp::McpConfig,
+    /// Import mode: "merge" (default) or "replace"
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImportServersResponse {
+    pub message: String,
+    pub mode: String,
+    pub added: usize,
+    pub updated: usize,
+    pub removed: usize,
+    pub server_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub start_errors: Vec<ImportStartError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImportStartError {
+    pub server_id: String,
+    pub error: String,
+}
+
+/// Bulk import MCP servers from a Claude Desktop-style config chunk.
+///
+/// # HTTP Route
+/// `POST /mcp/servers/import`
+///
+/// # Request Body
+/// ```json
+/// {
+///   "mcpServers": {
+///     "filesystem": { "command": "npx", "args": ["-y", "..."], "env": {"MCP_ROOT": "/tmp"} },
+///     "my-sse": { "url": "http://127.0.0.1:3000/sse", "headers": [{"name":"Authorization","value":"Bearer ..."}] }
+///   },
+///   "mode": "merge"
+/// }
+/// ```
+pub async fn import_servers(
+    state: web::Data<AppState>,
+    req: web::Json<ImportServersRequest>,
+) -> impl Responder {
+    let incoming = req.into_inner();
+    let mode = incoming.mode.unwrap_or_else(|| "merge".to_string());
+    let replace = mode.trim().eq_ignore_ascii_case("replace");
+    let mode = if replace { "replace" } else { "merge" }.to_string();
+
+    // Deduplicate by id (last one wins).
+    let mut incoming_by_id: HashMap<String, crate::agent::mcp::McpServerConfig> = HashMap::new();
+    for server in incoming.mcp_servers.servers {
+        incoming_by_id.insert(server.id.clone(), server);
+    }
+
+    if incoming_by_id.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "No servers found under 'mcpServers'"
+        }));
+    }
+
+    let server_ids: Vec<String> = {
+        let mut ids = incoming_by_id.keys().cloned().collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+
+    let mut added = 0usize;
+    let mut updated = 0usize;
+    let mut removed = 0usize;
+
+    // Apply config changes quickly under lock.
+    let removed_ids: Vec<String> = {
+        let mut root = state.config.write().await;
+        let existing_ids: std::collections::HashSet<String> =
+            root.mcp.servers.iter().map(|s| s.id.clone()).collect();
+
+        if replace {
+            let incoming_ids: std::collections::HashSet<String> =
+                incoming_by_id.keys().cloned().collect();
+            let to_remove: Vec<String> = existing_ids.difference(&incoming_ids).cloned().collect();
+            removed = to_remove.len();
+
+            root.mcp.servers.retain(|s| !incoming_ids.contains(&s.id));
+        }
+
+        for (id, server) in incoming_by_id.iter() {
+            let slot = root.mcp.servers.iter_mut().find(|s| s.id == *id);
+            if let Some(existing) = slot {
+                *existing = server.clone();
+                updated += 1;
+            } else {
+                root.mcp.servers.push(server.clone());
+                added += 1;
+            }
+        }
+
+        if replace {
+            let incoming_ids: std::collections::HashSet<String> =
+                incoming_by_id.keys().cloned().collect();
+            existing_ids.difference(&incoming_ids).cloned().collect()
+        } else {
+            Vec::new()
+        }
+    };
+
+    if let Err(e) = state.persist_config().await {
+        return persist_config_error(format!("Failed to save config: {e}"));
+    }
+
+    // Apply runtime changes best-effort (do not fail the import if some servers can't start).
+    for server_id in removed_ids.iter() {
+        let _ = state.mcp_manager.stop_server(server_id).await;
+    }
+
+    let mut start_errors = Vec::new();
+    for id in server_ids.iter() {
+        let Some(server_cfg) = incoming_by_id.get(id).cloned() else {
+            continue;
+        };
+
+        // In merge mode we only touch imported servers; in replace mode we also already stopped
+        // removed servers.
+        let _ = state.mcp_manager.stop_server(id).await;
+        if server_cfg.enabled {
+            if let Err(e) = state.mcp_manager.start_server(server_cfg).await {
+                start_errors.push(ImportStartError {
+                    server_id: id.clone(),
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
+
+    HttpResponse::Ok().json(ImportServersResponse {
+        message: "MCP servers imported".to_string(),
+        mode,
+        added,
+        updated,
+        removed,
+        server_ids,
+        start_errors,
+    })
 }
 
 /// Adds a new MCP server
@@ -241,7 +590,15 @@ pub async fn add_server(
     state: web::Data<AppState>,
     req: web::Json<ServerRequest>,
 ) -> impl Responder {
-    let config = req.into_inner().config;
+    let config = match req.into_inner() {
+        ServerRequest::Internal(config) => config,
+        ServerRequest::Mainstream(flat) => match flat.into_internal(None) {
+            Ok(config) => config,
+            Err(error) => {
+                return HttpResponse::BadRequest().json(serde_json::json!({ "error": error }))
+            }
+        },
+    };
     let server_id = config.id.clone();
 
     {
@@ -315,8 +672,18 @@ pub async fn update_server(
     req: web::Json<ServerRequest>,
 ) -> impl Responder {
     let server_id = path.into_inner();
-    let mut config = req.into_inner().config;
-    config.id = server_id.clone();
+    let config = match req.into_inner() {
+        ServerRequest::Internal(mut config) => {
+            config.id = server_id.clone();
+            config
+        }
+        ServerRequest::Mainstream(flat) => match flat.into_internal(Some(server_id.clone())) {
+            Ok(config) => config,
+            Err(error) => {
+                return HttpResponse::BadRequest().json(serde_json::json!({ "error": error }))
+            }
+        },
+    };
 
     {
         let mut root = state.config.write().await;

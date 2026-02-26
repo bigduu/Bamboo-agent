@@ -1,6 +1,5 @@
 use crate::core::keyword_masking::{KeywordEntry, KeywordMaskingConfig};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 use crate::core::Config;
 
@@ -15,25 +14,6 @@ pub struct KeywordMaskingResponse {
 pub struct ValidationError {
     pub index: usize,
     pub message: String,
-}
-
-pub fn load_keyword_masking_config(path: &Path) -> Result<KeywordMaskingConfig, String> {
-    if !path.exists() {
-        return Ok(KeywordMaskingConfig::default());
-    }
-    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&content).map_err(|e| format!("Failed to parse keyword_masking.json: {e}"))
-}
-
-pub fn save_keyword_masking_config(
-    path: &Path,
-    config: &KeywordMaskingConfig,
-) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let content = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
-    std::fs::write(path, content).map_err(|e| e.to_string())
 }
 
 /// Get the global keyword masking configuration
@@ -96,19 +76,5 @@ pub async fn validate_keyword_entries(
                 .collect();
             Err(validation_errors)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn load_keyword_masking_defaults_when_missing() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("keyword_masking.json");
-
-        let config = load_keyword_masking_config(&path).unwrap();
-        assert!(config.entries.is_empty());
     }
 }

@@ -12,6 +12,7 @@ use std::sync::{
 };
 
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -53,7 +54,8 @@ pub async fn spawn_claude_code_cli(
     cmd.env("ANTHROPIC_BASE_URL", &config.anthropic_base_url);
 
     // Non-interactive prompt mode.
-    cmd.arg("-p").arg(&config.prompt);
+    // Use stdin for the prompt to avoid command-line quoting issues (notably on Windows).
+    cmd.arg("-p");
     cmd.arg("--output-format").arg("stream-json");
     // Claude Code requires `--verbose` when using `--print/-p` with `--output-format=stream-json`.
     cmd.arg("--verbose");
@@ -70,12 +72,25 @@ pub async fn spawn_claude_code_cli(
         cmd.arg("--json-schema").arg(schema);
     }
 
+    cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn Claude Code CLI: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(config.prompt.as_bytes())
+            .await
+            .map_err(|e| format!("Failed writing Claude stdin: {e}"))?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| format!("Failed writing Claude stdin: {e}"))?;
+        let _ = stdin.shutdown().await;
+    }
 
     let pid = child.id().unwrap_or(0);
     let stdout = child

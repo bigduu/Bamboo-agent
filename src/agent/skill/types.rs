@@ -136,9 +136,10 @@ pub struct SkillStoreConfig {
 
 impl Default for SkillStoreConfig {
     fn default() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         Self {
-            skills_dir: home.join(".bamboo").join("skills"),
+            // Keep runtime path resolution consistent across the codebase:
+            // use BAMBOO_DATA_DIR (or ~/.bamboo) as the single storage root.
+            skills_dir: crate::core::paths::bamboo_dir().join("skills"),
         }
     }
 }

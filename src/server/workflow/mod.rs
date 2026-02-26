@@ -198,9 +198,8 @@ pub struct WorkflowLoader {
 
 impl WorkflowLoader {
     pub fn new() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
         Self {
-            workflows_dir: home.join(".bamboo").join("workflows"),
+            workflows_dir: crate::core::paths::workflows_dir(),
             cache: RwLock::new(HashMap::new()),
         }
     }
