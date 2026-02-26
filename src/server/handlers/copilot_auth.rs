@@ -35,12 +35,29 @@ pub async fn start_copilot_auth(app_state: web::Data<AppState>) -> Result<HttpRe
     let config = app_state.config.read().await.clone();
     let app_data_dir = app_state.app_data_dir.clone();
 
+    // Resolve headless_auth from providers.copilot, with fallback to deprecated root field.
+    let headless_auth = config
+        .providers
+        .copilot
+        .as_ref()
+        .map(|c| c.headless_auth)
+        .unwrap_or(config.headless_auth);
+
     // Build retry client
     let retry_policy = ExponentialBackoff::builder()
         .retry_bounds(Duration::from_millis(100), Duration::from_secs(5))
         .build_with_max_retries(3);
 
-    let client = reqwest::Client::new();
+    let client = match crate::agent::llm::http_client::build_http_client(&config) {
+        Ok(client) => client,
+        Err(e) => {
+            log::error!("Failed to build Copilot auth HTTP client (proxy?): {}", e);
+            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                "success": false,
+                "error": format!("Failed to build HTTP client: {}", e),
+            })));
+        }
+    };
     let client_with_middleware: Arc<ClientWithMiddleware> = Arc::new(
         ClientBuilder::new(client.clone())
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
@@ -51,7 +68,7 @@ pub async fn start_copilot_auth(app_state: web::Data<AppState>) -> Result<HttpRe
     let handler = crate::agent::llm::providers::copilot::auth::CopilotAuthHandler::new(
         client_with_middleware,
         app_data_dir,
-        config.headless_auth,
+        headless_auth,
     );
 
     match handler.start_authentication().await {
@@ -90,12 +107,29 @@ pub async fn complete_copilot_auth(
     let config = app_state.config.read().await.clone();
     let app_data_dir = app_state.app_data_dir.clone();
 
+    // Resolve headless_auth from providers.copilot, with fallback to deprecated root field.
+    let headless_auth = config
+        .providers
+        .copilot
+        .as_ref()
+        .map(|c| c.headless_auth)
+        .unwrap_or(config.headless_auth);
+
     // Build retry client
     let retry_policy = ExponentialBackoff::builder()
         .retry_bounds(Duration::from_millis(100), Duration::from_secs(5))
         .build_with_max_retries(3);
 
-    let client = reqwest::Client::new();
+    let client = match crate::agent::llm::http_client::build_http_client(&config) {
+        Ok(client) => client,
+        Err(e) => {
+            log::error!("Failed to build Copilot auth HTTP client (proxy?): {}", e);
+            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                "success": false,
+                "error": format!("Failed to build HTTP client: {}", e),
+            })));
+        }
+    };
     let client_with_middleware: Arc<ClientWithMiddleware> = Arc::new(
         ClientBuilder::new(client.clone())
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
@@ -103,8 +137,7 @@ pub async fn complete_copilot_auth(
     );
 
     // Create auth handler
-    let handler =
-        CopilotAuthHandler::new(client_with_middleware, app_data_dir, config.headless_auth);
+    let handler = CopilotAuthHandler::new(client_with_middleware, app_data_dir, headless_auth);
 
     // Create device code response from request
     let device_code = DeviceCodeResponse {
@@ -148,6 +181,15 @@ pub async fn authenticate_copilot(
 ) -> Result<HttpResponse, AppError> {
     // Get the current config
     let config = app_state.config.read().await.clone();
+    let app_data_dir = app_state.app_data_dir.clone();
+
+    // Resolve headless_auth from providers.copilot, with fallback to deprecated root field.
+    let headless_auth = config
+        .providers
+        .copilot
+        .as_ref()
+        .map(|c| c.headless_auth)
+        .unwrap_or(config.headless_auth);
 
     // Check if provider is copilot
     if config.provider != "copilot" {
@@ -157,8 +199,22 @@ pub async fn authenticate_copilot(
         })));
     }
 
-    // Create a new Copilot provider and trigger interactive auth
-    let mut provider = crate::agent::llm::providers::CopilotProvider::new();
+    // Create a Copilot provider that respects configured proxy settings.
+    let http_client = match crate::agent::llm::http_client::build_http_client(&config) {
+        Ok(client) => client,
+        Err(e) => {
+            log::error!("Failed to build Copilot HTTP client (proxy?): {}", e);
+            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                "success": false,
+                "error": format!("Failed to build HTTP client: {}", e),
+            })));
+        }
+    };
+    let mut provider = crate::agent::llm::providers::CopilotProvider::with_auth_handler(
+        http_client,
+        app_data_dir,
+        headless_auth,
+    );
 
     match provider.authenticate().await {
         Ok(_) => {

@@ -81,6 +81,7 @@
 //! - Concrete providers: [`AnthropicProvider`], [`OpenAIProvider`], [`GeminiProvider`], [`CopilotProvider`]
 
 pub mod error;
+pub(crate) mod http_client;
 pub mod models;
 pub mod protocol;
 pub mod provider;
