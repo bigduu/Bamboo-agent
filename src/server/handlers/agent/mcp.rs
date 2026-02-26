@@ -2,7 +2,7 @@ use actix_web::{web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::server::app_state::AppState;
+use crate::server::app_state::{AppState, ConfigUpdateEffects};
 
 fn persist_config_error(message: impl Into<String>) -> HttpResponse {
     HttpResponse::InternalServerError().json(serde_json::json!({
@@ -478,42 +478,42 @@ pub async fn import_servers(
     let mut updated = 0usize;
     let mut removed = 0usize;
 
-    // Apply config changes quickly under lock.
-    let removed_ids: Vec<String> = {
-        let mut root = state.config.write().await;
-        let existing_ids: std::collections::HashSet<String> =
-            root.mcp.servers.iter().map(|s| s.id.clone()).collect();
+    // Unified: update memory -> persist config.json. Then apply runtime updates.
+    let mut removed_ids: Vec<String> = Vec::new();
+    if let Err(e) = state
+        .update_config(
+            |root| {
+                let existing_ids: std::collections::HashSet<String> =
+                    root.mcp.servers.iter().map(|s| s.id.clone()).collect();
 
-        if replace {
-            let incoming_ids: std::collections::HashSet<String> =
-                incoming_by_id.keys().cloned().collect();
-            let to_remove: Vec<String> = existing_ids.difference(&incoming_ids).cloned().collect();
-            removed = to_remove.len();
+                if replace {
+                    let incoming_ids: std::collections::HashSet<String> =
+                        incoming_by_id.keys().cloned().collect();
+                    let to_remove: Vec<String> =
+                        existing_ids.difference(&incoming_ids).cloned().collect();
+                    removed = to_remove.len();
+                    removed_ids = to_remove;
 
-            root.mcp.servers.retain(|s| !incoming_ids.contains(&s.id));
-        }
+                    root.mcp.servers.retain(|s| !incoming_ids.contains(&s.id));
+                }
 
-        for (id, server) in incoming_by_id.iter() {
-            let slot = root.mcp.servers.iter_mut().find(|s| s.id == *id);
-            if let Some(existing) = slot {
-                *existing = server.clone();
-                updated += 1;
-            } else {
-                root.mcp.servers.push(server.clone());
-                added += 1;
-            }
-        }
+                for (id, server) in incoming_by_id.iter() {
+                    let slot = root.mcp.servers.iter_mut().find(|s| s.id == *id);
+                    if let Some(existing) = slot {
+                        *existing = server.clone();
+                        updated += 1;
+                    } else {
+                        root.mcp.servers.push(server.clone());
+                        added += 1;
+                    }
+                }
 
-        if replace {
-            let incoming_ids: std::collections::HashSet<String> =
-                incoming_by_id.keys().cloned().collect();
-            existing_ids.difference(&incoming_ids).cloned().collect()
-        } else {
-            Vec::new()
-        }
-    };
-
-    if let Err(e) = state.persist_config().await {
+                Ok(())
+            },
+            ConfigUpdateEffects::default(),
+        )
+        .await
+    {
         return persist_config_error(format!("Failed to save config: {e}"));
     }
 
@@ -601,17 +601,21 @@ pub async fn add_server(
     };
     let server_id = config.id.clone();
 
+    if let Err(e) = state
+        .update_config(
+            |root| {
+                let existing = root.mcp.servers.iter_mut().find(|s| s.id == server_id);
+                if let Some(slot) = existing {
+                    *slot = config.clone();
+                } else {
+                    root.mcp.servers.push(config.clone());
+                }
+                Ok(())
+            },
+            ConfigUpdateEffects::default(),
+        )
+        .await
     {
-        let mut root = state.config.write().await;
-        let existing = root.mcp.servers.iter_mut().find(|s| s.id == server_id);
-        if let Some(slot) = existing {
-            *slot = config.clone();
-        } else {
-            root.mcp.servers.push(config.clone());
-        }
-    }
-
-    if let Err(e) = state.persist_config().await {
         return persist_config_error(format!("Failed to save config: {e}"));
     }
 
@@ -685,17 +689,21 @@ pub async fn update_server(
         },
     };
 
+    if let Err(e) = state
+        .update_config(
+            |root| {
+                let existing = root.mcp.servers.iter_mut().find(|s| s.id == server_id);
+                if let Some(slot) = existing {
+                    *slot = config.clone();
+                } else {
+                    root.mcp.servers.push(config.clone());
+                }
+                Ok(())
+            },
+            ConfigUpdateEffects::default(),
+        )
+        .await
     {
-        let mut root = state.config.write().await;
-        let existing = root.mcp.servers.iter_mut().find(|s| s.id == server_id);
-        if let Some(slot) = existing {
-            *slot = config.clone();
-        } else {
-            root.mcp.servers.push(config.clone());
-        }
-    }
-
-    if let Err(e) = state.persist_config().await {
         return persist_config_error(format!("Failed to save config: {e}"));
     }
 
@@ -742,12 +750,16 @@ pub async fn update_server(
 pub async fn delete_server(state: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let server_id = path.into_inner();
 
+    if let Err(e) = state
+        .update_config(
+            |root| {
+                root.mcp.servers.retain(|s| s.id != server_id);
+                Ok(())
+            },
+            ConfigUpdateEffects::default(),
+        )
+        .await
     {
-        let mut root = state.config.write().await;
-        root.mcp.servers.retain(|s| s.id != server_id);
-    }
-
-    if let Err(e) = state.persist_config().await {
         return persist_config_error(format!("Failed to save config: {e}"));
     }
 
@@ -788,20 +800,35 @@ pub async fn connect_server(state: web::Data<AppState>, path: web::Path<String>)
     let server_id = path.into_inner();
 
     // Enable + start using the stored config.
-    let server_cfg = {
-        let mut root = state.config.write().await;
-        let Some(cfg) = root.mcp.servers.iter_mut().find(|s| s.id == server_id) else {
-            return HttpResponse::NotFound().json(serde_json::json!({
+    let mut server_cfg: Option<crate::agent::mcp::McpServerConfig> = None;
+    if let Err(e) = state
+        .update_config(
+            |root| {
+                let Some(cfg) = root.mcp.servers.iter_mut().find(|s| s.id == server_id) else {
+                    return Err(crate::server::error::AppError::NotFound(format!(
+                        "Server '{}'",
+                        server_id
+                    )));
+                };
+                cfg.enabled = true;
+                server_cfg = Some(cfg.clone());
+                Ok(())
+            },
+            ConfigUpdateEffects::default(),
+        )
+        .await
+    {
+        // Preserve the previous endpoint error shape.
+        return match e {
+            crate::server::error::AppError::NotFound(_) => HttpResponse::NotFound().json(serde_json::json!({
                 "error": format!("Server '{}' not found", server_id)
-            }));
+            })),
+            other => persist_config_error(format!("Failed to save config: {other}")),
         };
-        cfg.enabled = true;
-        cfg.clone()
-    };
-
-    if let Err(e) = state.persist_config().await {
-        return persist_config_error(format!("Failed to save config: {e}"));
     }
+    let Some(server_cfg) = server_cfg else {
+        return persist_config_error("Missing server config after connect".to_string());
+    };
 
     let _ = state.mcp_manager.stop_server(&server_id).await;
     match state.mcp_manager.start_server(server_cfg).await {
@@ -845,18 +872,28 @@ pub async fn disconnect_server(
 ) -> impl Responder {
     let server_id = path.into_inner();
 
+    if let Err(e) = state
+        .update_config(
+            |root| {
+                let Some(cfg) = root.mcp.servers.iter_mut().find(|s| s.id == server_id) else {
+                    return Err(crate::server::error::AppError::NotFound(format!(
+                        "Server '{}'",
+                        server_id
+                    )));
+                };
+                cfg.enabled = false;
+                Ok(())
+            },
+            ConfigUpdateEffects::default(),
+        )
+        .await
     {
-        let mut root = state.config.write().await;
-        let Some(cfg) = root.mcp.servers.iter_mut().find(|s| s.id == server_id) else {
-            return HttpResponse::NotFound().json(serde_json::json!({
+        return match e {
+            crate::server::error::AppError::NotFound(_) => HttpResponse::NotFound().json(serde_json::json!({
                 "error": format!("Server '{}' not found", server_id)
-            }));
+            })),
+            other => persist_config_error(format!("Failed to save config: {other}")),
         };
-        cfg.enabled = false;
-    }
-
-    if let Err(e) = state.persist_config().await {
-        return persist_config_error(format!("Failed to save config: {e}"));
     }
 
     match state.mcp_manager.stop_server(&server_id).await {

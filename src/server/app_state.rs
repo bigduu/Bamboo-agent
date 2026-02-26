@@ -84,6 +84,7 @@ use crate::agent::mcp::McpServerManager;
 use crate::agent::skill::{SkillManager, SkillStoreConfig};
 use crate::core::Config;
 use crate::process::ProcessRegistry;
+use crate::server::error::AppError;
 use crate::server::metrics_service::MetricsService;
 
 /// Default system prompt for agent interactions
@@ -715,6 +716,83 @@ impl AppState {
         Ok(())
     }
 
+    async fn persist_config_snapshot(&self, config: Config) -> anyhow::Result<()> {
+        let data_dir = self.app_data_dir.clone();
+        tokio::task::spawn_blocking(move || config.save_to_dir(data_dir))
+            .await
+            .map_err(|e| anyhow::anyhow!("Config save task failed: {e}"))??;
+        Ok(())
+    }
+
+    /// Unified config update entrypoint.
+    ///
+    /// Invariants:
+    /// - Update in-memory first
+    /// - Persist to disk
+    /// - Apply runtime side-effects last (provider reload, MCP reconcile)
+    pub async fn update_config<F>(
+        &self,
+        update: F,
+        effects: ConfigUpdateEffects,
+    ) -> Result<Config, AppError>
+    where
+        F: FnOnce(&mut Config) -> Result<(), AppError>,
+    {
+        let snapshot = {
+            let mut cfg = self.config.write().await;
+            update(&mut cfg)?;
+            cfg.clone()
+        };
+
+        self.persist_config_snapshot(snapshot.clone())
+            .await
+            .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}")))?;
+
+        self.apply_config_effects(snapshot.clone(), effects).await?;
+        Ok(snapshot)
+    }
+
+    /// Replace the full config (used for JSON merge endpoints).
+    pub async fn replace_config(
+        &self,
+        new_config: Config,
+        effects: ConfigUpdateEffects,
+    ) -> Result<Config, AppError> {
+        {
+            let mut cfg = self.config.write().await;
+            *cfg = new_config.clone();
+        }
+
+        self.persist_config_snapshot(new_config.clone())
+            .await
+            .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}")))?;
+
+        self.apply_config_effects(new_config.clone(), effects).await?;
+        Ok(new_config)
+    }
+
+    async fn apply_config_effects(
+        &self,
+        new_config: Config,
+        effects: ConfigUpdateEffects,
+    ) -> Result<(), AppError> {
+        if effects.reload_provider {
+            self.reload_provider().await.map_err(|e| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "Failed to reload provider after updating config: {e}"
+                ))
+            })?;
+        }
+
+        if effects.reconcile_mcp {
+            self.mcp_manager
+                .reconcile_from_config(&new_config.mcp)
+                .await;
+        }
+
+        Ok(())
+    }
+
     /// Get a clone of the current provider
     ///
     /// Returns a thread-safe reference to the current LLM provider.
@@ -793,6 +871,12 @@ impl AppState {
     pub fn get_all_tool_schemas(&self) -> Vec<crate::agent::core::tools::ToolSchema> {
         self.tools.list_tools()
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConfigUpdateEffects {
+    pub reload_provider: bool,
+    pub reconcile_mcp: bool,
 }
 
 #[cfg(test)]

@@ -116,6 +116,7 @@ pub mod metrics;
 pub mod metrics_service;
 pub mod model_config_helper;
 pub mod reloadable_provider;
+pub mod request_hooks;
 pub mod routes;
 pub mod server;
 pub mod services;

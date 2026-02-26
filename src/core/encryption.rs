@@ -6,12 +6,21 @@ use anyhow::{anyhow, Result};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::process::Command;
+#[cfg(not(test))]
+use std::sync::OnceLock;
 
 const KEY_ENV_VAR: &str = "BAMBOO_CONFIG_ENCRYPTION_KEY";
 const KEY_DERIVATION_CONTEXT: &[u8] = b"bamboo-config-encryption-v1";
+const KEY_FILE_NAME: &str = ".bamboo_encryption_key";
 
 #[cfg(test)]
 use std::cell::RefCell;
+
+// Cache the computed key to avoid repeated syscalls and file IO at runtime.
+//
+// Important: tests often mutate env vars; we intentionally do not cache in tests.
+#[cfg(not(test))]
+static KEY_CACHE: OnceLock<Vec<u8>> = OnceLock::new();
 
 // Test-only override to avoid mutating process-wide environment variables (which
 // is not thread-safe under concurrent test execution). Thread-local to prevent
@@ -24,6 +33,22 @@ thread_local! {
 /// Get the encryption key.
 /// Priority: environment variable, machine-derived key, then random fallback.
 pub fn get_encryption_key() -> Vec<u8> {
+    #[cfg(not(test))]
+    if let Some(key) = KEY_CACHE.get() {
+        return key.clone();
+    }
+
+    let key = get_encryption_key_uncached();
+
+    #[cfg(not(test))]
+    {
+        let _ = KEY_CACHE.set(key.clone());
+    }
+
+    key
+}
+
+fn get_encryption_key_uncached() -> Vec<u8> {
     #[cfg(test)]
     if let Some(key) = TEST_KEY_OVERRIDE.with(|cell| cell.borrow().clone()) {
         return key;
@@ -33,12 +58,22 @@ pub fn get_encryption_key() -> Vec<u8> {
         return key;
     }
 
-    if let Some(machine_id) = machine_identifier() {
-        return derive_key(machine_id.as_bytes());
+    if let Some(key) = read_key_file() {
+        return key;
     }
 
-    // Last-resort fallback keeps behavior safe if host identifiers are unavailable.
-    rand::thread_rng().gen::<[u8; 32]>().to_vec()
+    if let Some(machine_id) = machine_identifier() {
+        let key = derive_key(machine_id.as_bytes());
+        // Best-effort: persist the derived key so future runs don't depend on host ID lookups.
+        let _ = write_key_file(&key);
+        return key;
+    }
+
+    // Last-resort fallback: generate a key and persist it so encryption remains stable
+    // even if host identifiers are unavailable (e.g. sandboxed environments).
+    let key = rand::thread_rng().gen::<[u8; 32]>().to_vec();
+    let _ = write_key_file(&key);
+    key
 }
 
 #[cfg(test)]
@@ -72,6 +107,35 @@ fn derive_key(material: &[u8]) -> Vec<u8> {
     hasher.update(KEY_DERIVATION_CONTEXT);
     hasher.update(material);
     hasher.finalize().to_vec()
+}
+
+fn key_file_path() -> std::path::PathBuf {
+    crate::core::paths::bamboo_dir().join(KEY_FILE_NAME)
+}
+
+fn read_key_file() -> Option<Vec<u8>> {
+    let path = key_file_path();
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    let decoded = hex::decode(trimmed).ok()?;
+    (decoded.len() == 32).then_some(decoded)
+}
+
+fn write_key_file(key: &[u8]) -> Result<()> {
+    if key.len() != 32 {
+        return Err(anyhow!("Invalid encryption key length: {}", key.len()));
+    }
+
+    let path = key_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow!("Failed to create key dir {}: {e}", parent.display()))?;
+    }
+
+    // Store as hex for easy inspection/backup.
+    std::fs::write(&path, hex::encode(key))
+        .map_err(|e| anyhow!("Failed to write key file {}: {e}", path.display()))?;
+    Ok(())
 }
 
 fn machine_identifier() -> Option<String> {
@@ -301,6 +365,7 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
+    use tempfile::TempDir;
 
     struct EnvVarGuard {
         key: &'static str,
@@ -333,6 +398,28 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvPathGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvPathGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvPathGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 
     #[test]
@@ -377,6 +464,26 @@ mod tests {
 
         assert_eq!(first.len(), 32);
         assert_eq!(second.len(), 32);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn test_get_encryption_key_persists_key_file_under_bamboo_data_dir() {
+        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env_key = EnvVarGuard::unset(KEY_ENV_VAR);
+
+        let dir = TempDir::new().expect("tempdir");
+        let _data_dir = EnvPathGuard::set("BAMBOO_DATA_DIR", dir.path());
+
+        // First call should create the key file (either derived or random).
+        let first = get_encryption_key();
+        assert_eq!(first.len(), 32);
+
+        let key_path = crate::core::paths::bamboo_dir().join(KEY_FILE_NAME);
+        assert!(key_path.exists(), "expected key file to exist");
+
+        // Subsequent calls must be stable and load the same key.
+        let second = get_encryption_key();
         assert_eq!(first, second);
     }
 }

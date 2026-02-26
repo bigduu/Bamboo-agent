@@ -544,7 +544,7 @@ pub async fn chat_completions(
     req: web::Json<ChatCompletionRequest>,
 ) -> Result<HttpResponse, AppError> {
     let stream = req.stream.unwrap_or(false);
-    let request = req.into_inner();
+    let mut request = req.into_inner();
     let forward_id = uuid::Uuid::new_v4().to_string();
     let requested_model = request.model.trim().to_string();
     if requested_model.is_empty() || requested_model == "default" {
@@ -553,6 +553,20 @@ pub async fn chat_completions(
         ));
     }
     let resolved_model = requested_model;
+
+    // Apply request hooks against the OpenAI-compatible schema before conversion.
+    let config_snapshot = app_state.config.read().await.clone();
+    crate::server::request_hooks::apply_openai_preflight_hooks(
+        &config_snapshot,
+        resolved_model.as_str(),
+        &mut request,
+    )
+    .map_err(|e| match e {
+        crate::server::request_hooks::HookError::Unsupported(msg) => AppError::BadRequest(msg),
+        crate::server::request_hooks::HookError::InvalidConfig(msg) => {
+            AppError::InternalError(anyhow::anyhow!(msg))
+        }
+    })?;
 
     // Convert messages to internal format
     let internal_messages = convert_messages(request.messages)?;
@@ -773,6 +787,19 @@ pub async fn responses_create(
             "Missing `input`: at least one message is required".to_string(),
         ));
     }
+
+    // Apply request hooks before conversion.
+    let config_snapshot = app_state.config.read().await.clone();
+    crate::server::request_hooks::apply_openai_preflight_hooks_to_messages(
+        &config_snapshot,
+        &mut openai_messages,
+    )
+    .map_err(|e| match e {
+        crate::server::request_hooks::HookError::Unsupported(msg) => AppError::BadRequest(msg),
+        crate::server::request_hooks::HookError::InvalidConfig(msg) => {
+            AppError::InternalError(anyhow::anyhow!(msg))
+        }
+    })?;
 
     let internal_messages = convert_messages(openai_messages)?;
     let internal_tools = convert_tools(request.tools)?;

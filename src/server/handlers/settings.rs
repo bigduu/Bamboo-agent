@@ -1,6 +1,6 @@
 use crate::core::keyword_masking::{KeywordEntry, KeywordMaskingConfig};
 use crate::core::{Config, ProxyAuth};
-use crate::server::{app_state::AppState, error::AppError};
+use crate::server::{app_state::{AppState, ConfigUpdateEffects}, error::AppError};
 use actix_web::{web, HttpResponse};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -622,13 +622,6 @@ fn is_setup_completed_from_typed(config: &Config) -> bool {
         .unwrap_or(false)
 }
 
-async fn persist_app_config(app_state: &AppState) -> Result<(), AppError> {
-    app_state
-        .persist_config()
-        .await
-        .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}")))
-}
-
 fn deep_merge_json(dst: &mut Value, src: Value) {
     match (dst, src) {
         (Value::Object(dst_obj), Value::Object(src_obj)) => {
@@ -734,25 +727,25 @@ pub async fn get_setup_status(app_state: web::Data<AppState>) -> Result<HttpResp
 /// ```
 pub async fn mark_setup_complete(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let config_to_save = {
-        let mut config = app_state.config.write().await;
-        let setup_entry = config
-            .extra
-            .entry("setup".to_string())
-            .or_insert_with(|| serde_json::json!({}));
-        let setup_obj = setup_entry.as_object_mut().ok_or_else(|| {
-            AppError::BadRequest("config.setup must be a JSON object".to_string())
-        })?;
+    app_state
+        .update_config(
+            |config| {
+                let setup_entry = config
+                    .extra
+                    .entry("setup".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                let setup_obj = setup_entry.as_object_mut().ok_or_else(|| {
+                    AppError::BadRequest("config.setup must be a JSON object".to_string())
+                })?;
 
-        setup_obj.insert("completed".to_string(), Value::Bool(true));
-        setup_obj.insert("completed_at".to_string(), Value::String(completed_at));
-        setup_obj.insert("version".to_string(), Value::Number(1.into()));
-
-        config.clone()
-    };
-
-    let _ = config_to_save;
-    persist_app_config(app_state.get_ref()).await?;
+                setup_obj.insert("completed".to_string(), Value::Bool(true));
+                setup_obj.insert("completed_at".to_string(), Value::String(completed_at));
+                setup_obj.insert("version".to_string(), Value::Number(1.into()));
+                Ok(())
+            },
+            ConfigUpdateEffects::default(),
+        )
+        .await?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
@@ -781,19 +774,20 @@ pub async fn mark_setup_incomplete(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
     let reset_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let config_to_save = {
-        let mut config = app_state.config.write().await;
-        if let Some(setup_entry) = config.extra.get_mut("setup") {
-            if let Some(setup_obj) = setup_entry.as_object_mut() {
-                setup_obj.insert("completed".to_string(), Value::Bool(false));
-                setup_obj.insert("reset_at".to_string(), Value::String(reset_at));
-            }
-        }
-        config.clone()
-    };
-
-    let _ = config_to_save;
-    persist_app_config(app_state.get_ref()).await?;
+    app_state
+        .update_config(
+            |config| {
+                if let Some(setup_entry) = config.extra.get_mut("setup") {
+                    if let Some(setup_obj) = setup_entry.as_object_mut() {
+                        setup_obj.insert("completed".to_string(), Value::Bool(false));
+                        setup_obj.insert("reset_at".to_string(), Value::String(reset_at));
+                    }
+                }
+                Ok(())
+            },
+            ConfigUpdateEffects::default(),
+        )
+        .await?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
@@ -994,22 +988,14 @@ pub async fn set_bamboo_config(
         return Err(AppError::BadRequest(format!("Invalid configuration: {e}")));
     }
 
-    // Update in-memory config first, then persist and reload provider.
-    {
-        let mut cfg = app_state.config.write().await;
-        *cfg = new_config.clone();
-    }
-    persist_app_config(app_state.get_ref()).await?;
-    app_state.reload_provider().await.map_err(|e| {
-        AppError::InternalError(anyhow::anyhow!(
-            "Failed to reload provider after updating config: {e}"
-        ))
-    })?;
-    // Best-effort reconcile of MCP runtimes with the updated config (no restart required).
-    app_state
-        .mcp_manager
-        .reconcile_from_config(&new_config.mcp)
-        .await;
+    // Single entrypoint: update memory -> persist -> apply runtime effects.
+    let new_config = app_state.replace_config(
+        new_config,
+        ConfigUpdateEffects {
+            reload_provider: true,
+            reconcile_mcp: true,
+        },
+    ).await?;
 
     let mut config_for_response = new_config.clone();
     config_for_response.refresh_proxy_auth_encrypted()?;
@@ -1074,22 +1060,23 @@ pub async fn set_proxy_auth(
         Some(ProxyAuth { username, password })
     };
 
-    let config_to_save = {
-        let mut config = app_state.config.write().await;
-        config.proxy_auth = auth;
-        config.refresh_proxy_auth_encrypted()?;
-        config.clone()
-    };
-
-    let _ = config_to_save;
-    persist_app_config(app_state.get_ref()).await?;
-
-    // Reload provider to apply new proxy settings
-    app_state.reload_provider().await.map_err(|e| {
-        AppError::InternalError(anyhow::anyhow!(
-            "Failed to reload provider after updating proxy auth: {e}"
-        ))
-    })?;
+    app_state
+        .update_config(
+            |config| {
+                config.proxy_auth = auth;
+                config.refresh_proxy_auth_encrypted().map_err(|e| {
+                    AppError::InternalError(anyhow::anyhow!(
+                        "Failed to encrypt proxy auth before save: {e}"
+                    ))
+                })?;
+                Ok(())
+            },
+            ConfigUpdateEffects {
+                reload_provider: true,
+                reconcile_mcp: false,
+            },
+        )
+        .await?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
@@ -1205,13 +1192,15 @@ pub async fn set_anthropic_model_mapping(
     payload: web::Json<crate::core::model_mapping::AnthropicModelMapping>,
 ) -> Result<HttpResponse, AppError> {
     let mapping = payload.into_inner();
-    let config_to_save = {
-        let mut config = app_state.config.write().await;
-        config.anthropic_model_mapping = mapping.clone();
-        config.clone()
-    };
-    let _ = config_to_save;
-    persist_app_config(app_state.get_ref()).await?;
+    app_state
+        .update_config(
+            |config| {
+                config.anthropic_model_mapping = mapping.clone();
+                Ok(())
+            },
+            ConfigUpdateEffects::default(),
+        )
+        .await?;
     Ok(HttpResponse::Ok().json(mapping))
 }
 
@@ -1356,19 +1345,18 @@ pub async fn update_keyword_masking_config(
         )));
     }
 
-    let config_to_save = {
-        let mut current = app_state.config.write().await;
-        current.keyword_masking = config.clone();
-        current.clone()
-    };
-    let _ = config_to_save;
-    persist_app_config(app_state.get_ref()).await?;
-    // Keyword masking is applied via provider decorator; reload to make it effective immediately.
-    app_state.reload_provider().await.map_err(|e| {
-        AppError::InternalError(anyhow::anyhow!(
-            "Failed to reload provider after updating keyword masking: {e}"
-        ))
-    })?;
+    app_state
+        .update_config(
+            |current| {
+                current.keyword_masking = config.clone();
+                Ok(())
+            },
+            ConfigUpdateEffects {
+                reload_provider: true,
+                reconcile_mcp: false,
+            },
+        )
+        .await?;
 
     Ok(HttpResponse::Ok().json(KeywordMaskingResponse {
         entries: config.entries,
@@ -1627,21 +1615,15 @@ pub async fn update_provider_config(
         })));
     }
 
-    {
-        let mut cfg = app_state.config.write().await;
-        *cfg = new_config.clone();
-    }
-    persist_app_config(app_state.get_ref()).await?;
-    app_state.reload_provider().await.map_err(|e| {
-        AppError::InternalError(anyhow::anyhow!(
-            "Failed to reload provider after updating configuration: {e}"
-        ))
-    })?;
-    // Best-effort reconcile of MCP runtimes with the updated config.
-    app_state
-        .mcp_manager
-        .reconcile_from_config(&new_config.mcp)
-        .await;
+    let new_config = app_state
+        .replace_config(
+            new_config,
+            ConfigUpdateEffects {
+                reload_provider: true,
+                reconcile_mcp: true,
+            },
+        )
+        .await?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,

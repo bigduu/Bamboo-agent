@@ -117,6 +117,13 @@ pub struct Config {
     #[serde(default)]
     pub gemini_model_mapping: GeminiModelMapping,
 
+    /// Request preflight hooks.
+    ///
+    /// These hooks can inspect and rewrite outgoing requests before they are sent upstream
+    /// (e.g. image fallback behavior for text-only models).
+    #[serde(default)]
+    pub hooks: HooksConfig,
+
     /// MCP server configuration.
     ///
     /// Previously persisted in `mcp.json` (now unified into `config.json`).
@@ -155,6 +162,45 @@ pub struct ProviderConfigs {
     /// Preserve unknown provider keys (forward compatibility).
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Request hook configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HooksConfig {
+    /// Image fallback behavior for OpenAI-compatible requests (chat/responses).
+    #[serde(default)]
+    pub image_fallback: ImageFallbackHookConfig,
+}
+
+/// When a request contains image parts but the effective provider path is text-only,
+/// we can either:
+/// - error fast (preferred for strict setups), or
+/// - degrade gracefully by replacing images with a placeholder text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageFallbackHookConfig {
+    #[serde(default = "default_true_hooks")]
+    pub enabled: bool,
+
+    /// "placeholder" (default) or "error"
+    #[serde(default = "default_image_fallback_mode")]
+    pub mode: String,
+}
+
+impl Default for ImageFallbackHookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true_hooks(),
+            mode: default_image_fallback_mode(),
+        }
+    }
+}
+
+fn default_image_fallback_mode() -> String {
+    "placeholder".to_string()
+}
+
+fn default_true_hooks() -> bool {
+    true
 }
 
 /// OpenAI provider configuration
@@ -772,6 +818,7 @@ impl Config {
             keyword_masking: KeywordMaskingConfig::default(),
             anthropic_model_mapping: AnthropicModelMapping::default(),
             gemini_model_mapping: GeminiModelMapping::default(),
+            hooks: HooksConfig::default(),
             mcp: crate::agent::mcp::McpConfig::default(),
             extra: BTreeMap::new(),
         }
@@ -1059,6 +1106,7 @@ fn migrate_config(old: OldConfig) -> Config {
         keyword_masking: old.keyword_masking,
         anthropic_model_mapping: old.anthropic_model_mapping,
         gemini_model_mapping: old.gemini_model_mapping,
+        hooks: HooksConfig::default(),
         mcp: old.mcp,
         extra: old.extra,
     }
