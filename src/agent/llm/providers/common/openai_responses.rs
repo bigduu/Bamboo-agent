@@ -15,11 +15,32 @@ use std::collections::HashMap;
 /// We intentionally keep this conservative:
 /// - `role`
 /// - `content`
-/// - `tool_call_id` (for tool result messages)
 ///
-/// We **do not** send assistant `tool_calls` back in the input since the
-/// Responses API input format differs across providers and versions.
+/// NOTE: Many upstreams implementing the Responses API *do not* accept a `tool`
+/// role in the input (they only allow: system/developer/user/assistant). Bamboo
+/// internally represents tool results as `Role::Tool`; when serializing for
+/// Responses, we convert these tool-result messages into a regular `user`
+/// message with a clear prefix so the model can incorporate the observation.
+///
+/// We also intentionally avoid sending assistant `tool_calls` back in the input
+/// since the Responses API input format differs across providers and versions.
 pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
+    // Best-effort index so we can add a tool name in the serialized observation.
+    let mut call_id_to_name: HashMap<&str, &str> = HashMap::new();
+    for m in messages {
+        if m.role != Role::Assistant {
+            continue;
+        }
+        let Some(calls) = m.tool_calls.as_ref() else {
+            continue;
+        };
+        for c in calls {
+            if !c.id.is_empty() && !c.function.name.is_empty() {
+                call_id_to_name.insert(c.id.as_str(), c.function.name.as_str());
+            }
+        }
+    }
+
     messages
         .iter()
         .map(|m| {
@@ -27,17 +48,36 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
                 Role::System => "system",
                 Role::User => "user",
                 Role::Assistant => "assistant",
-                Role::Tool => "tool",
+                Role::Tool => "user",
             };
 
-            let mut msg = json!({
-                "role": role,
-                "content": m.content,
-            });
+            let content = if m.role == Role::Tool {
+                // Preserve the call id as plain text; some upstreams reject `tool_call_id`.
+                let call_id = m.tool_call_id.as_deref().unwrap_or("");
+                let tool_name = if !call_id.is_empty() {
+                    call_id_to_name.get(call_id).copied().unwrap_or("")
+                } else {
+                    ""
+                };
 
-            if let Some(tool_call_id) = &m.tool_call_id {
-                msg["tool_call_id"] = json!(tool_call_id);
-            }
+                if !tool_name.is_empty() && !call_id.is_empty() {
+                    format!(
+                        "[tool_result name={tool_name} call_id={call_id}]\n{}",
+                        m.content
+                    )
+                } else if !call_id.is_empty() {
+                    format!("[tool_result call_id={call_id}]\n{}", m.content)
+                } else {
+                    format!("[tool_result]\n{}", m.content)
+                }
+            } else {
+                m.content.clone()
+            };
+
+            let msg = json!({
+                "role": role,
+                "content": content,
+            });
 
             msg
         })
@@ -46,7 +86,22 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
 
 /// Convert internal tool schemas to a Responses API `tools` array JSON.
 pub fn tools_to_responses_json(tools: &[ToolSchema]) -> Vec<Value> {
-    tools.iter().map(|t| json!(t)).collect()
+    // OpenAI Responses API expects tools in a flattened shape:
+    // { "type": "function", "name": "...", "description": "...", "parameters": {..} }
+    //
+    // Our internal ToolSchema matches the Chat Completions shape:
+    // { "type": "function", "function": { name, description, parameters } }
+    tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": t.schema_type,
+                "name": t.function.name,
+                "description": t.function.description,
+                "parameters": t.function.parameters,
+            })
+        })
+        .collect()
 }
 
 /// Build a standard Responses API streaming request body.
@@ -237,6 +292,8 @@ impl ResponsesSseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::core::tools::{FunctionSchema, ToolSchema};
+    use crate::agent::core::tools::{FunctionCall, ToolCall};
 
     #[test]
     fn build_responses_body_includes_input_and_stream() {
@@ -245,6 +302,59 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_output_tokens"], 123);
         assert!(body.get("input").is_some());
+    }
+
+    #[test]
+    fn tools_to_responses_json_flattens_function_schema() {
+        let tools = vec![ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "search".to_string(),
+                description: "Search things".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "q": { "type": "string" } },
+                    "required": ["q"]
+                }),
+            },
+        }];
+
+        let out = tools_to_responses_json(&tools);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "function");
+        assert_eq!(out[0]["name"], "search");
+        assert_eq!(out[0]["description"], "Search things");
+        assert!(out[0].get("function").is_none());
+        assert!(out[0].get("parameters").is_some());
+    }
+
+    #[test]
+    fn messages_to_responses_input_json_converts_tool_role_to_user_observation() {
+        let messages = vec![
+            Message::assistant(
+                "Calling a tool...",
+                Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "search".to_string(),
+                        arguments: r#"{"q":"x"}"#.to_string(),
+                    },
+                }]),
+            ),
+            Message::tool_result("call_1", "result payload"),
+        ];
+
+        let out = messages_to_responses_input_json(&messages);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1]["role"], "user");
+        assert!(out[1]["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("tool_result"));
+        assert!(out[1]["content"].as_str().unwrap_or("").contains("call_1"));
+        assert!(out[1]["content"].as_str().unwrap_or("").contains("search"));
+        assert!(out[1].get("tool_call_id").is_none());
     }
 
     #[test]
