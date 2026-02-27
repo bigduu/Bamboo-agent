@@ -106,6 +106,7 @@
 
 pub mod app_state;
 pub mod config;
+pub mod config_manager;
 pub mod error;
 pub mod handlers;
 // Backward compatibility: "controllers" and "handlers" are unified.

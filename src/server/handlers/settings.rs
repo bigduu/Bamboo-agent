@@ -1,5 +1,6 @@
 use crate::core::keyword_masking::{KeywordEntry, KeywordMaskingConfig};
 use crate::core::{Config, ProxyAuth};
+use crate::server::config_manager;
 use crate::server::{app_state::{AppState, ConfigUpdateEffects}, error::AppError};
 use actix_web::{web, HttpResponse};
 use chrono::{SecondsFormat, Utc};
@@ -44,11 +45,6 @@ struct WorkflowGetResponse {
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-fn is_masked_api_key(value: &str) -> bool {
-    let v = value.trim();
-    v.is_empty() || v.contains("***") || v.contains("...") || v == "****...****"
-}
 
 fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
     // Never send decrypted secrets. Also avoid sending encrypted key material.
@@ -622,6 +618,7 @@ fn is_setup_completed_from_typed(config: &Config) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn deep_merge_json(dst: &mut Value, src: Value) {
     match (dst, src) {
         (Value::Object(dst_obj), Value::Object(src_obj)) => {
@@ -879,129 +876,172 @@ pub async fn set_bamboo_config(
     app_state: web::Data<AppState>,
     payload: web::Json<Value>,
 ) -> Result<HttpResponse, AppError> {
-    let mut patch = payload.into_inner();
-    let patch_obj = patch
-        .as_object_mut()
-        .ok_or_else(|| AppError::BadRequest("config.json must be a JSON object".to_string()))?;
+    let patch = payload.into_inner();
+    let mut patch_obj = config_manager::assert_json_object(patch)?;
+    config_manager::sanitize_root_patch(&mut patch_obj);
+    let api_key_intents = config_manager::provider_api_key_intents(&patch_obj);
+    let effects = config_manager::effects_for_root_patch(&patch_obj);
 
-    // Never allow clients to modify proxy auth fields or data_dir via this endpoint.
-    patch_obj.remove("proxy_auth");
-    patch_obj.remove("proxy_auth_encrypted");
-    // Legacy/compat proxy auth keys (written by older Bodhi/Tauri builds).
-    patch_obj.remove("http_proxy_auth_encrypted");
-    patch_obj.remove("https_proxy_auth_encrypted");
-    patch_obj.remove("data_dir");
+    // Apply the patch under the config write lock to avoid clobbering concurrent updates.
+    let new_config = app_state
+        .update_config(
+            move |config| {
+                let current = config.clone();
+                let mut patch_obj = patch_obj;
+                config_manager::preserve_masked_provider_api_keys(&mut patch_obj, &current);
+                let mut new_config = config_manager::build_merged_config(&current, patch_obj)?;
+                config_manager::sync_provider_api_keys_encrypted_for_patch(
+                    &mut new_config,
+                    &api_key_intents,
+                )?;
+                *config = new_config;
+                Ok(())
+            },
+            ConfigUpdateEffects {
+                // Best-effort: setup/UX flows must be able to persist partial config even when
+                // provider init isn't possible yet.
+                reload_provider: false,
+                reconcile_mcp: effects.reconcile_mcp,
+            },
+        )
+        .await?;
 
-    // Never allow clients to set encrypted secret material directly.
-    if let Some(servers) = patch
-        .get_mut("mcp")
-        .and_then(|m| m.get_mut("servers"))
-        .and_then(|v| v.as_array_mut())
-    {
-        for server in servers.iter_mut() {
-            let Some(server_obj) = server.as_object_mut() else {
-                continue;
-            };
-            let Some(transport) = server_obj
-                .get_mut("transport")
-                .and_then(|v| v.as_object_mut())
-            else {
-                continue;
-            };
-
-            match transport.get("type").and_then(|v| v.as_str()) {
-                Some("stdio") => {
-                    transport.remove("env_encrypted");
-                }
-                Some("sse") => {
-                    if let Some(headers) =
-                        transport.get_mut("headers").and_then(|v| v.as_array_mut())
-                    {
-                        for header in headers.iter_mut() {
-                            let Some(header_obj) = header.as_object_mut() else {
-                                continue;
-                            };
-                            header_obj.remove("value_encrypted");
-                        }
-                    }
-                }
-                _ => {}
-            }
+    if effects.reload_provider == config_manager::ReloadMode::BestEffort {
+        if let Err(e) = app_state.reload_provider().await {
+            log::warn!(
+                "Config updated (provider={}, requested_reload=true) but provider reload failed: {}",
+                new_config.provider,
+                e
+            );
         }
     }
-
-    let current = app_state.config.read().await.clone();
-    let mut merged = serde_json::to_value(&current)?;
-
-    // Preserve existing API keys when the client sends masked placeholders.
-    if let Some(patch_providers) = patch.get_mut("providers").and_then(|v| v.as_object_mut()) {
-        for (provider_name, provider_patch) in patch_providers.iter_mut() {
-            let Some(patch_cfg_obj) = provider_patch.as_object_mut() else {
-                continue;
-            };
-
-            // Do not allow clients to directly set encrypted key material.
-            patch_cfg_obj.remove("api_key_encrypted");
-
-            let Some(api_key) = patch_cfg_obj.get("api_key").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if !is_masked_api_key(api_key) {
-                continue;
-            }
-
-            let existing_plain = match provider_name.as_str() {
-                "openai" => current.providers.openai.as_ref().map(|c| c.api_key.clone()),
-                "anthropic" => current
-                    .providers
-                    .anthropic
-                    .as_ref()
-                    .map(|c| c.api_key.clone()),
-                "gemini" => current.providers.gemini.as_ref().map(|c| c.api_key.clone()),
-                _ => None,
-            };
-
-            if let Some(existing_plain) = existing_plain {
-                if !existing_plain.trim().is_empty() {
-                    patch_cfg_obj.insert("api_key".to_string(), Value::String(existing_plain));
-                } else {
-                    patch_cfg_obj.remove("api_key");
-                }
-            } else {
-                patch_cfg_obj.remove("api_key");
-            }
-        }
-    }
-
-    deep_merge_json(&mut merged, patch);
-
-    let mut new_config: Config = serde_json::from_value(merged)?;
-    new_config.hydrate_proxy_auth_from_encrypted();
-    new_config.hydrate_provider_api_keys_from_encrypted();
-    // Config serialization never includes decrypted MCP secrets (env/header values). After
-    // round-tripping through JSON we must re-hydrate them from the encrypted blobs, otherwise
-    // a subsequent save would overwrite secrets with empty placeholders.
-    new_config.hydrate_mcp_secrets_from_encrypted();
-
-    // Validate before persisting.
-    if let Err(e) = crate::agent::llm::validate_provider_config(&new_config) {
-        return Err(AppError::BadRequest(format!("Invalid configuration: {e}")));
-    }
-
-    // Single entrypoint: update memory -> persist -> apply runtime effects.
-    let new_config = app_state.replace_config(
-        new_config,
-        ConfigUpdateEffects {
-            reload_provider: true,
-            reconcile_mcp: true,
-        },
-    ).await?;
 
     let mut config_for_response = new_config.clone();
     config_for_response.refresh_proxy_auth_encrypted()?;
     config_for_response.refresh_provider_api_keys_encrypted()?;
     let value = serde_json::to_value(&config_for_response)?;
     Ok(HttpResponse::Ok().json(redact_config_for_api(value, &config_for_response)))
+}
+
+#[derive(Serialize)]
+struct ValidationIssue {
+    path: String,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct ValidateConfigResponse {
+    valid: bool,
+    errors: std::collections::BTreeMap<String, Vec<ValidationIssue>>,
+}
+
+/// Validates a config patch without persisting it.
+///
+/// # HTTP Route
+/// `POST /bamboo/config/validate`
+///
+/// This endpoint is designed for UX flows that want to surface issues early without
+/// forcing strict validation on the permissive `/bamboo/config` patch endpoint.
+pub async fn validate_bamboo_config_patch(
+    app_state: web::Data<AppState>,
+    payload: web::Json<Value>,
+) -> Result<HttpResponse, AppError> {
+    let patch = payload.into_inner();
+    let mut patch_obj = config_manager::assert_json_object(patch)?;
+    config_manager::sanitize_root_patch(&mut patch_obj);
+
+    let current = app_state.config.read().await.clone();
+    let merged = config_manager::build_merged_config(&current, patch_obj.clone())?;
+    let domains = config_manager::domains_for_root_patch(&patch_obj);
+
+    let mut errors: std::collections::BTreeMap<String, Vec<ValidationIssue>> =
+        std::collections::BTreeMap::new();
+
+    let mut push_error = |domain: &str, path: &str, message: String| {
+        errors
+            .entry(domain.to_string())
+            .or_default()
+            .push(ValidationIssue {
+                path: path.to_string(),
+                message,
+            });
+    };
+
+    if domains.proxy {
+        if let Err(e) = crate::agent::llm::http_client::build_proxy(&merged) {
+            push_error("proxy", "http_proxy/https_proxy", e.to_string());
+        }
+    }
+
+    if domains.provider {
+        if let Err(e) = crate::agent::llm::validate_provider_config(&merged) {
+            let provider = merged.provider.as_str();
+            let (path, message) = match provider {
+                "openai" => {
+                    let configured = merged
+                        .providers
+                        .openai
+                        .as_ref()
+                        .map(|c| !c.api_key.trim().is_empty() || c.api_key_encrypted.is_some())
+                        .unwrap_or(false);
+                    if configured {
+                        ("provider", e.to_string())
+                    } else {
+                        (
+                            "providers.openai.api_key",
+                            "OpenAI API key is required".to_string(),
+                        )
+                    }
+                }
+                "anthropic" => {
+                    let configured = merged
+                        .providers
+                        .anthropic
+                        .as_ref()
+                        .map(|c| !c.api_key.trim().is_empty() || c.api_key_encrypted.is_some())
+                        .unwrap_or(false);
+                    if configured {
+                        ("provider", e.to_string())
+                    } else {
+                        (
+                            "providers.anthropic.api_key",
+                            "Anthropic API key is required".to_string(),
+                        )
+                    }
+                }
+                "gemini" => {
+                    let configured = merged
+                        .providers
+                        .gemini
+                        .as_ref()
+                        .map(|c| !c.api_key.trim().is_empty() || c.api_key_encrypted.is_some())
+                        .unwrap_or(false);
+                    if configured {
+                        ("provider", e.to_string())
+                    } else {
+                        (
+                            "providers.gemini.api_key",
+                            "Gemini API key is required".to_string(),
+                        )
+                    }
+                }
+                _ => ("provider", e.to_string()),
+            };
+
+            push_error("provider", path, message);
+        }
+    }
+
+    if domains.setup {
+        if let Some(setup) = merged.extra.get("setup") {
+            if !setup.is_object() {
+                push_error("setup", "setup", "config.setup must be a JSON object".to_string());
+            }
+        }
+    }
+
+    let valid = errors.values().all(|v| v.is_empty());
+    Ok(HttpResponse::Ok().json(ValidateConfigResponse { valid, errors }))
 }
 
 /// Request body for setting proxy authentication
@@ -1072,11 +1112,17 @@ pub async fn set_proxy_auth(
                 Ok(())
             },
             ConfigUpdateEffects {
-                reload_provider: true,
+                // Best-effort: setup flows often set proxy auth before provider config is complete.
+                // Persisting should not fail just because provider init can't happen yet.
+                reload_provider: false,
                 reconcile_mcp: false,
             },
         )
         .await?;
+
+    if let Err(e) = app_state.reload_provider().await {
+        log::warn!("Proxy auth updated but provider reload failed: {}", e);
+    }
 
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
 }
@@ -1352,11 +1398,17 @@ pub async fn update_keyword_masking_config(
                 Ok(())
             },
             ConfigUpdateEffects {
-                reload_provider: true,
+                // Best-effort: keyword masking is a UX feature and should remain configurable
+                // even when the provider is not yet configured.
+                reload_provider: false,
                 reconcile_mcp: false,
             },
         )
         .await?;
+
+    if let Err(e) = app_state.reload_provider().await {
+        log::warn!("Keyword masking updated but provider reload failed: {}", e);
+    }
 
     Ok(HttpResponse::Ok().json(KeywordMaskingResponse {
         entries: config.entries,
@@ -1550,80 +1602,58 @@ pub async fn update_provider_config(
     app_state: web::Data<AppState>,
     payload: web::Json<UpdateProviderRequest>,
 ) -> Result<HttpResponse, AppError> {
-    let current = app_state.config.read().await.clone();
-    let mut merged = serde_json::to_value(&current)?;
+    let mut patch_obj = serde_json::Map::new();
+    patch_obj.insert("provider".to_string(), Value::String(payload.provider.clone()));
+    patch_obj.insert("providers".to_string(), payload.providers.clone());
 
-    // Build a patch like { provider: "...", providers: { ... } } and preserve existing
-    // API keys when the client sends masked placeholders.
-    let mut patch = serde_json::json!({
-        "provider": payload.provider,
-        "providers": payload.providers,
-    });
+    config_manager::sanitize_root_patch(&mut patch_obj);
+    let api_key_intents = config_manager::provider_api_key_intents(&patch_obj);
 
-    if let Some(patch_providers) = patch.get_mut("providers").and_then(|v| v.as_object_mut()) {
-        for (provider_name, provider_patch) in patch_providers.iter_mut() {
-            let Some(patch_cfg_obj) = provider_patch.as_object_mut() else {
-                continue;
-            };
+    let new_config = match app_state
+        .update_config(
+            move |config| {
+                let current = config.clone();
+                let mut patch_obj = patch_obj;
+                config_manager::preserve_masked_provider_api_keys(&mut patch_obj, &current);
+                let mut new_config = config_manager::build_merged_config(&current, patch_obj)?;
+                config_manager::sync_provider_api_keys_encrypted_for_patch(
+                    &mut new_config,
+                    &api_key_intents,
+                )?;
 
-            // Do not allow clients to directly set encrypted key material.
-            patch_cfg_obj.remove("api_key_encrypted");
-
-            let Some(api_key) = patch_cfg_obj.get("api_key").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if !is_masked_api_key(api_key) {
-                continue;
-            }
-
-            let existing_plain = match provider_name.as_str() {
-                "openai" => current.providers.openai.as_ref().map(|c| c.api_key.clone()),
-                "anthropic" => current
-                    .providers
-                    .anthropic
-                    .as_ref()
-                    .map(|c| c.api_key.clone()),
-                "gemini" => current.providers.gemini.as_ref().map(|c| c.api_key.clone()),
-                _ => None,
-            };
-
-            if let Some(existing_plain) = existing_plain {
-                if !existing_plain.trim().is_empty() {
-                    patch_cfg_obj.insert("api_key".to_string(), Value::String(existing_plain));
-                } else {
-                    patch_cfg_obj.remove("api_key");
+                if let Err(e) = crate::agent::llm::validate_provider_config(&new_config) {
+                    return Err(AppError::BadRequest(format!(
+                        "Invalid configuration: {e}"
+                    )));
                 }
-            } else {
-                patch_cfg_obj.remove("api_key");
-            }
-        }
-    }
 
-    deep_merge_json(&mut merged, patch);
-
-    let mut new_config: Config = serde_json::from_value(merged)?;
-    new_config.hydrate_proxy_auth_from_encrypted();
-    new_config.hydrate_provider_api_keys_from_encrypted();
-    // See note in `set_bamboo_config`: avoid losing decrypted MCP runtime secrets during
-    // provider-only updates.
-    new_config.hydrate_mcp_secrets_from_encrypted();
-
-    if let Err(e) = crate::agent::llm::validate_provider_config(&new_config) {
-        return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-            "success": false,
-            "error": format!("Invalid configuration: {}", e)
-        })));
-    }
-
-    let new_config = app_state
-        .replace_config(
-            new_config,
+                *config = new_config;
+                Ok(())
+            },
+            // Persist config first; reload below so we can control error reporting.
             ConfigUpdateEffects {
-                reload_provider: true,
+                reload_provider: false,
                 reconcile_mcp: true,
             },
         )
-        .await?;
+        .await
+    {
+        Ok(cfg) => cfg,
+        Err(AppError::BadRequest(msg)) => {
+            return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+                "success": false,
+                "error": msg
+            })));
+        }
+        Err(e) => return Err(e),
+    };
+
+    if let Err(e) = app_state.reload_provider().await {
+        return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false,
+            "error": format!("Failed to reload provider: {e}")
+        })));
+    }
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,

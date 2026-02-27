@@ -90,6 +90,10 @@ fn openai_compatible_v1_scope(
             web::post().to(settings::set_bamboo_config),
         )
         .route(
+            "/bamboo/config/validate",
+            web::post().to(settings::validate_bamboo_config_patch),
+        )
+        .route(
             "/bamboo/config/reset",
             web::post().to(settings::reset_bamboo_config),
         )

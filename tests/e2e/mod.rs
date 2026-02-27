@@ -7,6 +7,7 @@ mod agent_api;
 mod anthropic;
 mod chat;
 mod commands;
+mod config_flow;
 mod common;
 mod copilot_auth;
 mod delete;
