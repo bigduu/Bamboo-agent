@@ -3,7 +3,7 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::agent::mcp::config::StdioConfig;
 use crate::agent::mcp::error::{McpError, Result};
@@ -73,7 +73,7 @@ impl McpTransport for StdioTransport {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    debug!("[MCP server stderr] {}", line);
+                    trace!("[MCP server stderr] {}", line);
                 }
             });
         }
@@ -123,7 +123,8 @@ impl McpTransport for StdioTransport {
             .await
             .map_err(|e| McpError::Transport(format!("Failed to flush: {}", e)))?;
 
-        debug!("Sent: {}", message);
+        // Raw wire logs can be extremely noisy (e.g., keepalive pings).
+        trace!("Sent: {}", message);
         Ok(())
     }
 
@@ -149,7 +150,8 @@ impl McpTransport for StdioTransport {
                 if line.is_empty() {
                     Ok(None)
                 } else {
-                    debug!("Received: {}", line);
+                    // Raw wire logs can be extremely noisy (e.g., keepalive pings).
+                    trace!("Received: {}", line);
                     Ok(Some(line.to_string()))
                 }
             }

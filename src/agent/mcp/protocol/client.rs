@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tracing::{debug, error, warn};
+use tracing::{error, trace, warn};
 
 use crate::agent::mcp::error::{McpError, Result};
 use crate::agent::mcp::protocol::models::*;
@@ -81,7 +81,8 @@ impl McpProtocolClient {
 
                 match transport.receive().await {
                     Ok(Some(message)) => {
-                        debug!("Received message: {}", message);
+                        // Raw inbound wire messages can be extremely noisy (e.g., keepalive pings).
+                        trace!("Received message: {}", message);
                         if let Err(e) =
                             Self::handle_message(&message, &pending_requests, &notification_tx)
                                 .await
