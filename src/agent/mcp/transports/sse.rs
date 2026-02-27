@@ -22,10 +22,14 @@ pub struct SseTransport {
 
 impl SseTransport {
     pub fn new(config: SseConfig) -> Self {
+        Self::new_with_client(config, Client::new())
+    }
+
+    pub fn new_with_client(config: SseConfig, client: Client) -> Self {
         let (message_tx, message_rx) = mpsc::channel(100);
         Self {
             config,
-            client: Client::new(),
+            client,
             connected: AtomicBool::new(false),
             message_tx,
             message_rx: Mutex::new(message_rx),

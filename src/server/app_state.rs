@@ -75,10 +75,10 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::core::{tools::ToolSchema, Message};
 use crate::agent::core::storage::JsonlStorage;
 use crate::agent::core::tools::ToolExecutor;
 use crate::agent::core::AgentEvent;
+use crate::agent::core::{tools::ToolSchema, Message};
 use crate::agent::llm::{LLMError, LLMProvider, LLMStream};
 use crate::agent::mcp::McpServerManager;
 use crate::agent::skill::{SkillManager, SkillStoreConfig};
@@ -465,8 +465,8 @@ impl AppState {
         }
         let builtin_tools: Arc<dyn ToolExecutor> = Arc::new(builtin_executor);
 
-        // Initialize MCP manager
-        let mcp_manager = Arc::new(McpServerManager::new());
+        // Initialize MCP manager (needs access to config to respect proxy for SSE transports).
+        let mcp_manager = Arc::new(McpServerManager::new_with_config(config.clone()));
 
         // Try to load MCP config and initialize servers
         let mcp_config = config.read().await.mcp.clone();
@@ -767,7 +767,8 @@ impl AppState {
             .await
             .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}")))?;
 
-        self.apply_config_effects(new_config.clone(), effects).await?;
+        self.apply_config_effects(new_config.clone(), effects)
+            .await?;
         Ok(new_config)
     }
 

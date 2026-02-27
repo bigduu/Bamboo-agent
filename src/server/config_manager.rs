@@ -24,7 +24,9 @@ fn is_masked_api_key(value: &str) -> bool {
     v.contains("***") || v.contains("...") || v == "****...****"
 }
 
-pub fn provider_api_key_intents(patch_obj: &Map<String, Value>) -> std::collections::BTreeSet<String> {
+pub fn provider_api_key_intents(
+    patch_obj: &Map<String, Value>,
+) -> std::collections::BTreeSet<String> {
     let mut providers = std::collections::BTreeSet::new();
     let Some(root) = patch_obj.get("providers").and_then(|v| v.as_object()) else {
         return providers;
@@ -59,13 +61,11 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                     openai.api_key_encrypted = if api_key.is_empty() {
                         None
                     } else {
-                        Some(
-                            crate::core::encryption::encrypt(api_key).map_err(|e| {
-                                AppError::InternalError(anyhow::anyhow!(
-                                    "Failed to encrypt OpenAI api_key: {e}"
-                                ))
-                            })?,
-                        )
+                        Some(crate::core::encryption::encrypt(api_key).map_err(|e| {
+                            AppError::InternalError(anyhow::anyhow!(
+                                "Failed to encrypt OpenAI api_key: {e}"
+                            ))
+                        })?)
                     };
                 }
             }
@@ -75,13 +75,11 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                     anthropic.api_key_encrypted = if api_key.is_empty() {
                         None
                     } else {
-                        Some(
-                            crate::core::encryption::encrypt(api_key).map_err(|e| {
-                                AppError::InternalError(anyhow::anyhow!(
-                                    "Failed to encrypt Anthropic api_key: {e}"
-                                ))
-                            })?,
-                        )
+                        Some(crate::core::encryption::encrypt(api_key).map_err(|e| {
+                            AppError::InternalError(anyhow::anyhow!(
+                                "Failed to encrypt Anthropic api_key: {e}"
+                            ))
+                        })?)
                     };
                 }
             }
@@ -91,13 +89,11 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                     gemini.api_key_encrypted = if api_key.is_empty() {
                         None
                     } else {
-                        Some(
-                            crate::core::encryption::encrypt(api_key).map_err(|e| {
-                                AppError::InternalError(anyhow::anyhow!(
-                                    "Failed to encrypt Gemini api_key: {e}"
-                                ))
-                            })?,
-                        )
+                        Some(crate::core::encryption::encrypt(api_key).map_err(|e| {
+                            AppError::InternalError(anyhow::anyhow!(
+                                "Failed to encrypt Gemini api_key: {e}"
+                            ))
+                        })?)
                     };
                 }
             }
@@ -143,8 +139,12 @@ pub fn domains_for_root_patch(patch_obj: &Map<String, Value>) -> DomainChanges {
             "provider" | "providers" | "model" => changes.provider = true,
 
             // Proxy domain
-            "http_proxy" | "https_proxy" | "proxy_auth" | "proxy_auth_encrypted"
-            | "http_proxy_auth_encrypted" | "https_proxy_auth_encrypted" => changes.proxy = true,
+            "http_proxy"
+            | "https_proxy"
+            | "proxy_auth"
+            | "proxy_auth_encrypted"
+            | "http_proxy_auth_encrypted"
+            | "https_proxy_auth_encrypted" => changes.proxy = true,
 
             // Setup domain (stored under Config.extra via serde flatten)
             "setup" => changes.setup = true,
@@ -177,7 +177,9 @@ pub fn effects_for_root_patch(patch_obj: &Map<String, Value>) -> PatchEffects {
         } else {
             ReloadMode::None
         },
-        reconcile_mcp: touches_mcp,
+        // SSE-based MCP servers are HTTP clients and must respect proxy settings.
+        // Reconcile so proxy changes take effect without a restart.
+        reconcile_mcp: touches_mcp || touches_proxy,
     }
 }
 
@@ -200,7 +202,10 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
     patch_obj.remove("data_dir");
 
     // Never allow clients to set encrypted key material directly.
-    if let Some(providers) = patch_obj.get_mut("providers").and_then(|v| v.as_object_mut()) {
+    if let Some(providers) = patch_obj
+        .get_mut("providers")
+        .and_then(|v| v.as_object_mut())
+    {
         for (_provider_name, provider_cfg) in providers.iter_mut() {
             let Some(obj) = provider_cfg.as_object_mut() else {
                 continue;
@@ -213,7 +218,10 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
     //
     // Canonical MCP format:
     //   "mcpServers": { "<id>": { env_encrypted, headers[*].value_encrypted, ... } }
-    if let Some(mcp_servers) = patch_obj.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
+    if let Some(mcp_servers) = patch_obj
+        .get_mut("mcpServers")
+        .and_then(|v| v.as_object_mut())
+    {
         for (_id, server) in mcp_servers.iter_mut() {
             let Some(server_obj) = server.as_object_mut() else {
                 continue;
@@ -271,7 +279,9 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
 }
 
 pub fn preserve_masked_provider_api_keys(patch_obj: &mut Map<String, Value>, current: &Config) {
-    let Some(patch_providers) = patch_obj.get_mut("providers").and_then(|v| v.as_object_mut())
+    let Some(patch_providers) = patch_obj
+        .get_mut("providers")
+        .and_then(|v| v.as_object_mut())
     else {
         return;
     };
@@ -329,7 +339,10 @@ pub fn deep_merge_json(dst: &mut Value, src: Value) {
     }
 }
 
-pub fn build_merged_config(current: &Config, patch_obj: Map<String, Value>) -> Result<Config, AppError> {
+pub fn build_merged_config(
+    current: &Config,
+    patch_obj: Map<String, Value>,
+) -> Result<Config, AppError> {
     let mut merged = serde_json::to_value(current)
         .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to serialize config: {e}")))?;
 

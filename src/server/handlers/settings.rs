@@ -1,7 +1,10 @@
 use crate::core::keyword_masking::{KeywordEntry, KeywordMaskingConfig};
 use crate::core::{Config, ProxyAuth};
 use crate::server::config_manager;
-use crate::server::{app_state::{AppState, ConfigUpdateEffects}, error::AppError};
+use crate::server::{
+    app_state::{AppState, ConfigUpdateEffects},
+    error::AppError,
+};
 use actix_web::{web, HttpResponse};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -135,8 +138,9 @@ fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
                 // sse server: header values masked
                 if server_obj.get("url").is_some() {
                     // Mainstream style: headers is an object map.
-                    if let Some(headers_obj) =
-                        server_obj.get_mut("headers").and_then(|v| v.as_object_mut())
+                    if let Some(headers_obj) = server_obj
+                        .get_mut("headers")
+                        .and_then(|v| v.as_object_mut())
                     {
                         for (_k, v) in headers_obj.iter_mut() {
                             *v = Value::String("****...****".to_string());
@@ -1035,7 +1039,11 @@ pub async fn validate_bamboo_config_patch(
     if domains.setup {
         if let Some(setup) = merged.extra.get("setup") {
             if !setup.is_object() {
-                push_error("setup", "setup", "config.setup must be a JSON object".to_string());
+                push_error(
+                    "setup",
+                    "setup",
+                    "config.setup must be a JSON object".to_string(),
+                );
             }
         }
     }
@@ -1115,7 +1123,8 @@ pub async fn set_proxy_auth(
                 // Best-effort: setup flows often set proxy auth before provider config is complete.
                 // Persisting should not fail just because provider init can't happen yet.
                 reload_provider: false,
-                reconcile_mcp: false,
+                // Proxy auth can affect SSE-based MCP servers too.
+                reconcile_mcp: true,
             },
         )
         .await?;
@@ -1603,7 +1612,10 @@ pub async fn update_provider_config(
     payload: web::Json<UpdateProviderRequest>,
 ) -> Result<HttpResponse, AppError> {
     let mut patch_obj = serde_json::Map::new();
-    patch_obj.insert("provider".to_string(), Value::String(payload.provider.clone()));
+    patch_obj.insert(
+        "provider".to_string(),
+        Value::String(payload.provider.clone()),
+    );
     patch_obj.insert("providers".to_string(), payload.providers.clone());
 
     config_manager::sanitize_root_patch(&mut patch_obj);
@@ -1622,9 +1634,7 @@ pub async fn update_provider_config(
                 )?;
 
                 if let Err(e) = crate::agent::llm::validate_provider_config(&new_config) {
-                    return Err(AppError::BadRequest(format!(
-                        "Invalid configuration: {e}"
-                    )));
+                    return Err(AppError::BadRequest(format!("Invalid configuration: {e}")));
                 }
 
                 *config = new_config;
@@ -1940,7 +1950,9 @@ pub async fn reload_provider_config(
 mod tests {
     use super::*;
 
-    use crate::agent::mcp::{HeaderConfig, McpServerConfig, SseConfig, StdioConfig, TransportConfig};
+    use crate::agent::mcp::{
+        HeaderConfig, McpServerConfig, SseConfig, StdioConfig, TransportConfig,
+    };
     use crate::core::encryption::set_test_encryption_key;
     use crate::core::{OpenAIConfig, ProviderConfigs};
     use std::collections::HashMap;
@@ -2036,7 +2048,9 @@ mod tests {
 
         // This is the critical part: if MCP secrets weren't hydrated, the save would
         // re-encrypt empty placeholders and permanently lose credentials.
-        new_config.save_to_dir(temp_dir.path().to_path_buf()).unwrap();
+        new_config
+            .save_to_dir(temp_dir.path().to_path_buf())
+            .unwrap();
 
         // Reload from disk and ensure secrets survive.
         let reloaded = Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
@@ -2049,7 +2063,10 @@ mod tests {
             .unwrap();
         match &stdio.transport {
             TransportConfig::Stdio(stdio) => {
-                assert_eq!(stdio.env.get("TOKEN").map(|v| v.as_str()), Some("super-secret"));
+                assert_eq!(
+                    stdio.env.get("TOKEN").map(|v| v.as_str()),
+                    Some("super-secret")
+                );
             }
             _ => panic!("expected stdio transport"),
         }
@@ -2062,7 +2079,11 @@ mod tests {
             .unwrap();
         match &sse.transport {
             TransportConfig::Sse(sse) => {
-                let header = sse.headers.iter().find(|h| h.name == "Authorization").unwrap();
+                let header = sse
+                    .headers
+                    .iter()
+                    .find(|h| h.name == "Authorization")
+                    .unwrap();
                 assert_eq!(header.value.as_str(), "Bearer super-secret");
             }
             _ => panic!("expected sse transport"),

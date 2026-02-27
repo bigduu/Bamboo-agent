@@ -13,6 +13,8 @@ use crate::agent::mcp::protocol::{McpProtocolClient, McpTransport};
 use crate::agent::mcp::tool_index::ToolIndex;
 use crate::agent::mcp::transports::{SseTransport, StdioTransport};
 use crate::agent::mcp::types::{McpEvent, McpTool, RuntimeInfo, ServerStatus};
+use crate::core::Config;
+use sha2::{Digest, Sha256};
 
 /// Runtime state for a connected MCP server
 struct ServerRuntime {
@@ -22,6 +24,9 @@ struct ServerRuntime {
     tools: RwLock<Vec<McpTool>>,
     shutdown: AtomicBool,
     reconnecting: AtomicBool,
+    // Fingerprint of the global proxy settings at the time this runtime was started.
+    // Used to force-restart SSE transports when proxy settings change.
+    proxy_fingerprint: Option<String>,
 }
 
 /// Manages MCP server connections and tool execution
@@ -29,6 +34,7 @@ pub struct McpServerManager {
     runtimes: DashMap<String, Arc<ServerRuntime>>,
     index: Arc<ToolIndex>,
     event_tx: Option<tokio::sync::mpsc::Sender<McpEvent>>,
+    config: Option<Arc<tokio::sync::RwLock<Config>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +75,11 @@ fn effective_server_config(config: &McpServerConfig) -> EffectiveServerConfig {
             command: stdio.command.clone(),
             args: stdio.args.clone(),
             cwd: stdio.cwd.clone(),
-            env: stdio.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            env: stdio
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             startup_timeout_ms: stdio.startup_timeout_ms,
         },
         TransportConfig::Sse(sse) => EffectiveTransportConfig::Sse {
@@ -96,12 +106,49 @@ fn effective_server_config(config: &McpServerConfig) -> EffectiveServerConfig {
     }
 }
 
+fn proxy_fingerprint(config: &Config) -> Option<String> {
+    let http_proxy = config.http_proxy.trim();
+    let https_proxy = config.https_proxy.trim();
+
+    let proxy_url = if !http_proxy.is_empty() {
+        http_proxy
+    } else if !https_proxy.is_empty() {
+        https_proxy
+    } else {
+        return None;
+    };
+
+    let (username, password) = config
+        .proxy_auth
+        .as_ref()
+        .map(|a| (a.username.as_str(), a.password.as_str()))
+        .unwrap_or(("", ""));
+
+    // Hash to avoid keeping raw password copies outside the global config.
+    let mut hasher = Sha256::new();
+    hasher.update(proxy_url.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(username.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(password.as_bytes());
+    Some(hex::encode(hasher.finalize()))
+}
+
+async fn manager_proxy_fingerprint(
+    cfg_handle: Option<&Arc<tokio::sync::RwLock<Config>>>,
+) -> Option<String> {
+    let handle = cfg_handle?;
+    let cfg = handle.read().await.clone();
+    proxy_fingerprint(&cfg)
+}
+
 impl Clone for McpServerManager {
     fn clone(&self) -> Self {
         Self {
             runtimes: self.runtimes.clone(),
             index: self.index.clone(),
             event_tx: self.event_tx.clone(),
+            config: self.config.clone(),
         }
     }
 }
@@ -112,6 +159,17 @@ impl McpServerManager {
             runtimes: DashMap::new(),
             index: Arc::new(ToolIndex::new()),
             event_tx: None,
+            config: None,
+        }
+    }
+
+    /// Create a manager that can respect global proxy settings when connecting SSE transports.
+    pub fn new_with_config(config: Arc<tokio::sync::RwLock<Config>>) -> Self {
+        Self {
+            runtimes: DashMap::new(),
+            index: Arc::new(ToolIndex::new()),
+            event_tx: None,
+            config: Some(config),
         }
     }
 
@@ -134,6 +192,8 @@ impl McpServerManager {
     /// Secrets are compared by their hydrated plaintext (env/header values), not by the
     /// encrypted-at-rest blobs (which can change on every save due to random nonces).
     pub async fn reconcile_from_config(&self, config: &McpConfig) {
+        let desired_proxy_fingerprint = manager_proxy_fingerprint(self.config.as_ref()).await;
+
         // Stop or restart existing runtimes.
         for running_id in self.list_servers() {
             let desired = config.servers.iter().find(|s| s.id == running_id);
@@ -160,7 +220,20 @@ impl McpServerManager {
             let needs_restart = self
                 .runtimes
                 .get(&running_id)
-                .map(|runtime| effective_server_config(&runtime.config) != effective_server_config(desired))
+                .map(|runtime| {
+                    let mut restart =
+                        effective_server_config(&runtime.config) != effective_server_config(desired);
+
+                    // SSE transports are HTTP clients; if proxy settings change we must restart
+                    // to re-create the underlying reqwest client with the new proxy config.
+                    if let TransportConfig::Sse(_) = &runtime.config.transport {
+                        if runtime.proxy_fingerprint != desired_proxy_fingerprint {
+                            restart = true;
+                        }
+                    }
+
+                    restart
+                })
                 .unwrap_or(false);
 
             if needs_restart {
@@ -219,8 +292,24 @@ impl McpServerManager {
             TransportConfig::Stdio(stdio_config) => {
                 Box::new(StdioTransport::new(stdio_config.clone()))
             }
-            TransportConfig::Sse(sse_config) => Box::new(SseTransport::new(sse_config.clone())),
+            TransportConfig::Sse(sse_config) => {
+                // SSE uses HTTP; ensure it respects user-configured proxy settings when available.
+                if let Some(cfg_handle) = self.config.as_ref() {
+                    let cfg = cfg_handle.read().await.clone();
+                    let client =
+                        crate::agent::llm::http_client::build_http_client(&cfg).map_err(|e| {
+                            McpError::InvalidConfig(format!(
+                                "Failed to build HTTP client for MCP SSE transport: {e}"
+                            ))
+                        })?;
+                    Box::new(SseTransport::new_with_client(sse_config.clone(), client))
+                } else {
+                    Box::new(SseTransport::new(sse_config.clone()))
+                }
+            }
         };
+
+        let runtime_proxy_fingerprint = desired_proxy_fingerprint(self.config.as_ref()).await;
 
         // Create client
         let mut client = McpProtocolClient::new(transport);
@@ -265,6 +354,7 @@ impl McpServerManager {
             tools: RwLock::new(tools.clone()),
             shutdown: AtomicBool::new(false),
             reconnecting: AtomicBool::new(false),
+            proxy_fingerprint: runtime_proxy_fingerprint,
         });
 
         // Register tools in index
@@ -783,10 +873,16 @@ impl Default for McpServerManager {
     }
 }
 
+async fn desired_proxy_fingerprint(
+    cfg_handle: Option<&Arc<tokio::sync::RwLock<Config>>>,
+) -> Option<String> {
+    manager_proxy_fingerprint(cfg_handle).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::mcp::config::{ReconnectConfig, StdioConfig};
+    use crate::agent::mcp::config::{ReconnectConfig, SseConfig, StdioConfig};
     use tokio::sync::mpsc;
 
     fn create_test_server_config(id: &str) -> McpServerConfig {
@@ -1058,5 +1154,76 @@ mod tests {
 
         assert!(!config.enabled);
         // In the actual health check code, reconnection is only attempted if enabled
+    }
+
+    #[test]
+    fn test_proxy_fingerprint_changes_on_proxy_or_auth_change() {
+        let mut cfg = Config::default();
+        assert_eq!(proxy_fingerprint(&cfg), None);
+
+        cfg.http_proxy = "http://proxy:8080".to_string();
+        let fp1 = proxy_fingerprint(&cfg).expect("fingerprint expected");
+
+        cfg.http_proxy = "http://proxy2:8080".to_string();
+        let fp2 = proxy_fingerprint(&cfg).expect("fingerprint expected");
+        assert_ne!(fp1, fp2);
+
+        cfg.http_proxy = "http://proxy:8080".to_string();
+        cfg.proxy_auth = Some(crate::core::ProxyAuth {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        });
+        let fp3 = proxy_fingerprint(&cfg).expect("fingerprint expected");
+        assert_ne!(fp1, fp3);
+
+        cfg.proxy_auth = Some(crate::core::ProxyAuth {
+            username: "user".to_string(),
+            password: "pass2".to_string(),
+        });
+        let fp4 = proxy_fingerprint(&cfg).expect("fingerprint expected");
+        assert_ne!(fp3, fp4);
+    }
+
+    #[tokio::test]
+    async fn test_sse_transport_respects_proxy_settings_when_available() {
+        // If the manager has access to global config, SSE client creation should
+        // fail early when proxy URL is invalid (proving it attempted to apply proxy).
+        let cfg = Config {
+            http_proxy: "http://".to_string(), // invalid URL
+            ..Config::default()
+        };
+        let manager = McpServerManager::new_with_config(Arc::new(tokio::sync::RwLock::new(cfg)));
+
+        let server = McpServerConfig {
+            id: "sse-test".to_string(),
+            name: Some("SSE test".to_string()),
+            enabled: true,
+            transport: TransportConfig::Sse(SseConfig {
+                url: "http://localhost:9999/sse".to_string(),
+                headers: vec![],
+                connect_timeout_ms: 100,
+            }),
+            request_timeout_ms: 1000,
+            healthcheck_interval_ms: 1000,
+            reconnect: ReconnectConfig {
+                enabled: false,
+                initial_backoff_ms: 100,
+                max_backoff_ms: 1000,
+                max_attempts: 1,
+            },
+            allowed_tools: vec![],
+            denied_tools: vec![],
+        };
+
+        let err = manager.start_server(server).await.unwrap_err();
+        match err {
+            McpError::InvalidConfig(msg) => {
+                assert!(
+                    msg.to_lowercase().contains("proxy") || msg.to_lowercase().contains("http"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
     }
 }
