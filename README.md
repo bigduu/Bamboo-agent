@@ -183,7 +183,7 @@ Some upstream provider paths/models are text-only. Bamboo can optionally:
 - **preserve images** (default): `hooks.image_fallback.enabled=false`
 - **rewrite images to placeholder text**: `mode="placeholder"`
 - **error fast**: `mode="error"`
-- **OCR**: `mode="ocr"` (Windows-only; non-Windows currently leaves images intact)
+- **OCR**: `mode="ocr"` (Windows-only; uses `rust_ocr` and currently supports `data:image/png;base64,...` inputs; non-Windows leaves images intact)
 
 ### 🔧 Environment Variables
 

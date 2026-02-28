@@ -95,6 +95,10 @@ libc = "0.2"
 # Database
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 
+[target.'cfg(windows)'.dependencies]
+# Windows-only OCR via WinRT. Used by the `hooks.image_fallback.mode="ocr"` preflight hook.
+rust_ocr = "0.1.5"
+
 [[bin]]
 name = "bamboo"
 path = "src/bin/bamboo.rs"

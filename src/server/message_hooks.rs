@@ -8,6 +8,9 @@ use crate::agent::core::Message;
 use crate::agent::llm::models::ContentPart;
 use crate::core::Config;
 
+#[cfg(windows)]
+use base64::Engine;
+
 #[derive(Debug, thiserror::Error)]
 pub enum HookError {
     #[error("Invalid hook configuration: {0}")]
@@ -49,14 +52,12 @@ async fn apply_image_fallback_hook(
             continue;
         };
 
-        if parts
+        let image_parts = parts
             .iter()
-            .any(|p| matches!(p, ContentPart::ImageUrl { .. }))
-        {
-            images_seen += parts
-                .iter()
-                .filter(|p| matches!(p, ContentPart::ImageUrl { .. }))
-                .count();
+            .filter(|p| matches!(p, ContentPart::ImageUrl { .. }))
+            .count();
+        if image_parts > 0 {
+            images_seen += image_parts;
         }
 
         match mode.as_str() {
@@ -70,18 +71,18 @@ async fn apply_image_fallback_hook(
                 rewritten_messages += 1;
             }
             "ocr" => {
-                // For now:
-                // - On Windows we plan to use the built-in OCR API.
-                // - On non-Windows we log and fall back to placeholder mode.
-                //
-                // This keeps behavior predictable on all platforms and prevents leaking
-                // base64 data URIs into logs/responses.
+                if image_parts == 0 {
+                    continue;
+                }
+
+                // Windows: run OCR and rewrite image parts into text (with bounds).
+                // Non-Windows: log only (leave images intact).
                 #[cfg(windows)]
                 {
-                    // TODO: implement Windows OCR using WinRT (Windows.Media.Ocr).
-                    log::info!(
-                        "OCR hook enabled but Windows OCR is not implemented yet; leaving images intact."
-                    );
+                    let rewritten = rewrite_parts_to_ocr_text(parts).await;
+                    msg.content = rewritten;
+                    msg.content_parts = None;
+                    rewritten_messages += 1;
                 }
                 #[cfg(not(windows))]
                 {
@@ -161,6 +162,177 @@ fn summarize_image_url(url: &str) -> String {
     }
 }
 
+#[cfg(windows)]
+async fn rewrite_parts_to_ocr_text(parts: &[ContentPart]) -> String {
+    let mut out = String::new();
+    let mut image_index = 0usize;
+
+    for part in parts.iter() {
+        match part {
+            ContentPart::Text { text } => out.push_str(text),
+            ContentPart::ImageUrl { image_url } => {
+                image_index += 1;
+                let summary = summarize_image_url(&image_url.url);
+
+                match ocr_image_url_to_lines(&image_url.url).await {
+                    Ok(lines) if !lines.is_empty() => {
+                        out.push_str("\n\n[OCR extracted from image ");
+                        out.push_str(&image_index.to_string());
+                        out.push_str(": ");
+                        out.push_str(&summary);
+                        out.push_str("]\n");
+                        for l in lines {
+                            // Format: x,y,w,h are in pixels, relative to the image.
+                            out.push_str(&format!(
+                                "({},{},{},{}) {}\n",
+                                l.left, l.top, l.width, l.height, l.text
+                            ));
+                        }
+                    }
+                    Ok(_) => {
+                        out.push_str("\n\n[OCR extracted from image ");
+                        out.push_str(&image_index.to_string());
+                        out.push_str(": ");
+                        out.push_str(&summary);
+                        out.push_str("]\n(no text detected)\n");
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "OCR failed for image {} ({}): {}",
+                            image_index,
+                            summary,
+                            err
+                        );
+                        out.push_str("\n[Image omitted: ");
+                        out.push_str(&summary);
+                        out.push_str("]\n");
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+struct OcrLine {
+    text: String,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+}
+
+#[cfg(windows)]
+async fn ocr_image_url_to_lines(url: &str) -> anyhow::Result<Vec<OcrLine>> {
+    let (mime, data) = match parse_data_url_base64(url) {
+        Some(v) => v,
+        None => anyhow::bail!("only data: URLs are supported (got non-data URL)"),
+    };
+
+    if mime != "image/png" {
+        anyhow::bail!("unsupported mime type '{mime}' (only image/png is supported)");
+    }
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|e| anyhow::anyhow!("invalid base64 data: {e}"))?;
+
+    // Basic validation to avoid passing junk into the decoder.
+    const PNG_SIG: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+    if bytes.len() < PNG_SIG.len() || bytes[..PNG_SIG.len()] != PNG_SIG {
+        anyhow::bail!("decoded data is not a PNG");
+    }
+
+    // rust_ocr currently expects a PNG file path (it uses BitmapDecoder::PngDecoderId()).
+    let tmp_path = std::env::temp_dir().join(format!("bamboo_ocr_{}.png", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp_path, &bytes)?;
+
+    // WinRT OCR can block; keep it off the async executor.
+    let tmp_path2 = tmp_path.clone();
+    let coords = tokio::task::spawn_blocking(move || rust_ocr::ocr_with_bounds(&tmp_path2))
+        .await
+        .map_err(|e| anyhow::anyhow!("ocr task join failed: {e}"))??;
+
+    let _ = std::fs::remove_file(&tmp_path);
+
+    Ok(extract_line_candidates(coords))
+}
+
+#[cfg(windows)]
+fn extract_line_candidates(coords: Vec<rust_ocr::Coordinates>) -> Vec<OcrLine> {
+    // `rust_ocr::ocr_with_bounds` yields word-level coordinates and then a line-level
+    // coordinate for each OCR line. We pick the line-level entries by matching them
+    // against the accumulated words for that line.
+    let mut out = Vec::new();
+    let mut current_words: Vec<String> = Vec::new();
+
+    for c in coords.into_iter() {
+        let text = c.text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+
+        if !current_words.is_empty() {
+            let joined = current_words.join(" ");
+            if normalize_ws(&joined) == normalize_ws(&text) {
+                out.push(OcrLine {
+                    text,
+                    left: c.left,
+                    top: c.top,
+                    width: c.width,
+                    height: c.height,
+                });
+                current_words.clear();
+                continue;
+            }
+        }
+
+        current_words.push(text);
+    }
+
+    // Fallback: if we couldn't identify lines, emit a compact word list instead.
+    if out.is_empty() && !current_words.is_empty() {
+        out.push(OcrLine {
+            text: current_words.join(" "),
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+        });
+    }
+
+    out
+}
+
+#[cfg(windows)]
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(windows)]
+fn parse_data_url_base64(url: &str) -> Option<(String, String)> {
+    // data:<mime>;base64,<data...>
+    let trimmed = url.trim();
+    if !trimmed.starts_with("data:") {
+        return None;
+    }
+    let (header, data) = trimmed.split_once(',')?;
+    if !header.contains(";base64") {
+        return None;
+    }
+    let mime = header
+        .strip_prefix("data:")?
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream")
+        .trim()
+        .to_string();
+    Some((mime, data.trim().to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +405,33 @@ mod tests {
             .await
             .expect_err("should err");
         assert!(matches!(err, HookError::InvalidConfig(_)));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn image_fallback_ocr_non_windows_leaves_images_intact() {
+        let cfg = base_config("ocr");
+
+        let mut messages = vec![Message::user_with_parts(
+            "hi",
+            vec![
+                ContentPart::Text {
+                    text: "hi".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,AAAABBBBCCCC".to_string(),
+                        detail: None,
+                    },
+                },
+            ],
+        )];
+
+        apply_message_preflight_hooks(&cfg, "m", &mut messages)
+            .await
+            .expect("hook ok");
+
+        assert!(messages[0].content_parts.is_some());
+        assert!(messages[0].content.contains("hi"));
     }
 }
