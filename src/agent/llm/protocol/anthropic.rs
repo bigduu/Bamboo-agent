@@ -29,6 +29,7 @@ impl FromProvider<AnthropicMessage> for Message {
             id: String::new(),
             role,
             content,
+            content_parts: None,
             tool_calls: None, // Anthropic messages don't have tool_calls at this level
             tool_call_id: None,
             created_at: chrono::Utc::now(),
@@ -203,6 +204,7 @@ impl AnthropicResponseConverter {
             id: response.id,
             role: Role::Assistant,
             content,
+            content_parts: None,
             tool_calls,
             tool_call_id: None,
             created_at: chrono::Utc::now(),

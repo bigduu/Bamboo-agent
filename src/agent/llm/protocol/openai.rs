@@ -19,18 +19,19 @@ impl FromProvider<OpenAIChatMessage> for Message {
     fn from_provider(msg: OpenAIChatMessage) -> ProtocolResult<Self> {
         let role = convert_openai_role_to_internal(&msg.role);
 
-        let content = match msg.content {
-            OpenAIContent::Text(text) => text,
+        let (content, content_parts) = match msg.content {
+            OpenAIContent::Text(text) => (text, None),
             OpenAIContent::Parts(parts) => {
-                // Extract text from parts, ignore images for now
-                parts
-                    .into_iter()
+                // Preserve parts (including images) while also producing a text-only projection.
+                let text = parts
+                    .iter()
                     .filter_map(|part| match part {
-                        OpenAIContentPart::Text { text } => Some(text),
+                        OpenAIContentPart::Text { text } => Some(text.as_str()),
                         OpenAIContentPart::ImageUrl { .. } => None,
                     })
                     .collect::<Vec<_>>()
-                    .join("")
+                    .join("");
+                (text, Some(parts))
             }
         };
 
@@ -43,6 +44,7 @@ impl FromProvider<OpenAIChatMessage> for Message {
             id: String::new(), // Will be generated if needed
             role,
             content,
+            content_parts,
             tool_calls,
             tool_call_id: msg.tool_call_id,
             created_at: chrono::Utc::now(),
@@ -84,7 +86,10 @@ impl ToProvider<OpenAIChatMessage> for Message {
     fn to_provider(&self) -> ProtocolResult<OpenAIChatMessage> {
         let role = convert_internal_role_to_openai(&self.role);
 
-        let content = OpenAIContent::Text(self.content.clone());
+        let content = match self.content_parts.as_ref() {
+            Some(parts) => OpenAIContent::Parts(parts.clone()),
+            None => OpenAIContent::Text(self.content.clone()),
+        };
 
         let tool_calls = self
             .tool_calls

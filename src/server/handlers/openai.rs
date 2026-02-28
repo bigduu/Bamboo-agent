@@ -3,9 +3,7 @@ use crate::agent::llm::api::models::{
 };
 use crate::agent::llm::protocol::FromProvider;
 use crate::agent::metrics::types::ForwardStatus;
-use crate::server::{
-    app_state::AppState, error::AppError,
-};
+use crate::server::{app_state::AppState, error::AppError};
 use actix_web::{web, HttpResponse};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -544,7 +542,7 @@ pub async fn chat_completions(
     req: web::Json<ChatCompletionRequest>,
 ) -> Result<HttpResponse, AppError> {
     let stream = req.stream.unwrap_or(false);
-    let mut request = req.into_inner();
+    let request = req.into_inner();
     let forward_id = uuid::Uuid::new_v4().to_string();
     let requested_model = request.model.trim().to_string();
     if requested_model.is_empty() || requested_model == "default" {
@@ -554,22 +552,23 @@ pub async fn chat_completions(
     }
     let resolved_model = requested_model;
 
-    // Apply request hooks against the OpenAI-compatible schema before conversion.
+    // Convert messages to internal format (preserving multimodal parts).
+    let mut internal_messages = convert_messages(request.messages)?;
+    // Apply preflight hooks (OCR / placeholder / error) before forwarding upstream.
     let config_snapshot = app_state.config.read().await.clone();
-    crate::server::request_hooks::apply_openai_preflight_hooks(
+    crate::server::message_hooks::apply_message_preflight_hooks(
         &config_snapshot,
         resolved_model.as_str(),
-        &mut request,
+        &mut internal_messages,
     )
+    .await
     .map_err(|e| match e {
-        crate::server::request_hooks::HookError::Unsupported(msg) => AppError::BadRequest(msg),
-        crate::server::request_hooks::HookError::InvalidConfig(msg) => {
+        crate::server::message_hooks::HookError::Unsupported(msg) => AppError::BadRequest(msg),
+        crate::server::message_hooks::HookError::InvalidConfig(msg) => {
             AppError::InternalError(anyhow::anyhow!(msg))
         }
     })?;
 
-    // Convert messages to internal format
-    let internal_messages = convert_messages(request.messages)?;
     let internal_tools = convert_tools(request.tools)?;
     let max_tokens = request
         .parameters
@@ -788,20 +787,21 @@ pub async fn responses_create(
         ));
     }
 
-    // Apply request hooks before conversion.
+    // Convert to internal messages (preserving multimodal parts), then apply preflight hooks.
+    let mut internal_messages = convert_messages(openai_messages)?;
     let config_snapshot = app_state.config.read().await.clone();
-    crate::server::request_hooks::apply_openai_preflight_hooks_to_messages(
+    crate::server::message_hooks::apply_message_preflight_hooks(
         &config_snapshot,
-        &mut openai_messages,
+        resolved_model.as_str(),
+        &mut internal_messages,
     )
+    .await
     .map_err(|e| match e {
-        crate::server::request_hooks::HookError::Unsupported(msg) => AppError::BadRequest(msg),
-        crate::server::request_hooks::HookError::InvalidConfig(msg) => {
+        crate::server::message_hooks::HookError::Unsupported(msg) => AppError::BadRequest(msg),
+        crate::server::message_hooks::HookError::InvalidConfig(msg) => {
             AppError::InternalError(anyhow::anyhow!(msg))
         }
     })?;
-
-    let internal_messages = convert_messages(openai_messages)?;
     let internal_tools = convert_tools(request.tools)?;
 
     let max_tokens = request.max_output_tokens.or_else(|| {

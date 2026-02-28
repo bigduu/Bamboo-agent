@@ -820,9 +820,11 @@ pub async fn connect_server(state: web::Data<AppState>, path: web::Path<String>)
     {
         // Preserve the previous endpoint error shape.
         return match e {
-            crate::server::error::AppError::NotFound(_) => HttpResponse::NotFound().json(serde_json::json!({
-                "error": format!("Server '{}' not found", server_id)
-            })),
+            crate::server::error::AppError::NotFound(_) => {
+                HttpResponse::NotFound().json(serde_json::json!({
+                    "error": format!("Server '{}' not found", server_id)
+                }))
+            }
             other => persist_config_error(format!("Failed to save config: {other}")),
         };
     }
@@ -889,9 +891,11 @@ pub async fn disconnect_server(
         .await
     {
         return match e {
-            crate::server::error::AppError::NotFound(_) => HttpResponse::NotFound().json(serde_json::json!({
-                "error": format!("Server '{}' not found", server_id)
-            })),
+            crate::server::error::AppError::NotFound(_) => {
+                HttpResponse::NotFound().json(serde_json::json!({
+                    "error": format!("Server '{}' not found", server_id)
+                }))
+            }
             other => persist_config_error(format!("Failed to save config: {other}")),
         };
     }

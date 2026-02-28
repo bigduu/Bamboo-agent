@@ -165,6 +165,7 @@ impl FromProvider<GeminiContent> for Message {
             id: String::new(),
             role,
             content: content_text,
+            content_parts: None,
             tool_calls: if tool_calls.is_empty() {
                 None
             } else {

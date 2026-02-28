@@ -51,21 +51,31 @@ pub async fn generate_content(
     );
 
     // 1. Convert Gemini format → Message
-    let internal_messages = convert_gemini_to_messages(&request.contents)?;
+    let mut internal_messages = convert_gemini_to_messages(&request.contents)?;
 
     // 2. Convert tools if present
     let internal_tools = convert_gemini_tools(&request.tools)?;
 
-    // 3. Get provider
-    let provider = state.get_provider().await;
-
-    // 4. Call provider with mapped model
+    // 3. Call provider with mapped model
     let model_to_use = resolution.mapped_model.trim().to_string();
     if model_to_use.is_empty() {
         return Err(AppError::BadRequest(
             "No Gemini model mapping configured for requested model. Please configure gemini_model_mapping.".to_string(),
         ));
     }
+
+    // Apply preflight hooks before forwarding upstream.
+    let config_snapshot = state.config.read().await.clone();
+    crate::server::message_hooks::apply_message_preflight_hooks(
+        &config_snapshot,
+        model_to_use.as_str(),
+        &mut internal_messages,
+    )
+    .await
+    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+    // 4. Get provider
+    let provider = state.get_provider().await;
 
     let mut stream = provider
         .chat_stream(
@@ -165,7 +175,7 @@ pub async fn stream_generate_content(
     );
 
     // 1. Convert Gemini format → Message
-    let internal_messages = convert_gemini_to_messages(&request.contents)?;
+    let mut internal_messages = convert_gemini_to_messages(&request.contents)?;
 
     // 2. Convert tools if present
     let internal_tools = convert_gemini_tools(&request.tools)?;
@@ -177,6 +187,16 @@ pub async fn stream_generate_content(
             "No Gemini model mapping configured for requested model. Please configure gemini_model_mapping.".to_string(),
         ));
     }
+
+    // Apply preflight hooks before forwarding upstream.
+    let config_snapshot = state.config.read().await.clone();
+    crate::server::message_hooks::apply_message_preflight_hooks(
+        &config_snapshot,
+        model_to_use.as_str(),
+        &mut internal_messages,
+    )
+    .await
+    .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
     let mut stream = state
         .get_provider()

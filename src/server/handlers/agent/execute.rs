@@ -157,6 +157,21 @@ pub async fn handler(
 
     let mut session = session.unwrap();
 
+    // Apply preflight hooks (e.g. image OCR / fallback) before entering the agent loop.
+    // This ensures consistent behavior between proxy endpoints and agent execution.
+    let config_snapshot = state.config.read().await.clone();
+    if let Err(e) = crate::server::message_hooks::apply_message_preflight_hooks(
+        &config_snapshot,
+        model.as_str(),
+        &mut session.messages,
+    )
+    .await
+    {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": e.to_string()
+        }));
+    }
+
     // Check if there's a pending user message
     let last_message_is_user = session
         .messages

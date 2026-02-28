@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
 use crate::agent::core::{tools::ToolSchema, Message};
+use crate::agent::llm::models::ContentPart;
 use crate::core::keyword_masking::KeywordMaskingConfig;
 
 use crate::agent::llm::provider::{LLMProvider, LLMStream, Result};
@@ -44,6 +45,20 @@ impl<P: LLMProvider> LLMProvider for MaskingProviderDecorator<P> {
             .map(|m| {
                 let mut masked = m.clone();
                 masked.content = self.masking_config.apply_masking(&m.content);
+                if let Some(parts) = m.content_parts.as_ref() {
+                    let masked_parts = parts
+                        .iter()
+                        .map(|part| match part {
+                            ContentPart::Text { text } => ContentPart::Text {
+                                text: self.masking_config.apply_masking(text),
+                            },
+                            ContentPart::ImageUrl { image_url } => ContentPart::ImageUrl {
+                                image_url: image_url.clone(),
+                            },
+                        })
+                        .collect::<Vec<_>>();
+                    masked.content_parts = Some(masked_parts);
+                }
                 masked
             })
             .collect();

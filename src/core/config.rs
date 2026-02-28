@@ -200,7 +200,9 @@ fn default_image_fallback_mode() -> String {
 }
 
 fn default_true_hooks() -> bool {
-    true
+    // Default to disabled so image inputs are preserved unless the user explicitly
+    // opts into fallback rewriting (placeholder/error/ocr).
+    false
 }
 
 /// OpenAI provider configuration

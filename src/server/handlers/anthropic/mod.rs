@@ -229,8 +229,22 @@ pub async fn messages(
         let provider = app_state.get_provider().await;
         let model = resolution.response_model.clone();
 
-        // Convert messages to internal format
-        let internal_messages = convert_messages(openai_request.messages.clone())?;
+        // Convert messages to internal format (preserving multimodal parts), then apply preflight hooks.
+        let mut internal_messages = convert_messages(openai_request.messages.clone())?;
+        let config_snapshot = app_state.config.read().await.clone();
+        if let Err(e) = crate::server::message_hooks::apply_message_preflight_hooks(
+            &config_snapshot,
+            openai_request.model.as_str(),
+            &mut internal_messages,
+        )
+        .await
+        {
+            return Ok(anthropic_error_response(AnthropicError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                e.to_string(),
+            )));
+        }
         let internal_tools = convert_tools(openai_request.tools.clone())?;
         let max_tokens = openai_request
             .parameters
@@ -306,8 +320,22 @@ pub async fn messages(
     } else {
         let provider = app_state.get_provider().await;
 
-        // Convert messages to internal format
-        let internal_messages = convert_messages(openai_request.messages.clone())?;
+        // Convert messages to internal format (preserving multimodal parts), then apply preflight hooks.
+        let mut internal_messages = convert_messages(openai_request.messages.clone())?;
+        let config_snapshot = app_state.config.read().await.clone();
+        if let Err(e) = crate::server::message_hooks::apply_message_preflight_hooks(
+            &config_snapshot,
+            openai_request.model.as_str(),
+            &mut internal_messages,
+        )
+        .await
+        {
+            return Ok(anthropic_error_response(AnthropicError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                e.to_string(),
+            )));
+        }
         let internal_tools = convert_tools(openai_request.tools.clone())?;
         let max_tokens = openai_request
             .parameters
@@ -434,7 +462,21 @@ pub async fn complete(
         let model = resolution.response_model.clone();
 
         // Convert messages to internal format
-        let internal_messages = convert_messages(openai_request.messages.clone())?;
+        let mut internal_messages = convert_messages(openai_request.messages.clone())?;
+        let config_snapshot = app_state.config.read().await.clone();
+        if let Err(e) = crate::server::message_hooks::apply_message_preflight_hooks(
+            &config_snapshot,
+            openai_request.model.as_str(),
+            &mut internal_messages,
+        )
+        .await
+        {
+            return Ok(anthropic_error_response(AnthropicError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                e.to_string(),
+            )));
+        }
         let internal_tools = convert_tools(openai_request.tools.clone())?;
         let max_tokens = openai_request
             .parameters
@@ -501,7 +543,21 @@ pub async fn complete(
         let provider = app_state.get_provider().await;
 
         // Convert messages to internal format
-        let internal_messages = convert_messages(openai_request.messages.clone())?;
+        let mut internal_messages = convert_messages(openai_request.messages.clone())?;
+        let config_snapshot = app_state.config.read().await.clone();
+        if let Err(e) = crate::server::message_hooks::apply_message_preflight_hooks(
+            &config_snapshot,
+            openai_request.model.as_str(),
+            &mut internal_messages,
+        )
+        .await
+        {
+            return Ok(anthropic_error_response(AnthropicError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                e.to_string(),
+            )));
+        }
         let internal_tools = convert_tools(openai_request.tools.clone())?;
         let max_tokens = openai_request
             .parameters

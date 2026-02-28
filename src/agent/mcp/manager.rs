@@ -221,8 +221,8 @@ impl McpServerManager {
                 .runtimes
                 .get(&running_id)
                 .map(|runtime| {
-                    let mut restart =
-                        effective_server_config(&runtime.config) != effective_server_config(desired);
+                    let mut restart = effective_server_config(&runtime.config)
+                        != effective_server_config(desired);
 
                     // SSE transports are HTTP clients; if proxy settings change we must restart
                     // to re-create the underlying reqwest client with the new proxy config.

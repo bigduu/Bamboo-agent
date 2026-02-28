@@ -21,8 +21,12 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let data_dir = state.app_data_dir.clone();
     let config_path = data_dir.join("config.json");
 
-    let app = test::init_service(App::new().app_data(state.clone()).configure(configure_routes))
-        .await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(configure_routes),
+    )
+    .await;
 
     // 1) Setup flow: write proxy config + switch provider to an incomplete provider.
     // This MUST NOT fail with provider validation errors.
@@ -101,7 +105,10 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let body = test::read_body(resp).await;
     let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(err["success"], false);
-    assert!(err["error"].as_str().unwrap_or("").contains("Invalid configuration"));
+    assert!(err["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("Invalid configuration"));
 
     // 4) Strict provider endpoint: valid provider config => 200 and persists encrypted key.
     let req = test::TestRequest::post()

@@ -154,6 +154,12 @@ Edit `~/.bamboo/config.json` (JSON format):
   "http_proxy": "",
   "https_proxy": "",
   "provider": "anthropic",
+  "hooks": {
+    "image_fallback": {
+      "enabled": false,
+      "mode": "placeholder"
+    }
+  },
   "providers": {
     "anthropic": {
       "api_key": "sk-ant-...",
@@ -169,6 +175,15 @@ Edit `~/.bamboo/config.json` (JSON format):
 ```
 
 > **Note**: Legacy `config.toml` is no longer loaded. Please migrate to `config.json`.
+
+### 🪝 Request Hooks (Images)
+
+Some upstream provider paths/models are text-only. Bamboo can optionally:
+
+- **preserve images** (default): `hooks.image_fallback.enabled=false`
+- **rewrite images to placeholder text**: `mode="placeholder"`
+- **error fast**: `mode="error"`
+- **OCR**: `mode="ocr"` (Windows-only; non-Windows currently leaves images intact)
 
 ### 🔧 Environment Variables
 

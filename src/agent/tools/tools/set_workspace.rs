@@ -44,9 +44,8 @@ impl SetWorkspaceTool {
         // On Windows, `canonicalize()` may return a verbatim path (\\?\C:\...).
         // Prefer setting a normal Win32 path for broader compatibility with spawned tools.
         #[cfg(windows)]
-        let dir_for_process = std::path::PathBuf::from(crate::core::paths::path_to_display_string(
-            &absolute_path,
-        ));
+        let dir_for_process =
+            std::path::PathBuf::from(crate::core::paths::path_to_display_string(&absolute_path));
         #[cfg(not(windows))]
         let dir_for_process = absolute_path.clone();
 

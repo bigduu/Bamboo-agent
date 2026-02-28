@@ -3,6 +3,7 @@
 //! This module provides the HTTP endpoint for initiating chat sessions with the AI agent.
 
 use crate::agent::core::{Role, Session};
+use crate::agent::llm::models::{ContentPart, ImageUrl};
 use actix_web::{web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -41,7 +42,21 @@ pub struct ChatRequest {
     pub enhance_prompt: Option<String>,
     #[serde(default)]
     pub workspace_path: Option<String>,
+    /// Optional image attachments (data URLs) associated with this message.
+    #[serde(default)]
+    pub images: Option<Vec<ChatImage>>,
     pub model: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatImage {
+    pub base64: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default, rename = "type")]
+    pub mime_type: Option<String>,
 }
 
 /// Response returned after successfully creating a chat message.
@@ -162,7 +177,29 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     let system_prompt = build_enhanced_system_prompt(base_prompt, enhance_prompt, workspace_path);
     upsert_system_prompt_message(&mut session, system_prompt);
 
-    session.add_message(crate::agent::core::Message::user(req.message.clone()));
+    // Preserve multimodal parts so that preflight hooks (OCR/fallback) and/or multimodal
+    // upstream models can use the images.
+    if let Some(images) = req.images.as_ref().filter(|items| !items.is_empty()) {
+        let mut parts = Vec::new();
+        // Always include a text part to keep downstream behavior stable.
+        parts.push(ContentPart::Text {
+            text: req.message.clone(),
+        });
+
+        for image in images {
+            let url = normalize_image_data_url(&image.base64, image.mime_type.as_deref());
+            parts.push(ContentPart::ImageUrl {
+                image_url: ImageUrl { url, detail: None },
+            });
+        }
+
+        session.add_message(crate::agent::core::Message::user_with_parts(
+            req.message.clone(),
+            parts,
+        ));
+    } else {
+        session.add_message(crate::agent::core::Message::user(req.message.clone()));
+    }
 
     // Model is required (validated by request deserialization). Persist it on the session.
     session.model = model;
@@ -221,6 +258,15 @@ fn build_enhanced_system_prompt(
     }
 
     merged_prompt
+}
+
+fn normalize_image_data_url(raw: &str, mime_type: Option<&str>) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("data:") {
+        return trimmed.to_string();
+    }
+    let mime = mime_type.unwrap_or("image/png");
+    format!("data:{mime};base64,{trimmed}")
 }
 
 #[cfg(test)]
@@ -359,6 +405,7 @@ mod tests {
             system_prompt: None,
             enhance_prompt: None,
             workspace_path: None,
+            images: None,
             model: "   ".to_string(), // Empty/whitespace
         };
 

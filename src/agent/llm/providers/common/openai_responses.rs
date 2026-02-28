@@ -5,6 +5,7 @@
 //! events into [`LLMChunk`] so the rest of Bamboo can stay provider-agnostic.
 
 use crate::agent::core::{agent::Role, tools::ToolSchema, Message};
+use crate::agent::llm::models::ContentPart;
 use crate::agent::llm::provider::Result;
 use crate::agent::llm::types::LLMChunk;
 use serde_json::{json, Value};
@@ -25,6 +26,19 @@ use std::collections::HashMap;
 /// We also intentionally avoid sending assistant `tool_calls` back in the input
 /// since the Responses API input format differs across providers and versions.
 pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
+    // If any message contains image parts, emit a "typed" content array shape so
+    // multimodal inputs have a chance to reach upstream Responses implementations.
+    //
+    // For text-only requests, we keep the conservative string content shape that
+    // has proven to work across multiple upstreams.
+    let has_images = messages.iter().any(|m| {
+        m.content_parts.as_ref().is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ImageUrl { .. }))
+        })
+    });
+
     // Best-effort index so we can add a tool name in the serialized observation.
     let mut call_id_to_name: HashMap<&str, &str> = HashMap::new();
     for m in messages {
@@ -51,7 +65,7 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
                 Role::Tool => "user",
             };
 
-            let content = if m.role == Role::Tool {
+            let tool_observation_text: Option<String> = if m.role == Role::Tool {
                 // Preserve the call id as plain text; some upstreams reject `tool_call_id`.
                 let call_id = m.tool_call_id.as_deref().unwrap_or("");
                 let tool_name = if !call_id.is_empty() {
@@ -61,17 +75,52 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
                 };
 
                 if !tool_name.is_empty() && !call_id.is_empty() {
-                    format!(
+                    Some(format!(
                         "[tool_result name={tool_name} call_id={call_id}]\n{}",
                         m.content
-                    )
+                    ))
                 } else if !call_id.is_empty() {
-                    format!("[tool_result call_id={call_id}]\n{}", m.content)
+                    Some(format!("[tool_result call_id={call_id}]\n{}", m.content))
                 } else {
-                    format!("[tool_result]\n{}", m.content)
+                    Some(format!("[tool_result]\n{}", m.content))
                 }
             } else {
-                m.content.clone()
+                None
+            };
+
+            let content: Value = if has_images {
+                // Typed content array (best-effort for multimodal responses).
+                let mut out = Vec::new();
+
+                if let Some(parts) = m.content_parts.as_ref() {
+                    for part in parts {
+                        match part {
+                            ContentPart::Text { text } => {
+                                out.push(json!({"type": "input_text", "text": text}));
+                            }
+                            ContentPart::ImageUrl { image_url } => {
+                                out.push(
+                                    json!({"type": "input_image", "image_url": image_url.url}),
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    // No parts: degrade to a typed text entry (or tool observation text).
+                    let text = tool_observation_text
+                        .clone()
+                        .unwrap_or_else(|| m.content.clone());
+                    out.push(json!({"type": "input_text", "text": text}));
+                }
+
+                json!(out)
+            } else {
+                // Conservative string content (widely compatible).
+                if let Some(text) = tool_observation_text {
+                    json!(text)
+                } else {
+                    json!(m.content)
+                }
             };
 
             let msg = json!({
@@ -292,8 +341,8 @@ impl ResponsesSseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::core::tools::{FunctionSchema, ToolSchema};
     use crate::agent::core::tools::{FunctionCall, ToolCall};
+    use crate::agent::core::tools::{FunctionSchema, ToolSchema};
 
     #[test]
     fn build_responses_body_includes_input_and_stream() {

@@ -25,9 +25,20 @@ pub fn messages_to_openai_compat_json(messages: &[Message]) -> Vec<Value> {
                 Role::Tool => "tool",
             };
 
+            // OpenAI-compatible APIs accept either a string content, or an array of
+            // typed parts for multimodal messages. We only emit parts when present
+            // and when the role supports user/assistant content.
+            let content_value = if matches!(m.role, Role::Tool) {
+                json!(m.content)
+            } else if let Some(parts) = m.content_parts.as_ref() {
+                json!(parts)
+            } else {
+                json!(m.content)
+            };
+
             let mut msg = json!({
                 "role": role,
-                "content": m.content,
+                "content": content_value,
             });
 
             if let Some(tool_call_id) = &m.tool_call_id {

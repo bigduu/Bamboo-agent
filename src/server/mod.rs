@@ -113,6 +113,7 @@ pub mod handlers;
 // Keep the old module name as an alias so existing imports keep working.
 pub use handlers as controllers;
 pub mod logging;
+pub mod message_hooks;
 pub mod metrics;
 pub mod metrics_service;
 pub mod model_config_helper;

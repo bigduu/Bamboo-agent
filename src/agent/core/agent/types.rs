@@ -119,6 +119,13 @@ pub struct Message {
     pub role: Role,
     /// Message content text
     pub content: String,
+    /// Optional multimodal content parts (e.g. text + images).
+    ///
+    /// This keeps image inputs available for preflight hooks (OCR / image fallback)
+    /// and for multimodal-capable upstream models. Text-only subsystems can keep
+    /// using `content` as a best-effort projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_parts: Option<Vec<crate::agent::llm::models::ContentPart>>,
     /// Tool calls (for Assistant messages)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -153,6 +160,23 @@ impl Message {
             id: Uuid::new_v4().to_string(),
             role: Role::User,
             content: content.into(),
+            content_parts: None,
+            tool_calls: None,
+            tool_call_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Create a user message with multimodal content parts.
+    pub fn user_with_parts(
+        content: impl Into<String>,
+        parts: Vec<crate::agent::llm::models::ContentPart>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            role: Role::User,
+            content: content.into(),
+            content_parts: Some(parts),
             tool_calls: None,
             tool_call_id: None,
             created_at: Utc::now(),
@@ -177,6 +201,7 @@ impl Message {
             id: Uuid::new_v4().to_string(),
             role: Role::Assistant,
             content: content.into(),
+            content_parts: None,
             tool_calls,
             tool_call_id: None,
             created_at: Utc::now(),
@@ -201,6 +226,7 @@ impl Message {
             id: Uuid::new_v4().to_string(),
             role: Role::Tool,
             content: content.into(),
+            content_parts: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             created_at: Utc::now(),
@@ -224,6 +250,7 @@ impl Message {
             id: Uuid::new_v4().to_string(),
             role: Role::System,
             content: content.into(),
+            content_parts: None,
             tool_calls: None,
             tool_call_id: None,
             created_at: Utc::now(),

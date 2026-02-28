@@ -30,7 +30,10 @@ pub fn apply_openai_preflight_hooks_to_messages(
     apply_image_fallback_hook(config, messages)
 }
 
-fn apply_image_fallback_hook(config: &Config, messages: &mut Vec<ChatMessage>) -> Result<(), HookError> {
+fn apply_image_fallback_hook(
+    config: &Config,
+    messages: &mut Vec<ChatMessage>,
+) -> Result<(), HookError> {
     let hook_cfg = &config.hooks.image_fallback;
     if !hook_cfg.enabled {
         return Ok(());
@@ -181,7 +184,9 @@ mod tests {
 
         let err =
             apply_openai_preflight_hooks_to_messages(&cfg, &mut messages).expect_err("should err");
-        assert!(err.to_string().contains("does not currently support image inputs"));
+        assert!(err
+            .to_string()
+            .contains("does not currently support image inputs"));
     }
 
     #[test]
