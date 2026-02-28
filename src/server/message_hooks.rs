@@ -252,12 +252,15 @@ async fn ocr_image_url_to_lines(url: &str) -> anyhow::Result<Vec<OcrLine>> {
 
     // WinRT OCR can block; keep it off the async executor.
     let tmp_path2 = tmp_path.clone();
-    let coords = tokio::task::spawn_blocking(move || rust_ocr::ocr_with_bounds(&tmp_path2))
-        .await
-        .map_err(|e| anyhow::anyhow!("ocr task join failed: {e}"))?
-        // rust_ocr uses `Box<dyn Error>` which is not guaranteed to be `Send + Sync`,
-        // so we stringify it instead of relying on `anyhow`'s `From` conversion.
-        .map_err(|e| anyhow::anyhow!("ocr failed: {e}"))?;
+    let coords = tokio::task::spawn_blocking(move || {
+        // `rust_ocr` returns `Box<dyn Error>` which is not `Send`, so we must not
+        // return it across the thread boundary. Convert to `String` inside the
+        // blocking closure.
+        rust_ocr::ocr_with_bounds(tmp_path2, None).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("ocr task join failed: {e}"))?
+    .map_err(|e| anyhow::anyhow!("ocr failed: {e}"))?;
 
     let _ = std::fs::remove_file(&tmp_path);
 
