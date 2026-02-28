@@ -254,7 +254,10 @@ async fn ocr_image_url_to_lines(url: &str) -> anyhow::Result<Vec<OcrLine>> {
     let tmp_path2 = tmp_path.clone();
     let coords = tokio::task::spawn_blocking(move || rust_ocr::ocr_with_bounds(&tmp_path2))
         .await
-        .map_err(|e| anyhow::anyhow!("ocr task join failed: {e}"))??;
+        .map_err(|e| anyhow::anyhow!("ocr task join failed: {e}"))?
+        // rust_ocr uses `Box<dyn Error>` which is not guaranteed to be `Send + Sync`,
+        // so we stringify it instead of relying on `anyhow`'s `From` conversion.
+        .map_err(|e| anyhow::anyhow!("ocr failed: {e}"))?;
 
     let _ = std::fs::remove_file(&tmp_path);
 
@@ -280,10 +283,10 @@ fn extract_line_candidates(coords: Vec<rust_ocr::Coordinates>) -> Vec<OcrLine> {
             if normalize_ws(&joined) == normalize_ws(&text) {
                 out.push(OcrLine {
                     text,
-                    left: c.left,
-                    top: c.top,
-                    width: c.width,
-                    height: c.height,
+                    left: c.x.round() as i32,
+                    top: c.y.round() as i32,
+                    width: c.width.round() as i32,
+                    height: c.height.round() as i32,
                 });
                 current_words.clear();
                 continue;
