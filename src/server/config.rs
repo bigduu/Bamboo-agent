@@ -136,10 +136,49 @@ pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
             .allow_any_header()
             .max_age(3600)
     } else if bind_addr == "0.0.0.0" {
-        // Docker production mode (localhost only via reverse proxy)
-        info!("CORS configured for Docker production mode (localhost only)");
+        // Docker/sidecar mode.
+        //
+        // We still want to restrict origins to "local" callers, but ports and schemes
+        // can differ between:
+        // - Vite dev server (http://127.0.0.1:5173, http://localhost:5173)
+        // - Tauri webview (tauri://localhost, https://tauri.localhost)
+        // - Reverse proxy setups (http://localhost:{port})
+        //
+        // Accept any localhost/loopback origin (any port) and common Tauri origins.
+        info!("CORS configured for 0.0.0.0 bind: allowing localhost/loopback origins");
         Cors::default()
-            .allowed_origin(&format!("http://localhost:{}", port))
+            .allowed_origin_fn(move |origin, _req_head| {
+                let o = match origin.to_str() {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+
+                // Common local HTTP(S) dev origins (any port).
+                if o.starts_with("http://localhost:")
+                    || o.starts_with("http://127.0.0.1:")
+                    || o.starts_with("https://localhost:")
+                    || o.starts_with("https://127.0.0.1:")
+                    || o.starts_with("http://[::1]:")
+                    || o.starts_with("https://[::1]:")
+                {
+                    return true;
+                }
+
+                // Tauri webview origins (vary by version/config).
+                if o == "tauri://localhost"
+                    || o == "https://tauri.localhost"
+                    || o == "http://tauri.localhost"
+                {
+                    return true;
+                }
+
+                // Some setups might load the UI from the same port as the backend.
+                if o == format!("http://localhost:{port}") || o == format!("http://127.0.0.1:{port}") {
+                    return true;
+                }
+
+                false
+            })
             .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
             .allowed_headers(vec![
                 header::AUTHORIZATION,

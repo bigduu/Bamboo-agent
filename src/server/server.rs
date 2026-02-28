@@ -59,7 +59,7 @@ pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
 /// - Custom bind address (0.0.0.0 for Docker, custom for standalone)
 /// - Rate limiting enabled (10 req/sec, burst 20)
 /// - Security headers enabled
-/// - Request size limits (1MB JSON, 10MB payload)
+/// - Request size limits (25MB JSON, 30MB payload)
 ///
 /// # Arguments
 /// * `bamboo_home_dir` - Bamboo home directory containing all app data (config, sessions, skills, etc.)
@@ -78,8 +78,9 @@ pub async fn run_with_bind(bamboo_home_dir: PathBuf, port: u16, bind: &str) -> R
     let server = HttpServer::new(move || {
         App::new()
             // Request size limits to prevent DoS
-            .app_data(web::JsonConfig::default().limit(1024 * 1024)) // 1MB JSON limit
-            .app_data(web::PayloadConfig::new(10 * 1024 * 1024)) // 10MB payload limit
+            // Chat requests may include base64 images; keep limits high enough for local usage.
+            .app_data(web::JsonConfig::default().limit(25 * 1024 * 1024)) // 25MB JSON limit
+            .app_data(web::PayloadConfig::new(30 * 1024 * 1024)) // 30MB payload limit
             .app_data(app_state.clone())
             .wrap(build_cors(&bind_for_cors, port))
             .wrap(build_security_headers())
@@ -158,8 +159,9 @@ pub async fn run_with_bind_and_static(
     let server = HttpServer::new(move || {
         let mut app = App::new()
             // Request size limits to prevent DoS
-            .app_data(web::JsonConfig::default().limit(1024 * 1024)) // 1MB JSON limit
-            .app_data(web::PayloadConfig::new(10 * 1024 * 1024)) // 10MB payload limit
+            // Chat requests may include base64 images; keep limits high enough for local usage.
+            .app_data(web::JsonConfig::default().limit(25 * 1024 * 1024)) // 25MB JSON limit
+            .app_data(web::PayloadConfig::new(30 * 1024 * 1024)) // 30MB payload limit
             .app_data(app_state.clone())
             .wrap(build_cors(&bind_for_cors, port))
             .wrap(build_security_headers())
