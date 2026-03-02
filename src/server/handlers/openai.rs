@@ -8,7 +8,6 @@ use actix_web::{web, HttpResponse};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::{collections::HashMap, time::SystemTime};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -25,17 +24,6 @@ struct Model {
     object: String,
     created: u64,
     owned_by: String,
-}
-
-#[derive(Deserialize)]
-struct CopilotTokenConfig {
-    #[allow(dead_code)]
-    token: String,
-    expires_at: u64,
-    #[allow(dead_code)]
-    annotations_enabled: bool,
-    #[allow(dead_code)]
-    chat_enabled: bool,
 }
 
 // ============================================================================
@@ -141,89 +129,7 @@ struct ResponsesStreamEvent<T> {
     delta: Option<String>,
 }
 
-/// Check if we have valid authentication before triggering device flow
-/// Returns true if auth is available (via env var or valid token files)
-fn has_valid_auth(app_data_dir: &Path) -> bool {
-    // Check for COPILOT_API_KEY environment variable first
-    if std::env::var("COPILOT_API_KEY")
-        .ok()
-        .map(|k| !k.trim().is_empty())
-        .unwrap_or(false)
-    {
-        log::info!("COPILOT_API_KEY is set, auth available");
-        return true;
-    }
-
-    let token_path = app_data_dir.join(".token");
-    let copilot_token_path = app_data_dir.join(".copilot_token.json");
-
-    // Check .copilot_token.json first (cached config with expiry)
-    if copilot_token_path.exists() {
-        match std::fs::read_to_string(&copilot_token_path) {
-            Ok(content) => {
-                // Try to parse and validate the token
-                if let Ok(config) = serde_json::from_str::<CopilotTokenConfig>(&content) {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-
-                    // Add 60 second buffer to match token validation logic
-                    if config.expires_at.saturating_sub(60) > now {
-                        log::info!("Valid cached copilot token found, auth available");
-                        return true;
-                    } else {
-                        log::info!("Cached copilot token expired, will trigger auth if needed");
-                        // Remove expired token file
-                        let _ = std::fs::remove_file(&copilot_token_path);
-                    }
-                } else {
-                    log::warn!("Failed to parse .copilot_token.json, will re-authenticate");
-                    // Remove invalid token file
-                    let _ = std::fs::remove_file(&copilot_token_path);
-                }
-            }
-            Err(e) => {
-                log::error!("Failed to read .copilot_token.json: {}", e);
-                // Continue to check .token file
-            }
-        }
-    }
-
-    // Check .token file (access token for exchange)
-    if token_path.exists() {
-        match std::fs::read_to_string(&token_path) {
-            Ok(content) => {
-                let trimmed = content.trim();
-                if !trimmed.is_empty() {
-                    log::info!("Valid .token file found, auth available");
-                    true
-                } else {
-                    log::info!(".token file is empty, auth not available");
-                    false
-                }
-            }
-            Err(e) => {
-                log::error!("Failed to read .token file: {}", e);
-                false
-            }
-        }
-    } else {
-        log::info!("No token files found, auth not available");
-        false
-    }
-}
-
 pub async fn get_models(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
-    // Check if we have valid authentication before triggering any auth flow
-    if !has_valid_auth(&app_state.app_data_dir) {
-        log::info!("No valid authentication found (no env var or valid token files), returning empty model list");
-        return Ok(HttpResponse::Ok().json(ListModelsResponse {
-            object: "list".to_string(),
-            data: vec![],
-        }));
-    }
-
     // Get provider and fetch models
     let provider = app_state.get_provider().await;
     let model_ids = match provider.list_models().await {
@@ -234,10 +140,14 @@ pub async fn get_models(app_state: web::Data<AppState>) -> Result<HttpResponse, 
             if err_msg.contains("proxy") || err_msg.contains("407") {
                 return Err(AppError::ProxyAuthRequired);
             }
-            return Err(AppError::InternalError(anyhow::anyhow!(
-                "Failed to fetch models: {}",
-                e
-            )));
+            // Keep this endpoint best-effort so UIs/SDKs can call it even when the provider
+            // is not configured yet. Provider config pages should surface real errors via
+            // the dedicated Bamboo settings endpoints.
+            log::warn!("Failed to fetch models (returning empty list): {}", e);
+            return Ok(HttpResponse::Ok().json(ListModelsResponse {
+                object: "list".to_string(),
+                data: vec![],
+            }));
         }
     };
 
@@ -248,7 +158,7 @@ pub async fn get_models(app_state: web::Data<AppState>) -> Result<HttpResponse, 
             id,
             object: "model".to_string(),
             created: 1677610602, // Use a fixed timestamp for compatibility
-            owned_by: "github-copilot".to_string(),
+            owned_by: "bamboo".to_string(),
         })
         .collect();
 
