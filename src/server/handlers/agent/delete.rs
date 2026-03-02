@@ -47,6 +47,32 @@ use crate::server::app_state::AppState;
 pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Result<HttpResponse> {
     let session_id = path.into_inner();
 
+    // Best-effort pre-cancellation of the session (and its children if this is a root session).
+    let ids_to_cancel: Vec<String> = match state.session_store.get_index_entry(&session_id).await {
+        Some(entry) if matches!(entry.kind, crate::agent::core::SessionKind::Root) => state
+            .session_store
+            .list_index_entries()
+            .await
+            .into_iter()
+            .filter(|e| e.root_session_id == session_id)
+            .map(|e| e.id)
+            .collect(),
+        Some(_) => vec![session_id.clone()],
+        None => vec![session_id.clone()],
+    };
+
+    let cancelled_runner = {
+        let mut runners = state.agent_runners.write().await;
+        let mut cancelled = false;
+        for id in ids_to_cancel.iter() {
+            if let Some(runner) = runners.remove(id) {
+                runner.cancel_token.cancel();
+                cancelled = true;
+            }
+        }
+        cancelled
+    };
+
     let deleted_from_storage = match state.storage.delete_session(&session_id).await {
         Ok(deleted) => deleted,
         Err(error) => {
@@ -63,26 +89,40 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Res
 
     let removed_from_memory = {
         let mut sessions = state.sessions.write().await;
-        sessions.remove(&session_id).is_some()
+        let mut removed = false;
+        for id in ids_to_cancel.iter() {
+            removed |= sessions.remove(id).is_some();
+        }
+        removed
     };
+
+    {
+        let mut senders = state.session_event_senders.write().await;
+        for id in ids_to_cancel.iter() {
+            senders.remove(id);
+        }
+    }
 
     let cancelled_in_flight = {
         let mut tokens = state.cancel_tokens.write().await;
-        if let Some(token) = tokens.remove(&session_id) {
-            token.cancel();
-            true
-        } else {
-            false
+        let mut cancelled = false;
+        for id in ids_to_cancel.iter() {
+            if let Some(token) = tokens.remove(id) {
+                token.cancel();
+                cancelled = true;
+            }
         }
+        cancelled
     };
 
-    if deleted_from_storage || removed_from_memory || cancelled_in_flight {
+    if deleted_from_storage || removed_from_memory || cancelled_in_flight || cancelled_runner {
         log::info!(
-            "[{}] Session deleted successfully (storage: {}, memory: {}, cancelled: {})",
+            "[{}] Session deleted successfully (storage: {}, memory: {}, cancelled: {}, runner_cancelled: {})",
             session_id,
             deleted_from_storage,
             removed_from_memory,
-            cancelled_in_flight
+            cancelled_in_flight,
+            cancelled_runner
         );
         return Ok(HttpResponse::Ok().finish());
     }

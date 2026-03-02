@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::agent::core::budget::TokenBudget;
 use crate::agent::core::composition::CompositionExecutor;
 use crate::agent::core::storage::Storage;
+use crate::agent::core::storage::AttachmentReader;
 use crate::agent::core::tools::ToolSchema;
 use crate::agent::metrics::MetricsCollector;
 use crate::agent::skill::SkillManager;
@@ -20,6 +21,9 @@ pub struct AgentLoopConfig {
     pub skip_initial_user_message: bool,
     /// Optional storage for persisting session changes
     pub storage: Option<Arc<dyn Storage>>,
+    /// Optional attachment reader for resolving `bamboo-attachment://...` references
+    /// into `data:` URLs for upstream providers. This must not mutate session storage.
+    pub attachment_reader: Option<Arc<dyn AttachmentReader>>,
     /// Optional asynchronous metrics collector
     pub metrics_collector: Option<MetricsCollector>,
     /// Model name used for metrics attribution
@@ -39,6 +43,7 @@ impl Default for AgentLoopConfig {
             skill_manager: None,
             skip_initial_user_message: false,
             storage: None,
+            attachment_reader: None,
             metrics_collector: None,
             model_name: None,
             token_budget: None,

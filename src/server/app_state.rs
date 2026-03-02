@@ -75,7 +75,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::core::storage::JsonlStorage;
+use crate::agent::core::storage::{SessionStoreV2, Storage};
 use crate::agent::core::tools::ToolExecutor;
 use crate::agent::core::AgentEvent;
 use crate::agent::core::{tools::ToolSchema, Message};
@@ -86,6 +86,9 @@ use crate::core::Config;
 use crate::process::ProcessRegistry;
 use crate::server::error::AppError;
 use crate::server::metrics_service::MetricsService;
+use crate::server::schedules::{ScheduleManager, ScheduleStore};
+use crate::server::schedules::manager::ScheduleContext;
+use crate::server::spawn_scheduler::{SpawnContext, SpawnScheduler};
 
 /// Default system prompt for agent interactions
 pub const DEFAULT_BASE_PROMPT: &str =
@@ -267,16 +270,34 @@ pub struct AppState {
     /// via the `storage` field.
     pub sessions: Arc<RwLock<HashMap<String, crate::agent::core::Session>>>,
 
-    /// Persistent storage backend for sessions
+    /// Persistent storage backend for sessions (V2).
     ///
-    /// Uses JSONL format for append-only event logging.
-    pub storage: JsonlStorage,
+    /// Implemented as folder-per-session with a global `sessions.json` index.
+    pub storage: Arc<dyn Storage>,
+
+    /// Concrete session store implementation (for index/list/cleanup APIs).
+    pub session_store: Arc<SessionStoreV2>,
+
+    /// Background scheduler for async sub-session spawning.
+    pub spawn_scheduler: Arc<SpawnScheduler>,
+
+    /// Schedule store (timed tasks).
+    pub schedule_store: Arc<ScheduleStore>,
+
+    /// Background schedule manager that triggers scheduled runs.
+    pub schedule_manager: Arc<ScheduleManager>,
 
     /// Composite tool executor (builtin + MCP tools)
     ///
     /// Combines built-in tools (file ops, code execution) with
     /// MCP-provided tools from configured servers.
     pub tools: Arc<dyn ToolExecutor>,
+
+    /// Tool executor for child sessions (sub-sessions).
+    ///
+    /// This intentionally excludes `spawn_session` from schemas so child sessions
+    /// cannot recursively spawn more sessions. (Enforced in the tool too.)
+    pub child_tools: Arc<dyn ToolExecutor>,
 
     /// Cancellation tokens for in-flight requests
     ///
@@ -307,6 +328,14 @@ pub struct AppState {
     /// Each runner manages event broadcasting and cancellation
     /// for an active agent execution.
     pub agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+
+    /// Session-scoped event streams (long-lived).
+    ///
+    /// Unlike `agent_runners`, these senders exist even when no agent execution is running.
+    /// They are used for:
+    /// - UI subscriptions to `/api/v1/events/{session_id}` (background tasks, etc.)
+    /// - sub-session forwarding (child -> parent)
+    pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
 
     /// Registry for tracking external processes (e.g., Claude Code CLI sessions)
     pub process_registry: Arc<ProcessRegistry>,
@@ -427,15 +456,18 @@ impl AppState {
         provider: Arc<dyn LLMProvider>,
     ) -> Self {
         let data_dir = bamboo_home_dir.clone();
-        let sessions_dir = data_dir.join("sessions");
 
-        log::info!("Initializing storage at: {:?}", sessions_dir);
-        let storage = JsonlStorage::new(&sessions_dir);
-        if let Err(e) = storage.init().await {
-            log::error!("Failed to init storage at {:?}: {}", sessions_dir, e);
-            panic!("Failed to init storage: {}", e);
-        }
-        log::info!("Storage initialized successfully at: {:?}", sessions_dir);
+        log::info!("Initializing session store V2 at: {:?}", data_dir);
+        let session_store = Arc::new(SessionStoreV2::new(data_dir.clone()).await.unwrap_or_else(|e| {
+            log::error!("Failed to init SessionStoreV2 at {:?}: {}", data_dir, e);
+            panic!("Failed to init SessionStoreV2: {}", e);
+        }));
+        let storage: Arc<dyn Storage> = session_store.clone();
+        log::info!(
+            "Session store V2 initialized (index: {:?}, sessions: {:?})",
+            session_store.index_path(),
+            session_store.sessions_root_dir()
+        );
 
         // Discover Claude Code CLI once at startup. This is optional.
         // We do it early so we can conditionally register the `claude_code` tool.
@@ -477,7 +509,7 @@ impl AppState {
             mcp_manager.clone(),
             mcp_manager.tool_index(),
         ));
-        let tools: Arc<dyn ToolExecutor> = Arc::new(crate::agent::mcp::CompositeToolExecutor::new(
+        let base_tools: Arc<dyn ToolExecutor> = Arc::new(crate::agent::mcp::CompositeToolExecutor::new(
             builtin_tools,
             mcp_tools,
         ));
@@ -577,25 +609,131 @@ impl AppState {
             crate::server::reloadable_provider::ReloadableProvider::new(provider_lock.clone()),
         );
 
+        // In-memory session cache (shared across handlers and background jobs).
+        let sessions: Arc<RwLock<HashMap<String, crate::agent::core::Session>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // Long-lived session event senders map (UI subscriptions + background tasks).
+        let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // Add `session_inspector` to both root + child tool sets.
+        let session_inspector_tool = Arc::new(crate::server::tools::SessionInspectorTool::new(
+            session_store.clone(),
+            storage.clone(),
+        ));
+        let tools_with_inspector: Arc<dyn ToolExecutor> =
+            Arc::new(crate::server::tools::OverlayToolExecutor::new(
+                base_tools.clone(),
+                session_inspector_tool,
+            ));
+
+        // Child tools intentionally do not expose `spawn_session` (no nesting), but can inspect sessions.
+        let child_tools: Arc<dyn ToolExecutor> = tools_with_inspector.clone();
+
+        // Initialize sub-session spawn scheduler (async background jobs).
+        let spawn_scheduler = Arc::new(SpawnScheduler::new(SpawnContext {
+            session_store: session_store.clone(),
+            storage: storage.clone(),
+            provider: provider_handle.clone(),
+            tools: child_tools.clone(),
+            skill_manager: skill_manager.clone(),
+            metrics_collector: metrics_service.collector(),
+            sessions_cache: sessions.clone(),
+            agent_runners: agent_runners.clone(),
+            session_event_senders: session_event_senders.clone(),
+        }));
+
+        // Root tools include `spawn_session` via a lightweight overlay executor.
+        let spawn_tool = Arc::new(crate::server::tools::SpawnSessionTool::new(
+            session_store.clone(),
+            storage.clone(),
+            spawn_scheduler.clone(),
+        ));
+        let tools_with_spawn: Arc<dyn ToolExecutor> =
+            Arc::new(crate::server::tools::OverlayToolExecutor::new(
+                tools_with_inspector.clone(),
+                spawn_tool,
+            ));
+
+        // Initialize schedule store + manager (timed tasks).
+        let schedule_store = Arc::new(
+            ScheduleStore::new(data_dir.clone())
+                .await
+                .unwrap_or_else(|e| {
+                    log::error!("Failed to init ScheduleStore at {:?}: {}", data_dir, e);
+                    panic!("Failed to init ScheduleStore: {}", e);
+                }),
+        );
+
+        // Schedule jobs should not automatically inherit schedule-management tools; keep the tool
+        // surface minimal for background automation unless explicitly needed later.
+        let tools_for_schedules = tools_with_spawn.clone();
+        let schedule_manager = Arc::new(ScheduleManager::new(ScheduleContext {
+            schedule_store: schedule_store.clone(),
+            session_store: session_store.clone(),
+            storage: storage.clone(),
+            provider: provider_handle.clone(),
+            tools: tools_for_schedules,
+            skill_manager: skill_manager.clone(),
+            metrics_collector: metrics_service.collector(),
+            sessions_cache: sessions.clone(),
+            agent_runners: agent_runners.clone(),
+            session_event_senders: session_event_senders.clone(),
+            config: config.clone(),
+        }));
+
+        // Add schedule management as a single server-only tool (action-based).
+        let schedule_tool = Arc::new(crate::server::tools::ScheduleTasksTool::new(
+            schedule_store.clone(),
+            schedule_manager.clone(),
+            session_store.clone(),
+            storage.clone(),
+        ));
+        let tools: Arc<dyn ToolExecutor> = Arc::new(crate::server::tools::OverlayToolExecutor::new(
+            tools_with_spawn,
+            schedule_tool,
+        ));
+
         Self {
             app_data_dir: bamboo_home_dir,
             config,
             provider: provider_lock,
             provider_handle,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            sessions,
             storage,
+            session_store,
+            spawn_scheduler,
+            schedule_store,
+            schedule_manager,
             tools,
+            child_tools,
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             skill_manager,
             mcp_manager,
             metrics_service,
             agent_runners,
+            session_event_senders,
             process_registry,
             claude_cli_path,
             claude_runners,
             claude_session_aliases: Arc::new(RwLock::new(HashMap::new())),
             metrics_bus: None, // Will be set by server if needed
         }
+    }
+
+    /// Get (or create) a long-lived session event sender for a session id.
+    ///
+    /// This stream is intended for UI consumption and background activity; it should remain
+    /// available even when no agent execution is running.
+    pub async fn get_session_event_sender(&self, session_id: &str) -> broadcast::Sender<AgentEvent> {
+        let mut senders = self.session_event_senders.write().await;
+        if let Some(existing) = senders.get(session_id) {
+            return existing.clone();
+        }
+        let (tx, _) = broadcast::channel(1000);
+        senders.insert(session_id.to_string(), tx.clone());
+        tx
     }
 
     /// Reload the provider based on current configuration

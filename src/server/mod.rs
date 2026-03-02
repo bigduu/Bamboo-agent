@@ -120,8 +120,11 @@ pub mod model_config_helper;
 pub mod reloadable_provider;
 pub mod request_hooks;
 pub mod routes;
+pub mod schedules;
 pub mod server;
 pub mod services;
+pub mod spawn_scheduler;
+pub mod tools;
 pub mod workflow;
 
 // Re-export commonly used types

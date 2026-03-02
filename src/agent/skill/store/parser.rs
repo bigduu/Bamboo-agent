@@ -159,7 +159,7 @@ mod tests {
         assert!(is_valid_skill_id("my-skill"));
         assert!(is_valid_skill_id("skill123"));
         assert!(is_valid_skill_id("a-b-c"));
-        assert!(is_valid_skill_id("builtin-file-analysis"));
+        assert!(is_valid_skill_id("skill-creator"));
     }
 
     #[test]

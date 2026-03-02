@@ -215,6 +215,45 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api/v1")
             .route("/chat", web::post().to(agent::chat::handler))
+            // Session index / management (V2)
+            .route("/sessions", web::get().to(agent::sessions::list_sessions))
+            .route("/sessions", web::post().to(agent::sessions::create_session))
+            .route(
+                "/sessions/cleanup",
+                web::post().to(agent::sessions::cleanup_sessions),
+            )
+            .route("/sessions/{session_id}", web::get().to(agent::sessions::get_session))
+            .route(
+                "/sessions/{session_id}",
+                web::patch().to(agent::sessions::patch_session),
+            )
+            .route(
+                "/sessions/{session_id}/clear",
+                web::post().to(agent::sessions::clear_session),
+            )
+            .route(
+                "/sessions/{session_id}/attachments/{attachment_id}",
+                web::get().to(agent::sessions::get_attachment),
+            )
+            // Schedules (timed tasks)
+            .route("/schedules", web::get().to(agent::schedules::list_schedules))
+            .route("/schedules", web::post().to(agent::schedules::create_schedule))
+            .route(
+                "/schedules/{schedule_id}",
+                web::patch().to(agent::schedules::patch_schedule),
+            )
+            .route(
+                "/schedules/{schedule_id}",
+                web::delete().to(agent::schedules::delete_schedule),
+            )
+            .route(
+                "/schedules/{schedule_id}/run",
+                web::post().to(agent::schedules::run_now),
+            )
+            .route(
+                "/schedules/{schedule_id}/sessions",
+                web::get().to(agent::schedules::list_sessions_for_schedule),
+            )
             // New separated execute + events endpoints
             .route(
                 "/execute/{session_id}",
@@ -249,6 +288,8 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 "/sessions/{session_id}",
                 web::delete().to(agent::delete::handler),
             )
+            // Dev-only endpoints (greenfield reset)
+            .route("/dev/reset", web::post().to(agent::dev::reset))
             .route("/health", web::get().to(agent::health::handler))
             // Metrics routes (agent metrics)
             .route("/metrics/summary", web::get().to(agent::metrics::summary))

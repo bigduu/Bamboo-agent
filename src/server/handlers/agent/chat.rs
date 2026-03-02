@@ -158,12 +158,27 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         },
     };
 
-    let base_prompt = req
+    // Persist the base system prompt on the session so the frontend does not need to
+    // store chat history (or system prompt config) in localStorage.
+    //
+    // IMPORTANT: The agent loop may mutate the in-session system message by merging
+    // in skills/tool guide context. We therefore treat `metadata.base_system_prompt`
+    // as the stable "source of truth" for future prompt construction.
+    let base_prompt_from_request = req
         .system_prompt
         .as_deref()
         .map(str::trim)
-        .filter(|prompt| !prompt.is_empty())
-        .unwrap_or(crate::server::app_state::DEFAULT_BASE_PROMPT);
+        .filter(|prompt| !prompt.is_empty());
+    if let Some(prompt) = base_prompt_from_request {
+        session
+            .metadata
+            .insert("base_system_prompt".to_string(), prompt.to_string());
+    }
+    let base_prompt = base_prompt_from_request
+        .map(|v| v.to_string())
+        .or_else(|| session.metadata.get("base_system_prompt").cloned())
+        .unwrap_or_else(|| crate::server::app_state::DEFAULT_BASE_PROMPT.to_string());
+
     let enhance_prompt = req
         .enhance_prompt
         .as_deref()
@@ -174,8 +189,33 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         .as_deref()
         .map(str::trim)
         .filter(|workspace_path| !workspace_path.is_empty());
-    let system_prompt = build_enhanced_system_prompt(base_prompt, enhance_prompt, workspace_path);
-    upsert_system_prompt_message(&mut session, system_prompt);
+    if let Some(path) = workspace_path {
+        session
+            .metadata
+            .insert("workspace_path".to_string(), path.to_string());
+    }
+    let workspace_path = workspace_path
+        .map(|v| v.to_string())
+        .or_else(|| session.metadata.get("workspace_path").cloned());
+
+    // Only upsert the system message when the client is explicitly customizing prompt
+    // inputs (or if the session has no system message yet).
+    let has_system_message = session
+        .messages
+        .iter()
+        .any(|m| matches!(m.role, crate::agent::core::Role::System));
+    if base_prompt_from_request.is_some()
+        || enhance_prompt.is_some()
+        || workspace_path.is_some()
+        || !has_system_message
+    {
+        let system_prompt = build_enhanced_system_prompt(
+            base_prompt.as_str(),
+            enhance_prompt,
+            workspace_path.as_deref(),
+        );
+        upsert_system_prompt_message(&mut session, system_prompt);
+    }
 
     // Preserve multimodal parts so that preflight hooks (OCR/fallback) and/or multimodal
     // upstream models can use the images.
@@ -187,7 +227,18 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         });
 
         for image in images {
-            let url = normalize_image_data_url(&image.base64, image.mime_type.as_deref());
+            let (_, url) = match state
+                .session_store
+                .write_image_attachment(&session, &image.base64, image.mime_type.as_deref())
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    return HttpResponse::BadRequest().json(serde_json::json!({
+                        "error": format!("Failed to store image attachment: {e}")
+                    }));
+                }
+            };
             parts.push(ContentPart::ImageUrl {
                 image_url: ImageUrl { url, detail: None },
             });
@@ -260,14 +311,8 @@ fn build_enhanced_system_prompt(
     merged_prompt
 }
 
-fn normalize_image_data_url(raw: &str, mime_type: Option<&str>) -> String {
-    let trimmed = raw.trim();
-    if trimmed.starts_with("data:") {
-        return trimmed.to_string();
-    }
-    let mime = mime_type.unwrap_or("image/png");
-    format!("data:{mime};base64,{trimmed}")
-}
+// Note: image attachments are stored on disk in SessionStoreV2, and message parts
+// use `bamboo-attachment://<session_id>/<attachment_id>` references.
 
 #[cfg(test)]
 mod tests {

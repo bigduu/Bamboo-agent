@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::agent::core::agent::Role;
+use crate::agent::core::SessionKind;
 use crate::agent::loop_module::{run_agent_loop_with_config, AgentLoopConfig};
 use crate::server::app_state::{AgentRunner, AgentStatus, AppState};
 
@@ -156,6 +157,7 @@ pub async fn handler(
     }
 
     let mut session = session.unwrap();
+    let is_child_session = session.kind == SessionKind::Child;
 
     // Apply preflight hooks (e.g. image OCR / fallback) before entering the agent loop.
     // This ensures consistent behavior between proxy endpoints and agent execution.
@@ -191,8 +193,11 @@ pub async fn handler(
         });
     }
 
+    // Stable, long-lived session event sender (also used for background jobs).
+    let session_tx = state.get_session_event_sender(&session_id).await;
+
     // Atomically check and insert runner to prevent race conditions
-    let (broadcast_tx, cancel_token) = {
+    let cancel_token = {
         let mut runners = state.agent_runners.write().await;
 
         // Check if there's already a running runner for this session
@@ -220,12 +225,12 @@ pub async fn handler(
 
         let mut runner = AgentRunner::new();
         runner.status = AgentStatus::Running;
-        let broadcast_tx = runner.event_sender.clone();
+        runner.event_sender = session_tx.clone();
         let cancel_token = runner.cancel_token.clone();
 
         runners.insert(session_id.clone(), runner);
 
-        (broadcast_tx, cancel_token)
+        cancel_token
     };
 
     log::info!("[{}] Starting agent execution", session_id);
@@ -240,6 +245,7 @@ pub async fn handler(
     // Spawn event forwarder: mpsc -> broadcast
     let session_id_forwarder = session_id.clone();
     let state_for_forwarder = state.clone();
+    let session_tx_for_forwarder = session_tx.clone();
     tokio::spawn(async move {
         while let Some(event) = mpsc_rx.recv().await {
             // Store budget events for late subscribers
@@ -257,7 +263,7 @@ pub async fn handler(
                 }
             }
 
-            if broadcast_tx.send(event.clone()).is_err() {
+            if session_tx_for_forwarder.send(event.clone()).is_err() {
                 log::debug!("[{}] No subscribers for event", session_id_forwarder);
             }
         }
@@ -281,8 +287,12 @@ pub async fn handler(
             .map(|m| m.content.clone())
             .unwrap_or_default();
 
-        // Get all tool schemas
-        let all_tool_schemas = state_clone.get_all_tool_schemas();
+        // Use child tool set for child sessions (no spawn schemas), otherwise root tools.
+        let tools = if is_child_session {
+            state_clone.child_tools.clone()
+        } else {
+            state_clone.tools.clone()
+        };
 
         // Use model from request (not from session - session.model is just for recording/debugging)
         log::info!("[{}] Using model from request: {}", session_id_clone, model);
@@ -300,8 +310,7 @@ pub async fn handler(
         }
 
         // Run agent loop
-        let storage: Arc<dyn crate::agent::core::storage::Storage> =
-            Arc::new(state_clone.storage.clone());
+        let storage: Arc<dyn crate::agent::core::storage::Storage> = state_clone.storage.clone();
 
         let result = run_agent_loop_with_config(
             &mut session,
@@ -310,15 +319,15 @@ pub async fn handler(
             // Use the reloadable provider handle so config/provider switches take effect
             // without requiring a server restart.
             state_clone.get_provider().await,
-            state_clone.tools.clone(),
+            tools,
             cancel_token,
             AgentLoopConfig {
                 max_rounds: 50,
                 system_prompt,
-                additional_tool_schemas: all_tool_schemas,
                 skill_manager: Some(state_clone.skill_manager.clone()),
                 skip_initial_user_message: true,
                 storage: Some(storage),
+                attachment_reader: Some(state_clone.session_store.clone()),
                 metrics_collector: Some(state_clone.metrics_service.collector()),
                 model_name: Some(model),
                 ..Default::default()

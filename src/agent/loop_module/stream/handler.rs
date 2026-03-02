@@ -39,7 +39,7 @@ pub async fn consume_llm_stream(
                     .await;
             }
             Ok(LLMChunk::ToolCalls(partial_calls)) => {
-                log::debug!(
+                log::trace!(
                     "[{}] Received {} tool call parts",
                     session_id,
                     partial_calls.len()

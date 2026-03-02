@@ -423,6 +423,24 @@ impl ConversationSummary {
 pub struct Session {
     /// Unique session identifier
     pub id: String,
+    /// Human-friendly title for UI (stored on backend as the source of truth).
+    #[serde(default)]
+    pub title: String,
+    /// Whether the session is pinned (root and child sessions can be pinned).
+    #[serde(default)]
+    pub pinned: bool,
+    /// Session kind (root or child). Child sessions are spawned by a root session.
+    #[serde(default)]
+    pub kind: SessionKind,
+    /// Parent session id when `kind == child` (root sessions must keep this as None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Root session id for this session tree. For root sessions this equals `id`.
+    #[serde(default)]
+    pub root_session_id: String,
+    /// Spawn depth within the session tree. For root sessions this is 0; for child sessions 1.
+    #[serde(default)]
+    pub spawn_depth: u32,
     /// Conversation message history
     pub messages: Vec<Message>,
     /// Session creation timestamp
@@ -452,6 +470,23 @@ pub struct Session {
     pub conversation_summary: Option<ConversationSummary>,
 }
 
+/// Session type marker for spawn-session support.
+///
+/// - `root`: user-facing main session (can spawn child sessions)
+/// - `child`: sub session spawned from a root (cannot spawn further)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    Root,
+    Child,
+}
+
+impl Default for SessionKind {
+    fn default() -> Self {
+        Self::Root
+    }
+}
+
 impl Session {
     /// Create a new session.
     ///
@@ -469,8 +504,46 @@ impl Session {
     /// ```
     pub fn new(id: impl Into<String>, model: impl Into<String>) -> Self {
         let now = Utc::now();
+        let id = id.into();
         Self {
-            id: id.into(),
+            id: id.clone(),
+            title: "New Session".to_string(),
+            pinned: false,
+            kind: SessionKind::Root,
+            parent_session_id: None,
+            root_session_id: id,
+            spawn_depth: 0,
+            messages: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            todo_list: None,
+            pending_question: None,
+            model: model.into(),
+            metadata: std::collections::HashMap::new(),
+            token_budget: None,
+            token_usage: None,
+            conversation_summary: None,
+        }
+    }
+
+    /// Create a new child session (sub-session) under a root session.
+    pub fn new_child(
+        id: impl Into<String>,
+        root_session_id: impl Into<String>,
+        model: impl Into<String>,
+        title: impl Into<String>,
+    ) -> Self {
+        let now = Utc::now();
+        let id = id.into();
+        let root_session_id = root_session_id.into();
+        Self {
+            id: id.clone(),
+            title: title.into(),
+            pinned: false,
+            kind: SessionKind::Child,
+            parent_session_id: Some(root_session_id.clone()),
+            root_session_id,
+            spawn_depth: 1,
             messages: Vec::new(),
             created_at: now,
             updated_at: now,

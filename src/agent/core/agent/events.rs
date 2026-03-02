@@ -69,6 +69,12 @@ use serde::{Deserialize, Serialize};
 /// - `TokenBudgetUpdated` - Context budget changed
 /// - `ContextSummarized` - Old messages summarized
 ///
+/// ## Sub-sessions (Async Spawn)
+/// - `SubSessionStarted` - A child session is created and scheduled to run
+/// - `SubSessionEvent` - Forwarded raw child event (full fidelity)
+/// - `SubSessionHeartbeat` - Periodic heartbeat while the child is running
+/// - `SubSessionCompleted` - Child session finished (completed/cancelled/error)
+///
 /// ## Terminal Events
 /// - `Complete` - Execution finished successfully
 /// - `Error` - Execution failed
@@ -198,6 +204,41 @@ pub enum AgentEvent {
         messages_summarized: usize,
         /// Tokens saved by summarization
         tokens_saved: u32,
+    },
+
+    /// A child session was spawned from a parent session (async background job).
+    SubSessionStarted {
+        parent_session_id: String,
+        child_session_id: String,
+        /// Optional title (useful for UI lists).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+
+    /// Forwarded raw child event to the parent session stream.
+    ///
+    /// Child sessions are not allowed to spawn further sessions, so this should not nest.
+    SubSessionEvent {
+        parent_session_id: String,
+        child_session_id: String,
+        event: Box<AgentEvent>,
+    },
+
+    /// Heartbeat emitted while a child session is running.
+    SubSessionHeartbeat {
+        parent_session_id: String,
+        child_session_id: String,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Child session finished (completed/cancelled/error).
+    SubSessionCompleted {
+        parent_session_id: String,
+        child_session_id: String,
+        /// One of: "completed" | "cancelled" | "error" | "skipped"
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 
     /// Agent execution completed successfully.

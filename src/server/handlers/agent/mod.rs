@@ -5,6 +5,7 @@
 
 pub mod chat;
 pub mod delete;
+pub mod dev;
 pub mod events;
 pub mod execute;
 pub mod health;
@@ -12,5 +13,7 @@ pub mod history;
 pub mod mcp;
 pub mod metrics;
 pub mod respond;
+pub mod sessions;
+pub mod schedules;
 pub mod stop;
 pub mod todo;

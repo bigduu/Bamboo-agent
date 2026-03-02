@@ -6,8 +6,11 @@
 use actix_web::http::header;
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 
-use crate::agent::core::TokenUsage;
-use crate::server::app_state::{AgentStatus, AppState};
+use crate::agent::core::agent::events::TokenUsage;
+use crate::agent::core::AgentEvent;
+use crate::server::app_state::AppState;
+use crate::server::app_state::AgentStatus;
+use tokio::sync::broadcast;
 
 /// Subscribe to real-time agent execution events via Server-Sent Events (SSE).
 ///
@@ -88,161 +91,116 @@ pub async fn handler(
     let session_id = path.into_inner();
     log::debug!("[{}] Events subscription requested", session_id);
 
-    // Check if there's a runner for this session
-    let (event_receiver, runner_status, budget_event_to_replay) = {
+    // Validate session exists (index-backed).
+    if state
+        .session_store
+        .get_index_entry(&session_id)
+        .await
+        .is_none()
+    {
+        log::warn!("[{}] Session not found for events subscription", session_id);
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "error": "Session not found",
+            "session_id": session_id
+        }));
+    }
+
+    let sender = state.get_session_event_sender(&session_id).await;
+    let mut receiver = sender.subscribe();
+
+    // Snapshot runner info (if present). After restarts we may not have runners in-memory,
+    // so don't rely solely on this for "already completed" detection.
+    let runner_snapshot = {
         let runners = state.agent_runners.read().await;
-        match runners.get(&session_id) {
-            Some(runner) => {
-                let rx = runner.event_sender.subscribe();
-                let status = runner.status.clone();
-                let budget_event = runner.last_budget_event.clone();
-                log::debug!("[{}] Found runner with status: {:?}", session_id, status);
-                (Some(rx), Some(status), budget_event)
-            }
-            None => {
-                log::debug!("[{}] No runner found for session", session_id);
-                (None, None, None)
-            }
-        }
+        runners.get(&session_id).cloned()
     };
 
-    match event_receiver {
-        Some(mut receiver) => {
-            // Check if runner is already completed or errored - if so, send immediate event
-            match runner_status {
-                Some(AgentStatus::Completed) => {
-                    log::debug!(
-                        "[{}] Runner already completed, sending immediate complete event",
-                        session_id
-                    );
-                    return HttpResponse::Ok()
-                        .append_header((header::CONTENT_TYPE, "text/event-stream"))
-                        .append_header((header::CACHE_CONTROL, "no-cache"))
-                        .streaming(async_stream::stream! {
-                            let event = crate::agent::core::AgentEvent::Complete {
-                                usage: TokenUsage {
-                                    prompt_tokens: 0,
-                                    completion_tokens: 0,
-                                    total_tokens: 0,
-                                }
-                            };
-                            let event_json = serde_json::to_string(&event).unwrap();
-                            let sse_data = format!("data: {}\n\n", event_json);
-                            yield Ok::<_, actix_web::Error>(
-                                actix_web::web::Bytes::from(sse_data)
-                            );
-                        });
-                }
-                Some(AgentStatus::Error(err)) => {
-                    log::debug!(
-                        "[{}] Runner already errored, sending immediate error event: {}",
-                        session_id,
-                        err
-                    );
-                    return HttpResponse::Ok()
-                        .append_header((header::CONTENT_TYPE, "text/event-stream"))
-                        .append_header((header::CACHE_CONTROL, "no-cache"))
-                        .streaming(async_stream::stream! {
-                            let event = crate::agent::core::AgentEvent::Error {
-                                message: err.clone(),
-                            };
-                            let event_json = serde_json::to_string(&event).unwrap();
-                            let sse_data = format!("data: {}\n\n", event_json);
-                            yield Ok::<_, actix_web::Error>(
-                                actix_web::web::Bytes::from(sse_data)
-                            );
-                        });
-                }
-                _ => {
-                    // Runner is still running or in another state, continue to normal streaming
-                }
-            }
+    // Replay last budget event if available (for late subscribers).
+    let budget_event_to_replay = runner_snapshot
+        .as_ref()
+        .and_then(|runner| runner.last_budget_event.clone());
 
-            // Has runner, stream events from broadcast channel
-            HttpResponse::Ok()
+    // If the runner is not actively running (or missing), and the session has no pending
+    // user message, return a one-shot terminal event and close the stream. This makes it safe
+    // for UIs to "subscribe once" on open even when they missed the live stream.
+    let runner_status = runner_snapshot.as_ref().map(|r| r.status.clone());
+    let should_attempt_terminal = !matches!(runner_status, Some(AgentStatus::Running));
+    if should_attempt_terminal {
+        let last_message_is_user = match state.storage.load_session(&session_id).await {
+            Ok(Some(session)) => session
+                .messages
+                .last()
+                .map(|m| matches!(m.role, crate::agent::core::agent::Role::User))
+                .unwrap_or(false),
+            _ => false,
+        };
+
+        if !last_message_is_user {
+            let terminal_event = match runner_status {
+                Some(AgentStatus::Error(msg)) => AgentEvent::Error { message: msg },
+                Some(AgentStatus::Cancelled) => AgentEvent::Error {
+                    message: "Agent execution cancelled by user".to_string(),
+                },
+                _ => AgentEvent::Complete {
+                    // We don't persist TokenUsage today; clients can fetch history for results.
+                    usage: TokenUsage {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                    },
+                },
+            };
+
+            return HttpResponse::Ok()
                 .append_header((header::CONTENT_TYPE, "text/event-stream"))
                 .append_header((header::CACHE_CONTROL, "no-cache"))
                 .append_header((header::CONNECTION, "keep-alive"))
                 .streaming(async_stream::stream! {
-                    // Replay last budget event if available (for late subscribers)
                     if let Some(ref budget_event) = budget_event_to_replay {
-                        let event_json = match serde_json::to_string(budget_event) {
-                            Ok(json) => json,
-                            Err(_) => {
-                                log::warn!("[{}] Failed to serialize budget event for replay", session_id);
-                                String::new()
-                            }
-                        };
-                        if !event_json.is_empty() {
+                        if let Ok(event_json) = serde_json::to_string(budget_event) {
                             let sse_data = format!("data: {}\n\n", event_json);
-                            yield Ok::<_, actix_web::Error>(
-                                actix_web::web::Bytes::from(sse_data)
-                            );
+                            yield Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(sse_data));
                         }
                     }
 
-                    while let Ok(event) = receiver.recv().await {
-                        let event_json = match serde_json::to_string(&event) {
-                            Ok(json) => json,
-                            Err(_) => continue,
-                        };
-
+                    if let Ok(event_json) = serde_json::to_string(&terminal_event) {
                         let sse_data = format!("data: {}\n\n", event_json);
-                        yield Ok::<_, actix_web::Error>(
-                            actix_web::web::Bytes::from(sse_data)
-                        );
-
-                        // Terminal events end the stream
-                        match &event {
-                            crate::agent::core::AgentEvent::Complete { .. } |
-                            crate::agent::core::AgentEvent::Error { .. } => break,
-                            _ => {}
-                        }
+                        yield Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(sse_data));
                     }
-                })
-        }
-        None => {
-            // No runner, check if session exists
-            let session_exists = {
-                let sessions = state.sessions.read().await;
-                sessions.contains_key(&session_id)
-            } || state
-                .storage
-                .load_session(&session_id)
-                .await
-                .ok()
-                .flatten()
-                .is_some();
-
-            if session_exists {
-                // Session exists but agent never ran or completed long ago
-                log::debug!(
-                    "[{}] Session exists but no active runner, sending immediate complete",
-                    session_id
-                );
-                HttpResponse::Ok()
-                    .append_header((header::CONTENT_TYPE, "text/event-stream"))
-                    .streaming(async_stream::stream! {
-                        let event = crate::agent::core::AgentEvent::Complete {
-                            usage: TokenUsage {
-                                prompt_tokens: 0,
-                                completion_tokens: 0,
-                                total_tokens: 0,
-                            }
-                        };
-                        let event_json = serde_json::to_string(&event).unwrap();
-                        let sse_data = format!("data: {}\n\n", event_json);
-                        yield Ok::<_, actix_web::Error>(
-                            actix_web::web::Bytes::from(sse_data)
-                        );
-                    })
-            } else {
-                log::warn!("[{}] Session not found for events subscription", session_id);
-                HttpResponse::NotFound().json(serde_json::json!({
-                    "error": "Session not found",
-                    "session_id": session_id
-                }))
-            }
+                });
         }
     }
+
+    HttpResponse::Ok()
+        .append_header((header::CONTENT_TYPE, "text/event-stream"))
+        .append_header((header::CACHE_CONTROL, "no-cache"))
+        .append_header((header::CONNECTION, "keep-alive"))
+        .streaming(async_stream::stream! {
+            if let Some(ref budget_event) = budget_event_to_replay {
+                if let Ok(event_json) = serde_json::to_string(budget_event) {
+                    let sse_data = format!("data: {}\n\n", event_json);
+                    yield Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(sse_data));
+                }
+            }
+
+            loop {
+                match receiver.recv().await {
+                    Ok(event) => {
+                        let Ok(event_json) = serde_json::to_string(&event) else {
+                            continue;
+                        };
+                        let sse_data = format!("data: {}\n\n", event_json);
+                        yield Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(sse_data));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Best-effort stream; late subscribers can open history.
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Should not happen for long-lived session senders, but exit cleanly.
+                        break;
+                    }
+                }
+            }
+        })
 }
