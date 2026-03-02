@@ -188,3 +188,100 @@ impl Tool for SpawnSessionTool {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use tokio::sync::{broadcast, RwLock};
+
+    use crate::agent::core::tools::{ToolCall, ToolExecutor, ToolSchema};
+    use crate::agent::llm::{LLMError, LLMProvider, LLMStream};
+    use crate::agent::metrics::storage::SqliteMetricsStorage;
+    use crate::agent::metrics::MetricsCollector;
+    use crate::agent::skill::SkillManager;
+
+    struct NoopProvider;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for NoopProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Err(LLMError::Api("noop".to_string()))
+        }
+    }
+
+    struct NoopToolExecutor;
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for NoopToolExecutor {
+        async fn execute(
+            &self,
+            _call: &ToolCall,
+        ) -> std::result::Result<ToolResult, ToolError> {
+            Err(ToolError::NotFound("noop".to_string()))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    fn make_temp_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn spawn_session_requires_session_id_in_tool_context() {
+        // This should fail fast before any disk IO or scheduler enqueues happen.
+        let bamboo_home = make_temp_dir("bamboo-spawn-session-tool-test");
+        tokio::fs::create_dir_all(&bamboo_home).await.unwrap();
+
+        let session_store = Arc::new(SessionStoreV2::new(bamboo_home.clone()).await.unwrap());
+        let storage_dir = bamboo_home.join("storage");
+        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
+        let jsonl = crate::agent::core::storage::JsonlStorage::new(&storage_dir);
+        jsonl.init().await.unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(jsonl);
+
+        let metrics_storage = Arc::new(SqliteMetricsStorage::new(bamboo_home.join("metrics.db")));
+        let metrics_collector = MetricsCollector::spawn(metrics_storage, 7);
+
+        let ctx = crate::server::spawn_scheduler::SpawnContext {
+            session_store: session_store.clone(),
+            storage: storage.clone(),
+            provider: Arc::new(NoopProvider),
+            tools: Arc::new(NoopToolExecutor),
+            skill_manager: Arc::new(SkillManager::new()),
+            metrics_collector,
+            sessions_cache: Arc::new(RwLock::new(HashMap::new())),
+            agent_runners: Arc::new(RwLock::new(HashMap::new())),
+            session_event_senders: Arc::new(RwLock::new(HashMap::<String, broadcast::Sender<crate::agent::core::AgentEvent>>::new())),
+        };
+        let scheduler = Arc::new(SpawnScheduler::new(ctx));
+
+        let tool = SpawnSessionTool::new(session_store, storage, scheduler);
+
+        let err = tool
+            .execute_with_context(
+                json!({ "goal": "do something" }),
+                ToolExecutionContext::none("tool_call"),
+            )
+            .await
+            .unwrap_err();
+
+        match err {
+            ToolError::Execution(msg) => {
+                assert!(msg.contains("spawn_session requires a session_id in tool context"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+}
