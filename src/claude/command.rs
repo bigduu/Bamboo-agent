@@ -1,5 +1,57 @@
 use log::{debug, info};
 
+#[cfg(windows)]
+fn resolve_windows_program(program: &str) -> (String, Vec<String>) {
+    use std::path::Path;
+
+    // NPM on Windows commonly creates BOTH:
+    // - claude (a non-executable shim script for Unix)
+    // - claude.cmd (the actual Windows launcher)
+    //
+    // If the configured path points at the no-extension shim, CreateProcess fails with:
+    // "%1 is not a valid Win32 application" (os error 193).
+    let p = Path::new(program);
+
+    let mut resolved = program.to_string();
+    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+
+    if ext.is_empty() {
+        // If the path exists as a file, prefer a sibling .exe/.cmd/.bat.
+        if p.exists() && p.is_file() {
+            let exe = p.with_extension("exe");
+            let cmd = p.with_extension("cmd");
+            let bat = p.with_extension("bat");
+            if exe.exists() && exe.is_file() {
+                resolved = exe.to_string_lossy().to_string();
+            } else if cmd.exists() && cmd.is_file() {
+                resolved = cmd.to_string_lossy().to_string();
+            } else if bat.exists() && bat.is_file() {
+                resolved = bat.to_string_lossy().to_string();
+            }
+        } else if program.eq_ignore_ascii_case("claude") {
+            // For PATH lookups, prefer the Windows shim.
+            resolved = "claude.cmd".to_string();
+        }
+    }
+
+    let resolved_ext = Path::new(&resolved)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if resolved_ext == "cmd" || resolved_ext == "bat" {
+        ("cmd".to_string(), vec!["/C".to_string(), resolved])
+    } else {
+        (resolved, Vec::new())
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_windows_program(program: &str) -> (String, Vec<String>) {
+    (program.to_string(), Vec::new())
+}
+
 fn collect_inherited_env(program: &str) -> Vec<(String, String)> {
     let mut envs: Vec<(String, String)> = Vec::new();
 
@@ -88,8 +140,10 @@ fn log_proxy_settings() {
 }
 
 pub fn create_command_with_env(program: &str) -> std::process::Command {
-    let mut cmd = std::process::Command::new(program);
-    info!("Creating command for: {}", program);
+    let (exe, prefix_args) = resolve_windows_program(program);
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(prefix_args);
+    info!("Creating command for: {} (exec: {})", program, exe);
     for (key, value) in collect_inherited_env(program) {
         cmd.env(&key, &value);
     }
@@ -98,8 +152,10 @@ pub fn create_command_with_env(program: &str) -> std::process::Command {
 }
 
 pub fn create_tokio_command_with_env(program: &str) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(program);
-    info!("Creating tokio command for: {}", program);
+    let (exe, prefix_args) = resolve_windows_program(program);
+    let mut cmd = tokio::process::Command::new(&exe);
+    cmd.args(prefix_args);
+    info!("Creating tokio command for: {} (exec: {})", program, exe);
     for (key, value) in collect_inherited_env(program) {
         cmd.env(&key, &value);
     }

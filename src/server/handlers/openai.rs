@@ -557,6 +557,7 @@ pub async fn chat_completions(
     // Apply preflight hooks (OCR / placeholder / error) before forwarding upstream.
     let config_snapshot = app_state.config.read().await.clone();
     crate::server::message_hooks::apply_message_preflight_hooks(
+        Some(app_state.as_ref()),
         &config_snapshot,
         resolved_model.as_str(),
         &mut internal_messages,
@@ -791,6 +792,7 @@ pub async fn responses_create(
     let mut internal_messages = convert_messages(openai_messages)?;
     let config_snapshot = app_state.config.read().await.clone();
     crate::server::message_hooks::apply_message_preflight_hooks(
+        Some(app_state.as_ref()),
         &config_snapshot,
         resolved_model.as_str(),
         &mut internal_messages,

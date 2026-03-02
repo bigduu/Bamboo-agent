@@ -67,6 +67,7 @@ pub async fn generate_content(
     // Apply preflight hooks before forwarding upstream.
     let config_snapshot = state.config.read().await.clone();
     crate::server::message_hooks::apply_message_preflight_hooks(
+        Some(state.as_ref()),
         &config_snapshot,
         model_to_use.as_str(),
         &mut internal_messages,
@@ -191,6 +192,7 @@ pub async fn stream_generate_content(
     // Apply preflight hooks before forwarding upstream.
     let config_snapshot = state.config.read().await.clone();
     crate::server::message_hooks::apply_message_preflight_hooks(
+        Some(state.as_ref()),
         &config_snapshot,
         model_to_use.as_str(),
         &mut internal_messages,

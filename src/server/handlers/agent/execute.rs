@@ -163,6 +163,7 @@ pub async fn handler(
     // This ensures consistent behavior between proxy endpoints and agent execution.
     let config_snapshot = state.config.read().await.clone();
     if let Err(e) = crate::server::message_hooks::apply_message_preflight_hooks(
+        Some(state.as_ref()),
         &config_snapshot,
         model.as_str(),
         &mut session.messages,

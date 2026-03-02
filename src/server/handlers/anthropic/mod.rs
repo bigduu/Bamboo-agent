@@ -233,6 +233,7 @@ pub async fn messages(
         let mut internal_messages = convert_messages(openai_request.messages.clone())?;
         let config_snapshot = app_state.config.read().await.clone();
         if let Err(e) = crate::server::message_hooks::apply_message_preflight_hooks(
+            Some(app_state.as_ref()),
             &config_snapshot,
             openai_request.model.as_str(),
             &mut internal_messages,
@@ -324,6 +325,7 @@ pub async fn messages(
         let mut internal_messages = convert_messages(openai_request.messages.clone())?;
         let config_snapshot = app_state.config.read().await.clone();
         if let Err(e) = crate::server::message_hooks::apply_message_preflight_hooks(
+            Some(app_state.as_ref()),
             &config_snapshot,
             openai_request.model.as_str(),
             &mut internal_messages,
@@ -465,6 +467,7 @@ pub async fn complete(
         let mut internal_messages = convert_messages(openai_request.messages.clone())?;
         let config_snapshot = app_state.config.read().await.clone();
         if let Err(e) = crate::server::message_hooks::apply_message_preflight_hooks(
+            Some(app_state.as_ref()),
             &config_snapshot,
             openai_request.model.as_str(),
             &mut internal_messages,
@@ -546,6 +549,7 @@ pub async fn complete(
         let mut internal_messages = convert_messages(openai_request.messages.clone())?;
         let config_snapshot = app_state.config.read().await.clone();
         if let Err(e) = crate::server::message_hooks::apply_message_preflight_hooks(
+            Some(app_state.as_ref()),
             &config_snapshot,
             openai_request.model.as_str(),
             &mut internal_messages,

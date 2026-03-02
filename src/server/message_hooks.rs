@@ -7,6 +7,7 @@
 use crate::agent::core::Message;
 use crate::agent::llm::models::ContentPart;
 use crate::core::Config;
+use crate::server::app_state::AppState;
 
 #[cfg(windows)]
 use base64::Engine;
@@ -21,17 +22,22 @@ pub enum HookError {
 
 /// Apply all configured preflight hooks.
 pub async fn apply_message_preflight_hooks(
+    state: Option<&AppState>,
     config: &Config,
     _model: &str,
     messages: &mut Vec<Message>,
 ) -> Result<(), HookError> {
-    apply_image_fallback_hook(config, messages).await
+    apply_image_fallback_hook(state, config, messages).await
 }
 
 async fn apply_image_fallback_hook(
+    state: Option<&AppState>,
     config: &Config,
     messages: &mut Vec<Message>,
 ) -> Result<(), HookError> {
+    #[cfg(not(windows))]
+    let _ = state;
+
     let hook_cfg = &config.hooks.image_fallback;
     if !hook_cfg.enabled {
         return Ok(());
@@ -79,7 +85,7 @@ async fn apply_image_fallback_hook(
                 // Non-Windows: log only (leave images intact).
                 #[cfg(windows)]
                 {
-                    let rewritten = rewrite_parts_to_ocr_text(parts).await;
+                    let rewritten = rewrite_parts_to_ocr_text(state, parts).await;
                     msg.content = rewritten;
                     msg.content_parts = None;
                     rewritten_messages += 1;
@@ -163,7 +169,21 @@ fn summarize_image_url(url: &str) -> String {
 }
 
 #[cfg(windows)]
-async fn rewrite_parts_to_ocr_text(parts: &[ContentPart]) -> String {
+fn parse_bamboo_attachment_url(url: &str) -> Option<(String, String)> {
+    // bamboo-attachment://<session_id>/<attachment_id>
+    let trimmed = url.trim();
+    let rest = trimmed.strip_prefix("bamboo-attachment://")?;
+    let (session_id, attachment_id) = rest.split_once('/')?;
+    let session_id = session_id.trim();
+    let attachment_id = attachment_id.trim();
+    if session_id.is_empty() || attachment_id.is_empty() {
+        return None;
+    }
+    Some((session_id.to_string(), attachment_id.to_string()))
+}
+
+#[cfg(windows)]
+async fn rewrite_parts_to_ocr_text(state: Option<&AppState>, parts: &[ContentPart]) -> String {
     let mut out = String::new();
     let mut image_index = 0usize;
 
@@ -174,7 +194,7 @@ async fn rewrite_parts_to_ocr_text(parts: &[ContentPart]) -> String {
                 image_index += 1;
                 let summary = summarize_image_url(&image_url.url);
 
-                match ocr_image_url_to_lines(&image_url.url).await {
+                match ocr_image_url_to_lines(state, &image_url.url).await {
                     Ok(lines) if !lines.is_empty() => {
                         out.push_str("\n\n[OCR extracted from image ");
                         out.push_str(&image_index.to_string());
@@ -226,19 +246,32 @@ struct OcrLine {
 }
 
 #[cfg(windows)]
-async fn ocr_image_url_to_lines(url: &str) -> anyhow::Result<Vec<OcrLine>> {
-    let (mime, data) = match parse_data_url_base64(url) {
-        Some(v) => v,
-        None => anyhow::bail!("only data: URLs are supported (got non-data URL)"),
+async fn ocr_image_url_to_lines(state: Option<&AppState>, url: &str) -> anyhow::Result<Vec<OcrLine>> {
+    let (mime, bytes) = if let Some((mime, data)) = parse_data_url_base64(url) {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data.as_bytes())
+            .map_err(|e| anyhow::anyhow!("invalid base64 data: {e}"))?;
+        (mime, bytes)
+    } else if let Some((session_id, attachment_id)) = parse_bamboo_attachment_url(url) {
+        let Some(state) = state else {
+            anyhow::bail!("cannot resolve bamboo-attachment URL without server state")
+        };
+        match state
+            .session_store
+            .read_attachment(&session_id, &attachment_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed reading attachment: {e}"))?
+        {
+            Some((bytes, mime)) => (mime, bytes),
+            None => anyhow::bail!("attachment not found"),
+        }
+    } else {
+        anyhow::bail!("unsupported image URL (expected data: or bamboo-attachment:)")
     };
 
     if mime != "image/png" {
         anyhow::bail!("unsupported mime type '{mime}' (only image/png is supported)");
     }
-
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data.as_bytes())
-        .map_err(|e| anyhow::anyhow!("invalid base64 data: {e}"))?;
 
     // Basic validation to avoid passing junk into the decoder.
     const PNG_SIG: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
@@ -372,7 +405,7 @@ mod tests {
             ],
         )];
 
-        apply_message_preflight_hooks(&cfg, "m", &mut messages)
+        apply_message_preflight_hooks(None, &cfg, "m", &mut messages)
             .await
             .expect("hook ok");
 
@@ -395,7 +428,7 @@ mod tests {
             }],
         )];
 
-        let err = apply_message_preflight_hooks(&cfg, "m", &mut messages)
+        let err = apply_message_preflight_hooks(None, &cfg, "m", &mut messages)
             .await
             .expect_err("should err");
         assert!(err
@@ -407,7 +440,7 @@ mod tests {
     async fn image_fallback_invalid_mode_errors() {
         let cfg = base_config("wat");
         let mut messages = Vec::new();
-        let err = apply_message_preflight_hooks(&cfg, "m", &mut messages)
+        let err = apply_message_preflight_hooks(None, &cfg, "m", &mut messages)
             .await
             .expect_err("should err");
         assert!(matches!(err, HookError::InvalidConfig(_)));
@@ -433,7 +466,7 @@ mod tests {
             ],
         )];
 
-        apply_message_preflight_hooks(&cfg, "m", &mut messages)
+        apply_message_preflight_hooks(None, &cfg, "m", &mut messages)
             .await
             .expect("hook ok");
 

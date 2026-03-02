@@ -1,7 +1,6 @@
 use log::{debug, warn};
 use regex::Regex;
 use std::cmp::Ordering;
-use std::process::Command;
 
 use super::ClaudeInstallation;
 
@@ -25,7 +24,10 @@ pub(super) fn source_preference(installation: &ClaudeInstallation) -> u8 {
 }
 
 pub(super) fn get_claude_version(path: &str) -> Result<Option<String>, String> {
-    match Command::new(path).arg("--version").output() {
+    match super::command::create_command_with_env(path)
+        .arg("--version")
+        .output()
+    {
         Ok(output) => {
             if output.status.success() {
                 Ok(extract_version_from_output(&output.stdout))
