@@ -74,11 +74,11 @@ bamboo serve --data-dir /custom/path  # Loads from /custom/path/config.json
 - Updated `tests/server_integration.rs`
 
 ### Documentation
-- `UNIFIED_CONFIG_IMPLEMENTATION.md`
+- `docs/archive/2026-03-03/UNIFIED_CONFIG_IMPLEMENTATION.md`
 - `CODEX_REVIEW_FIXES.md`
 - `TEST_COVERAGE_REPORT.md`
 - `CRITICAL_ISSUES_ROUND2.md`
-- `FINAL_IMPLEMENTATION_REPORT.md`
+- `docs/archive/2026-03-03/FINAL_IMPLEMENTATION_REPORT.md`
 
 ## Known Issues (Documented, Not Critical)
 

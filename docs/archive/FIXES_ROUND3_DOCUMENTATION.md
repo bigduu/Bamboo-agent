@@ -143,4 +143,4 @@ cargo run -- config --show-secrets | grep api_key
 
 - `CRITICAL_BLOCKERS_ROUND3.md` - Original issue list from Codex
 - `DEPLOYMENT_READY.md` - Previous deployment status
-- `UNIFIED_CONFIG_IMPLEMENTATION.md` - Original implementation plan
+- `docs/archive/2026-03-03/UNIFIED_CONFIG_IMPLEMENTATION.md` - Original implementation plan
