@@ -17,7 +17,6 @@ pub fn get_default_model_from_config(config: &Config) -> Result<String, LLMError
                 .and_then(|c| c.model.clone());
 
             Ok(provider_model
-                .or_else(|| config.model.clone())
                 .unwrap_or_else(|| "gpt-4o".to_string()))
         }
         "openai" => {
@@ -127,21 +126,6 @@ mod tests {
                 }),
                 ..ProviderConfigs::default()
             },
-            model: Some("gpt-4o".to_string()),
-            ..Config::default()
-        };
-
-        let result = get_default_model_from_config(&config);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "gpt-4o-mini");
-    }
-
-    #[test]
-    fn test_get_model_from_copilot_root_model_fallback() {
-        let config = Config {
-            provider: "copilot".to_string(),
-            providers: ProviderConfigs::default(),
-            model: Some("gpt-4o-mini".to_string()),
             ..Config::default()
         };
 
@@ -155,7 +139,6 @@ mod tests {
         let config = Config {
             provider: "copilot".to_string(),
             providers: ProviderConfigs::default(),
-            model: None,
             ..Config::default()
         };
 

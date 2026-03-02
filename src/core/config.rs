@@ -46,7 +46,6 @@
 //! - `BAMBOO_BIND`: Override server bind address
 //! - `BAMBOO_PROVIDER`: Override default provider
 //! - `BAMBOO_HEADLESS`: Enable headless authentication mode
-//! - `MODEL`: Override default model
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -81,8 +80,6 @@ pub struct Config {
     /// decrypt it into `proxy_auth` at load time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_auth_encrypted: Option<String>,
-    /// Default model to use (can be overridden per provider)
-    pub model: Option<String>,
     /// Deprecated: Use `providers.copilot.headless_auth` instead
     #[serde(default)]
     pub headless_auth: bool,
@@ -444,9 +441,8 @@ impl Config {
     ///
     /// Configuration loading order:
     /// 1. Try loading from `config.json` (`{data_dir}/config.json`)
-    /// 2. Migrate old format if detected
-    /// 3. Use defaults
-    /// 4. Apply environment variable overrides (highest priority)
+    /// 2. Use defaults
+    /// 3. Apply environment variable overrides (highest priority)
     ///
     /// # Environment Variables
     ///
@@ -454,7 +450,6 @@ impl Config {
     /// - `BAMBOO_BIND`: Override bind address
     /// - `BAMBOO_DATA_DIR`: Override data directory
     /// - `BAMBOO_PROVIDER`: Override default provider
-    /// - `MODEL`: Default model name
     /// - `BAMBOO_HEADLESS`: Enable headless authentication mode
     pub fn new() -> Self {
         Self::from_data_dir(None)
@@ -475,50 +470,20 @@ impl Config {
 
         let mut config = if config_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&config_path) {
-                // Try to parse as old format first (for migration)
-                if let Ok(old_config) = serde_json::from_str::<OldConfig>(&content) {
-                    // Check if it has old-only fields (indicating a true old config that needs migration)
-                    let has_old_fields = old_config.http_proxy_auth.is_some()
-                        || old_config.https_proxy_auth.is_some()
-                        || old_config.api_key.is_some()
-                        || old_config.api_base.is_some();
-
-                    if has_old_fields {
-                        log::info!("Migrating old config format to new format");
-                        let migrated = migrate_config(old_config);
-                        // Save migrated config
-                        if let Ok(new_content) = serde_json::to_string_pretty(&migrated) {
-                            let _ = std::fs::write(&config_path, new_content);
-                        }
-                        migrated
-                    } else {
-                        // No old fields, so try to parse as new Config
-                        // OldConfig successfully parsed common fields like http_proxy, model, provider, etc.
-                        // Try Config, but if it fails (e.g., due to syntax errors), use OldConfig values
-                        match serde_json::from_str::<Config>(&content) {
-                            Ok(mut config) => {
-                                config.hydrate_proxy_auth_from_encrypted();
-                                config.hydrate_provider_api_keys_from_encrypted();
-                                config.hydrate_mcp_secrets_from_encrypted();
-                                config
-                            }
-                            Err(_) => {
-                                // Config parse failed, but OldConfig worked, so preserve those values
-                                migrate_config(old_config)
-                            }
-                        }
-                    }
-                } else {
-                    // Couldn't parse as OldConfig, try as Config
-                    serde_json::from_str::<Config>(&content)
-                        .map(|mut config| {
-                            config.hydrate_proxy_auth_from_encrypted();
-                            config.hydrate_provider_api_keys_from_encrypted();
-                            config.hydrate_mcp_secrets_from_encrypted();
-                            config
-                        })
-                        .unwrap_or_else(|_| Self::create_default())
-                }
+                serde_json::from_str::<Config>(&content)
+                    .map(|mut config| {
+                        config.hydrate_proxy_auth_from_encrypted();
+                        config.hydrate_provider_api_keys_from_encrypted();
+                        config.hydrate_mcp_secrets_from_encrypted();
+                        config
+                    })
+                    .unwrap_or_else(|e| {
+                        log::warn!(
+                            "Failed to parse config.json ({}), using defaults",
+                            e
+                        );
+                        Self::create_default()
+                    })
             } else {
                 Self::create_default()
             }
@@ -537,10 +502,6 @@ impl Config {
         // derived from runtime (BAMBOO_DATA_DIR or ~/.bamboo).
         config.extra.remove("data_dir");
 
-        // Best-effort migration from legacy sidecar config files into unified config.json.
-        // This keeps config state globally unified going forward without breaking existing installs.
-        config.migrate_legacy_sidecar_configs(&data_dir);
-
         // Apply environment variable overrides (highest priority)
         if let Ok(port) = std::env::var("BAMBOO_PORT") {
             if let Ok(port) = port.parse() {
@@ -557,15 +518,35 @@ impl Config {
             config.provider = provider;
         }
 
-        if let Ok(model) = std::env::var("MODEL") {
-            config.model = Some(model);
-        }
-
         if let Ok(headless) = std::env::var("BAMBOO_HEADLESS") {
             config.headless_auth = parse_bool_env(&headless);
         }
 
         config
+    }
+
+    /// Get the effective default model for the currently active provider.
+    ///
+    /// Note: for most providers this is a required config value (returns None when absent).
+    /// Copilot has a built-in fallback when no model is configured.
+    pub fn get_model(&self) -> Option<String> {
+        match self.provider.as_str() {
+            "openai" => self.providers.openai.as_ref().and_then(|c| c.model.clone()),
+            "anthropic" => self
+                .providers
+                .anthropic
+                .as_ref()
+                .and_then(|c| c.model.clone()),
+            "gemini" => self.providers.gemini.as_ref().and_then(|c| c.model.clone()),
+            "copilot" => Some(
+                self.providers
+                    .copilot
+                    .as_ref()
+                    .and_then(|c| c.model.clone())
+                    .unwrap_or_else(|| "gpt-4o".to_string()),
+            ),
+            _ => None,
+        }
     }
 
     /// Populate `proxy_auth` (plaintext) from `proxy_auth_encrypted` if present.
@@ -812,7 +793,6 @@ impl Config {
             https_proxy: String::new(),
             proxy_auth: None,
             proxy_auth_encrypted: None,
-            model: None,
             headless_auth: false,
             provider: default_provider(),
             providers: ProviderConfigs::default(),
@@ -850,6 +830,8 @@ impl Config {
         let mut to_save = self.clone();
         // Never persist `data_dir` into config.json (data dir is runtime-derived).
         to_save.extra.remove("data_dir");
+        // Root-level `model` is deprecated; do not persist it.
+        to_save.extra.remove("model");
         to_save.refresh_proxy_auth_encrypted()?;
         to_save.refresh_provider_api_keys_encrypted()?;
         let content =
@@ -860,131 +842,6 @@ impl Config {
         Ok(())
     }
 
-    fn migrate_legacy_sidecar_configs(&mut self, data_dir: &std::path::Path) {
-        let mut changed = false;
-
-        // keyword_masking.json -> config.keyword_masking
-        if self.keyword_masking.entries.is_empty() {
-            let path = data_dir.join("keyword_masking.json");
-            if path.exists() {
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => match serde_json::from_str::<KeywordMaskingConfig>(&content) {
-                        Ok(km) => {
-                            self.keyword_masking = km;
-                            changed = true;
-                            let _ = backup_legacy_file(&path);
-                        }
-                        Err(e) => log::warn!(
-                            "Failed to migrate keyword_masking.json into config.json: {}",
-                            e
-                        ),
-                    },
-                    Err(e) => {
-                        log::warn!("Failed to read keyword_masking.json for migration: {}", e)
-                    }
-                }
-            }
-        }
-
-        // anthropic-model-mapping.json -> config.anthropic_model_mapping
-        if self.anthropic_model_mapping.mappings.is_empty() {
-            let path = data_dir.join("anthropic-model-mapping.json");
-            if path.exists() {
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => match serde_json::from_str::<AnthropicModelMapping>(&content) {
-                        Ok(mapping) => {
-                            self.anthropic_model_mapping = mapping;
-                            changed = true;
-                            let _ = backup_legacy_file(&path);
-                        }
-                        Err(e) => log::warn!(
-                            "Failed to migrate anthropic-model-mapping.json into config.json: {}",
-                            e
-                        ),
-                    },
-                    Err(e) => log::warn!(
-                        "Failed to read anthropic-model-mapping.json for migration: {}",
-                        e
-                    ),
-                }
-            }
-        }
-
-        // gemini-model-mapping.json -> config.gemini_model_mapping
-        if self.gemini_model_mapping.mappings.is_empty() {
-            let path = data_dir.join("gemini-model-mapping.json");
-            if path.exists() {
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => match serde_json::from_str::<GeminiModelMapping>(&content) {
-                        Ok(mapping) => {
-                            self.gemini_model_mapping = mapping;
-                            changed = true;
-                            let _ = backup_legacy_file(&path);
-                        }
-                        Err(e) => log::warn!(
-                            "Failed to migrate gemini-model-mapping.json into config.json: {}",
-                            e
-                        ),
-                    },
-                    Err(e) => log::warn!(
-                        "Failed to read gemini-model-mapping.json for migration: {}",
-                        e
-                    ),
-                }
-            }
-        }
-
-        // mcp.json -> config.mcp
-        if self.mcp.servers.is_empty() {
-            let path = data_dir.join("mcp.json");
-            if path.exists() {
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => {
-                        match serde_json::from_str::<crate::agent::mcp::McpConfig>(&content) {
-                            Ok(mcp) => {
-                                self.mcp = mcp;
-                                changed = true;
-                                let _ = backup_legacy_file(&path);
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to migrate mcp.json into config.json: {}", e)
-                            }
-                        }
-                    }
-                    Err(e) => log::warn!("Failed to read mcp.json for migration: {}", e),
-                }
-            }
-        }
-
-        // permissions.json -> config.extra["permissions"]
-        if !self.extra.contains_key("permissions") {
-            let path = data_dir.join("permissions.json");
-            if path.exists() {
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => match serde_json::from_str::<Value>(&content) {
-                        Ok(value) => {
-                            self.extra.insert("permissions".to_string(), value);
-                            changed = true;
-                            let _ = backup_legacy_file(&path);
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to migrate permissions.json into config.json: {}", e)
-                        }
-                    },
-                    Err(e) => log::warn!("Failed to read permissions.json for migration: {}", e),
-                }
-            }
-        }
-
-        if changed {
-            if let Err(e) = self.save_to_dir(data_dir.to_path_buf()) {
-                log::warn!(
-                    "Failed to persist unified config.json after migration: {}",
-                    e
-                );
-            }
-        }
-    }
 }
 
 fn write_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
@@ -1013,106 +870,6 @@ fn write_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn backup_legacy_file(path: &std::path::Path) -> std::io::Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-        return Ok(());
-    };
-    let backup = parent.join(format!("{name}.migrated.bak"));
-    if backup.exists() {
-        return Ok(());
-    }
-    std::fs::rename(path, backup)?;
-    Ok(())
-}
-
-/// Legacy configuration format for backward compatibility
-///
-/// This struct is used to migrate old configuration files to the new format.
-/// It supports the previous single-provider model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OldConfig {
-    #[serde(default)]
-    http_proxy: String,
-    #[serde(default)]
-    https_proxy: String,
-    #[serde(default)]
-    http_proxy_auth: Option<ProxyAuth>,
-    #[serde(default)]
-    https_proxy_auth: Option<ProxyAuth>,
-    api_key: Option<String>,
-    api_base: Option<String>,
-    model: Option<String>,
-    #[serde(default)]
-    headless_auth: bool,
-    // Also capture new fields so we don't lose them during fallback
-    #[serde(default = "default_provider")]
-    provider: String,
-    #[serde(default)]
-    server: ServerConfig,
-    #[serde(default)]
-    providers: ProviderConfigs,
-    #[serde(default)]
-    data_dir: Option<PathBuf>,
-
-    #[serde(default)]
-    keyword_masking: KeywordMaskingConfig,
-    #[serde(default)]
-    anthropic_model_mapping: AnthropicModelMapping,
-    #[serde(default)]
-    gemini_model_mapping: GeminiModelMapping,
-    #[serde(default)]
-    mcp: crate::agent::mcp::McpConfig,
-
-    /// Preserve unknown root keys for forward compatibility.
-    #[serde(default, flatten)]
-    extra: BTreeMap<String, Value>,
-}
-
-/// Migrate old configuration format to new multi-provider format
-///
-/// Converts the legacy single-provider configuration to the new structure
-/// with explicit provider configurations.
-fn migrate_config(old: OldConfig) -> Config {
-    // Log warning about deprecated fields
-    if old.api_key.is_some() {
-        log::warn!(
-            "api_key is no longer used. CopilotClient automatically manages authentication."
-        );
-    }
-    if old.api_base.is_some() {
-        log::warn!(
-            "api_base is no longer used. CopilotClient automatically manages API endpoints."
-        );
-    }
-
-    let proxy_auth = old.https_proxy_auth.or(old.http_proxy_auth);
-    let proxy_auth_encrypted = proxy_auth
-        .as_ref()
-        .and_then(|auth| serde_json::to_string(auth).ok())
-        .and_then(|auth_str| crate::core::encryption::encrypt(&auth_str).ok());
-
-    Config {
-        http_proxy: old.http_proxy,
-        https_proxy: old.https_proxy,
-        // Use https_proxy_auth if available, otherwise fallback to http_proxy_auth
-        proxy_auth,
-        proxy_auth_encrypted,
-        model: old.model,
-        headless_auth: old.headless_auth,
-        provider: old.provider,
-        providers: old.providers,
-        server: old.server,
-        keyword_masking: old.keyword_masking,
-        anthropic_model_mapping: old.anthropic_model_mapping,
-        gemini_model_mapping: old.gemini_model_mapping,
-        hooks: HooksConfig::default(),
-        mcp: old.mcp,
-        extra: old.extra,
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1243,7 +1000,13 @@ mod tests {
         let temp_home = TempHome::new();
         temp_home.set_config_json(
             r#"{
-  "model": "gpt-4"
+  "provider": "openai",
+  "providers": {
+    "openai": {
+      "api_key": "sk-test",
+      "model": "gpt-4o"
+    }
+  }
 }"#,
         );
 
@@ -1253,9 +1016,13 @@ mod tests {
         let config = Config::from_data_dir(Some(temp_home.path.clone()));
 
         assert_eq!(
-            config.model.as_deref(),
-            Some("gpt-4"),
-            "config should load model from config file even when proxy fields are omitted"
+            config
+                .providers
+                .openai
+                .as_ref()
+                .and_then(|c| c.model.as_deref()),
+            Some("gpt-4o"),
+            "config should load provider model from config file even when proxy fields are omitted"
         );
         assert!(config.http_proxy.is_empty());
         assert!(config.https_proxy.is_empty());
@@ -1267,7 +1034,13 @@ mod tests {
         let temp_home = TempHome::new();
         temp_home.set_config_json(
             r#"{
-  "model": "gpt-4"
+  "provider": "openai",
+  "providers": {
+    "openai": {
+      "api_key": "sk-test",
+      "model": "gpt-4o"
+    }
+  }
 }"#,
         );
 
@@ -1276,7 +1049,14 @@ mod tests {
 
         let config = Config::from_data_dir(Some(temp_home.path.clone()));
 
-        assert_eq!(config.model.as_deref(), Some("gpt-4"));
+        assert_eq!(
+            config
+                .providers
+                .openai
+                .as_ref()
+                .and_then(|c| c.model.as_deref()),
+            Some("gpt-4o")
+        );
         assert!(
             config.http_proxy.is_empty(),
             "config should keep http_proxy empty when field is omitted"
@@ -1285,78 +1065,6 @@ mod tests {
             config.https_proxy.is_empty(),
             "config should keep https_proxy empty when field is omitted"
         );
-    }
-
-    #[test]
-    fn config_migrates_old_format_to_new() {
-        let _lock = env_lock_acquire();
-        let temp_home = TempHome::new();
-
-        // Create config with old format
-        temp_home.set_config_json(
-            r#"{
-  "http_proxy": "http://proxy.example.com:8080",
-  "https_proxy": "http://proxy.example.com:8443",
-  "http_proxy_auth": {
-    "username": "http_user",
-    "password": "http_pass"
-  },
-  "https_proxy_auth": {
-    "username": "https_user",
-    "password": "https_pass"
-  },
-  "api_key": "old_key",
-  "api_base": "https://old.api.com",
-  "model": "gpt-4",
-  "headless_auth": true
-}"#,
-        );
-
-        let config = Config::from_data_dir(Some(temp_home.path.clone()));
-
-        // Verify migration
-        assert_eq!(config.http_proxy, "http://proxy.example.com:8080");
-        assert_eq!(config.https_proxy, "http://proxy.example.com:8443");
-
-        // Should use https_proxy_auth (higher priority)
-        assert!(config.proxy_auth.is_some());
-        let auth = config.proxy_auth.unwrap();
-        assert_eq!(auth.username, "https_user");
-        assert_eq!(auth.password, "https_pass");
-
-        // Model and headless_auth should be preserved
-        assert_eq!(config.model.as_deref(), Some("gpt-4"));
-        assert!(config.headless_auth);
-
-        // api_key and api_base are no longer in Config
-    }
-
-    #[test]
-    fn config_migrates_only_http_proxy_auth() {
-        let _lock = env_lock_acquire();
-        let temp_home = TempHome::new();
-
-        // Create config with only http_proxy_auth
-        temp_home.set_config_json(
-            r#"{
-  "http_proxy": "http://proxy.example.com:8080",
-  "http_proxy_auth": {
-    "username": "http_user",
-    "password": "http_pass"
-  }
-}"#,
-        );
-
-        let config = Config::from_data_dir(Some(temp_home.path.clone()));
-
-        // Should fallback to http_proxy_auth when https_proxy_auth is absent
-        assert!(
-            config.proxy_auth.is_some(),
-            "proxy_auth should be migrated from http_proxy_auth"
-        );
-        let auth = config.proxy_auth.unwrap();
-        assert_eq!(auth.username, "http_user");
-        assert_eq!(auth.password, "http_pass");
     }
 
     #[test]

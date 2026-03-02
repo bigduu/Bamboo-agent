@@ -138,20 +138,6 @@ mod comprehensive_config_tests {
     }
 
     #[test]
-    fn env_model_overrides_file_value() {
-        let _lock = env_lock_acquire();
-        let temp = TempDir::new();
-
-        temp.write_config(r#"{"model": "gpt-3.5"}"#);
-
-        let _env = EnvVarGuard::set("BAMBOO_DATA_DIR", temp.path.to_str().unwrap());
-        let _model = EnvVarGuard::set("MODEL", "gpt-4");
-
-        let config = Config::new();
-        assert_eq!(config.model, Some("gpt-4".to_string()));
-    }
-
-    #[test]
     fn env_headless_overrides_file_value() {
         let _lock = env_lock_acquire();
         let temp = TempDir::new();
@@ -233,7 +219,6 @@ mod comprehensive_config_tests {
             r#"{
             "http_proxy": "http://proxy:8080",
             "https_proxy": "https://proxy:8443",
-            "model": "gpt-4-turbo",
             "headless_auth": true,
             "provider": "openai",
             "providers": {
@@ -265,7 +250,6 @@ mod comprehensive_config_tests {
 
         assert_eq!(config.http_proxy, "http://proxy:8080");
         assert_eq!(config.https_proxy, "https://proxy:8443");
-        assert_eq!(config.model, Some("gpt-4-turbo".to_string()));
         assert_eq!(config.provider, "openai");
         assert!(config.providers.openai.is_some());
         assert!(config.providers.anthropic.is_some());
@@ -283,7 +267,14 @@ mod comprehensive_config_tests {
 
         let mut original = Config::from_data_dir(Some(temp.path.clone()));
         original.provider = "anthropic".to_string();
-        original.model = Some("claude-3".to_string());
+        original.providers.anthropic = Some(bamboo_agent::core::AnthropicConfig {
+            api_key: String::new(),
+            api_key_encrypted: None,
+            base_url: None,
+            model: Some("claude-3".to_string()),
+            max_tokens: None,
+            extra: Default::default(),
+        });
         original.server.port = 8888;
         original.server.workers = 8;
         original.server.static_dir = Some(PathBuf::from("/app/static"));
@@ -292,33 +283,17 @@ mod comprehensive_config_tests {
 
         let loaded = Config::from_data_dir(Some(temp.path.clone()));
         assert_eq!(loaded.provider, "anthropic");
-        assert_eq!(loaded.model, Some("claude-3".to_string()));
+        assert_eq!(
+            loaded
+                .providers
+                .anthropic
+                .as_ref()
+                .and_then(|c| c.model.as_deref()),
+            Some("claude-3")
+        );
         assert_eq!(loaded.server.port, 8888);
         assert_eq!(loaded.server.workers, 8);
         assert_eq!(loaded.server.static_dir, Some(PathBuf::from("/app/static")));
-    }
-
-    #[test]
-    fn migration_writes_back_to_disk() {
-        let _lock = env_lock_acquire();
-        let temp = TempDir::new();
-
-        // Old format with old-only fields
-        temp.write_config(
-            r#"{
-            "http_proxy": "http://old.proxy",
-            "http_proxy_auth": {"username": "old", "password": "old"},
-            "api_key": "deprecated_key"
-        }"#,
-        );
-
-        let _env = EnvVarGuard::set("BAMBOO_DATA_DIR", temp.path.to_str().unwrap());
-        let _config = Config::new();
-
-        // Check file was written back
-        let written = temp.read_config().unwrap();
-        assert!(written.contains("proxy_auth"));
-        assert!(!written.contains("http_proxy_auth"));
     }
 
     // === 3) Saving behavior ===
