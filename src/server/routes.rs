@@ -402,9 +402,10 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         .configure(gemini_routes);
 }
 
-/// Configure all routes for production mode (with rate limiting)
+/// Configure all routes for production mode.
 ///
-/// Production mode binds to 0.0.0.0 or custom addresses, so rate limiting is enabled
+/// Note: OpenAI-compatible forwarding endpoints are intentionally not rate-limited in this
+/// configuration (local-first deployments).
 pub fn configure_routes_with_rate_limiting(cfg: &mut web::ServiceConfig) {
     cfg.configure(agent_routes)
         .configure(bamboo_v1_routes)
