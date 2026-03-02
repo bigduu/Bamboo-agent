@@ -18,7 +18,7 @@ use std::time::Instant;
 #[command(about = "CLI tool for copilot-agent")]
 #[command(version)]
 struct Cli {
-    #[arg(long, default_value = "http://localhost:8080")]
+    #[arg(long, default_value = "http://localhost:9562")]
     server_url: String,
 
     #[arg(long)]

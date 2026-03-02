@@ -42,7 +42,7 @@ use crate::server::app_state::AppState;
 /// # Example
 ///
 /// ```bash
-/// curl -X DELETE http://localhost:8080/api/v1/sessions/session-123
+/// curl -X DELETE http://localhost:9562/api/v1/sessions/session-123
 /// ```
 pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Result<HttpResponse> {
     let session_id = path.into_inner();

@@ -225,7 +225,7 @@ use bamboo::{BambooBuilder, BambooConfig};
 
 let config = BambooConfig::default();
 let server = BambooBuilder::new()
-    .port(8080)
+    .port(9562)
     .bind("127.0.0.1")
     .data_dir(data_dir)
     .build()?;

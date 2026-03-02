@@ -66,7 +66,7 @@ impl Tool for ClaudeCodeTool {
                 },
                 "anthropic_base_url": {
                     "type": "string",
-                    "description": "Anthropic base URL (e.g. http://127.0.0.1:8080/anthropic). If omitted, Bamboo uses ANTHROPIC_BASE_URL env var."
+                    "description": "Anthropic base URL (e.g. http://127.0.0.1:9562/anthropic). If omitted, Bamboo uses ANTHROPIC_BASE_URL env var."
                 },
                 "json_schema": {
                     "type": "string",

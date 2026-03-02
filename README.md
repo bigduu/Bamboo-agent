@@ -101,7 +101,7 @@ cargo install --path .
 #### 🖥️ Binary Mode (Standalone Server)
 
 ```bash
-# Start server with default settings on port 8080
+# Start server with default settings on port 9562
 bamboo serve
 
 # Custom configuration

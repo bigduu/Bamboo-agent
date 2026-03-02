@@ -122,7 +122,7 @@ pub fn build_security_headers() -> DefaultHeaders {
 /// use actix_web::HttpServer;
 /// use bambooagent::server::config::build_cors;
 ///
-/// let cors = build_cors("127.0.0.1", 8080);
+/// let cors = build_cors("127.0.0.1", 9562);
 /// // Use cors middleware in HttpServer
 /// ```
 pub fn build_cors(bind_addr: &str, port: u16) -> Cors {

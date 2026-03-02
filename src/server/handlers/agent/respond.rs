@@ -69,7 +69,7 @@ pub struct RespondRequest {
 /// # Example
 ///
 /// ```bash
-/// curl -X POST http://localhost:8080/api/v1/sessions/session-123/respond \
+/// curl -X POST http://localhost:9562/api/v1/sessions/session-123/respond \
 ///   -H "Content-Type: application/json" \
 ///   -d '{"response": "Use TypeScript"}'
 /// ```
@@ -264,7 +264,7 @@ pub async fn submit_response(
 /// # Example
 ///
 /// ```bash
-/// curl http://localhost:8080/api/v1/sessions/session-123/question
+/// curl http://localhost:9562/api/v1/sessions/session-123/question
 /// ```
 pub async fn get_pending_question(
     state: web::Data<AppState>,

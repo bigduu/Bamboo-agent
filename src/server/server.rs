@@ -117,10 +117,10 @@ pub async fn run_with_bind(bamboo_home_dir: PathBuf, port: u16, bind: &str) -> R
 /// # Example
 /// ```bash
 /// # Docker mode (serve frontend)
-/// bamboo serve --port 8080 --bind 0.0.0.0 --static-dir /app/static
+/// bamboo serve --port 9562 --bind 0.0.0.0 --static-dir /app/static
 ///
 /// # Standalone production mode (serve frontend)
-/// bamboo serve --port 8080 --static-dir ./dist
+/// bamboo serve --port 9562 --static-dir ./dist
 /// ```
 pub async fn run_with_bind_and_static(
     bamboo_home_dir: PathBuf,

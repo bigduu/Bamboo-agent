@@ -9,7 +9,7 @@ Bamboo offers RESTful API endpoints for creating and managing AI agent conversat
 ## Base URL
 
 ```
-http://localhost:8080/api/v1
+http://localhost:9562/api/v1
 ```
 
 ## API Endpoints
@@ -351,7 +351,7 @@ Simple health check for load balancers and monitoring.
 ### 1. Create a Chat Session
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/chat \
+curl -X POST http://localhost:9562/api/v1/chat \
   -H "Content-Type: application/json" \
   -d '{
     "message": "Help me write a Rust function",
@@ -364,7 +364,7 @@ Response includes `session_id` and `stream_url`.
 ### 2. Start Agent Execution
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/execute/{session_id} \
+curl -X POST http://localhost:9562/api/v1/execute/{session_id} \
   -H "Content-Type: application/json" \
   -d '{"model": "gpt-4o-mini"}'
 ```
@@ -390,10 +390,10 @@ If the agent asks a question:
 
 ```bash
 # Check for pending question
-curl http://localhost:8080/api/v1/sessions/{session_id}/question
+curl http://localhost:9562/api/v1/sessions/{session_id}/question
 
 # Submit response
-curl -X POST http://localhost:8080/api/v1/sessions/{session_id}/respond \
+curl -X POST http://localhost:9562/api/v1/sessions/{session_id}/respond \
   -H "Content-Type: application/json" \
   -d '{"response": "Use async/await"}'
 ```
@@ -402,10 +402,10 @@ curl -X POST http://localhost:8080/api/v1/sessions/{session_id}/respond \
 
 ```bash
 # Stop execution
-curl -X POST http://localhost:8080/api/v1/stop/{session_id}
+curl -X POST http://localhost:9562/api/v1/stop/{session_id}
 
 # Delete session
-curl -X DELETE http://localhost:8080/api/v1/sessions/{session_id}
+curl -X DELETE http://localhost:9562/api/v1/sessions/{session_id}
 ```
 
 ---
@@ -452,12 +452,12 @@ All endpoints return consistent error responses:
 Bamboo can be configured via command-line flags or environment variables:
 
 ```bash
-bamboo serve --port 8080 --data-dir ~/.local/share/bamboo
+bamboo serve --port 9562 --data-dir ~/.local/share/bamboo
 ```
 
 **Environment Variables:**
 
-- `BAMBOO_PORT` - Server port (default: 8080)
+- `BAMBOO_PORT` - Server port (default: 9562)
 - `BAMBOO_DATA_DIR` - Data directory
 - `BAMBOO_BIND` - Bind address (default: 127.0.0.1)
 

@@ -37,7 +37,7 @@ use crate::server::app_state::AppState;
 /// # Example
 ///
 /// ```bash
-/// curl http://localhost:8080/api/v1/sessions/session-123/history
+/// curl http://localhost:9562/api/v1/sessions/session-123/history
 /// ```
 pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let session_id = path.into_inner();

@@ -177,7 +177,7 @@ let server = BambooBuilder::new()
 
 ### Config Priority Example
 ```rust
-// File: /app/config.json has port 8080
+// File: /app/config.json has port 9562
 // Env: BAMBOO_PORT=9000
 // CLI: --port 7777
 

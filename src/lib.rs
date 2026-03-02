@@ -25,7 +25,7 @@
 #![allow(clippy::incompatible_msrv)]
 //!
 //! ```bash
-//! bamboo serve --port 8080 --data-dir ~/.bamboo
+//! bamboo serve --port 9562 --data-dir ~/.bamboo
 //! ```
 //!
 //! ## Library Mode
@@ -107,7 +107,7 @@ impl BambooServer {
 /// use std::path::PathBuf;
 ///
 /// let server = BambooBuilder::new()
-///     .port(8080)
+///     .port(9562)
 ///     .bind("127.0.0.1")
 ///     .data_dir(PathBuf::from("~/.bamboo"))
 ///     .build()

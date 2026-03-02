@@ -31,7 +31,7 @@ cargo watch -x build
 ### Running the Server
 
 ```bash
-# Run in development mode with defaults (port 8080)
+# Run in development mode with defaults (port 9562)
 cargo run -- serve
 
 # Custom port and bind address
@@ -215,7 +215,7 @@ Legacy TOML format is automatically migrated to JSON.
 ### Environment Variables
 
 Higher priority than config file:
-- `BAMBOO_PORT` - Server port (default: 8080)
+- `BAMBOO_PORT` - Server port (default: 9562)
 - `BAMBOO_BIND` - Bind address (default: 127.0.0.1)
 - `BAMBOO_DATA_DIR` - Data directory
 - `BAMBOO_PROVIDER` - Default LLM provider

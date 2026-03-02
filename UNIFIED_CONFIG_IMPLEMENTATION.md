@@ -18,7 +18,7 @@ Successfully merged the two independent configuration systems into a single unif
 - ✅ Implemented `Default` trait for `ServerConfig` with sensible defaults
 - ✅ Added default value functions: `default_port()`, `default_bind()`, `default_workers()`
 - ✅ Updated `Config::new()` to support server configuration environment variables:
-  - `BAMBOO_PORT` - Server port (default: 8080)
+  - `BAMBOO_PORT` - Server port (default: 9562)
   - `BAMBOO_BIND` - Bind address (default: 127.0.0.1)
   - `BAMBOO_DATA_DIR` - Data directory (default: ~/.bamboo)
   - `BAMBOO_PROVIDER` - Default LLM provider
@@ -79,7 +79,7 @@ All tests passing:
     "copilot": {...}
   },
   "server": {
-    "port": 8080,
+    "port": 9562,
     "bind": "127.0.0.1",
     "static_dir": null,
     "workers": 10

@@ -18,7 +18,7 @@
 //! # Example
 //!
 //! ```bash
-//! curl -X POST http://localhost:8080/api/v1/tools/execute \
+//! curl -X POST http://localhost:9562/api/v1/tools/execute \
 //!   -H "Content-Type: application/json" \
 //!   -d '{
 //!     "tool_name": "read_file",
@@ -130,7 +130,7 @@ pub struct ToolExecutionResultPayload {
 /// # Example
 ///
 /// ```bash
-/// curl -X POST http://localhost:8080/api/v1/tools/execute \
+/// curl -X POST http://localhost:9562/api/v1/tools/execute \
 ///   -H "Content-Type: application/json" \
 ///   -d '{
 ///     "tool_name": "read_file",

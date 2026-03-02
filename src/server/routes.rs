@@ -352,7 +352,7 @@ pub fn bamboo_v1_routes(cfg: &mut web::ServiceConfig) {
 ///
 /// This mirrors the provider-specific prefixes used by Anthropic (/anthropic/v1/*)
 /// and Gemini (/gemini/v1beta/*), making it easier to configure OpenAI clients with a base URL
-/// like `http://localhost:8080/openai`.
+/// like `http://localhost:9562/openai`.
 pub fn openai_prefixed_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/openai/v1")

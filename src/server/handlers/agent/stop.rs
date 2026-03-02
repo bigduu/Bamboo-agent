@@ -55,7 +55,7 @@ struct StopResponse {
 /// # Example
 ///
 /// ```bash
-/// curl -X POST http://localhost:8080/api/v1/stop/session-123
+/// curl -X POST http://localhost:9562/api/v1/stop/session-123
 /// ```
 pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let session_id = path.into_inner();

@@ -105,7 +105,7 @@ pub struct ExecuteRequest {
 /// # Example
 ///
 /// ```bash
-/// curl -X POST http://localhost:8080/api/v1/execute/session-123 \
+/// curl -X POST http://localhost:9562/api/v1/execute/session-123 \
 ///   -H "Content-Type: application/json" \
 ///   -d '{"model": "gpt-4o-mini"}'
 /// ```

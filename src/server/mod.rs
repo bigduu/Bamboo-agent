@@ -46,7 +46,7 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), String> {
 //!     let data_dir = PathBuf::from("./.bamboo");
-//!     run(data_dir, 8080).await
+//!     run(data_dir, 9562).await
 //! }
 //! ```
 //!
@@ -61,7 +61,7 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), String> {
 //!     let data_dir = PathBuf::from("./.bamboo");
-//!     run_with_bind(data_dir, 8080, "0.0.0.0").await
+//!     run_with_bind(data_dir, 9562, "0.0.0.0").await
 //! }
 //! ```
 //!
@@ -78,7 +78,7 @@
 //!     let data_dir = PathBuf::from("./.bamboo");
 //!     run_with_bind_and_static(
 //!         data_dir,
-//!         8080,
+//!         9562,
 //!         "0.0.0.0",
 //!         Some(PathBuf::from("./dist")),
 //!     )

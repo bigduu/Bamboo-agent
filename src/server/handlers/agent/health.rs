@@ -27,7 +27,7 @@ use actix_web::Responder;
 /// # Example
 ///
 /// ```bash
-/// curl http://localhost:8080/health
+/// curl http://localhost:9562/health
 /// # Returns: OK
 /// ```
 pub async fn handler() -> impl Responder {

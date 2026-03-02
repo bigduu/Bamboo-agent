@@ -29,7 +29,7 @@ pub struct ClaudeCodeCliConfig {
     pub prompt: String,
     /// A UUID string. Claude Code requires session ids to be valid UUIDs.
     pub session_id: String,
-    /// e.g. `http://localhost:8080/anthropic` (Claude will append `/v1/...`)
+    /// e.g. `http://localhost:9562/anthropic` (Claude will append `/v1/...`)
     pub anthropic_base_url: String,
     /// Optional structured output schema (passed as `--json-schema`).
     pub json_schema: Option<String>,

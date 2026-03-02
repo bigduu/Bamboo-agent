@@ -15,7 +15,7 @@
 //! {
 //!   "provider": "anthropic",
 //!   "server": {
-//!     "port": 8080,
+//!     "port": 9562,
 //!     "bind": "127.0.0.1"
 //!   },
 //!   "providers": {
@@ -356,9 +356,9 @@ fn default_provider() -> String {
     "anthropic".to_string()
 }
 
-/// Returns the default server port (8080)
+/// Returns the default server port (9562)
 fn default_port() -> u16 {
-    8080
+    9562
 }
 
 /// Returns the default bind address (127.0.0.1)
@@ -1073,7 +1073,7 @@ mod tests {
         let temp_home = TempHome::new();
 
         let config = Config::from_data_dir(Some(temp_home.path.clone()));
-        assert_eq!(config.server.port, 8080);
+        assert_eq!(config.server.port, 9562);
         assert_eq!(config.server.bind, "127.0.0.1");
         assert_eq!(config.server.workers, 10);
         assert!(config.server.static_dir.is_none());

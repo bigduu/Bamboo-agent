@@ -343,7 +343,7 @@ mod comprehensive_config_tests {
 
         let config = Config::from_data_dir(Some(temp.path.clone()));
 
-        assert_eq!(config.server.port, 8080);
+        assert_eq!(config.server.port, 9562);
         assert_eq!(config.server.bind, "127.0.0.1");
         assert_eq!(config.server.workers, 10);
         assert_eq!(config.provider, "anthropic");
@@ -357,7 +357,7 @@ mod comprehensive_config_tests {
         temp.write_config(r#"{ not valid json }"#);
 
         let config = Config::from_data_dir(Some(temp.path.clone()));
-        assert_eq!(config.server.port, 8080);
+        assert_eq!(config.server.port, 9562);
     }
 
     #[test]
@@ -368,7 +368,7 @@ mod comprehensive_config_tests {
         temp.write_config(r#"{"server": {"port": "not_a_number"}}"#);
 
         let config = Config::from_data_dir(Some(temp.path.clone()));
-        assert_eq!(config.server.port, 8080); // Default
+        assert_eq!(config.server.port, 9562); // Default
     }
 
     // === 6) Library Usage Patterns ===
