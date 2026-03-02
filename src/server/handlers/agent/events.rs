@@ -8,6 +8,7 @@ use actix_web::{web, HttpRequest, HttpResponse, Responder};
 
 use crate::agent::core::agent::events::TokenUsage;
 use crate::agent::core::AgentEvent;
+use crate::agent::core::SessionKind;
 use crate::server::app_state::AppState;
 use crate::server::app_state::AgentStatus;
 use tokio::sync::broadcast;
@@ -123,9 +124,41 @@ pub async fn handler(
     // If the runner is not actively running (or missing), and the session has no pending
     // user message, return a one-shot terminal event and close the stream. This makes it safe
     // for UIs to "subscribe once" on open even when they missed the live stream.
+    //
+    // IMPORTANT: If there are running child sessions that forward events into this session's
+    // event stream, we must keep the SSE stream open even if the parent runner is not running.
     let runner_status = runner_snapshot.as_ref().map(|r| r.status.clone());
     let should_attempt_terminal = !matches!(runner_status, Some(AgentStatus::Running));
     if should_attempt_terminal {
+        // Determine whether any running child session belongs to this parent.
+        // We intentionally do not hold the runners lock across awaits.
+        let running_session_ids: Vec<String> = {
+            let runners = state.agent_runners.read().await;
+            runners
+                .iter()
+                .filter_map(|(sid, runner)| {
+                    if matches!(runner.status, AgentStatus::Running) {
+                        Some(sid.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        let mut has_running_child = false;
+        for sid in running_session_ids {
+            let Some(entry) = state.session_store.get_index_entry(&sid).await else {
+                continue;
+            };
+            if entry.kind == SessionKind::Child
+                && entry.parent_session_id.as_deref() == Some(session_id.as_str())
+            {
+                has_running_child = true;
+                break;
+            }
+        }
+
         let last_message_is_user = match state.storage.load_session(&session_id).await {
             Ok(Some(session)) => session
                 .messages
@@ -135,7 +168,7 @@ pub async fn handler(
             _ => false,
         };
 
-        if !last_message_is_user {
+        if !last_message_is_user && !has_running_child {
             let terminal_event = match runner_status {
                 Some(AgentStatus::Error(msg)) => AgentEvent::Error { message: msg },
                 Some(AgentStatus::Cancelled) => AgentEvent::Error {
