@@ -3,7 +3,6 @@
 //! This module provides explicit route registration for all API endpoints,
 //! with no macro-based routing for consistency and clarity.
 
-use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::{dev::HttpServiceFactory, web};
 
 use crate::server::handlers::{
@@ -11,9 +10,7 @@ use crate::server::handlers::{
     workspace,
 };
 
-fn openai_compatible_v1_scope(
-    openai_routes: impl HttpServiceFactory + 'static,
-) -> impl HttpServiceFactory {
+fn bamboo_v1_scope() -> impl HttpServiceFactory {
     web::scope("/v1")
         // Agent management endpoints (Claude Code integration)
         .service(
@@ -204,8 +201,6 @@ fn openai_compatible_v1_scope(
             "/bamboo/copilot/logout",
             web::post().to(copilot_auth::logout_copilot),
         )
-        // OpenAI-compatible endpoints (MUST BE LAST - empty scope will shadow earlier routes)
-        .service(openai_routes)
 }
 
 /// Configure agent API routes (core agent functionality)
@@ -346,19 +341,11 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
     );
 }
 
-/// Configure OpenAI-compatible API routes (/v1/*)
+/// Configure Bamboo internal `/v1/*` routes.
 ///
-/// Routes for OpenAI chat completions, agent management, commands, settings, skills, tools, workspace
-pub fn openai_compatible_routes(cfg: &mut web::ServiceConfig) {
-    let openai_routes = web::scope("")
-        .route(
-            "/chat/completions",
-            web::post().to(openai::chat_completions),
-        )
-        .route("/responses", web::post().to(openai::responses_create))
-        .route("/models", web::get().to(openai::get_models));
-
-    cfg.service(openai_compatible_v1_scope(openai_routes));
+/// OpenAI-compatible forwarding endpoints live under `/openai/v1/*`.
+pub fn bamboo_v1_routes(cfg: &mut web::ServiceConfig) {
+    cfg.service(bamboo_v1_scope());
 }
 
 /// Configure OpenAI-compatible API routes with an explicit prefix (/openai/v1/*)
@@ -369,50 +356,6 @@ pub fn openai_compatible_routes(cfg: &mut web::ServiceConfig) {
 pub fn openai_prefixed_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/openai/v1")
-            .route(
-                "/chat/completions",
-                web::post().to(openai::chat_completions),
-            )
-            .route("/responses", web::post().to(openai::responses_create))
-            .route("/models", web::get().to(openai::get_models)),
-    );
-}
-
-/// Configure OpenAI-compatible API routes with rate limiting
-///
-/// Production mode with rate limiting on chat completions
-pub fn openai_compatible_routes_with_rate_limiting(cfg: &mut web::ServiceConfig) {
-    // Build rate limiter for production: 10 req/sec, burst 20
-    let rate_limiter = GovernorConfigBuilder::default()
-        .per_second(10)
-        .burst_size(20)
-        .finish()
-        .expect("Failed to build rate limiter");
-
-    let openai_routes = web::scope("")
-        .wrap(Governor::new(&rate_limiter))
-        .route(
-            "/chat/completions",
-            web::post().to(openai::chat_completions),
-        )
-        .route("/responses", web::post().to(openai::responses_create))
-        .route("/models", web::get().to(openai::get_models));
-
-    cfg.service(openai_compatible_v1_scope(openai_routes));
-}
-
-/// Configure prefixed OpenAI-compatible routes with rate limiting (/openai/v1/*)
-pub fn openai_prefixed_routes_with_rate_limiting(cfg: &mut web::ServiceConfig) {
-    // Build rate limiter for production: 10 req/sec, burst 20
-    let rate_limiter = GovernorConfigBuilder::default()
-        .per_second(10)
-        .burst_size(20)
-        .finish()
-        .expect("Failed to build rate limiter");
-
-    cfg.service(
-        web::scope("/openai/v1")
-            .wrap(Governor::new(&rate_limiter))
             .route(
                 "/chat/completions",
                 web::post().to(openai::chat_completions),
@@ -453,7 +396,7 @@ pub fn gemini_routes(cfg: &mut web::ServiceConfig) {
 /// Desktop mode binds to localhost only, so rate limiting is not needed
 pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.configure(agent_routes)
-        .configure(openai_compatible_routes)
+        .configure(bamboo_v1_routes)
         .configure(openai_prefixed_routes)
         .configure(anthropic_routes)
         .configure(gemini_routes);
@@ -464,8 +407,8 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
 /// Production mode binds to 0.0.0.0 or custom addresses, so rate limiting is enabled
 pub fn configure_routes_with_rate_limiting(cfg: &mut web::ServiceConfig) {
     cfg.configure(agent_routes)
-        .configure(openai_compatible_routes_with_rate_limiting)
-        .configure(openai_prefixed_routes_with_rate_limiting)
+        .configure(bamboo_v1_routes)
+        .configure(openai_prefixed_routes)
         .configure(anthropic_routes)
         .configure(gemini_routes);
 }
