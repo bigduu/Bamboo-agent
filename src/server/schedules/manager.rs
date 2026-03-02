@@ -15,7 +15,6 @@ use crate::agent::metrics::MetricsCollector;
 use crate::agent::skill::SkillManager;
 use crate::server::app_state::{AgentRunner, AgentStatus};
 use crate::core::Config;
-use crate::server::model_config_helper::get_default_model_from_config;
 
 use super::store::{ClaimedScheduleRun, ScheduleRunConfig, ScheduleStore};
 
@@ -151,12 +150,22 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
 
     // Resolve model at run-time so schedules can follow the active provider model
     // when `run_config.model` is omitted.
+    //
+    // If we still can't resolve a model, skip the run (no session will be created).
     let model = if let Some(m) = requested_model.clone() {
         m
     } else {
         let snapshot = ctx.config.read().await.clone();
-        get_default_model_from_config(&snapshot)
-            .map_err(|e| format!("failed to resolve default model from config: {e}"))?
+        match snapshot.get_model().map(|m| m.trim().to_string()).filter(|m| !m.is_empty()) {
+            Some(m) => m,
+            None => {
+                log::warn!(
+                    "[schedule:{}] skipping run: no model configured (run_config.model is empty and config.get_model() returned None)",
+                    job.schedule_id
+                );
+                return Ok(());
+            }
+        }
     };
 
     let title = format!("{} ({})", job.schedule_name, now.to_rfc3339());
@@ -236,7 +245,7 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
         if requested_model.is_some() {
             "schedule.run_config.model"
         } else {
-            "config.providers.<active>.model"
+            "config.get_model()"
         }
     );
     if !should_execute {

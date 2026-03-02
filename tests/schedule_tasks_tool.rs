@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use futures::stream;
 use tokio::sync::{broadcast, RwLock};
+use tokio::time::{sleep, Duration};
 
 use bamboo_agent::agent::core::storage::{SessionStoreV2, Storage};
 use bamboo_agent::agent::core::tools::{Tool, ToolExecutionContext, ToolExecutor, ToolResult};
@@ -17,7 +19,7 @@ use bamboo_agent::agent::metrics::storage::SqliteMetricsStorage;
 use bamboo_agent::agent::skill::SkillManager;
 use bamboo_agent::server::app_state::AgentRunner;
 use bamboo_agent::server::schedules::manager::ScheduleContext;
-use bamboo_agent::server::schedules::{ScheduleManager, ScheduleStore};
+use bamboo_agent::server::schedules::{ScheduleManager, ScheduleRunConfig, ScheduleStore};
 use bamboo_agent::server::tools::ScheduleTasksTool;
 
 mod common;
@@ -242,4 +244,121 @@ async fn schedule_tasks_crud_and_list_sessions() {
         .unwrap()["success"]
         .as_bool()
         .unwrap());
+}
+
+#[tokio::test]
+async fn schedule_run_skips_when_no_model_available() {
+    common::init_test_env();
+    let dir = common::create_temp_dir();
+    let store = Arc::new(SessionStoreV2::new(dir.path().to_path_buf()).await.unwrap());
+    let schedule_store = Arc::new(ScheduleStore::new(dir.path().to_path_buf()).await.unwrap());
+
+    let metrics_storage = Arc::new(SqliteMetricsStorage::new(dir.path().join("metrics.db")));
+    let metrics = MetricsCollector::spawn(metrics_storage, 1);
+
+    // Default config has no model for most providers (openai/anthropic/gemini), so scheduled runs
+    // without an explicit model should be skipped (no session created).
+    let manager = Arc::new(ScheduleManager::new(ScheduleContext {
+        schedule_store: schedule_store.clone(),
+        session_store: store.clone(),
+        storage: store.clone(),
+        provider: Arc::new(DummyProvider),
+        tools: Arc::new(NoopTools),
+        skill_manager: Arc::new(SkillManager::new()),
+        metrics_collector: metrics,
+        sessions_cache: Arc::new(RwLock::new(HashMap::new())),
+        agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
+        session_event_senders: Arc::new(RwLock::new(
+            HashMap::<String, broadcast::Sender<AgentEvent>>::new(),
+        )),
+        config: Arc::new(RwLock::new(bamboo_agent::core::Config::default())),
+    }));
+
+    manager
+        .enqueue_run_now(bamboo_agent::server::schedules::ScheduleRunJob {
+            schedule_id: "s1".to_string(),
+            schedule_name: "No Model".to_string(),
+            run_config: ScheduleRunConfig {
+                auto_execute: false,
+                ..Default::default()
+            },
+            claimed_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    // Best-effort wait for the background worker to process the job.
+    for _ in 0..20 {
+        let entries = store.list_index_entries().await;
+        if entries.is_empty() {
+            return;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    let entries = store.list_index_entries().await;
+    assert!(entries.is_empty(), "expected no sessions, got: {entries:?}");
+}
+
+#[tokio::test]
+async fn schedule_run_uses_config_get_model_fallback() {
+    common::init_test_env();
+    let dir = common::create_temp_dir();
+    let store = Arc::new(SessionStoreV2::new(dir.path().to_path_buf()).await.unwrap());
+    let schedule_store = Arc::new(ScheduleStore::new(dir.path().to_path_buf()).await.unwrap());
+
+    let metrics_storage = Arc::new(SqliteMetricsStorage::new(dir.path().join("metrics.db")));
+    let metrics = MetricsCollector::spawn(metrics_storage, 1);
+
+    // Copilot has a built-in get_model() fallback ("gpt-4o") even when not configured.
+    let mut cfg = bamboo_agent::core::Config::default();
+    cfg.provider = "copilot".to_string();
+    let expected_model = cfg.get_model().expect("copilot should always have a model fallback");
+
+    let manager = Arc::new(ScheduleManager::new(ScheduleContext {
+        schedule_store: schedule_store.clone(),
+        session_store: store.clone(),
+        storage: store.clone(),
+        provider: Arc::new(DummyProvider),
+        tools: Arc::new(NoopTools),
+        skill_manager: Arc::new(SkillManager::new()),
+        metrics_collector: metrics,
+        sessions_cache: Arc::new(RwLock::new(HashMap::new())),
+        agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
+        session_event_senders: Arc::new(RwLock::new(
+            HashMap::<String, broadcast::Sender<AgentEvent>>::new(),
+        )),
+        config: Arc::new(RwLock::new(cfg)),
+    }));
+
+    manager
+        .enqueue_run_now(bamboo_agent::server::schedules::ScheduleRunJob {
+            schedule_id: "s2".to_string(),
+            schedule_name: "Config Model Fallback".to_string(),
+            run_config: ScheduleRunConfig {
+                auto_execute: false,
+                ..Default::default()
+            },
+            claimed_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let mut created_id: Option<String> = None;
+    for _ in 0..40 {
+        let entries = store.list_index_entries().await;
+        if let Some(first) = entries.first() {
+            created_id = Some(first.id.clone());
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    let session_id = created_id.expect("expected a scheduled session to be created");
+    let session = store
+        .load_session(&session_id)
+        .await
+        .unwrap()
+        .expect("session exists");
+    assert_eq!(session.model, expected_model);
 }
