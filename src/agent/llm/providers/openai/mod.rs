@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use reqwest::Client;
+use serde_json::Value;
 
 use crate::agent::core::{tools::ToolSchema, Message};
 use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
@@ -176,6 +177,67 @@ impl LLMProvider for OpenAIProvider {
         });
 
         Ok(stream)
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>> {
+        let response = self
+            .client
+            .get(format!("{}/models", self.base_url.trim_end_matches('/')))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+            .map_err(LLMError::Http)?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.map_err(LLMError::Http)?;
+            return Err(LLMError::Api(format!(
+                "OpenAI models API error: HTTP {}: {}",
+                status, text
+            )));
+        }
+
+        let json: Value = response.json().await.map_err(LLMError::Http)?;
+
+        // Accept common formats:
+        // - OpenAI: { object: "list", data: [{ id: "..." }, ...] }
+        // - Alternative: { models: [...] } or ["id1", "id2"]
+        let models: Vec<String> = if let Some(data) = json.get("data").and_then(|d| d.as_array())
+        {
+            data.iter()
+                .filter_map(|model| {
+                    model
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        } else if let Some(models_arr) = json.get("models").and_then(|m| m.as_array()) {
+            models_arr
+                .iter()
+                .filter_map(|model| {
+                    model
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            model
+                                .get("id")
+                                .and_then(|i| i.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .or_else(|| model.as_str().map(|s| s.to_string()))
+                })
+                .collect()
+        } else if let Some(arr) = json.as_array() {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        } else {
+            vec![]
+        };
+
+        Ok(models)
     }
 }
 
