@@ -361,6 +361,23 @@ pub fn openai_compatible_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(openai_compatible_v1_scope(openai_routes));
 }
 
+/// Configure OpenAI-compatible API routes with an explicit prefix (/openai/v1/*)
+///
+/// This mirrors the provider-specific prefixes used by Anthropic (/anthropic/v1/*)
+/// and Gemini (/gemini/v1beta/*), making it easier to configure OpenAI clients with a base URL
+/// like `http://localhost:8080/openai`.
+pub fn openai_prefixed_routes(cfg: &mut web::ServiceConfig) {
+    cfg.service(
+        web::scope("/openai/v1")
+            .route(
+                "/chat/completions",
+                web::post().to(openai::chat_completions),
+            )
+            .route("/responses", web::post().to(openai::responses_create))
+            .route("/models", web::get().to(openai::get_models)),
+    );
+}
+
 /// Configure OpenAI-compatible API routes with rate limiting
 ///
 /// Production mode with rate limiting on chat completions
@@ -382,6 +399,27 @@ pub fn openai_compatible_routes_with_rate_limiting(cfg: &mut web::ServiceConfig)
         .route("/models", web::get().to(openai::get_models));
 
     cfg.service(openai_compatible_v1_scope(openai_routes));
+}
+
+/// Configure prefixed OpenAI-compatible routes with rate limiting (/openai/v1/*)
+pub fn openai_prefixed_routes_with_rate_limiting(cfg: &mut web::ServiceConfig) {
+    // Build rate limiter for production: 10 req/sec, burst 20
+    let rate_limiter = GovernorConfigBuilder::default()
+        .per_second(10)
+        .burst_size(20)
+        .finish()
+        .expect("Failed to build rate limiter");
+
+    cfg.service(
+        web::scope("/openai/v1")
+            .wrap(Governor::new(&rate_limiter))
+            .route(
+                "/chat/completions",
+                web::post().to(openai::chat_completions),
+            )
+            .route("/responses", web::post().to(openai::responses_create))
+            .route("/models", web::get().to(openai::get_models)),
+    );
 }
 
 /// Configure Anthropic API routes (/anthropic/v1/*)
@@ -416,6 +454,7 @@ pub fn gemini_routes(cfg: &mut web::ServiceConfig) {
 pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.configure(agent_routes)
         .configure(openai_compatible_routes)
+        .configure(openai_prefixed_routes)
         .configure(anthropic_routes)
         .configure(gemini_routes);
 }
@@ -426,6 +465,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
 pub fn configure_routes_with_rate_limiting(cfg: &mut web::ServiceConfig) {
     cfg.configure(agent_routes)
         .configure(openai_compatible_routes_with_rate_limiting)
+        .configure(openai_prefixed_routes_with_rate_limiting)
         .configure(anthropic_routes)
         .configure(gemini_routes);
 }
