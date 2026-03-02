@@ -14,6 +14,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Serialize)]
 struct ListModelsResponse {
+    success: bool,
     object: String,
     data: Vec<Model>,
 }
@@ -24,6 +25,7 @@ struct Model {
     object: String,
     created: u64,
     owned_by: String,
+    supported_endpoint_types: Vec<String>,
 }
 
 // ============================================================================
@@ -145,6 +147,7 @@ pub async fn get_models(app_state: web::Data<AppState>) -> Result<HttpResponse, 
             // the dedicated Bamboo settings endpoints.
             log::warn!("Failed to fetch models (returning empty list): {}", e);
             return Ok(HttpResponse::Ok().json(ListModelsResponse {
+                success: true,
                 object: "list".to_string(),
                 data: vec![],
             }));
@@ -157,12 +160,14 @@ pub async fn get_models(app_state: web::Data<AppState>) -> Result<HttpResponse, 
         .map(|id| Model {
             id,
             object: "model".to_string(),
-            created: 1677610602, // Use a fixed timestamp for compatibility
-            owned_by: "bamboo".to_string(),
+            created: 1626777600, // Stable timestamp for UI compatibility
+            owned_by: "custom".to_string(),
+            supported_endpoint_types: vec!["openai".to_string(), "anthropic".to_string()],
         })
         .collect();
 
     let response = ListModelsResponse {
+        success: true,
         object: "list".to_string(),
         data: models,
     };
