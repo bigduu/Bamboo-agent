@@ -145,6 +145,10 @@ async fn validate_url_not_internal(parsed_url: &url::Url) -> Result<(), String> 
 
     // Try to parse as IP address directly
     if let Ok(ip) = host.parse::<IpAddr>() {
+        // Allow loopback explicitly for local-only usage.
+        if ip.is_loopback() {
+            return Ok(());
+        }
         if is_private_ip(&ip) {
             return Err(format!(
                 "SSRF protection: Request to private IP address {} is blocked",
@@ -163,6 +167,10 @@ async fn validate_url_not_internal(parsed_url: &url::Url) -> Result<(), String> 
     match lookup_result {
         Ok(addrs) => {
             for addr in addrs {
+                // Allow loopback explicitly for local-only usage.
+                if addr.ip().is_loopback() {
+                    continue;
+                }
                 if is_private_ip(&addr.ip()) {
                     return Err(format!(
                         "SSRF protection: Request to host {} which resolves to private IP {} is blocked",
@@ -634,24 +642,22 @@ mod tests {
 
     #[tokio::test]
 
-    async fn test_ssrf_loopback_blocked() {
-        let tool = HttpRequestTool::new();
-
-        // Loopback addresses
-        let loopback_ips = vec![
+    async fn test_ssrf_loopback_allowed() {
+        // Validate SSRF checks without making any network requests.
+        let urls = vec![
             "http://127.0.0.1/",
             "http://127.0.0.1:8080/admin",
             "http://127.1.1.1/",
+            "http://[::1]/",
+            "http://[::1]:8080/admin",
         ];
 
-        for url in loopback_ips {
-            let result = tool.execute(json!({"url": url})).await.unwrap();
-
-            assert!(!result.success, "Should block loopback IP: {}", url);
+        for u in urls {
+            let parsed_url = url::Url::parse(u).expect("valid URL");
+            let result = validate_url_not_internal(&parsed_url).await;
             assert!(
-                result.result.contains("SSRF protection"),
-                "Should mention SSRF protection: {}",
-                url
+                result.is_ok(),
+                "Loopback should be allowed, got error for {u}: {result:?}"
             );
         }
     }
