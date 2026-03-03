@@ -58,7 +58,10 @@ pub mod todo;
 pub mod tools;
 
 pub use agent::events::{AgentEvent, TokenBudgetUsage, TokenUsage};
-pub use agent::types::{ConversationSummary, Message, MessageContent, Role, Session, SessionKind};
+pub use agent::types::{
+    ConversationSummary, ImageOcrLine, ImageOcrResult, Message, MessageContent, Role, Session,
+    SessionKind,
+};
 pub use agent::AgentError;
 pub use budget::limits::create_budget_for_model;
 pub use memory::{format_summary_as_note, ExternalMemory};

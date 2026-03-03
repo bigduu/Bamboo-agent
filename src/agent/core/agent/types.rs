@@ -126,6 +126,12 @@ pub struct Message {
     /// using `content` as a best-effort projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_parts: Option<Vec<crate::agent::llm::models::ContentPart>>,
+    /// Optional OCR results for image parts in this message (persisted).
+    ///
+    /// This is intentionally kept separate from `content` / `content_parts` so the UI
+    /// can choose whether/how to render OCR text without losing the original image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_ocr: Option<Vec<ImageOcrResult>>,
     /// Tool calls (for Assistant messages)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -135,6 +141,27 @@ pub struct Message {
     /// Message creation timestamp
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
+}
+
+/// OCR line with bounding box (pixels relative to the image).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageOcrLine {
+    pub text: String,
+    pub left: i32,
+    pub top: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// OCR results for a single image part.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageOcrResult {
+    /// The `image_url.url` this OCR result corresponds to.
+    pub image_url: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<ImageOcrLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Generate a unique ID for messages.
@@ -161,6 +188,7 @@ impl Message {
             role: Role::User,
             content: content.into(),
             content_parts: None,
+            image_ocr: None,
             tool_calls: None,
             tool_call_id: None,
             created_at: Utc::now(),
@@ -177,6 +205,7 @@ impl Message {
             role: Role::User,
             content: content.into(),
             content_parts: Some(parts),
+            image_ocr: None,
             tool_calls: None,
             tool_call_id: None,
             created_at: Utc::now(),
@@ -202,6 +231,7 @@ impl Message {
             role: Role::Assistant,
             content: content.into(),
             content_parts: None,
+            image_ocr: None,
             tool_calls,
             tool_call_id: None,
             created_at: Utc::now(),
@@ -227,6 +257,7 @@ impl Message {
             role: Role::Tool,
             content: content.into(),
             content_parts: None,
+            image_ocr: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             created_at: Utc::now(),
@@ -251,6 +282,7 @@ impl Message {
             role: Role::System,
             content: content.into(),
             content_parts: None,
+            image_ocr: None,
             tool_calls: None,
             tool_call_id: None,
             created_at: Utc::now(),

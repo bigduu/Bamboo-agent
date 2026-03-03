@@ -19,6 +19,8 @@ use crate::agent::core::tools::{
     ToolSchema,
 };
 use crate::agent::core::{AgentError, AgentEvent, Message, Session, TodoItemStatus};
+#[cfg(windows)]
+use crate::agent::core::{ImageOcrLine, ImageOcrResult};
 use crate::agent::core::storage::AttachmentReader;
 use crate::agent::llm::LLMProvider;
 use crate::agent::llm::models::ContentPart;
@@ -32,6 +34,396 @@ use crate::agent::tools::CreateTodoListTool;
 use crate::agent::loop_module::config::AgentLoopConfig;
 use crate::agent::loop_module::stream::handler::consume_llm_stream;
 use crate::agent::loop_module::todo_context::TodoLoopContext;
+
+fn summarize_image_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.starts_with("data:") {
+        // data:<mime>;base64,<data...>
+        // Keep summary stable and avoid ever echoing base64 content.
+        let mut mime = "unknown".to_string();
+        if let Some(semi_idx) = trimmed.find(';') {
+            let header = &trimmed["data:".len()..semi_idx];
+            if !header.trim().is_empty() {
+                mime = header.trim().to_string();
+            }
+        }
+
+        let approx_bytes = trimmed
+            .split_once(',')
+            .map(|(_, data)| {
+                let len = data.trim().len();
+                // Base64 is ~4/3 expansion.
+                (len.saturating_mul(3)) / 4
+            })
+            .unwrap_or(0);
+
+        return format!("{mime} (~{approx_bytes} bytes)");
+    }
+
+    // For normal URLs, truncate to keep logs/responses compact.
+    const MAX: usize = 120;
+    if trimmed.len() <= MAX {
+        trimmed.to_string()
+    } else {
+        format!("{}...", &trimmed[..MAX])
+    }
+}
+
+fn rewrite_parts_to_placeholder(parts: &[ContentPart]) -> String {
+    let mut out = String::new();
+    for part in parts.iter() {
+        match part {
+            ContentPart::Text { text } => out.push_str(text),
+            ContentPart::ImageUrl { image_url } => {
+                let summary = summarize_image_url(&image_url.url);
+                out.push_str("\n[Image omitted: ");
+                out.push_str(&summary);
+                out.push_str("]\n");
+            }
+        }
+    }
+    out
+}
+
+#[cfg(any(test, windows))]
+fn persistable_image_urls(parts: &[ContentPart]) -> Vec<String> {
+    parts
+        .iter()
+        .filter_map(|p| match p {
+            ContentPart::ImageUrl { image_url } => {
+                // Never persist `data:` URLs into session JSON (they can embed base64).
+                let trimmed = image_url.url.trim();
+                if trimmed.starts_with("data:") || trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+async fn apply_image_fallback_to_llm_messages(
+    messages: &mut [Message],
+    fallback: crate::agent::loop_module::config::ImageFallbackConfig,
+    attachment_reader: Option<&dyn AttachmentReader>,
+) -> Result<()> {
+    use crate::agent::loop_module::config::ImageFallbackMode;
+    #[cfg(not(windows))]
+    let _ = attachment_reader;
+
+    let mode = fallback.mode;
+    for msg in messages.iter_mut() {
+        let Some(parts) = msg.content_parts.as_ref() else {
+            continue;
+        };
+
+        let has_images = parts
+            .iter()
+            .any(|p| matches!(p, crate::agent::llm::models::ContentPart::ImageUrl { .. }));
+        if !has_images {
+            continue;
+        }
+
+        match mode {
+            ImageFallbackMode::Error => {
+                return Err(AgentError::LLM(
+                    "This server does not currently support image inputs. Configure hooks.image_fallback.mode='placeholder' or 'ocr' to degrade gracefully.".to_string(),
+                ));
+            }
+            ImageFallbackMode::Placeholder => {
+                msg.content = rewrite_parts_to_placeholder(parts);
+                msg.content_parts = None;
+            }
+            ImageFallbackMode::Ocr => {
+                #[cfg(windows)]
+                {
+                    let rewritten = rewrite_parts_to_ocr_text(
+                        attachment_reader,
+                        parts,
+                        msg.image_ocr.as_deref(),
+                    )
+                        .await
+                        .map_err(AgentError::LLM)?;
+                    msg.content = rewritten;
+                    msg.content_parts = None;
+                }
+                #[cfg(not(windows))]
+                {
+                    log::info!(
+                        "OCR image fallback requested but OCR is currently Windows-only; leaving images intact."
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn ensure_session_image_ocr_cached(
+    session: &mut Session,
+    attachment_reader: Option<&dyn AttachmentReader>,
+) -> bool {
+    let Some(reader) = attachment_reader else {
+        return false;
+    };
+
+    let mut changed = false;
+
+    for msg in session.messages.iter_mut() {
+        let Some(parts) = msg.content_parts.as_ref() else {
+            continue;
+        };
+
+        let image_urls = persistable_image_urls(parts);
+        if image_urls.is_empty() {
+            continue;
+        }
+
+        let mut results = msg.image_ocr.take().unwrap_or_default();
+        for url in image_urls {
+            let already = results.iter().any(|r| r.image_url == url);
+            if already {
+                continue;
+            }
+
+            match ocr_image_url_to_lines(Some(reader), url.as_str()).await {
+                Ok(lines) => {
+                    results.push(ImageOcrResult {
+                        image_url: url,
+                        lines,
+                        error: None,
+                    });
+                }
+                Err(err) => {
+                    results.push(ImageOcrResult {
+                        image_url: url,
+                        lines: Vec::new(),
+                        error: Some(err),
+                    });
+                }
+            }
+            changed = true;
+        }
+
+        if results.is_empty() {
+            msg.image_ocr = None;
+        } else {
+            msg.image_ocr = Some(results);
+        }
+    }
+
+    changed
+}
+
+#[cfg(windows)]
+fn parse_data_url_base64(url: &str) -> Option<(String, String)> {
+    // data:<mime>;base64,<data...>
+    let trimmed = url.trim();
+    if !trimmed.starts_with("data:") {
+        return None;
+    }
+    let (header, data) = trimmed.split_once(',')?;
+    if !header.contains(";base64") {
+        return None;
+    }
+    let mime = header
+        .strip_prefix("data:")?
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream")
+        .trim()
+        .to_string();
+    Some((mime, data.trim().to_string()))
+}
+
+#[cfg(windows)]
+async fn rewrite_parts_to_ocr_text(
+    attachment_reader: Option<&dyn AttachmentReader>,
+    parts: &[ContentPart],
+    cached: Option<&[ImageOcrResult]>,
+) -> std::result::Result<String, String> {
+    let mut out = String::new();
+    let mut image_index = 0usize;
+
+    for part in parts.iter() {
+        match part {
+            ContentPart::Text { text } => out.push_str(text),
+            ContentPart::ImageUrl { image_url } => {
+                image_index += 1;
+                let summary = summarize_image_url(&image_url.url);
+
+                let cached_lines = cached.and_then(|items| {
+                    items
+                        .iter()
+                        .find(|r| r.image_url == image_url.url)
+                        .map(|r| (r.lines.as_slice(), r.error.as_deref()))
+                });
+
+                let ocr_result = if let Some((lines, err)) = cached_lines {
+                    if let Some(err) = err {
+                        Err(err.to_string())
+                    } else {
+                        Ok(lines.to_vec())
+                    }
+                } else {
+                    ocr_image_url_to_lines(attachment_reader, &image_url.url).await
+                };
+
+                match ocr_result {
+                    Ok(lines) if !lines.is_empty() => {
+                        out.push_str("\n\n[OCR extracted from image ");
+                        out.push_str(&image_index.to_string());
+                        out.push_str(": ");
+                        out.push_str(&summary);
+                        out.push_str("]\n");
+                        for l in lines {
+                            out.push_str(&format!(
+                                "({},{},{},{}) {}\n",
+                                l.left, l.top, l.width, l.height, l.text
+                            ));
+                        }
+                    }
+                    Ok(_) => {
+                        out.push_str("\n\n[OCR extracted from image ");
+                        out.push_str(&image_index.to_string());
+                        out.push_str(": ");
+                        out.push_str(&summary);
+                        out.push_str("]\n(no text detected)\n");
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "OCR failed for image {} ({}): {}",
+                            image_index,
+                            summary,
+                            err
+                        );
+                        out.push_str("\n[Image omitted: ");
+                        out.push_str(&summary);
+                        out.push_str("]\n");
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+#[cfg(windows)]
+async fn ocr_image_url_to_lines(
+    attachment_reader: Option<&dyn AttachmentReader>,
+    url: &str,
+) -> std::result::Result<Vec<ImageOcrLine>, String> {
+    let (mime, bytes) = if let Some((mime, data)) = parse_data_url_base64(url) {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data.as_bytes())
+            .map_err(|e| format!("invalid base64 data: {e}"))?;
+        (mime, bytes)
+    } else if let Some((session_id, attachment_id)) = parse_bamboo_attachment_url(url) {
+        let Some(reader) = attachment_reader else {
+            return Err(
+                "cannot resolve bamboo-attachment URL without an attachment reader".to_string(),
+            );
+        };
+        match reader
+            .read_attachment(session_id, attachment_id)
+            .await
+            .map_err(|e| format!("failed reading attachment: {e}"))?
+        {
+            Some((bytes, mime)) => (mime, bytes),
+            None => return Err("attachment not found".to_string()),
+        }
+    } else {
+        return Err("unsupported image URL (expected data: or bamboo-attachment:)".to_string());
+    };
+
+    if mime != "image/png" {
+        return Err(format!(
+            "unsupported mime type '{mime}' (only image/png is supported)"
+        ));
+    }
+
+    // Basic validation to avoid passing junk into the decoder.
+    const PNG_SIG: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+    if bytes.len() < PNG_SIG.len() || bytes[..PNG_SIG.len()] != PNG_SIG {
+        return Err("decoded data is not a PNG".to_string());
+    }
+
+    // rust_ocr currently expects a PNG file path (it uses BitmapDecoder::PngDecoderId()).
+    let tmp_path = std::env::temp_dir().join(format!("bamboo_ocr_{}.png", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp_path, &bytes).map_err(|e| format!("failed writing tmp png: {e}"))?;
+
+    // WinRT OCR can block; keep it off the async executor.
+    let tmp_path2 = tmp_path.clone();
+    let coords = tokio::task::spawn_blocking(move || {
+        // `rust_ocr` returns `Box<dyn Error>` which is not `Send`, so we must not
+        // return it across the thread boundary. Convert to `String` inside the
+        // blocking closure.
+        rust_ocr::ocr_with_bounds(tmp_path2, None).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("ocr task join failed: {e}"))?
+    .map_err(|e| format!("ocr failed: {e}"))?;
+
+    let _ = std::fs::remove_file(&tmp_path);
+
+    Ok(extract_line_candidates(coords))
+}
+
+#[cfg(windows)]
+fn extract_line_candidates(coords: Vec<rust_ocr::Coordinates>) -> Vec<ImageOcrLine> {
+    // `rust_ocr::ocr_with_bounds` yields word-level coordinates and then a line-level
+    // coordinate for each OCR line. We pick the line-level entries by matching them
+    // against the accumulated words for that line.
+    let mut out = Vec::new();
+    let mut current_words: Vec<String> = Vec::new();
+
+    for c in coords.into_iter() {
+        let text = c.text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+
+        if !current_words.is_empty() {
+            let joined = current_words.join(" ");
+            if normalize_ws(&joined) == normalize_ws(&text) {
+                out.push(ImageOcrLine {
+                    text,
+                    left: c.x.round() as i32,
+                    top: c.y.round() as i32,
+                    width: c.width.round() as i32,
+                    height: c.height.round() as i32,
+                });
+                current_words.clear();
+                continue;
+            }
+        }
+
+        current_words.push(text);
+    }
+
+    // Fallback: if we couldn't identify lines, emit a compact word list instead.
+    if out.is_empty() && !current_words.is_empty() {
+        out.push(ImageOcrLine {
+            text: current_words.join(" "),
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+        });
+    }
+
+    out
+}
+
+#[cfg(windows)]
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 fn parse_bamboo_attachment_url(url: &str) -> Option<(&str, &str)> {
     let trimmed = url.trim();
@@ -273,6 +665,26 @@ pub async fn run_agent_loop_with_config(
 
         let tool_schemas = resolve_available_tool_schemas(&config, tools.as_ref());
 
+        // If OCR fallback is enabled, compute + cache OCR results into the persisted session
+        // (but do NOT rewrite message parts). This keeps OCR available for the UI while
+        // also allowing the LLM request to be built from text-only projections.
+        #[cfg(windows)]
+        if matches!(
+            config.image_fallback,
+            Some(crate::agent::loop_module::config::ImageFallbackConfig {
+                mode: crate::agent::loop_module::config::ImageFallbackMode::Ocr
+            })
+        ) {
+            let changed = ensure_session_image_ocr_cached(session, config.attachment_reader.as_deref()).await;
+            if changed {
+                if let Some(ref storage) = config.storage {
+                    if let Err(e) = storage.save_session(session).await {
+                        log::warn!("[{}] Failed to save session after OCR caching: {}", session_id, e);
+                    }
+                }
+            }
+        }
+
         // Token budget preparation
         let budget = resolve_token_budget(session, &config, &model_name);
         let counter = HeuristicTokenCounter::default();
@@ -305,6 +717,17 @@ pub async fn run_agent_loop_with_config(
                 return Err(agent_error);
             }
         };
+
+        // Apply image fallback (placeholder / OCR / error) to the prepared LLM context only.
+        // This must never mutate the persisted session messages (UI should still show images).
+        if let Some(fallback) = config.image_fallback {
+            apply_image_fallback_to_llm_messages(
+                &mut prepared_context.messages,
+                fallback,
+                config.attachment_reader.as_deref(),
+            )
+            .await?;
+        }
 
         // Resolve `bamboo-attachment://...` URLs into `data:` URLs for upstream providers.
         // This must only mutate the prepared context (never the persisted session messages).
@@ -1220,8 +1643,9 @@ impl Timer {
 #[cfg(test)]
 mod tests {
     use super::{
-        merge_system_prompt_with_contexts, strip_existing_skill_context,
-        strip_existing_tool_guide_context, AgentLoopConfig,
+        apply_image_fallback_to_llm_messages, merge_system_prompt_with_contexts,
+        persistable_image_urls,
+        strip_existing_skill_context, strip_existing_tool_guide_context, AgentLoopConfig,
     };
 
     use std::sync::Arc;
@@ -1233,8 +1657,71 @@ mod tests {
 
     use crate::agent::core::tools::{FunctionCall, Tool, ToolError, ToolExecutionContext, ToolResult};
     use crate::agent::core::{Message, Session};
+    use crate::agent::loop_module::config::{ImageFallbackConfig, ImageFallbackMode};
+    use crate::agent::llm::models::{ContentPart, ImageUrl};
     use crate::agent::llm::{LLMChunk, LLMProvider, LLMStream};
     use crate::agent::tools::BuiltinToolExecutorBuilder;
+
+    #[test]
+    fn persistable_image_urls_filters_out_data_urls() {
+        let parts = vec![
+            ContentPart::Text {
+                text: "hello".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,AAAA".to_string(),
+                    detail: None,
+                },
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "bamboo-attachment://s1/a1".to_string(),
+                    detail: None,
+                },
+            },
+        ];
+
+        let urls = persistable_image_urls(&parts);
+        assert_eq!(urls, vec!["bamboo-attachment://s1/a1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn image_fallback_placeholder_does_not_mutate_persisted_session_messages() {
+        let parts = vec![
+            ContentPart::Text {
+                text: "这个内容有什么".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "bamboo-attachment://s1/a1".to_string(),
+                    detail: None,
+                },
+            },
+        ];
+
+        let mut session = Session::new("s1", "m");
+        session
+            .messages
+            .push(Message::user_with_parts("这个内容有什么", parts));
+
+        let mut llm_messages = session.messages.clone();
+        apply_image_fallback_to_llm_messages(
+            &mut llm_messages,
+            ImageFallbackConfig {
+                mode: ImageFallbackMode::Placeholder,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(session.messages[0].content_parts.is_some());
+        assert!(llm_messages[0].content_parts.is_none());
+        assert!(llm_messages[0]
+            .content
+            .contains("[Image omitted: bamboo-attachment://s1/a1]"));
+    }
 
     /// Regression test: tool calls executed inside the agent loop MUST receive a ToolExecutionContext
     /// with `session_id=Some(...)`. This is required by server-only tools like `spawn_session`.

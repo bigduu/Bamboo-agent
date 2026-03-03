@@ -166,6 +166,7 @@ impl FromProvider<GeminiContent> for Message {
             role,
             content: content_text,
             content_parts: None,
+            image_ocr: None,
             tool_calls: if tool_calls.is_empty() {
                 None
             } else {

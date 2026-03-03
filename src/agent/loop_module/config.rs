@@ -9,6 +9,18 @@ use crate::agent::metrics::MetricsCollector;
 use crate::agent::skill::SkillManager;
 use crate::agent::tools::ToolRegistry;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFallbackMode {
+    Placeholder,
+    Error,
+    Ocr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageFallbackConfig {
+    pub mode: ImageFallbackMode,
+}
+
 /// Configuration for the agent loop.
 pub struct AgentLoopConfig {
     pub max_rounds: usize,
@@ -30,6 +42,11 @@ pub struct AgentLoopConfig {
     pub model_name: Option<String>,
     /// Token budget for context management (optional, defaults to model's limits)
     pub token_budget: Option<TokenBudget>,
+    /// Optional image fallback behavior applied to *LLM requests only* (never persisted).
+    ///
+    /// This is intended for text-only provider paths where image parts must be degraded
+    /// (placeholder / OCR / error) without leaking into stored session history or UI.
+    pub image_fallback: Option<ImageFallbackConfig>,
 }
 
 impl Default for AgentLoopConfig {
@@ -47,6 +64,7 @@ impl Default for AgentLoopConfig {
             metrics_collector: None,
             model_name: None,
             token_budget: None,
+            image_fallback: None,
         }
     }
 }

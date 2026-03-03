@@ -11,7 +11,9 @@ use tokio::sync::mpsc;
 
 use crate::agent::core::agent::Role;
 use crate::agent::core::SessionKind;
-use crate::agent::loop_module::{run_agent_loop_with_config, AgentLoopConfig};
+use crate::agent::loop_module::{
+    run_agent_loop_with_config, AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode,
+};
 use crate::server::app_state::{AgentRunner, AgentStatus, AppState};
 
 /// Response returned after triggering agent execution.
@@ -159,20 +161,55 @@ pub async fn handler(
     let mut session = session.unwrap();
     let is_child_session = session.kind == SessionKind::Child;
 
-    // Apply preflight hooks (e.g. image OCR / fallback) before entering the agent loop.
-    // This ensures consistent behavior between proxy endpoints and agent execution.
+    // Snapshot server config for this execution.
+    //
+    // IMPORTANT: Do NOT rewrite `session.messages` here. Image fallback (placeholder/OCR)
+    // is intended for LLM request construction only. Persisted session history must keep
+    // the original multimodal parts so the frontend can render attachments.
     let config_snapshot = state.config.read().await.clone();
-    if let Err(e) = crate::server::message_hooks::apply_message_preflight_hooks(
-        Some(state.as_ref()),
-        &config_snapshot,
-        model.as_str(),
-        &mut session.messages,
-    )
-    .await
-    {
-        return HttpResponse::BadRequest().json(serde_json::json!({
-            "error": e.to_string()
-        }));
+    let image_fallback = if config_snapshot.hooks.image_fallback.enabled {
+        let mode_str = config_snapshot
+            .hooks
+            .image_fallback
+            .mode
+            .trim()
+            .to_ascii_lowercase();
+        let mode = match mode_str.as_str() {
+            "placeholder" => ImageFallbackMode::Placeholder,
+            "error" => ImageFallbackMode::Error,
+            "ocr" => ImageFallbackMode::Ocr,
+            other => {
+                return HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": format!("Invalid config: hooks.image_fallback.mode must be 'placeholder', 'error', or 'ocr' (got '{other}')")
+                }));
+            }
+        };
+        Some(ImageFallbackConfig { mode })
+    } else {
+        None
+    };
+
+    // Preserve previous semantics: in "error" mode, reject sessions containing images.
+    if matches!(
+        image_fallback,
+        Some(ImageFallbackConfig {
+            mode: ImageFallbackMode::Error
+        })
+    ) {
+        let images_seen = session
+            .messages
+            .iter()
+            .filter_map(|m| m.content_parts.as_ref())
+            .flat_map(|parts| parts.iter())
+            .filter(|p| matches!(p, crate::agent::llm::models::ContentPart::ImageUrl { .. }))
+            .count();
+        if images_seen > 0 {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!(
+                    "This server does not currently support image inputs (found {images_seen} image part(s)). Configure hooks.image_fallback.mode='placeholder' or 'ocr' to degrade gracefully."
+                )
+            }));
+        }
     }
 
     // Check if there's a pending user message
@@ -331,6 +368,7 @@ pub async fn handler(
                 attachment_reader: Some(state_clone.session_store.clone()),
                 metrics_collector: Some(state_clone.metrics_service.collector()),
                 model_name: Some(model),
+                image_fallback,
                 ..Default::default()
             },
         )

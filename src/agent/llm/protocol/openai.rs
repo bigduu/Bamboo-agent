@@ -45,6 +45,7 @@ impl FromProvider<OpenAIChatMessage> for Message {
             role,
             content,
             content_parts,
+            image_ocr: None,
             tool_calls,
             tool_call_id: msg.tool_call_id,
             created_at: chrono::Utc::now(),

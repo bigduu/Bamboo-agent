@@ -25,7 +25,7 @@ pub mod stream;
 pub mod todo_context;
 pub mod todo_evaluation;
 
-pub use config::AgentLoopConfig;
+pub use config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 pub use runner::{run_agent_loop, run_agent_loop_with_config};
 pub use todo_context::TodoLoopContext;
 pub use todo_evaluation::{evaluate_todo_progress, TodoEvaluationResult};
