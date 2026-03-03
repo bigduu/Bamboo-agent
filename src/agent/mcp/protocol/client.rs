@@ -81,8 +81,8 @@ impl McpProtocolClient {
 
                 match transport.receive().await {
                     Ok(Some(message)) => {
-                        // Raw inbound wire messages can be extremely noisy (e.g., keepalive pings).
-                        trace!("Received message: {}", message);
+                        // Raw inbound wire messages can be extremely noisy and may contain secrets.
+                        trace!("Received message (bytes={})", message.len());
                         if let Err(e) =
                             Self::handle_message(&message, &pending_requests, &notification_tx)
                                 .await
@@ -114,13 +114,22 @@ impl McpProtocolClient {
         if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(message) {
             let mut pending = pending_requests.write().await;
             if let Some(request) = pending.remove(&response.id) {
+                trace!("MCP JSON-RPC response matched (id={})", response.id);
                 let _ = request.sender.send(Ok(response));
+            } else {
+                // Common in transport/proxy bugs: responses arrive but the client never registered
+                // the request, or IDs got out of sync.
+                warn!("MCP JSON-RPC response had no pending request (id={})", response.id);
             }
             return Ok(());
         }
 
         // Try to parse as notification
         if let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(message) {
+            trace!(
+                "MCP JSON-RPC notification received (method={})",
+                notification.method
+            );
             let _ = notification_tx.send(notification).await;
             return Ok(());
         }
@@ -138,6 +147,10 @@ impl McpProtocolClient {
 
         let request = JsonRpcRequest::new(id, method, params);
         let request_json = serde_json::to_string(&request)?;
+        trace!(
+            "MCP JSON-RPC request send (id={}, method={}, timeout_ms={})",
+            id, method, timeout_ms
+        );
 
         let (tx, rx) = oneshot::channel();
         {
@@ -146,7 +159,15 @@ impl McpProtocolClient {
         }
 
         let transport = self.transport.read().await;
-        transport.send(request_json).await?;
+        if let Err(e) = transport.send(request_json).await {
+            // Avoid leaking pending requests on send failure.
+            self.pending_requests.write().await.remove(&id);
+            warn!(
+                "MCP JSON-RPC request send failed (id={}, method={}): {}",
+                id, method, e
+            );
+            return Err(e);
+        }
         drop(transport);
 
         match tokio::time::timeout(tokio::time::Duration::from_millis(timeout_ms), rx).await {
@@ -164,6 +185,10 @@ impl McpProtocolClient {
             Ok(Err(_)) => Err(McpError::Disconnected),
             Err(_) => {
                 self.pending_requests.write().await.remove(&id);
+                warn!(
+                    "MCP JSON-RPC request timed out (id={}, method={}, timeout_ms={})",
+                    id, method, timeout_ms
+                );
                 Err(McpError::Timeout(format!(
                     "Request {} timed out after {}ms",
                     id, timeout_ms
