@@ -226,6 +226,15 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 "/sessions/{session_id}/clear",
                 web::post().to(agent::sessions::clear_session),
             )
+            // Message management
+            .route(
+                "/sessions/{session_id}/messages/truncate",
+                web::post().to(agent::messages::truncate_messages),
+            )
+            .route(
+                "/sessions/{session_id}/messages/{message_id}",
+                web::delete().to(agent::messages::delete_message),
+            )
             .route(
                 "/sessions/{session_id}/attachments/{attachment_id}",
                 web::get().to(agent::sessions::get_attachment),

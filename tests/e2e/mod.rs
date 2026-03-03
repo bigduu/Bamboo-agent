@@ -16,6 +16,7 @@ mod execute;
 mod gemini;
 mod health;
 mod history;
+mod messages;
 mod integration_tests;
 mod mcp;
 mod metrics;
