@@ -5,6 +5,7 @@
 
 use actix_web::http::header;
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
+use std::time::Duration;
 
 use crate::agent::core::agent::events::TokenUsage;
 use crate::agent::core::AgentEvent;
@@ -216,22 +217,36 @@ pub async fn handler(
                 }
             }
 
+            // Some platforms (notably desktop/webview stacks in release mode) can terminate idle
+            // HTTP streams. Emit a small SSE comment heartbeat periodically to keep the
+            // connection alive even when the agent is "thinking" (no tokens yet).
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+            // Skip the immediate tick.
+            heartbeat.tick().await;
+
             loop {
-                match receiver.recv().await {
-                    Ok(event) => {
-                        let Ok(event_json) = serde_json::to_string(&event) else {
-                            continue;
-                        };
-                        let sse_data = format!("data: {}\n\n", event_json);
-                        yield Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(sse_data));
+                tokio::select! {
+                    _ = heartbeat.tick() => {
+                        yield Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(": heartbeat\n\n"));
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Best-effort stream; late subscribers can open history.
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        // Should not happen for long-lived session senders, but exit cleanly.
-                        break;
+                    recv = receiver.recv() => {
+                        match recv {
+                            Ok(event) => {
+                                let Ok(event_json) = serde_json::to_string(&event) else {
+                                    continue;
+                                };
+                                let sse_data = format!("data: {}\n\n", event_json);
+                                yield Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(sse_data));
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                // Best-effort stream; late subscribers can open history.
+                                continue;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                // Should not happen for long-lived session senders, but exit cleanly.
+                                break;
+                            }
+                        }
                     }
                 }
             }
