@@ -709,7 +709,8 @@ pub async fn execute_claude_code(
     state: web::Data<AppState>,
     req: web::Json<ExecuteRequest>,
 ) -> Result<HttpResponse, AppError> {
-    let Some(claude_path) = state.claude_cli_path.clone() else {
+    let claude_path = state.claude_cli_path.read().await.clone();
+    let Some(claude_path) = claude_path else {
         log::warn!("Claude Code CLI not available; refusing to execute");
         return Ok(HttpResponse::Ok().json(serde_json::json!({
             "success": false,

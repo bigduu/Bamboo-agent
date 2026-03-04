@@ -340,8 +340,11 @@ pub struct AppState {
     /// Registry for tracking external processes (e.g., Claude Code CLI sessions)
     pub process_registry: Arc<ProcessRegistry>,
 
-    /// Discovered Claude Code CLI binary path (if installed)
-    pub claude_cli_path: Option<String>,
+    /// Discovered Claude Code CLI binary path (if installed).
+    ///
+    /// This is resolved asynchronously after server startup to avoid blocking
+    /// core endpoints like `/v1/bamboo/setup/status`.
+    pub claude_cli_path: Arc<RwLock<Option<String>>>,
 
     /// Active Claude Code CLI runners indexed by Claude session ID
     ///
@@ -469,40 +472,53 @@ impl AppState {
             session_store.sessions_root_dir()
         );
 
-        // Discover Claude Code CLI once at startup. This is optional.
-        // We do it early so we can conditionally register the `claude_code` tool.
-        let claude_cli_path =
-            tokio::task::spawn_blocking(|| crate::claude::try_find_claude_binary())
-                .await
-                .ok()
-                .flatten();
-
-        if let Some(ref path) = claude_cli_path {
-            log::info!("Claude Code CLI enabled (found at: {})", path);
-        } else {
-            log::warn!("Claude Code CLI not found; Claude integration disabled");
-        }
-
         let config = Arc::new(RwLock::new(config));
+        let claude_cli_path: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
         // Initialize built-in tools (with optional Claude Code tool)
-        let builtin_executor =
-            crate::agent::tools::BuiltinToolExecutor::new_with_config(config.clone());
-        if let Some(ref path) = claude_cli_path {
-            if let Err(e) = builtin_executor.register_tool(
-                crate::agent::tools::tools::ClaudeCodeTool::new(path.clone()),
-            ) {
-                log::warn!("Failed to register claude_code tool: {}", e);
-            }
+        let builtin_executor = Arc::new(crate::agent::tools::BuiltinToolExecutor::new_with_config(
+            config.clone(),
+        ));
+        let builtin_tools: Arc<dyn ToolExecutor> = builtin_executor.clone();
+
+        // Optional integration: discover Claude Code CLI in the background so server startup
+        // is not blocked by PATH scanning / process invocations (e.g. `claude --version`).
+        {
+            let claude_cli_path = claude_cli_path.clone();
+            let builtin_executor = builtin_executor.clone();
+            tokio::spawn(async move {
+                let discovered =
+                    tokio::task::spawn_blocking(|| crate::claude::try_find_claude_binary())
+                        .await
+                        .ok()
+                        .flatten();
+
+                if let Some(path) = discovered {
+                    *claude_cli_path.write().await = Some(path.clone());
+                    log::info!("Claude Code CLI enabled (found at: {})", path);
+                    if let Err(e) = builtin_executor.register_tool(
+                        crate::agent::tools::tools::ClaudeCodeTool::new(path),
+                    ) {
+                        log::warn!("Failed to register claude_code tool: {}", e);
+                    }
+                } else {
+                    log::warn!("Claude Code CLI not found; Claude integration disabled");
+                }
+            });
         }
-        let builtin_tools: Arc<dyn ToolExecutor> = Arc::new(builtin_executor);
 
         // Initialize MCP manager (needs access to config to respect proxy for SSE transports).
         let mcp_manager = Arc::new(McpServerManager::new_with_config(config.clone()));
 
-        // Try to load MCP config and initialize servers
-        let mcp_config = config.read().await.mcp.clone();
-        mcp_manager.initialize_from_config(&mcp_config).await;
+        // Initialize MCP servers in the background so the HTTP API is responsive quickly.
+        {
+            let mcp_manager = mcp_manager.clone();
+            let config = config.clone();
+            tokio::spawn(async move {
+                let mcp_config = config.read().await.mcp.clone();
+                mcp_manager.initialize_from_config(&mcp_config).await;
+            });
+        }
 
         // Create composite tool executor (builtin + MCP)
         let mcp_tools = Arc::new(crate::agent::mcp::McpToolExecutor::new(

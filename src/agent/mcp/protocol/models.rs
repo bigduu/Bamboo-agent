@@ -297,6 +297,9 @@ pub struct ServerCapabilities {
 #[serde(rename_all = "camelCase")]
 pub struct PromptsCapability {
     /// If true, server sends "prompts/list_changed" notifications
+    ///
+    /// Some MCP servers omit this field; treat missing as `false`.
+    #[serde(default, alias = "list_changed")]
     pub list_changed: bool,
 }
 
@@ -313,8 +316,14 @@ pub struct PromptsCapability {
 #[serde(rename_all = "camelCase")]
 pub struct ResourcesCapability {
     /// If true, clients can subscribe to resource change notifications
+    ///
+    /// Some MCP servers omit this field; treat missing as `false`.
+    #[serde(default)]
     pub subscribe: bool,
     /// If true, server sends "resources/list_changed" notifications
+    ///
+    /// Some MCP servers omit this field; treat missing as `false`.
+    #[serde(default, alias = "list_changed")]
     pub list_changed: bool,
 }
 
@@ -330,6 +339,9 @@ pub struct ResourcesCapability {
 #[serde(rename_all = "camelCase")]
 pub struct ToolsCapability {
     /// If true, server sends "tools/list_changed" notifications
+    ///
+    /// Some MCP servers omit this field; treat missing as `false`.
+    #[serde(default, alias = "list_changed")]
     pub list_changed: bool,
 }
 
@@ -404,7 +416,11 @@ pub struct McpToolInfo {
     /// Human-readable tool description
     pub description: String,
     /// JSON Schema for tool input parameters
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "inputSchema",
+        alias = "input_schema",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub input_schema: Option<Value>,
 }
 
@@ -583,6 +599,39 @@ mod tests {
     }
 
     #[test]
+    fn test_tools_capability_missing_list_changed_defaults_false() {
+        let json = r#"{"tools": {}}"#;
+        let caps: ServerCapabilities = serde_json::from_str(json).unwrap();
+        assert!(caps.tools.is_some());
+        assert!(!caps.tools.unwrap().list_changed);
+    }
+
+    #[test]
+    fn test_tools_capability_accepts_snake_case_list_changed() {
+        let json = r#"{"tools": {"list_changed": true}}"#;
+        let caps: ServerCapabilities = serde_json::from_str(json).unwrap();
+        assert!(caps.tools.is_some());
+        assert!(caps.tools.unwrap().list_changed);
+    }
+
+    #[test]
+    fn test_resources_capability_missing_fields_defaults_false() {
+        let json = r#"{"resources": {}}"#;
+        let caps: ServerCapabilities = serde_json::from_str(json).unwrap();
+        let resources = caps.resources.unwrap();
+        assert!(!resources.subscribe);
+        assert!(!resources.list_changed);
+    }
+
+    #[test]
+    fn test_prompts_capability_missing_list_changed_defaults_false() {
+        let json = r#"{"prompts": {}}"#;
+        let caps: ServerCapabilities = serde_json::from_str(json).unwrap();
+        assert!(caps.prompts.is_some());
+        assert!(!caps.prompts.unwrap().list_changed);
+    }
+
+    #[test]
     fn test_implementation() {
         let impl_info = Implementation {
             name: "test".to_string(),
@@ -607,6 +656,24 @@ mod tests {
         assert_eq!(result.tools.len(), 1);
         assert_eq!(result.tools[0].name, "test_tool");
         assert_eq!(result.tools[0].description, "A test tool");
+    }
+
+    #[test]
+    fn test_mcp_tool_list_result_accepts_snake_case_input_schema() {
+        let json = r#"{
+            "tools": [
+                {
+                    "name": "test_tool",
+                    "description": "A test tool",
+                    "input_schema": {"type": "object"}
+                }
+            ]
+        }"#;
+        let result: McpToolListResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.tools.len(), 1);
+        assert_eq!(result.tools[0].name, "test_tool");
+        assert_eq!(result.tools[0].description, "A test tool");
+        assert!(result.tools[0].input_schema.is_some());
     }
 
     #[test]
