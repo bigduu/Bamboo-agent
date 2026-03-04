@@ -107,6 +107,11 @@ pub struct ToolInfo {
     pub original_name: String,
     /// Tool description
     pub description: String,
+    /// Tool input parameters schema (JSON Schema).
+    ///
+    /// This is surfaced so the UI can display expected arguments and help users
+    /// debug tool calls. It does not contain secrets.
+    pub parameters: serde_json::Value,
 }
 
 // ============================================================================
@@ -1000,6 +1005,7 @@ pub async fn list_tools(state: web::Data<AppState>) -> impl Responder {
                     server_id: alias.server_id,
                     original_name: alias.original_name,
                     description: tool.description,
+                    parameters: tool.parameters,
                 })
         })
         .collect();
@@ -1061,6 +1067,7 @@ pub async fn get_server_tools(
                             server_id: alias.server_id,
                             original_name: alias.original_name,
                             description: tool.description,
+                            parameters: tool.parameters,
                         })
                 })
                 .collect();
