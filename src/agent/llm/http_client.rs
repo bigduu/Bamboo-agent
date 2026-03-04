@@ -5,7 +5,7 @@
 
 use crate::agent::llm::provider::LLMError;
 use crate::core::Config;
-use reqwest::{Client, Proxy};
+use reqwest::{Client, NoProxy, Proxy};
 
 pub(crate) fn build_proxy(config: &Config) -> Result<Option<Proxy>, LLMError> {
     let http_proxy = config.http_proxy.trim();
@@ -25,6 +25,11 @@ pub(crate) fn build_proxy(config: &Config) -> Result<Option<Proxy>, LLMError> {
         proxy = proxy.basic_auth(&auth.username, &auth.password);
     }
 
+    // Safety: never proxy loopback requests. This avoids surprising failures when users
+    // run local OpenAI-compatible servers (e.g. localhost base_url) while having a
+    // corporate proxy configured.
+    proxy = proxy.no_proxy(NoProxy::from_string("localhost,127.0.0.1,::1"));
+
     Ok(Some(proxy))
 }
 
@@ -34,4 +39,25 @@ pub(crate) fn build_http_client(config: &Config) -> Result<Client, LLMError> {
         builder = builder.proxy(proxy);
     }
     Ok(builder.build()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_attaches_no_proxy_loopback_list() {
+        let mut cfg = Config::default();
+        cfg.http_proxy = "http://proxy.example.com:8080".to_string();
+
+        let proxy = build_proxy(&cfg).unwrap().expect("proxy");
+        let dbg = format!("{proxy:?}");
+
+        // We rely on reqwest's Debug output here because there is no public getter for the
+        // internal no-proxy matcher. This still guards against accidentally dropping the
+        // loopback bypass list during refactors.
+        assert!(dbg.contains("localhost"));
+        assert!(dbg.contains("127.0.0.1"));
+        assert!(dbg.contains("::1"));
+    }
 }
