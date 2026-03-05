@@ -1,11 +1,5 @@
 use log::{debug, info};
 
-// Windows: spawning console apps (including `cmd.exe`) from a GUI process (like Tauri)
-// can create a visible console window. We don't want that for Claude Code CLI runs
-// since we capture stdio and stream output in-app.
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-
 #[cfg(windows)]
 fn resolve_windows_program(program: &str) -> (String, Vec<String>) {
     use std::path::Path;
@@ -146,18 +140,9 @@ fn log_proxy_settings() {
 }
 
 pub fn create_command_with_env(program: &str) -> std::process::Command {
-    #[cfg(windows)]
-    use std::os::windows::process::CommandExt;
-
     let (exe, prefix_args) = resolve_windows_program(program);
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(prefix_args);
-
-    #[cfg(windows)]
-    {
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
     info!("Creating command for: {} (exec: {})", program, exe);
     for (key, value) in collect_inherited_env(program) {
         cmd.env(&key, &value);
@@ -167,19 +152,9 @@ pub fn create_command_with_env(program: &str) -> std::process::Command {
 }
 
 pub fn create_tokio_command_with_env(program: &str) -> tokio::process::Command {
-    #[cfg(windows)]
-    use std::os::windows::process::CommandExt;
-
     let (exe, prefix_args) = resolve_windows_program(program);
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.args(prefix_args);
-
-    #[cfg(windows)]
-    {
-        // tokio::process::Command exposes the underlying std::process::Command.
-        cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
-    }
-
     info!("Creating tokio command for: {} (exec: {})", program, exe);
     for (key, value) in collect_inherited_env(program) {
         cmd.env(&key, &value);
