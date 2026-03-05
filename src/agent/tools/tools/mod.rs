@@ -81,6 +81,7 @@ pub mod git_write;
 pub mod glob_search;
 pub mod http_request;
 pub mod list_directory;
+pub mod memory_note;
 pub mod read_file;
 pub mod read_file_range;
 pub mod registry;
@@ -125,6 +126,8 @@ pub use glob_search::GlobSearchTool;
 pub use http_request::HttpRequestTool;
 /// Tool for listing directory contents with optional filtering.
 pub use list_directory::ListDirectoryTool;
+/// Tool for reading/updating the persistent per-session memory note.
+pub use memory_note::MemoryNoteTool;
 /// Tool for reading entire file contents.
 pub use read_file::ReadFileTool;
 /// Tool for reading specific line ranges from a file.

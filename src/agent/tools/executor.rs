@@ -12,9 +12,9 @@ use crate::agent::tools::permission::{check_permissions, PermissionChecker, Perm
 use crate::agent::tools::tools::{
     ApplyPatchTool, AskUserTool, CreateTodoListTool, ExecuteCommandTool, FileExistsTool,
     GetCurrentDirTool, GetFileInfoTool, GitDiffTool, GitStatusTool, GitWriteTool, GlobSearchTool,
-    HttpRequestTool, ListDirectoryTool, ReadFileRangeTool, ReadFileTool, SearchInFileTool,
-    SearchInProjectTool, SetWorkspaceTool, SleepTool, TerminalSessionTool, ToolRegistry,
-    UpdateTodoItemTool, WriteFileTool,
+    HttpRequestTool, ListDirectoryTool, MemoryNoteTool, ReadFileRangeTool, ReadFileTool,
+    SearchInFileTool, SearchInProjectTool, SetWorkspaceTool, SleepTool, TerminalSessionTool,
+    ToolRegistry, UpdateTodoItemTool, WriteFileTool,
 };
 use crate::core::Config;
 use tokio::sync::RwLock;
@@ -24,7 +24,7 @@ use tokio::sync::RwLock;
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 22] = [
+pub const BUILTIN_TOOL_NAMES: [&str; 23] = [
     "read_file",
     "write_file",
     "list_directory",
@@ -47,6 +47,7 @@ pub const BUILTIN_TOOL_NAMES: [&str; 22] = [
     "http_request",
     "sleep",
     "terminal_session",
+    "memory_note",
 ];
 
 /// Normalizes a tool reference to a standard tool name
@@ -184,6 +185,9 @@ impl BuiltinToolExecutor {
         };
         let _ = registry.register(SleepTool::new());
         let _ = registry.register(TerminalSessionTool::new());
+
+        // Persistent external memory note (per session).
+        let _ = registry.register(MemoryNoteTool::new());
     }
 
     /// Returns all built-in tool schemas
