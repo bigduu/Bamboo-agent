@@ -160,7 +160,7 @@ fn map_index_entry(e: &SessionIndexEntry) -> serde_json::Value {
         "message_count": e.message_count,
         "has_attachments": e.has_attachments,
         "token_usage": e.token_usage,
-        // Expose rel_path so advanced workflows can inspect ~/.bamboo directly if needed.
+        // Expose rel_path so advanced workflows can inspect the Bamboo data dir directly if needed.
         "rel_path": e.rel_path,
     })
 }

@@ -7,7 +7,7 @@
 //! # Configuration File
 //!
 //! Configuration is stored in `config.json` under the unified data directory
-//! (defaults to `~/.bamboo/`). Environment variables can override file values.
+//! (defaults to `${HOME}/.bamboo/`). Environment variables can override file values.
 //!
 //! # Example (JSON)
 //!
@@ -35,7 +35,7 @@
 //!
 //! Configuration values are loaded in this order (later overrides earlier):
 //! 1. Code defaults (hardcoded default values)
-//! 2. Config file values (from `~/.bamboo/config.json`)
+//! 2. Config file values (from `${HOME}/.bamboo/config.json`)
 //! 3. Environment variables (e.g., `BAMBOO_PORT`)
 //! 4. CLI arguments (e.g., `--port 9000`)
 //!
@@ -371,7 +371,7 @@ fn default_workers() -> usize {
     10
 }
 
-/// Returns the default data directory (~/.bamboo)
+/// Returns the default data directory (`BAMBOO_DATA_DIR` or `${HOME}/.bamboo`)
 fn default_data_dir() -> PathBuf {
     super::paths::bamboo_dir()
 }
@@ -459,7 +459,7 @@ impl Config {
     ///
     /// # Arguments
     ///
-    /// * `data_dir` - Optional data directory path. If None, uses default (~/.bamboo)
+    /// * `data_dir` - Optional data directory path. If None, uses default (`BAMBOO_DATA_DIR` or `${HOME}/.bamboo`)
     pub fn from_data_dir(data_dir: Option<PathBuf>) -> Self {
         // Determine data_dir early (needed to find config file)
         let data_dir = data_dir
@@ -499,7 +499,7 @@ impl Config {
         config.hydrate_mcp_secrets_from_encrypted();
 
         // Legacy: `data_dir` is no longer a persisted config field. The data directory is
-        // derived from runtime (BAMBOO_DATA_DIR or ~/.bamboo).
+        // derived from runtime (BAMBOO_DATA_DIR or `${HOME}/.bamboo`).
         config.extra.remove("data_dir");
 
         // Apply environment variable overrides (highest priority)

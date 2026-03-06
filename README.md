@@ -137,17 +137,17 @@ Bamboo uses a simple, unified directory structure for all configuration and data
 
 ### 📁 Default Paths
 
-All Bamboo data is stored under `~/.bamboo/`:
-- **Config**: `~/.bamboo/config.json`
-- **Data**: `~/.bamboo/` (sessions, skills, workflows, etc.)
-- **Cache**: `~/.bamboo/cache/`
-- **Runtime**: `~/.bamboo/runtime/`
+All Bamboo data is stored under the data directory `BAMBOO_DATA_DIR` (default `${HOME}/.bamboo/`):
+- **Config**: `${BAMBOO_DATA_DIR}/config.json` (default `${HOME}/.bamboo/config.json`)
+- **Data**: `${BAMBOO_DATA_DIR}/` (sessions, skills, workflows, etc.)
+- **Cache**: `${BAMBOO_DATA_DIR}/cache/`
+- **Runtime**: `${BAMBOO_DATA_DIR}/runtime/`
 
 You can override the data directory with the `BAMBOO_DATA_DIR` environment variable.
 
 ### 📝 Configuration File
 
-Edit `~/.bamboo/config.json` (JSON format):
+Edit `${BAMBOO_DATA_DIR}/config.json` (JSON format):
 
 ```json
 {

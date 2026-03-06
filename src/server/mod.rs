@@ -26,7 +26,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), String> {
-//!     let app_data_dir = PathBuf::from("~/.bamboo");
+//!     let app_data_dir = PathBuf::from("/path/to/bamboo-data-dir");
 //!     run(app_data_dir, 3456).await
 //! }
 //! ```

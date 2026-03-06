@@ -4,7 +4,9 @@ use serde_json::json;
 use tokio::fs;
 
 /// Tool for reading file contents
-pub struct ReadFileTool;
+pub struct ReadFileTool {
+    description: String,
+}
 
 impl ReadFileTool {
     /// Create a new ReadFileTool instance.
@@ -13,7 +15,14 @@ impl ReadFileTool {
     /// Supports both absolute paths and tilde expansion (~ for home directory).
     /// Includes security checks to prevent path traversal attacks.
     pub fn new() -> Self {
-        Self
+        let bamboo_data_dir = crate::core::paths::bamboo_dir_display();
+        let description = format!(
+            "Read file content. Supports text files (txt, json, md, rs, etc.). \
+Path can be absolute (e.g., /Users/alice/workspace/file.txt) or use ~ for home directory (e.g., ~/notes.txt). \
+Bamboo data dir: {} (prefer paths under this directory).",
+            bamboo_data_dir
+        );
+        Self { description }
     }
 
     /// Expand ~ to home directory
@@ -55,7 +64,7 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read file content. Supports text files (txt, json, md, rs, etc.). Path can be absolute (e.g., /Users/bigduu/workspace/file.txt) or use ~ for home directory (e.g., ~/.bamboo/skills/my-skill/SKILL.md)"
+        &self.description
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

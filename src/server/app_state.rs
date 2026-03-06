@@ -95,8 +95,12 @@ pub const DEFAULT_BASE_PROMPT: &str =
     "You are a helpful AI assistant with access to various tools and skills.";
 
 /// Guidance for workspace-based interactions
-pub const WORKSPACE_PROMPT_GUIDANCE: &str =
-    "If you need to inspect files, check the workspace first, then ~/.bamboo.";
+pub fn workspace_prompt_guidance() -> String {
+    format!(
+        "If you need to inspect files, check the workspace first, then {}.",
+        crate::core::paths::bamboo_dir_display()
+    )
+}
 
 /// Placeholder provider used when the configured provider cannot be initialized.
 ///
@@ -245,7 +249,7 @@ impl AgentRunner {
 /// | `metrics_service` | Usage metrics collection | Yes (Arc) |
 /// | `agent_runners` | Active agent executions | Yes (RwLock) |
 pub struct AppState {
-    /// Application data directory (typically ~/.bamboo)
+    /// Application data directory (configured via `BAMBOO_DATA_DIR`; default `${HOME}/.bamboo`)
     pub app_data_dir: PathBuf,
 
     /// Hot-reloadable application configuration
@@ -373,7 +377,7 @@ impl AppState {
     /// # Arguments
     ///
     /// * `bamboo_home_dir` - Bamboo home directory containing all application data.
-    ///                        This is the root directory (e.g., ~/.bamboo) that contains:
+    ///                        This is the root directory (e.g., `${HOME}/.bamboo`) that contains:
     ///                        - config.json: Configuration file
     ///                        - sessions/: Conversation history
     ///                        - skills/: Skill definitions
@@ -397,12 +401,16 @@ impl AppState {
     ///
     /// #[tokio::main]
     /// async fn main() {
-    ///     let state = AppState::new(PathBuf::from("/path/to/.bamboo")).await;
+    ///     let state = AppState::new(PathBuf::from("/path/to/bamboo-data-dir")).await;
     ///     let provider = state.get_provider().await;
     ///     let _models = provider.list_models().await.ok();
     /// }
     /// ```
     pub async fn new(bamboo_home_dir: PathBuf) -> Self {
+        // Ensure all helpers that rely on `core::paths::bamboo_dir()` see the same
+        // directory as the server runtime.
+        crate::core::paths::init_bamboo_dir(bamboo_home_dir.clone());
+
         // Load config from the specified data directory
         let config = Config::from_data_dir(Some(bamboo_home_dir.clone()));
 

@@ -1,0 +1,10 @@
+target
+.git
+.github
+docs
+tests
+examples
+**/*.md
+**/*.log
+.DS_Store
+

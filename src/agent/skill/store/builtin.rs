@@ -6,13 +6,13 @@ use crate::agent::skill::types::SkillDefinition;
 pub const INIT_SKILL_SCRIPT: &str = include_str!("builtin_scripts/init_skill.py");
 pub const VALIDATE_SKILL_SCRIPT: &str = include_str!("builtin_scripts/validate_skill.py");
 
-const SKILL_CREATOR_PROMPT: &str = r#"# Skill Creator
+const SKILL_CREATOR_PROMPT_TEMPLATE: &str = r#"# Skill Creator
 
 This skill provides guidance for creating effective skills for Bamboo.
 
 ## About Skills
 
-Skills are modular, self-contained folders that extend Bamboo's capabilities by providing specialized knowledge and workflows. They are stored in `~/.bamboo/skills/` as individual folders.
+Skills are modular, self-contained folders that extend Bamboo's capabilities by providing specialized knowledge and workflows. They are stored in `<SKILLS_DIR>/` as individual folders.
 
 ### What Skills Provide
 
@@ -61,7 +61,7 @@ skill-name/
 Skills can be organized in subdirectories for better organization:
 
 ```
-~/.bamboo/skills/
+<SKILLS_DIR>/
 ├── custom/
 │   ├── my-api-helper/
 │   │   └── SKILL.md
@@ -71,7 +71,7 @@ Skills can be organized in subdirectories for better organization:
     └── SKILL.md
 ```
 
-The system recursively searches for all `SKILL.md` files in `~/.bamboo/skills/`. Any directory containing a `SKILL.md` file is considered a skill directory. The `id` in the frontmatter must match the directory name (the immediate parent of `SKILL.md`).
+The system recursively searches for all `SKILL.md` files in `<SKILLS_DIR>/`. Any directory containing a `SKILL.md` file is considered a skill directory. The `id` in the frontmatter must match the directory name (the immediate parent of `SKILL.md`).
 
 ### Bundled Resources
 
@@ -110,7 +110,7 @@ Analyze what reusable resources would help:
 Use the init script to create the skill:
 
 ```bash
-python3 ~/.bamboo/skills/skill-creator/scripts/init_skill.py <skill-name> --path ~/.bamboo/skills
+python3 <SKILLS_DIR>/skill-creator/scripts/init_skill.py <skill-name> --path <SKILLS_DIR>
 ```
 
 Options:
@@ -138,7 +138,7 @@ Options:
 Run the validator to check structure:
 
 ```bash
-python3 ~/.bamboo/skills/skill-creator/scripts/validate_skill.py ~/.bamboo/skills/<skill-name>
+python3 <SKILLS_DIR>/skill-creator/scripts/validate_skill.py <SKILLS_DIR>/<skill-name>
 ```
 
 ## Skill Naming
@@ -158,6 +158,12 @@ python3 ~/.bamboo/skills/skill-creator/scripts/validate_skill.py ~/.bamboo/skill
 5. **Keep descriptions clear** - This is how the system knows when to use your skill
 "#;
 
+fn skill_creator_prompt() -> String {
+    let skills_dir = crate::core::paths::bamboo_dir().join("skills");
+    let skills_dir_display = crate::core::paths::path_to_display_string(&skills_dir);
+    SKILL_CREATOR_PROMPT_TEMPLATE.replace("<SKILLS_DIR>", &skills_dir_display)
+}
+
 pub fn create_builtin_skills() -> Vec<SkillDefinition> {
     vec![
         SkillDefinition::new(
@@ -165,7 +171,7 @@ pub fn create_builtin_skills() -> Vec<SkillDefinition> {
             "Skill Creator",
             "Guide for creating effective skills for Bamboo. Use this skill when users want to create a new skill that extends Bamboo's capabilities with specialized knowledge, workflows, or tool integrations.",
             "system",
-            SKILL_CREATOR_PROMPT,
+            skill_creator_prompt(),
         )
         .with_tag("skills")
         .with_tag("development"),

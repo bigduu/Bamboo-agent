@@ -233,7 +233,7 @@ pub enum PermissionStorageError {
 /// Returns `None` if the Bamboo data directory cannot be determined.
 pub fn default_storage() -> Option<PermissionStorage> {
     // Keep storage consistent with the unified config.json location:
-    // all persisted state lives under `paths::bamboo_dir()` (BAMBOO_DATA_DIR or ~/.bamboo).
+    // all persisted state lives under `paths::bamboo_dir()` (BAMBOO_DATA_DIR or `${HOME}/.bamboo`).
     Some(PermissionStorage::new(crate::core::paths::bamboo_dir()))
 }
 

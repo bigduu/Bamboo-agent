@@ -4,10 +4,12 @@
 //! Eliminates the proxy pattern by using unified AppState
 
 use std::path::PathBuf;
+use std::net::TcpListener;
 
 use actix_files as fs;
 use actix_web::{web, App, HttpServer};
 use log::{error, info};
+use log::warn;
 use tokio::sync::oneshot;
 
 use crate::server::app_state::AppState;
@@ -15,6 +17,36 @@ use crate::server::config::{build_cors, build_security_headers};
 use crate::server::routes::{configure_routes, configure_routes_with_rate_limiting};
 
 const DEFAULT_WORKER_COUNT: usize = 10;
+
+fn resolve_worker_count() -> usize {
+    // Keep server-level worker configuration non-breaking by sourcing from env.
+    // The `bamboo` binary maps config/CLI into this env var before starting.
+    const ENV_KEY: &str = "BAMBOO_WORKERS";
+
+    match std::env::var(ENV_KEY) {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                warn!(
+                    "Invalid {} value '{}'; using default worker count {}",
+                    ENV_KEY, raw, DEFAULT_WORKER_COUNT
+                );
+                DEFAULT_WORKER_COUNT
+            }
+        },
+        Err(_) => DEFAULT_WORKER_COUNT,
+    }
+}
+
+fn try_make_listener(addr: &str) -> std::io::Result<TcpListener> {
+    let listener = TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+fn is_addr_in_use(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::AddrInUse
+}
 
 /// Run the unified server in desktop mode (localhost only, no rate limiting)
 ///
@@ -25,23 +57,43 @@ const DEFAULT_WORKER_COUNT: usize = 10;
 ///
 /// # Arguments
 /// * `bamboo_home_dir` - Bamboo home directory containing all app data (config, sessions, skills, etc.)
-///                       Equivalent to ~/.bamboo in standard installations.
+///                       Equivalent to `${HOME}/.bamboo` in standard installations.
 /// * `port` - Port to listen on
 pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
     info!("Starting unified server in desktop mode...");
 
     let app_state = web::Data::new(AppState::new(bamboo_home_dir.clone()).await);
+    let workers = resolve_worker_count();
 
-    let server = HttpServer::new(move || {
+    let app_factory = move || {
         App::new()
             .app_data(app_state.clone())
             .wrap(build_cors("127.0.0.1", port))
             .configure(configure_routes) // No rate limiting for desktop mode
-    })
-    .workers(DEFAULT_WORKER_COUNT)
-    .bind(format!("127.0.0.1:{port}"))
-    .map_err(|e| format!("Failed to bind server: {e}"))?
-    .run();
+    };
+
+    // Prefer explicit IPv4 bind, and opportunistically add IPv6 loopback.
+    let v4_addr = format!("127.0.0.1:{port}");
+    let v4 = try_make_listener(&v4_addr).map_err(|e| format!("Failed to bind listener {v4_addr}: {e}"))?;
+
+    let v6_addr = format!("[::1]:{port}");
+    let v6 = match try_make_listener(&v6_addr) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            warn!("IPv6 loopback bind skipped ({v6_addr}): {e}");
+            None
+        }
+    };
+
+    let mut http = HttpServer::new(app_factory).workers(workers);
+    http = http.listen(v4).map_err(|e| format!("Failed to listen on IPv4: {e}"))?;
+    if let Some(v6) = v6 {
+        http = http
+            .listen(v6)
+            .map_err(|e| format!("Failed to listen on IPv6: {e}"))?;
+    }
+
+    let server = http.run();
 
     info!("Unified server running on http://127.0.0.1:{port}");
 
@@ -63,19 +115,20 @@ pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
 ///
 /// # Arguments
 /// * `bamboo_home_dir` - Bamboo home directory containing all app data (config, sessions, skills, etc.)
-///                       Equivalent to ~/.bamboo in standard installations.
+///                       Equivalent to `${HOME}/.bamboo` in standard installations.
 /// * `port` - Port to listen on
 /// * `bind` - Bind address (127.0.0.1, 0.0.0.0, or custom)
 pub async fn run_with_bind(bamboo_home_dir: PathBuf, port: u16, bind: &str) -> Result<(), String> {
     info!("Starting unified server on {}:{}", bind, port);
 
     let app_state = web::Data::new(AppState::new(bamboo_home_dir.clone()).await);
+    let workers = resolve_worker_count();
 
     // Move bind_addr into the closure
     let bind_for_closure = bind.to_string();
     let bind_for_cors = bind.to_string();
 
-    let server = HttpServer::new(move || {
+    let app_factory = move || {
         App::new()
             // Request size limits to prevent DoS
             // Chat requests may include base64 images; keep limits high enough for local usage.
@@ -85,11 +138,69 @@ pub async fn run_with_bind(bamboo_home_dir: PathBuf, port: u16, bind: &str) -> R
             .wrap(build_cors(&bind_for_cors, port))
             .wrap(build_security_headers())
             .configure(configure_routes_with_rate_limiting) // Enable rate limiting
-    })
-    .workers(DEFAULT_WORKER_COUNT)
-    .bind(format!("{}:{}", bind_for_closure, port))
-    .map_err(|e| format!("Failed to bind server: {e}"))?
-    .run();
+    };
+
+    // Build listeners first so IPv6 is best-effort (never fatal when unsupported).
+    // - 127.0.0.1/localhost: add ::1 if available
+    // - 0.0.0.0: add [::] if available (and tolerate IPv4 AddrInUse when IPv6 binds dual-stack)
+    let mut listeners: Vec<TcpListener> = Vec::new();
+    let mut has_ipv6_any = false;
+
+    if bind_for_closure == "0.0.0.0" {
+        let v6_addr = format!("[::]:{port}");
+        match try_make_listener(&v6_addr) {
+            Ok(l) => {
+                has_ipv6_any = true;
+                listeners.push(l);
+            }
+            Err(e) => warn!("IPv6 any bind skipped ({v6_addr}): {e}"),
+        }
+
+        // IPv4 is still preferred for compatibility; tolerate AddrInUse when IPv6 bound dual-stack.
+        let v4_addr = format!("0.0.0.0:{port}");
+        match try_make_listener(&v4_addr) {
+            Ok(l) => listeners.push(l),
+            Err(e) => {
+                if has_ipv6_any && is_addr_in_use(&e) {
+                    warn!("IPv4 any bind skipped (already covered by IPv6 dual-stack?) ({v4_addr}): {e}");
+                } else {
+                    return Err(format!("Failed to bind listener {v4_addr}: {e}"));
+                }
+            }
+        }
+    } else if bind_for_closure == "127.0.0.1" || bind_for_closure == "localhost" {
+        let v4_addr = format!("127.0.0.1:{port}");
+        listeners.push(
+            try_make_listener(&v4_addr).map_err(|e| format!("Failed to bind listener {v4_addr}: {e}"))?,
+        );
+
+        let v6_addr = format!("[::1]:{port}");
+        match try_make_listener(&v6_addr) {
+            Ok(l) => listeners.push(l),
+            Err(e) => warn!("IPv6 loopback bind skipped ({v6_addr}): {e}"),
+        }
+    } else if bind_for_closure.contains(':') {
+        // Treat as IPv6 literal.
+        let addr = if bind_for_closure.starts_with('[') {
+            format!("{bind_for_closure}:{port}")
+        } else {
+            format!("[{bind_for_closure}]:{port}")
+        };
+        listeners.push(try_make_listener(&addr).map_err(|e| format!("Failed to bind listener {addr}: {e}"))?);
+    } else {
+        // IPv4 literal or hostname.
+        let addr = format!("{bind_for_closure}:{port}");
+        listeners.push(try_make_listener(&addr).map_err(|e| format!("Failed to bind listener {addr}: {e}"))?);
+    }
+
+    let mut http = HttpServer::new(app_factory).workers(workers);
+    for (idx, l) in listeners.into_iter().enumerate() {
+        http = http
+            .listen(l)
+            .map_err(|e| format!("Failed to attach listener #{idx}: {e}"))?;
+    }
+
+    let server = http.run();
 
     info!("Unified server running on http://{}:{}", bind, port);
 
@@ -109,7 +220,7 @@ pub async fn run_with_bind(bamboo_home_dir: PathBuf, port: u16, bind: &str) -> R
 ///
 /// # Arguments
 /// * `bamboo_home_dir` - Bamboo home directory containing all app data (config, sessions, skills, etc.)
-///                       Equivalent to ~/.bamboo in standard installations.
+///                       Equivalent to `${HOME}/.bamboo` in standard installations.
 /// * `port` - Port to listen on
 /// * `bind` - Bind address (127.0.0.1 for localhost, 0.0.0.0 for all interfaces)
 /// * `static_dir` - Optional directory containing built frontend files
@@ -150,13 +261,14 @@ pub async fn run_with_bind_and_static(
     };
 
     let app_state = web::Data::new(AppState::new(bamboo_home_dir.clone()).await);
+    let workers = resolve_worker_count();
 
     // Move bind_addr into the closure
     let bind_addr = bind.to_string();
     let bind_for_closure = bind_addr.clone();
     let bind_for_cors = bind_addr.clone();
 
-    let server = HttpServer::new(move || {
+    let app_factory = move || {
         let mut app = App::new()
             // Request size limits to prevent DoS
             // Chat requests may include base64 images; keep limits high enough for local usage.
@@ -186,11 +298,62 @@ pub async fn run_with_bind_and_static(
         }
 
         app
-    })
-    .workers(DEFAULT_WORKER_COUNT)
-    .bind(format!("{}:{}", bind_for_closure, port))
-    .map_err(|e| format!("Failed to bind server: {e}"))?
-    .run();
+    };
+
+    // Same listener strategy as `run_with_bind` (best-effort IPv6).
+    let mut listeners: Vec<TcpListener> = Vec::new();
+    let mut bound_ipv6_any = false;
+
+    if bind_for_closure == "0.0.0.0" {
+        let v6_addr = format!("[::]:{port}");
+        match try_make_listener(&v6_addr) {
+            Ok(l) => {
+                bound_ipv6_any = true;
+                listeners.push(l);
+            }
+            Err(e) => warn!("IPv6 any bind skipped ({v6_addr}): {e}"),
+        }
+
+        let v4_addr = format!("0.0.0.0:{port}");
+        match try_make_listener(&v4_addr) {
+            Ok(l) => listeners.push(l),
+            Err(e) => {
+                if bound_ipv6_any && is_addr_in_use(&e) {
+                    warn!("IPv4 any bind skipped (already covered by IPv6 dual-stack?) ({v4_addr}): {e}");
+                } else {
+                    return Err(format!("Failed to bind listener {v4_addr}: {e}"));
+                }
+            }
+        }
+    } else if bind_for_closure == "127.0.0.1" || bind_for_closure == "localhost" {
+        let v4_addr = format!("127.0.0.1:{port}");
+        listeners.push(try_make_listener(&v4_addr).map_err(|e| format!("Failed to bind listener {v4_addr}: {e}"))?);
+
+        let v6_addr = format!("[::1]:{port}");
+        match try_make_listener(&v6_addr) {
+            Ok(l) => listeners.push(l),
+            Err(e) => warn!("IPv6 loopback bind skipped ({v6_addr}): {e}"),
+        }
+    } else if bind_for_closure.contains(':') {
+        let addr = if bind_for_closure.starts_with('[') {
+            format!("{bind_for_closure}:{port}")
+        } else {
+            format!("[{bind_for_closure}]:{port}")
+        };
+        listeners.push(try_make_listener(&addr).map_err(|e| format!("Failed to bind listener {addr}: {e}"))?);
+    } else {
+        let addr = format!("{bind_for_closure}:{port}");
+        listeners.push(try_make_listener(&addr).map_err(|e| format!("Failed to bind listener {addr}: {e}"))?);
+    }
+
+    let mut http = HttpServer::new(app_factory).workers(workers);
+    for (idx, l) in listeners.into_iter().enumerate() {
+        http = http
+            .listen(l)
+            .map_err(|e| format!("Failed to attach listener #{idx}: {e}"))?;
+    }
+
+    let server = http.run();
 
     info!("Unified server running on http://{}:{}", bind, port);
 
@@ -218,7 +381,7 @@ impl WebService {
     /// Create a new WebService instance
     ///
     /// # Arguments
-    /// * `bamboo_home_dir` - Bamboo home directory (e.g., ~/.bamboo or custom path)
+    /// * `bamboo_home_dir` - Bamboo home directory (e.g., `${HOME}/.bamboo` or custom path)
     pub fn new(bamboo_home_dir: PathBuf) -> Self {
         Self {
             shutdown_tx: None,

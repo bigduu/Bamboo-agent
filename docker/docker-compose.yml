@@ -1,0 +1,30 @@
+services:
+  bamboo:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: bamboo-server:latest
+    container_name: bamboo
+    ports:
+      - "9562:9562"
+    environment:
+      - RUST_LOG=info
+      - BAMBOO_DATA_DIR=/data
+      - BAMBOO_PORT=9562
+      - BAMBOO_BIND=0.0.0.0
+      # Optional: override Actix-web worker threads (default: 10)
+      # - BAMBOO_WORKERS=10
+      # Comma-separated allowlist entries:
+      # - Exact origins: https://app.example.com, http://localhost:5173
+      # - Hosts (any scheme/port): app.example.com, 127.0.0.1
+      # - Wildcard subdomains: *.example.com
+      - BAMBOO_CORS_ALLOW_ORIGINS=
+    volumes:
+      # - bamboo-data:/data
+      # Optional: mount a config.json into the data dir (read-only)
+      - ~/.bamboo:/data
+    restart: unless-stopped
+
+volumes:
+  bamboo-data:
+    driver: local

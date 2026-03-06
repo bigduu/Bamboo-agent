@@ -12,7 +12,7 @@
 //! # Features
 //!
 //! - **Dual mode**: Binary (standalone server) or library (embedded)
-//! - **Unified directory**: All data in ~/.bamboo directory
+//! - **Unified directory**: All data in the Bamboo data directory (default `${HOME}/.bamboo`)
 //! - **Production-ready**: Built-in CORS, rate limiting, security headers
 //!
 //! # Quick Start
@@ -25,7 +25,7 @@
 #![allow(clippy::incompatible_msrv)]
 //!
 //! ```bash
-//! bamboo serve --port 9562 --data-dir ~/.bamboo
+//! bamboo serve --port 9562 --data-dir "$HOME/.bamboo"
 //! ```
 //!
 //! ## Library Mode
@@ -109,7 +109,7 @@ impl BambooServer {
 /// let server = BambooBuilder::new()
 ///     .port(9562)
 ///     .bind("127.0.0.1")
-///     .data_dir(PathBuf::from("~/.bamboo"))
+///     .data_dir(PathBuf::from("/path/to/bamboo-data-dir"))
 ///     .build()
 ///     .unwrap();
 /// ```

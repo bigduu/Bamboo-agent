@@ -27,7 +27,7 @@
 //!     // Create auth handler with data directory
 //!     let handler = CopilotAuthHandler::new(
 //!         client,
-//!         std::path::PathBuf::from("~/.bamboo"),
+//!         std::path::PathBuf::from("/path/to/bamboo-data-dir"),
 //!         false, // Set to true for CLI mode
 //!     );
 //!
@@ -377,7 +377,7 @@ lazy_static! {
 ///     let client = Arc::new(ClientWithMiddleware::new(/* ... */));
 ///     let handler = CopilotAuthHandler::new(
 ///         client,
-///         std::path::PathBuf::from("~/.bamboo"),
+///         std::path::PathBuf::from("/path/to/bamboo-data-dir"),
 ///         false,
 ///     );
 ///
@@ -421,7 +421,7 @@ impl CopilotAuthHandler {
     /// let client = Arc::new(ClientWithMiddleware::new(/* ... */));
     /// let handler = CopilotAuthHandler::new(
     ///     client,
-    ///     std::path::PathBuf::from("~/.bamboo"),
+    ///     std::path::PathBuf::from("/path/to/bamboo-data-dir"),
     ///     true, // CLI mode
     /// );
     /// ```

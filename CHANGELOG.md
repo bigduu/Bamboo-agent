@@ -77,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Documentation
 - **HIGH**: Fixed documentation drift in configuration module
-  - Updated config file location to `~/.bamboo/config.json` (was incorrectly showing XDG paths)
+  - Updated config file location to `${BAMBOO_DATA_DIR}/config.json` (default `${HOME}/.bamboo/config.json`; was incorrectly showing XDG paths)
   - Removed TOML format references (actual format is JSON only)
   - Fixed environment variable name: `BAMBOO_HEADLESS` (was incorrectly `BAMBOO_HEADLESS_AUTH`)
   - Removed mentions of `HTTP_PROXY`/`HTTPS_PROXY` (explicitly ignored by implementation)

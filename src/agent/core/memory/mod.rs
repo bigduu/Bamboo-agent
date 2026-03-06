@@ -23,7 +23,7 @@ impl ExternalMemory {
 
     /// Create with default settings.
     ///
-    /// Uses `~/.bamboo/notes` as the storage directory.
+    /// Uses the Bamboo data directory's `notes/` folder as the storage directory.
     pub fn with_defaults() -> Self {
         let notes_dir = crate::core::paths::bamboo_dir().join("notes");
         Self::new(notes_dir)

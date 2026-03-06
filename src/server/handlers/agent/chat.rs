@@ -305,7 +305,7 @@ fn build_enhanced_system_prompt(
         merged_prompt.push_str("\n\nWorkspace path: ");
         merged_prompt.push_str(workspace_path);
         merged_prompt.push('\n');
-        merged_prompt.push_str(crate::server::app_state::WORKSPACE_PROMPT_GUIDANCE);
+        merged_prompt.push_str(&crate::server::app_state::workspace_prompt_guidance());
     }
 
     merged_prompt
@@ -365,10 +365,12 @@ mod tests {
             Some("/tmp/workspace"),
         );
 
-        let workspace_segment =
-            "Workspace path: /tmp/workspace\nIf you need to inspect files, check the workspace first, then ~/.bamboo.";
+        let workspace_segment = format!(
+            "Workspace path: /tmp/workspace\n{}",
+            crate::server::app_state::workspace_prompt_guidance()
+        );
 
-        assert!(prompt.contains(workspace_segment));
+        assert!(prompt.contains(&workspace_segment));
     }
 
     #[test]

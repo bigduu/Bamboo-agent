@@ -46,7 +46,8 @@ impl ToolOutputManager {
 
     /// Create with default settings.
     ///
-    /// Uses `~/.bamboo/artifacts` as the storage directory and 1000 tokens as the limit.
+    /// Uses the Bamboo data directory's `artifacts/` folder as the storage directory and
+    /// 1000 tokens as the limit.
     pub fn with_defaults() -> Self {
         let artifacts_dir = crate::core::paths::bamboo_dir().join("artifacts");
         Self::new(artifacts_dir, 1000)

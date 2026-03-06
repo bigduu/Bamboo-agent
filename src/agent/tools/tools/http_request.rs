@@ -369,6 +369,8 @@ pub struct HttpResponse {
 impl HttpResponse {
     /// Format the response for display
     pub fn format(&self) -> String {
+        const MAX_BODY_DISPLAY_BYTES: usize = 10_000;
+
         let mut output = format!("HTTP Status: {}\n", self.status);
 
         if !self.headers.is_empty() {
@@ -381,8 +383,13 @@ impl HttpResponse {
         if !self.body.is_empty() {
             output.push_str("\nBody:\n");
             // Truncate if too long for display
-            if self.body.len() > 10000 {
-                output.push_str(&self.body[..10000]);
+            if self.body.len() > MAX_BODY_DISPLAY_BYTES {
+                // Avoid slicing in the middle of a UTF-8 code point.
+                let mut end = MAX_BODY_DISPLAY_BYTES;
+                while end > 0 && !self.body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                output.push_str(&self.body[..end]);
                 output.push_str("\n\n[Body truncated for display]");
             } else {
                 output.push_str(&self.body);
@@ -482,6 +489,26 @@ pub fn extract_domain_from_url(url: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn format_truncates_on_utf8_boundary() {
+        // Construct a string where byte index 10_000 falls inside a multi-byte char ("词").
+        let body = format!("{}词{}", "a".repeat(9_998), "b".repeat(200));
+        assert!(body.len() > 10_000);
+
+        let resp = HttpResponse {
+            status: 200,
+            headers: HashMap::new(),
+            body,
+        };
+
+        let formatted = resp.format();
+        assert!(formatted.contains("Body:\n"));
+        assert!(formatted.contains("[Body truncated for display]"));
+        // We should not include the partial multi-byte character.
+        assert!(!formatted.contains('词'));
+    }
 
     mod extract_domain_from_url_tests {
         use super::extract_domain_from_url;

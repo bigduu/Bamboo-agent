@@ -6,7 +6,7 @@ Usage:
     validate_skill.py <path/to/skill-folder>
 
 Examples:
-    validate_skill.py ~/.bamboo/skills/my-skill
+    validate_skill.py /path/to/bamboo-data-dir/skills/my-skill
 """
 
 import argparse

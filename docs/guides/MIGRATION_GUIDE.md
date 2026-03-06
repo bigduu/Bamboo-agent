@@ -182,7 +182,8 @@ let result = executor.execute(&tool_call).await;
 
 ### 4. Update Configuration
 
-Bamboo now uses a unified `~/.bamboo` directory for all configuration and data:
+Bamboo now uses a unified data directory for all configuration and data:
+- `BAMBOO_DATA_DIR` (default `${HOME}/.bamboo`)
 
 **Before:**
 ```rust

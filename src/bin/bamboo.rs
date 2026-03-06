@@ -67,9 +67,11 @@ async fn main() {
         } => {
             let bamboo_home_dir = data_dir
                 .clone()
-                .unwrap_or_else(|| bamboo_agent::core::paths::bamboo_dir());
+                .unwrap_or_else(|| bamboo_agent::core::paths::resolve_bamboo_dir());
+            // Stabilize the data dir for the lifetime of this process.
+            bamboo_agent::core::paths::init_bamboo_dir(bamboo_home_dir.clone());
             // Keep runtime path resolution consistent: most helpers derive their base dir from
-            // BAMBOO_DATA_DIR / ~/.bamboo via `core::paths::bamboo_dir()`.
+            // BAMBOO_DATA_DIR / `${HOME}/.bamboo` via `core::paths::bamboo_dir()`.
             std::env::set_var("BAMBOO_DATA_DIR", bamboo_home_dir.as_os_str());
 
             // Load config (with env var overrides already applied)
@@ -91,15 +93,32 @@ async fn main() {
                 config.server.workers = w;
             }
 
+            // Map config-level worker count into an env var that the server entrypoints can
+            // consume without requiring breaking signature changes.
+            if workers.is_some() || std::env::var("BAMBOO_WORKERS").is_err() {
+                std::env::set_var("BAMBOO_WORKERS", config.server.workers.to_string());
+            }
+
             // Start server using the unified config
             println!("Starting Bamboo server at {}", config.server_addr());
-            if let Err(e) = bamboo_agent::server::run_with_bind(
-                bamboo_home_dir,
-                config.server.port,
-                &config.server.bind,
-            )
-            .await
-            {
+            let result = if config.server.static_dir.is_some() {
+                bamboo_agent::server::run_with_bind_and_static(
+                    bamboo_home_dir,
+                    config.server.port,
+                    &config.server.bind,
+                    config.server.static_dir.clone(),
+                )
+                .await
+            } else {
+                bamboo_agent::server::run_with_bind(
+                    bamboo_home_dir,
+                    config.server.port,
+                    &config.server.bind,
+                )
+                .await
+            };
+
+            if let Err(e) = result {
                 eprintln!("Failed to start server: {}", e);
                 std::process::exit(1);
             }

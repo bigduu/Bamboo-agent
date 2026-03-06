@@ -27,9 +27,13 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
     context.push_str("1. Analyze the user's request\n");
     context
         .push_str("2. Match it against the available skills below based on their descriptions\n");
-    context.push_str(
-        "3. If there's a match, read the skill file (under BAMBOO_DATA_DIR; default ~/.bamboo): `read_file({\"path\": \"~/.bamboo/skills/<skill_id>/SKILL.md\"})`\n",
-    );
+
+    let skills_root = crate::core::paths::bamboo_dir().join("skills");
+    let skills_root_display = crate::core::paths::path_to_display_string(&skills_root);
+    context.push_str(&format!(
+        "3. If there's a match, read the skill file (skills dir: {}): `read_file({{\"path\": \"{}/<skill_id>/SKILL.md\"}})`\n",
+        skills_root_display, skills_root_display
+    ));
     context.push_str("4. Follow the instructions in the skill file to help the user\n\n");
     context.push_str("### Available Skills\n");
 
@@ -58,9 +62,10 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
         }
 
         // Tell AI where to find the full skill content
+        let skill_path = skills_root.join(&skill.id).join("SKILL.md");
         context.push_str(&format!(
-            "- Skill file (default): `~/.bamboo/skills/{}/SKILL.md`\n",
-            skill.id
+            "- Skill file: `{}`\n",
+            crate::core::paths::path_to_display_string(&skill_path)
         ));
     }
 
@@ -101,6 +106,13 @@ mod tests {
         assert!(context.contains("How to Use Skills"));
         assert!(context.contains("Match it against the available skills"));
         assert!(context.contains("read_file"));
+        let expected_skills_root = crate::core::paths::path_to_display_string(
+            &crate::core::paths::bamboo_dir().join("skills"),
+        );
+        assert!(context.contains(&format!(
+            "{}/<skill_id>/SKILL.md",
+            expected_skills_root
+        )));
 
         // Should contain skill metadata
         assert!(context.contains("Demo Skill"));
@@ -109,7 +121,15 @@ mod tests {
         assert!(context.contains("Category: demo"));
         assert!(context.contains("Tags: test"));
         assert!(context.contains("Provides tools: read_file"));
-        assert!(context.contains("Skill file (default): `~/.bamboo/skills/demo-skill/SKILL.md`"));
+        let expected_skill_path = crate::core::paths::bamboo_dir()
+            .join("skills")
+            .join("demo-skill")
+            .join("SKILL.md");
+        let expected_line = format!(
+            "Skill file: `{}`",
+            crate::core::paths::path_to_display_string(&expected_skill_path)
+        );
+        assert!(context.contains(&expected_line));
 
         // Should NOT contain the detailed prompt
         assert!(!context.contains("This detailed prompt should NOT appear"));

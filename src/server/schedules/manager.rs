@@ -126,7 +126,8 @@ fn build_system_prompt(base: &str, enhance: Option<&str>, workspace_path: Option
     }
     if let Some(path) = workspace_path.map(str::trim).filter(|v| !v.is_empty()) {
         let segment = format!(
-            "Workspace path: {path}\nIf you need to inspect files, check the workspace first, then ~/.bamboo."
+            "Workspace path: {path}\n{}",
+            crate::server::app_state::workspace_prompt_guidance()
         );
         if !prompt.is_empty() {
             prompt.push_str("\n\n");

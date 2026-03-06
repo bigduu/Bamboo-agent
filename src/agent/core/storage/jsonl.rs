@@ -16,7 +16,7 @@
 //! ```rust,ignore
 //! use bamboo_agent::agent::core::storage::jsonl::*;
 //!
-//! let storage = JsonlStorage::new("~/.bamboo/sessions");
+//! let storage = JsonlStorage::new("/path/to/bamboo-data-dir/sessions");
 //! storage.init().await?;
 //!
 //! // Save session
@@ -48,7 +48,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 /// # Example
 ///
 /// ```rust,ignore
-/// let storage = JsonlStorage::new("~/.bamboo/sessions");
+/// let storage = JsonlStorage::new("/path/to/bamboo-data-dir/sessions");
 /// storage.init().await?;
 ///
 /// storage.save_session(&session).await?;
@@ -70,7 +70,7 @@ impl JsonlStorage {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let storage = JsonlStorage::new("~/.bamboo/sessions");
+    /// let storage = JsonlStorage::new("/path/to/bamboo-data-dir/sessions");
     /// ```
     pub fn new(base_path: impl AsRef<Path>) -> Self {
         Self {

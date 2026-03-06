@@ -1,0 +1,17 @@
+{
+  "provider": "openai",
+  "http_proxy": "",
+  "https_proxy": "",
+  "server": {
+    "port": 9562,
+    "bind": "0.0.0.0"
+  },
+  "providers": {
+    "openai": {
+      "api_key": "your-openai-api-key-here",
+      "base_url": "https://api.openai.com/v1",
+      "model": "gpt-4o-mini"
+    }
+  }
+}
+

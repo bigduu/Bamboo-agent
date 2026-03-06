@@ -138,7 +138,7 @@ impl Default for SkillStoreConfig {
     fn default() -> Self {
         Self {
             // Keep runtime path resolution consistent across the codebase:
-            // use BAMBOO_DATA_DIR (or ~/.bamboo) as the single storage root.
+            // use BAMBOO_DATA_DIR (or `${HOME}/.bamboo`) as the single storage root.
             skills_dir: crate::core::paths::bamboo_dir().join("skills"),
         }
     }

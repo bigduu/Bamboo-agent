@@ -1,4 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+static BAMBOO_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Convert a filesystem path to a user-facing string.
 ///
@@ -23,8 +26,15 @@ pub fn path_to_display_string(path: &Path) -> String {
     s
 }
 
-/// Get Bamboo data directory (~/.bamboo)
-pub fn bamboo_dir() -> PathBuf {
+/// Resolve the Bamboo data directory from runtime configuration.
+///
+/// Order:
+/// 1) `BAMBOO_DATA_DIR` environment variable
+/// 2) `${HOME}/.bamboo`
+///
+/// Note: this does not consult the in-process global. Use [`bamboo_dir`] for the
+/// stabilized value after startup.
+pub fn resolve_bamboo_dir() -> PathBuf {
     std::env::var("BAMBOO_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -32,6 +42,30 @@ pub fn bamboo_dir() -> PathBuf {
                 .expect("Could not determine home directory")
                 .join(".bamboo")
         })
+}
+
+/// Initialize the global Bamboo data directory (set once per process).
+///
+/// Call this once during startup (e.g. in the binary entrypoint) so all modules
+/// read a consistent data dir even if the environment changes later.
+pub fn init_bamboo_dir(dir: PathBuf) {
+    // First call wins; subsequent calls are ignored to keep the value stable.
+    let _ = BAMBOO_DATA_DIR.set(dir);
+}
+
+/// Get Bamboo data directory (stabilized for the lifetime of the process).
+pub fn bamboo_dir() -> PathBuf {
+    // If initialized at startup, return the stabilized in-process value.
+    // Otherwise, fall back to resolving from the current environment/home.
+    BAMBOO_DATA_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(resolve_bamboo_dir)
+}
+
+/// A user-facing string for the stabilized Bamboo data directory.
+pub fn bamboo_dir_display() -> String {
+    path_to_display_string(&bamboo_dir())
 }
 
 /// Get config.json path (in data directory)
@@ -66,7 +100,7 @@ pub fn ensure_bamboo_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Get sessions directory (~/.bamboo/sessions)
+/// Get sessions directory (`{bamboo_dir}/sessions`)
 pub fn sessions_dir() -> PathBuf {
     bamboo_dir().join("sessions")
 }
@@ -95,10 +129,16 @@ pub fn save_config_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use std::sync::{Mutex, OnceLock};
 
     #[test]
-    fn test_sessions_dir_returns_bamboo_sessions() {
-        // Set BAMBOO_DATA_DIR for test
+    fn test_resolve_bamboo_dir_prefers_env() {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("ENV_LOCK poisoned");
+
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let bamboo_home = temp_dir.path().to_string_lossy().to_string();
 
@@ -107,11 +147,7 @@ mod tests {
 
         std::env::set_var("BAMBOO_DATA_DIR", &bamboo_home);
 
-        let sessions = sessions_dir();
-        let sessions_str = sessions.to_str().unwrap();
-
-        // Should end with /sessions
-        assert!(sessions_str.ends_with("sessions"));
+        assert_eq!(resolve_bamboo_dir(), PathBuf::from(&bamboo_home));
 
         // Restore original env
         if let Some(val) = original {
@@ -119,5 +155,10 @@ mod tests {
         } else {
             std::env::remove_var("BAMBOO_DATA_DIR");
         }
+    }
+
+    #[test]
+    fn test_sessions_dir_is_under_bamboo_dir() {
+        assert_eq!(sessions_dir(), bamboo_dir().join("sessions"));
     }
 }

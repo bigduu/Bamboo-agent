@@ -6,9 +6,9 @@ Usage:
     init_skill.py <skill-name> --path <path> [--resources scripts,references,assets] [--examples]
 
 Examples:
-    init_skill.py my-new-skill --path ~/.bamboo/skills
-    init_skill.py my-new-skill --path ~/.bamboo/skills --resources scripts,references
-    init_skill.py my-api-helper --path ~/.bamboo/skills --resources scripts --examples
+    init_skill.py my-new-skill --path /path/to/bamboo-data-dir/skills
+    init_skill.py my-new-skill --path /path/to/bamboo-data-dir/skills --resources scripts,references
+    init_skill.py my-api-helper --path /path/to/bamboo-data-dir/skills --resources scripts --examples
 """
 
 import argparse
@@ -208,7 +208,7 @@ def create_resource_dirs(skill_dir, skill_name, skill_title, resources, include_
 def init_skill(skill_name, path, resources, include_examples):
     """Initialize a new skill directory."""
     # On Windows, "~" is not expanded automatically by Path.resolve().
-    # Use expanduser() so `--path ~/.bamboo/skills` works cross-platform.
+    # Use expanduser() so `--path ~/bamboo/skills` works cross-platform.
     skills_root = Path(path).expanduser().resolve()
     skill_dir = skills_root / skill_name
 
