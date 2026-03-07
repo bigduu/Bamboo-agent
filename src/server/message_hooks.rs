@@ -25,7 +25,7 @@ pub async fn apply_message_preflight_hooks(
     state: Option<&AppState>,
     config: &Config,
     _model: &str,
-    messages: &mut Vec<Message>,
+    messages: &mut [Message],
 ) -> Result<(), HookError> {
     apply_image_fallback_hook(state, config, messages).await
 }
@@ -33,7 +33,7 @@ pub async fn apply_message_preflight_hooks(
 async fn apply_image_fallback_hook(
     state: Option<&AppState>,
     config: &Config,
-    messages: &mut Vec<Message>,
+    messages: &mut [Message],
 ) -> Result<(), HookError> {
     #[cfg(not(windows))]
     let _ = state;

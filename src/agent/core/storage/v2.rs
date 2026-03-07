@@ -298,9 +298,8 @@ impl SessionStoreV2 {
         raw_base64_or_data_url: &str,
         mime_hint: Option<&str>,
     ) -> io::Result<(String, String)> {
-        let (mime, base64_data) = parse_data_url_base64(raw_base64_or_data_url)
-            .map(|(mime, data)| (mime, data))
-            .unwrap_or_else(|| {
+        let (mime, base64_data) =
+            parse_data_url_base64(raw_base64_or_data_url).unwrap_or_else(|| {
                 (
                     mime_hint.unwrap_or("image/png").trim().to_string(),
                     raw_base64_or_data_url.trim().to_string(),
@@ -358,7 +357,7 @@ impl SessionStoreV2 {
             {
                 continue;
             }
-            let ext = file_name.split('.').last().unwrap_or("bin");
+            let ext = file_name.split('.').next_back().unwrap_or("bin");
             let mime = extension_to_mime(ext).unwrap_or("application/octet-stream");
             let bytes = fs::read(entry.path()).await?;
             return Ok(Some((bytes, mime.to_string())));

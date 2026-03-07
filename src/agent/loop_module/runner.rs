@@ -1546,13 +1546,11 @@ fn strip_existing_external_memory(prompt: &str) -> String {
 
 fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
     let mut out = String::new();
-    let mut count = 0usize;
-    for ch in value.chars() {
+    for (count, ch) in value.chars().enumerate() {
         if count >= max_chars {
             return (out, true);
         }
         out.push(ch);
-        count += 1;
     }
     (out, false)
 }

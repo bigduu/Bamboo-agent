@@ -19,7 +19,7 @@ async fn atomic_write_json(path: &Path, bytes: Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ScheduleRunConfig {
     /// Optional system prompt override for new sessions created by this schedule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -39,19 +39,6 @@ pub struct ScheduleRunConfig {
     /// If true, immediately execute the new session (only meaningful if `task_message` exists).
     #[serde(default)]
     pub auto_execute: bool,
-}
-
-impl Default for ScheduleRunConfig {
-    fn default() -> Self {
-        Self {
-            system_prompt: None,
-            task_message: None,
-            model: None,
-            workspace_path: None,
-            enhance_prompt: None,
-            auto_execute: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

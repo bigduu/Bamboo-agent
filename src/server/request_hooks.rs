@@ -25,14 +25,14 @@ pub fn apply_openai_preflight_hooks(
 
 pub fn apply_openai_preflight_hooks_to_messages(
     config: &Config,
-    messages: &mut Vec<ChatMessage>,
+    messages: &mut [ChatMessage],
 ) -> Result<(), HookError> {
     apply_image_fallback_hook(config, messages)
 }
 
 fn apply_image_fallback_hook(
     config: &Config,
-    messages: &mut Vec<ChatMessage>,
+    messages: &mut [ChatMessage],
 ) -> Result<(), HookError> {
     let hook_cfg = &config.hooks.image_fallback;
     if !hook_cfg.enabled {

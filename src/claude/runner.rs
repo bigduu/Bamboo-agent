@@ -189,7 +189,7 @@ pub async fn spawn_claude_code_cli(
                     let _ = registry.kill_process(run_id).await;
                     Err("cancelled".to_string())
                 }
-                s = wait_fut => s.map_err(|e| e),
+                s = wait_fut => s,
             };
 
             // Ensure we emit a terminal event if Claude didn't provide one.

@@ -506,17 +506,12 @@ pub struct Session {
 ///
 /// - `root`: user-facing main session (can spawn child sessions)
 /// - `child`: sub session spawned from a root (cannot spawn further)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionKind {
+    #[default]
     Root,
     Child,
-}
-
-impl Default for SessionKind {
-    fn default() -> Self {
-        Self::Root
-    }
 }
 
 impl Session {

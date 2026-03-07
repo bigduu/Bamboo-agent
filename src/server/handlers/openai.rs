@@ -292,7 +292,7 @@ fn responses_input_to_chat_messages(
                     "input_image" | "image_url" => {
                         if let Some(url) = pobj
                             .get("image_url")
-                            .and_then(|v| v.get("url").or_else(|| Some(v)))
+                            .and_then(|v| v.get("url").or(Some(v)))
                             .and_then(|v| v.as_str())
                         {
                             out_parts.push(ContentPart::ImageUrl {

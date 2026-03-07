@@ -497,11 +497,10 @@ impl AppState {
             let claude_cli_path = claude_cli_path.clone();
             let builtin_executor = builtin_executor.clone();
             tokio::spawn(async move {
-                let discovered =
-                    tokio::task::spawn_blocking(|| crate::claude::try_find_claude_binary())
-                        .await
-                        .ok()
-                        .flatten();
+                let discovered = tokio::task::spawn_blocking(crate::claude::try_find_claude_binary)
+                    .await
+                    .ok()
+                    .flatten();
 
                 if let Some(path) = discovered {
                     *claude_cli_path.write().await = Some(path.clone());

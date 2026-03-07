@@ -67,7 +67,7 @@ async fn main() {
         } => {
             let bamboo_home_dir = data_dir
                 .clone()
-                .unwrap_or_else(|| bamboo_agent::core::paths::resolve_bamboo_dir());
+                .unwrap_or_else(bamboo_agent::core::paths::resolve_bamboo_dir);
             // Stabilize the data dir for the lifetime of this process.
             bamboo_agent::core::paths::init_bamboo_dir(bamboo_home_dir.clone());
             // Keep runtime path resolution consistent: most helpers derive their base dir from
