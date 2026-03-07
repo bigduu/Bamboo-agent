@@ -3,6 +3,11 @@ name: Publish Crate
 on:
   workflow_dispatch:
     inputs:
+      version:
+        description: "Override crate version to publish (for example: 2026.3.9). Leave empty or 'latest' to use Cargo.toml."
+        required: false
+        default: ""
+        type: string
       dry_run:
         description: "Run cargo publish --dry-run only"
         required: false
@@ -20,6 +25,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set crate version (workflow override)
+        if: github.event.inputs.version != '' && github.event.inputs.version != 'latest'
+        shell: bash
+        run: |
+          TARGET_VERSION="${{ github.event.inputs.version }}"
+          sed -i.bak -E '0,/^version = "[^"]+"/s//version = "'"${TARGET_VERSION}"'"/' Cargo.toml
+          rm -f Cargo.toml.bak
+          echo "Using crate version override: ${TARGET_VERSION}"
+          grep '^version = ' Cargo.toml | head -1
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
