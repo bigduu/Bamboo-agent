@@ -24,6 +24,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-publish-crate-${{ runner.os }}
+          cache-on-failure: true
+
       - name: Resolve crate version
         id: version
         run: |

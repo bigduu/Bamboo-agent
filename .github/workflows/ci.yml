@@ -19,23 +19,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v3
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v3
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target directory
-        uses: actions/cache@v3
-        with:
-          path: target
-          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: bamboo-ci-test-${{ runner.os }}
+          cache-on-failure: true
 
       - name: Run tests
         run: cargo test --all-features --lib --tests
@@ -52,23 +40,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v3
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v3
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target directory
-        uses: actions/cache@v3
-        with:
-          path: target
-          key: ${{ runner.os }}-e2e-target-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: bamboo-ci-e2e-${{ runner.os }}
+          cache-on-failure: true
 
       - name: Run E2E tests
         run: cargo test --test e2e_tests --all-features
@@ -83,6 +59,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-lint-${{ runner.os }}
+          cache-on-failure: true
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -102,6 +84,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-build-${{ matrix.os }}
+          cache-on-failure: true
+
       - name: Build
         run: cargo build --release --verbose
 
@@ -114,6 +102,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-docs-${{ runner.os }}
+          cache-on-failure: true
+
       - name: Build documentation
         run: cargo doc --no-deps
 
@@ -125,6 +119,12 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-security-${{ runner.os }}
+          cache-on-failure: true
 
       - name: Install cargo-audit
         run: cargo install cargo-audit

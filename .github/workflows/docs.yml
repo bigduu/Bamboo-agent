@@ -21,23 +21,11 @@ jobs:
         with:
           components: rust-docs
 
-      - name: Cache cargo registry
-        uses: actions/cache@v3
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v3
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target directory
-        uses: actions/cache@v3
-        with:
-          path: target
-          key: ${{ runner.os }}-docs-target-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: bamboo-docs-${{ runner.os }}
+          cache-on-failure: true
 
       - name: Build documentation
         run: cargo doc --no-deps --all-features --document-private-items
