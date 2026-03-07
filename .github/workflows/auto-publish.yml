@@ -1,10 +1,7 @@
 name: Auto Publish
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - 'Cargo.toml'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
