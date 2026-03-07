@@ -478,10 +478,7 @@ impl Config {
                         config
                     })
                     .unwrap_or_else(|e| {
-                        log::warn!(
-                            "Failed to parse config.json ({}), using defaults",
-                            e
-                        );
+                        log::warn!("Failed to parse config.json ({}), using defaults", e);
                         Self::create_default()
                     })
             } else {
@@ -841,7 +838,6 @@ impl Config {
 
         Ok(())
     }
-
 }
 
 fn write_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
@@ -869,7 +865,6 @@ fn write_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp_path, path)?;
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {

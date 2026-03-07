@@ -4,11 +4,11 @@
 //! They may depend on `AppState` components (storage, schedulers, etc.).
 
 pub mod overlay_executor;
-pub mod session_inspector;
 pub mod schedule_tasks;
+pub mod session_inspector;
 pub mod spawn_session;
 
 pub use overlay_executor::OverlayToolExecutor;
-pub use session_inspector::SessionInspectorTool;
 pub use schedule_tasks::ScheduleTasksTool;
+pub use session_inspector::SessionInspectorTool;
 pub use spawn_session::SpawnSessionTool;

@@ -19,7 +19,12 @@ struct PostResponse {
 
 #[async_trait]
 trait PostClient: Send + Sync {
-    async fn post_json(&self, url: String, headers: HeaderMap, body: String) -> Result<PostResponse>;
+    async fn post_json(
+        &self,
+        url: String,
+        headers: HeaderMap,
+        body: String,
+    ) -> Result<PostResponse>;
 }
 
 #[derive(Clone)]
@@ -29,7 +34,12 @@ struct ReqwestPostClient {
 
 #[async_trait]
 impl PostClient for ReqwestPostClient {
-    async fn post_json(&self, url: String, headers: HeaderMap, body: String) -> Result<PostResponse> {
+    async fn post_json(
+        &self,
+        url: String,
+        headers: HeaderMap,
+        body: String,
+    ) -> Result<PostResponse> {
         let response = self
             .client
             .post(&url)
@@ -249,7 +259,10 @@ impl McpTransport for SseTransport {
                 }
             }
             connected.store(false, Ordering::SeqCst);
-            warn!("SSE stream ended for {}", SseTransport::redact_url_for_log(&url));
+            warn!(
+                "SSE stream ended for {}",
+                SseTransport::redact_url_for_log(&url)
+            );
         });
 
         self.sse_handle = Some(handle);
@@ -389,9 +402,9 @@ impl McpTransport for SseTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
-    use async_trait::async_trait;
     use tokio::sync::Mutex;
     use tokio::time::Duration;
 
@@ -598,7 +611,11 @@ mod tests {
                 panic!("Unexpected POST call #{idx} to {url} (no mock step configured)")
             });
 
-            assert_eq!(url, step.expected_url, "Unexpected POST URL at step {}", idx);
+            assert_eq!(
+                url, step.expected_url,
+                "Unexpected POST URL at step {}",
+                idx
+            );
 
             if let Some(endpoint) = &step.set_endpoint_url {
                 let mut guard = self.endpoint_url.lock().await;
@@ -655,10 +672,7 @@ mod tests {
 
         transport.send("{}".to_string()).await.unwrap();
 
-        assert_eq!(
-            *seen_urls.lock().await,
-            vec![fallback_url, endpoint_url]
-        );
+        assert_eq!(*seen_urls.lock().await, vec![fallback_url, endpoint_url]);
     }
 
     #[tokio::test]

@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::agent::core::storage::{CleanupMode, CleanupResult, SessionIndexEntry};
 use crate::agent::core::{Message, Session};
-use crate::server::app_state::AppState;
 use crate::server::app_state::AgentStatus;
+use crate::server::app_state::AppState;
 
 #[derive(Debug, Serialize)]
 pub struct SessionSummary {
@@ -88,7 +88,12 @@ pub async fn create_session(
         .to_string();
 
     let mut session = Session::new(id.clone(), model);
-    if let Some(title) = req.title.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()) {
+    if let Some(title) = req
+        .title
+        .as_ref()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+    {
         session.title = title.to_string();
     }
     if let Some(prompt) = req
@@ -103,11 +108,9 @@ pub async fn create_session(
         session.add_message(Message::system(prompt.to_string()));
     }
 
-    state
-        .storage
-        .save_session(&session)
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to save session: {e}")))?;
+    state.storage.save_session(&session).await.map_err(|e| {
+        actix_web::error::ErrorInternalServerError(format!("Failed to save session: {e}"))
+    })?;
 
     {
         let mut sessions = state.sessions.write().await;
@@ -214,11 +217,9 @@ pub async fn patch_session(
     }
     session.updated_at = chrono::Utc::now();
 
-    state
-        .storage
-        .save_session(&session)
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to save session: {e}")))?;
+    state.storage.save_session(&session).await.map_err(|e| {
+        actix_web::error::ErrorInternalServerError(format!("Failed to save session: {e}"))
+    })?;
 
     // Update in-memory cache too.
     {
@@ -240,7 +241,9 @@ pub async fn clear_session(
         .session_store
         .clear_session(&session_id)
         .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to clear session: {e}")))?;
+        .map_err(|e| {
+            actix_web::error::ErrorInternalServerError(format!("Failed to clear session: {e}"))
+        })?;
 
     if !cleared {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({

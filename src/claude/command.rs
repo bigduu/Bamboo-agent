@@ -13,7 +13,11 @@ fn resolve_windows_program(program: &str) -> (String, Vec<String>) {
     let p = Path::new(program);
 
     let mut resolved = program.to_string();
-    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+    let ext = p
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
     if ext.is_empty() {
         // If the path exists as a file, prefer a sibling .exe/.cmd/.bat.

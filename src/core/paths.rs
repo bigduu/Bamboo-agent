@@ -128,8 +128,8 @@ pub fn save_config_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
 
     #[test]
     fn test_resolve_bamboo_dir_prefers_env() {

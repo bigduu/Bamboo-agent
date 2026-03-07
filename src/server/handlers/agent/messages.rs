@@ -77,11 +77,9 @@ pub async fn truncate_messages(
         session.conversation_summary = None;
         session.updated_at = Utc::now();
 
-        state
-            .storage
-            .save_session(&session)
-            .await
-            .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to save session: {e}")))?;
+        state.storage.save_session(&session).await.map_err(|e| {
+            actix_web::error::ErrorInternalServerError(format!("Failed to save session: {e}"))
+        })?;
 
         // Best-effort update in-memory cache too.
         {
@@ -145,11 +143,9 @@ pub async fn delete_message(
     session.conversation_summary = None;
     session.updated_at = Utc::now();
 
-    state
-        .storage
-        .save_session(&session)
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to save session: {e}")))?;
+    state.storage.save_session(&session).await.map_err(|e| {
+        actix_web::error::ErrorInternalServerError(format!("Failed to save session: {e}"))
+    })?;
 
     // Best-effort update in-memory cache too.
     {

@@ -12,14 +12,14 @@ use chrono::Utc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::core::storage::SessionStoreV2;
 use crate::agent::core::storage::Storage;
+use crate::agent::core::tools::ToolExecutor;
 use crate::agent::core::{AgentEvent, Role, Session, SessionKind};
-use crate::agent::loop_module::{run_agent_loop_with_config, AgentLoopConfig};
 use crate::agent::llm::LLMProvider;
+use crate::agent::loop_module::{run_agent_loop_with_config, AgentLoopConfig};
 use crate::agent::metrics::MetricsCollector;
 use crate::agent::skill::SkillManager;
-use crate::agent::core::tools::ToolExecutor;
-use crate::agent::core::storage::SessionStoreV2;
 use crate::server::app_state::{AgentRunner, AgentStatus};
 
 #[derive(Debug, Clone)]
@@ -92,7 +92,10 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
         .session_store
         .get_index_entry(&job.child_session_id)
         .await;
-    let child_title = child_entry.as_ref().map(|e| e.title.clone()).unwrap_or_default();
+    let child_title = child_entry
+        .as_ref()
+        .map(|e| e.title.clone())
+        .unwrap_or_default();
 
     // High-level start event.
     let _ = parent_tx.send(AgentEvent::SubSessionStarted {
@@ -214,7 +217,10 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
             let _ = child_tx_for_forwarder.send(event.clone());
 
             // store budget replay on runner (same behavior as execute handler)
-            if matches!(&event, crate::agent::core::AgentEvent::TokenBudgetUpdated { .. }) {
+            if matches!(
+                &event,
+                crate::agent::core::AgentEvent::TokenBudgetUpdated { .. }
+            ) {
                 let mut runners = agent_runners_for_status.write().await;
                 if let Some(runner) = runners.get_mut(&child_id_for_status) {
                     runner.last_budget_event = Some(event);

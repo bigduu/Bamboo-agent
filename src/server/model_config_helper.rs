@@ -16,8 +16,7 @@ pub fn get_default_model_from_config(config: &Config) -> Result<String, LLMError
                 .as_ref()
                 .and_then(|c| c.model.clone());
 
-            Ok(provider_model
-                .unwrap_or_else(|| "gpt-4o".to_string()))
+            Ok(provider_model.unwrap_or_else(|| "gpt-4o".to_string()))
         }
         "openai" => {
             let openai_config = config

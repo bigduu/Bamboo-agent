@@ -53,4 +53,3 @@ impl ToolExecutor for OverlayToolExecutor {
         tools
     }
 }
-

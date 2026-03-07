@@ -190,4 +190,3 @@ impl Tool for MemoryNoteTool {
         }
     }
 }
-

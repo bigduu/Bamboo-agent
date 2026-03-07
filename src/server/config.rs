@@ -341,7 +341,9 @@ pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
                 }
 
                 // Some setups might load the UI from the same port as the backend.
-                if o == format!("http://localhost:{port}") || o == format!("http://127.0.0.1:{port}") {
+                if o == format!("http://localhost:{port}")
+                    || o == format!("http://127.0.0.1:{port}")
+                {
                     return true;
                 }
 
@@ -430,14 +432,22 @@ mod tests {
         allow
             .exact_origins
             .insert("https://app.example.com".to_string());
-        allow.hosts.push(HostPattern::Exact("app2.example.com".to_string()));
+        allow
+            .hosts
+            .push(HostPattern::Exact("app2.example.com".to_string()));
         allow
             .hosts
             .push(HostPattern::Suffix(".example.net".to_string()));
 
         assert!(is_allowed_by_allowlist("https://app.example.com", &allow));
-        assert!(is_allowed_by_allowlist("https://app.example.com:443", &allow));
-        assert!(is_allowed_by_allowlist("http://app2.example.com:5173", &allow));
+        assert!(is_allowed_by_allowlist(
+            "https://app.example.com:443",
+            &allow
+        ));
+        assert!(is_allowed_by_allowlist(
+            "http://app2.example.com:5173",
+            &allow
+        ));
         assert!(is_allowed_by_allowlist("https://x.example.net", &allow));
         assert!(!is_allowed_by_allowlist("https://example.net", &allow));
         assert!(!is_allowed_by_allowlist("https://evil.com", &allow));

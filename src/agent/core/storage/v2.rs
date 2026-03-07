@@ -14,8 +14,8 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -24,8 +24,8 @@ use uuid::Uuid;
 
 use crate::agent::core::agent::{AgentEvent, Session, SessionKind};
 
-use super::Storage;
 use super::AttachmentReader;
+use super::Storage;
 
 fn other_io_error(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::Other, message.into())
@@ -105,12 +105,17 @@ impl SessionStoreV2 {
 
         let index = if index_path.exists() {
             let raw = fs::read_to_string(&index_path).await?;
-            serde_json::from_str(&raw).map_err(|e| other_io_error(format!("invalid sessions.json: {e}")))?
+            serde_json::from_str(&raw)
+                .map_err(|e| other_io_error(format!("invalid sessions.json: {e}")))?
         } else {
             let index = SessionsIndex::empty();
             // Persist immediately so "index is mandatory" holds from boot.
             let tmp = index_path.with_extension(format!("json.tmp.{}", Uuid::new_v4()));
-            fs::write(&tmp, serde_json::to_vec_pretty(&index).map_err(|e| other_io_error(e.to_string()))?).await?;
+            fs::write(
+                &tmp,
+                serde_json::to_vec_pretty(&index).map_err(|e| other_io_error(e.to_string()))?,
+            )
+            .await?;
             atomic_rename(&tmp, &index_path).await?;
             index
         };
@@ -148,8 +153,7 @@ impl SessionStoreV2 {
         let tmp = self
             .index_path
             .with_extension(format!("json.tmp.{}", Uuid::new_v4()));
-        let bytes =
-            serde_json::to_vec_pretty(index).map_err(|e| other_io_error(e.to_string()))?;
+        let bytes = serde_json::to_vec_pretty(index).map_err(|e| other_io_error(e.to_string()))?;
         fs::write(&tmp, bytes).await?;
         atomic_rename(&tmp, &self.index_path).await?;
         Ok(())
@@ -250,7 +254,11 @@ impl SessionStoreV2 {
         rd.next_entry().await.ok().flatten().is_some()
     }
 
-    async fn upsert_index_from_session(&self, session: &Session, rel_path: String) -> io::Result<()> {
+    async fn upsert_index_from_session(
+        &self,
+        session: &Session,
+        rel_path: String,
+    ) -> io::Result<()> {
         let has_attachments = self.compute_has_attachments(&session.id).await;
         let created_by_schedule_id = session
             .metadata
@@ -390,13 +398,17 @@ impl SessionStoreV2 {
         Ok(true)
     }
 
-    pub async fn cleanup(
-        &self,
-        mode: CleanupMode,
-        keep_pinned: bool,
-    ) -> io::Result<CleanupResult> {
+    pub async fn cleanup(&self, mode: CleanupMode, keep_pinned: bool) -> io::Result<CleanupResult> {
         // All decisions are index-only.
-        let entries = { self.index.read().await.sessions.values().cloned().collect::<Vec<_>>() };
+        let entries = {
+            self.index
+                .read()
+                .await
+                .sessions
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
 
         let pinned_child_roots: HashSet<String> = if keep_pinned {
             entries
@@ -516,14 +528,20 @@ impl SessionStoreV2 {
     /// If the session is a child, deletes only that child directory.
     ///
     /// `force=true` ignores pinned protection; callers must enforce confirmations at the API/UI layer.
-    pub async fn delete_session_recursive(&self, session_id: &str, force: bool) -> io::Result<bool> {
+    pub async fn delete_session_recursive(
+        &self,
+        session_id: &str,
+        force: bool,
+    ) -> io::Result<bool> {
         let entry = self.get_index_entry(session_id).await;
         let Some(entry) = entry else {
             return Ok(false);
         };
 
         if !force && entry.pinned {
-            return Err(other_io_error("refusing to delete pinned session without force"));
+            return Err(other_io_error(
+                "refusing to delete pinned session without force",
+            ));
         }
 
         match entry.kind {
@@ -655,8 +673,8 @@ impl Storage for SessionStoreV2 {
             return Ok(None);
         }
         let raw = fs::read_to_string(path).await?;
-        let session: Session =
-            serde_json::from_str(&raw).map_err(|e| other_io_error(format!("invalid session.json: {e}")))?;
+        let session: Session = serde_json::from_str(&raw)
+            .map_err(|e| other_io_error(format!("invalid session.json: {e}")))?;
         Ok(Some(session))
     }
 

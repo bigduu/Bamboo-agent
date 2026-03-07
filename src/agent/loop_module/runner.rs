@@ -14,16 +14,18 @@ use crate::agent::core::agent::events::{TokenBudgetUsage, TokenUsage};
 use crate::agent::core::budget::{
     prepare_hybrid_context, HeuristicTokenCounter, ModelLimitsRegistry, TokenBudget,
 };
+use crate::agent::core::storage::AttachmentReader;
 use crate::agent::core::tools::{
     handle_tool_result_with_agentic_support, parse_tool_args, ToolExecutor, ToolHandlingOutcome,
     ToolSchema,
 };
-use crate::agent::core::{AgentError, AgentEvent, ExternalMemory, Message, Session, TodoItemStatus};
+use crate::agent::core::{
+    AgentError, AgentEvent, ExternalMemory, Message, Session, TodoItemStatus,
+};
 #[cfg(windows)]
 use crate::agent::core::{ImageOcrLine, ImageOcrResult};
-use crate::agent::core::storage::AttachmentReader;
-use crate::agent::llm::LLMProvider;
 use crate::agent::llm::models::ContentPart;
+use crate::agent::llm::LLMProvider;
 use crate::agent::metrics::{
     MetricsCollector, RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
     TokenUsage as MetricsTokenUsage,
@@ -144,8 +146,8 @@ async fn apply_image_fallback_to_llm_messages(
                         parts,
                         msg.image_ocr.as_deref(),
                     )
-                        .await
-                        .map_err(AgentError::LLM)?;
+                    .await
+                    .map_err(AgentError::LLM)?;
                     msg.content = rewritten;
                     msg.content_parts = None;
                 }
@@ -678,11 +680,16 @@ pub async fn run_agent_loop_with_config(
                 mode: crate::agent::loop_module::config::ImageFallbackMode::Ocr
             })
         ) {
-            let changed = ensure_session_image_ocr_cached(session, config.attachment_reader.as_deref()).await;
+            let changed =
+                ensure_session_image_ocr_cached(session, config.attachment_reader.as_deref()).await;
             if changed {
                 if let Some(ref storage) = config.storage {
                     if let Err(e) = storage.save_session(session).await {
-                        log::warn!("[{}] Failed to save session after OCR caching: {}", session_id, e);
+                        log::warn!(
+                            "[{}] Failed to save session after OCR caching: {}",
+                            session_id,
+                            e
+                        );
                     }
                 }
             }
@@ -1738,8 +1745,8 @@ impl Timer {
 mod tests {
     use super::{
         apply_image_fallback_to_llm_messages, merge_system_prompt_with_contexts,
-        persistable_image_urls,
-        strip_existing_skill_context, strip_existing_tool_guide_context, AgentLoopConfig,
+        persistable_image_urls, strip_existing_skill_context, strip_existing_tool_guide_context,
+        AgentLoopConfig,
     };
 
     use std::sync::Arc;
@@ -1749,11 +1756,13 @@ mod tests {
     use tokio::sync::{mpsc, Mutex};
     use tokio_util::sync::CancellationToken;
 
-    use crate::agent::core::tools::{FunctionCall, Tool, ToolError, ToolExecutionContext, ToolResult};
+    use crate::agent::core::tools::{
+        FunctionCall, Tool, ToolError, ToolExecutionContext, ToolResult,
+    };
     use crate::agent::core::{Message, Session};
-    use crate::agent::loop_module::config::{ImageFallbackConfig, ImageFallbackMode};
     use crate::agent::llm::models::{ContentPart, ImageUrl};
     use crate::agent::llm::{LLMChunk, LLMProvider, LLMStream};
+    use crate::agent::loop_module::config::{ImageFallbackConfig, ImageFallbackMode};
     use crate::agent::tools::BuiltinToolExecutorBuilder;
 
     #[test]
@@ -1916,10 +1925,7 @@ mod tests {
 
         let provider = Arc::new(QueueProvider {
             queue: Mutex::new(vec![
-                vec![
-                    Ok(LLMChunk::ToolCalls(vec![tool_call])),
-                    Ok(LLMChunk::Done),
-                ],
+                vec![Ok(LLMChunk::ToolCalls(vec![tool_call])), Ok(LLMChunk::Done)],
                 vec![Ok(LLMChunk::Token("done".to_string())), Ok(LLMChunk::Done)],
             ]),
         });

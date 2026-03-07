@@ -23,8 +23,7 @@ pub fn create_temp_dir() -> TempDir {
 pub fn find_available_port() -> u16 {
     use std::net::TcpListener;
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .expect("Failed to bind to random port");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to random port");
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     port

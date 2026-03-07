@@ -27,7 +27,10 @@ impl SessionInspectorTool {
         }
     }
 
-    async fn load_session(&self, session_id: &str) -> Result<crate::agent::core::Session, ToolError> {
+    async fn load_session(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::agent::core::Session, ToolError> {
         match self.storage.load_session(session_id).await {
             Ok(Some(s)) => Ok(s),
             Ok(None) => Err(ToolError::Execution(format!(
@@ -122,7 +125,9 @@ fn normalize_contains(haystack: &str, needle: &str, case_sensitive: bool) -> boo
     if case_sensitive {
         haystack.contains(needle)
     } else {
-        haystack.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
+        haystack
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase())
     }
 }
 
@@ -243,7 +248,9 @@ impl Tool for SessionInspectorTool {
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let _caller_session_id = ctx.session_id.ok_or_else(|| {
-            ToolError::Execution("session_inspector requires a session_id in tool context".to_string())
+            ToolError::Execution(
+                "session_inspector requires a session_id in tool context".to_string(),
+            )
         })?;
 
         let parsed: SessionInspectorArgs = serde_json::from_value(args).map_err(|e| {
@@ -268,13 +275,24 @@ impl Tool for SessionInspectorTool {
 
                 let query = query.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty());
                 let kind = kind.as_ref().map(|v| v.trim().to_ascii_lowercase());
-                let parent_session_id = parent_session_id.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty());
-                let root_session_id = root_session_id.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty());
-                let created_by_schedule_id = created_by_schedule_id.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty());
+                let parent_session_id = parent_session_id
+                    .as_ref()
+                    .map(|v| v.trim())
+                    .filter(|v| !v.is_empty());
+                let root_session_id = root_session_id
+                    .as_ref()
+                    .map(|v| v.trim())
+                    .filter(|v| !v.is_empty());
+                let created_by_schedule_id = created_by_schedule_id
+                    .as_ref()
+                    .map(|v| v.trim())
+                    .filter(|v| !v.is_empty());
 
                 items.retain(|e| {
                     if let Some(q) = query {
-                        if !normalize_contains(&e.title, q, false) && !normalize_contains(&e.id, q, false) {
+                        if !normalize_contains(&e.title, q, false)
+                            && !normalize_contains(&e.id, q, false)
+                        {
                             return false;
                         }
                     }
@@ -339,7 +357,9 @@ impl Tool for SessionInspectorTool {
                 }
 
                 let Some(entry) = self.session_store.get_index_entry(&session_id).await else {
-                    return Err(ToolError::Execution(format!("session not found: {session_id}")));
+                    return Err(ToolError::Execution(format!(
+                        "session not found: {session_id}"
+                    )));
                 };
 
                 Ok(ToolResult {

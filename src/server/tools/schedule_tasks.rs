@@ -72,9 +72,15 @@ enum ScheduleTasksArgs {
         #[serde(default)]
         run_config: Option<ScheduleRunConfig>,
     },
-    Delete { schedule_id: String },
-    RunNow { schedule_id: String },
-    ListSessions { schedule_id: String },
+    Delete {
+        schedule_id: String,
+    },
+    RunNow {
+        schedule_id: String,
+    },
+    ListSessions {
+        schedule_id: String,
+    },
 }
 
 #[async_trait]
@@ -187,12 +193,7 @@ impl Tool for ScheduleTasksTool {
 
                 let created = self
                     .schedule_store
-                    .create_schedule(
-                        name,
-                        interval_seconds,
-                        enabled.unwrap_or(false),
-                        run_config,
-                    )
+                    .create_schedule(name, interval_seconds, enabled.unwrap_or(false), run_config)
                     .await
                     .map_err(|e| ToolError::Execution(format!("Failed to create schedule: {e}")))?;
                 Ok(ToolResult {
@@ -299,12 +300,13 @@ impl Tool for ScheduleTasksTool {
                     .schedule_store
                     .create_run_now(schedule_id.trim())
                     .await
-                    .map_err(|e| ToolError::Execution(format!("Failed to create run job: {e}")))? else {
-                        return Err(ToolError::Execution(format!(
-                            "Schedule not found: {}",
-                            schedule_id.trim()
-                        )));
-                    };
+                    .map_err(|e| ToolError::Execution(format!("Failed to create run job: {e}")))?
+                else {
+                    return Err(ToolError::Execution(format!(
+                        "Schedule not found: {}",
+                        schedule_id.trim()
+                    )));
+                };
 
                 let now = Utc::now();
                 self.schedule_manager
@@ -343,8 +345,7 @@ impl Tool for ScheduleTasksTool {
                     .filter(|e| e.created_by_schedule_id.as_deref() == Some(schedule_id.as_str()))
                     .map(|e| {
                         crate::server::handlers::agent::sessions::SessionSummary::from_entry(
-                            e,
-                            false,
+                            e, false,
                         )
                     })
                     .collect::<Vec<_>>();

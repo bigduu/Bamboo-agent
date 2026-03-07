@@ -246,7 +246,10 @@ struct OcrLine {
 }
 
 #[cfg(windows)]
-async fn ocr_image_url_to_lines(state: Option<&AppState>, url: &str) -> anyhow::Result<Vec<OcrLine>> {
+async fn ocr_image_url_to_lines(
+    state: Option<&AppState>,
+    url: &str,
+) -> anyhow::Result<Vec<OcrLine>> {
     let (mime, bytes) = if let Some((mime, data)) = parse_data_url_base64(url) {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(data.as_bytes())

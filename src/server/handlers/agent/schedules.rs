@@ -3,12 +3,12 @@
 use actix_web::{web, HttpResponse, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::server::app_state::AppState;
 use crate::server::app_state::AgentStatus;
-use std::collections::HashSet;
+use crate::server::app_state::AppState;
 use crate::server::model_config_helper::get_default_model_from_config;
 use crate::server::schedules::store::ScheduleRunConfig;
 use crate::server::schedules::{ScheduleEntry, ScheduleRunJob};
+use std::collections::HashSet;
 
 #[derive(Debug, Serialize)]
 pub struct ListSchedulesResponse {
@@ -82,9 +82,16 @@ pub async fn create_schedule(
 
     let created = state
         .schedule_store
-        .create_schedule(name, req.interval_seconds, req.enabled, req.run_config.clone())
+        .create_schedule(
+            name,
+            req.interval_seconds,
+            req.enabled,
+            req.run_config.clone(),
+        )
         .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to create schedule: {e}")))?;
+        .map_err(|e| {
+            actix_web::error::ErrorInternalServerError(format!("Failed to create schedule: {e}"))
+        })?;
 
     Ok(HttpResponse::Ok().json(created))
 }
@@ -155,7 +162,9 @@ pub async fn patch_schedule(
             req.run_config.clone(),
         )
         .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to patch schedule: {e}")))?;
+        .map_err(|e| {
+            actix_web::error::ErrorInternalServerError(format!("Failed to patch schedule: {e}"))
+        })?;
 
     match updated {
         Some(s) => Ok(HttpResponse::Ok().json(s)),
@@ -176,7 +185,9 @@ pub async fn delete_schedule(
         .schedule_store
         .delete_schedule(&id)
         .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to delete schedule: {e}")))?;
+        .map_err(|e| {
+            actix_web::error::ErrorInternalServerError(format!("Failed to delete schedule: {e}"))
+        })?;
 
     if deleted {
         Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))
@@ -189,21 +200,21 @@ pub async fn delete_schedule(
 }
 
 /// `POST /api/v1/schedules/{schedule_id}/run`
-pub async fn run_now(
-    state: web::Data<AppState>,
-    path: web::Path<String>,
-) -> Result<HttpResponse> {
+pub async fn run_now(state: web::Data<AppState>, path: web::Path<String>) -> Result<HttpResponse> {
     let id = path.into_inner();
     let Some(claimed) = state
         .schedule_store
         .create_run_now(&id)
         .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to create run job: {e}")))? else {
-            return Ok(HttpResponse::NotFound().json(serde_json::json!({
-                "error": "Schedule not found",
-                "schedule_id": id
-            })));
-        };
+        .map_err(|e| {
+            actix_web::error::ErrorInternalServerError(format!("Failed to create run job: {e}"))
+        })?
+    else {
+        return Ok(HttpResponse::NotFound().json(serde_json::json!({
+            "error": "Schedule not found",
+            "schedule_id": id
+        })));
+    };
 
     let now = chrono::Utc::now();
     state
@@ -215,7 +226,9 @@ pub async fn run_now(
             claimed_at: now,
         })
         .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to enqueue run: {e}")))?;
+        .map_err(|e| {
+            actix_web::error::ErrorInternalServerError(format!("Failed to enqueue run: {e}"))
+        })?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,

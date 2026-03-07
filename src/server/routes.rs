@@ -217,7 +217,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 "/sessions/cleanup",
                 web::post().to(agent::sessions::cleanup_sessions),
             )
-            .route("/sessions/{session_id}", web::get().to(agent::sessions::get_session))
+            .route(
+                "/sessions/{session_id}",
+                web::get().to(agent::sessions::get_session),
+            )
             .route(
                 "/sessions/{session_id}",
                 web::patch().to(agent::sessions::patch_session),
@@ -240,8 +243,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 web::get().to(agent::sessions::get_attachment),
             )
             // Schedules (timed tasks)
-            .route("/schedules", web::get().to(agent::schedules::list_schedules))
-            .route("/schedules", web::post().to(agent::schedules::create_schedule))
+            .route(
+                "/schedules",
+                web::get().to(agent::schedules::list_schedules),
+            )
+            .route(
+                "/schedules",
+                web::post().to(agent::schedules::create_schedule),
+            )
             .route(
                 "/schedules/{schedule_id}",
                 web::patch().to(agent::schedules::patch_schedule),

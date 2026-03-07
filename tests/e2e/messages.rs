@@ -23,14 +23,10 @@ async fn test_truncate_after_last_user() {
         .await
         .expect("save session");
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state.clone())
-            .route(
-                "/api/v1/sessions/{session_id}/messages/truncate",
-                web::post().to(messages::truncate_messages),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state.clone()).route(
+        "/api/v1/sessions/{session_id}/messages/truncate",
+        web::post().to(messages::truncate_messages),
+    ))
     .await;
 
     let req = test::TestRequest::post()
@@ -57,7 +53,10 @@ async fn test_truncate_after_last_user() {
         .expect("load session")
         .expect("session exists");
     assert_eq!(loaded.messages.len(), 4);
-    assert_eq!(loaded.messages.last().unwrap().role, bamboo_agent::agent::core::Role::User);
+    assert_eq!(
+        loaded.messages.last().unwrap().role,
+        bamboo_agent::agent::core::Role::User
+    );
     assert_eq!(loaded.messages.last().unwrap().content, "u2");
 }
 
@@ -79,14 +78,10 @@ async fn test_delete_message_persists() {
         .await
         .expect("save session");
 
-    let app = test::init_service(
-        App::new()
-            .app_data(state.clone())
-            .route(
-                "/api/v1/sessions/{session_id}/messages/{message_id}",
-                web::delete().to(messages::delete_message),
-            ),
-    )
+    let app = test::init_service(App::new().app_data(state.clone()).route(
+        "/api/v1/sessions/{session_id}/messages/{message_id}",
+        web::delete().to(messages::delete_message),
+    ))
     .await;
 
     let req = test::TestRequest::delete()

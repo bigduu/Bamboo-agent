@@ -119,7 +119,10 @@ impl McpProtocolClient {
             } else {
                 // Common in transport/proxy bugs: responses arrive but the client never registered
                 // the request, or IDs got out of sync.
-                warn!("MCP JSON-RPC response had no pending request (id={})", response.id);
+                warn!(
+                    "MCP JSON-RPC response had no pending request (id={})",
+                    response.id
+                );
             }
             return Ok(());
         }
@@ -149,7 +152,9 @@ impl McpProtocolClient {
         let request_json = serde_json::to_string(&request)?;
         trace!(
             "MCP JSON-RPC request send (id={}, method={}, timeout_ms={})",
-            id, method, timeout_ms
+            id,
+            method,
+            timeout_ms
         );
 
         let (tx, rx) = oneshot::channel();

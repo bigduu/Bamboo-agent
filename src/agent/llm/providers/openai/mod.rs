@@ -202,8 +202,7 @@ impl LLMProvider for OpenAIProvider {
         // Accept common formats:
         // - OpenAI: { object: "list", data: [{ id: "..." }, ...] }
         // - Alternative: { models: [...] } or ["id1", "id2"]
-        let models: Vec<String> = if let Some(data) = json.get("data").and_then(|d| d.as_array())
-        {
+        let models: Vec<String> = if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
             data.iter()
                 .filter_map(|model| {
                     model

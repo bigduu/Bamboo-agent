@@ -129,9 +129,9 @@ async fn session_inspector_search_tail_messages_finds_match() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m["type"].as_str() == Some("message_match") && m["session_id"].as_str() == Some("s2")),
+            .any(|m| m["type"].as_str() == Some("message_match")
+                && m["session_id"].as_str() == Some("s2")),
         "expected a message_match for s2, got: {}",
         out.result
     );
 }
-

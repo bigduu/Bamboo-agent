@@ -3,13 +3,13 @@
 //! Consolidates run(), run_with_bind(), WebService from web_service/server.rs
 //! Eliminates the proxy pattern by using unified AppState
 
-use std::path::PathBuf;
 use std::net::TcpListener;
+use std::path::PathBuf;
 
 use actix_files as fs;
 use actix_web::{web, App, HttpServer};
-use log::{error, info};
 use log::warn;
+use log::{error, info};
 use tokio::sync::oneshot;
 
 use crate::server::app_state::AppState;
@@ -74,7 +74,8 @@ pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
 
     // Prefer explicit IPv4 bind, and opportunistically add IPv6 loopback.
     let v4_addr = format!("127.0.0.1:{port}");
-    let v4 = try_make_listener(&v4_addr).map_err(|e| format!("Failed to bind listener {v4_addr}: {e}"))?;
+    let v4 = try_make_listener(&v4_addr)
+        .map_err(|e| format!("Failed to bind listener {v4_addr}: {e}"))?;
 
     let v6_addr = format!("[::1]:{port}");
     let v6 = match try_make_listener(&v6_addr) {
@@ -86,7 +87,9 @@ pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
     };
 
     let mut http = HttpServer::new(app_factory).workers(workers);
-    http = http.listen(v4).map_err(|e| format!("Failed to listen on IPv4: {e}"))?;
+    http = http
+        .listen(v4)
+        .map_err(|e| format!("Failed to listen on IPv4: {e}"))?;
     if let Some(v6) = v6 {
         http = http
             .listen(v6)
@@ -171,7 +174,8 @@ pub async fn run_with_bind(bamboo_home_dir: PathBuf, port: u16, bind: &str) -> R
     } else if bind_for_closure == "127.0.0.1" || bind_for_closure == "localhost" {
         let v4_addr = format!("127.0.0.1:{port}");
         listeners.push(
-            try_make_listener(&v4_addr).map_err(|e| format!("Failed to bind listener {v4_addr}: {e}"))?,
+            try_make_listener(&v4_addr)
+                .map_err(|e| format!("Failed to bind listener {v4_addr}: {e}"))?,
         );
 
         let v6_addr = format!("[::1]:{port}");
@@ -186,11 +190,15 @@ pub async fn run_with_bind(bamboo_home_dir: PathBuf, port: u16, bind: &str) -> R
         } else {
             format!("[{bind_for_closure}]:{port}")
         };
-        listeners.push(try_make_listener(&addr).map_err(|e| format!("Failed to bind listener {addr}: {e}"))?);
+        listeners.push(
+            try_make_listener(&addr).map_err(|e| format!("Failed to bind listener {addr}: {e}"))?,
+        );
     } else {
         // IPv4 literal or hostname.
         let addr = format!("{bind_for_closure}:{port}");
-        listeners.push(try_make_listener(&addr).map_err(|e| format!("Failed to bind listener {addr}: {e}"))?);
+        listeners.push(
+            try_make_listener(&addr).map_err(|e| format!("Failed to bind listener {addr}: {e}"))?,
+        );
     }
 
     let mut http = HttpServer::new(app_factory).workers(workers);
@@ -327,7 +335,10 @@ pub async fn run_with_bind_and_static(
         }
     } else if bind_for_closure == "127.0.0.1" || bind_for_closure == "localhost" {
         let v4_addr = format!("127.0.0.1:{port}");
-        listeners.push(try_make_listener(&v4_addr).map_err(|e| format!("Failed to bind listener {v4_addr}: {e}"))?);
+        listeners.push(
+            try_make_listener(&v4_addr)
+                .map_err(|e| format!("Failed to bind listener {v4_addr}: {e}"))?,
+        );
 
         let v6_addr = format!("[::1]:{port}");
         match try_make_listener(&v6_addr) {
@@ -340,10 +351,14 @@ pub async fn run_with_bind_and_static(
         } else {
             format!("[{bind_for_closure}]:{port}")
         };
-        listeners.push(try_make_listener(&addr).map_err(|e| format!("Failed to bind listener {addr}: {e}"))?);
+        listeners.push(
+            try_make_listener(&addr).map_err(|e| format!("Failed to bind listener {addr}: {e}"))?,
+        );
     } else {
         let addr = format!("{bind_for_closure}:{port}");
-        listeners.push(try_make_listener(&addr).map_err(|e| format!("Failed to bind listener {addr}: {e}"))?);
+        listeners.push(
+            try_make_listener(&addr).map_err(|e| format!("Failed to bind listener {addr}: {e}"))?,
+        );
     }
 
     let mut http = HttpServer::new(app_factory).workers(workers);

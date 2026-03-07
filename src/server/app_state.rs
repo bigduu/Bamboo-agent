@@ -86,8 +86,8 @@ use crate::core::Config;
 use crate::process::ProcessRegistry;
 use crate::server::error::AppError;
 use crate::server::metrics_service::MetricsService;
-use crate::server::schedules::{ScheduleManager, ScheduleStore};
 use crate::server::schedules::manager::ScheduleContext;
+use crate::server::schedules::{ScheduleManager, ScheduleStore};
 use crate::server::spawn_scheduler::{SpawnContext, SpawnScheduler};
 
 /// Default system prompt for agent interactions
@@ -469,10 +469,12 @@ impl AppState {
         let data_dir = bamboo_home_dir.clone();
 
         log::info!("Initializing session store V2 at: {:?}", data_dir);
-        let session_store = Arc::new(SessionStoreV2::new(data_dir.clone()).await.unwrap_or_else(|e| {
-            log::error!("Failed to init SessionStoreV2 at {:?}: {}", data_dir, e);
-            panic!("Failed to init SessionStoreV2: {}", e);
-        }));
+        let session_store = Arc::new(SessionStoreV2::new(data_dir.clone()).await.unwrap_or_else(
+            |e| {
+                log::error!("Failed to init SessionStoreV2 at {:?}: {}", data_dir, e);
+                panic!("Failed to init SessionStoreV2: {}", e);
+            },
+        ));
         let storage: Arc<dyn Storage> = session_store.clone();
         log::info!(
             "Session store V2 initialized (index: {:?}, sessions: {:?})",
@@ -504,9 +506,9 @@ impl AppState {
                 if let Some(path) = discovered {
                     *claude_cli_path.write().await = Some(path.clone());
                     log::info!("Claude Code CLI enabled (found at: {})", path);
-                    if let Err(e) = builtin_executor.register_tool(
-                        crate::agent::tools::tools::ClaudeCodeTool::new(path),
-                    ) {
+                    if let Err(e) = builtin_executor
+                        .register_tool(crate::agent::tools::tools::ClaudeCodeTool::new(path))
+                    {
                         log::warn!("Failed to register claude_code tool: {}", e);
                     }
                 } else {
@@ -533,10 +535,9 @@ impl AppState {
             mcp_manager.clone(),
             mcp_manager.tool_index(),
         ));
-        let base_tools: Arc<dyn ToolExecutor> = Arc::new(crate::agent::mcp::CompositeToolExecutor::new(
-            builtin_tools,
-            mcp_tools,
-        ));
+        let base_tools: Arc<dyn ToolExecutor> = Arc::new(
+            crate::agent::mcp::CompositeToolExecutor::new(builtin_tools, mcp_tools),
+        );
 
         // Initialize skill manager
         let skill_manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
@@ -681,14 +682,12 @@ impl AppState {
             ));
 
         // Initialize schedule store + manager (timed tasks).
-        let schedule_store = Arc::new(
-            ScheduleStore::new(data_dir.clone())
-                .await
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to init ScheduleStore at {:?}: {}", data_dir, e);
-                    panic!("Failed to init ScheduleStore: {}", e);
-                }),
-        );
+        let schedule_store = Arc::new(ScheduleStore::new(data_dir.clone()).await.unwrap_or_else(
+            |e| {
+                log::error!("Failed to init ScheduleStore at {:?}: {}", data_dir, e);
+                panic!("Failed to init ScheduleStore: {}", e);
+            },
+        ));
 
         // Schedule jobs should not automatically inherit schedule-management tools; keep the tool
         // surface minimal for background automation unless explicitly needed later.
@@ -714,10 +713,9 @@ impl AppState {
             session_store.clone(),
             storage.clone(),
         ));
-        let tools: Arc<dyn ToolExecutor> = Arc::new(crate::server::tools::OverlayToolExecutor::new(
-            tools_with_spawn,
-            schedule_tool,
-        ));
+        let tools: Arc<dyn ToolExecutor> = Arc::new(
+            crate::server::tools::OverlayToolExecutor::new(tools_with_spawn, schedule_tool),
+        );
 
         Self {
             app_data_dir: bamboo_home_dir,
@@ -750,7 +748,10 @@ impl AppState {
     ///
     /// This stream is intended for UI consumption and background activity; it should remain
     /// available even when no agent execution is running.
-    pub async fn get_session_event_sender(&self, session_id: &str) -> broadcast::Sender<AgentEvent> {
+    pub async fn get_session_event_sender(
+        &self,
+        session_id: &str,
+    ) -> broadcast::Sender<AgentEvent> {
         let mut senders = self.session_event_senders.write().await;
         if let Some(existing) = senders.get(session_id) {
             return existing.clone();

@@ -113,8 +113,7 @@ impl ScheduleStore {
             let index = SchedulesIndex::empty();
             atomic_write_json(
                 &index_path,
-                serde_json::to_vec_pretty(&index)
-                    .map_err(|e| other_io_error(e.to_string()))?,
+                serde_json::to_vec_pretty(&index).map_err(|e| other_io_error(e.to_string()))?,
             )
             .await?;
             index

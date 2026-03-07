@@ -88,7 +88,8 @@ impl Tool for SpawnSessionTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(args, ToolExecutionContext::none("tool_call")).await
+        self.execute_with_context(args, ToolExecutionContext::none("tool_call"))
+            .await
     }
 
     async fn execute_with_context(
@@ -100,9 +101,8 @@ impl Tool for SpawnSessionTool {
             ToolError::Execution("spawn_session requires a session_id in tool context".to_string())
         })?;
 
-        let parsed: SpawnSessionArgs = serde_json::from_value(args).map_err(|e| {
-            ToolError::InvalidArguments(format!("Invalid spawn_session args: {e}"))
-        })?;
+        let parsed: SpawnSessionArgs = serde_json::from_value(args)
+            .map_err(|e| ToolError::InvalidArguments(format!("Invalid spawn_session args: {e}")))?;
         let goal = parsed.goal.trim();
         if goal.is_empty() {
             return Err(ToolError::InvalidArguments(
@@ -140,11 +140,11 @@ impl Tool for SpawnSessionTool {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "Child Session".to_string());
 
-        let mut child = Session::new_child(child_id.clone(), parent.id.clone(), model.clone(), title);
-        child.metadata.insert(
-            "spawned_by".to_string(),
-            "spawn_session".to_string(),
-        );
+        let mut child =
+            Session::new_child(child_id.clone(), parent.id.clone(), model.clone(), title);
+        child
+            .metadata
+            .insert("spawned_by".to_string(), "spawn_session".to_string());
         child.metadata.insert(
             "base_system_prompt".to_string(),
             CHILD_SYSTEM_PROMPT.to_string(),
@@ -173,7 +173,8 @@ impl Tool for SpawnSessionTool {
             .await
             .map_err(ToolError::Execution)?;
 
-        ctx.emit_tool_token(format!("Spawned child session: {child_id}")).await;
+        ctx.emit_tool_token(format!("Spawned child session: {child_id}"))
+            .await;
 
         Ok(ToolResult {
             success: true,
@@ -222,10 +223,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ToolExecutor for NoopToolExecutor {
-        async fn execute(
-            &self,
-            _call: &ToolCall,
-        ) -> std::result::Result<ToolResult, ToolError> {
+        async fn execute(&self, _call: &ToolCall) -> std::result::Result<ToolResult, ToolError> {
             Err(ToolError::NotFound("noop".to_string()))
         }
 
@@ -263,7 +261,10 @@ mod tests {
             metrics_collector,
             sessions_cache: Arc::new(RwLock::new(HashMap::new())),
             agent_runners: Arc::new(RwLock::new(HashMap::new())),
-            session_event_senders: Arc::new(RwLock::new(HashMap::<String, broadcast::Sender<crate::agent::core::AgentEvent>>::new())),
+            session_event_senders: Arc::new(RwLock::new(HashMap::<
+                String,
+                broadcast::Sender<crate::agent::core::AgentEvent>,
+            >::new())),
         };
         let scheduler = Arc::new(SpawnScheduler::new(ctx));
 

@@ -9,12 +9,12 @@ use uuid::Uuid;
 use crate::agent::core::storage::{SessionStoreV2, Storage};
 use crate::agent::core::tools::ToolExecutor;
 use crate::agent::core::{AgentEvent, Message, Role, Session};
-use crate::agent::loop_module::{run_agent_loop_with_config, AgentLoopConfig};
 use crate::agent::llm::LLMProvider;
+use crate::agent::loop_module::{run_agent_loop_with_config, AgentLoopConfig};
 use crate::agent::metrics::MetricsCollector;
 use crate::agent::skill::SkillManager;
-use crate::server::app_state::{AgentRunner, AgentStatus};
 use crate::core::Config;
+use crate::server::app_state::{AgentRunner, AgentStatus};
 
 use super::store::{ClaimedScheduleRun, ScheduleRunConfig, ScheduleStore};
 
@@ -157,7 +157,11 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
         m
     } else {
         let snapshot = ctx.config.read().await.clone();
-        match snapshot.get_model().map(|m| m.trim().to_string()).filter(|m| !m.is_empty()) {
+        match snapshot
+            .get_model()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+        {
             Some(m) => m,
             None => {
                 log::warn!(

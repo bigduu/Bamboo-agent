@@ -109,10 +109,7 @@ mod tests {
         let expected_skills_root = crate::core::paths::path_to_display_string(
             &crate::core::paths::bamboo_dir().join("skills"),
         );
-        assert!(context.contains(&format!(
-            "{}/<skill_id>/SKILL.md",
-            expected_skills_root
-        )));
+        assert!(context.contains(&format!("{}/<skill_id>/SKILL.md", expected_skills_root)));
 
         // Should contain skill metadata
         assert!(context.contains("Demo Skill"));

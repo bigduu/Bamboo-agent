@@ -12,8 +12,8 @@ use tokio::time::{sleep, Duration};
 use bamboo_agent::agent::core::storage::{SessionStoreV2, Storage};
 use bamboo_agent::agent::core::tools::{Tool, ToolExecutionContext, ToolExecutor, ToolResult};
 use bamboo_agent::agent::core::{AgentEvent, Message, Session};
+use bamboo_agent::agent::llm::provider::Result as LLMResult;
 use bamboo_agent::agent::llm::provider::{LLMProvider, LLMStream};
-use bamboo_agent::agent::llm::provider::{Result as LLMResult};
 use bamboo_agent::agent::metrics::collector::MetricsCollector;
 use bamboo_agent::agent::metrics::storage::SqliteMetricsStorage;
 use bamboo_agent::agent::skill::SkillManager;
@@ -87,18 +87,14 @@ async fn schedule_tasks_requires_session_id() {
         metrics_collector: metrics,
         sessions_cache: Arc::new(RwLock::new(HashMap::new())),
         agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
-        session_event_senders: Arc::new(RwLock::new(
-            HashMap::<String, broadcast::Sender<AgentEvent>>::new(),
-        )),
+        session_event_senders: Arc::new(RwLock::new(HashMap::<
+            String,
+            broadcast::Sender<AgentEvent>,
+        >::new())),
         config: Arc::new(RwLock::new(bamboo_agent::core::Config::default())),
     }));
 
-    let tool = ScheduleTasksTool::new(
-        schedule_store,
-        manager,
-        store.clone(),
-        store,
-    );
+    let tool = ScheduleTasksTool::new(schedule_store, manager, store.clone(), store);
 
     let err = tool
         .execute_with_context(
@@ -131,9 +127,10 @@ async fn schedule_tasks_crud_and_list_sessions() {
         metrics_collector: metrics,
         sessions_cache: Arc::new(RwLock::new(HashMap::new())),
         agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
-        session_event_senders: Arc::new(RwLock::new(
-            HashMap::<String, broadcast::Sender<AgentEvent>>::new(),
-        )),
+        session_event_senders: Arc::new(RwLock::new(HashMap::<
+            String,
+            broadcast::Sender<AgentEvent>,
+        >::new())),
         config: Arc::new(RwLock::new(bamboo_agent::core::Config::default())),
     }));
 
@@ -201,13 +198,17 @@ async fn schedule_tasks_crud_and_list_sessions() {
         .unwrap();
     let patched_v: serde_json::Value = serde_json::from_str(&patched.result).unwrap();
     assert_eq!(patched_v["schedule"]["enabled"].as_bool(), Some(true));
-    assert_eq!(patched_v["schedule"]["interval_seconds"].as_u64(), Some(120));
+    assert_eq!(
+        patched_v["schedule"]["interval_seconds"].as_u64(),
+        Some(120)
+    );
 
     // Create a session that looks like it was created by schedule.
     let mut scheduled = Session::new("scheduled-session", "test-model");
-    scheduled
-        .metadata
-        .insert("created_by_schedule_id".to_string(), patched_v["schedule"]["id"].as_str().unwrap().to_string());
+    scheduled.metadata.insert(
+        "created_by_schedule_id".to_string(),
+        patched_v["schedule"]["id"].as_str().unwrap().to_string(),
+    );
     scheduled.add_message(Message::system("x".to_string()));
     store.save_session(&scheduled).await.unwrap();
 
@@ -240,10 +241,11 @@ async fn schedule_tasks_crud_and_list_sessions() {
         )
         .await
         .unwrap();
-    assert!(serde_json::from_str::<serde_json::Value>(&deleted.result)
-        .unwrap()["success"]
-        .as_bool()
-        .unwrap());
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&deleted.result).unwrap()["success"]
+            .as_bool()
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -268,9 +270,10 @@ async fn schedule_run_skips_when_no_model_available() {
         metrics_collector: metrics,
         sessions_cache: Arc::new(RwLock::new(HashMap::new())),
         agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
-        session_event_senders: Arc::new(RwLock::new(
-            HashMap::<String, broadcast::Sender<AgentEvent>>::new(),
-        )),
+        session_event_senders: Arc::new(RwLock::new(HashMap::<
+            String,
+            broadcast::Sender<AgentEvent>,
+        >::new())),
         config: Arc::new(RwLock::new(bamboo_agent::core::Config::default())),
     }));
 
@@ -313,7 +316,9 @@ async fn schedule_run_uses_config_get_model_fallback() {
     // Copilot has a built-in get_model() fallback ("gpt-4o") even when not configured.
     let mut cfg = bamboo_agent::core::Config::default();
     cfg.provider = "copilot".to_string();
-    let expected_model = cfg.get_model().expect("copilot should always have a model fallback");
+    let expected_model = cfg
+        .get_model()
+        .expect("copilot should always have a model fallback");
 
     let manager = Arc::new(ScheduleManager::new(ScheduleContext {
         schedule_store: schedule_store.clone(),
@@ -325,9 +330,10 @@ async fn schedule_run_uses_config_get_model_fallback() {
         metrics_collector: metrics,
         sessions_cache: Arc::new(RwLock::new(HashMap::new())),
         agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
-        session_event_senders: Arc::new(RwLock::new(
-            HashMap::<String, broadcast::Sender<AgentEvent>>::new(),
-        )),
+        session_event_senders: Arc::new(RwLock::new(HashMap::<
+            String,
+            broadcast::Sender<AgentEvent>,
+        >::new())),
         config: Arc::new(RwLock::new(cfg)),
     }));
 
