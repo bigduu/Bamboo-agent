@@ -35,6 +35,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+const MAX_TOOL_MESSAGE_BYTES: usize = 256 * 1024;
+const TOOL_MESSAGE_HEAD_BYTES: usize = 160 * 1024;
+const TOOL_MESSAGE_TAIL_BYTES: usize = 64 * 1024;
+const TOOL_MESSAGE_TRUNCATION_MARKER: &str = "[... tool output truncated ...]";
+
 /// Message role in a conversation.
 ///
 /// Identifies the sender of a message in the conversation history.
@@ -598,9 +603,34 @@ impl Session {
     /// session.add_message(Message::user("Hello"));
     /// assert_eq!(session.messages.len(), 1);
     /// ```
-    pub fn add_message(&mut self, message: Message) {
+    pub fn add_message(&mut self, mut message: Message) {
+        if matches!(message.role, Role::Tool) {
+            if let Some(truncated) = truncate_tool_message_content(&message.content) {
+                message.content = truncated;
+            }
+        }
         self.messages.push(message);
         self.updated_at = Utc::now();
+    }
+
+    /// Truncate oversized historical tool messages in-place.
+    ///
+    /// Returns the number of tool messages that were compacted.
+    pub fn compact_oversized_tool_messages(&mut self) -> usize {
+        let mut compacted = 0usize;
+        for message in &mut self.messages {
+            if !matches!(message.role, Role::Tool) {
+                continue;
+            }
+            if let Some(truncated) = truncate_tool_message_content(&message.content) {
+                message.content = truncated;
+                compacted += 1;
+            }
+        }
+        if compacted > 0 {
+            self.updated_at = Utc::now();
+        }
+        compacted
     }
 
     /// Set the todo list for this session
@@ -710,4 +740,53 @@ impl Session {
     pub fn has_pending_question(&self) -> bool {
         self.pending_question.is_some()
     }
+}
+
+fn utf8_prefix_by_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn utf8_suffix_by_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+fn truncate_tool_message_content(content: &str) -> Option<String> {
+    if content.len() <= MAX_TOOL_MESSAGE_BYTES {
+        return None;
+    }
+
+    let head = utf8_prefix_by_bytes(content, TOOL_MESSAGE_HEAD_BYTES);
+    let tail = utf8_suffix_by_bytes(content, TOOL_MESSAGE_TAIL_BYTES);
+    let omitted_bytes = content
+        .len()
+        .saturating_sub(head.len())
+        .saturating_sub(tail.len());
+
+    let marker = format!(
+        "\n\n{} original={} bytes omitted={} bytes kept={} bytes\n\n",
+        TOOL_MESSAGE_TRUNCATION_MARKER,
+        content.len(),
+        omitted_bytes,
+        head.len().saturating_add(tail.len())
+    );
+
+    let mut compacted = String::with_capacity(head.len() + marker.len() + tail.len());
+    compacted.push_str(head);
+    compacted.push_str(&marker);
+    compacted.push_str(tail);
+    Some(compacted)
 }

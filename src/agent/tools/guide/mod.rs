@@ -610,21 +610,21 @@ mod tests {
 
     use crate::agent::core::tools::{FunctionSchema, ToolSchema};
 
-    use crate::agent::tools::tools::{ReadFileTool, ToolRegistry};
+    use crate::agent::tools::tools::{ReadTool, ToolRegistry};
 
     use super::{context::GuideBuildContext, context::GuideLanguage, EnhancedPromptBuilder};
 
     #[test]
     fn build_renders_builtin_guides() {
         let registry = ToolRegistry::new();
-        registry.register(ReadFileTool::new()).unwrap();
+        registry.register(ReadTool::new()).unwrap();
 
         let schemas = registry.list_tools();
         let prompt =
             EnhancedPromptBuilder::build(Some(&registry), &schemas, &GuideBuildContext::default());
 
         assert!(prompt.contains("## Tool Usage Guidelines"));
-        assert!(prompt.contains("**read_file**"));
+        assert!(prompt.contains("**Read**"));
     }
 
     #[test]

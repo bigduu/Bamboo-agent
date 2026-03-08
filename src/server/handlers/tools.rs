@@ -32,7 +32,7 @@ use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::agent::core::tools::{FunctionCall, ToolCall};
+use crate::agent::core::tools::{FunctionCall, ToolCall, ToolExecutionContext};
 use crate::agent::tools::normalize_tool_ref;
 
 use crate::server::app_state::AppState;
@@ -164,7 +164,7 @@ pub async fn execute_tool(
 
     let result = app_state
         .tools
-        .execute(&call)
+        .execute_with_context(&call, ToolExecutionContext::none(&call.id))
         .await
         .map_err(|err| AppError::ToolExecutionError(err.to_string()))?;
 

@@ -123,7 +123,18 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let tools: Arc<dyn ToolExecutor> = Arc::new(BuiltinToolExecutor::new());
         let mut session = Session::new("s2", "test-model");
-        let sub_action = make_tool_call("call_sub", "get_current_dir", "{}");
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "workspace context\n")
+            .await
+            .unwrap();
+        let sub_action = make_tool_call(
+            "call_sub",
+            "Read",
+            &serde_json::json!({
+                "file_path": file.path()
+            })
+            .to_string(),
+        );
         let parent_call = make_tool_call("call_parent", "smart_tool", "{}");
         let result = ToolResult {
             success: true,
@@ -178,7 +189,16 @@ mod tests {
         let tools: Arc<dyn ToolExecutor> = Arc::new(BuiltinToolExecutor::new());
         let composition_executor =
             Arc::new(CompositionExecutor::new(Arc::new(ToolRegistry::new())));
-        let tool_call = make_tool_call("call_sub", "get_current_dir", "{}");
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "fallback\n").await.unwrap();
+        let tool_call = make_tool_call(
+            "call_sub",
+            "Read",
+            &serde_json::json!({
+                "file_path": file.path(),
+            })
+            .to_string(),
+        );
 
         let result = execute_tool_call(&tool_call, tools.as_ref(), Some(composition_executor))
             .await

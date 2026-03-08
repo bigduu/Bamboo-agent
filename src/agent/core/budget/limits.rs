@@ -4,36 +4,45 @@
 //! configurable user limits via file or session overrides.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Known model context window sizes.
+/// Known model defaults: `(pattern, max_context_tokens, max_output_tokens)`.
 ///
-/// These are the default context window limits for popular models.
-/// Users can override these via configuration files.
-pub const KNOWN_MODEL_LIMITS: &[(&str, u32)] = &[
-    // OpenAI models
-    ("gpt-4o", 128_000),
-    ("gpt-4o-mini", 128_000),
-    ("gpt-4-turbo", 128_000),
-    // Treat gpt-4.1 as a modern long-context OpenAI model by default.
-    // If your provider exposes a different context size, override via the Bamboo data directory's
-    // `model_limits.json` file.
-    ("gpt-4.1", 128_000),
-    ("gpt-4", 8_192),
-    ("gpt-3.5-turbo", 16_385),
-    // Anthropic models
-    ("claude-3-5-sonnet", 200_000),
-    ("claude-3-5-sonnet-20241022", 200_000),
-    ("claude-3-5-sonnet-20240620", 200_000),
-    ("claude-3-opus", 200_000),
-    ("claude-3-opus-20240229", 200_000),
-    ("claude-3-sonnet", 200_000),
-    ("claude-3-haiku", 200_000),
-    // Copilot models (same as OpenAI in Copilot Chat)
-    ("copilot-chat", 128_000),
+/// These are the built-in defaults used when there is no user override in
+/// `config.json:model_limits` and no legacy `model_limits.json`.
+pub const KNOWN_MODEL_LIMITS: &[(&str, u32, u32)] = &[
+    // OpenAI (GPT-5 series)
+    ("gpt-5.4-thinking", 1_000_000, 128_000),
+    ("gpt-5.3-codex", 1_000_000, 128_000),
+    ("gpt-5.2-pro", 256_000, 64_000),
+    ("gpt-5-mini", 400_000, 128_000),
+    // OpenAI (legacy)
+    ("gpt-4.1", 1_000_000, 32_000),
+    ("gpt-4o", 128_000, 16_000),
+    // Google
+    ("gemini-2.5-pro", 1_000_000, 64_000),
+    // Moonshot
+    ("kimi-k2.5", 256_000, 64_000),
+    ("kimi-for-coding", 256_000, 64_000),
+    // Zhipu
+    ("glm-5", 200_000, 128_000),
+    // Compatibility fallbacks
+    ("gpt-4o-mini", 128_000, 16_000),
+    ("gpt-4-turbo", 128_000, 16_000),
+    ("gpt-4", 8_192, 4_096),
+    ("gpt-3.5-turbo", 16_385, 4_096),
+    ("claude-3-5-sonnet", 200_000, 8_192),
+    ("claude-3-5-sonnet-20241022", 200_000, 8_192),
+    ("claude-3-5-sonnet-20240620", 200_000, 8_192),
+    ("claude-3-opus", 200_000, 8_192),
+    ("claude-3-opus-20240229", 200_000, 8_192),
+    ("claude-3-sonnet", 200_000, 8_192),
+    ("claude-3-haiku", 200_000, 8_192),
+    ("copilot-chat", 128_000, 16_000),
     // Default fallback
-    ("default", 128_000),
+    ("default", 128_000, 4_096),
 ];
 
 /// Default maximum output tokens (reserve ~25% for response).
@@ -78,6 +87,12 @@ impl ModelLimit {
     pub fn get_safety_margin(&self) -> u32 {
         self.safety_margin.unwrap_or(DEFAULT_SAFETY_MARGIN)
     }
+}
+
+fn builtin_limit(pattern: &str, max_context_tokens: u32, max_output_tokens: u32) -> ModelLimit {
+    let mut limit = ModelLimit::new(pattern.to_string(), max_context_tokens);
+    limit.max_output_tokens = Some(max_output_tokens);
+    limit
 }
 
 /// Registry for model limits with built-in defaults and user overrides.
@@ -157,9 +172,13 @@ impl ModelLimitsRegistry {
         }
 
         // Check built-in limits for exact match
-        for (pattern, tokens) in KNOWN_MODEL_LIMITS {
+        for (pattern, max_context_tokens, max_output_tokens) in KNOWN_MODEL_LIMITS {
             if *pattern == model {
-                return Some(ModelLimit::new(model.to_string(), *tokens));
+                return Some(builtin_limit(
+                    model,
+                    *max_context_tokens,
+                    *max_output_tokens,
+                ));
             }
         }
 
@@ -179,11 +198,15 @@ impl ModelLimitsRegistry {
         // Find the best partial match from built-in limits
         let best_builtin_match = KNOWN_MODEL_LIMITS
             .iter()
-            .filter(|(pattern, _)| model.contains(*pattern) || pattern.contains(model))
-            .max_by_key(|(pattern, _)| pattern.len());
+            .filter(|(pattern, _, _)| model.contains(*pattern) || pattern.contains(model))
+            .max_by_key(|(pattern, _, _)| pattern.len());
 
-        if let Some((pattern, tokens)) = best_builtin_match {
-            return Some(ModelLimit::new(pattern.to_string(), *tokens));
+        if let Some((pattern, max_context_tokens, max_output_tokens)) = best_builtin_match {
+            return Some(builtin_limit(
+                pattern,
+                *max_context_tokens,
+                *max_output_tokens,
+            ));
         }
 
         None
@@ -194,10 +217,14 @@ impl ModelLimitsRegistry {
         self.get(model).unwrap_or_else(|| {
             let default = KNOWN_MODEL_LIMITS
                 .iter()
-                .find(|(k, _)| *k == "default")
-                .map(|(_, v)| *v)
-                .unwrap_or(128_000);
-            ModelLimit::new("default", default)
+                .find(|(k, _, _)| *k == "default")
+                .map(|(_, max_context_tokens, max_output_tokens)| {
+                    (*max_context_tokens, *max_output_tokens)
+                })
+                .unwrap_or((128_000, DEFAULT_MAX_OUTPUT_TOKENS));
+            let mut limit = ModelLimit::new("default", default.0);
+            limit.max_output_tokens = Some(default.1);
+            limit
         })
     }
 
@@ -240,6 +267,31 @@ pub fn get_default_config_path() -> PathBuf {
     crate::core::paths::bamboo_dir().join("model_limits.json")
 }
 
+/// Load user model limits from unified `config.json` root key `model_limits`.
+///
+/// Returns:
+/// - `Ok(None)` when `model_limits` key is absent.
+/// - `Ok(Some(vec))` when key exists and is valid (including empty array).
+/// - `Err(...)` when key exists but is not a valid `Vec<ModelLimit>`.
+pub fn load_model_limits_from_unified_config(
+    config: &crate::core::Config,
+) -> Result<Option<Vec<ModelLimit>>, String> {
+    let Some(raw_limits) = config.extra.get("model_limits") else {
+        return Ok(None);
+    };
+
+    if raw_limits.is_null() {
+        return Ok(Some(Vec::new()));
+    }
+
+    match raw_limits {
+        Value::Array(_) => serde_json::from_value::<Vec<ModelLimit>>(raw_limits.clone())
+            .map(Some)
+            .map_err(|error| format!("invalid config.model_limits format: {error}")),
+        _ => Err("invalid config.model_limits format: expected array".to_string()),
+    }
+}
+
 /// Create a token budget for a specific model.
 ///
 /// This is a convenience function that creates a budget with appropriate defaults.
@@ -264,28 +316,33 @@ mod tests {
 
     #[test]
     fn builtin_limits_contain_common_models() {
-        let gpt4 = KNOWN_MODEL_LIMITS
+        let gpt5 = KNOWN_MODEL_LIMITS
             .iter()
-            .find(|(k, _)| *k == "gpt-4o")
-            .expect("Should have gpt-4o");
-        assert_eq!(gpt4.1, 128_000);
+            .find(|(k, _, _)| *k == "gpt-5.4-thinking")
+            .expect("Should have gpt-5.4-thinking");
+        assert_eq!(gpt5.1, 1_000_000);
+        assert_eq!(gpt5.2, 128_000);
     }
 
     #[test]
     fn registry_finds_builtin_by_exact_match() {
         let registry = ModelLimitsRegistry::new();
-        let limit = registry.get("gpt-4o").expect("Should find gpt-4o");
-        assert_eq!(limit.max_context_tokens, 128_000);
+        let limit = registry
+            .get("gpt-5.4-thinking")
+            .expect("Should find gpt-5.4-thinking");
+        assert_eq!(limit.max_context_tokens, 1_000_000);
+        assert_eq!(limit.get_max_output_tokens(), 128_000);
     }
 
     #[test]
     fn registry_finds_builtin_by_partial_match() {
         let registry = ModelLimitsRegistry::new();
-        // "gpt-4o-mini" contains "gpt-4o"
+        // "gpt-5.4-thinking-preview" contains "gpt-5.4-thinking"
         let limit = registry
-            .get("gpt-4o-mini")
-            .expect("Should find gpt-4o-mini");
-        assert_eq!(limit.max_context_tokens, 128_000);
+            .get("gpt-5.4-thinking-preview")
+            .expect("Should find gpt-5.4-thinking");
+        assert_eq!(limit.max_context_tokens, 1_000_000);
+        assert_eq!(limit.get_max_output_tokens(), 128_000);
     }
 
     #[test]
@@ -298,10 +355,10 @@ mod tests {
     #[test]
     fn user_override_takes_precedence() {
         let mut registry = ModelLimitsRegistry::new();
-        registry.add_limit(ModelLimit::new("gpt-4o", 64_000)); // Override with smaller limit
+        registry.add_limit(ModelLimit::new("gpt-5.4-thinking", 64_000)); // Override with smaller limit
 
         let limit = registry
-            .get("gpt-4o")
+            .get("gpt-5.4-thinking")
             .expect("Should find overridden limit");
         assert_eq!(limit.max_context_tokens, 64_000);
     }
@@ -325,5 +382,49 @@ mod tests {
         let limit = ModelLimit::new("test", 8_192);
         // Default is min(8192 / 4, 4096) = 2048
         assert_eq!(limit.get_max_output_tokens(), 2048);
+    }
+
+    #[test]
+    fn unified_config_loader_returns_none_when_absent() {
+        let config = crate::core::Config::default();
+        let loaded = load_model_limits_from_unified_config(&config).expect("should parse");
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn unified_config_loader_reads_valid_model_limits() {
+        let mut config = crate::core::Config::default();
+        config.extra.insert(
+            "model_limits".to_string(),
+            serde_json::json!([
+                {
+                    "model_pattern": "gpt-5.4-thinking",
+                    "max_context_tokens": 64000,
+                    "max_output_tokens": 2048,
+                    "safety_margin": 512
+                }
+            ]),
+        );
+
+        let loaded = load_model_limits_from_unified_config(&config)
+            .expect("should parse")
+            .expect("should exist");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].model_pattern, "gpt-5.4-thinking");
+        assert_eq!(loaded[0].max_context_tokens, 64_000);
+        assert_eq!(loaded[0].max_output_tokens, Some(2048));
+        assert_eq!(loaded[0].safety_margin, Some(512));
+    }
+
+    #[test]
+    fn unified_config_loader_errors_on_invalid_shape() {
+        let mut config = crate::core::Config::default();
+        config.extra.insert(
+            "model_limits".to_string(),
+            serde_json::json!({"unexpected": true}),
+        );
+
+        let error = load_model_limits_from_unified_config(&config).expect_err("should error");
+        assert!(error.contains("expected array"));
     }
 }

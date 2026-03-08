@@ -31,6 +31,36 @@ mod tests {
     }
 
     #[test]
+    fn test_session_add_message_truncates_oversized_tool_output() {
+        let mut session = Session::new("test", "test-model");
+        let oversized = "x".repeat(300 * 1024);
+        session.add_message(Message::tool_result("call-1", oversized.clone()));
+
+        assert_eq!(session.messages.len(), 1);
+        assert!(matches!(session.messages[0].role, Role::Tool));
+        assert!(session.messages[0].content.len() < oversized.len());
+        assert!(session.messages[0]
+            .content
+            .contains("[... tool output truncated ...]"));
+    }
+
+    #[test]
+    fn test_compact_oversized_tool_messages_compacts_existing_history() {
+        let mut session = Session::new("test", "test-model");
+        let oversized = "y".repeat(320 * 1024);
+        let mut tool = Message::tool_result("call-legacy", "");
+        tool.content = oversized.clone();
+        session.messages.push(tool);
+
+        let compacted = session.compact_oversized_tool_messages();
+        assert_eq!(compacted, 1);
+        assert!(session.messages[0].content.len() < oversized.len());
+        assert!(session.messages[0]
+            .content
+            .contains("[... tool output truncated ...]"));
+    }
+
+    #[test]
     fn test_tool_call_creation() {
         let tool_call = ToolCall {
             id: "call-1".to_string(),

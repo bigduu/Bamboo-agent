@@ -8,7 +8,7 @@
 //! The tools module provides a comprehensive framework for extending agent capabilities
 //! through a plugin architecture. It includes:
 //!
-//! - **tools**: Built-in tool implementations (file ops, git, commands, etc.)
+//! - **tools**: Claude-style built-in tool implementations
 //! - **executor**: Tool execution engine with safety controls
 //! - **permission**: Permission system for tool actions
 //! - **guide**: Tool documentation and example generation
@@ -21,14 +21,14 @@
 //! The [`ToolRegistry`] provides dynamic tool registration and lookup:
 //!
 //! ```no_run
-//! use bamboo_agent::tools::{ToolRegistry, ReadFileTool, WriteFileTool};
+//! use bamboo_agent::tools::{ToolRegistry, ReadTool, WriteTool};
 //!
 //! let registry = ToolRegistry::new();
-//! registry.register(ReadFileTool::new()).unwrap();
-//! registry.register(WriteFileTool::new()).unwrap();
+//! registry.register(ReadTool::new()).unwrap();
+//! registry.register(WriteTool::new()).unwrap();
 //!
 //! // Look up and execute tools
-//! let _tool = registry.get("read_file").expect("tool registered");
+//! let _tool = registry.get("Read").expect("tool registered");
 //! ```
 //!
 //! ## Built-in Tool Executor
@@ -49,14 +49,12 @@
 //!
 //! # Available Tools
 //!
-//! The module includes 20+ built-in tools organized by category:
+//! The module includes Claude-style built-in tools such as:
 //!
-//! - **File Operations**: read, write, patch, list, search
-//! - **Git Operations**: status, diff, commit, push
-//! - **Command Execution**: shell commands, terminal sessions
-//! - **User Interaction**: ask questions, get input
-//! - **Task Management**: todo lists, task tracking
-//! - **Utilities**: HTTP requests, glob search, sleep
+//! - **Shell**: `Bash`, `BashOutput`, `KillShell`
+//! - **File Operations**: `Read`, `Write`, `Edit`, `NotebookEdit`
+//! - **Search**: `Glob`, `Grep`, `WebFetch`, `WebSearch`
+//! - **Workflow**: `Task`, `TodoWrite`, `ExitPlanMode`, `SlashCommand`
 //!
 //! # Example
 //!
@@ -100,11 +98,9 @@ pub use output_manager::{ArtifactRef, ToolOutputManager};
 
 // Re-export all tool implementations
 pub use tools::{
-    ApplyPatchTool, AskUserTool, CreateTodoListTool, ExecuteCommandTool, FileExistsTool,
-    GetCurrentDirTool, GetFileInfoTool, GitDiffTool, GitStatusTool, GitWriteTool, GlobSearchTool,
-    HttpRequestTool, ListDirectoryTool, ReadFileRangeTool, ReadFileTool, SearchInFileTool,
-    SearchInProjectTool, SetWorkspaceTool, SleepTool, TerminalSessionTool, ToolRegistry,
-    UpdateTodoItemTool, WriteFileTool,
+    AskUserTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, GlobTool, GrepTool,
+    KillShellTool, NotebookEditTool, ReadTool, SlashCommandTool, TaskTool, TodoWriteTool,
+    ToolRegistry, WebFetchTool, WebSearchTool, WriteTool,
 };
 
 // Re-export todo types from agent-core for convenience

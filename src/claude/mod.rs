@@ -107,4 +107,3 @@ fn select_best_installation(installations: Vec<ClaudeInstallation>) -> Option<Cl
 pub use command::create_command_with_env;
 pub use command::create_tokio_command_with_env;
 pub use runner::{spawn_claude_code_cli, ClaudeCodeCliConfig};
-pub(crate) use stream_json::ClaudeStreamJsonParser;

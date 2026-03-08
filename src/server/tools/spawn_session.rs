@@ -8,25 +8,20 @@ use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResul
 use crate::agent::core::{Message, Session, SessionKind};
 use crate::server::spawn_scheduler::{SpawnJob, SpawnScheduler};
 
-const CHILD_SYSTEM_PROMPT: &str = r#"你是一个 **Child Session（子会话）**，由主会话委派任务。
+const CHILD_SYSTEM_PROMPT: &str = r#"You are a **Child Session**, delegated by a parent session.
 
-要求：
-- 只专注完成当前任务，避免无关对话。
-- 允许使用工具来完成任务。
-- 不允许创建/触发新的子会话（禁止递归 spawn）。
-- 输出尽量简洁：先给结论，再给必要依据/步骤。
+Requirements:
+- Focus only on the assigned task and avoid unrelated conversation.
+- You may use tools to complete the task.
+- Do not create or trigger any additional child sessions (no recursive spawn).
+- Keep output concise: provide the conclusion first, then only necessary evidence or steps.
 "#;
 
 #[derive(Debug, serde::Deserialize)]
 struct SpawnSessionArgs {
-    /// Task goal / instructions for the child session.
-    goal: String,
-    /// Optional display title.
-    #[serde(default)]
-    title: Option<String>,
-    /// Optional model override. Defaults to the parent session's model.
-    #[serde(default)]
-    model: Option<String>,
+    description: String,
+    prompt: String,
+    subagent_type: String,
 }
 
 /// Server-only tool: spawn a child session and run it asynchronously.
@@ -68,22 +63,23 @@ impl SpawnSessionTool {
 #[async_trait]
 impl Tool for SpawnSessionTool {
     fn name(&self) -> &str {
-        "spawn_session"
+        "Task"
     }
 
     fn description(&self) -> &str {
-        "Create a child session to handle a sub-task asynchronously (returns immediately). Progress is forwarded to the parent session event stream; do not use http_request to poll localhost. Child sessions cannot spawn further sessions."
+        "Launch a new agent to handle complex, multi-step tasks asynchronously"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "goal": { "type": "string", "description": "Sub-task instructions for the child session." },
-                "title": { "type": "string", "description": "Optional child session title." },
-                "model": { "type": "string", "description": "Optional model override (defaults to parent session model)." }
+                "description": { "type": "string", "description": "A short (3-5 word) description of the task" },
+                "prompt": { "type": "string", "description": "The task for the agent to perform" },
+                "subagent_type": { "type": "string", "description": "The type of specialized agent to use" }
             },
-            "required": ["goal"]
+            "required": ["description", "prompt", "subagent_type"],
+            "additionalProperties": false
         })
     }
 
@@ -98,53 +94,43 @@ impl Tool for SpawnSessionTool {
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let parent_session_id = ctx.session_id.ok_or_else(|| {
-            ToolError::Execution("spawn_session requires a session_id in tool context".to_string())
+            ToolError::Execution("Task requires a session_id in tool context".to_string())
         })?;
 
         let parsed: SpawnSessionArgs = serde_json::from_value(args)
-            .map_err(|e| ToolError::InvalidArguments(format!("Invalid spawn_session args: {e}")))?;
-        let goal = parsed.goal.trim();
-        if goal.is_empty() {
+            .map_err(|e| ToolError::InvalidArguments(format!("Invalid Task args: {e}")))?;
+        let goal = parsed.prompt.trim();
+        if goal.is_empty() || parsed.description.trim().is_empty() {
             return Err(ToolError::InvalidArguments(
-                "goal must be a non-empty string".to_string(),
+                "description and prompt must be non-empty".to_string(),
             ));
         }
 
         let parent = self.load_parent_session(parent_session_id).await?;
         if parent.kind != SessionKind::Root {
             return Err(ToolError::Execution(
-                "spawn_session is not allowed inside child sessions".to_string(),
+                "Task is not allowed inside child sessions".to_string(),
             ));
         }
 
-        // Use parent model by default. This is set by /execute (per-request model).
-        let model = parsed
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| parent.model.clone());
+        let model = parent.model.clone();
         if model.trim().is_empty() {
             return Err(ToolError::Execution(
-                "parent session model is empty; pass `model` explicitly".to_string(),
+                "parent session model is empty".to_string(),
             ));
         }
 
         let child_id = Uuid::new_v4().to_string();
-        let title = parsed
-            .title
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "Child Session".to_string());
+        let title = parsed.description.trim().to_string();
 
         let mut child =
             Session::new_child(child_id.clone(), parent.id.clone(), model.clone(), title);
         child
             .metadata
-            .insert("spawned_by".to_string(), "spawn_session".to_string());
+            .insert("spawned_by".to_string(), "Task".to_string());
+        child
+            .metadata
+            .insert("subagent_type".to_string(), parsed.subagent_type.clone());
         child.metadata.insert(
             "base_system_prompt".to_string(),
             CHILD_SYSTEM_PROMPT.to_string(),
@@ -152,7 +138,12 @@ impl Tool for SpawnSessionTool {
 
         // Keep the child prompt minimal; do NOT copy the parent's full system prompt.
         child.add_message(Message::system(CHILD_SYSTEM_PROMPT));
-        child.add_message(Message::user(goal.to_string()));
+        child.add_message(Message::user(format!(
+            "Task description: {}\nSubagent type: {}\n\n{}",
+            parsed.description.trim(),
+            parsed.subagent_type.trim(),
+            goal
+        )));
 
         // Persist child session + index entry.
         self.storage
@@ -179,10 +170,12 @@ impl Tool for SpawnSessionTool {
         Ok(ToolResult {
             success: true,
             result: json!({
+                "description": parsed.description,
+                "subagent_type": parsed.subagent_type,
                 "child_session_id": child_id,
                 "parent_session_id": parent.id,
                 "model": model,
-                "note": "Child session runs in background. UI can observe progress via the parent session event stream (sub_session_* events) and open the child session for full history."
+                "note": "Child session runs in background. Observe via sub_session_* events."
             })
             .to_string(),
             display_preference: Some("Collapsible".to_string()),
@@ -237,7 +230,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_session_requires_session_id_in_tool_context() {
+    async fn task_requires_session_id_in_tool_context() {
         // This should fail fast before any disk IO or scheduler enqueues happen.
         let bamboo_home = make_temp_dir("bamboo-spawn-session-tool-test");
         tokio::fs::create_dir_all(&bamboo_home).await.unwrap();
@@ -272,7 +265,11 @@ mod tests {
 
         let err = tool
             .execute_with_context(
-                json!({ "goal": "do something" }),
+                json!({
+                    "description": "demo task",
+                    "prompt": "do something",
+                    "subagent_type": "general-purpose"
+                }),
                 ToolExecutionContext::none("tool_call"),
             )
             .await
@@ -280,7 +277,7 @@ mod tests {
 
         match err {
             ToolError::Execution(msg) => {
-                assert!(msg.contains("spawn_session requires a session_id in tool context"));
+                assert!(msg.contains("Task requires a session_id in tool context"));
             }
             other => panic!("unexpected error: {other:?}"),
         }

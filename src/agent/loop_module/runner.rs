@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::core::agent::events::{TokenBudgetUsage, TokenUsage};
+use crate::agent::core::budget::limits::load_model_limits_from_unified_config;
 use crate::agent::core::budget::{
     prepare_hybrid_context, HeuristicTokenCounter, ModelLimitsRegistry, TokenBudget,
 };
@@ -31,7 +32,7 @@ use crate::agent::metrics::{
     TokenUsage as MetricsTokenUsage,
 };
 use crate::agent::tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder};
-use crate::agent::tools::CreateTodoListTool;
+use crate::agent::tools::TodoWriteTool;
 
 use crate::agent::loop_module::config::AgentLoopConfig;
 use crate::agent::loop_module::stream::handler::consume_llm_stream;
@@ -608,6 +609,26 @@ pub async fn run_agent_loop_with_config(
         }
     }
 
+    // Compact oversized historical tool outputs so they don't keep blowing up budget
+    // calculations or context payloads in subsequent rounds.
+    let compacted_messages = session.compact_oversized_tool_messages();
+    if compacted_messages > 0 {
+        log::warn!(
+            "[{}] Compacted {} oversized tool message(s) to protect context budget",
+            session_id,
+            compacted_messages
+        );
+        if let Some(ref storage) = config.storage {
+            if let Err(error) = storage.save_session(session).await {
+                log::warn!(
+                    "[{}] Failed to persist compacted tool messages: {}",
+                    session_id,
+                    error
+                );
+            }
+        }
+    }
+
     let mut sent_complete = false;
 
     // Initialize TodoLoopContext from session's todo list
@@ -696,7 +717,7 @@ pub async fn run_agent_loop_with_config(
         }
 
         // Token budget preparation
-        let budget = resolve_token_budget(session, &config, &model_name);
+        let budget = resolve_token_budget(session, &config, &model_name).await;
         let counter = HeuristicTokenCounter::default();
 
         let mut prepared_context = match prepare_hybrid_context(session, &budget, &counter) {
@@ -987,17 +1008,17 @@ pub async fn run_agent_loop_with_config(
                         }
                     }
 
-                    // Handle todo list tools specially
-                    if tool_call.function.name == "create_todo_list" && result.success {
+                    // Handle TodoWrite specially
+                    if tool_call.function.name == "TodoWrite" && result.success {
                         if let Ok(args) =
                             serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
                         {
                             if let Ok(todo_list) =
-                                CreateTodoListTool::todo_list_from_args(&args, &session_id)
+                                TodoWriteTool::todo_list_from_args(&args, &session_id)
                             {
                                 session.set_todo_list(todo_list.clone());
                                 log::info!(
-                                    "[{}] Todo list '{}' created with {} items",
+                                    "[{}] TodoWrite updated todo list '{}' with {} items",
                                     session_id,
                                     todo_list.title,
                                     todo_list.items.len()
@@ -1009,7 +1030,7 @@ pub async fn run_agent_loop_with_config(
                                         log::warn!("[{}] Failed to save session after todo list creation: {}", session_id, e);
                                     } else {
                                         log::debug!(
-                                            "[{}] Session saved after todo list creation",
+                                            "[{}] Session saved after TodoWrite update",
                                             session_id
                                         );
                                     }
@@ -1026,79 +1047,20 @@ pub async fn run_agent_loop_with_config(
                                 // This enables automatic tracking for newly created lists
                                 todo_context = TodoLoopContext::from_session(session);
                                 if todo_context.is_some() {
-                                    log::debug!("[{}] TodoLoopContext re-initialized after create_todo_list", session_id);
-                                }
-                            }
-                        }
-                    } else if tool_call.function.name == "update_todo_item" && result.success {
-                        if let Ok(args) =
-                            serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
-                        {
-                            if let (Some(item_id), Some(status)) =
-                                (args["item_id"].as_str(), args["status"].as_str())
-                            {
-                                let status_enum = match status {
-                                    "pending" => Some(crate::agent::core::TodoItemStatus::Pending),
-                                    "in_progress" => {
-                                        Some(crate::agent::core::TodoItemStatus::InProgress)
-                                    }
-                                    "completed" => {
-                                        Some(crate::agent::core::TodoItemStatus::Completed)
-                                    }
-                                    "blocked" => Some(crate::agent::core::TodoItemStatus::Blocked),
-                                    _ => None,
-                                };
-                                if let Some(s) = status_enum {
-                                    let notes = args["notes"].as_str();
-
-                                    // IMPORTANT: Update TodoLoopContext first to keep it in sync
-                                    // This prevents final sync from overwriting manual updates
-                                    if let Some(ref mut ctx) = todo_context {
-                                        ctx.update_item_status(item_id, s.clone());
-                                    }
-
-                                    if let Err(e) = session.update_todo_item(item_id, s, notes) {
-                                        log::warn!(
-                                            "[{}] Failed to update todo item: {}",
-                                            session_id,
-                                            e
-                                        );
-                                    } else {
-                                        log::info!(
-                                            "[{}] Updated todo item '{}' to '{}'",
-                                            session_id,
-                                            item_id,
-                                            status
-                                        );
-
-                                        // Save session to persist todo list changes
-                                        if let Some(ref storage) = config.storage {
-                                            if let Err(e) = storage.save_session(session).await {
-                                                log::warn!("[{}] Failed to save session after todo item update: {}", session_id, e);
-                                            } else {
-                                                log::debug!(
-                                                    "[{}] Session saved after todo item update",
-                                                    session_id
-                                                );
-                                            }
-                                        }
-
-                                        // Emit event for frontend
-                                        if let Some(ref todo_list) = session.todo_list {
-                                            let _ = event_tx
-                                                .send(AgentEvent::TodoListUpdated {
-                                                    todo_list: todo_list.clone(),
-                                                })
-                                                .await;
-                                        }
-                                    }
+                                    log::debug!(
+                                        "[{}] TodoLoopContext re-initialized after TodoWrite",
+                                        session_id
+                                    );
                                 }
                             }
                         }
                     }
 
-                    // Handle ask_user tool specially - emit NeedClarification event
-                    if tool_call.function.name == "ask_user" && result.success {
+                    // Handle user-question tools specially - emit NeedClarification event
+                    if (tool_call.function.name == "ExitPlanMode"
+                        || tool_call.function.name == "ask_user")
+                        && result.success
+                    {
                         if let Ok(payload) =
                             serde_json::from_str::<serde_json::Value>(&result.result)
                         {
@@ -1117,8 +1079,9 @@ pub async fn run_agent_loop_with_config(
                             let allow_custom = payload["allow_custom"].as_bool().unwrap_or(true);
 
                             log::info!(
-                                "[{}] ask_user tool called, awaiting user response",
-                                session_id
+                                "[{}] {} called, awaiting user response",
+                                session_id,
+                                tool_call.function.name
                             );
 
                             // Add tool result message (required by OpenAI API)
@@ -1127,8 +1090,13 @@ pub async fn run_agent_loop_with_config(
                                 tool_call.id.clone(),
                                 format!("Waiting for user response to: {}", question),
                             );
-                            log::debug!("[{}] Adding tool result message for ask_user, tool_call_id: {}, message_id: {}",
-                                session_id, tool_call.id, tool_result_msg.id);
+                            log::debug!(
+                                "[{}] Adding tool result message for {}, tool_call_id: {}, message_id: {}",
+                                session_id,
+                                tool_call.function.name,
+                                tool_call.id,
+                                tool_result_msg.id
+                            );
                             session.add_message(tool_result_msg);
 
                             // Ensure the UI/tooling pipeline sees this tool call as completed.
@@ -1170,7 +1138,7 @@ pub async fn run_agent_loop_with_config(
                             if let Some(ref storage) = config.storage {
                                 if let Err(e) = storage.save_session(session).await {
                                     log::warn!(
-                                        "[{}] Failed to save session after ask_user: {}",
+                                        "[{}] Failed to save session after user-question tool: {}",
                                         session_id,
                                         e
                                     );
@@ -1446,7 +1414,7 @@ async fn send_event_with_metrics(
     let _ = event_tx.send(event).await;
 }
 
-fn resolve_token_budget(
+async fn resolve_token_budget(
     session: &Session,
     config: &AgentLoopConfig,
     model_name: &str,
@@ -1462,9 +1430,69 @@ fn resolve_token_budget(
         return budget.clone();
     }
 
-    // Default to model limits
-    let registry = ModelLimitsRegistry::default();
-    let model_limit = registry.get_or_default(model_name);
+    // Default to model limits:
+    // 1. built-in defaults
+    // 2. optional unified config override: config.json -> model_limits
+    // 3. legacy fallback: model_limits.json
+    let mut registry = ModelLimitsRegistry::default();
+
+    let unified_model_limits = match tokio::task::spawn_blocking(|| {
+        let config = crate::core::Config::new();
+        load_model_limits_from_unified_config(&config)
+    })
+    .await
+    {
+        Ok(Ok(limits)) => limits,
+        Ok(Err(error)) => {
+            log::warn!(
+                "Failed to parse model limits from config.json key 'model_limits': {}. Falling back to legacy file.",
+                error
+            );
+            None
+        }
+        Err(error) => {
+            log::warn!(
+                "Failed to load model limits from config.json: {}. Falling back to legacy file.",
+                error
+            );
+            None
+        }
+    };
+
+    if let Some(limits) = unified_model_limits {
+        for limit in limits {
+            registry.add_limit(limit);
+        }
+    } else if let Err(error) = registry.load_user_config().await {
+        log::warn!(
+            "Failed to load model limits from legacy {:?}: {}",
+            crate::agent::core::budget::limits::get_default_config_path(),
+            error
+        );
+    }
+
+    let matched_limit = registry.get(model_name);
+    let model_limit = matched_limit
+        .clone()
+        .unwrap_or_else(|| registry.get_or_default(model_name));
+
+    if matched_limit.is_some() {
+        log::debug!(
+            "Using model limit for '{}': context={}, max_output={}, safety_margin={}",
+            model_name,
+            model_limit.max_context_tokens,
+            model_limit.get_max_output_tokens(),
+            model_limit.get_safety_margin()
+        );
+    } else {
+        log::info!(
+            "No model limit match for '{}', using fallback '{}' (context={}). Override via {:?}",
+            model_name,
+            model_limit.model_pattern,
+            model_limit.max_context_tokens,
+            crate::agent::core::budget::limits::get_default_config_path()
+        );
+    }
 
     TokenBudget::with_safety_margin(
         model_limit.max_context_tokens,
@@ -1489,7 +1517,7 @@ fn resolve_available_tool_schemas(
     tool_schemas
 }
 
-const SKILL_CONTEXT_MARKER: &str = "\n\n## Available Skills\n";
+const SKILL_CONTEXT_MARKERS: [&str; 2] = ["\n\n## Skill System\n", "\n\n## Available Skills\n"];
 const TOOL_GUIDE_MARKER: &str = "## Tool Usage Guidelines\n";
 const EXTERNAL_MEMORY_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n";
 const EXTERNAL_MEMORY_PROMPT_MAX_CHARS: usize = 4_000;
@@ -1525,7 +1553,11 @@ fn merge_system_prompt_with_contexts(
 }
 
 fn strip_existing_skill_context(prompt: &str) -> String {
-    strip_existing_prompt_section(prompt, SKILL_CONTEXT_MARKER)
+    SKILL_CONTEXT_MARKERS
+        .iter()
+        .fold(prompt.to_string(), |acc, marker| {
+            strip_existing_prompt_section(&acc, marker)
+        })
 }
 
 fn strip_existing_tool_guide_context(prompt: &str) -> String {
@@ -1960,11 +1992,11 @@ mod tests {
     fn merge_system_prompt_with_contexts_appends_both_contexts() {
         let merged = merge_system_prompt_with_contexts(
             "You are a helpful assistant.",
-            "\n\n## Available Skills\n\n### Skill\nDetails",
+            "\n\n## Skill System\n\n### Available Skills\nDetails",
             "## Tool Usage Guidelines\n\n### File Reading Tools\nDetails",
         );
         assert!(merged.starts_with("You are a helpful assistant."));
-        assert!(merged.contains("## Available Skills"));
+        assert!(merged.contains("## Skill System"));
         assert!(merged.contains("## Tool Usage Guidelines"));
     }
 
@@ -1972,17 +2004,25 @@ mod tests {
     fn merge_system_prompt_with_contexts_handles_empty_base_prompt() {
         let merged = merge_system_prompt_with_contexts(
             "",
-            "\n\n## Available Skills\n\n### Skill",
+            "\n\n## Skill System\n\n### Available Skills",
             "## Tool Usage Guidelines\n\n### File Reading Tools",
         );
         assert_eq!(
             merged,
-            "## Available Skills\n\n### Skill\n\n## Tool Usage Guidelines\n\n### File Reading Tools"
+            "## Skill System\n\n### Available Skills\n\n## Tool Usage Guidelines\n\n### File Reading Tools"
         );
     }
 
     #[test]
     fn strip_existing_skill_context_removes_previous_section() {
+        let stripped = strip_existing_skill_context(
+            "Base prompt\n\n## Skill System\n\n### Available Skills\nInstructions",
+        );
+        assert_eq!(stripped, "Base prompt");
+    }
+
+    #[test]
+    fn strip_existing_skill_context_removes_legacy_section_marker() {
         let stripped = strip_existing_skill_context(
             "Base prompt\n\n## Available Skills\n\n### One\nInstructions",
         );

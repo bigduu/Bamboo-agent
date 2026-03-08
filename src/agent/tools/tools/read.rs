@@ -1,0 +1,128 @@
+use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::json;
+use std::path::Path;
+
+use super::read_tracker;
+
+#[derive(Debug, Deserialize)]
+struct ReadArgs {
+    file_path: String,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+pub struct ReadTool;
+
+impl ReadTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for ReadTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn render_with_line_numbers(content: &str, offset: usize, limit: Option<usize>) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    let start = offset.min(lines.len());
+    let end = limit
+        .map(|value| start.saturating_add(value).min(lines.len()))
+        .unwrap_or(lines.len());
+
+    lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| format!("{:>6}\t{}", start + idx + 1, line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[async_trait]
+impl Tool for ReadTool {
+    fn name(&self) -> &str {
+        "Read"
+    }
+
+    fn description(&self) -> &str {
+        "Read a file from the local filesystem"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The absolute path to the file to read"
+                },
+                "offset": {
+                    "type": "number",
+                    "description": "The line number offset to start reading from"
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "The number of lines to read"
+                }
+            },
+            "required": ["file_path"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        self.execute_with_context(args, ToolExecutionContext::none("Read"))
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let parsed: ReadArgs = serde_json::from_value(args)
+            .map_err(|e| ToolError::InvalidArguments(format!("Invalid Read args: {}", e)))?;
+
+        let path = Path::new(parsed.file_path.trim());
+        if !path.is_absolute() {
+            return Err(ToolError::InvalidArguments(
+                "file_path must be an absolute path".to_string(),
+            ));
+        }
+
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| ToolError::Execution(format!("Failed to read file: {}", e)))?;
+
+        if bytes.contains(&0) {
+            return Ok(ToolResult {
+                success: true,
+                result: "[Binary file omitted]".to_string(),
+                display_preference: Some("Collapsible".to_string()),
+            });
+        }
+
+        let content = String::from_utf8_lossy(&bytes).to_string();
+        let rendered = render_with_line_numbers(&content, parsed.offset.unwrap_or(0), parsed.limit);
+
+        if let Some(session_id) = ctx.session_id {
+            read_tracker::mark_read(session_id, parsed.file_path.trim()).await;
+        }
+
+        Ok(ToolResult {
+            success: true,
+            result: rendered,
+            display_preference: Some("Collapsible".to_string()),
+        })
+    }
+}

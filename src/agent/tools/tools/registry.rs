@@ -25,14 +25,14 @@ use crate::agent::tools::guide::{ToolGuide, ToolGuideSpec};
 /// # Example
 ///
 /// ```no_run
-/// use bamboo_agent::tools::{ToolRegistry, ReadFileTool};
+/// use bamboo_agent::tools::{ToolRegistry, ReadTool};
 ///
 /// let registry = ToolRegistry::new();
-/// registry.register(ReadFileTool::new()).unwrap();
+/// registry.register(ReadTool::new()).unwrap();
 ///
 /// // Later, add a guide
 /// let guide_spec = r#"{...}"#;
-/// registry.register_guide_from_json("read_file", guide_spec).unwrap();
+/// registry.register_guide_from_json("Read", guide_spec).unwrap();
 /// ```
 pub struct ToolRegistry {
     tools: crate::agent::core::tools::ToolRegistry,
@@ -163,7 +163,7 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::tools::tools::ReadFileTool;
+    use crate::agent::tools::tools::ReadTool;
 
     struct MockGuide;
 
@@ -196,30 +196,30 @@ mod tests {
     #[test]
     fn register_tool_without_guide() {
         let registry = ToolRegistry::new();
-        registry.register(ReadFileTool::new()).unwrap();
+        registry.register(ReadTool::new()).unwrap();
 
-        assert!(registry.contains("read_file"));
-        assert!(registry.get_guide("read_file").is_none());
+        assert!(registry.contains("Read"));
+        assert!(registry.get_guide("Read").is_none());
     }
 
     #[test]
     fn register_tool_with_guide() {
         let registry = ToolRegistry::new();
         registry
-            .register_with_guide(ReadFileTool::new(), MockGuide)
+            .register_with_guide(ReadTool::new(), MockGuide)
             .unwrap();
 
-        assert!(registry.contains("read_file"));
-        assert!(registry.get_guide("read_file").is_some());
+        assert!(registry.contains("Read"));
+        assert!(registry.get_guide("Read").is_some());
     }
 
     #[test]
     fn register_guide_from_json() {
         let registry = ToolRegistry::new();
-        registry.register(ReadFileTool::new()).unwrap();
+        registry.register(ReadTool::new()).unwrap();
 
         let json_spec = r#"{
-            "tool_name": "read_file",
+            "tool_name": "Read",
             "when_to_use": "Read small files",
             "when_not_to_use": "Don't read large files",
             "examples": [],
@@ -228,10 +228,10 @@ mod tests {
         }"#;
 
         registry
-            .register_guide_from_json("read_file", json_spec)
+            .register_guide_from_json("Read", json_spec)
             .unwrap();
 
-        let guide = registry.get_guide("read_file").unwrap();
+        let guide = registry.get_guide("Read").unwrap();
         assert_eq!(guide.when_to_use(), "Read small files");
     }
 
@@ -239,12 +239,12 @@ mod tests {
     fn guide_removed_when_tool_unregistered() {
         let registry = ToolRegistry::new();
         registry
-            .register_with_guide(ReadFileTool::new(), MockGuide)
+            .register_with_guide(ReadTool::new(), MockGuide)
             .unwrap();
 
-        registry.unregister("read_file");
+        registry.unregister("Read");
 
-        assert!(!registry.contains("read_file"));
-        assert!(registry.get_guide("read_file").is_none());
+        assert!(!registry.contains("Read"));
+        assert!(registry.get_guide("Read").is_none());
     }
 }

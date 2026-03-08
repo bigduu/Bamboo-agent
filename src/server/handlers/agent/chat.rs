@@ -198,24 +198,14 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         .map(|v| v.to_string())
         .or_else(|| session.metadata.get("workspace_path").cloned());
 
-    // Only upsert the system message when the client is explicitly customizing prompt
-    // inputs (or if the session has no system message yet).
-    let has_system_message = session
-        .messages
-        .iter()
-        .any(|m| matches!(m.role, crate::agent::core::Role::System));
-    if base_prompt_from_request.is_some()
-        || enhance_prompt.is_some()
-        || workspace_path.is_some()
-        || !has_system_message
-    {
-        let system_prompt = build_enhanced_system_prompt(
-            base_prompt.as_str(),
-            enhance_prompt,
-            workspace_path.as_deref(),
-        );
-        upsert_system_prompt_message(&mut session, system_prompt);
-    }
+    // Always refresh the persisted system prompt so existing sessions don't
+    // keep stale tool instructions after backend upgrades.
+    let system_prompt = build_enhanced_system_prompt(
+        base_prompt.as_str(),
+        enhance_prompt,
+        workspace_path.as_deref(),
+    );
+    upsert_system_prompt_message(&mut session, system_prompt);
 
     // Preserve multimodal parts so that preflight hooks (OCR/fallback) and/or multimodal
     // upstream models can use the images.

@@ -485,7 +485,7 @@ impl AppState {
         let config = Arc::new(RwLock::new(config));
         let claude_cli_path: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
-        // Initialize built-in tools (with optional Claude Code tool)
+        // Initialize built-in tools.
         let builtin_executor = Arc::new(crate::agent::tools::BuiltinToolExecutor::new_with_config(
             config.clone(),
         ));
@@ -495,7 +495,6 @@ impl AppState {
         // is not blocked by PATH scanning / process invocations (e.g. `claude --version`).
         {
             let claude_cli_path = claude_cli_path.clone();
-            let builtin_executor = builtin_executor.clone();
             tokio::spawn(async move {
                 let discovered = tokio::task::spawn_blocking(crate::claude::try_find_claude_binary)
                     .await
@@ -504,12 +503,7 @@ impl AppState {
 
                 if let Some(path) = discovered {
                     *claude_cli_path.write().await = Some(path.clone());
-                    log::info!("Claude Code CLI enabled (found at: {})", path);
-                    if let Err(e) = builtin_executor
-                        .register_tool(crate::agent::tools::tools::ClaudeCodeTool::new(path))
-                    {
-                        log::warn!("Failed to register claude_code tool: {}", e);
-                    }
+                    log::info!("Claude Code CLI discovered (found at: {})", path);
                 } else {
                     log::warn!("Claude Code CLI not found; Claude integration disabled");
                 }
@@ -641,19 +635,8 @@ impl AppState {
         let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
-        // Add `session_inspector` to both root + child tool sets.
-        let session_inspector_tool = Arc::new(crate::server::tools::SessionInspectorTool::new(
-            session_store.clone(),
-            storage.clone(),
-        ));
-        let tools_with_inspector: Arc<dyn ToolExecutor> =
-            Arc::new(crate::server::tools::OverlayToolExecutor::new(
-                base_tools.clone(),
-                session_inspector_tool,
-            ));
-
-        // Child tools intentionally do not expose `spawn_session` (no nesting), but can inspect sessions.
-        let child_tools: Arc<dyn ToolExecutor> = tools_with_inspector.clone();
+        // Child tools intentionally do not expose `Task` (no nested child spawns).
+        let child_tools: Arc<dyn ToolExecutor> = base_tools.clone();
 
         // Initialize sub-session spawn scheduler (async background jobs).
         let spawn_scheduler = Arc::new(SpawnScheduler::new(SpawnContext {
@@ -668,17 +651,15 @@ impl AppState {
             session_event_senders: session_event_senders.clone(),
         }));
 
-        // Root tools include `spawn_session` via a lightweight overlay executor.
+        // Root tools include `Task` via a lightweight overlay executor.
         let spawn_tool = Arc::new(crate::server::tools::SpawnSessionTool::new(
             session_store.clone(),
             storage.clone(),
             spawn_scheduler.clone(),
         ));
-        let tools_with_spawn: Arc<dyn ToolExecutor> =
-            Arc::new(crate::server::tools::OverlayToolExecutor::new(
-                tools_with_inspector.clone(),
-                spawn_tool,
-            ));
+        let tools_with_task: Arc<dyn ToolExecutor> = Arc::new(
+            crate::server::tools::OverlayToolExecutor::new(base_tools.clone(), spawn_tool),
+        );
 
         // Initialize schedule store + manager (timed tasks).
         let schedule_store = Arc::new(ScheduleStore::new(data_dir.clone()).await.unwrap_or_else(
@@ -690,7 +671,7 @@ impl AppState {
 
         // Schedule jobs should not automatically inherit schedule-management tools; keep the tool
         // surface minimal for background automation unless explicitly needed later.
-        let tools_for_schedules = tools_with_spawn.clone();
+        let tools_for_schedules = tools_with_task.clone();
         let schedule_manager = Arc::new(ScheduleManager::new(ScheduleContext {
             schedule_store: schedule_store.clone(),
             session_store: session_store.clone(),
@@ -705,16 +686,7 @@ impl AppState {
             config: config.clone(),
         }));
 
-        // Add schedule management as a single server-only tool (action-based).
-        let schedule_tool = Arc::new(crate::server::tools::ScheduleTasksTool::new(
-            schedule_store.clone(),
-            schedule_manager.clone(),
-            session_store.clone(),
-            storage.clone(),
-        ));
-        let tools: Arc<dyn ToolExecutor> = Arc::new(
-            crate::server::tools::OverlayToolExecutor::new(tools_with_spawn, schedule_tool),
-        );
+        let tools: Arc<dyn ToolExecutor> = tools_with_task;
 
         Self {
             app_data_dir: bamboo_home_dir,

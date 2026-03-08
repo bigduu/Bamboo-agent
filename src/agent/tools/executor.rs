@@ -10,11 +10,9 @@ use serde_json::json;
 use crate::agent::tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
 use crate::agent::tools::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::agent::tools::tools::{
-    ApplyPatchTool, AskUserTool, CreateTodoListTool, ExecuteCommandTool, FileExistsTool,
-    GetCurrentDirTool, GetFileInfoTool, GitDiffTool, GitStatusTool, GitWriteTool, GlobSearchTool,
-    HttpRequestTool, ListDirectoryTool, MemoryNoteTool, ReadFileRangeTool, ReadFileTool,
-    SearchInFileTool, SearchInProjectTool, SetWorkspaceTool, SleepTool, TerminalSessionTool,
-    ToolRegistry, UpdateTodoItemTool, WriteFileTool,
+    AskUserTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, GlobTool, GrepTool,
+    KillShellTool, NotebookEditTool, ReadTool, SlashCommandTool, TaskTool, TodoWriteTool,
+    ToolRegistry, WebFetchTool, WebSearchTool, WriteTool,
 };
 use crate::core::Config;
 use tokio::sync::RwLock;
@@ -24,35 +22,28 @@ use tokio::sync::RwLock;
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 23] = [
-    "read_file",
-    "write_file",
-    "list_directory",
-    "file_exists",
-    "get_file_info",
-    "execute_command",
+pub const BUILTIN_TOOL_NAMES: [&str; 16] = [
     "ask_user",
-    "get_current_dir",
-    "set_workspace",
-    "read_file_range",
-    "search_in_file",
-    "apply_patch",
-    "search_in_project",
-    "git_status",
-    "git_diff",
-    "git_write",
-    "create_todo_list",
-    "update_todo_item",
-    "glob_search",
-    "http_request",
-    "sleep",
-    "terminal_session",
-    "memory_note",
+    "Bash",
+    "BashOutput",
+    "Edit",
+    "ExitPlanMode",
+    "Glob",
+    "Grep",
+    "KillShell",
+    "NotebookEdit",
+    "Read",
+    "SlashCommand",
+    "Task",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+    "Write",
 ];
 
 /// Normalizes a tool reference to a standard tool name
 ///
-/// Handles legacy aliases like "run_command" -> "execute_command"
+/// Returns None if the tool name is not recognized.
 /// Returns None if the tool name is not recognized
 pub fn normalize_tool_ref(value: &str) -> Option<String> {
     let trimmed = value.trim();
@@ -60,13 +51,8 @@ pub fn normalize_tool_ref(value: &str) -> Option<String> {
         return None;
     }
     let raw_tool_name = trimmed.split("::").last().unwrap_or(trimmed);
-    let tool_name = match raw_tool_name {
-        "run_command" => "execute_command",
-        _ => raw_tool_name,
-    };
-    // `claude_code` is an optional integration tool that may be registered at runtime.
-    if BUILTIN_TOOL_NAMES.iter().any(|name| name == &tool_name) || tool_name == "claude_code" {
-        Some(tool_name.to_string())
+    if BUILTIN_TOOL_NAMES.iter().any(|name| name == &raw_tool_name) {
+        Some(raw_tool_name.to_string())
     } else {
         None
     }
@@ -145,49 +131,23 @@ impl BuiltinToolExecutor {
 
     /// Registers all built-in tools to the given registry
     fn register_builtin_tools(registry: &ToolRegistry, config: Option<Arc<RwLock<Config>>>) {
-        // Register filesystem tools
-        let _ = registry.register(ReadFileTool::new());
-        let _ = registry.register(WriteFileTool::new());
-        let _ = registry.register(ListDirectoryTool::new());
-        let _ = registry.register(FileExistsTool::new());
-        let _ = registry.register(GetFileInfoTool::new());
-
-        // Register command tools
-        let _ = registry.register(ExecuteCommandTool::new());
+        let _ = config;
         let _ = registry.register(AskUserTool::new());
-        let _ = registry.register(GetCurrentDirTool::new());
-
-        // Register workspace tools
-        let _ = registry.register(SetWorkspaceTool::new());
-
-        // Register advanced file tools
-        let _ = registry.register(ReadFileRangeTool::new());
-        let _ = registry.register(SearchInFileTool::new());
-        let _ = registry.register(ApplyPatchTool::new());
-
-        // Register project-wide tools
-        let _ = registry.register(SearchInProjectTool::new());
-
-        // Register git tools
-        let _ = registry.register(GitStatusTool::new());
-        let _ = registry.register(GitDiffTool::new());
-        let _ = registry.register(GitWriteTool::new());
-
-        // Register todo list tools
-        let _ = registry.register(CreateTodoListTool::new());
-        let _ = registry.register(UpdateTodoItemTool::new());
-
-        // Register new utility tools
-        let _ = registry.register(GlobSearchTool::new());
-        let _ = match config {
-            Some(config) => registry.register(HttpRequestTool::new_with_config(config)),
-            None => registry.register(HttpRequestTool::new()),
-        };
-        let _ = registry.register(SleepTool::new());
-        let _ = registry.register(TerminalSessionTool::new());
-
-        // Persistent external memory note (per session).
-        let _ = registry.register(MemoryNoteTool::new());
+        let _ = registry.register(BashTool::new());
+        let _ = registry.register(BashOutputTool::new());
+        let _ = registry.register(EditTool::new());
+        let _ = registry.register(ExitPlanModeTool::new());
+        let _ = registry.register(GlobTool::new());
+        let _ = registry.register(GrepTool::new());
+        let _ = registry.register(KillShellTool::new());
+        let _ = registry.register(NotebookEditTool::new());
+        let _ = registry.register(ReadTool::new());
+        let _ = registry.register(SlashCommandTool::new());
+        let _ = registry.register(TaskTool::new());
+        let _ = registry.register(TodoWriteTool::new());
+        let _ = registry.register(WebFetchTool::new());
+        let _ = registry.register(WebSearchTool::new());
+        let _ = registry.register(WriteTool::new());
     }
 
     /// Returns all built-in tool schemas
@@ -320,11 +280,10 @@ impl BuiltinToolExecutorBuilder {
     /// Registers a specific filesystem tool by name
     pub fn with_filesystem_tool(self, name: &str) -> Result<Self, ToolError> {
         match name {
-            "read_file" => self.registry.register(ReadFileTool::new()),
-            "write_file" => self.registry.register(WriteFileTool::new()),
-            "list_directory" => self.registry.register(ListDirectoryTool::new()),
-            "file_exists" => self.registry.register(FileExistsTool::new()),
-            "get_file_info" => self.registry.register(GetFileInfoTool::new()),
+            "Read" => self.registry.register(ReadTool::new()),
+            "Write" => self.registry.register(WriteTool::new()),
+            "Edit" => self.registry.register(EditTool::new()),
+            "NotebookEdit" => self.registry.register(NotebookEditTool::new()),
             _ => return Err(ToolError::NotFound(format!("Unknown tool: {}", name))),
         }
         .map_err(|e| ToolError::Execution(e.to_string()))?;
@@ -334,8 +293,10 @@ impl BuiltinToolExecutorBuilder {
     /// Registers a specific command tool by name
     pub fn with_command_tool(self, name: &str) -> Result<Self, ToolError> {
         match name {
-            "execute_command" => self.registry.register(ExecuteCommandTool::new()),
-            "get_current_dir" => self.registry.register(GetCurrentDirTool::new()),
+            "Bash" => self.registry.register(BashTool::new()),
+            "BashOutput" => self.registry.register(BashOutputTool::new()),
+            "KillShell" => self.registry.register(KillShellTool::new()),
+            "Task" => self.registry.register(TaskTool::new()),
             _ => return Err(ToolError::NotFound(format!("Unknown tool: {}", name))),
         }
         .map_err(|e| ToolError::Execution(e.to_string()))?;
@@ -382,7 +343,7 @@ mod tests {
     use tokio::fs;
     use tokio::sync::mpsc;
 
-    use crate::agent::tools::tools::WriteFileTool;
+    use crate::agent::tools::tools::WriteTool;
 
     fn make_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
         ToolCall {
@@ -399,8 +360,8 @@ mod tests {
         permission_checker: Option<Arc<dyn PermissionChecker>>,
     ) -> BuiltinToolExecutor {
         let builder = BuiltinToolExecutorBuilder::new()
-            .with_tool(WriteFileTool::new())
-            .expect("register write_file tool");
+            .with_tool(WriteTool::new())
+            .expect("register Write tool");
 
         let builder = match permission_checker {
             Some(checker) => builder.with_permission_checker(checker),
@@ -411,16 +372,78 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_tool_ref_supports_legacy_run_command_alias() {
+    fn test_normalize_tool_ref_accepts_claude_style_names() {
         assert_eq!(
-            normalize_tool_ref("default::run_command"),
-            Some("execute_command".to_string())
+            normalize_tool_ref("default::Bash"),
+            Some("Bash".to_string())
         );
     }
 
     #[test]
     fn test_normalize_tool_ref_rejects_unknown_tool() {
         assert_eq!(normalize_tool_ref("default::search"), None);
+    }
+
+    #[test]
+    fn test_executor_does_not_expose_legacy_tools() {
+        let executor = BuiltinToolExecutor::new();
+        let tool_names: Vec<String> = executor
+            .list_tools()
+            .into_iter()
+            .map(|schema| schema.function.name)
+            .collect();
+
+        for legacy in [
+            "claude_code",
+            "search_in_file",
+            "search_in_project",
+            "apply_patch",
+        ] {
+            assert!(!tool_names.iter().any(|name| name == legacy));
+        }
+    }
+
+    #[test]
+    fn test_critical_tool_schemas_match_claude_shapes() {
+        let executor = BuiltinToolExecutor::new();
+        let tools = executor.list_tools();
+
+        let get_params = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.function.name == name)
+                .unwrap()
+                .function
+                .parameters
+                .clone()
+        };
+
+        let grep = get_params("Grep");
+        assert_eq!(grep["required"], json!(["pattern"]));
+        assert_eq!(
+            grep["properties"]["output_mode"]["enum"],
+            json!(["content", "files_with_matches", "count"])
+        );
+        assert!(grep["properties"]["-A"].is_object());
+        assert!(grep["properties"]["-B"].is_object());
+        assert!(grep["properties"]["-C"].is_object());
+        assert!(grep["properties"]["-n"].is_object());
+        assert!(grep["properties"]["-i"].is_object());
+
+        let edit = get_params("Edit");
+        assert_eq!(
+            edit["required"],
+            json!(["file_path", "old_string", "new_string"])
+        );
+        assert_eq!(edit["properties"]["replace_all"]["type"], "boolean");
+
+        let bash = get_params("Bash");
+        assert_eq!(bash["required"], json!(["command"]));
+        assert_eq!(bash["properties"]["run_in_background"]["type"], "boolean");
+
+        let bash_output = get_params("BashOutput");
+        assert_eq!(bash_output["required"], json!(["bash_id"]));
+        assert_eq!(bash_output["properties"]["filter"]["type"], "string");
     }
 
     #[test]
@@ -441,7 +464,7 @@ mod tests {
         let executor = BuiltinToolExecutor::new();
         let prompt = executor.build_enhanced_prompt(GuideBuildContext::default());
         assert!(prompt.contains("## Tool Usage Guidelines"));
-        assert!(prompt.contains("**read_file**"));
+        assert!(prompt.contains("**Read**"));
     }
 
     #[test]
@@ -461,13 +484,13 @@ mod tests {
     #[test]
     fn test_executor_builder_with_specific_tool() {
         let executor = BuiltinToolExecutorBuilder::new()
-            .with_filesystem_tool("read_file")
+            .with_filesystem_tool("Read")
             .unwrap()
             .build();
 
         let tools = executor.list_tools();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].function.name, "read_file");
+        assert_eq!(tools[0].function.name, "Read");
     }
 
     #[tokio::test]
@@ -476,7 +499,7 @@ mod tests {
         let path = "/tmp/executor_permission_none.txt";
         let _ = fs::remove_file(path).await;
 
-        let call = make_tool_call("write_file", json!({"path": path, "content": "ok"}));
+        let call = make_tool_call("Write", json!({"file_path": path, "content": "ok"}));
         let result = executor.execute(&call).await.expect("execute tool");
 
         assert!(result.success);
@@ -490,7 +513,7 @@ mod tests {
         let path = "/tmp/executor_permission_denied.txt";
         let _ = fs::remove_file(path).await;
 
-        let call = make_tool_call("write_file", json!({"path": path, "content": "nope"}));
+        let call = make_tool_call("Write", json!({"file_path": path, "content": "nope"}));
         let result = executor.execute(&call).await;
 
         assert!(matches!(result, Err(ToolError::Execution(_))));
@@ -563,5 +586,21 @@ mod tests {
         assert!(
             matches!(ev, AgentEvent::ToolToken { tool_call_id, content } if tool_call_id == "call_1" && content == "stream")
         );
+    }
+
+    #[tokio::test]
+    async fn removed_legacy_tools_return_not_found() {
+        let executor = BuiltinToolExecutor::new();
+
+        for legacy in [
+            "claude_code",
+            "search_in_file",
+            "search_in_project",
+            "apply_patch",
+        ] {
+            let call = make_tool_call(legacy, json!({}));
+            let result = executor.execute(&call).await;
+            assert!(matches!(result, Err(ToolError::NotFound(_))));
+        }
     }
 }

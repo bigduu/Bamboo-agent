@@ -31,7 +31,7 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
     let skills_root = crate::core::paths::bamboo_dir().join("skills");
     let skills_root_display = crate::core::paths::path_to_display_string(&skills_root);
     context.push_str(&format!(
-        "3. If there's a match, read the skill file (skills dir: {}): `read_file({{\"path\": \"{}/<skill_id>/SKILL.md\"}})`\n",
+        "3. If there's a match, read the skill file (skills dir: {}): `Read({{\"file_path\": \"{}/<skill_id>/SKILL.md\"}})`\n",
         skills_root_display, skills_root_display
     ));
     context.push_str("4. Follow the instructions in the skill file to help the user\n\n");
@@ -105,7 +105,7 @@ mod tests {
         assert!(context.contains("## Skill System"));
         assert!(context.contains("How to Use Skills"));
         assert!(context.contains("Match it against the available skills"));
-        assert!(context.contains("read_file"));
+        assert!(context.contains("Read"));
         let expected_skills_root = crate::core::paths::path_to_display_string(
             &crate::core::paths::bamboo_dir().join("skills"),
         );

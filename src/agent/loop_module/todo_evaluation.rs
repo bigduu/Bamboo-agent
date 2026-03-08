@@ -28,6 +28,41 @@ pub struct TodoItemUpdate {
     pub notes: Option<String>,
 }
 
+fn status_to_wire_value(status: &TodoItemStatus) -> &'static str {
+    match status {
+        TodoItemStatus::Pending => "pending",
+        TodoItemStatus::InProgress => "in_progress",
+        TodoItemStatus::Completed => "completed",
+        TodoItemStatus::Blocked => "blocked",
+    }
+}
+
+fn has_tool_activity(ctx: &TodoLoopContext) -> bool {
+    ctx.items.iter().any(|item| !item.tool_calls.is_empty())
+}
+
+fn summarize_updates(updates: &[TodoItemUpdate]) -> String {
+    if updates.is_empty() {
+        return "No todo status changes needed.".to_string();
+    }
+
+    let details: Vec<String> = updates
+        .iter()
+        .map(|update| {
+            format!(
+                "{} -> {}",
+                update.item_id,
+                status_to_wire_value(&update.status)
+            )
+        })
+        .collect();
+    format!(
+        "Applied {} todo update(s): {}",
+        updates.len(),
+        details.join(", ")
+    )
+}
+
 /// 构建用于 TodoList 评估的 messages
 pub fn build_todo_evaluation_messages(
     ctx: &TodoLoopContext,
@@ -163,7 +198,7 @@ pub async fn evaluate_todo_progress(
     session_id: &str,
     model: &str, // Add model parameter (required)
 ) -> Result<TodoEvaluationResult, crate::agent::core::AgentError> {
-    use crate::agent::loop_module::stream::handler::consume_llm_stream;
+    use crate::agent::loop_module::stream::handler::consume_llm_stream_silent;
 
     // 检查是否有需要评估的任务
     let in_progress_count = ctx
@@ -177,6 +212,15 @@ pub async fn evaluate_todo_progress(
             needs_evaluation: false,
             updates: Vec::new(),
             reasoning: "No in-progress tasks to evaluate".to_string(),
+        });
+    }
+
+    // No tool activity means there is no new evidence to evaluate yet.
+    if !has_tool_activity(ctx) {
+        return Ok(TodoEvaluationResult {
+            needs_evaluation: false,
+            updates: Vec::new(),
+            reasoning: "No tool executions yet; skipping todo evaluation.".to_string(),
         });
     }
 
@@ -204,10 +248,10 @@ pub async fn evaluate_todo_progress(
     // 调用 LLM（限制 output tokens）
     match llm.chat_stream(&messages, &tools, Some(500), model).await {
         Ok(stream) => {
-            // 消费流
-            let stream_output = consume_llm_stream(
+            // Consume evaluation stream silently so evaluation text does not leak
+            // into the main assistant response channel.
+            let stream_output = consume_llm_stream_silent(
                 stream,
-                event_tx,
                 &tokio_util::sync::CancellationToken::new(),
                 session_id,
             )
@@ -246,20 +290,28 @@ pub async fn evaluate_todo_progress(
                     }
                 }
             }
+            let reasoning = summarize_updates(&updates);
+            if !stream_output.content.trim().is_empty() {
+                log::debug!(
+                    "[{}] Todo evaluation raw reasoning suppressed ({} chars)",
+                    session_id,
+                    stream_output.content.len()
+                );
+            }
 
             // 发送评估完成事件
             let _ = event_tx
                 .send(AgentEvent::TodoEvaluationCompleted {
                     session_id: session_id.to_string(),
                     updates_count: updates.len(),
-                    reasoning: stream_output.content.clone(),
+                    reasoning: reasoning.clone(),
                 })
                 .await;
 
             Ok(TodoEvaluationResult {
                 needs_evaluation: true,
                 updates,
-                reasoning: stream_output.content,
+                reasoning,
             })
         }
         Err(e) => {

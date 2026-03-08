@@ -130,6 +130,8 @@ fn select_segments_within_budget(
     let total_segments = segments.len();
     let mut selected: Vec<crate::agent::core::budget::segmenter::MessageSegment> = Vec::new();
     let mut current_tokens: u32 = 0;
+    let mut oversized_skipped_count: usize = 0;
+    let mut oversized_max_tokens: u32 = 0;
 
     // Iterate from the end (most recent) backwards
     for segment in segments.into_iter().rev() {
@@ -139,12 +141,9 @@ fn select_segments_within_budget(
         if segment_tokens > remaining_budget {
             if selected.is_empty() {
                 // Edge case: single message exceeds entire budget
-                // Log warning but skip it (don't include oversized segments)
-                tracing::warn!(
-                    "Single segment ({tokens} tokens) exceeds remaining budget ({budget} tokens), skipping",
-                    tokens = segment_tokens,
-                    budget = remaining_budget
-                );
+                // Skip oversized segments and log a summarized warning later.
+                oversized_skipped_count = oversized_skipped_count.saturating_add(1);
+                oversized_max_tokens = oversized_max_tokens.max(segment_tokens);
                 // Skip this segment and continue to try to find smaller ones
                 continue;
             } else {
@@ -166,6 +165,15 @@ fn select_segments_within_budget(
     selected.reverse();
 
     let removed_count = total_segments - selected.len();
+
+    if oversized_skipped_count > 0 {
+        tracing::warn!(
+            "Skipped {count} oversized segment(s); largest={largest} tokens exceeds remaining budget={budget}",
+            count = oversized_skipped_count,
+            largest = oversized_max_tokens,
+            budget = remaining_budget
+        );
+    }
 
     (selected, removed_count)
 }

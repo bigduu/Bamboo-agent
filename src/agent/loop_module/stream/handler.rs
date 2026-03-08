@@ -12,9 +12,9 @@ pub struct StreamHandlingOutput {
     pub tool_calls: Vec<ToolCall>,
 }
 
-pub async fn consume_llm_stream(
+async fn consume_llm_stream_internal(
     mut stream: LLMStream,
-    event_tx: &mpsc::Sender<AgentEvent>,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
     cancel_token: &CancellationToken,
     session_id: &str,
 ) -> Result<StreamHandlingOutput, AgentError> {
@@ -32,11 +32,13 @@ pub async fn consume_llm_stream(
                 token_count += token.len();
                 content.push_str(&token);
 
-                let _ = event_tx
-                    .send(AgentEvent::Token {
-                        content: token.clone(),
-                    })
-                    .await;
+                if let Some(event_tx) = event_tx {
+                    let _ = event_tx
+                        .send(AgentEvent::Token {
+                            content: token.clone(),
+                        })
+                        .await;
+                }
             }
             Ok(LLMChunk::ToolCalls(partial_calls)) => {
                 log::trace!(
@@ -50,12 +52,14 @@ pub async fn consume_llm_stream(
                 log::debug!("[{}] LLM stream completed", session_id);
             }
             Err(error) => {
-                let message = format!("Stream error: {error}");
-                let _ = event_tx
-                    .send(AgentEvent::Error {
-                        message: message.clone(),
-                    })
-                    .await;
+                if let Some(event_tx) = event_tx {
+                    let message = format!("Stream error: {error}");
+                    let _ = event_tx
+                        .send(AgentEvent::Error {
+                            message: message.clone(),
+                        })
+                        .await;
+                }
                 return Err(AgentError::LLM(error.to_string()));
             }
         }
@@ -66,6 +70,23 @@ pub async fn consume_llm_stream(
         token_count,
         tool_calls: tool_calls.finalize(),
     })
+}
+
+pub async fn consume_llm_stream(
+    stream: LLMStream,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    cancel_token: &CancellationToken,
+    session_id: &str,
+) -> Result<StreamHandlingOutput, AgentError> {
+    consume_llm_stream_internal(stream, Some(event_tx), cancel_token, session_id).await
+}
+
+pub async fn consume_llm_stream_silent(
+    stream: LLMStream,
+    cancel_token: &CancellationToken,
+    session_id: &str,
+) -> Result<StreamHandlingOutput, AgentError> {
+    consume_llm_stream_internal(stream, None, cancel_token, session_id).await
 }
 
 #[cfg(test)]
@@ -120,5 +141,21 @@ mod tests {
 
         let token_event = event_rx.recv().await.expect("missing token event");
         assert!(matches!(token_event, AgentEvent::Token { .. }));
+    }
+
+    #[tokio::test]
+    async fn consume_llm_stream_silent_does_not_emit_events() {
+        let stream = build_stream(vec![
+            Ok(LLMChunk::Token("hello".to_string())),
+            Ok(LLMChunk::Done),
+        ]);
+
+        let output = consume_llm_stream_silent(stream, &CancellationToken::new(), "session-2")
+            .await
+            .expect("silent stream should succeed");
+
+        assert_eq!(output.content, "hello");
+        assert_eq!(output.token_count, 5);
+        assert!(output.tool_calls.is_empty());
     }
 }
