@@ -17,8 +17,8 @@ use crate::agent::core::budget::{
 };
 use crate::agent::core::storage::AttachmentReader;
 use crate::agent::core::tools::{
-    handle_tool_result_with_agentic_support, parse_tool_args, ToolExecutor, ToolHandlingOutcome,
-    ToolSchema,
+    handle_tool_result_with_agentic_support, parse_tool_args, ToolCall, ToolExecutor,
+    ToolHandlingOutcome, ToolResult, ToolSchema,
 };
 use crate::agent::core::{
     AgentError, AgentEvent, ExternalMemory, Message, Session, TodoItemStatus,
@@ -32,7 +32,7 @@ use crate::agent::metrics::{
     TokenUsage as MetricsTokenUsage,
 };
 use crate::agent::tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder};
-use crate::agent::tools::TodoWriteTool;
+use crate::agent::tools::{normalize_tool_ref, TodoWriteTool};
 
 use crate::agent::loop_module::config::AgentLoopConfig;
 use crate::agent::loop_module::stream::handler::consume_llm_stream;
@@ -1056,6 +1056,18 @@ pub async fn run_agent_loop_with_config(
                         }
                     }
 
+                    if let Some(workspace_path) =
+                        extract_workspace_path_from_set_workspace_result(tool_call, &result)
+                    {
+                        apply_workspace_path_to_session(session, &workspace_path);
+                        log::info!(
+                            "[{}] Updated session workspace_path via {}: {}",
+                            session_id,
+                            tool_call.function.name,
+                            workspace_path
+                        );
+                    }
+
                     // Handle user-question tools specially - emit NeedClarification event
                     if (tool_call.function.name == "ExitPlanMode"
                         || tool_call.function.name == "ask_user")
@@ -1576,6 +1588,112 @@ fn strip_existing_external_memory(prompt: &str) -> String {
     strip_existing_prompt_section(prompt, EXTERNAL_MEMORY_MARKER)
 }
 
+const WORKSPACE_CONTEXT_MARKER: &str = "\n\nWorkspace path: ";
+
+fn extract_workspace_path_from_set_workspace_result(
+    tool_call: &ToolCall,
+    result: &ToolResult,
+) -> Option<String> {
+    if !result.success {
+        return None;
+    }
+
+    let normalized_tool_name = normalize_tool_ref(&tool_call.function.name)?;
+    if normalized_tool_name != "SetWorkspace" {
+        return None;
+    }
+
+    let payload: serde_json::Value = serde_json::from_str(&result.result).ok()?;
+    payload
+        .get("workspace")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn apply_workspace_path_to_session(session: &mut Session, workspace_path: &str) {
+    let workspace_path = workspace_path.trim();
+    if workspace_path.is_empty() {
+        return;
+    }
+
+    session
+        .metadata
+        .insert("workspace_path".to_string(), workspace_path.to_string());
+
+    if let Some(system_message) = session
+        .messages
+        .iter_mut()
+        .find(|message| matches!(message.role, crate::agent::core::Role::System))
+    {
+        // Drop dynamic round sections first. They will be re-injected by the loop.
+        let base_prompt =
+            strip_existing_todo_list(&strip_existing_external_memory(&system_message.content));
+        system_message.content = upsert_workspace_context(&base_prompt, workspace_path);
+    } else {
+        session.messages.insert(
+            0,
+            Message::system(upsert_workspace_context("", workspace_path)),
+        );
+    }
+}
+
+fn upsert_workspace_context(prompt: &str, workspace_path: &str) -> String {
+    let workspace_path = workspace_path.trim();
+    if workspace_path.is_empty() {
+        return strip_existing_workspace_context(prompt);
+    }
+
+    let guidance = crate::server::app_state::workspace_prompt_guidance();
+    let segment = format!(
+        "{WORKSPACE_CONTEXT_MARKER}{workspace_path}\n{}",
+        guidance.trim()
+    );
+    let stripped = strip_existing_workspace_context(prompt);
+
+    if stripped.trim().is_empty() {
+        segment.trim_start().to_string()
+    } else {
+        format!("{}{}", stripped.trim_end(), segment)
+    }
+}
+
+fn strip_existing_workspace_context(prompt: &str) -> String {
+    let Some(start_idx) = prompt.find(WORKSPACE_CONTEXT_MARKER) else {
+        return prompt.to_string();
+    };
+
+    let guidance = crate::server::app_state::workspace_prompt_guidance();
+    if let Some(guidance_rel_idx) = prompt[start_idx..].find(&guidance) {
+        let guidance_end_idx = start_idx + guidance_rel_idx + guidance.len();
+        let mut out = String::new();
+        out.push_str(prompt[..start_idx].trim_end());
+        out.push_str(&prompt[guidance_end_idx..]);
+        return out.trim_end().to_string();
+    }
+
+    let after_marker_idx = start_idx + WORKSPACE_CONTEXT_MARKER.len();
+    let remainder = &prompt[after_marker_idx..];
+    let next_section_idx = [
+        remainder.find(SKILL_CONTEXT_MARKERS[0]),
+        remainder.find(SKILL_CONTEXT_MARKERS[1]),
+        remainder.find(TOOL_GUIDE_MARKER),
+        remainder.find(EXTERNAL_MEMORY_MARKER),
+        remainder.find(TODO_LIST_MARKER),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .map(|idx| after_marker_idx + idx)
+    .unwrap_or(prompt.len());
+
+    let mut out = String::new();
+    out.push_str(prompt[..start_idx].trim_end());
+    out.push_str(&prompt[next_section_idx..]);
+    out.trim_end().to_string()
+}
+
 fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
     let mut out = String::new();
     for (count, ch) in value.chars().enumerate() {
@@ -1774,9 +1892,10 @@ impl Timer {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_image_fallback_to_llm_messages, merge_system_prompt_with_contexts,
+        apply_image_fallback_to_llm_messages, apply_workspace_path_to_session,
+        extract_workspace_path_from_set_workspace_result, merge_system_prompt_with_contexts,
         persistable_image_urls, strip_existing_skill_context, strip_existing_tool_guide_context,
-        AgentLoopConfig,
+        upsert_workspace_context, AgentLoopConfig,
     };
 
     use std::sync::Arc;
@@ -1787,7 +1906,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::agent::core::tools::{
-        FunctionCall, Tool, ToolError, ToolExecutionContext, ToolResult,
+        FunctionCall, Tool, ToolCall, ToolError, ToolExecutionContext, ToolResult,
     };
     use crate::agent::core::{Message, Session};
     use crate::agent::llm::models::{ContentPart, ImageUrl};
@@ -2035,6 +2154,62 @@ mod tests {
             "Base prompt\n\n## Tool Usage Guidelines\n\n### File Reading Tools\nInstructions",
         );
         assert_eq!(stripped, "Base prompt");
+    }
+
+    #[test]
+    fn extract_workspace_path_from_set_workspace_result_supports_alias_name() {
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "setWorkspace".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let result = ToolResult {
+            success: true,
+            result: r#"{"workspace":"/tmp/ws"}"#.to_string(),
+            display_preference: Some("json".to_string()),
+        };
+
+        assert_eq!(
+            extract_workspace_path_from_set_workspace_result(&tool_call, &result),
+            Some("/tmp/ws".to_string())
+        );
+    }
+
+    #[test]
+    fn upsert_workspace_context_replaces_existing_segment() {
+        let guidance = crate::server::app_state::workspace_prompt_guidance();
+        let old = format!(
+            "Base prompt\n\nWorkspace path: /old/path\n{}\n\n## Tool Usage Guidelines\nX",
+            guidance
+        );
+        let updated = upsert_workspace_context(&old, "/new/path");
+
+        assert!(updated.contains("Workspace path: /new/path"));
+        assert!(!updated.contains("Workspace path: /old/path"));
+        assert!(updated.contains("## Tool Usage Guidelines"));
+    }
+
+    #[test]
+    fn apply_workspace_path_to_session_updates_metadata_and_prompt() {
+        let mut session = Session::new("session-1", "test-model");
+        session.add_message(Message::system("Base prompt".to_string()));
+
+        apply_workspace_path_to_session(&mut session, "/tmp/workspace");
+
+        assert_eq!(
+            session.metadata.get("workspace_path"),
+            Some(&"/tmp/workspace".to_string())
+        );
+        let system_content = session
+            .messages
+            .iter()
+            .find(|message| matches!(message.role, crate::agent::core::Role::System))
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        assert!(system_content.contains("Workspace path: /tmp/workspace"));
     }
 
     // ========== MODEL REQUIREMENT ARCHITECTURE TESTS ==========

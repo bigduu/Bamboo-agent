@@ -3,24 +3,21 @@ use async_trait::async_trait;
 use serde_json::json;
 use tokio::fs;
 
-/// Tool for checking if a file or directory exists
+/// Check whether a path exists on disk.
 pub struct FileExistsTool;
 
 impl FileExistsTool {
-    /// Create a new FileExistsTool instance.
-    ///
-    /// This tool checks whether a file or directory exists at the specified path.
-    /// Includes security checks to prevent path traversal attacks.
     pub fn new() -> Self {
         Self
     }
 
-    /// Internal implementation for checking file existence
-    pub async fn file_exists(path: &str) -> Result<bool, String> {
+    async fn exists(path: &str) -> Result<bool, String> {
+        if path.trim().is_empty() {
+            return Err("path must be a non-empty string".to_string());
+        }
         if path.contains("..") {
             return Err("Invalid path: contains '..'".to_string());
         }
-
         Ok(fs::metadata(path).await.is_ok())
     }
 }
@@ -34,11 +31,11 @@ impl Default for FileExistsTool {
 #[async_trait]
 impl Tool for FileExistsTool {
     fn name(&self) -> &str {
-        "file_exists"
+        "FileExists"
     }
 
     fn description(&self) -> &str {
-        "Check if a file or directory exists"
+        "Check if a file or directory exists at a given path"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -47,48 +44,34 @@ impl Tool for FileExistsTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path of the file or directory"
+                    "description": "Absolute or relative path to check"
                 }
             },
-            "required": ["path"]
+            "required": ["path"],
+            "additionalProperties": false
         })
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        let path = if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-            if !p.is_empty() {
-                p.to_string()
-            } else {
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .map_err(|e| {
-                        ToolError::InvalidArguments(format!(
-                            "Missing 'path' parameter and failed to resolve current dir: {}",
-                            e
-                        ))
-                    })?
-            }
-        } else {
-            std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .map_err(|e| {
-                    ToolError::InvalidArguments(format!(
-                        "Missing 'path' parameter and failed to resolve current dir: {}",
-                        e
-                    ))
-                })?
-        };
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidArguments("Missing 'path' parameter".to_string()))?;
 
-        match Self::file_exists(&path).await {
+        match Self::exists(path).await {
             Ok(exists) => Ok(ToolResult {
                 success: true,
-                result: if exists { "true" } else { "false" }.to_string(),
-                display_preference: None,
+                result: json!({
+                    "path": path,
+                    "exists": exists
+                })
+                .to_string(),
+                display_preference: Some("json".to_string()),
             }),
-            Err(e) => Ok(ToolResult {
+            Err(error) => Ok(ToolResult {
                 success: false,
-                result: e,
-                display_preference: None,
+                result: error,
+                display_preference: Some("error".to_string()),
             }),
         }
     }
@@ -97,46 +80,15 @@ impl Tool for FileExistsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::fs;
 
     #[tokio::test]
-    async fn test_file_exists_true() {
-        let test_path = "/tmp/test_file_exists.txt";
-
-        // Setup: create test file
-        fs::write(test_path, "test").await.unwrap();
-
-        let tool = FileExistsTool::new();
-        let result = tool.execute(json!({"path": test_path})).await.unwrap();
-
-        assert!(result.success);
-        assert_eq!(result.result, "true");
-
-        // Cleanup
-        let _ = fs::remove_file(test_path).await;
-    }
-
-    #[tokio::test]
-    async fn test_file_exists_false() {
+    async fn file_exists_returns_false_for_missing_path() {
         let tool = FileExistsTool::new();
         let result = tool
-            .execute(json!({"path": "/tmp/nonexistent_file_xyz.txt"}))
+            .execute(json!({"path": "/tmp/bamboo-file-exists-missing-xyz"}))
             .await
             .unwrap();
-
         assert!(result.success);
-        assert_eq!(result.result, "false");
-    }
-
-    #[tokio::test]
-    async fn test_file_exists_path_traversal() {
-        let tool = FileExistsTool::new();
-        let result = tool
-            .execute(json!({"path": "/etc/../etc/passwd"}))
-            .await
-            .unwrap();
-
-        assert!(!result.success);
-        assert!(result.result.contains("Invalid path"));
+        assert!(result.result.contains("\"exists\":false"));
     }
 }

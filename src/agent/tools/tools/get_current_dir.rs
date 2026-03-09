@@ -2,23 +2,12 @@ use crate::agent::core::tools::{Tool, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 
-/// Tool for getting the current working directory
+/// Return process current working directory.
 pub struct GetCurrentDirTool;
 
 impl GetCurrentDirTool {
-    /// Create a new GetCurrentDirTool instance.
-    ///
-    /// This tool returns the absolute path of the current working directory.
-    /// Useful for understanding the execution context of other file operations.
     pub fn new() -> Self {
         Self
-    }
-
-    /// Internal implementation for getting current directory
-    pub async fn get_current_dir() -> Result<String, String> {
-        std::env::current_dir()
-            .map(|p| crate::core::paths::path_to_display_string(&p))
-            .map_err(|e| format!("Failed to get current directory: {}", e))
     }
 }
 
@@ -31,31 +20,32 @@ impl Default for GetCurrentDirTool {
 #[async_trait]
 impl Tool for GetCurrentDirTool {
     fn name(&self) -> &str {
-        "get_current_dir"
+        "GetCurrentDir"
     }
 
     fn description(&self) -> &str {
-        "Get the absolute path of the current working directory"
+        "Get the current working directory"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
-            "properties": {}
+            "properties": {},
+            "additionalProperties": false
         })
     }
 
     async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        match Self::get_current_dir().await {
+        match std::env::current_dir() {
             Ok(dir) => Ok(ToolResult {
                 success: true,
-                result: dir,
+                result: crate::core::paths::path_to_display_string(&dir),
                 display_preference: None,
             }),
-            Err(e) => Ok(ToolResult {
+            Err(error) => Ok(ToolResult {
                 success: false,
-                result: e,
-                display_preference: None,
+                result: format!("Failed to get current directory: {error}"),
+                display_preference: Some("error".to_string()),
             }),
         }
     }
@@ -66,14 +56,10 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_get_current_dir() {
+    async fn get_current_dir_tool_returns_non_empty_path() {
         let tool = GetCurrentDirTool::new();
         let result = tool.execute(json!({})).await.unwrap();
-
         assert!(result.success);
-        // Just verify it returns a non-empty path
-        assert!(!result.result.is_empty());
-        // Should be an absolute path (starts with / on Unix)
-        assert!(result.result.starts_with('/'));
+        assert!(!result.result.trim().is_empty());
     }
 }

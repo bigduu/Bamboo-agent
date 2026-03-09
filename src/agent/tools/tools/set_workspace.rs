@@ -1,58 +1,14 @@
 use crate::agent::core::tools::{Tool, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
-use std::env;
 use std::path::Path;
 
-/// Tool for setting the current workspace directory
+/// Set process working directory.
 pub struct SetWorkspaceTool;
 
 impl SetWorkspaceTool {
-    /// Create a new SetWorkspaceTool instance.
-    ///
-    /// This tool changes the current working directory for subsequent file operations
-    /// and command executions. The path must exist and be a directory.
-    /// Includes security checks to prevent path traversal attacks.
     pub fn new() -> Self {
         Self
-    }
-
-    /// Set the workspace directory
-    pub async fn set_workspace(path: &str) -> Result<String, String> {
-        // Security check: ensure path doesn't contain ..
-        if path.contains("..") {
-            return Err("Invalid path: contains '..'".to_string());
-        }
-
-        let path_obj = Path::new(path);
-
-        // Check if path exists and is a directory
-        if !path_obj.exists() {
-            return Err(format!("Path does not exist: {}", path));
-        }
-
-        if !path_obj.is_dir() {
-            return Err(format!("Path is not a directory: {}", path));
-        }
-
-        // Get absolute path
-        let absolute_path = path_obj
-            .canonicalize()
-            .map_err(|e| format!("Failed to canonicalize path: {}", e))?;
-
-        // Set as current directory for this process
-        // On Windows, `canonicalize()` may return a verbatim path (\\?\C:\...).
-        // Prefer setting a normal Win32 path for broader compatibility with spawned tools.
-        #[cfg(windows)]
-        let dir_for_process =
-            std::path::PathBuf::from(crate::core::paths::path_to_display_string(&absolute_path));
-        #[cfg(not(windows))]
-        let dir_for_process = absolute_path.clone();
-
-        env::set_current_dir(&dir_for_process)
-            .map_err(|e| format!("Failed to set workspace: {}", e))?;
-
-        Ok(crate::core::paths::path_to_display_string(&absolute_path))
     }
 }
 
@@ -65,11 +21,11 @@ impl Default for SetWorkspaceTool {
 #[async_trait]
 impl Tool for SetWorkspaceTool {
     fn name(&self) -> &str {
-        "set_workspace"
+        "SetWorkspace"
     }
 
     fn description(&self) -> &str {
-        "Set the current working directory (workspace). Subsequent file operations and command execution will be based on this directory. Path must be an existing directory"
+        "Set current working directory for this process"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -78,30 +34,68 @@ impl Tool for SetWorkspaceTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path of the workspace directory, must be an existing directory"
+                    "description": "Path of the workspace directory"
                 }
             },
-            "required": ["path"]
+            "required": ["path"],
+            "additionalProperties": false
         })
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        let path = args["path"]
-            .as_str()
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArguments("Missing 'path' parameter".to_string()))?;
 
-        match Self::set_workspace(path).await {
-            Ok(absolute_path) => Ok(ToolResult {
-                success: true,
-                result: format!("Workspace set to: {}", absolute_path),
-                display_preference: None,
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                result: e,
-                display_preference: Some("error".to_string()),
-            }),
+        if path.trim().is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "path must be a non-empty string".to_string(),
+            ));
         }
+        if path.contains("..") {
+            return Err(ToolError::InvalidArguments(
+                "Invalid path: contains '..'".to_string(),
+            ));
+        }
+
+        let path_obj = Path::new(path);
+        if !path_obj.exists() {
+            return Ok(ToolResult {
+                success: false,
+                result: format!("Path does not exist: {path}"),
+                display_preference: Some("error".to_string()),
+            });
+        }
+        if !path_obj.is_dir() {
+            return Ok(ToolResult {
+                success: false,
+                result: format!("Path is not a directory: {path}"),
+                display_preference: Some("error".to_string()),
+            });
+        }
+
+        let absolute_path = path_obj
+            .canonicalize()
+            .map_err(|e| ToolError::Execution(format!("Failed to canonicalize path: {e}")))?;
+
+        #[cfg(windows)]
+        let dir_for_process =
+            std::path::PathBuf::from(crate::core::paths::path_to_display_string(&absolute_path));
+        #[cfg(not(windows))]
+        let dir_for_process = absolute_path.clone();
+
+        std::env::set_current_dir(&dir_for_process)
+            .map_err(|e| ToolError::Execution(format!("Failed to set workspace: {e}")))?;
+
+        Ok(ToolResult {
+            success: true,
+            result: json!({
+                "workspace": crate::core::paths::path_to_display_string(&absolute_path)
+            })
+            .to_string(),
+            display_preference: Some("json".to_string()),
+        })
     }
 }
 
@@ -109,9 +103,14 @@ impl Tool for SetWorkspaceTool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_set_workspace_tool_name() {
+    #[tokio::test]
+    async fn set_workspace_rejects_missing_path() {
         let tool = SetWorkspaceTool::new();
-        assert_eq!(tool.name(), "set_workspace");
+        let result = tool
+            .execute(json!({"path": "/tmp/bamboo-no-such-workspace"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.result.contains("does not exist"));
     }
 }

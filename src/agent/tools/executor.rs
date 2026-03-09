@@ -10,8 +10,9 @@ use serde_json::json;
 use crate::agent::tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
 use crate::agent::tools::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::agent::tools::tools::{
-    AskUserTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, GlobTool, GrepTool,
-    KillShellTool, MemoryNoteTool, NotebookEditTool, ReadTool, SlashCommandTool, TaskTool,
+    AskUserTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, FileExistsTool,
+    GetCurrentDirTool, GetFileInfoTool, GlobTool, GrepTool, KillShellTool, MemoryNoteTool,
+    NotebookEditTool, ReadTool, SetWorkspaceTool, SlashCommandTool, SleepTool, TaskTool,
     TodoWriteTool, ToolRegistry, WebFetchTool, WebSearchTool, WriteTool,
 };
 use crate::core::Config;
@@ -22,18 +23,23 @@ use tokio::sync::RwLock;
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 17] = [
+pub const BUILTIN_TOOL_NAMES: [&str; 22] = [
     "ask_user",
     "Bash",
     "BashOutput",
     "Edit",
     "ExitPlanMode",
+    "FileExists",
     "Glob",
+    "GetCurrentDir",
+    "GetFileInfo",
     "Grep",
     "KillShell",
     "memory_note",
     "NotebookEdit",
     "Read",
+    "SetWorkspace",
+    "Sleep",
     "SlashCommand",
     "Task",
     "TodoWrite",
@@ -52,10 +58,23 @@ pub fn normalize_tool_ref(value: &str) -> Option<String> {
         return None;
     }
     let raw_tool_name = trimmed.split("::").last().unwrap_or(trimmed);
-    if BUILTIN_TOOL_NAMES.iter().any(|name| name == &raw_tool_name) {
-        Some(raw_tool_name.to_string())
+    let normalized = normalize_builtin_alias(raw_tool_name);
+    if BUILTIN_TOOL_NAMES.iter().any(|name| name == &normalized) {
+        Some(normalized.to_string())
     } else {
         None
+    }
+}
+
+fn normalize_builtin_alias(name: &str) -> &str {
+    match name {
+        // Backward compatibility for earlier camelCase variant names.
+        "fileExists" => "FileExists",
+        "getCurrentDir" => "GetCurrentDir",
+        "getFileInfo" => "GetFileInfo",
+        "setWorkspace" => "SetWorkspace",
+        "sleep" => "Sleep",
+        _ => name,
     }
 }
 
@@ -138,13 +157,18 @@ impl BuiltinToolExecutor {
         let _ = registry.register(BashOutputTool::new());
         let _ = registry.register(EditTool::new());
         let _ = registry.register(ExitPlanModeTool::new());
+        let _ = registry.register(FileExistsTool::new());
         let _ = registry.register(GlobTool::new());
+        let _ = registry.register(GetCurrentDirTool::new());
+        let _ = registry.register(GetFileInfoTool::new());
         let _ = registry.register(GrepTool::new());
         let _ = registry.register(KillShellTool::new());
         let _ = registry.register(MemoryNoteTool::new());
         let _ = registry.register(NotebookEditTool::new());
         let _ = registry.register(ReadTool::new());
+        let _ = registry.register(SetWorkspaceTool::new());
         let _ = registry.register(SlashCommandTool::new());
+        let _ = registry.register(SleepTool::new());
         let _ = registry.register(TaskTool::new());
         let _ = registry.register(TodoWriteTool::new());
         let _ = registry.register(WebFetchTool::new());
@@ -222,7 +246,7 @@ impl ToolExecutor for BuiltinToolExecutor {
             })?
         };
 
-        let tool_name = normalize_tool_name(&call.function.name);
+        let tool_name = normalize_builtin_alias(normalize_tool_name(&call.function.name));
 
         // Look up the tool in the registry
         let tool = self
@@ -378,6 +402,30 @@ mod tests {
         assert_eq!(
             normalize_tool_ref("default::Bash"),
             Some("Bash".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_tool_ref_accepts_legacy_camel_aliases() {
+        assert_eq!(
+            normalize_tool_ref("default::fileExists"),
+            Some("FileExists".to_string())
+        );
+        assert_eq!(
+            normalize_tool_ref("default::getCurrentDir"),
+            Some("GetCurrentDir".to_string())
+        );
+        assert_eq!(
+            normalize_tool_ref("default::getFileInfo"),
+            Some("GetFileInfo".to_string())
+        );
+        assert_eq!(
+            normalize_tool_ref("default::setWorkspace"),
+            Some("SetWorkspace".to_string())
+        );
+        assert_eq!(
+            normalize_tool_ref("default::sleep"),
+            Some("Sleep".to_string())
         );
     }
 

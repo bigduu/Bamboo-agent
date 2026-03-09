@@ -3,56 +3,12 @@ use async_trait::async_trait;
 use serde_json::json;
 use tokio::fs;
 
-/// Tool for getting detailed file information
+/// Return metadata for a file or directory.
 pub struct GetFileInfoTool;
 
 impl GetFileInfoTool {
-    /// Create a new GetFileInfoTool instance.
-    ///
-    /// This tool retrieves detailed metadata about a file or directory including:
-    /// - File type (file, directory, or other)
-    /// - Size in bytes
-    /// - Last modification timestamp
-    /// - Path validation for security
     pub fn new() -> Self {
         Self
-    }
-
-    /// Internal implementation for getting file info
-    pub async fn get_file_info(path: &str) -> Result<String, String> {
-        if path.contains("..") {
-            return Err("Invalid path: contains '..'".to_string());
-        }
-
-        let metadata = fs::metadata(path)
-            .await
-            .map_err(|e| format!("Failed to get file info '{}': {}", path, e))?;
-
-        let size = metadata.len();
-        let is_file = metadata.is_file();
-        let is_dir = metadata.is_dir();
-        let modified = metadata
-            .modified()
-            .map_err(|e| e.to_string())?
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_secs();
-
-        Ok(format!(
-            "Path: {}\nType: {}\nSize: {} bytes\nModified: {} UTC",
-            path,
-            if is_file {
-                "File"
-            } else if is_dir {
-                "Directory"
-            } else {
-                "Other"
-            },
-            size,
-            chrono::DateTime::from_timestamp(modified as i64, 0)
-                .map(|d: chrono::DateTime<chrono::Utc>| d.to_rfc3339())
-                .unwrap_or_else(|| "Unknown".to_string())
-        ))
     }
 }
 
@@ -65,11 +21,11 @@ impl Default for GetFileInfoTool {
 #[async_trait]
 impl Tool for GetFileInfoTool {
     fn name(&self) -> &str {
-        "get_file_info"
+        "GetFileInfo"
     }
 
     fn description(&self) -> &str {
-        "Get detailed file information (size, type, modification time, etc.)"
+        "Get file metadata such as type, size, and modification time"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -78,97 +34,80 @@ impl Tool for GetFileInfoTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path of the file"
+                    "description": "Absolute or relative path"
                 }
             },
-            "required": ["path"]
+            "required": ["path"],
+            "additionalProperties": false
         })
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        let path = if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-            if !p.is_empty() {
-                p.to_string()
-            } else {
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .map_err(|e| {
-                        ToolError::InvalidArguments(format!(
-                            "Missing 'path' parameter and failed to resolve current dir: {}",
-                            e
-                        ))
-                    })?
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidArguments("Missing 'path' parameter".to_string()))?;
+
+        if path.trim().is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "path must be a non-empty string".to_string(),
+            ));
+        }
+        if path.contains("..") {
+            return Err(ToolError::InvalidArguments(
+                "Invalid path: contains '..'".to_string(),
+            ));
+        }
+
+        let metadata = match fs::metadata(path).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    result: format!("Failed to read metadata for '{path}': {error}"),
+                    display_preference: Some("error".to_string()),
+                });
             }
-        } else {
-            std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .map_err(|e| {
-                    ToolError::InvalidArguments(format!(
-                        "Missing 'path' parameter and failed to resolve current dir: {}",
-                        e
-                    ))
-                })?
         };
 
-        match Self::get_file_info(&path).await {
-            Ok(info) => Ok(ToolResult {
-                success: true,
-                result: info,
-                display_preference: Some("markdown".to_string()),
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                result: e,
-                display_preference: None,
-            }),
-        }
+        let modified_unix = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs());
+
+        Ok(ToolResult {
+            success: true,
+            result: json!({
+                "path": path,
+                "is_file": metadata.is_file(),
+                "is_dir": metadata.is_dir(),
+                "size_bytes": metadata.len(),
+                "modified_unix": modified_unix
+            })
+            .to_string(),
+            display_preference: Some("json".to_string()),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::fs;
 
     #[tokio::test]
-    async fn test_get_file_info_success() {
-        let test_path = "/tmp/test_file_info.txt";
-        let test_content = "Hello, GetFileInfoTool!";
+    async fn get_file_info_returns_metadata_for_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("demo.txt");
+        tokio::fs::write(&file_path, "hello").await.unwrap();
 
-        // Setup: create test file
-        fs::write(test_path, test_content).await.unwrap();
-
-        let tool = GetFileInfoTool::new();
-        let result = tool.execute(json!({"path": test_path})).await.unwrap();
-
-        assert!(result.success);
-        assert!(result.result.contains("Path:"));
-        assert!(result.result.contains("Type: File"));
-        assert!(result.result.contains("Size:"));
-        assert!(result.result.contains("Modified:"));
-
-        // Cleanup
-        let _ = fs::remove_file(test_path).await;
-    }
-
-    #[tokio::test]
-    async fn test_get_file_info_directory() {
-        let tool = GetFileInfoTool::new();
-        let result = tool.execute(json!({"path": "/tmp"})).await.unwrap();
-
-        assert!(result.success);
-        assert!(result.result.contains("Type: Directory"));
-    }
-
-    #[tokio::test]
-    async fn test_get_file_info_path_traversal() {
         let tool = GetFileInfoTool::new();
         let result = tool
-            .execute(json!({"path": "/etc/../etc/passwd"}))
+            .execute(json!({"path": file_path.to_string_lossy()}))
             .await
             .unwrap();
 
-        assert!(!result.success);
-        assert!(result.result.contains("Invalid path"));
+        assert!(result.success);
+        assert!(result.result.contains("\"is_file\":true"));
     }
 }

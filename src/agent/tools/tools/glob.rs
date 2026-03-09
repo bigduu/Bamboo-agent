@@ -6,17 +6,29 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-const MAX_GLOB_MATCHES: usize = 500;
+const DEFAULT_GLOB_MATCHES: usize = 100;
+const MAX_GLOB_MATCHES: usize = 200;
+const MAX_GLOB_SCANNED_FILES: usize = 50_000;
+const SKIP_DIRS: [&str; 8] = [
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".cache",
+    "coverage",
+];
 const SEARCH_SCOPE_TOO_BROAD_ERROR: &str =
     "Search scope too broad. Add path/glob/type or reduce pattern.";
-const GLOB_TRUNCATED_NOTICE: &str =
-    "[TRUNCATED] Showing first 500 matches. Refine pattern/path and retry.";
 
 #[derive(Debug, Deserialize)]
 struct GlobArgs {
     pattern: String,
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 pub struct GlobTool;
@@ -32,6 +44,13 @@ impl GlobTool {
             normalized.as_str(),
             "*" | "**" | "**/*" | "**/**" | "./**/*" | ".//**/*"
         )
+    }
+
+    fn should_skip_dir(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| SKIP_DIRS.contains(&name))
+            .unwrap_or(false)
     }
 }
 
@@ -62,6 +81,10 @@ impl Tool for GlobTool {
                 "path": {
                     "type": "string",
                     "description": "The directory to search in"
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Maximum number of returned matches (default 100, hard cap 200)"
                 }
             },
             "required": ["pattern"],
@@ -92,6 +115,11 @@ impl Tool for GlobTool {
             )));
         }
 
+        let limit = parsed
+            .limit
+            .unwrap_or(DEFAULT_GLOB_MATCHES)
+            .clamp(1, MAX_GLOB_MATCHES);
+
         let mut glob_builder = GlobSetBuilder::new();
         let glob = GlobBuilder::new(parsed.pattern.trim())
             .literal_separator(false)
@@ -102,14 +130,27 @@ impl Tool for GlobTool {
             .build()
             .map_err(|e| ToolError::Execution(format!("Failed to compile glob: {}", e)))?;
 
-        let mut matches: Vec<(String, std::time::SystemTime)> = Vec::new();
+        let mut matches: Vec<(String, u64)> = Vec::new();
+        let mut total_matches = 0usize;
+        let mut scanned_files = 0usize;
+        let mut scan_truncated = false;
+
         for entry in WalkDir::new(&root)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|entry| {
+                !entry.file_type().is_dir() || !Self::should_skip_dir(entry.path())
+            })
             .filter_map(|entry| entry.ok())
         {
             if !entry.file_type().is_file() {
                 continue;
+            }
+
+            scanned_files += 1;
+            if scanned_files > MAX_GLOB_SCANNED_FILES {
+                scan_truncated = true;
+                break;
             }
 
             let path = entry.path();
@@ -118,27 +159,39 @@ impl Tool for GlobTool {
                 continue;
             }
 
+            total_matches += 1;
             let modified = entry
                 .metadata()
                 .ok()
                 .and_then(|m| m.modified().ok())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
             matches.push((
                 crate::core::paths::path_to_display_string(Path::new(path)),
                 modified,
             ));
         }
 
-        matches.sort_by(|a, b| b.1.cmp(&a.1));
+        matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-        let mut result_lines: Vec<String> = matches.into_iter().map(|(path, _)| path).collect();
-        let mut truncated = false;
-        if result_lines.len() > MAX_GLOB_MATCHES {
-            result_lines.truncate(MAX_GLOB_MATCHES);
-            truncated = true;
+        let mut result_lines: Vec<String> = matches
+            .into_iter()
+            .take(limit)
+            .map(|(path, _)| path)
+            .collect();
+
+        if total_matches > limit {
+            result_lines.push(format!(
+                "[TRUNCATED] Showing first {limit} matches (matched {total_matches}). Refine pattern/path and retry."
+            ));
         }
-        if truncated {
-            result_lines.push(GLOB_TRUNCATED_NOTICE.to_string());
+
+        if scan_truncated {
+            result_lines.push(format!(
+                "[PARTIAL] Stopped after scanning {} files. Narrow path/pattern to improve results.",
+                MAX_GLOB_SCANNED_FILES
+            ));
         }
 
         Ok(ToolResult {
@@ -189,13 +242,46 @@ mod tests {
         let result = tool
             .execute(json!({
                 "pattern": "**/*.txt",
-                "path": dir.path()
+                "path": dir.path(),
+                "limit": 120
             }))
             .await
             .unwrap();
 
         let lines = result_lines(&result);
-        assert_eq!(lines.len(), super::MAX_GLOB_MATCHES + 1);
-        assert_eq!(lines.last().copied(), Some(super::GLOB_TRUNCATED_NOTICE));
+        assert_eq!(lines.len(), 121);
+        assert!(lines
+            .last()
+            .copied()
+            .unwrap_or_default()
+            .contains("[TRUNCATED]"));
+    }
+
+    #[tokio::test]
+    async fn glob_skips_heavy_default_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("src").join("keep.txt");
+        let skipped = dir.path().join("node_modules").join("skip.txt");
+        tokio::fs::create_dir_all(kept.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(skipped.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&kept, "ok").await.unwrap();
+        tokio::fs::write(&skipped, "skip").await.unwrap();
+
+        let tool = GlobTool::new();
+        let result = tool
+            .execute(json!({
+                "pattern": "**/*.txt",
+                "path": dir.path(),
+                "limit": 50
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.result.contains("keep.txt"));
+        assert!(!result.result.contains("node_modules"));
     }
 }

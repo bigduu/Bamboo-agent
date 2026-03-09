@@ -190,3 +190,61 @@ impl Tool for MemoryNoteTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_note_schema_requires_action() {
+        let tool = MemoryNoteTool::new();
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["required"], json!(["action"]));
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!(["read", "append", "replace", "clear"])
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_note_requires_session_context() {
+        let tool = MemoryNoteTool::new();
+        let result = tool
+            .execute_with_context(
+                json!({"action": "read"}),
+                ToolExecutionContext::none("tool_call"),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ToolError::Execution(msg)) if msg.contains("session_id")
+        ));
+    }
+
+    #[tokio::test]
+    async fn memory_note_validates_action_and_content_before_io() {
+        let tool = MemoryNoteTool::new();
+        let ctx = ToolExecutionContext {
+            session_id: Some("session-1"),
+            tool_call_id: "tool_call",
+            event_tx: None,
+        };
+
+        let unknown = tool
+            .execute_with_context(json!({"action": "unknown"}), ctx)
+            .await;
+        assert!(matches!(
+            unknown,
+            Err(ToolError::InvalidArguments(msg)) if msg.contains("action must be one of")
+        ));
+
+        let missing_content = tool
+            .execute_with_context(json!({"action": "replace"}), ctx)
+            .await;
+        assert!(matches!(
+            missing_content,
+            Err(ToolError::InvalidArguments(msg)) if msg.contains("content is required")
+        ));
+    }
+}
