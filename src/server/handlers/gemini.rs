@@ -1,3 +1,4 @@
+use crate::agent::core::budget::{HeuristicTokenCounter, TokenCounter};
 use crate::agent::core::tools::ToolSchema;
 use crate::agent::core::Message;
 use crate::agent::llm::protocol::gemini::{
@@ -5,6 +6,7 @@ use crate::agent::llm::protocol::gemini::{
 };
 use crate::agent::llm::protocol::FromProvider;
 use crate::agent::llm::LLMChunk;
+use crate::agent::metrics::types::{ForwardStatus, TokenUsage as MetricsTokenUsage};
 use crate::server::services::gemini_model_mapping_service::resolve_model;
 use crate::server::{app_state::AppState, error::AppError};
 use actix_web::{web, HttpResponse};
@@ -26,12 +28,31 @@ pub fn config(cfg: &mut web::ServiceConfig) {
         );
 }
 
+fn estimate_prompt_tokens(messages: &[Message]) -> u64 {
+    let counter = HeuristicTokenCounter::with_defaults();
+    u64::from(counter.count_messages(messages))
+}
+
+fn estimate_completion_tokens(output_text: &str) -> u64 {
+    let counter = HeuristicTokenCounter::with_defaults();
+    u64::from(counter.count_text(output_text))
+}
+
+fn build_estimated_usage(prompt_tokens: u64, completion_tokens: u64) -> MetricsTokenUsage {
+    MetricsTokenUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+    }
+}
+
 /// Generate content (non-streaming)
 pub async fn generate_content(
     path: web::Path<String>,
     request: web::Json<GeminiRequest>,
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
+    let forward_id = uuid::Uuid::new_v4().to_string();
     let gemini_model = path.into_inner();
 
     // Resolve model mapping
@@ -74,11 +95,19 @@ pub async fn generate_content(
     )
     .await
     .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
 
     // 4. Get provider
+    state.metrics_service.collector().forward_started(
+        forward_id.clone(),
+        "gemini.generate_content",
+        model_to_use.clone(),
+        false,
+        chrono::Utc::now(),
+    );
     let provider = state.get_provider().await;
 
-    let mut stream = provider
+    let mut stream = match provider
         .chat_stream(
             &internal_messages,
             &internal_tools,
@@ -86,7 +115,20 @@ pub async fn generate_content(
             model_to_use.as_str(),
         )
         .await
-        .map_err(|e| AppError::InternalError(anyhow!("Provider error: {}", e)))?;
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            state.metrics_service.collector().forward_completed(
+                forward_id,
+                chrono::Utc::now(),
+                None,
+                ForwardStatus::Error,
+                None,
+                Some(format!("Provider error: {}", e)),
+            );
+            return Err(AppError::InternalError(anyhow!("Provider error: {}", e)));
+        }
+    };
 
     // 5. Collect response
     let mut full_content = String::new();
@@ -99,9 +141,20 @@ pub async fn generate_content(
             Ok(LLMChunk::ToolCalls(calls)) => {
                 tool_calls = Some(calls);
             }
-            Err(e) => return Err(AppError::InternalError(anyhow!("Stream error: {}", e))),
+            Err(e) => {
+                state.metrics_service.collector().forward_completed(
+                    forward_id.clone(),
+                    chrono::Utc::now(),
+                    None,
+                    ForwardStatus::Error,
+                    None,
+                    Some(format!("Stream error: {}", e)),
+                );
+                return Err(AppError::InternalError(anyhow!("Stream error: {}", e)));
+            }
         }
     }
+    let completion_tokens = estimate_completion_tokens(&full_content);
 
     // 6. Convert back to Gemini format
     let mut parts = vec![GeminiPart {
@@ -147,6 +200,17 @@ pub async fn generate_content(
             finish_reason: Some("STOP".to_string()),
         }],
     };
+    state.metrics_service.collector().forward_completed(
+        forward_id,
+        chrono::Utc::now(),
+        Some(200),
+        ForwardStatus::Success,
+        Some(build_estimated_usage(
+            estimated_prompt_tokens,
+            completion_tokens,
+        )),
+        None,
+    );
 
     Ok(HttpResponse::Ok().json(gemini_response))
 }
@@ -157,6 +221,7 @@ pub async fn stream_generate_content(
     request: web::Json<GeminiRequest>,
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
+    let forward_id = uuid::Uuid::new_v4().to_string();
     let gemini_model = path.into_inner();
 
     // Resolve model mapping
@@ -199,8 +264,17 @@ pub async fn stream_generate_content(
     )
     .await
     .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
 
-    let mut stream = state
+    state.metrics_service.collector().forward_started(
+        forward_id.clone(),
+        "gemini.stream_generate_content",
+        model_to_use.clone(),
+        true,
+        chrono::Utc::now(),
+    );
+
+    let mut stream = match state
         .get_provider()
         .await
         .chat_stream(
@@ -210,13 +284,33 @@ pub async fn stream_generate_content(
             model_to_use.as_str(),
         )
         .await
-        .map_err(|e| AppError::InternalError(anyhow!("Provider error: {}", e)))?;
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            state.metrics_service.collector().forward_completed(
+                forward_id,
+                chrono::Utc::now(),
+                None,
+                ForwardStatus::Error,
+                None,
+                Some(format!("Provider error: {}", e)),
+            );
+            return Err(AppError::InternalError(anyhow!("Provider error: {}", e)));
+        }
+    };
+
+    let metrics = state.metrics_service.collector();
+    let forward_id_clone = forward_id.clone();
+    let estimated_prompt_tokens_clone = estimated_prompt_tokens;
 
     // 4. Create SSE stream
     let gemini_stream = async_stream::stream! {
+        let mut had_error = false;
+        let mut streamed_text = String::new();
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(LLMChunk::Token(token)) => {
+                    streamed_text.push_str(&token);
                     let gemini_chunk = GeminiResponse {
                         candidates: vec![GeminiCandidate {
                             content: GeminiContent {
@@ -295,12 +389,36 @@ pub async fn stream_generate_content(
                     break;
                 }
                 Err(e) => {
+                    had_error = true;
+                    metrics.forward_completed(
+                        forward_id_clone.clone(),
+                        chrono::Utc::now(),
+                        None,
+                        ForwardStatus::Error,
+                        None,
+                        Some(format!("Stream error: {}", e)),
+                    );
                     yield Err(actix_web::Error::from(std::io::Error::other(
                         format!("Stream error: {}", e),
                     )));
                     break;
                 }
             }
+        }
+
+        if !had_error {
+            let completion_tokens = estimate_completion_tokens(&streamed_text);
+            metrics.forward_completed(
+                forward_id_clone,
+                chrono::Utc::now(),
+                Some(200),
+                ForwardStatus::Success,
+                Some(build_estimated_usage(
+                    estimated_prompt_tokens_clone,
+                    completion_tokens,
+                )),
+                None,
+            );
         }
     };
 
@@ -311,12 +429,44 @@ pub async fn stream_generate_content(
 
 /// List available models
 pub async fn list_models(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
+    let forward_id = uuid::Uuid::new_v4().to_string();
+    state.metrics_service.collector().forward_started(
+        forward_id.clone(),
+        "gemini.models",
+        "models",
+        false,
+        chrono::Utc::now(),
+    );
+
     let provider = state.get_provider().await;
 
-    let models = provider
-        .list_models()
-        .await
-        .map_err(|e| AppError::InternalError(anyhow!("Failed to list models: {}", e)))?;
+    let models = match provider.list_models().await {
+        Ok(models) => {
+            state.metrics_service.collector().forward_completed(
+                forward_id,
+                chrono::Utc::now(),
+                Some(200),
+                ForwardStatus::Success,
+                None,
+                None,
+            );
+            models
+        }
+        Err(e) => {
+            state.metrics_service.collector().forward_completed(
+                forward_id,
+                chrono::Utc::now(),
+                None,
+                ForwardStatus::Error,
+                None,
+                Some(format!("Failed to list models: {}", e)),
+            );
+            return Err(AppError::InternalError(anyhow!(
+                "Failed to list models: {}",
+                e
+            )));
+        }
+    };
 
     // Convert to Gemini format
     let gemini_models: Vec<_> = models

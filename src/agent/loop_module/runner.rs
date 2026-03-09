@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::core::agent::events::{TokenBudgetUsage, TokenUsage};
 use crate::agent::core::budget::limits::load_model_limits_from_unified_config;
 use crate::agent::core::budget::{
-    prepare_hybrid_context, HeuristicTokenCounter, ModelLimitsRegistry, TokenBudget,
+    prepare_hybrid_context, HeuristicTokenCounter, ModelLimitsRegistry, TokenBudget, TokenCounter,
 };
 use crate::agent::core::storage::AttachmentReader;
 use crate::agent::core::tools::{
@@ -37,6 +37,40 @@ use crate::agent::tools::{normalize_tool_ref, TodoWriteTool};
 use crate::agent::loop_module::config::AgentLoopConfig;
 use crate::agent::loop_module::stream::handler::consume_llm_stream;
 use crate::agent::loop_module::todo_context::TodoLoopContext;
+
+fn estimate_prompt_tokens(messages: &[Message]) -> u64 {
+    let counter = HeuristicTokenCounter::with_defaults();
+    u64::from(counter.count_messages(messages))
+}
+
+fn estimate_completion_tokens(content: &str, tool_calls: &[ToolCall]) -> u64 {
+    let counter = HeuristicTokenCounter::with_defaults();
+    let mut completion_surface = content.to_string();
+
+    for call in tool_calls {
+        if !completion_surface.is_empty() {
+            completion_surface.push('\n');
+        }
+        completion_surface.push_str(&call.function.name);
+        completion_surface.push('\n');
+        completion_surface.push_str(&call.function.arguments);
+    }
+
+    u64::from(counter.count_text(&completion_surface))
+}
+
+fn to_event_token_usage(prompt_tokens: u64, completion_tokens: u64) -> TokenUsage {
+    let prompt_tokens_u32 = u32::try_from(prompt_tokens).unwrap_or(u32::MAX);
+    let completion_tokens_u32 = u32::try_from(completion_tokens).unwrap_or(u32::MAX);
+    let total_tokens_u64 = prompt_tokens.saturating_add(completion_tokens);
+    let total_tokens_u32 = u32::try_from(total_tokens_u64).unwrap_or(u32::MAX);
+
+    TokenUsage {
+        prompt_tokens: prompt_tokens_u32,
+        completion_tokens: completion_tokens_u32,
+        total_tokens: total_tokens_u32,
+    }
+}
 
 fn summarize_image_url(url: &str) -> String {
     let trimmed = url.trim();
@@ -878,19 +912,23 @@ pub async fn run_agent_loop_with_config(
                 }
             };
 
-        let round_usage = MetricsTokenUsage {
-            prompt_tokens: 0,
-            completion_tokens: stream_output.token_count as u64,
-            total_tokens: stream_output.token_count as u64,
+        let prompt_tokens = estimate_prompt_tokens(&prepared_context.messages);
+        let completion_tokens =
+            estimate_completion_tokens(&stream_output.content, &stream_output.tool_calls);
+        let mut round_usage = MetricsTokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
         };
 
         let llm_duration = timer.elapsed_ms();
         timer.debug(&session_id);
         log::debug!(
-            "[{}] LLM response completed in {}ms, {} tokens received",
+            "[{}] LLM response completed in {}ms, {} chars streamed, {} estimated tokens",
             session_id,
             llm_duration,
-            stream_output.token_count
+            stream_output.token_count,
+            round_usage.total_tokens
         );
 
         if stream_output.tool_calls.is_empty() {
@@ -898,11 +936,7 @@ pub async fn run_agent_loop_with_config(
 
             let _ = event_tx
                 .send(AgentEvent::Complete {
-                    usage: TokenUsage {
-                        prompt_tokens: 0,
-                        completion_tokens: stream_output.token_count as u32,
-                        total_tokens: stream_output.token_count as u32,
-                    },
+                    usage: to_event_token_usage(prompt_tokens, completion_tokens),
                 })
                 .await;
 
@@ -1289,6 +1323,16 @@ pub async fn run_agent_loop_with_config(
             .await
             {
                 Ok(evaluation_result) => {
+                    round_usage.prompt_tokens = round_usage
+                        .prompt_tokens
+                        .saturating_add(evaluation_result.prompt_tokens);
+                    round_usage.completion_tokens = round_usage
+                        .completion_tokens
+                        .saturating_add(evaluation_result.completion_tokens);
+                    round_usage.total_tokens = round_usage
+                        .prompt_tokens
+                        .saturating_add(round_usage.completion_tokens);
+
                     if evaluation_result.needs_evaluation && !evaluation_result.updates.is_empty() {
                         log::info!(
                             "[{}] LLM evaluated {} todo item updates",

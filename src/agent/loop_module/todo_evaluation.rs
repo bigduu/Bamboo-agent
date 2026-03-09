@@ -1,6 +1,7 @@
 // TodoList Evaluation Module
 // 在 Agent Loop 每轮结束时，让 LLM 评估任务进度
 
+use crate::agent::core::budget::{HeuristicTokenCounter, TokenCounter};
 use crate::agent::core::tools::{FunctionSchema, ToolSchema};
 use crate::agent::core::{AgentEvent, Session, TodoItemStatus};
 use crate::agent::llm::LLMProvider;
@@ -19,6 +20,10 @@ pub struct TodoEvaluationResult {
     pub updates: Vec<TodoItemUpdate>,
     /// LLM 的推理说明
     pub reasoning: String,
+    /// Estimated prompt tokens consumed by the evaluation call
+    pub prompt_tokens: u64,
+    /// Estimated completion tokens consumed by the evaluation call
+    pub completion_tokens: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +66,30 @@ fn summarize_updates(updates: &[TodoItemUpdate]) -> String {
         updates.len(),
         details.join(", ")
     )
+}
+
+fn estimate_prompt_tokens(messages: &[crate::agent::core::Message]) -> u64 {
+    let counter = HeuristicTokenCounter::with_defaults();
+    u64::from(counter.count_messages(messages))
+}
+
+fn estimate_completion_tokens(
+    content: &str,
+    tool_calls: &[crate::agent::core::tools::ToolCall],
+) -> u64 {
+    let counter = HeuristicTokenCounter::with_defaults();
+    let mut completion_surface = content.to_string();
+
+    for call in tool_calls {
+        if !completion_surface.is_empty() {
+            completion_surface.push('\n');
+        }
+        completion_surface.push_str(&call.function.name);
+        completion_surface.push('\n');
+        completion_surface.push_str(&call.function.arguments);
+    }
+
+    u64::from(counter.count_text(&completion_surface))
 }
 
 /// 构建用于 TodoList 评估的 messages
@@ -212,6 +241,8 @@ pub async fn evaluate_todo_progress(
             needs_evaluation: false,
             updates: Vec::new(),
             reasoning: "No in-progress tasks to evaluate".to_string(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
         });
     }
 
@@ -221,6 +252,8 @@ pub async fn evaluate_todo_progress(
             needs_evaluation: false,
             updates: Vec::new(),
             reasoning: "No tool executions yet; skipping todo evaluation.".to_string(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
         });
     }
 
@@ -240,6 +273,7 @@ pub async fn evaluate_todo_progress(
 
     // 构建评估消息
     let messages = build_todo_evaluation_messages(ctx, session);
+    let prompt_tokens = estimate_prompt_tokens(&messages);
     let tools = get_todo_evaluation_tools();
 
     // Use model from parameter (passed from config), not from session
@@ -298,6 +332,8 @@ pub async fn evaluate_todo_progress(
                     stream_output.content.len()
                 );
             }
+            let completion_tokens =
+                estimate_completion_tokens(&stream_output.content, &stream_output.tool_calls);
 
             // 发送评估完成事件
             let _ = event_tx
@@ -312,6 +348,8 @@ pub async fn evaluate_todo_progress(
                 needs_evaluation: true,
                 updates,
                 reasoning,
+                prompt_tokens,
+                completion_tokens,
             })
         }
         Err(e) => {
@@ -320,6 +358,8 @@ pub async fn evaluate_todo_progress(
                 needs_evaluation: false,
                 updates: Vec::new(),
                 reasoning: format!("Evaluation failed: {}", e),
+                prompt_tokens: 0,
+                completion_tokens: 0,
             })
         }
     }

@@ -1,3 +1,4 @@
+use crate::agent::core::budget::{HeuristicTokenCounter, TokenCounter};
 use crate::agent::core::tools::ToolSchema;
 use crate::agent::core::Message;
 use crate::agent::llm::api::models::{
@@ -5,6 +6,7 @@ use crate::agent::llm::api::models::{
     ContentPart, FunctionCall, ImageUrl, Role, StreamToolCall, Tool, ToolCall, ToolChoice, Usage,
 };
 use crate::agent::llm::protocol::FromProvider;
+use crate::agent::metrics::types::{ForwardStatus, TokenUsage as MetricsTokenUsage};
 use crate::core::model_mapping::AnthropicModelMapping;
 use crate::server::{app_state::AppState, error::AppError};
 use actix_web::{http::StatusCode, web, HttpResponse};
@@ -185,6 +187,24 @@ struct AnthropicErrorDetail {
     message: String,
 }
 
+fn estimate_prompt_tokens(messages: &[Message]) -> u64 {
+    let counter = HeuristicTokenCounter::with_defaults();
+    u64::from(counter.count_messages(messages))
+}
+
+fn estimate_completion_tokens(output_text: &str) -> u64 {
+    let counter = HeuristicTokenCounter::with_defaults();
+    u64::from(counter.count_text(output_text))
+}
+
+fn build_estimated_usage(prompt_tokens: u64, completion_tokens: u64) -> MetricsTokenUsage {
+    MetricsTokenUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+    }
+}
+
 pub async fn messages(
     app_state: web::Data<AppState>,
     req: web::Json<AnthropicMessagesRequest>,
@@ -192,6 +212,7 @@ pub async fn messages(
     let stream = req.stream.unwrap_or(false);
     let request = req.into_inner();
     let response_model = request.model.clone();
+    let forward_id = uuid::Uuid::new_v4().to_string();
 
     let resolution = {
         let config = app_state.config.read().await;
@@ -252,6 +273,15 @@ pub async fn messages(
             .get("max_tokens")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
+        let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
+
+        app_state.metrics_service.collector().forward_started(
+            forward_id.clone(),
+            "anthropic.messages",
+            openai_request.model.clone(),
+            true,
+            chrono::Utc::now(),
+        );
 
         // Start streaming
         let stream_result = provider
@@ -266,21 +296,38 @@ pub async fn messages(
         let mut stream = match stream_result {
             Ok(s) => s,
             Err(err) => {
+                app_state.metrics_service.collector().forward_completed(
+                    forward_id.clone(),
+                    chrono::Utc::now(),
+                    None,
+                    ForwardStatus::Error,
+                    None,
+                    Some(format!("Upstream API error: {}", err)),
+                );
                 return Ok(anthropic_error_response(AnthropicError::new(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
                     format!("Upstream API error: {}", err),
-                )))
+                )));
             }
         };
 
+        let metrics = app_state.metrics_service.collector();
+        let forward_id_clone = forward_id.clone();
+        let estimated_prompt_tokens_clone = estimated_prompt_tokens;
+
         let stream = stream! {
             let mut state = AnthropicStreamState::new(model.clone());
+            let mut had_error = false;
+            let mut completion_text = String::new();
             use futures::StreamExt;
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
+                        if let crate::agent::llm::types::LLMChunk::Token(text) = &chunk {
+                            completion_text.push_str(text);
+                        }
                         // Convert LLMChunk to ChatCompletionStreamChunk
                         if let Some(openai_chunk) = convert_llm_chunk_to_openai(chunk, &model) {
                             let payload = state.handle_chunk(&openai_chunk);
@@ -290,6 +337,15 @@ pub async fn messages(
                         }
                     }
                     Err(err) => {
+                        had_error = true;
+                        metrics.forward_completed(
+                            forward_id_clone.clone(),
+                            chrono::Utc::now(),
+                            None,
+                            ForwardStatus::Error,
+                            None,
+                            Some(format!("Stream error: {}", err)),
+                        );
                         let payload = format_sse_event(
                             "error",
                             json!({
@@ -313,6 +369,21 @@ pub async fn messages(
                 yield Ok::<Bytes, AppError>(Bytes::from(payload));
             }
             yield Ok::<Bytes, AppError>(Bytes::from("data: [DONE]\n\n"));
+
+            if !had_error {
+                let completion_tokens = estimate_completion_tokens(&completion_text);
+                metrics.forward_completed(
+                    forward_id_clone,
+                    chrono::Utc::now(),
+                    Some(200),
+                    ForwardStatus::Success,
+                    Some(build_estimated_usage(
+                        estimated_prompt_tokens_clone,
+                        completion_tokens,
+                    )),
+                    None,
+                );
+            }
         };
 
         Ok(HttpResponse::Ok()
@@ -344,9 +415,18 @@ pub async fn messages(
             .get("max_tokens")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
+        let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
+
+        app_state.metrics_service.collector().forward_started(
+            forward_id.clone(),
+            "anthropic.messages",
+            openai_request.model.clone(),
+            false,
+            chrono::Utc::now(),
+        );
 
         // Get completion by collecting the stream
-        let mut stream = provider
+        let mut stream = match provider
             .chat_stream(
                 &internal_messages,
                 &internal_tools,
@@ -354,9 +434,23 @@ pub async fn messages(
                 openai_request.model.as_str(),
             )
             .await
-            .map_err(|err| {
-                AppError::InternalError(anyhow::anyhow!("Upstream API error: {}", err))
-            })?;
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                app_state.metrics_service.collector().forward_completed(
+                    forward_id.clone(),
+                    chrono::Utc::now(),
+                    None,
+                    ForwardStatus::Error,
+                    None,
+                    Some(format!("Upstream API error: {}", err)),
+                );
+                return Err(AppError::InternalError(anyhow::anyhow!(
+                    "Upstream API error: {}",
+                    err
+                )));
+            }
+        };
 
         // Collect stream into a response
         use futures::StreamExt;
@@ -384,6 +478,14 @@ pub async fn messages(
                 }
                 Ok(crate::agent::llm::types::LLMChunk::Done) => break,
                 Err(err) => {
+                    app_state.metrics_service.collector().forward_completed(
+                        forward_id.clone(),
+                        chrono::Utc::now(),
+                        None,
+                        ForwardStatus::Error,
+                        None,
+                        Some(format!("Stream error: {}", err)),
+                    );
                     return Err(AppError::InternalError(anyhow::anyhow!(
                         "Stream error: {}",
                         err
@@ -391,6 +493,7 @@ pub async fn messages(
                 }
             }
         }
+        let completion_tokens = estimate_completion_tokens(&content);
 
         let completion = ChatCompletionResponse {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -418,9 +521,29 @@ pub async fn messages(
         let response = match convert_messages_response(completion, &resolution.response_model) {
             Ok(value) => value,
             Err(err) => {
+                app_state.metrics_service.collector().forward_completed(
+                    forward_id,
+                    chrono::Utc::now(),
+                    None,
+                    ForwardStatus::Error,
+                    None,
+                    Some(err.message.clone()),
+                );
                 return Ok(anthropic_error_response(err));
             }
         };
+
+        app_state.metrics_service.collector().forward_completed(
+            forward_id,
+            chrono::Utc::now(),
+            Some(200),
+            ForwardStatus::Success,
+            Some(build_estimated_usage(
+                estimated_prompt_tokens,
+                completion_tokens,
+            )),
+            None,
+        );
 
         Ok(HttpResponse::Ok().json(response))
     }
@@ -433,6 +556,7 @@ pub async fn complete(
     let stream = req.stream.unwrap_or(false);
     let request = req.into_inner();
     let response_model = request.model.clone();
+    let forward_id = uuid::Uuid::new_v4().to_string();
 
     let resolution = {
         let config = app_state.config.read().await;
@@ -486,6 +610,15 @@ pub async fn complete(
             .get("max_tokens")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
+        let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
+
+        app_state.metrics_service.collector().forward_started(
+            forward_id.clone(),
+            "anthropic.complete",
+            openai_request.model.clone(),
+            true,
+            chrono::Utc::now(),
+        );
 
         // Start streaming
         let stream_result = provider
@@ -500,20 +633,37 @@ pub async fn complete(
         let mut stream = match stream_result {
             Ok(s) => s,
             Err(err) => {
+                app_state.metrics_service.collector().forward_completed(
+                    forward_id.clone(),
+                    chrono::Utc::now(),
+                    None,
+                    ForwardStatus::Error,
+                    None,
+                    Some(format!("Upstream API error: {}", err)),
+                );
                 return Ok(anthropic_error_response(AnthropicError::new(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
                     format!("Upstream API error: {}", err),
-                )))
+                )));
             }
         };
 
+        let metrics = app_state.metrics_service.collector();
+        let forward_id_clone = forward_id.clone();
+        let estimated_prompt_tokens_clone = estimated_prompt_tokens;
+
         let stream = stream! {
             use futures::StreamExt;
+            let mut had_error = false;
+            let mut completion_text = String::new();
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
+                        if let crate::agent::llm::types::LLMChunk::Token(text) = &chunk {
+                            completion_text.push_str(text);
+                        }
                         // Convert LLMChunk to ChatCompletionStreamChunk
                         if let Some(openai_chunk) = convert_llm_chunk_to_openai(chunk, &model) {
                             let payload = map_completion_stream_chunk(&openai_chunk, &model);
@@ -523,6 +673,15 @@ pub async fn complete(
                         }
                     }
                     Err(err) => {
+                        had_error = true;
+                        metrics.forward_completed(
+                            forward_id_clone.clone(),
+                            chrono::Utc::now(),
+                            None,
+                            ForwardStatus::Error,
+                            None,
+                            Some(format!("Stream error: {}", err)),
+                        );
                         let payload = format_sse_data(json!({
                             "type": "error",
                             "error": {
@@ -537,6 +696,21 @@ pub async fn complete(
                 }
             }
             yield Ok::<Bytes, AppError>(Bytes::from("data: [DONE]\n\n"));
+
+            if !had_error {
+                let completion_tokens = estimate_completion_tokens(&completion_text);
+                metrics.forward_completed(
+                    forward_id_clone,
+                    chrono::Utc::now(),
+                    Some(200),
+                    ForwardStatus::Success,
+                    Some(build_estimated_usage(
+                        estimated_prompt_tokens_clone,
+                        completion_tokens,
+                    )),
+                    None,
+                );
+            }
         };
 
         Ok(HttpResponse::Ok()
@@ -568,9 +742,18 @@ pub async fn complete(
             .get("max_tokens")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
+        let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
+
+        app_state.metrics_service.collector().forward_started(
+            forward_id.clone(),
+            "anthropic.complete",
+            openai_request.model.clone(),
+            false,
+            chrono::Utc::now(),
+        );
 
         // Get completion by collecting the stream
-        let mut stream = provider
+        let mut stream = match provider
             .chat_stream(
                 &internal_messages,
                 &internal_tools,
@@ -578,9 +761,23 @@ pub async fn complete(
                 openai_request.model.as_str(),
             )
             .await
-            .map_err(|err| {
-                AppError::InternalError(anyhow::anyhow!("Upstream API error: {}", err))
-            })?;
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                app_state.metrics_service.collector().forward_completed(
+                    forward_id.clone(),
+                    chrono::Utc::now(),
+                    None,
+                    ForwardStatus::Error,
+                    None,
+                    Some(format!("Upstream API error: {}", err)),
+                );
+                return Err(AppError::InternalError(anyhow::anyhow!(
+                    "Upstream API error: {}",
+                    err
+                )));
+            }
+        };
 
         // Collect stream into a response
         use futures::StreamExt;
@@ -608,6 +805,14 @@ pub async fn complete(
                 }
                 Ok(crate::agent::llm::types::LLMChunk::Done) => break,
                 Err(err) => {
+                    app_state.metrics_service.collector().forward_completed(
+                        forward_id.clone(),
+                        chrono::Utc::now(),
+                        None,
+                        ForwardStatus::Error,
+                        None,
+                        Some(format!("Stream error: {}", err)),
+                    );
                     return Err(AppError::InternalError(anyhow::anyhow!(
                         "Stream error: {}",
                         err
@@ -615,6 +820,7 @@ pub async fn complete(
                 }
             }
         }
+        let completion_tokens = estimate_completion_tokens(&content);
 
         let completion = ChatCompletionResponse {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -642,9 +848,29 @@ pub async fn complete(
         let response = match convert_complete_response(completion, &resolution.response_model) {
             Ok(value) => value,
             Err(err) => {
+                app_state.metrics_service.collector().forward_completed(
+                    forward_id,
+                    chrono::Utc::now(),
+                    None,
+                    ForwardStatus::Error,
+                    None,
+                    Some(err.message.clone()),
+                );
                 return Ok(anthropic_error_response(err));
             }
         };
+
+        app_state.metrics_service.collector().forward_completed(
+            forward_id,
+            chrono::Utc::now(),
+            Some(200),
+            ForwardStatus::Success,
+            Some(build_estimated_usage(
+                estimated_prompt_tokens,
+                completion_tokens,
+            )),
+            None,
+        );
 
         Ok(HttpResponse::Ok().json(response))
     }
@@ -669,11 +895,38 @@ struct AnthropicModel {
 }
 
 pub async fn get_models(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
+    let forward_id = uuid::Uuid::new_v4().to_string();
+    app_state.metrics_service.collector().forward_started(
+        forward_id.clone(),
+        "anthropic.models",
+        "models",
+        false,
+        chrono::Utc::now(),
+    );
+
     // Get provider and fetch models
     let provider = app_state.get_provider().await;
     let model_ids = match provider.list_models().await {
-        Ok(model_ids) => model_ids,
+        Ok(model_ids) => {
+            app_state.metrics_service.collector().forward_completed(
+                forward_id.clone(),
+                chrono::Utc::now(),
+                Some(200),
+                ForwardStatus::Success,
+                None,
+                None,
+            );
+            model_ids
+        }
         Err(e) => {
+            app_state.metrics_service.collector().forward_completed(
+                forward_id,
+                chrono::Utc::now(),
+                None,
+                ForwardStatus::Error,
+                None,
+                Some(e.to_string()),
+            );
             // Check if error is related to proxy auth
             let err_msg = e.to_string();
             if err_msg.contains("proxy") || err_msg.contains("407") {

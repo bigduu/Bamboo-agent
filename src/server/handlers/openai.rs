@@ -1,8 +1,9 @@
+use crate::agent::core::budget::{HeuristicTokenCounter, TokenCounter};
 use crate::agent::llm::api::models::{
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamChunk,
 };
 use crate::agent::llm::protocol::FromProvider;
-use crate::agent::metrics::types::ForwardStatus;
+use crate::agent::metrics::types::{ForwardStatus, TokenUsage as MetricsTokenUsage};
 use crate::server::{app_state::AppState, error::AppError};
 use actix_web::{web, HttpResponse};
 use bytes::Bytes;
@@ -131,12 +132,57 @@ struct ResponsesStreamEvent<T> {
     delta: Option<String>,
 }
 
+fn estimate_prompt_tokens(messages: &[crate::agent::core::Message]) -> u64 {
+    let counter = HeuristicTokenCounter::with_defaults();
+    u64::from(counter.count_messages(messages))
+}
+
+fn estimate_completion_tokens(output_text: &str) -> u64 {
+    let counter = HeuristicTokenCounter::with_defaults();
+    u64::from(counter.count_text(output_text))
+}
+
+fn build_estimated_usage(prompt_tokens: u64, completion_tokens: u64) -> MetricsTokenUsage {
+    MetricsTokenUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+    }
+}
+
 pub async fn get_models(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
+    let forward_id = uuid::Uuid::new_v4().to_string();
+    app_state.metrics_service.collector().forward_started(
+        forward_id.clone(),
+        "openai.models",
+        "models",
+        false,
+        chrono::Utc::now(),
+    );
+
     // Get provider and fetch models
     let provider = app_state.get_provider().await;
     let model_ids = match provider.list_models().await {
-        Ok(model_ids) => model_ids,
+        Ok(model_ids) => {
+            app_state.metrics_service.collector().forward_completed(
+                forward_id.clone(),
+                chrono::Utc::now(),
+                Some(200),
+                ForwardStatus::Success,
+                None,
+                None,
+            );
+            model_ids
+        }
         Err(e) => {
+            app_state.metrics_service.collector().forward_completed(
+                forward_id,
+                chrono::Utc::now(),
+                None,
+                ForwardStatus::Error,
+                None,
+                Some(e.to_string()),
+            );
             // Check if error is related to proxy auth
             let err_msg = e.to_string();
             if err_msg.contains("proxy") || err_msg.contains("407") {
@@ -491,6 +537,7 @@ pub async fn chat_completions(
         .get("max_tokens")
         .and_then(|v| v.as_u64())
         .map(|v| v as u32);
+    let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
 
     if stream {
         app_state.metrics_service.collector().forward_started(
@@ -524,14 +571,19 @@ pub async fn chat_completions(
         let model_clone = resolved_model.clone();
         let metrics = app_state.metrics_service.collector();
         let forward_id_clone = forward_id.clone();
+        let estimated_prompt_tokens_clone = estimated_prompt_tokens;
 
         // Spawn a task to handle the streaming response
         tokio::spawn(async move {
             use futures::StreamExt;
             let mut had_error = false;
+            let mut streamed_text = String::new();
             while let Some(chunk_result) = stream_result.next().await {
                 match chunk_result {
                     Ok(chunk) => {
+                        if let crate::agent::llm::types::LLMChunk::Token(text) = &chunk {
+                            streamed_text.push_str(text);
+                        }
                         if let Some(openai_chunk) = convert_chunk_to_openai(chunk, &model_clone) {
                             let chunk_str =
                                 serde_json::to_string(&openai_chunk).unwrap_or_default();
@@ -558,12 +610,16 @@ pub async fn chat_completions(
 
             // If we exit cleanly, mark success (best-effort; usage not available from stream).
             if !had_error {
+                let completion_tokens = estimate_completion_tokens(&streamed_text);
                 metrics.forward_completed(
                     forward_id_clone,
                     chrono::Utc::now(),
                     Some(200),
                     ForwardStatus::Success,
-                    None,
+                    Some(build_estimated_usage(
+                        estimated_prompt_tokens_clone,
+                        completion_tokens,
+                    )),
                     None,
                 );
             }
@@ -650,13 +706,15 @@ pub async fn chat_completions(
             }
         }
 
+        let completion_tokens = estimate_completion_tokens(&content);
         let response = build_completion_response(content, tool_calls, &resolved_model);
+        let usage = build_estimated_usage(estimated_prompt_tokens, completion_tokens);
         app_state.metrics_service.collector().forward_completed(
             forward_id,
             chrono::Utc::now(),
             Some(200),
             ForwardStatus::Success,
-            None,
+            Some(usage),
             None,
         );
         Ok(HttpResponse::Ok().json(response))
@@ -728,6 +786,7 @@ pub async fn responses_create(
             .and_then(|v| v.as_u64())
             .map(|v| v as u32)
     });
+    let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
 
     if stream {
         app_state.metrics_service.collector().forward_started(
@@ -788,6 +847,7 @@ pub async fn responses_create(
 
         let metrics = app_state.metrics_service.collector();
         let forward_id_clone = forward_id.clone();
+        let estimated_prompt_tokens_clone = estimated_prompt_tokens;
         let resolved_model_clone = resolved_model.clone();
         let response_id_clone = response_id.clone();
         let message_id_clone = message_id.clone();
@@ -838,6 +898,7 @@ pub async fn responses_create(
                 }
             }
 
+            let completion_tokens = estimate_completion_tokens(&content);
             // Final response.completed event with the assembled response object.
             let mut output: Vec<ResponsesOutputItem> = Vec::new();
             output.push(ResponsesOutputItem::Message(ResponsesMessageOutputItem {
@@ -893,7 +954,10 @@ pub async fn responses_create(
                 chrono::Utc::now(),
                 Some(200),
                 ForwardStatus::Success,
-                None,
+                Some(build_estimated_usage(
+                    estimated_prompt_tokens_clone,
+                    completion_tokens,
+                )),
                 None,
             );
         });
@@ -957,6 +1021,7 @@ pub async fn responses_create(
                 }
             }
         }
+        let completion_tokens = estimate_completion_tokens(&content);
 
         let response_id = format!("resp_{}", uuid::Uuid::new_v4());
         let message_id = format!("msg_{}", uuid::Uuid::new_v4());
@@ -1000,7 +1065,10 @@ pub async fn responses_create(
             chrono::Utc::now(),
             Some(200),
             ForwardStatus::Success,
-            None,
+            Some(build_estimated_usage(
+                estimated_prompt_tokens,
+                completion_tokens,
+            )),
             None,
         );
 
