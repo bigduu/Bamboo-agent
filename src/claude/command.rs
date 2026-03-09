@@ -1,3 +1,6 @@
+use crate::core::process_utils::{
+    hide_window_for_std_command, hide_window_for_tokio_command, trace_windows_command,
+};
 use log::{debug, info};
 
 #[cfg(windows)]
@@ -146,6 +149,12 @@ fn log_proxy_settings() {
 pub fn create_command_with_env(program: &str) -> std::process::Command {
     let (exe, prefix_args) = resolve_windows_program(program);
     let mut cmd = std::process::Command::new(&exe);
+    hide_window_for_std_command(&mut cmd);
+    trace_windows_command(
+        "claude.create_command_with_env",
+        &exe,
+        prefix_args.iter().map(String::as_str),
+    );
     cmd.args(prefix_args);
     info!("Creating command for: {} (exec: {})", program, exe);
     for (key, value) in collect_inherited_env(program) {
@@ -158,6 +167,12 @@ pub fn create_command_with_env(program: &str) -> std::process::Command {
 pub fn create_tokio_command_with_env(program: &str) -> tokio::process::Command {
     let (exe, prefix_args) = resolve_windows_program(program);
     let mut cmd = tokio::process::Command::new(&exe);
+    hide_window_for_tokio_command(&mut cmd);
+    trace_windows_command(
+        "claude.create_tokio_command_with_env",
+        &exe,
+        prefix_args.iter().map(String::as_str),
+    );
     cmd.args(prefix_args);
     info!("Creating tokio command for: {} (exec: {})", program, exe);
     for (key, value) in collect_inherited_env(program) {

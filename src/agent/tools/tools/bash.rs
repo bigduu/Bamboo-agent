@@ -1,4 +1,8 @@
 use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use crate::core::process_utils::{
+    hide_window_for_tokio_command, render_command_line, trace_windows_command,
+    windows_command_trace_enabled,
+};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
@@ -47,7 +51,15 @@ impl BashTool {
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let (shell, arg) = SHELL;
+        trace_windows_command("agent.bash.foreground", shell, [arg, command]);
+        if windows_command_trace_enabled() {
+            let rendered = render_command_line(shell, [arg, command]);
+            ctx.emit_tool_token(format!("[windows-cmd-trace] {rendered}\n"))
+                .await;
+        }
+
         let mut cmd = Command::new(shell);
+        hide_window_for_tokio_command(&mut cmd);
         cmd.arg(arg)
             .arg(command)
             .stdin(Stdio::null())

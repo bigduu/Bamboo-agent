@@ -9,6 +9,8 @@ use std::process::Command;
 #[cfg(not(test))]
 use std::sync::OnceLock;
 
+use crate::core::process_utils::{hide_window_for_std_command, trace_windows_command};
+
 const KEY_ENV_VAR: &str = "BAMBOO_CONFIG_ENCRYPTION_KEY";
 const KEY_DERIVATION_CONTEXT: &[u8] = b"bamboo-config-encryption-v1";
 const KEY_FILE_NAME: &str = ".bamboo_encryption_key";
@@ -166,6 +168,12 @@ fn read_machine_id() -> Option<String> {
     None
 }
 
+fn command_with_hidden_window(program: &str) -> Command {
+    let mut command = Command::new(program);
+    hide_window_for_std_command(&mut command);
+    command
+}
+
 #[cfg(target_os = "windows")]
 fn read_windows_machine_guid() -> Option<String> {
     // Prefer a stable host identifier on Windows so secrets can be decrypted across
@@ -173,7 +181,17 @@ fn read_windows_machine_guid() -> Option<String> {
     // break decryption when paths change (e.g. Tauri dev builds).
     //
     // Registry: HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
-    let output = Command::new("reg")
+    trace_windows_command(
+        "core.encryption.read_windows_machine_guid",
+        "reg",
+        [
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Cryptography",
+            "/v",
+            "MachineGuid",
+        ],
+    );
+    let output = command_with_hidden_window("reg")
         .args([
             "query",
             r"HKLM\SOFTWARE\Microsoft\Cryptography",
@@ -273,7 +291,15 @@ fn read_trimmed_file(path: &str) -> Option<String> {
 }
 
 fn run_command_first_line(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
+    trace_windows_command(
+        "core.encryption.run_command_first_line",
+        program,
+        args.iter().copied(),
+    );
+    let output = command_with_hidden_window(program)
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -285,7 +311,7 @@ fn run_command_first_line(program: &str, args: &[&str]) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn read_macos_platform_uuid() -> Option<String> {
-    let output = Command::new("ioreg")
+    let output = command_with_hidden_window("ioreg")
         .args(["-rd1", "-c", "IOPlatformExpertDevice"])
         .output()
         .ok()?;

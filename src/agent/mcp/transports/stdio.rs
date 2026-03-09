@@ -8,6 +8,7 @@ use tracing::{error, info, trace, warn};
 use crate::agent::mcp::config::StdioConfig;
 use crate::agent::mcp::error::{McpError, Result};
 use crate::agent::mcp::protocol::client::McpTransport;
+use crate::core::process_utils::{hide_window_for_tokio_command, trace_windows_command};
 
 pub struct StdioTransport {
     config: StdioConfig,
@@ -37,7 +38,13 @@ impl McpTransport for StdioTransport {
             self.config.command, self.config.args
         );
 
+        trace_windows_command(
+            "agent.mcp.stdio.connect",
+            &self.config.command,
+            self.config.args.iter().map(String::as_str),
+        );
         let mut cmd = Command::new(&self.config.command);
+        hide_window_for_tokio_command(&mut cmd);
         cmd.args(&self.config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

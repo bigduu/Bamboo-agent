@@ -1,3 +1,4 @@
+use crate::core::process_utils::{hide_window_for_tokio_command, trace_windows_command};
 use dashmap::DashMap;
 use regex::Regex;
 use std::process::Stdio;
@@ -84,7 +85,9 @@ async fn push_line(output: &Arc<Mutex<Vec<String>>>, line: String) {
 
 pub async fn spawn_background(command: &str) -> Result<Arc<ShellSession>, String> {
     let (shell, arg) = SHELL;
+    trace_windows_command("agent.bash.background", shell, [arg, command]);
     let mut cmd = Command::new(shell);
+    hide_window_for_tokio_command(&mut cmd);
     cmd.arg(arg)
         .arg(command)
         .stdin(Stdio::null())

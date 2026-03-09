@@ -12,6 +12,7 @@ pub mod encryption;
 pub mod keyword_masking;
 pub mod model_mapping;
 pub mod paths;
+pub mod process_utils;
 pub mod todo;
 
 // Re-export commonly used types

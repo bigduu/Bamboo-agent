@@ -4,6 +4,13 @@ use std::process::Command;
 
 use super::version::{extract_version_from_output, get_claude_version};
 use super::{ClaudeInstallation, InstallationType};
+use crate::core::process_utils::{hide_window_for_std_command, trace_windows_command};
+
+fn command_with_hidden_window(program: &str) -> Command {
+    let mut command = Command::new(program);
+    hide_window_for_std_command(&mut command);
+    command
+}
 
 pub(super) fn discover_system_installations() -> Vec<ClaudeInstallation> {
     let mut installations = Vec::new();
@@ -25,7 +32,8 @@ pub(super) fn discover_system_installations() -> Vec<ClaudeInstallation> {
 fn try_which_command() -> Option<ClaudeInstallation> {
     debug!("Trying 'which claude' to find binary...");
 
-    match Command::new("which").arg("claude").output() {
+    trace_windows_command("claude.discovery.which", "which", ["claude"]);
+    match command_with_hidden_window("which").arg("claude").output() {
         Ok(output) if output.status.success() => {
             let output_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
@@ -66,7 +74,8 @@ fn try_which_command() -> Option<ClaudeInstallation> {
 fn try_which_command() -> Option<ClaudeInstallation> {
     debug!("Trying 'where claude' to find binary...");
 
-    match Command::new("where").arg("claude").output() {
+    trace_windows_command("claude.discovery.where", "where", ["claude"]);
+    match command_with_hidden_window("where").arg("claude").output() {
         Ok(output) if output.status.success() => {
             let output_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
@@ -249,7 +258,11 @@ fn find_standard_installations() -> Vec<ClaudeInstallation> {
         }
     }
 
-    if let Ok(output) = Command::new("claude").arg("--version").output() {
+    trace_windows_command("claude.discovery.path-version", "claude", ["--version"]);
+    if let Ok(output) = command_with_hidden_window("claude")
+        .arg("--version")
+        .output()
+    {
         if output.status.success() {
             debug!("claude is available in PATH");
             let version = extract_version_from_output(&output.stdout);
@@ -313,7 +326,11 @@ fn find_standard_installations() -> Vec<ClaudeInstallation> {
         }
     }
 
-    if let Ok(output) = Command::new("claude.exe").arg("--version").output() {
+    trace_windows_command("claude.discovery.path-version", "claude.exe", ["--version"]);
+    if let Ok(output) = command_with_hidden_window("claude.exe")
+        .arg("--version")
+        .output()
+    {
         if output.status.success() {
             debug!("claude.exe is available in PATH");
             let version = extract_version_from_output(&output.stdout);

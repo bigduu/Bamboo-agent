@@ -777,9 +777,15 @@ impl ProcessRegistry {
         info!("Attempting to kill process {} by PID {}", run_id, pid);
 
         let kill_result = if cfg!(target_os = "windows") {
-            std::process::Command::new("taskkill")
-                .args(["/F", "/PID", &pid.to_string()])
-                .output()
+            let pid_str = pid.to_string();
+            crate::core::process_utils::trace_windows_command(
+                "process_registry.kill_process_by_pid",
+                "taskkill",
+                ["/F", "/PID", pid_str.as_str()],
+            );
+            let mut command = std::process::Command::new("taskkill");
+            crate::core::process_utils::hide_window_for_std_command(&mut command);
+            command.args(["/F", "/PID", &pid_str]).output()
         } else {
             let term_result = std::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
