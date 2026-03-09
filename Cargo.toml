@@ -1,6 +1,6 @@
 [package]
 name = "bamboo-agent"
-version = "2026.3.11"
+version = "2026.3.20"
 edition = "2021"
 license = "MIT"
 authors = ["mugeng.du@gmail.com"]
