@@ -232,6 +232,15 @@ pub enum AnthropicContentBlock {
         text: String,
     },
 
+    /// Image content block.
+    ///
+    /// Supports either base64 data URLs (converted to Anthropic `source: {type: "base64", ...}`)
+    /// or direct URL source references.
+    Image {
+        /// Image source payload.
+        source: AnthropicImageSource,
+    },
+
     /// Tool invocation request block.
     ///
     /// Represents the model's request to call a specific tool with given parameters.
@@ -255,6 +264,24 @@ pub enum AnthropicContentBlock {
 
         /// The result of the tool execution, as JSON.
         content: Value,
+    },
+}
+
+/// Image source formats for Anthropic image content blocks.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicImageSource {
+    /// Base64-encoded image bytes.
+    Base64 {
+        /// MIME type such as `image/png`.
+        media_type: String,
+        /// Raw base64 payload without data URL prefix.
+        data: String,
+    },
+    /// Direct URL image source.
+    Url {
+        /// Image URL.
+        url: String,
     },
 }
 

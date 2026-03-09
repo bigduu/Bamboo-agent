@@ -102,14 +102,32 @@ impl ToProvider<AnthropicMessage> for Message {
                 // System messages are handled at the request level
                 AnthropicContent::Text(self.content.clone())
             }
-            Role::User => AnthropicContent::Blocks(vec![AnthropicContentBlock::Text {
-                text: self.content.clone(),
-            }]),
+            Role::User => {
+                let mut blocks = Vec::new();
+                if let Some(parts) = self.content_parts.as_ref() {
+                    for part in parts {
+                        if let Some(block) = content_part_to_anthropic_block(part) {
+                            blocks.push(block);
+                        }
+                    }
+                }
+                if blocks.is_empty() {
+                    blocks.push(AnthropicContentBlock::Text {
+                        text: self.content.clone(),
+                    });
+                }
+                AnthropicContent::Blocks(blocks)
+            }
             Role::Assistant => {
                 let mut blocks: Vec<AnthropicContentBlock> = Vec::new();
 
-                // Add text content
-                if !self.content.is_empty() {
+                if let Some(parts) = self.content_parts.as_ref() {
+                    for part in parts {
+                        if let Some(block) = content_part_to_anthropic_block(part) {
+                            blocks.push(block);
+                        }
+                    }
+                } else if !self.content.is_empty() {
                     blocks.push(AnthropicContentBlock::Text {
                         text: self.content.clone(),
                     });
@@ -245,6 +263,9 @@ fn extract_text_from_anthropic_blocks(
     for block in blocks {
         match block {
             AnthropicContentBlock::Text { text } => texts.push(text),
+            AnthropicContentBlock::Image { .. } => {
+                // Keep `content` as text-only projection for text-only subsystems.
+            }
             AnthropicContentBlock::ToolUse { .. } => {
                 // Tool calls are handled separately
             }
@@ -268,6 +289,59 @@ fn extract_text_from_anthropic_blocks(
     }
 
     Ok(texts.join("\n"))
+}
+
+fn content_part_to_anthropic_block(
+    part: &crate::agent::llm::models::ContentPart,
+) -> Option<AnthropicContentBlock> {
+    match part {
+        crate::agent::llm::models::ContentPart::Text { text } => {
+            Some(AnthropicContentBlock::Text { text: text.clone() })
+        }
+        crate::agent::llm::models::ContentPart::ImageUrl { image_url } => {
+            let trimmed = image_url.url.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if let Some((media_type, data)) = parse_data_url_base64(trimmed) {
+                return Some(AnthropicContentBlock::Image {
+                    source: AnthropicImageSource::Base64 { media_type, data },
+                });
+            }
+            Some(AnthropicContentBlock::Image {
+                source: AnthropicImageSource::Url {
+                    url: trimmed.to_string(),
+                },
+            })
+        }
+    }
+}
+
+fn parse_data_url_base64(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let data = data.trim();
+    if data.is_empty() {
+        return None;
+    }
+
+    let mut media_type = "application/octet-stream";
+    let mut is_base64 = false;
+    for (idx, seg) in meta.split(';').enumerate() {
+        let segment = seg.trim();
+        if idx == 0 && !segment.is_empty() && !segment.eq_ignore_ascii_case("base64") {
+            media_type = segment;
+        }
+        if segment.eq_ignore_ascii_case("base64") {
+            is_base64 = true;
+        }
+    }
+
+    if !is_base64 {
+        return None;
+    }
+
+    Some((media_type.to_string(), data.to_string()))
 }
 
 // ============================================================================

@@ -165,6 +165,8 @@ pub async fn generate_content(
         } else {
             Some(full_content)
         },
+        inline_data: None,
+        file_data: None,
         function_call: None,
         function_response: None,
     }];
@@ -182,6 +184,8 @@ pub async fn generate_content(
 
             parts.push(GeminiPart {
                 text: None,
+                inline_data: None,
+                file_data: None,
                 function_call: Some(GeminiFunctionCall {
                     name: tc.function.name,
                     args,
@@ -317,6 +321,8 @@ pub async fn stream_generate_content(
                                 role: "model".to_string(),
                                 parts: vec![GeminiPart {
                                     text: Some(token),
+                                    inline_data: None,
+                                    file_data: None,
                                     function_call: None,
                                     function_response: None,
                                 }],
@@ -349,6 +355,8 @@ pub async fn stream_generate_content(
                                     role: "model".to_string(),
                                     parts: vec![GeminiPart {
                                         text: None,
+                                        inline_data: None,
+                                        file_data: None,
                                         function_call: Some(GeminiFunctionCall {
                                             name: tc.function.name,
                                             args,

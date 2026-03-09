@@ -69,6 +69,9 @@ enum AnthropicContentBlock {
     Text {
         text: String,
     },
+    Image {
+        source: AnthropicImageSource,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -78,6 +81,13 @@ enum AnthropicContentBlock {
         tool_use_id: String,
         content: Value,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicImageSource {
+    Base64 { media_type: String, data: String },
+    Url { url: String },
 }
 
 #[derive(Deserialize)]
@@ -1256,6 +1266,11 @@ fn append_user_blocks(
             AnthropicContentBlock::Text { text } => {
                 text_parts.push(ContentPart::Text { text });
             }
+            AnthropicContentBlock::Image { source } => {
+                text_parts.push(ContentPart::ImageUrl {
+                    image_url: convert_image_source_to_image_url(source)?,
+                });
+            }
             AnthropicContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -1323,6 +1338,11 @@ fn convert_assistant_blocks(
             AnthropicContentBlock::Text { text } => {
                 content_parts.push(ContentPart::Text { text });
             }
+            AnthropicContentBlock::Image { source } => {
+                content_parts.push(ContentPart::ImageUrl {
+                    image_url: convert_image_source_to_image_url(source)?,
+                });
+            }
             AnthropicContentBlock::ToolUse { id, name, input } => {
                 tool_calls.push(ToolCall {
                     id,
@@ -1367,6 +1387,42 @@ fn convert_assistant_blocks(
         },
         tool_call_id: None,
     })
+}
+
+fn convert_image_source_to_image_url(
+    source: AnthropicImageSource,
+) -> Result<ImageUrl, AnthropicError> {
+    match source {
+        AnthropicImageSource::Base64 { media_type, data } => {
+            let media_type = media_type.trim();
+            let data = data.trim();
+            if media_type.is_empty() || data.is_empty() {
+                return Err(AnthropicError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "image source base64 blocks require non-empty media_type and data".to_string(),
+                ));
+            }
+            Ok(ImageUrl {
+                url: format!("data:{media_type};base64,{data}"),
+                detail: None,
+            })
+        }
+        AnthropicImageSource::Url { url } => {
+            let trimmed = url.trim();
+            if trimmed.is_empty() {
+                return Err(AnthropicError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "image source url blocks require a non-empty url".to_string(),
+                ));
+            }
+            Ok(ImageUrl {
+                url: trimmed.to_string(),
+                detail: None,
+            })
+        }
+    }
 }
 
 fn extract_tool_result_text(content: Value) -> Result<String, AnthropicError> {

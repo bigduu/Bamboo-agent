@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 
 use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
 use crate::agent::llm::types::LLMChunk;
+use crate::agent::llm::ContentPart;
 
 /// Anthropic Messages API provider.
 pub struct AnthropicProvider {
@@ -181,12 +182,7 @@ fn message_to_anthropic_json(message: &Message) -> Value {
         Role::System => unreachable!("system messages should be extracted into top-level `system`"),
         Role::User => json!({
             "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": message.content,
-                }
-            ],
+            "content": user_content_to_anthropic_blocks(message),
         }),
         Role::Assistant => {
             let mut blocks: Vec<Value> = Vec::new();
@@ -227,6 +223,93 @@ fn message_to_anthropic_json(message: &Message) -> Value {
             })
         }
     }
+}
+
+fn user_content_to_anthropic_blocks(message: &Message) -> Vec<Value> {
+    if let Some(parts) = message.content_parts.as_ref() {
+        let mut blocks = Vec::new();
+        for part in parts {
+            if let Some(block) = content_part_to_anthropic_block(part) {
+                blocks.push(block);
+            }
+        }
+        if blocks.is_empty() {
+            blocks.push(json!({
+                "type": "text",
+                "text": message.content,
+            }));
+        }
+        return blocks;
+    }
+
+    vec![json!({
+        "type": "text",
+        "text": message.content,
+    })]
+}
+
+fn content_part_to_anthropic_block(part: &ContentPart) -> Option<Value> {
+    match part {
+        ContentPart::Text { text } => Some(json!({
+            "type": "text",
+            "text": text,
+        })),
+        ContentPart::ImageUrl { image_url } => image_url_to_anthropic_block(&image_url.url),
+    }
+}
+
+fn image_url_to_anthropic_block(url: &str) -> Option<Value> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((media_type, data)) = parse_data_url_base64(trimmed) {
+        return Some(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": data,
+            }
+        }));
+    }
+
+    Some(json!({
+        "type": "image",
+        "source": {
+            "type": "url",
+            "url": trimmed,
+        }
+    }))
+}
+
+fn parse_data_url_base64(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let data = data.trim();
+    if data.is_empty() {
+        return None;
+    }
+
+    let mut media_type = "application/octet-stream";
+    let mut is_base64 = false;
+
+    for (idx, seg) in meta.split(';').enumerate() {
+        let segment = seg.trim();
+        if idx == 0 && !segment.is_empty() && !segment.eq_ignore_ascii_case("base64") {
+            media_type = segment;
+        }
+        if segment.eq_ignore_ascii_case("base64") {
+            is_base64 = true;
+        }
+    }
+
+    if !is_base64 {
+        return None;
+    }
+
+    Some((media_type.to_string(), data.to_string()))
 }
 
 fn tool_call_to_tool_use_block(tool_call: &crate::agent::core::tools::ToolCall) -> Value {
@@ -405,6 +488,7 @@ pub fn parse_anthropic_sse_event(
 mod anthropic_request_building {
     use crate::agent::core::tools::{FunctionCall, ToolCall};
     use crate::agent::core::Message;
+    use crate::agent::llm::{ContentPart, ImageUrl};
 
     #[test]
     fn system_messages_are_extracted_into_top_level_system_field() {
@@ -455,6 +539,59 @@ mod anthropic_request_building {
         assert_eq!(out["messages"][0]["content"][0]["id"], "call_1");
         assert_eq!(out["messages"][0]["content"][0]["name"], "search");
         assert_eq!(out["messages"][0]["content"][0]["input"]["q"], "test");
+    }
+
+    #[test]
+    fn user_message_with_data_url_image_becomes_anthropic_image_block() {
+        let messages = vec![Message::user_with_parts(
+            "describe",
+            vec![
+                ContentPart::Text {
+                    text: "describe".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,AAAABBBB".to_string(),
+                        detail: None,
+                    },
+                },
+            ],
+        )];
+
+        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
+
+        assert_eq!(out["messages"][0]["content"][1]["type"], "image");
+        assert_eq!(out["messages"][0]["content"][1]["source"]["type"], "base64");
+        assert_eq!(
+            out["messages"][0]["content"][1]["source"]["media_type"],
+            "image/png"
+        );
+        assert_eq!(
+            out["messages"][0]["content"][1]["source"]["data"],
+            "AAAABBBB"
+        );
+    }
+
+    #[test]
+    fn user_message_with_remote_image_uses_url_source() {
+        let messages = vec![Message::user_with_parts(
+            "describe",
+            vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/cat.png".to_string(),
+                    detail: None,
+                },
+            }],
+        )];
+
+        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
+
+        assert_eq!(out["messages"][0]["content"][0]["type"], "image");
+        assert_eq!(out["messages"][0]["content"][0]["source"]["type"], "url");
+        assert_eq!(
+            out["messages"][0]["content"][0]["source"]["url"],
+            "https://example.com/cat.png"
+        );
     }
 }
 

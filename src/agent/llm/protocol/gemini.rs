@@ -41,13 +41,21 @@ pub struct GeminiRequest {
     /// Conversation history
     pub contents: Vec<GeminiContent>,
     /// System instructions (extracted from system messages)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "systemInstruction",
+        alias = "system_instruction"
+    )]
     pub system_instruction: Option<GeminiContent>,
     /// Available tools
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<GeminiTool>>,
     /// Generation config (temperature, max_tokens, etc.)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "generationConfig",
+        alias = "generation_config"
+    )]
     pub generation_config: Option<Value>,
 }
 
@@ -66,12 +74,55 @@ pub struct GeminiPart {
     /// Text content
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Inline base64 image content.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "inlineData",
+        alias = "inline_data"
+    )]
+    pub inline_data: Option<GeminiInlineData>,
+    /// File/URL-based image reference.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "fileData",
+        alias = "file_data"
+    )]
+    pub file_data: Option<GeminiFileData>,
     /// Function call (for model responses)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "functionCall",
+        alias = "function_call"
+    )]
     pub function_call: Option<GeminiFunctionCall>,
     /// Function response (for user/tool messages)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "functionResponse",
+        alias = "function_response"
+    )]
     pub function_response: Option<GeminiFunctionResponse>,
+}
+
+/// Gemini inline image payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiInlineData {
+    #[serde(rename = "mimeType", alias = "mime_type")]
+    pub mime_type: String,
+    pub data: String,
+}
+
+/// Gemini file image payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiFileData {
+    #[serde(rename = "fileUri", alias = "file_uri")]
+    pub file_uri: String,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "mimeType",
+        alias = "mime_type"
+    )]
+    pub mime_type: Option<String>,
 }
 
 /// Gemini function call
@@ -91,6 +142,7 @@ pub struct GeminiFunctionResponse {
 /// Gemini tool definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiTool {
+    #[serde(rename = "functionDeclarations", alias = "function_declarations")]
     pub function_declarations: Vec<GeminiFunctionDeclaration>,
 }
 
@@ -130,13 +182,38 @@ impl FromProvider<GeminiContent> for Message {
             _ => return Err(ProtocolError::InvalidRole(content.role)),
         };
 
-        // Extract text and tool calls from parts
+        // Extract text/image content and tool calls from parts.
         let mut text_parts = Vec::new();
+        let mut content_parts = Vec::new();
         let mut tool_calls = Vec::new();
+        let mut has_image_parts = false;
 
         for part in content.parts {
             if let Some(text) = part.text {
-                text_parts.push(text);
+                text_parts.push(text.clone());
+                content_parts.push(crate::agent::llm::models::ContentPart::Text { text });
+            }
+
+            if let Some(inline_data) = part.inline_data {
+                if let Some(url) = inline_data_to_data_url(&inline_data) {
+                    has_image_parts = true;
+                    content_parts.push(crate::agent::llm::models::ContentPart::ImageUrl {
+                        image_url: crate::agent::llm::models::ImageUrl { url, detail: None },
+                    });
+                }
+            }
+
+            if let Some(file_data) = part.file_data {
+                let file_uri = file_data.file_uri.trim();
+                if !file_uri.is_empty() {
+                    has_image_parts = true;
+                    content_parts.push(crate::agent::llm::models::ContentPart::ImageUrl {
+                        image_url: crate::agent::llm::models::ImageUrl {
+                            url: file_uri.to_string(),
+                            detail: None,
+                        },
+                    });
+                }
             }
 
             if let Some(func_call) = part.function_call {
@@ -165,7 +242,7 @@ impl FromProvider<GeminiContent> for Message {
             id: String::new(),
             role,
             content: content_text,
-            content_parts: None,
+            content_parts: has_image_parts.then_some(content_parts),
             image_ocr: None,
             tool_calls: if tool_calls.is_empty() {
                 None
@@ -221,6 +298,8 @@ impl ToProvider<GeminiRequest> for Vec<Message> {
                         role: "system".to_string(),
                         parts: vec![GeminiPart {
                             text: Some(msg.content.clone()),
+                            inline_data: None,
+                            file_data: None,
                             function_call: None,
                             function_response: None,
                         }],
@@ -254,6 +333,8 @@ impl ToProvider<GeminiContent> for Message {
                 role: "user".to_string(),
                 parts: vec![GeminiPart {
                     text: None,
+                    inline_data: None,
+                    file_data: None,
                     function_call: None,
                     function_response: Some(GeminiFunctionResponse {
                         name: tool_name,
@@ -273,10 +354,21 @@ impl ToProvider<GeminiContent> for Message {
 
         let mut parts = Vec::new();
 
-        // Add text content
-        if !self.content.is_empty() {
+        // Preserve multimodal parts (text + images) when available.
+        if let Some(content_parts) = self.content_parts.as_ref() {
+            for part in content_parts {
+                if let Some(gemini_part) = message_content_part_to_gemini_part(part) {
+                    parts.push(gemini_part);
+                }
+            }
+        }
+
+        // Fall back to text projection if there are no explicit parts.
+        if parts.is_empty() && !self.content.is_empty() {
             parts.push(GeminiPart {
                 text: Some(self.content.clone()),
+                inline_data: None,
+                file_data: None,
                 function_call: None,
                 function_response: None,
             });
@@ -290,6 +382,8 @@ impl ToProvider<GeminiContent> for Message {
 
                 parts.push(GeminiPart {
                     text: None,
+                    inline_data: None,
+                    file_data: None,
                     function_call: Some(GeminiFunctionCall {
                         name: tc.function.name.clone(),
                         args,
@@ -303,6 +397,8 @@ impl ToProvider<GeminiContent> for Message {
         if parts.is_empty() {
             parts.push(GeminiPart {
                 text: Some(String::new()),
+                inline_data: None,
+                file_data: None,
                 function_call: None,
                 function_response: None,
             });
@@ -353,6 +449,87 @@ impl ToProvider<Vec<GeminiTool>> for Vec<ToolSchema> {
     }
 }
 
+fn message_content_part_to_gemini_part(
+    part: &crate::agent::llm::models::ContentPart,
+) -> Option<GeminiPart> {
+    match part {
+        crate::agent::llm::models::ContentPart::Text { text } => Some(GeminiPart {
+            text: Some(text.clone()),
+            inline_data: None,
+            file_data: None,
+            function_call: None,
+            function_response: None,
+        }),
+        crate::agent::llm::models::ContentPart::ImageUrl { image_url } => {
+            image_url_to_gemini_part(&image_url.url)
+        }
+    }
+}
+
+fn image_url_to_gemini_part(url: &str) -> Option<GeminiPart> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((mime_type, data)) = parse_data_url_base64(trimmed) {
+        return Some(GeminiPart {
+            text: None,
+            inline_data: Some(GeminiInlineData { mime_type, data }),
+            file_data: None,
+            function_call: None,
+            function_response: None,
+        });
+    }
+
+    Some(GeminiPart {
+        text: None,
+        inline_data: None,
+        file_data: Some(GeminiFileData {
+            file_uri: trimmed.to_string(),
+            mime_type: None,
+        }),
+        function_call: None,
+        function_response: None,
+    })
+}
+
+fn parse_data_url_base64(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let data = data.trim();
+    if data.is_empty() {
+        return None;
+    }
+
+    let mut mime_type = "application/octet-stream";
+    let mut is_base64 = false;
+    for (idx, seg) in meta.split(';').enumerate() {
+        let segment = seg.trim();
+        if idx == 0 && !segment.is_empty() && !segment.eq_ignore_ascii_case("base64") {
+            mime_type = segment;
+        }
+        if segment.eq_ignore_ascii_case("base64") {
+            is_base64 = true;
+        }
+    }
+
+    if !is_base64 {
+        return None;
+    }
+
+    Some((mime_type.to_string(), data.to_string()))
+}
+
+fn inline_data_to_data_url(inline: &GeminiInlineData) -> Option<String> {
+    let mime_type = inline.mime_type.trim();
+    let data = inline.data.trim();
+    if mime_type.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some(format!("data:{mime_type};base64,{data}"))
+}
+
 // ============================================================================
 // Extension trait for ergonomic conversion
 // ============================================================================
@@ -390,6 +567,7 @@ impl GeminiExt for Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::llm::{ContentPart, ImageUrl};
 
     #[test]
     fn test_gemini_to_internal_user_message() {
@@ -397,6 +575,8 @@ mod tests {
             role: "user".to_string(),
             parts: vec![GeminiPart {
                 text: Some("Hello".to_string()),
+                inline_data: None,
+                file_data: None,
                 function_call: None,
                 function_response: None,
             }],
@@ -421,11 +601,43 @@ mod tests {
     }
 
     #[test]
+    fn test_internal_to_gemini_with_data_url_image_part() {
+        let internal = Message::user_with_parts(
+            "describe",
+            vec![
+                ContentPart::Text {
+                    text: "describe".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,AAAA".to_string(),
+                        detail: None,
+                    },
+                },
+            ],
+        );
+
+        let gemini: GeminiContent = internal.to_provider().unwrap();
+
+        assert_eq!(gemini.parts.len(), 2);
+        assert_eq!(gemini.parts[0].text, Some("describe".to_string()));
+        let inline = gemini.parts[1]
+            .inline_data
+            .as_ref()
+            .expect("inlineData should be present");
+        assert_eq!(inline.mime_type, "image/png");
+        assert_eq!(inline.data, "AAAA");
+        assert!(gemini.parts[1].file_data.is_none());
+    }
+
+    #[test]
     fn test_gemini_to_internal_model_message() {
         let gemini = GeminiContent {
             role: "model".to_string(),
             parts: vec![GeminiPart {
                 text: Some("Hello there!".to_string()),
+                inline_data: None,
+                file_data: None,
                 function_call: None,
                 function_response: None,
             }],
@@ -435,6 +647,37 @@ mod tests {
 
         assert_eq!(internal.role, Role::Assistant);
         assert_eq!(internal.content, "Hello there!");
+    }
+
+    #[test]
+    fn test_gemini_to_internal_with_inline_data_image() {
+        let gemini = GeminiContent {
+            role: "user".to_string(),
+            parts: vec![GeminiPart {
+                text: Some("look".to_string()),
+                inline_data: Some(GeminiInlineData {
+                    mime_type: "image/png".to_string(),
+                    data: "BBBB".to_string(),
+                }),
+                file_data: None,
+                function_call: None,
+                function_response: None,
+            }],
+        };
+
+        let internal: Message = Message::from_provider(gemini).unwrap();
+        assert_eq!(internal.content, "look");
+        let parts = internal
+            .content_parts
+            .as_ref()
+            .expect("content_parts should preserve image");
+        assert!(parts.iter().any(|part| {
+            matches!(
+                part,
+                ContentPart::ImageUrl { image_url }
+                if image_url.url == "data:image/png;base64,BBBB"
+            )
+        }));
     }
 
     #[test]
@@ -468,6 +711,8 @@ mod tests {
             role: "model".to_string(),
             parts: vec![GeminiPart {
                 text: None,
+                inline_data: None,
+                file_data: None,
                 function_call: Some(GeminiFunctionCall {
                     name: "search".to_string(),
                     args: serde_json::json!({"q": "test"}),
@@ -589,6 +834,8 @@ mod tests {
             role: "invalid_role".to_string(),
             parts: vec![GeminiPart {
                 text: Some("test".to_string()),
+                inline_data: None,
+                file_data: None,
                 function_call: None,
                 function_response: None,
             }],
