@@ -92,13 +92,16 @@ use crate::server::spawn_scheduler::{SpawnContext, SpawnScheduler};
 
 /// Default system prompt for agent interactions
 pub const DEFAULT_BASE_PROMPT: &str =
-    "You are a helpful AI assistant with access to various tools and skills.";
+    "You are a helpful AI assistant with access to various tools and skills. For recurring or delayed tasks, use the schedule_tasks tool to create and manage schedule jobs.";
 
 /// Guidance for workspace-based interactions
 pub fn workspace_prompt_guidance() -> String {
+    let config_path =
+        crate::core::paths::path_to_display_string(&crate::core::paths::config_json_path());
     format!(
-        "If you need to inspect files, check the workspace first, then {}.",
-        crate::core::paths::bamboo_dir_display()
+        "If you need to inspect files, check the workspace first, then Bamboo data at {}. Bamboo configuration is stored in {} (equivalent to ${{BAMBOO_DATA_DIR}}/config.json).",
+        crate::core::paths::bamboo_dir_display(),
+        config_path
     )
 }
 
@@ -686,7 +689,18 @@ impl AppState {
             config: config.clone(),
         }));
 
-        let tools: Arc<dyn ToolExecutor> = tools_with_task;
+        // Root sessions can manage schedules via `schedule_tasks`.
+        // Background schedule runs intentionally use `tools_for_schedules` above and therefore
+        // do not get this management tool by default.
+        let schedule_tasks_tool = Arc::new(crate::server::tools::ScheduleTasksTool::new(
+            schedule_store.clone(),
+            schedule_manager.clone(),
+            session_store.clone(),
+            storage.clone(),
+        ));
+        let tools: Arc<dyn ToolExecutor> = Arc::new(
+            crate::server::tools::OverlayToolExecutor::new(tools_with_task, schedule_tasks_tool),
+        );
 
         Self {
             app_data_dir: bamboo_home_dir,

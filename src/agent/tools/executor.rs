@@ -11,8 +11,8 @@ use crate::agent::tools::guide::{context::GuideBuildContext, EnhancedPromptBuild
 use crate::agent::tools::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::agent::tools::tools::{
     AskUserTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, GlobTool, GrepTool,
-    KillShellTool, NotebookEditTool, ReadTool, SlashCommandTool, TaskTool, TodoWriteTool,
-    ToolRegistry, WebFetchTool, WebSearchTool, WriteTool,
+    KillShellTool, MemoryNoteTool, NotebookEditTool, ReadTool, SlashCommandTool, TaskTool,
+    TodoWriteTool, ToolRegistry, WebFetchTool, WebSearchTool, WriteTool,
 };
 use crate::core::Config;
 use tokio::sync::RwLock;
@@ -22,7 +22,7 @@ use tokio::sync::RwLock;
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 16] = [
+pub const BUILTIN_TOOL_NAMES: [&str; 17] = [
     "ask_user",
     "Bash",
     "BashOutput",
@@ -31,6 +31,7 @@ pub const BUILTIN_TOOL_NAMES: [&str; 16] = [
     "Glob",
     "Grep",
     "KillShell",
+    "memory_note",
     "NotebookEdit",
     "Read",
     "SlashCommand",
@@ -140,6 +141,7 @@ impl BuiltinToolExecutor {
         let _ = registry.register(GlobTool::new());
         let _ = registry.register(GrepTool::new());
         let _ = registry.register(KillShellTool::new());
+        let _ = registry.register(MemoryNoteTool::new());
         let _ = registry.register(NotebookEditTool::new());
         let _ = registry.register(ReadTool::new());
         let _ = registry.register(SlashCommandTool::new());
