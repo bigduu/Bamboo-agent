@@ -171,7 +171,7 @@ impl LLMProvider for OpenAIProvider {
 
             let chunk = parse_openai_compat_sse_data_strict(data)?;
             match chunk {
-                LLMChunk::Done => Ok(None),
+                LLMChunk::Done => Ok(Some(LLMChunk::Done)),
                 other => Ok(Some(other)),
             }
         });

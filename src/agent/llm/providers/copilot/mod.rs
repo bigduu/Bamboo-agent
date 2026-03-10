@@ -497,7 +497,7 @@ impl LLMProvider for CopilotProvider {
         let stream = llm_stream_from_sse(response, |_event, data| {
             let chunk = parse_openai_compat_sse_data_lenient(data)?;
             match chunk {
-                LLMChunk::Done => Ok(None),
+                LLMChunk::Done => Ok(Some(LLMChunk::Done)),
                 other => Ok(Some(other)),
             }
         });

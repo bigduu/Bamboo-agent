@@ -577,21 +577,51 @@ pub async fn chat_completions(
         tokio::spawn(async move {
             use futures::StreamExt;
             let mut had_error = false;
+            let mut saw_done = false;
             let mut streamed_text = String::new();
             while let Some(chunk_result) = stream_result.next().await {
                 match chunk_result {
-                    Ok(chunk) => {
-                        if let crate::agent::llm::types::LLMChunk::Token(text) = &chunk {
-                            streamed_text.push_str(text);
+                    Ok(chunk) => match chunk {
+                        crate::agent::llm::types::LLMChunk::Done => {
+                            saw_done = true;
+                            if let Some(openai_done_chunk) = convert_chunk_to_openai(
+                                crate::agent::llm::types::LLMChunk::Done,
+                                &model_clone,
+                            ) {
+                                let done_chunk_str =
+                                    serde_json::to_string(&openai_done_chunk).unwrap_or_default();
+                                if tx.send(Ok(Bytes::from(done_chunk_str))).await.is_err() {
+                                    break;
+                                }
+                            }
+                            break;
                         }
-                        if let Some(openai_chunk) = convert_chunk_to_openai(chunk, &model_clone) {
-                            let chunk_str =
-                                serde_json::to_string(&openai_chunk).unwrap_or_default();
-                            if tx.send(Ok(Bytes::from(chunk_str))).await.is_err() {
-                                break;
+                        crate::agent::llm::types::LLMChunk::Token(text) => {
+                            streamed_text.push_str(&text);
+                            if let Some(openai_chunk) = convert_chunk_to_openai(
+                                crate::agent::llm::types::LLMChunk::Token(text),
+                                &model_clone,
+                            ) {
+                                let chunk_str =
+                                    serde_json::to_string(&openai_chunk).unwrap_or_default();
+                                if tx.send(Ok(Bytes::from(chunk_str))).await.is_err() {
+                                    break;
+                                }
                             }
                         }
-                    }
+                        crate::agent::llm::types::LLMChunk::ToolCalls(calls) => {
+                            if let Some(openai_chunk) = convert_chunk_to_openai(
+                                crate::agent::llm::types::LLMChunk::ToolCalls(calls),
+                                &model_clone,
+                            ) {
+                                let chunk_str =
+                                    serde_json::to_string(&openai_chunk).unwrap_or_default();
+                                if tx.send(Ok(Bytes::from(chunk_str))).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    },
                     Err(e) => {
                         log::error!("Stream error: {}", e);
                         had_error = true;
@@ -608,8 +638,20 @@ pub async fn chat_completions(
                 }
             }
 
-            // If we exit cleanly, mark success (best-effort; usage not available from stream).
+            // Ensure OpenAI-compatible stream termination with a single [DONE] marker.
             if !had_error {
+                if !saw_done {
+                    if let Some(openai_done_chunk) = convert_chunk_to_openai(
+                        crate::agent::llm::types::LLMChunk::Done,
+                        &model_clone,
+                    ) {
+                        let done_chunk_str =
+                            serde_json::to_string(&openai_done_chunk).unwrap_or_default();
+                        let _ = tx.send(Ok(Bytes::from(done_chunk_str))).await;
+                    }
+                }
+                let _ = tx.send(Ok(Bytes::from("[DONE]"))).await;
+
                 let completion_tokens = estimate_completion_tokens(&streamed_text);
                 metrics.forward_completed(
                     forward_id_clone,
@@ -622,6 +664,8 @@ pub async fn chat_completions(
                     )),
                     None,
                 );
+            } else {
+                let _ = tx.send(Ok(Bytes::from("[DONE]"))).await;
             }
         });
 

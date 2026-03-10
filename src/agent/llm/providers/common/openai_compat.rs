@@ -168,6 +168,12 @@ pub fn parse_openai_compat_chunk(chunk: OpenAICompatStreamChunk) -> LLMChunk {
         return LLMChunk::Token(content.clone());
     }
 
+    // Some OpenAI-compatible providers terminate with an empty delta plus
+    // finish_reason (without emitting a separate [DONE] marker).
+    if choice.finish_reason.is_some() {
+        return LLMChunk::Done;
+    }
+
     LLMChunk::Token(String::new())
 }
 
@@ -369,6 +375,20 @@ mod tests {
     #[test]
     fn parse_openai_compat_sse_data_strict_done_with_whitespace() {
         let chunk = super::parse_openai_compat_sse_data_strict("  [DONE]  ").unwrap();
+        assert!(matches!(chunk, LLMChunk::Done));
+    }
+
+    #[test]
+    fn parse_openai_compat_sse_data_strict_finish_reason_without_done_yields_done() {
+        let data = r#"{"id":"chatcmpl_1","choices":[{"delta":{},"finish_reason":"stop"}]}"#;
+        let chunk = super::parse_openai_compat_sse_data_strict(data).unwrap();
+        assert!(matches!(chunk, LLMChunk::Done));
+    }
+
+    #[test]
+    fn parse_openai_compat_sse_data_lenient_finish_reason_without_done_yields_done() {
+        let data = r#"{"id":"chatcmpl_1","choices":[{"delta":{},"finish_reason":"stop"}]}"#;
+        let chunk = super::parse_openai_compat_sse_data_lenient(data).unwrap();
         assert!(matches!(chunk, LLMChunk::Done));
     }
 
