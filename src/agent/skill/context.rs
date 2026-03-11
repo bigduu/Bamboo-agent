@@ -34,7 +34,8 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
         "3. If there's a match, read the skill file (skills dir: {}): `Read({{\"file_path\": \"{}/<skill_id>/SKILL.md\"}})`\n",
         skills_root_display, skills_root_display
     ));
-    context.push_str("4. Follow the instructions in the skill file to help the user\n\n");
+    context.push_str("4. Follow the instructions in the skill file to help the user\n");
+    context.push_str("5. If compatibility constraints might matter (tools/dependencies), read the `compatibility` field from the same SKILL.md frontmatter before acting\n\n");
     context.push_str("### Available Skills\n");
 
     for skill in skills {
@@ -61,6 +62,11 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
             "- Skill file: `{}`\n",
             crate::core::paths::path_to_display_string(&skill_path)
         ));
+        if skill.compatibility.is_some() {
+            context.push_str(
+                "- Compatibility details are in SKILL.md frontmatter (`compatibility`)\n",
+            );
+        }
     }
 
     log::info!("Skill metadata context built: {} chars", context.len());
@@ -82,13 +88,14 @@ mod tests {
 
     #[test]
     fn build_skill_context_renders_metadata_only() {
-        let skill = SkillDefinition::new(
+        let mut skill = SkillDefinition::new(
             "demo-skill",
             "Demo Skill",
             "A demo skill for testing",
             "This detailed prompt should NOT appear in context.", // This should NOT be in output
         )
         .with_tool_ref("read_file");
+        skill.compatibility = Some("Requires Read and Write tools".to_string());
 
         let context = build_skill_context(&[skill]);
 
@@ -97,6 +104,7 @@ mod tests {
         assert!(context.contains("How to Use Skills"));
         assert!(context.contains("Match it against the available skills"));
         assert!(context.contains("Read"));
+        assert!(context.contains("compatibility"));
         let expected_skills_root = crate::core::paths::path_to_display_string(
             &crate::core::paths::bamboo_dir().join("skills"),
         );
@@ -116,6 +124,7 @@ mod tests {
             crate::core::paths::path_to_display_string(&expected_skill_path)
         );
         assert!(context.contains(&expected_line));
+        assert!(context.contains("Compatibility details are in SKILL.md frontmatter"));
 
         // Should NOT contain the detailed prompt
         assert!(!context.contains("This detailed prompt should NOT appear"));
