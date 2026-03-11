@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
 
-use super::read_tracker;
+use super::{file_change, read_tracker};
 
 #[derive(Debug, Deserialize)]
 struct WriteArgs {
@@ -92,13 +92,27 @@ impl Tool for WriteTool {
             })?;
         }
 
-        tokio::fs::write(path, parsed.content)
+        let previous_bytes = file_change::read_existing_bytes(path).await?;
+        let checkpoint = file_change::create_checkpoint(path, previous_bytes.as_deref()).await?;
+        let next_content = parsed.content;
+
+        tokio::fs::write(path, &next_content)
             .await
             .map_err(|e| ToolError::Execution(format!("Failed to write file: {}", e)))?;
 
+        let previous_text = file_change::bytes_to_lossy_text(previous_bytes.as_deref());
+        let payload = file_change::build_file_change_payload(
+            "Write",
+            path,
+            format!("Wrote file: {}", file_path),
+            checkpoint,
+            &previous_text,
+            &next_content,
+        );
+
         Ok(ToolResult {
             success: true,
-            result: format!("Wrote file: {}", file_path),
+            result: payload,
             display_preference: Some("Default".to_string()),
         })
     }

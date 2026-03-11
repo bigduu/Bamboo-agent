@@ -3,6 +3,7 @@
 //! This module provides the core agent execution loop that orchestrates LLM interactions,
 //! tool execution, and event streaming for conversational AI agents.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine;
@@ -1091,15 +1092,17 @@ pub async fn run_agent_loop_with_config(
                     }
 
                     if let Some(workspace_path) =
-                        extract_workspace_path_from_set_workspace_result(tool_call, &result)
+                        extract_workspace_path_from_tool_result(tool_call, &result)
                     {
-                        apply_workspace_path_to_session(session, &workspace_path);
-                        log::info!(
-                            "[{}] Updated session workspace_path via {}: {}",
-                            session_id,
-                            tool_call.function.name,
-                            workspace_path
-                        );
+                        if should_apply_workspace_update(session, tool_call) {
+                            apply_workspace_path_to_session(session, &workspace_path);
+                            log::info!(
+                                "[{}] Updated session workspace_path via {}: {}",
+                                session_id,
+                                tool_call.function.name,
+                                workspace_path
+                            );
+                        }
                     }
 
                     // Handle user-question tools specially - emit NeedClarification event
@@ -1634,7 +1637,7 @@ fn strip_existing_external_memory(prompt: &str) -> String {
 
 const WORKSPACE_CONTEXT_MARKER: &str = "\n\nWorkspace path: ";
 
-fn extract_workspace_path_from_set_workspace_result(
+fn extract_workspace_path_from_tool_result(
     tool_call: &ToolCall,
     result: &ToolResult,
 ) -> Option<String> {
@@ -1643,7 +1646,11 @@ fn extract_workspace_path_from_set_workspace_result(
     }
 
     let normalized_tool_name = normalize_tool_ref(&tool_call.function.name)?;
-    if normalized_tool_name != "SetWorkspace" {
+    if normalized_tool_name != "SetWorkspace"
+        && normalized_tool_name != "Write"
+        && normalized_tool_name != "Edit"
+        && normalized_tool_name != "NotebookEdit"
+    {
         return None;
     }
 
@@ -1654,6 +1661,87 @@ fn extract_workspace_path_from_set_workspace_result(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn should_apply_workspace_update(session: &Session, tool_call: &ToolCall) -> bool {
+    let Some(normalized_tool_name) = normalize_tool_ref(&tool_call.function.name) else {
+        return false;
+    };
+
+    if normalized_tool_name == "SetWorkspace" {
+        return true;
+    }
+
+    if normalized_tool_name != "Write"
+        && normalized_tool_name != "Edit"
+        && normalized_tool_name != "NotebookEdit"
+    {
+        return false;
+    }
+
+    let current_workspace = session
+        .metadata
+        .get("workspace_path")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let Some(current_workspace) = current_workspace else {
+        return true;
+    };
+
+    let Some(target_file_path) = extract_target_file_path_from_tool_call(tool_call) else {
+        return true;
+    };
+
+    !path_is_within_workspace(&target_file_path, current_workspace)
+}
+
+fn extract_target_file_path_from_tool_call(tool_call: &ToolCall) -> Option<String> {
+    let normalized_tool_name = normalize_tool_ref(&tool_call.function.name)?;
+    let argument_key = match normalized_tool_name.as_str() {
+        "Write" | "Edit" => "file_path",
+        "NotebookEdit" => "notebook_path",
+        _ => return None,
+    };
+
+    let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments).ok()?;
+    args.get(argument_key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn path_is_within_workspace(target_path: &str, workspace_path: &str) -> bool {
+    let target_path = Path::new(target_path);
+    let workspace_path = Path::new(workspace_path);
+
+    if !target_path.is_absolute() || !workspace_path.is_absolute() {
+        return false;
+    }
+
+    let normalized_target = normalize_path_for_comparison(target_path);
+    let normalized_workspace = normalize_path_for_comparison(workspace_path);
+
+    normalized_target == normalized_workspace
+        || normalized_target.starts_with(&normalized_workspace)
+}
+
+fn normalize_path_for_comparison(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+
+    if let Some(parent) = path.parent() {
+        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+            if let Some(file_name) = path.file_name() {
+                return canonical_parent.join(file_name);
+            }
+            return canonical_parent;
+        }
+    }
+
+    path.to_path_buf()
 }
 
 fn apply_workspace_path_to_session(session: &mut Session, workspace_path: &str) {
@@ -1937,9 +2025,9 @@ impl Timer {
 mod tests {
     use super::{
         apply_image_fallback_to_llm_messages, apply_workspace_path_to_session,
-        extract_workspace_path_from_set_workspace_result, merge_system_prompt_with_contexts,
-        persistable_image_urls, strip_existing_skill_context, strip_existing_tool_guide_context,
-        upsert_workspace_context, AgentLoopConfig,
+        extract_workspace_path_from_tool_result, merge_system_prompt_with_contexts,
+        persistable_image_urls, should_apply_workspace_update, strip_existing_skill_context,
+        strip_existing_tool_guide_context, upsert_workspace_context, AgentLoopConfig,
     };
 
     use std::sync::Arc;
@@ -2201,7 +2289,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_workspace_path_from_set_workspace_result_supports_alias_name() {
+    fn extract_workspace_path_from_tool_result_supports_alias_name() {
         let tool_call = ToolCall {
             id: "call_1".to_string(),
             tool_type: "function".to_string(),
@@ -2217,9 +2305,83 @@ mod tests {
         };
 
         assert_eq!(
-            extract_workspace_path_from_set_workspace_result(&tool_call, &result),
+            extract_workspace_path_from_tool_result(&tool_call, &result),
             Some("/tmp/ws".to_string())
         );
+    }
+
+    #[test]
+    fn should_apply_workspace_update_when_workspace_is_missing_for_write() {
+        let session = Session::new("session-1", "test-model");
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Write".to_string(),
+                arguments: r#"{"file_path":"/tmp/project/src/main.rs"}"#.to_string(),
+            },
+        };
+
+        assert!(should_apply_workspace_update(&session, &tool_call));
+    }
+
+    #[test]
+    fn should_not_apply_workspace_update_when_target_is_inside_workspace() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let workspace = temp_dir.path().join("workspace");
+        let file_path = workspace.join("src").join("main.rs");
+        std::fs::create_dir_all(file_path.parent().expect("has parent"))
+            .expect("create workspace dirs");
+        std::fs::write(&file_path, "fn main() {}\n").expect("write test file");
+
+        let workspace_display = crate::core::paths::path_to_display_string(&workspace);
+        let file_display = crate::core::paths::path_to_display_string(&file_path);
+
+        let mut session = Session::new("session-1", "test-model");
+        session
+            .metadata
+            .insert("workspace_path".to_string(), workspace_display);
+
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Edit".to_string(),
+                arguments: serde_json::json!({ "file_path": file_display }).to_string(),
+            },
+        };
+
+        assert!(!should_apply_workspace_update(&session, &tool_call));
+    }
+
+    #[test]
+    fn should_apply_workspace_update_when_target_is_outside_workspace() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let workspace = temp_dir.path().join("workspace");
+        let external_dir = temp_dir.path().join("external");
+        let notebook_path = external_dir.join("notes.ipynb");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+        std::fs::create_dir_all(&external_dir).expect("create external dir");
+        std::fs::write(&notebook_path, "{}").expect("write notebook");
+
+        let workspace_display = crate::core::paths::path_to_display_string(&workspace);
+        let notebook_display = crate::core::paths::path_to_display_string(&notebook_path);
+
+        let mut session = Session::new("session-1", "test-model");
+        session
+            .metadata
+            .insert("workspace_path".to_string(), workspace_display);
+
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "NotebookEdit".to_string(),
+                arguments: serde_json::json!({ "notebook_path": notebook_display }).to_string(),
+            },
+        };
+
+        assert!(should_apply_workspace_update(&session, &tool_call));
     }
 
     #[test]

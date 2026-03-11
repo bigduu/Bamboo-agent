@@ -86,7 +86,7 @@ pub struct ToolExecutionResultPayload {
     pub tool_name: String,
     /// Tool execution result (usually JSON string)
     pub result: String,
-    /// Display preference hint (always "Default")
+    /// Display preference hint
     pub display_preference: String,
 }
 
@@ -144,7 +144,7 @@ pub async fn execute_tool(
     payload: web::Json<ToolExecutionRequest>,
 ) -> Result<HttpResponse, AppError> {
     let request = payload.into_inner();
-    let normalized = normalize_tool_ref(&request.tool_name)
+    normalize_tool_ref(&request.tool_name)
         .ok_or_else(|| AppError::ToolNotFound(request.tool_name.clone()))?;
 
     let mut args = serde_json::Map::new();
@@ -152,12 +152,11 @@ pub async fn execute_tool(
         let parsed = serde_json::from_str(&param.value).unwrap_or(Value::String(param.value));
         args.insert(param.name, parsed);
     }
-
     let call = ToolCall {
         id: "tool_call".to_string(),
         tool_type: "function".to_string(),
         function: FunctionCall {
-            name: normalized,
+            name: request.tool_name.clone(),
             arguments: serde_json::to_string(&args).map_err(AppError::SerializationError)?,
         },
     };
@@ -168,10 +167,14 @@ pub async fn execute_tool(
         .await
         .map_err(|err| AppError::ToolExecutionError(err.to_string()))?;
 
+    let display_preference = result
+        .display_preference
+        .clone()
+        .unwrap_or_else(|| "Default".to_string());
     let result_payload = ToolExecutionResultPayload {
         tool_name: request.tool_name,
         result: result.result,
-        display_preference: "Default".to_string(),
+        display_preference,
     };
     let response = ToolExecutionResponse {
         result: serde_json::to_string(&result_payload).map_err(AppError::SerializationError)?,

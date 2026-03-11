@@ -6,6 +6,7 @@ pub mod bash_output;
 pub mod bash_runtime;
 pub mod edit;
 pub mod exit_plan_mode;
+pub mod file_change;
 pub mod file_exists;
 pub mod get_current_dir;
 pub mod get_file_info;

@@ -235,6 +235,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 web::post().to(agent::messages::truncate_messages),
             )
             .route(
+                "/sessions/{session_id}/restore",
+                web::post().to(agent::messages::restore_session_state),
+            )
+            .route(
                 "/sessions/{session_id}/messages/{message_id}",
                 web::delete().to(agent::messages::delete_message),
             )

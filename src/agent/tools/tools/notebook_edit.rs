@@ -4,6 +4,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
 
+use super::file_change;
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum CellType {
@@ -136,6 +138,7 @@ impl Tool for NotebookEditTool {
         let content = tokio::fs::read_to_string(path)
             .await
             .map_err(|e| ToolError::Execution(format!("Failed to read notebook: {}", e)))?;
+        let checkpoint = file_change::create_checkpoint(path, Some(content.as_bytes())).await?;
 
         let mut notebook: Value = serde_json::from_str(&content)
             .map_err(|e| ToolError::Execution(format!("Invalid notebook JSON: {}", e)))?;
@@ -189,13 +192,22 @@ impl Tool for NotebookEditTool {
         let updated = serde_json::to_string_pretty(&notebook)
             .map_err(|e| ToolError::Execution(format!("Failed to serialize notebook: {}", e)))?;
 
-        tokio::fs::write(path, updated)
+        tokio::fs::write(path, &updated)
             .await
             .map_err(|e| ToolError::Execution(format!("Failed to write notebook: {}", e)))?;
 
+        let payload = file_change::build_file_change_payload(
+            "NotebookEdit",
+            path,
+            format!("Notebook updated: {}", parsed.notebook_path),
+            checkpoint,
+            &content,
+            &updated,
+        );
+
         Ok(ToolResult {
             success: true,
-            result: format!("Notebook updated: {}", parsed.notebook_path),
+            result: payload,
             display_preference: Some("Default".to_string()),
         })
     }

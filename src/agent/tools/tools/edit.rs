@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
 
-use super::read_tracker;
+use super::{file_change, read_tracker};
 
 #[derive(Debug, Deserialize)]
 struct EditArgs {
@@ -135,17 +135,28 @@ impl Tool for EditTool {
             next
         };
 
-        tokio::fs::write(path, updated)
+        let checkpoint = file_change::create_checkpoint(path, Some(content.as_bytes())).await?;
+
+        tokio::fs::write(path, &updated)
             .await
             .map_err(|e| ToolError::Execution(format!("Failed to write file: {}", e)))?;
 
-        Ok(ToolResult {
-            success: true,
-            result: format!(
+        let payload = file_change::build_file_change_payload(
+            "Edit",
+            path,
+            format!(
                 "Edited file: {} (replacements: {})",
                 file_path,
                 if replace_all { matches.len() } else { 1 }
             ),
+            checkpoint,
+            &content,
+            &updated,
+        );
+
+        Ok(ToolResult {
+            success: true,
+            result: payload,
             display_preference: Some("Default".to_string()),
         })
     }
