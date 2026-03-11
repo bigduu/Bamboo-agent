@@ -386,14 +386,16 @@ mod tests {
 
     #[test]
     fn unified_config_loader_returns_none_when_absent() {
-        let config = crate::core::Config::default();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = crate::core::Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
         let loaded = load_model_limits_from_unified_config(&config).expect("should parse");
         assert!(loaded.is_none());
     }
 
     #[test]
     fn unified_config_loader_reads_valid_model_limits() {
-        let mut config = crate::core::Config::default();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::core::Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
         config.extra.insert(
             "model_limits".to_string(),
             serde_json::json!([
@@ -418,7 +420,8 @@ mod tests {
 
     #[test]
     fn unified_config_loader_errors_on_invalid_shape() {
-        let mut config = crate::core::Config::default();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::core::Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
         config.extra.insert(
             "model_limits".to_string(),
             serde_json::json!({"unexpected": true}),

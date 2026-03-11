@@ -1,83 +1,105 @@
 use std::path::Path;
 
 use crate::agent::tools::normalize_tool_ref;
-use chrono::{DateTime, Utc};
 use log::warn;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::skill::types::{SkillDefinition, SkillError, SkillResult, SkillVisibility};
+use crate::agent::skill::types::{SkillDefinition, SkillError, SkillResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SkillFrontmatter {
-    id: String,
     name: String,
     description: String,
-    category: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    license: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compatibility: Option<String>,
     #[serde(default)]
-    tags: Vec<String>,
-    #[serde(default)]
-    tool_refs: Vec<String>,
-    #[serde(default)]
-    workflow_refs: Vec<String>,
-    visibility: SkillVisibility,
-    version: String,
-    created_at: String,
-    updated_at: String,
+    #[serde(rename = "allowed-tools", skip_serializing_if = "Vec::is_empty")]
+    allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata: Option<serde_json::Value>,
 }
 
 pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefinition> {
     let (frontmatter_raw, body) = split_frontmatter(content)?;
     let frontmatter: SkillFrontmatter = serde_yaml::from_str(&frontmatter_raw)?;
 
-    // Validate that parent directory name matches skill ID
+    // Skill ID comes from directory name.
     let dir_name = path
         .parent()
         .and_then(|parent| parent.file_name())
         .and_then(|segment| segment.to_str())
         .unwrap_or_default();
-    if dir_name != frontmatter.id {
-        return Err(SkillError::Validation(format!(
-            "Skill id {} does not match directory name {}",
-            frontmatter.id, dir_name
-        )));
-    }
-
-    if !is_valid_skill_id(&frontmatter.id) {
+    if !is_valid_skill_id(dir_name) {
         return Err(SkillError::InvalidId(format!(
             "Invalid skill ID: {}. Use kebab-case (e.g., my-skill-name)",
-            frontmatter.id
+            dir_name
         )));
     }
 
-    let created_at = parse_timestamp(&frontmatter.created_at)?;
-    let updated_at = parse_timestamp(&frontmatter.updated_at)?;
+    let name = frontmatter.name.trim();
+    if name.is_empty() {
+        return Err(SkillError::Validation(
+            "Skill name cannot be empty".to_string(),
+        ));
+    }
+    validate_skill_name(name)?;
+
+    let description = frontmatter.description.trim();
+    if description.is_empty() {
+        return Err(SkillError::Validation(
+            "Skill description cannot be empty".to_string(),
+        ));
+    }
+    validate_skill_description(description)?;
+
+    let compatibility = frontmatter
+        .compatibility
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(value) = compatibility.as_deref() {
+        validate_compatibility(value)?;
+    }
+
+    let license = frontmatter
+        .license
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     let mut tool_refs = Vec::new();
-    for tool_ref in frontmatter.tool_refs {
-        match normalize_tool_ref(&tool_ref) {
+    for tool_ref in frontmatter.allowed_tools {
+        let trimmed = tool_ref.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        match normalize_tool_ref(trimmed) {
             Some(normalized) => tool_refs.push(normalized),
             None => {
                 warn!(
-                    "Skipping unsupported tool reference {} in {:?}",
-                    tool_ref, path
+                    "Unrecognized allowed-tool '{}' in {:?}; preserving raw value",
+                    trimmed, path
                 );
+                tool_refs.push(trimmed.to_string());
             }
         }
     }
 
     Ok(SkillDefinition {
-        id: frontmatter.id,
-        name: frontmatter.name,
-        description: frontmatter.description,
-        category: frontmatter.category,
-        tags: frontmatter.tags,
+        id: dir_name.to_string(),
+        name: name.to_string(),
+        description: description.to_string(),
+        license,
+        compatibility,
+        metadata: frontmatter.metadata,
         prompt: body.trim().to_string(),
         tool_refs,
-        workflow_refs: frontmatter.workflow_refs,
-        visibility: frontmatter.visibility,
-        version: frontmatter.version,
-        created_at,
-        updated_at,
     })
 }
 
@@ -93,11 +115,18 @@ pub fn split_frontmatter(content: &str) -> SkillResult<(String, String)> {
     }
 
     let mut frontmatter_lines = Vec::new();
+    let mut found_closing = false;
     for line in lines.by_ref() {
         if line == "---" {
+            found_closing = true;
             break;
         }
         frontmatter_lines.push(line);
+    }
+    if !found_closing {
+        return Err(SkillError::Validation(
+            "Invalid frontmatter format".to_string(),
+        ));
     }
 
     let frontmatter = frontmatter_lines.join("\n");
@@ -105,25 +134,64 @@ pub fn split_frontmatter(content: &str) -> SkillResult<(String, String)> {
     Ok((frontmatter, body))
 }
 
-pub fn parse_timestamp(value: &str) -> SkillResult<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|date_time| date_time.with_timezone(&Utc))
-        .map_err(|error| SkillError::Validation(format!("Invalid timestamp {}: {}", value, error)))
+fn validate_skill_name(name: &str) -> SkillResult<()> {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(SkillError::Validation(format!(
+            "Name '{}' should be kebab-case (lowercase letters, digits, and hyphens only)",
+            name
+        )));
+    }
+    if name.starts_with('-') || name.ends_with('-') || name.contains("--") {
+        return Err(SkillError::Validation(format!(
+            "Name '{}' cannot start/end with hyphen or contain consecutive hyphens",
+            name
+        )));
+    }
+    if name.len() > 64 {
+        return Err(SkillError::Validation(format!(
+            "Name is too long ({} characters). Maximum is 64 characters.",
+            name.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_skill_description(description: &str) -> SkillResult<()> {
+    if description.contains('<') || description.contains('>') {
+        return Err(SkillError::Validation(
+            "Description cannot contain angle brackets (< or >)".to_string(),
+        ));
+    }
+    if description.len() > 1024 {
+        return Err(SkillError::Validation(format!(
+            "Description is too long ({} characters). Maximum is 1024 characters.",
+            description.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_compatibility(compatibility: &str) -> SkillResult<()> {
+    if compatibility.len() > 500 {
+        return Err(SkillError::Validation(format!(
+            "Compatibility is too long ({} characters). Maximum is 500 characters.",
+            compatibility.len()
+        )));
+    }
+    Ok(())
 }
 
 pub fn render_skill_markdown(skill: &SkillDefinition) -> SkillResult<String> {
     let frontmatter = SkillFrontmatter {
-        id: skill.id.clone(),
         name: skill.name.clone(),
         description: skill.description.clone(),
-        category: skill.category.clone(),
-        tags: skill.tags.clone(),
-        tool_refs: skill.tool_refs.clone(),
-        workflow_refs: skill.workflow_refs.clone(),
-        visibility: skill.visibility.clone(),
-        version: skill.version.clone(),
-        created_at: skill.created_at.to_rfc3339(),
-        updated_at: skill.updated_at.to_rfc3339(),
+        license: skill.license.clone(),
+        compatibility: skill.compatibility.clone(),
+        allowed_tools: skill.tool_refs.clone(),
+        metadata: skill.metadata.clone(),
     };
 
     let yaml = serde_yaml::to_string(&frontmatter)?;
@@ -152,7 +220,9 @@ pub(crate) fn is_valid_skill_id(id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_valid_skill_id;
+    use std::path::Path;
+
+    use super::{is_valid_skill_id, parse_markdown_skill};
 
     #[test]
     fn valid_skill_ids() {
@@ -169,5 +239,37 @@ mod tests {
         assert!(!is_valid_skill_id("123-skill"));
         assert!(!is_valid_skill_id("my_skill"));
         assert!(!is_valid_skill_id("my skill"));
+    }
+
+    #[test]
+    fn parse_skill_without_id_uses_directory_name() {
+        let content = r#"---
+name: skill-creator
+description: Helps create and improve skills.
+---
+Use this skill when users want to create skills.
+"#;
+
+        let parsed = parse_markdown_skill(Path::new("skill-creator/SKILL.md"), content)
+            .expect("parse minimal frontmatter");
+        assert_eq!(parsed.id, "skill-creator");
+        assert_eq!(parsed.name, "skill-creator");
+        assert_eq!(parsed.description, "Helps create and improve skills.");
+        assert!(parsed.tool_refs.is_empty());
+    }
+
+    #[test]
+    fn parse_skill_rejects_unexpected_id_field() {
+        let content = r#"---
+id: skill-creator
+name: skill-creator
+description: Helps create and improve skills.
+---
+Use this skill when users want to create skills.
+"#;
+
+        let error = parse_markdown_skill(Path::new("skill-creator/SKILL.md"), content)
+            .expect_err("id should be rejected by strict schema");
+        assert!(error.to_string().contains("unknown field"));
     }
 }

@@ -31,7 +31,6 @@ struct SkillListResponse {
 
 #[derive(Deserialize)]
 pub struct ListSkillsQuery {
-    category: Option<String>,
     search: Option<String>,
     refresh: Option<bool>,
 }
@@ -71,9 +70,6 @@ pub async fn list_skills(
     query: web::Query<ListSkillsQuery>,
 ) -> Result<HttpResponse, AppError> {
     let mut filter = SkillFilter::new();
-    if let Some(category) = query.category.clone() {
-        filter = filter.with_category(category);
-    }
     if let Some(search) = query.search.clone() {
         filter = filter.with_search(search);
     }

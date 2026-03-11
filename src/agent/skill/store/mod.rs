@@ -56,14 +56,13 @@ use std::path::PathBuf;
 use log::info;
 use tokio::sync::RwLock;
 
-use crate::agent::skill::store::builtin::{create_builtin_skills, get_builtin_scripts};
+use crate::agent::skill::store::builtin::load_builtin_skill_bundles;
 use crate::agent::skill::store::parser::render_skill_markdown;
 use crate::agent::skill::store::storage::{
-    ensure_skills_dir, load_skills_from_dir, skill_path, write_skill_file,
+    ensure_skills_dir, load_skills_from_dir, write_skill_file,
 };
 use crate::agent::skill::types::{
     SkillDefinition, SkillError, SkillFilter, SkillId, SkillResult, SkillStoreConfig,
-    SkillVisibility,
 };
 
 /// Persistent storage for skills with in-memory caching.
@@ -126,9 +125,8 @@ impl SkillStore {
     ///
     /// This method performs the following steps:
     /// 1. Creates the skills directory if it doesn't exist.
-    /// 2. Attempts to load existing skills from disk.
-    /// 3. Creates built-in skills if no existing skills are found.
-    /// 4. Reloads skills into memory after initialization.
+    /// 2. Syncs built-in skill bundles from compile-time embedded files (overwrites built-ins).
+    /// 3. Reloads all skills into memory after synchronization.
     ///
     /// # Returns
     ///
@@ -150,13 +148,8 @@ impl SkillStore {
     pub async fn initialize(&self) -> SkillResult<()> {
         info!("Initializing skill store...");
         ensure_skills_dir(&self.config.skills_dir).await?;
-
-        let loaded = self.load().await?;
-        if loaded == 0 {
-            info!("No existing skills found, creating built-in skills");
-            self.create_builtin_skills().await?;
-            self.load().await?;
-        }
+        self.create_builtin_skills().await?;
+        self.load().await?;
 
         info!("Skill store initialized");
         Ok(())
@@ -188,9 +181,9 @@ impl SkillStore {
     ///
     /// Generates default skills that ship with Bamboo (e.g., skill-creator).
     /// For each built-in skill, this method:
-    /// 1. Checks if the skill already exists (skips if so).
-    /// 2. Writes the skill definition to disk.
-    /// 3. Extracts and writes any embedded scripts.
+    /// 1. Loads built-in skill bundles from compile-time embedded files.
+    /// 2. Writes the skill definition to disk (overwriting previous built-in content).
+    /// 3. Writes bundled files (scripts/references/assets/agents/etc.) under each skill dir.
     /// 4. Sets executable permissions on Unix systems.
     ///
     /// # Returns
@@ -201,28 +194,25 @@ impl SkillStore {
     ///
     /// Returns `SkillError` if file operations fail.
     async fn create_builtin_skills(&self) -> SkillResult<()> {
-        for skill in create_builtin_skills() {
-            let path = skill_path(&self.config.skills_dir, &skill.id);
-            if path.exists() {
-                continue;
-            }
-            write_skill_file(&self.config.skills_dir, &skill).await?;
+        for bundle in load_builtin_skill_bundles()? {
+            let skill_id = bundle.skill.id.clone();
+            write_skill_file(&self.config.skills_dir, &bundle.skill).await?;
 
-            // Write embedded scripts for builtin skills (e.g., skill-creator)
-            let scripts = get_builtin_scripts(&skill.id);
-            for (script_path, content) in scripts {
-                let full_path = self.config.skills_dir.join(&skill.id).join(script_path);
+            for (relative_path, content) in bundle.files {
+                let full_path = self.config.skills_dir.join(&skill_id).join(&relative_path);
                 if let Some(parent) = full_path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
                 tokio::fs::write(&full_path, content).await?;
-                // Make scripts executable on Unix
+                // Make script files executable on Unix
                 #[cfg(unix)]
                 {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mut perms = tokio::fs::metadata(&full_path).await?.permissions();
-                    perms.set_mode(0o755);
-                    tokio::fs::set_permissions(&full_path, perms).await?;
+                    if relative_path.starts_with("scripts/") {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mut perms = tokio::fs::metadata(&full_path).await?.permissions();
+                        perms.set_mode(0o755);
+                        tokio::fs::set_permissions(&full_path, perms).await?;
+                    }
                 }
             }
         }
@@ -258,7 +248,7 @@ impl SkillStore {
     ///
     /// # Arguments
     ///
-    /// * `filter` - Optional filter criteria (by category, tags, visibility, etc.).
+    /// * `filter` - Optional filter criteria.
     /// * `refresh` - If true, reload skills from disk before listing.
     ///
     /// # Returns
@@ -268,11 +258,8 @@ impl SkillStore {
     /// # Example
     ///
     /// ```rust,ignore
-    /// // List all public skills, refreshing from disk
-    /// let filter = SkillFilter {
-    ///     visibility: Some(SkillVisibility::Public),
-    ///     ..Default::default()
-    /// };
+    /// // List skills matching a search query, refreshing from disk
+    /// let filter = SkillFilter::new().with_search("dashboard");
     /// let skills = store.list_skills(Some(filter), true).await;
     /// ```
     pub async fn list_skills(
@@ -380,7 +367,7 @@ impl SkillStore {
 
     /// Enable a skill globally (not supported - read-only mode).
     ///
-    /// Skill visibility must be configured in the Markdown file's frontmatter.
+    /// Skill enablement is controlled outside this read-only store.
     /// This method always returns an error.
     ///
     /// # Errors
@@ -394,7 +381,7 @@ impl SkillStore {
 
     /// Disable a skill globally (not supported - read-only mode).
     ///
-    /// Skill visibility must be configured in the Markdown file's frontmatter.
+    /// Skill enablement is controlled outside this read-only store.
     /// This method always returns an error.
     ///
     /// # Errors
@@ -466,66 +453,6 @@ impl SkillStore {
         &self.config.skills_dir
     }
 
-    /// Get all unique categories across all skills.
-    ///
-    /// Scans all loaded skills and extracts their category values,
-    /// returning a deduplicated and sorted list.
-    ///
-    /// # Returns
-    ///
-    /// A sorted vector of unique category names.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let categories = store.get_categories().await;
-    /// for category in categories {
-    ///     println!("Category: {}", category);
-    /// }
-    /// ```
-    pub async fn get_categories(&self) -> Vec<String> {
-        let mut categories: Vec<String> = self
-            .skills
-            .read()
-            .await
-            .values()
-            .map(|skill| skill.category.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        categories.sort();
-        categories
-    }
-
-    /// Get all unique tags across all skills.
-    ///
-    /// Scans all loaded skills and aggregates their tags,
-    /// returning a deduplicated and sorted list.
-    ///
-    /// # Returns
-    ///
-    /// A sorted vector of unique tag names.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let tags = store.get_all_tags().await;
-    /// println!("Available tags: {:?}", tags);
-    /// ```
-    pub async fn get_all_tags(&self) -> Vec<String> {
-        let mut tags: Vec<String> = self
-            .skills
-            .read()
-            .await
-            .values()
-            .flat_map(|skill| skill.tags.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        tags.sort();
-        tags
-    }
-
     /// Export skills to Markdown format.
     ///
     /// Renders one or more skills as Markdown documents with YAML frontmatter.
@@ -593,7 +520,7 @@ impl Default for SkillStore {
 /// let update = SkillUpdate::new()
 ///     .with_name("New Name")
 ///     .with_description("Updated description")
-///     .with_tags(vec!["new-tag".to_string()]);
+///     .with_tool_refs(vec!["read_file".to_string()]);
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct SkillUpdate {
@@ -603,26 +530,20 @@ pub struct SkillUpdate {
     /// New description for the skill.
     pub description: Option<String>,
 
-    /// New category for the skill.
-    pub category: Option<String>,
-
-    /// New list of tags for the skill.
-    pub tags: Option<Vec<String>>,
-
     /// New prompt template for the skill.
     pub prompt: Option<String>,
 
     /// New list of tool references for the skill.
     pub tool_refs: Option<Vec<String>>,
 
-    /// New list of workflow references for the skill.
-    pub workflow_refs: Option<Vec<String>>,
+    /// New license for the skill.
+    pub license: Option<String>,
 
-    /// New visibility setting for the skill.
-    pub visibility: Option<SkillVisibility>,
+    /// New compatibility notes for the skill.
+    pub compatibility: Option<String>,
 
-    /// New version string for the skill.
-    pub version: Option<String>,
+    /// New metadata payload for the skill.
+    pub metadata: Option<serde_json::Value>,
 }
 
 impl SkillUpdate {
@@ -653,26 +574,6 @@ impl SkillUpdate {
         self
     }
 
-    /// Set the category field.
-    ///
-    /// # Arguments
-    ///
-    /// * `category` - The new category for the skill.
-    pub fn with_category(mut self, category: impl Into<String>) -> Self {
-        self.category = Some(category.into());
-        self
-    }
-
-    /// Set the tags field.
-    ///
-    /// # Arguments
-    ///
-    /// * `tags` - The new list of tags for the skill.
-    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
-        self.tags = Some(tags);
-        self
-    }
-
     /// Set the prompt field.
     ///
     /// # Arguments
@@ -693,33 +594,33 @@ impl SkillUpdate {
         self
     }
 
-    /// Set the workflow references field.
+    /// Set the license field.
     ///
     /// # Arguments
     ///
-    /// * `workflow_refs` - The new list of workflow references for the skill.
-    pub fn with_workflow_refs(mut self, workflow_refs: Vec<String>) -> Self {
-        self.workflow_refs = Some(workflow_refs);
+    /// * `license` - The new license string for the skill.
+    pub fn with_license(mut self, license: impl Into<String>) -> Self {
+        self.license = Some(license.into());
         self
     }
 
-    /// Set the visibility field.
+    /// Set the compatibility field.
     ///
     /// # Arguments
     ///
-    /// * `visibility` - The new visibility setting for the skill.
-    pub fn with_visibility(mut self, visibility: SkillVisibility) -> Self {
-        self.visibility = Some(visibility);
+    /// * `compatibility` - The new compatibility notes for the skill.
+    pub fn with_compatibility(mut self, compatibility: impl Into<String>) -> Self {
+        self.compatibility = Some(compatibility.into());
         self
     }
 
-    /// Set the version field.
+    /// Set the metadata field.
     ///
     /// # Arguments
     ///
-    /// * `version` - The new version string for the skill.
-    pub fn with_version(mut self, version: impl Into<String>) -> Self {
-        self.version = Some(version.into());
+    /// * `metadata` - The new metadata payload for the skill.
+    pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = Some(metadata);
         self
     }
 }
@@ -738,19 +639,10 @@ mod tests {
         fs::create_dir_all(&skills_dir).await.expect("create dir");
 
         let content = r#"---
-id: test-skill
-name: Test Skill
+name: test-skill
 description: A test skill
-category: test
-tags:
-  - demo
-tool_refs:
+allowed-tools:
   - read_file
-workflow_refs: []
-visibility: public
-version: 1.0.0
-created_at: "2026-02-01T00:00:00Z"
-updated_at: "2026-02-01T00:00:00Z"
 ---
 Use this skill for testing.
 "#;
@@ -767,8 +659,8 @@ Use this skill for testing.
         store.initialize().await.expect("initialize");
 
         let skills = store.list_skills(None, false).await;
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].id, "test-skill");
+        assert!(skills.iter().any(|skill| skill.id == "test-skill"));
+        assert!(skills.iter().any(|skill| skill.id == "skill-creator"));
     }
 
     #[tokio::test]
@@ -781,6 +673,6 @@ Use this skill for testing.
         store.initialize().await.expect("initialize");
 
         let skills = store.list_skills(None, false).await;
-        assert!(!skills.is_empty());
+        assert!(skills.iter().any(|skill| skill.id == "skill-creator"));
     }
 }

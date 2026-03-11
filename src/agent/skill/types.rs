@@ -1,22 +1,9 @@
 //! Skill types and shared data structures.
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Unique identifier for a skill (kebab-case)
 pub type SkillId = String;
-
-/// Visibility level for a skill
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[derive(Default)]
-pub enum SkillVisibility {
-    /// Visible to all users
-    #[default]
-    Public,
-    /// Private to the creator
-    Private,
-}
 
 /// Complete definition of a skill
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,12 +17,17 @@ pub struct SkillDefinition {
     /// Human-readable description
     pub description: String,
 
-    /// Category for grouping
-    pub category: String,
+    /// Optional license information from SKILL.md frontmatter
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
 
-    /// Searchable tags
-    #[serde(default)]
-    pub tags: Vec<String>,
+    /// Optional compatibility notes from SKILL.md frontmatter
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<String>,
+
+    /// Optional arbitrary metadata from SKILL.md frontmatter
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 
     /// Prompt fragment injected into system prompt
     pub prompt: String,
@@ -43,53 +35,25 @@ pub struct SkillDefinition {
     /// Built-in tool references (format: "tool")
     #[serde(default)]
     pub tool_refs: Vec<String>,
-
-    /// Associated workflow names
-    #[serde(default)]
-    pub workflow_refs: Vec<String>,
-
-    /// Visibility level
-    #[serde(default)]
-    pub visibility: SkillVisibility,
-
-    /// Semantic version
-    #[serde(default = "default_version")]
-    pub version: String,
-
-    /// Creation timestamp
-    pub created_at: DateTime<Utc>,
-
-    /// Last update timestamp
-    pub updated_at: DateTime<Utc>,
-}
-
-fn default_version() -> String {
-    "1.0.0".to_string()
 }
 
 impl SkillDefinition {
-    /// Create a new skill definition with generated timestamp
+    /// Create a new skill definition.
     pub fn new(
         id: impl Into<String>,
         name: impl Into<String>,
         description: impl Into<String>,
-        category: impl Into<String>,
         prompt: impl Into<String>,
     ) -> Self {
-        let now = Utc::now();
         Self {
             id: id.into(),
             name: name.into(),
             description: description.into(),
-            category: category.into(),
-            tags: Vec::new(),
+            license: None,
+            compatibility: None,
+            metadata: None,
             prompt: prompt.into(),
             tool_refs: Vec::new(),
-            workflow_refs: Vec::new(),
-            visibility: SkillVisibility::default(),
-            version: default_version(),
-            created_at: now,
-            updated_at: now,
         }
     }
 
@@ -99,30 +63,7 @@ impl SkillDefinition {
         self
     }
 
-    /// Add a workflow reference
-    pub fn with_workflow_ref(mut self, workflow_ref: impl Into<String>) -> Self {
-        self.workflow_refs.push(workflow_ref.into());
-        self
-    }
-
-    /// Add a tag
-    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
-        self.tags.push(tag.into());
-        self
-    }
-
-    /// Set visibility
-    pub fn with_visibility(mut self, visibility: SkillVisibility) -> Self {
-        self.visibility = visibility;
-        self
-    }
-
-    /// Update the timestamp
-    pub fn touch(&mut self) {
-        self.updated_at = Utc::now();
-    }
-
-    /// Check if this is a built-in skill (based on id prefix or version)
+    /// Check if this is a built-in skill (based on id prefix).
     pub fn is_builtin(&self) -> bool {
         self.id.starts_with("builtin-") || self.id.starts_with("system-")
     }
@@ -147,35 +88,14 @@ impl Default for SkillStoreConfig {
 /// Filter options for listing skills
 #[derive(Debug, Clone, Default)]
 pub struct SkillFilter {
-    /// Filter by category
-    pub category: Option<String>,
-
-    /// Filter by tags (any match)
-    pub tags: Vec<String>,
-
     /// Search in name and description
     pub search: Option<String>,
-
-    /// Filter by visibility
-    pub visibility: Option<SkillVisibility>,
 }
 
 impl SkillFilter {
     /// Create a new empty filter
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Filter by category
-    pub fn with_category(mut self, category: impl Into<String>) -> Self {
-        self.category = Some(category.into());
-        self
-    }
-
-    /// Add a tag filter
-    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
-        self.tags.push(tag.into());
-        self
     }
 
     /// Set search query
@@ -186,30 +106,11 @@ impl SkillFilter {
 
     /// Check if a skill matches this filter
     pub fn matches(&self, skill: &SkillDefinition) -> bool {
-        if let Some(ref category) = self.category {
-            if skill.category != *category {
-                return false;
-            }
-        }
-
-        if !self.tags.is_empty() {
-            let has_matching_tag = self.tags.iter().any(|tag| skill.tags.contains(tag));
-            if !has_matching_tag {
-                return false;
-            }
-        }
-
         if let Some(ref search) = self.search {
             let search_lower = search.to_lowercase();
             if !skill.name.to_lowercase().contains(&search_lower)
                 && !skill.description.to_lowercase().contains(&search_lower)
             {
-                return false;
-            }
-        }
-
-        if let Some(ref visibility) = self.visibility {
-            if skill.visibility != *visibility {
                 return false;
             }
         }

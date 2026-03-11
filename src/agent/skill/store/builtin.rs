@@ -1,198 +1,108 @@
 use std::collections::HashMap;
+use std::path::Path;
 
-use crate::agent::skill::types::SkillDefinition;
+use crate::agent::skill::store::parser::parse_markdown_skill;
+use crate::agent::skill::types::{SkillError, SkillResult};
 
-/// Script content embedded at compile time
-pub const INIT_SKILL_SCRIPT: &str = include_str!("builtin_scripts/init_skill.py");
-pub const VALIDATE_SKILL_SCRIPT: &str = include_str!("builtin_scripts/validate_skill.py");
+include!(concat!(env!("OUT_DIR"), "/builtin_skills_embedded.rs"));
 
-const SKILL_CREATOR_PROMPT_TEMPLATE: &str = r#"# Skill Creator
+pub struct BuiltinSkillBundle {
+    pub skill: crate::agent::skill::types::SkillDefinition,
+    pub files: HashMap<String, Vec<u8>>,
+}
 
-This skill provides guidance for creating effective skills for Bamboo.
+fn discover_skill_roots() -> Vec<String> {
+    let mut roots = BUILTIN_SKILL_FILES
+        .iter()
+        .filter_map(|(path, _)| path.strip_suffix("/SKILL.md"))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
 
-## About Skills
+    roots.sort();
+    roots.dedup();
+    roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
+    roots
+}
 
-Skills are modular, self-contained folders that extend Bamboo's capabilities by providing specialized knowledge and workflows. They are stored in `<SKILLS_DIR>/` as individual folders.
+pub fn load_builtin_skill_bundles() -> SkillResult<Vec<BuiltinSkillBundle>> {
+    let mut bundles = Vec::new();
 
-### What Skills Provide
-
-1. **Specialized workflows** - Multi-step procedures for specific domains
-2. **Tool integrations** - Instructions for working with specific tools or APIs
-3. **Domain expertise** - Project-specific knowledge, schemas, business logic
-4. **Bundled resources** - Scripts, references, and assets for complex tasks
-
-## Core Principles
-
-### Concise is Key
-
-The context window is limited. Skills share context with conversation history and system prompts.
-
-**Default assumption:** The AI is already very smart. Only add context it doesn't already have.
-
-Prefer concise examples over verbose explanations.
-
-### Skill Anatomy
-
-Every skill is a folder containing:
-
-```
-skill-name/
-├── SKILL.md (required)
-│   ├── YAML frontmatter (required)
-│   │   ├── id: skill-name (kebab-case, matches folder name)
-│   │   ├── name: Display Name
-│   │   ├── description: When to use this skill (important for triggering)
-│   │   ├── category: Category for grouping
-│   │   ├── tags: [] (searchable tags)
-│   │   ├── tool_refs: [] (tools this skill uses)
-│   │   ├── workflow_refs: [] (workflows this skill uses)
-│   │   ├── visibility: public | private
-│   │   ├── version: "1.0.0"
-│   │   ├── created_at: "2026-02-01T00:00:00Z"
-│   │   └── updated_at: "2026-02-01T00:00:00Z"
-│   └── Body (Markdown prompt content)
-├── scripts/ (optional) - Executable scripts
-├── references/ (optional) - Documentation
-└── assets/ (optional) - Templates, files
-```
-
-### Directory Structure
-
-Skills can be organized in subdirectories for better organization:
-
-```
-<SKILLS_DIR>/
-├── custom/
-│   ├── my-api-helper/
-│   │   └── SKILL.md
-│   └── my-workflow/
-│       └── SKILL.md
-└── skill-creator/
-    └── SKILL.md
-```
-
-The system recursively searches for all `SKILL.md` files in `<SKILLS_DIR>/`. Any directory containing a `SKILL.md` file is considered a skill directory. The `id` in the frontmatter must match the directory name (the immediate parent of `SKILL.md`).
-
-### Bundled Resources
-
-**Scripts (`scripts/`)**
-- Executable code (Python/Bash/etc.)
-- Use when deterministic reliability is needed
-- Example: `scripts/rotate_pdf.py` for PDF operations
-
-**References (`references/`)**
-- Documentation loaded into context as needed
-- Example: Database schemas, API docs, workflow guides
-- Reference from SKILL.md with clear "when to read" guidance
-
-**Assets (`assets/`)**
-- Files used in output (templates, images, fonts)
-- Example: `assets/logo.png`, `assets/template.pptx`
-
-## Skill Creation Process
-
-### Step 1: Understand the Skill
-
-Ask clarifying questions:
-- "What functionality should this skill support?"
-- "Can you give examples of how this skill would be used?"
-- "What would a user say that should trigger this skill?"
-
-### Step 2: Plan Resources
-
-Analyze what reusable resources would help:
-- Scripts for repetitive code
-- References for complex documentation
-- Assets for templates
-
-### Step 3: Initialize the Skill
-
-Use the init script to create the skill:
-
-```bash
-python3 <SKILLS_DIR>/skill-creator/scripts/init_skill.py <skill-name> --path <SKILLS_DIR>
-```
-
-Options:
-- `--resources scripts,references,assets` - Create resource directories
-- `--examples` - Add example files
-
-### Step 4: Edit SKILL.md
-
-**Frontmatter fields:**
-- `id`: Must match folder name (kebab-case)
-- `name`: Display name
-- `description`: **Critical** - This determines when the skill triggers. Include specific scenarios and triggers.
-- `category`: For grouping in UI
-- `tags`: Searchable keywords
-- `tool_refs`: List of tools this skill uses
-- `workflow_refs`: List of workflows this skill uses
-
-**Body content:**
-- Instructions for using the skill
-- Reference bundled resources as needed
-- Keep under 500 lines; split large content to references/
-
-### Step 5: Validate
-
-Run the validator to check structure:
-
-```bash
-python3 <SKILLS_DIR>/skill-creator/scripts/validate_skill.py <SKILLS_DIR>/<skill-name>
-```
-
-## Skill Naming
-
-- Use kebab-case: `my-new-skill`
-- Maximum 64 characters
-- Use lowercase letters, digits, and hyphens only
-- Prefer verb-led phrases: `pdf-processor`, `api-helper`
-- Folder name must exactly match skill `id`
-
-## Best Practices
-
-1. **Start simple** - Add complexity only when needed
-2. **Test scripts** - Run them to ensure they work
-3. **Reference strategically** - Link to references from SKILL.md with clear usage guidance
-4. **Validate frontmatter** - Ensure id matches folder name, timestamps are valid ISO 8601
-5. **Keep descriptions clear** - This is how the system knows when to use your skill
-"#;
-
-fn skill_creator_prompt() -> String {
     let skills_dir = crate::core::paths::bamboo_dir().join("skills");
     let skills_dir_display = crate::core::paths::path_to_display_string(&skills_dir);
-    SKILL_CREATOR_PROMPT_TEMPLATE.replace("<SKILLS_DIR>", &skills_dir_display)
-}
 
-pub fn create_builtin_skills() -> Vec<SkillDefinition> {
-    vec![
-        SkillDefinition::new(
-            "skill-creator",
-            "Skill Creator",
-            "Guide for creating effective skills for Bamboo. Use this skill when users want to create a new skill that extends Bamboo's capabilities with specialized knowledge, workflows, or tool integrations.",
-            "system",
-            skill_creator_prompt(),
-        )
-        .with_tag("skills")
-        .with_tag("development"),
-    ]
-}
-
-/// Get embedded script content for a builtin skill
-/// Returns a map of relative file path -> content
-pub fn get_builtin_scripts(skill_id: &str) -> HashMap<String, String> {
-    let mut scripts = HashMap::new();
-
-    if skill_id == "skill-creator" {
-        scripts.insert(
-            "scripts/init_skill.py".to_string(),
-            INIT_SKILL_SCRIPT.to_string(),
-        );
-        scripts.insert(
-            "scripts/validate_skill.py".to_string(),
-            VALIDATE_SKILL_SCRIPT.to_string(),
-        );
+    let roots = discover_skill_roots();
+    if roots.is_empty() {
+        return Ok(bundles);
     }
 
-    scripts
+    let mut grouped: HashMap<String, Vec<(String, Vec<u8>)>> = HashMap::new();
+    for (path, bytes) in BUILTIN_SKILL_FILES {
+        if let Some(root) = roots.iter().find(|root| {
+            let prefix = format!("{}/", root);
+            path.starts_with(&prefix)
+        }) {
+            let prefix = format!("{}/", root);
+            if let Some(relative_path) = path.strip_prefix(&prefix) {
+                grouped
+                    .entry(root.clone())
+                    .or_default()
+                    .push((relative_path.to_string(), bytes.to_vec()));
+            }
+        }
+    }
+
+    for (skill_root, files) in grouped {
+        let mut skill_markdown: Option<String> = None;
+        let mut assets: HashMap<String, Vec<u8>> = HashMap::new();
+
+        for (relative_path, bytes) in files {
+            if relative_path == "SKILL.md" {
+                let raw = String::from_utf8(bytes).map_err(|error| {
+                    SkillError::Validation(format!(
+                        "Builtin skill {} has non-UTF8 SKILL.md: {}",
+                        skill_root, error
+                    ))
+                })?;
+                skill_markdown = Some(raw.replace("<SKILLS_DIR>", &skills_dir_display));
+            } else {
+                assets.insert(relative_path, bytes);
+            }
+        }
+
+        let markdown = skill_markdown.ok_or_else(|| {
+            SkillError::Validation(format!("Builtin skill {} is missing SKILL.md", skill_root))
+        })?;
+
+        let skill =
+            parse_markdown_skill(Path::new(&format!("{}/SKILL.md", skill_root)), &markdown)?;
+        bundles.push(BuiltinSkillBundle {
+            skill,
+            files: assets,
+        });
+    }
+
+    bundles.sort_by(|left, right| left.skill.id.cmp(&right.skill.id));
+    Ok(bundles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_builtin_skill_bundles;
+
+    #[test]
+    fn builtin_skill_creator_bundle_includes_scripts() {
+        let bundles = load_builtin_skill_bundles().expect("load builtin bundles");
+        let skill_creator = bundles
+            .iter()
+            .find(|bundle| bundle.skill.id == "skill-creator")
+            .expect("skill-creator bundle");
+
+        // Verify multiple grouped resource folders are embedded.
+        assert!(skill_creator.files.contains_key("scripts/run_eval.py"));
+        assert!(skill_creator.files.contains_key("agents/analyzer.md"));
+        assert!(skill_creator.files.contains_key("assets/eval_review.html"));
+        assert!(skill_creator
+            .files
+            .contains_key("eval-viewer/generate_review.py"));
+    }
 }

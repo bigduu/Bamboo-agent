@@ -1,7 +1,7 @@
 use crate::agent::skill::types::SkillDefinition;
 
 /// Build system prompt context text from available skills.
-/// Only includes metadata (id, name, description, category, tags).
+/// Only includes metadata (id, name, description, allowed tools).
 /// The detailed skill content (SKILL.md body) is NOT included to save context space.
 /// When a user's request matches a skill's description, read the full skill file for detailed instructions.
 pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
@@ -39,20 +39,14 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
 
     for skill in skills {
         log::debug!(
-            "Adding skill metadata '{}' with {} tool(s), {} workflow(s)",
+            "Adding skill metadata '{}' with {} tool(s)",
             skill.id,
             skill.tool_refs.len(),
-            skill.workflow_refs.len()
         );
 
         // Only metadata - minimal token usage
         context.push_str(&format!("\n**{}** (`{}`)\n", skill.name, skill.id));
         context.push_str(&format!("- Description: {}\n", skill.description));
-        context.push_str(&format!("- Category: {}\n", skill.category));
-
-        if !skill.tags.is_empty() {
-            context.push_str(&format!("- Tags: {}\n", skill.tags.join(", ")));
-        }
 
         if !skill.tool_refs.is_empty() {
             context.push_str(&format!(
@@ -92,12 +86,9 @@ mod tests {
             "demo-skill",
             "Demo Skill",
             "A demo skill for testing",
-            "demo",
             "This detailed prompt should NOT appear in context.", // This should NOT be in output
         )
-        .with_tool_ref("read_file")
-        .with_tag("test")
-        .with_workflow_ref("demo-workflow");
+        .with_tool_ref("read_file");
 
         let context = build_skill_context(&[skill]);
 
@@ -115,8 +106,6 @@ mod tests {
         assert!(context.contains("Demo Skill"));
         assert!(context.contains("demo-skill"));
         assert!(context.contains("A demo skill for testing"));
-        assert!(context.contains("Category: demo"));
-        assert!(context.contains("Tags: test"));
         assert!(context.contains("Provides tools: read_file"));
         let expected_skill_path = crate::core::paths::bamboo_dir()
             .join("skills")

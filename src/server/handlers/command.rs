@@ -269,13 +269,14 @@ fn skill_to_command(skill: &SkillDefinition) -> CommandItem {
         display_name: skill.name.clone(),
         description: skill.description.clone(),
         command_type: "skill".to_string(),
-        category: Some(skill.category.clone()),
-        tags: Some(skill.tags.clone()),
+        category: None,
+        tags: None,
         metadata: serde_json::json!({
             "prompt": skill.prompt,
             "toolRefs": skill.tool_refs,
-            "workflowRefs": skill.workflow_refs,
-            "visibility": skill.visibility,
+            "license": skill.license,
+            "compatibility": skill.compatibility,
+            "metadata": skill.metadata,
         }),
     }
 }
