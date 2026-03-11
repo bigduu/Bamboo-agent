@@ -16,18 +16,13 @@ const SEARCH_SCOPE_TOO_BROAD_ERROR: &str =
 const MULTILINE_REQUIRES_NARROWED_PATH_ERROR: &str = "Multiline grep requires narrowed path.";
 const RESULT_TOO_LARGE_ERROR: &str = "Result too large; refine query and retry.";
 
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Clone, Copy, Default)]
 #[serde(rename_all = "snake_case")]
 enum OutputMode {
     Content,
+    #[default]
     FilesWithMatches,
     Count,
-}
-
-impl Default for OutputMode {
-    fn default() -> Self {
-        Self::FilesWithMatches
-    }
 }
 
 #[derive(Debug, Deserialize)]

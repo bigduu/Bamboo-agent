@@ -10,12 +10,7 @@ pub fn check_permissions(
 ) -> Result<Option<Vec<PermissionContext>>, PermissionError> {
     match tool_name {
         "Write" | "Edit" => {
-            let key = if tool_name == "Write" {
-                "file_path"
-            } else {
-                "file_path"
-            };
-            let path = required_string_arg(args, key)?;
+            let path = required_string_arg(args, "file_path")?;
             Ok(Some(vec![PermissionContext::new(
                 PermissionType::WriteFile,
                 path,

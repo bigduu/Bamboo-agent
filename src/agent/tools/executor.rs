@@ -68,13 +68,66 @@ pub fn normalize_tool_ref(value: &str) -> Option<String> {
 
 fn normalize_builtin_alias(name: &str) -> &str {
     match name {
-        // Backward compatibility for earlier camelCase variant names.
+        // Backward compatibility for earlier camelCase and snake_case names.
+        "execute_command" => "Bash",
+        "file_exists" => "FileExists",
         "fileExists" => "FileExists",
+        "get_current_dir" => "GetCurrentDir",
         "getCurrentDir" => "GetCurrentDir",
+        "get_file_info" => "GetFileInfo",
         "getFileInfo" => "GetFileInfo",
+        "list_directory" => "Glob",
+        "read_file" => "Read",
+        "set_workspace" => "SetWorkspace",
         "setWorkspace" => "SetWorkspace",
         "sleep" => "Sleep",
+        "write_file" => "Write",
         _ => name,
+    }
+}
+
+fn copy_legacy_arg_if_missing(
+    args: &mut serde_json::Map<String, serde_json::Value>,
+    from: &str,
+    to: &str,
+) {
+    if args.contains_key(to) {
+        return;
+    }
+    if let Some(value) = args.get(from).cloned() {
+        args.insert(to.to_string(), value);
+    }
+}
+
+fn normalize_legacy_builtin_args(
+    raw_tool_name: &str,
+    args: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    match raw_tool_name {
+        "read_file" | "write_file" | "Read" | "Write" => {
+            copy_legacy_arg_if_missing(args, "path", "file_path");
+        }
+        "execute_command" | "Bash" => {
+            copy_legacy_arg_if_missing(args, "cmd", "command");
+        }
+        "list_directory" | "Glob" => {
+            let should_default_pattern = raw_tool_name == "list_directory"
+                || args.contains_key("path")
+                || args.contains_key("recursive");
+            if should_default_pattern && !args.contains_key("pattern") {
+                let recursive = args
+                    .get("recursive")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let pattern = if recursive { "**/*" } else { "*" };
+                args.insert(
+                    "pattern".to_string(),
+                    serde_json::Value::String(pattern.to_string()),
+                );
+            }
+            args.remove("recursive");
+        }
+        _ => {}
     }
 }
 
@@ -238,7 +291,7 @@ impl ToolExecutor for BuiltinToolExecutor {
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let args_raw = call.function.arguments.trim();
-        let args: serde_json::Value = if args_raw.is_empty() {
+        let mut args: serde_json::Value = if args_raw.is_empty() {
             json!({})
         } else {
             serde_json::from_str(args_raw).map_err(|e| {
@@ -246,7 +299,12 @@ impl ToolExecutor for BuiltinToolExecutor {
             })?
         };
 
-        let tool_name = normalize_builtin_alias(normalize_tool_name(&call.function.name));
+        let raw_tool_name = normalize_tool_name(&call.function.name);
+        if let Some(args_obj) = args.as_object_mut() {
+            normalize_legacy_builtin_args(raw_tool_name, args_obj);
+        }
+
+        let tool_name = normalize_builtin_alias(raw_tool_name);
 
         // Look up the tool in the registry
         let tool = self
@@ -427,6 +485,102 @@ mod tests {
             normalize_tool_ref("default::sleep"),
             Some("Sleep".to_string())
         );
+    }
+
+    #[test]
+    fn test_normalize_tool_ref_accepts_legacy_snake_case_aliases() {
+        assert_eq!(
+            normalize_tool_ref("default::execute_command"),
+            Some("Bash".to_string())
+        );
+        assert_eq!(
+            normalize_tool_ref("default::file_exists"),
+            Some("FileExists".to_string())
+        );
+        assert_eq!(
+            normalize_tool_ref("default::get_current_dir"),
+            Some("GetCurrentDir".to_string())
+        );
+        assert_eq!(
+            normalize_tool_ref("default::get_file_info"),
+            Some("GetFileInfo".to_string())
+        );
+        assert_eq!(
+            normalize_tool_ref("default::list_directory"),
+            Some("Glob".to_string())
+        );
+        assert_eq!(
+            normalize_tool_ref("default::read_file"),
+            Some("Read".to_string())
+        );
+        assert_eq!(
+            normalize_tool_ref("default::set_workspace"),
+            Some("SetWorkspace".to_string())
+        );
+        assert_eq!(
+            normalize_tool_ref("default::write_file"),
+            Some("Write".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_executor_accepts_legacy_read_file_path_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("legacy-read.txt");
+        fs::write(&file_path, "legacy read content").await.unwrap();
+
+        let executor = BuiltinToolExecutor::new();
+        let call = make_tool_call("read_file", json!({"path": file_path}));
+
+        let result = executor.execute(&call).await.unwrap();
+        assert!(result.success);
+        assert!(result.result.contains("legacy read content"));
+    }
+
+    #[tokio::test]
+    async fn test_executor_accepts_legacy_list_directory_without_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("legacy-list.txt");
+        fs::write(&file_path, "legacy list content").await.unwrap();
+
+        let executor = BuiltinToolExecutor::new();
+        let call = make_tool_call("list_directory", json!({"path": dir.path()}));
+
+        let result = executor.execute(&call).await.unwrap();
+        assert!(result.success);
+        assert!(result.result.contains("legacy-list.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_executor_accepts_canonical_read_with_path_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("canonical-read.txt");
+        fs::write(&file_path, "canonical read content")
+            .await
+            .unwrap();
+
+        let executor = BuiltinToolExecutor::new();
+        let call = make_tool_call("Read", json!({"path": file_path}));
+
+        let result = executor.execute(&call).await.unwrap();
+        assert!(result.success);
+        assert!(result.result.contains("canonical read content"));
+    }
+
+    #[tokio::test]
+    async fn test_executor_accepts_canonical_glob_without_pattern_when_path_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("canonical-list.txt");
+        fs::write(&file_path, "canonical list content")
+            .await
+            .unwrap();
+
+        let executor = BuiltinToolExecutor::new();
+        let call = make_tool_call("Glob", json!({"path": dir.path()}));
+
+        let result = executor.execute(&call).await.unwrap();
+        assert!(result.success);
+        assert!(result.result.contains("canonical-list.txt"));
     }
 
     #[test]

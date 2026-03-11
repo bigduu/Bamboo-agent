@@ -41,7 +41,7 @@ impl BashTool {
 
     fn effective_timeout_ms(requested: Option<u64>) -> u64 {
         let value = requested.unwrap_or(DEFAULT_TIMEOUT_MS);
-        value.min(MAX_TIMEOUT_MS).max(1)
+        value.clamp(1, MAX_TIMEOUT_MS)
     }
 
     async fn run_foreground(
