@@ -176,6 +176,14 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
         .map(|m| matches!(m.role, Role::User))
         .unwrap_or(false);
     if !last_is_user {
+        session
+            .metadata
+            .insert("last_run_status".to_string(), "skipped".to_string());
+        session.metadata.insert(
+            "last_run_error".to_string(),
+            "No pending message to execute".to_string(),
+        );
+        let _ = ctx.storage.save_session(&session).await;
         forwarder_done.cancel();
         let _ = parent_tx.send(AgentEvent::SubSessionCompleted {
             parent_session_id: job.parent_session_id.clone(),
@@ -185,6 +193,14 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
         });
         return Ok(());
     }
+
+    // Persist a running marker early so list_sessions can reconstruct status
+    // even if the parent UI briefly misses streamed events.
+    session
+        .metadata
+        .insert("last_run_status".to_string(), "running".to_string());
+    session.metadata.remove("last_run_error");
+    let _ = ctx.storage.save_session(&session).await;
 
     // Insert runner status (for cancellation/status introspection).
     let cancel_token = {
@@ -305,6 +321,16 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
         }
 
         // Persist final session snapshot.
+        session
+            .metadata
+            .insert("last_run_status".to_string(), status.clone());
+        if let Some(err) = &error {
+            session
+                .metadata
+                .insert("last_run_error".to_string(), err.clone());
+        } else {
+            session.metadata.remove("last_run_error");
+        }
         let _ = persist.save_session(&session).await;
         {
             let mut sessions = sessions_cache.write().await;

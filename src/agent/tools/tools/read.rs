@@ -104,6 +104,10 @@ impl Tool for ReadTool {
             .await
             .map_err(|e| ToolError::Execution(format!("Failed to read file: {}", e)))?;
 
+        if let Some(session_id) = ctx.session_id {
+            read_tracker::mark_read(session_id, parsed.file_path.trim()).await;
+        }
+
         if bytes.contains(&0) {
             return Ok(ToolResult {
                 success: true,
@@ -115,14 +119,51 @@ impl Tool for ReadTool {
         let content = String::from_utf8_lossy(&bytes).to_string();
         let rendered = render_with_line_numbers(&content, parsed.offset.unwrap_or(0), parsed.limit);
 
-        if let Some(session_id) = ctx.session_id {
-            read_tracker::mark_read(session_id, parsed.file_path.trim()).await;
-        }
-
         Ok(ToolResult {
             success: true,
             result: rendered,
             display_preference: Some("Collapsible".to_string()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::tools::tools::WriteTool;
+
+    #[tokio::test]
+    async fn binary_read_still_marks_file_as_read_for_session_write_gate() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), vec![0_u8, 1, 2, 3])
+            .await
+            .unwrap();
+        let file_path = file.path().to_string_lossy().to_string();
+        let ctx = ToolExecutionContext {
+            session_id: Some("session_binary_read"),
+            tool_call_id: "call_1",
+            event_tx: None,
+        };
+
+        let read_tool = ReadTool::new();
+        let read_result = read_tool
+            .execute_with_context(json!({ "file_path": file_path }), ctx)
+            .await
+            .unwrap();
+        assert!(read_result.success);
+        assert!(read_result.result.contains("Binary file omitted"));
+
+        let write_tool = WriteTool::new();
+        let write_result = write_tool
+            .execute_with_context(
+                json!({
+                    "file_path": file.path(),
+                    "content": "now text"
+                }),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert!(write_result.success);
     }
 }

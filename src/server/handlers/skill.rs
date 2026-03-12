@@ -117,6 +117,7 @@ pub async fn get_available_tools(_state: web::Data<AppState>) -> Result<HttpResp
 
 #[derive(Deserialize)]
 pub struct FilteredToolsQuery {
+    session_id: Option<String>,
     chat_id: Option<String>,
 }
 
@@ -125,10 +126,14 @@ pub async fn get_filtered_tools(
     state: web::Data<AppState>,
     query: web::Query<FilteredToolsQuery>,
 ) -> Result<HttpResponse, AppError> {
+    let session_id = query
+        .session_id
+        .as_deref()
+        .or(query.chat_id.as_deref());
     let allowed_tools = state
         .skill_manager
         .as_ref()
-        .get_allowed_tools(query.chat_id.as_deref())
+        .get_allowed_tools(session_id)
         .await;
     debug!("Skill filtered tools allowed list: {:?}", allowed_tools);
 

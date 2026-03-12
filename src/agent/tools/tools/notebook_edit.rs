@@ -63,7 +63,7 @@ impl NotebookEditTool {
 
     fn find_cell_index(cells: &[Value], cell_id: Option<&str>) -> Option<usize> {
         let Some(cell_id) = cell_id else {
-            return if cells.is_empty() { None } else { Some(0) };
+            return None;
         };
 
         cells.iter().position(|cell| {
@@ -149,10 +149,20 @@ impl Tool for NotebookEditTool {
             .ok_or_else(|| ToolError::Execution("Notebook missing 'cells' array".to_string()))?;
 
         let edit_mode = parsed.edit_mode.unwrap_or_default();
-        let target_index = Self::find_cell_index(cells, parsed.cell_id.as_deref());
+        let cell_id = parsed
+            .cell_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let target_index = Self::find_cell_index(cells, cell_id);
 
         match edit_mode {
             EditMode::Replace => {
+                if cell_id.is_none() {
+                    return Err(ToolError::InvalidArguments(
+                        "cell_id is required when edit_mode=replace".to_string(),
+                    ));
+                }
                 let idx = target_index.ok_or_else(|| {
                     ToolError::Execution("Target cell not found for replace".to_string())
                 })?;
@@ -175,13 +185,24 @@ impl Tool for NotebookEditTool {
                     "execution_count": serde_json::Value::Null,
                 });
 
-                if let Some(idx) = target_index {
+                if let Some(cell_id) = cell_id {
+                    let idx = target_index.ok_or_else(|| {
+                        ToolError::Execution(format!(
+                            "Target cell '{}' not found for insert",
+                            cell_id
+                        ))
+                    })?;
                     cells.insert(idx + 1, new_cell);
                 } else {
-                    cells.insert(0, new_cell);
+                    cells.push(new_cell);
                 }
             }
             EditMode::Delete => {
+                if cell_id.is_none() {
+                    return Err(ToolError::InvalidArguments(
+                        "cell_id is required when edit_mode=delete".to_string(),
+                    ));
+                }
                 let idx = target_index.ok_or_else(|| {
                     ToolError::Execution("Target cell not found for delete".to_string())
                 })?;
@@ -192,9 +213,7 @@ impl Tool for NotebookEditTool {
         let updated = serde_json::to_string_pretty(&notebook)
             .map_err(|e| ToolError::Execution(format!("Failed to serialize notebook: {}", e)))?;
 
-        tokio::fs::write(path, &updated)
-            .await
-            .map_err(|e| ToolError::Execution(format!("Failed to write notebook: {}", e)))?;
+        file_change::atomic_write_text(path, &updated).await?;
 
         let payload = file_change::build_file_change_payload(
             "NotebookEdit",
@@ -210,5 +229,123 @@ impl Tool for NotebookEditTool {
             result: payload,
             display_preference: Some("Default".to_string()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_notebook() -> serde_json::Value {
+        json!({
+            "cells": [
+                {
+                    "id": "cell-a",
+                    "cell_type": "code",
+                    "metadata": {},
+                    "source": ["print('a')\n"],
+                    "outputs": [],
+                    "execution_count": 1
+                },
+                {
+                    "id": "cell-b",
+                    "cell_type": "markdown",
+                    "metadata": {},
+                    "source": ["# title\n"]
+                }
+            ],
+            "metadata": {},
+            "nbformat": 4,
+            "nbformat_minor": 5
+        })
+    }
+
+    async fn write_notebook(path: &Path) {
+        tokio::fs::write(
+            path,
+            serde_json::to_string_pretty(&sample_notebook()).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn replace_requires_cell_id() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write_notebook(file.path()).await;
+
+        let tool = NotebookEditTool::new();
+        let result = tool
+            .execute(json!({
+                "notebook_path": file.path(),
+                "edit_mode": "replace",
+                "new_source": "updated"
+            }))
+            .await;
+
+        assert!(matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("cell_id")));
+    }
+
+    #[tokio::test]
+    async fn delete_requires_cell_id() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write_notebook(file.path()).await;
+
+        let tool = NotebookEditTool::new();
+        let result = tool
+            .execute(json!({
+                "notebook_path": file.path(),
+                "edit_mode": "delete",
+                "new_source": ""
+            }))
+            .await;
+
+        assert!(matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("cell_id")));
+    }
+
+    #[tokio::test]
+    async fn insert_without_cell_id_appends_cell() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write_notebook(file.path()).await;
+
+        let tool = NotebookEditTool::new();
+        let result = tool
+            .execute(json!({
+                "notebook_path": file.path(),
+                "edit_mode": "insert",
+                "cell_type": "markdown",
+                "new_source": "appended cell"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let updated: Value =
+            serde_json::from_str(&tokio::fs::read_to_string(file.path()).await.unwrap()).unwrap();
+        let cells = updated["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 3);
+        let last = cells.last().unwrap();
+        assert_eq!(last["cell_type"], "markdown");
+        let source = last["source"].as_array().unwrap();
+        assert_eq!(source[0], "appended cell\n");
+    }
+
+    #[tokio::test]
+    async fn insert_with_unknown_cell_id_returns_error() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write_notebook(file.path()).await;
+
+        let tool = NotebookEditTool::new();
+        let result = tool
+            .execute(json!({
+                "notebook_path": file.path(),
+                "edit_mode": "insert",
+                "cell_id": "does-not-exist",
+                "cell_type": "code",
+                "new_source": "print('x')"
+            }))
+            .await;
+
+        assert!(matches!(result, Err(ToolError::Execution(msg)) if msg.contains("not found")));
     }
 }

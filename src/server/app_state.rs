@@ -488,10 +488,40 @@ impl AppState {
         let config = Arc::new(RwLock::new(config));
         let claude_cli_path: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
-        // Initialize built-in tools.
-        let builtin_executor = Arc::new(crate::agent::tools::BuiltinToolExecutor::new_with_config(
-            config.clone(),
-        ));
+        // Initialize built-in tools with permission checks.
+        // If no permission config has been persisted yet, keep checks disabled for backward
+        // compatibility and opt-in behavior.
+        let permission_checker: Arc<dyn crate::agent::tools::permission::PermissionChecker> = {
+            let storage = crate::agent::tools::permission::storage::PermissionStorage::new(
+                bamboo_home_dir.clone(),
+            );
+            let permission_config = match storage.load().await {
+                Ok(Some(config)) => config,
+                Ok(None) => {
+                    let cfg = crate::agent::tools::permission::PermissionConfig::new();
+                    cfg.set_enabled(false);
+                    cfg
+                }
+                Err(error) => {
+                    log::warn!("Failed to load permission config; defaulting to disabled: {error}");
+                    let cfg = crate::agent::tools::permission::PermissionConfig::new();
+                    cfg.set_enabled(false);
+                    cfg
+                }
+            };
+            permission_config.cleanup_expired_grants();
+            Arc::new(
+                crate::agent::tools::permission::ConfigPermissionChecker::new(Arc::new(
+                    permission_config,
+                )),
+            )
+        };
+        let builtin_executor = Arc::new(
+            crate::agent::tools::BuiltinToolExecutor::new_with_config_and_permissions(
+                config.clone(),
+                permission_checker,
+            ),
+        );
         let builtin_tools: Arc<dyn ToolExecutor> = builtin_executor.clone();
 
         // Optional integration: discover Claude Code CLI in the background so server startup
@@ -1041,6 +1071,10 @@ pub struct ConfigUpdateEffects {
 mod tests {
     use super::*;
     use crate::agent::core::tools::{FunctionCall, ToolCall, ToolError};
+    use crate::agent::tools::permission::config::{
+        PermissionConfig, PermissionRule, PermissionType,
+    };
+    use crate::agent::tools::permission::storage::PermissionStorage;
     use serde_json::json;
 
     fn make_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
@@ -1123,5 +1157,29 @@ mod tests {
             inspector_result,
             Err(ToolError::Execution(msg)) if msg.contains("session_id")
         ));
+    }
+
+    #[tokio::test]
+    async fn app_state_uses_persisted_permission_config_in_data_dir() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = PermissionStorage::new(temp_dir.path());
+        let config = PermissionConfig::new();
+        config.set_enabled(true);
+        config.add_rule(PermissionRule::new(PermissionType::WriteFile, "*", false));
+        storage.save(&config).await.unwrap();
+
+        let state = AppState::new(temp_dir.path().to_path_buf()).await;
+        let target = temp_dir.path().join("blocked.txt");
+        let call = make_tool_call(
+            "Write",
+            json!({
+                "file_path": target,
+                "content": "blocked"
+            }),
+        );
+
+        let result = state.tools.execute(&call).await;
+        assert!(matches!(result, Err(ToolError::Execution(_))));
+        assert!(!target.exists());
     }
 }

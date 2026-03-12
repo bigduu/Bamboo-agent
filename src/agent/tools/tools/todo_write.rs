@@ -110,6 +110,18 @@ impl Tool for TodoWriteTool {
         let parsed: TodoWriteArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid TodoWrite args: {}", e)))?;
 
+        for item in &parsed.todos {
+            match item.status.as_str() {
+                "pending" | "in_progress" | "completed" => {}
+                _ => {
+                    return Err(ToolError::InvalidArguments(format!(
+                        "Invalid todo status '{}' (expected pending/in_progress/completed)",
+                        item.status
+                    )));
+                }
+            }
+        }
+
         let completed = parsed
             .todos
             .iter()
@@ -125,5 +137,67 @@ impl Tool for TodoWriteTool {
             ),
             display_preference: Some("Default".to_string()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn execute_rejects_invalid_status() {
+        let tool = TodoWriteTool::new();
+        let err = tool
+            .execute(json!({
+                "todos": [
+                    {
+                        "content": "do it",
+                        "status": "done",
+                        "activeForm": "doing it"
+                    }
+                ]
+            }))
+            .await
+            .expect_err("invalid status should fail");
+
+        assert!(
+            matches!(err, ToolError::InvalidArguments(msg) if msg.contains("Invalid todo status"))
+        );
+    }
+
+    #[test]
+    fn todo_list_from_args_validates_statuses() {
+        let err = TodoWriteTool::todo_list_from_args(
+            &json!({
+                "todos": [
+                    {
+                        "content": "do it",
+                        "status": "done",
+                        "activeForm": "doing it"
+                    }
+                ]
+            }),
+            "session_1",
+        )
+        .expect_err("invalid status should fail");
+        assert!(
+            matches!(err, ToolError::InvalidArguments(msg) if msg.contains("Invalid todo status"))
+        );
+
+        let list = TodoWriteTool::todo_list_from_args(
+            &json!({
+                "todos": [
+                    {
+                        "content": "do it",
+                        "status": "in_progress",
+                        "activeForm": "doing it"
+                    }
+                ]
+            }),
+            "session_1",
+        )
+        .unwrap();
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(list.items[0].status, TodoItemStatus::InProgress);
     }
 }

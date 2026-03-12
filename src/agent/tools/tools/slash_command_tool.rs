@@ -1,7 +1,9 @@
-use crate::agent::core::tools::{Tool, ToolError, ToolResult};
+use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
+
+use super::workspace_state;
 
 #[derive(Debug, Deserialize)]
 struct SlashCommandArgs {
@@ -47,6 +49,15 @@ impl Tool for SlashCommandTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        self.execute_with_context(args, ToolExecutionContext::none("SlashCommand"))
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let parsed: SlashCommandArgs = serde_json::from_value(args).map_err(|e| {
             ToolError::InvalidArguments(format!("Invalid SlashCommand args: {}", e))
         })?;
@@ -62,9 +73,9 @@ impl Tool for SlashCommandTool {
         let head = parts.next().unwrap_or_default();
         let tail = parts.collect::<Vec<_>>().join(" ");
 
-        let project_path = std::env::current_dir()
-            .ok()
-            .map(|path| path.to_string_lossy().to_string());
+        let project_path = Some(crate::core::paths::path_to_display_string(
+            &workspace_state::workspace_or_process_cwd(ctx.session_id),
+        ));
 
         let commands = crate::commands::slash_commands::slash_commands_list(project_path)
             .await
@@ -106,5 +117,40 @@ impl Tool for SlashCommandTool {
             head,
             available.join(", ")
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn slash_command_uses_session_workspace_for_project_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands_dir = dir.path().join(".claude/commands");
+        tokio::fs::create_dir_all(&commands_dir).await.unwrap();
+        tokio::fs::write(commands_dir.join("hello.md"), "Hi $ARGUMENTS")
+            .await
+            .unwrap();
+
+        let session = format!("session_{}", uuid::Uuid::new_v4());
+        super::workspace_state::set_workspace(&session, dir.path().to_path_buf());
+
+        let tool = SlashCommandTool::new();
+        let result = tool
+            .execute_with_context(
+                json!({ "command": "/hello world" }),
+                ToolExecutionContext {
+                    session_id: Some(&session),
+                    tool_call_id: "call_1",
+                    event_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(payload["resolved_command"], "/hello");
+        assert_eq!(payload["content"], "Hi world");
     }
 }

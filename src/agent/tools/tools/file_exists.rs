@@ -15,9 +15,6 @@ impl FileExistsTool {
         if path.trim().is_empty() {
             return Err("path must be a non-empty string".to_string());
         }
-        if path.contains("..") {
-            return Err("Invalid path: contains '..'".to_string());
-        }
         Ok(fs::metadata(path).await.is_ok())
     }
 }

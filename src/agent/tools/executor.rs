@@ -12,8 +12,8 @@ use crate::agent::tools::permission::{check_permissions, PermissionChecker, Perm
 use crate::agent::tools::tools::{
     AskUserTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, FileExistsTool,
     GetCurrentDirTool, GetFileInfoTool, GlobTool, GrepTool, KillShellTool, MemoryNoteTool,
-    NotebookEditTool, ReadTool, SetWorkspaceTool, SleepTool, TaskTool, TodoWriteTool,
-    ToolRegistry, WebFetchTool, WebSearchTool, WriteTool,
+    NotebookEditTool, ReadTool, SetWorkspaceTool, SleepTool, TaskTool, TodoWriteTool, ToolRegistry,
+    WebFetchTool, WebSearchTool, WriteTool,
 };
 use crate::core::Config;
 use tokio::sync::RwLock;
@@ -80,6 +80,16 @@ fn normalize_builtin_alias(name: &str) -> &str {
         "set_workspace" => "SetWorkspace",
         "setWorkspace" => "SetWorkspace",
         "sleep" => "Sleep",
+        "spawn_session" => "Task",
+        "spawnSession" => "Task",
+        "sub_session" => "Task",
+        "subSession" => "Task",
+        "sub_task" => "Task",
+        "subTask" => "Task",
+        "team_agent" => "Task",
+        "teamAgent" => "Task",
+        "child_session" => "Task",
+        "childSession" => "Task",
         "write_file" => "Write",
         _ => name,
     }
@@ -302,7 +312,11 @@ impl ToolExecutor for BuiltinToolExecutor {
             normalize_legacy_builtin_args(raw_tool_name, args_obj);
         }
 
-        let tool_name = normalize_builtin_alias(raw_tool_name);
+        let tool_name = if self.registry.get(raw_tool_name).is_some() {
+            raw_tool_name
+        } else {
+            normalize_builtin_alias(raw_tool_name)
+        };
 
         // Look up the tool in the registry
         let tool = self
@@ -521,6 +535,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_normalize_tool_ref_accepts_spawn_task_aliases() {
+        for alias in [
+            "default::spawn_session",
+            "default::sub_session",
+            "default::sub_task",
+            "default::team_agent",
+            "default::child_session",
+        ] {
+            assert_eq!(normalize_tool_ref(alias), Some("Task".to_string()));
+        }
+    }
+
     #[tokio::test]
     async fn test_executor_accepts_legacy_read_file_path_argument() {
         let dir = tempfile::tempdir().unwrap();
@@ -633,11 +660,16 @@ mod tests {
         assert!(grep["properties"]["-i"].is_object());
 
         let edit = get_params("Edit");
-        assert_eq!(
-            edit["required"],
-            json!(["file_path", "old_string", "new_string"])
-        );
+        assert_eq!(edit["required"], json!(["file_path"]));
+        assert_eq!(edit["properties"]["old_string"]["type"], "string");
+        assert_eq!(edit["properties"]["new_string"]["type"], "string");
+        assert_eq!(edit["properties"]["patch"]["type"], "string");
         assert_eq!(edit["properties"]["replace_all"]["type"], "boolean");
+        assert_eq!(
+            edit["oneOf"][0]["required"],
+            json!(["old_string", "new_string"])
+        );
+        assert_eq!(edit["oneOf"][1]["required"], json!(["patch"]));
 
         let bash = get_params("Bash");
         assert_eq!(bash["required"], json!(["command"]));
@@ -804,5 +836,43 @@ mod tests {
             let result = executor.execute(&call).await;
             assert!(matches!(result, Err(ToolError::NotFound(_))));
         }
+    }
+
+    #[tokio::test]
+    async fn executor_prefers_exact_tool_name_before_builtin_alias() {
+        struct CustomSpawnSessionTool;
+
+        #[async_trait]
+        impl Tool for CustomSpawnSessionTool {
+            fn name(&self) -> &str {
+                "spawn_session"
+            }
+
+            fn description(&self) -> &str {
+                "custom tool for regression coverage"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type":"object","properties":{}})
+            }
+
+            async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
+                Ok(ToolResult {
+                    success: true,
+                    result: "custom-spawn-session".to_string(),
+                    display_preference: None,
+                })
+            }
+        }
+
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(CustomSpawnSessionTool)
+            .expect("register custom spawn_session tool")
+            .build();
+
+        let call = make_tool_call("spawn_session", json!({}));
+        let result = executor.execute(&call).await.expect("execute custom tool");
+        assert!(result.success);
+        assert_eq!(result.result, "custom-spawn-session");
     }
 }

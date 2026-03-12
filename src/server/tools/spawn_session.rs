@@ -18,10 +18,79 @@ Requirements:
 "#;
 
 #[derive(Debug, serde::Deserialize)]
-struct SpawnSessionArgs {
+struct SpawnSessionArgsRaw {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
     description: String,
+    #[serde(default)]
+    responsibility: Option<String>,
     prompt: String,
     subagent_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnSessionArgs {
+    title: String,
+    responsibility: String,
+    prompt: String,
+    subagent_type: String,
+}
+
+fn normalize_required_text(value: Option<String>, field_name: &str) -> Result<String, ToolError> {
+    let Some(value) = value else {
+        return Err(ToolError::InvalidArguments(format!(
+            "{field_name} must be non-empty"
+        )));
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(ToolError::InvalidArguments(format!(
+            "{field_name} must be non-empty"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_title(title: Option<String>, legacy_description: String) -> Result<String, ToolError> {
+    let title = title.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    let legacy_description = {
+        let trimmed = legacy_description.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
+    normalize_required_text(title.or(legacy_description), "title")
+}
+
+fn normalize_spawn_session_args(raw: SpawnSessionArgsRaw) -> Result<SpawnSessionArgs, ToolError> {
+    let title = normalize_title(raw.title, raw.description)?;
+    let responsibility = normalize_required_text(raw.responsibility, "responsibility")?;
+    let prompt = normalize_required_text(Some(raw.prompt), "prompt")?;
+    let subagent_type = normalize_required_text(Some(raw.subagent_type), "subagent_type")?;
+
+    Ok(SpawnSessionArgs {
+        title,
+        responsibility,
+        prompt,
+        subagent_type,
+    })
+}
+
+fn format_child_assignment(args: &SpawnSessionArgs) -> String {
+    format!(
+        "Sub-session title: {}\nResponsibility: {}\nSubagent type: {}\n\nTask brief:\n{}",
+        args.title, args.responsibility, args.subagent_type, args.prompt
+    )
 }
 
 /// Server-only tool: spawn a child session and run it asynchronously.
@@ -67,18 +136,23 @@ impl Tool for SpawnSessionTool {
     }
 
     fn description(&self) -> &str {
-        "Launch a new agent to handle complex, multi-step tasks asynchronously"
+        "Delegate a sub-session (sub task/team agent/parallel worker) to run asynchronously. Always provide a clear title and responsibility."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "description": { "type": "string", "description": "A short (3-5 word) description of the task" },
-                "prompt": { "type": "string", "description": "The task for the agent to perform" },
-                "subagent_type": { "type": "string", "description": "The type of specialized agent to use" }
+                "title": { "type": "string", "description": "Short title for the child session. This is displayed in the Child Sessions panel." },
+                "description": { "type": "string", "description": "Legacy alias of title; prefer title." },
+                "responsibility": { "type": "string", "description": "Single, explicit responsibility for this child session." },
+                "prompt": { "type": "string", "description": "Detailed task instructions and expected output for the child session." },
+                "subagent_type": { "type": "string", "description": "Specialized agent profile to use (for example: general-purpose, researcher, coder)." }
             },
-            "required": ["description", "prompt", "subagent_type"],
+            "oneOf": [
+                { "required": ["title", "responsibility", "prompt", "subagent_type"] },
+                { "required": ["description", "responsibility", "prompt", "subagent_type"] }
+            ],
             "additionalProperties": false
         })
     }
@@ -97,14 +171,9 @@ impl Tool for SpawnSessionTool {
             ToolError::Execution("Task requires a session_id in tool context".to_string())
         })?;
 
-        let parsed: SpawnSessionArgs = serde_json::from_value(args)
+        let parsed: SpawnSessionArgsRaw = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid Task args: {e}")))?;
-        let goal = parsed.prompt.trim();
-        if goal.is_empty() || parsed.description.trim().is_empty() {
-            return Err(ToolError::InvalidArguments(
-                "description and prompt must be non-empty".to_string(),
-            ));
-        }
+        let parsed = normalize_spawn_session_args(parsed)?;
 
         let parent = self.load_parent_session(parent_session_id).await?;
         if parent.kind != SessionKind::Root {
@@ -121,7 +190,7 @@ impl Tool for SpawnSessionTool {
         }
 
         let child_id = Uuid::new_v4().to_string();
-        let title = parsed.description.trim().to_string();
+        let title = parsed.title.clone();
 
         let mut child =
             Session::new_child(child_id.clone(), parent.id.clone(), model.clone(), title);
@@ -131,6 +200,13 @@ impl Tool for SpawnSessionTool {
         child
             .metadata
             .insert("subagent_type".to_string(), parsed.subagent_type.clone());
+        child
+            .metadata
+            .insert("responsibility".to_string(), parsed.responsibility.clone());
+        child
+            .metadata
+            .insert("last_run_status".to_string(), "pending".to_string());
+        child.metadata.remove("last_run_error");
         child.metadata.insert(
             "base_system_prompt".to_string(),
             CHILD_SYSTEM_PROMPT.to_string(),
@@ -138,12 +214,7 @@ impl Tool for SpawnSessionTool {
 
         // Keep the child prompt minimal; do NOT copy the parent's full system prompt.
         child.add_message(Message::system(CHILD_SYSTEM_PROMPT));
-        child.add_message(Message::user(format!(
-            "Task description: {}\nSubagent type: {}\n\n{}",
-            parsed.description.trim(),
-            parsed.subagent_type.trim(),
-            goal
-        )));
+        child.add_message(Message::user(format_child_assignment(&parsed)));
 
         // Persist child session + index entry.
         self.storage
@@ -166,12 +237,19 @@ impl Tool for SpawnSessionTool {
 
         ctx.emit_tool_token(format!("Spawned child session: {child_id}"))
             .await;
+        let result_title = parsed.title.clone();
+        let result_responsibility = parsed.responsibility.clone();
+        let result_prompt = parsed.prompt.clone();
+        let result_subagent_type = parsed.subagent_type.clone();
 
         Ok(ToolResult {
             success: true,
             result: json!({
-                "description": parsed.description,
-                "subagent_type": parsed.subagent_type,
+                "title": result_title.clone(),
+                "description": result_title,
+                "responsibility": result_responsibility,
+                "prompt": result_prompt,
+                "subagent_type": result_subagent_type,
                 "child_session_id": child_id,
                 "parent_session_id": parent.id,
                 "model": model,
@@ -196,6 +274,82 @@ mod tests {
     use crate::agent::metrics::storage::SqliteMetricsStorage;
     use crate::agent::metrics::MetricsCollector;
     use crate::agent::skill::SkillManager;
+
+    #[test]
+    fn normalize_spawn_session_args_accepts_legacy_description() {
+        let parsed = normalize_spawn_session_args(SpawnSessionArgsRaw {
+            title: None,
+            description: "Search refs".to_string(),
+            responsibility: Some("Inspect parser modules and summarize entrypoints".to_string()),
+            prompt: "Read parser-related files and report key functions.".to_string(),
+            subagent_type: "general-purpose".to_string(),
+        })
+        .expect("legacy description should map to title");
+
+        assert_eq!(parsed.title, "Search refs");
+        assert_eq!(
+            parsed.responsibility,
+            "Inspect parser modules and summarize entrypoints"
+        );
+    }
+
+    #[test]
+    fn normalize_spawn_session_args_rejects_missing_responsibility() {
+        let err = normalize_spawn_session_args(SpawnSessionArgsRaw {
+            title: Some("Search refs".to_string()),
+            description: String::new(),
+            responsibility: None,
+            prompt: "Read parser-related files and report key functions.".to_string(),
+            subagent_type: "general-purpose".to_string(),
+        })
+        .expect_err("responsibility should be required");
+
+        assert!(matches!(err, ToolError::InvalidArguments(msg) if msg.contains("responsibility")));
+    }
+
+    #[test]
+    fn normalize_spawn_session_args_rejects_missing_title_and_description() {
+        let err = normalize_spawn_session_args(SpawnSessionArgsRaw {
+            title: None,
+            description: String::new(),
+            responsibility: Some("Inspect parser modules and summarize entrypoints".to_string()),
+            prompt: "Read parser-related files and report key functions.".to_string(),
+            subagent_type: "general-purpose".to_string(),
+        })
+        .expect_err("title should be required when legacy description is also missing");
+
+        assert!(matches!(err, ToolError::InvalidArguments(msg) if msg.contains("title")));
+    }
+
+    #[test]
+    fn normalize_spawn_session_args_uses_legacy_description_when_title_is_blank() {
+        let parsed = normalize_spawn_session_args(SpawnSessionArgsRaw {
+            title: Some("   ".to_string()),
+            description: "Legacy title".to_string(),
+            responsibility: Some("Inspect parser modules and summarize entrypoints".to_string()),
+            prompt: "Read parser-related files and report key functions.".to_string(),
+            subagent_type: "general-purpose".to_string(),
+        })
+        .expect("blank title should fall back to legacy description");
+
+        assert_eq!(parsed.title, "Legacy title");
+    }
+
+    #[test]
+    fn format_child_assignment_includes_title_and_responsibility() {
+        let content = format_child_assignment(&SpawnSessionArgs {
+            title: "Find parser entrypoints".to_string(),
+            responsibility: "Locate parser entrypoints and summarize call graph".to_string(),
+            prompt: "Scan src/parser and produce a short report.".to_string(),
+            subagent_type: "general-purpose".to_string(),
+        });
+
+        assert!(content.contains("Sub-session title: Find parser entrypoints"));
+        assert!(
+            content.contains("Responsibility: Locate parser entrypoints and summarize call graph")
+        );
+        assert!(content.contains("Task brief:"));
+    }
 
     struct NoopProvider;
 

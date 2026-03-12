@@ -25,6 +25,7 @@ pub mod task;
 pub mod todo_write;
 pub mod web_fetch;
 pub mod web_search;
+pub mod workspace_state;
 pub mod write;
 
 pub use ask_user::AskUserTool;

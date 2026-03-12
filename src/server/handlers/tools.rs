@@ -61,6 +61,9 @@ pub struct ToolExecutionRequest {
     pub tool_name: String,
     /// Tool parameters as key-value pairs
     pub parameters: Vec<ToolParameter>,
+    /// Optional session context for tools that require read/write safety gates.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Single tool parameter.
@@ -88,6 +91,19 @@ pub struct ToolExecutionResultPayload {
     pub result: String,
     /// Display preference hint
     pub display_preference: String,
+}
+
+fn requires_session_context(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "Write"
+            | "Edit"
+            | "SetWorkspace"
+            | "Task"
+            | "memory_note"
+            | "schedule_tasks"
+            | "session_inspector"
+    )
 }
 
 /// Execute a tool directly without agent loop.
@@ -144,8 +160,19 @@ pub async fn execute_tool(
     payload: web::Json<ToolExecutionRequest>,
 ) -> Result<HttpResponse, AppError> {
     let request = payload.into_inner();
-    normalize_tool_ref(&request.tool_name)
+    let canonical_tool_name = normalize_tool_ref(&request.tool_name)
         .ok_or_else(|| AppError::ToolNotFound(request.tool_name.clone()))?;
+    let session_id = request
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if requires_session_context(&canonical_tool_name) && session_id.is_none() {
+        return Err(AppError::BadRequest(format!(
+            "Tool '{}' requires session_id for safe execution",
+            canonical_tool_name
+        )));
+    }
 
     let mut args = serde_json::Map::new();
     for param in request.parameters {
@@ -156,14 +183,21 @@ pub async fn execute_tool(
         id: "tool_call".to_string(),
         tool_type: "function".to_string(),
         function: FunctionCall {
-            name: request.tool_name.clone(),
+            name: canonical_tool_name,
             arguments: serde_json::to_string(&args).map_err(AppError::SerializationError)?,
         },
     };
 
     let result = app_state
         .tools
-        .execute_with_context(&call, ToolExecutionContext::none(&call.id))
+        .execute_with_context(
+            &call,
+            ToolExecutionContext {
+                session_id,
+                tool_call_id: &call.id,
+                event_tx: None,
+            },
+        )
         .await
         .map_err(|err| AppError::ToolExecutionError(err.to_string()))?;
 

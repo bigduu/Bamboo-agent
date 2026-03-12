@@ -28,6 +28,10 @@ pub struct SessionSummary {
     pub has_attachments: bool,
     pub is_running: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<crate::agent::core::TokenBudgetUsage>,
 }
 
@@ -48,6 +52,8 @@ impl SessionSummary {
             message_count: entry.message_count,
             has_attachments: entry.has_attachments,
             is_running,
+            last_run_status: entry.last_run_status,
+            last_run_error: entry.last_run_error,
             token_usage: entry.token_usage,
         }
     }
@@ -348,5 +354,41 @@ pub async fn get_attachment(
             "session_id": session_id,
             "attachment_id": attachment_id
         }))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::agent::core::SessionKind;
+    use chrono::Utc;
+
+    #[test]
+    fn session_summary_from_entry_includes_last_run_fields() {
+        let entry = SessionIndexEntry {
+            id: "child-1".to_string(),
+            kind: SessionKind::Child,
+            rel_path: "sessions/root/children/child-1".to_string(),
+            title: "Child Session".to_string(),
+            pinned: false,
+            parent_session_id: Some("root".to_string()),
+            root_session_id: "root".to_string(),
+            spawn_depth: 1,
+            created_by_schedule_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_activity_at: Utc::now(),
+            message_count: 5,
+            has_attachments: false,
+            last_run_status: Some("completed".to_string()),
+            last_run_error: None,
+            token_usage: None,
+        };
+
+        let summary = SessionSummary::from_entry(entry, false);
+
+        assert_eq!(summary.last_run_status.as_deref(), Some("completed"));
+        assert_eq!(summary.last_run_error, None);
     }
 }

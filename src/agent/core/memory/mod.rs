@@ -29,6 +29,37 @@ impl ExternalMemory {
         Self::new(notes_dir)
     }
 
+    fn validate_session_id(session_id: &str) -> io::Result<()> {
+        let trimmed = session_id.trim();
+        if trimmed.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session_id cannot be empty",
+            ));
+        }
+        if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session_id contains invalid path characters",
+            ));
+        }
+        if !trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session_id contains unsupported characters",
+            ));
+        }
+        Ok(())
+    }
+
+    fn note_path_for_session(&self, session_id: &str) -> io::Result<PathBuf> {
+        Self::validate_session_id(session_id)?;
+        Ok(self.notes_dir.join(format!("{}.md", session_id.trim())))
+    }
+
     /// Save a note for a session.
     ///
     /// The note is stored as a markdown file named `{session_id}.md`.
@@ -36,7 +67,7 @@ impl ExternalMemory {
         // Ensure notes directory exists
         tokio::fs::create_dir_all(&self.notes_dir).await?;
 
-        let note_path = self.notes_dir.join(format!("{}.md", session_id));
+        let note_path = self.note_path_for_session(session_id)?;
         tokio::fs::write(&note_path, note).await?;
 
         Ok(note_path)
@@ -46,7 +77,7 @@ impl ExternalMemory {
     ///
     /// Returns None if no note exists for the session.
     pub async fn read_note(&self, session_id: &str) -> io::Result<Option<String>> {
-        let note_path = self.notes_dir.join(format!("{}.md", session_id));
+        let note_path = self.note_path_for_session(session_id)?;
 
         if !note_path.exists() {
             return Ok(None);
@@ -60,7 +91,7 @@ impl ExternalMemory {
     ///
     /// Returns true if a note was deleted, false if no note existed.
     pub async fn delete_note(&self, session_id: &str) -> io::Result<bool> {
-        let note_path = self.notes_dir.join(format!("{}.md", session_id));
+        let note_path = self.note_path_for_session(session_id)?;
 
         if note_path.exists() {
             tokio::fs::remove_file(&note_path).await?;
@@ -109,7 +140,8 @@ impl ExternalMemory {
 
     /// Get the path to the notes file for a session.
     pub fn get_note_path(&self, session_id: &str) -> PathBuf {
-        self.notes_dir.join(format!("{}.md", session_id))
+        self.note_path_for_session(session_id)
+            .unwrap_or_else(|_| self.notes_dir.join("invalid-session-id.md"))
     }
 
     /// Check if a note exists for a session.
@@ -200,6 +232,18 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert!(sessions.contains(&"session-1".to_string()));
         assert!(sessions.contains(&"session-2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_session_id_characters() {
+        let dir = tempdir().unwrap();
+        let memory = ExternalMemory::new(dir.path());
+
+        let save = memory.save_note("../escape", "bad").await;
+        assert!(save.is_err());
+
+        let read = memory.read_note("bad/name").await;
+        assert!(read.is_err());
     }
 
     #[test]

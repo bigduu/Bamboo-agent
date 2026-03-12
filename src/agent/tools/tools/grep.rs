@@ -1,4 +1,4 @@
-use crate::agent::core::tools::{Tool, ToolError, ToolResult};
+use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use async_trait::async_trait;
 use globset::{GlobBuilder, GlobSet};
 use regex::{Regex, RegexBuilder};
@@ -8,9 +8,23 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use super::workspace_state;
+
 const DEFAULT_HEAD_LIMIT: usize = 200;
 const MAX_RESULT_BYTES: usize = 256 * 1024;
 const MAX_MATCHES: usize = 2_000;
+const MAX_SCANNED_FILES: usize = 50_000;
+const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const SKIP_DIRS: [&str; 8] = [
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".cache",
+    "coverage",
+];
 const SEARCH_SCOPE_TOO_BROAD_ERROR: &str =
     "Search scope too broad. Add path/glob/type or reduce pattern.";
 const MULTILINE_REQUIRES_NARROWED_PATH_ERROR: &str = "Multiline grep requires narrowed path.";
@@ -84,10 +98,16 @@ impl GrepTool {
         for entry in WalkDir::new(base)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|entry| {
+                !entry.file_type().is_dir() || !Self::should_skip_dir(entry.path())
+            })
             .filter_map(|entry| entry.ok())
         {
             if !entry.file_type().is_file() {
                 continue;
+            }
+            if files.len() >= MAX_SCANNED_FILES {
+                break;
             }
             let path = entry.path();
 
@@ -105,6 +125,13 @@ impl GrepTool {
         }
 
         files
+    }
+
+    fn should_skip_dir(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| SKIP_DIRS.contains(&name))
+            .unwrap_or(false)
     }
 
     fn compile_glob(glob: Option<&str>) -> Result<Option<GlobSet>, ToolError> {
@@ -171,7 +198,7 @@ impl GrepTool {
 
             for mat in regex.find_iter(content) {
                 let start_line = Self::byte_to_line(&line_starts, mat.start());
-                let end_line = Self::byte_to_line(&line_starts, mat.end());
+                let end_line = Self::byte_to_line(&line_starts, mat.end().saturating_sub(1));
                 let range_start = start_line.saturating_sub(before);
                 let range_end = (end_line + after).min(lines.len().saturating_sub(1));
                 for line_idx in range_start..=range_end {
@@ -301,10 +328,19 @@ impl Tool for GrepTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        self.execute_with_context(args, ToolExecutionContext::none("Grep"))
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let parsed: GrepArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid Grep args: {}", e)))?;
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd = workspace_state::workspace_or_process_cwd(ctx.session_id);
         let root = Self::resolve_search_root(parsed.path.as_deref(), &cwd);
 
         let output_mode = parsed.output_mode.unwrap_or_default();
@@ -336,6 +372,7 @@ impl Tool for GrepTool {
         let mut count_rows = Vec::new();
         let mut content_rows = Vec::new();
         let mut total_matches = 0usize;
+        let mut partial = false;
 
         for file in files {
             if let Some(filter) = &glob_filter {
@@ -343,6 +380,13 @@ impl Tool for GrepTool {
                 if !filter.is_match(relative) && !filter.is_match(&file) {
                     continue;
                 }
+            }
+
+            let Ok(metadata) = tokio::fs::metadata(&file).await else {
+                continue;
+            };
+            if metadata.len() > MAX_FILE_BYTES {
+                continue;
             }
 
             let Ok(content) = tokio::fs::read_to_string(&file).await else {
@@ -385,6 +429,20 @@ impl Tool for GrepTool {
                     after,
                     line_numbers,
                 ));
+                if content_rows.len() >= head_limit {
+                    content_rows.truncate(head_limit);
+                    partial = true;
+                    break;
+                }
+            }
+
+            if matches!(
+                output_mode,
+                OutputMode::FilesWithMatches | OutputMode::Count
+            ) && matched_files.len() >= head_limit
+            {
+                partial = true;
+                break;
             }
         }
 
@@ -396,6 +454,11 @@ impl Tool for GrepTool {
 
         if result_lines.len() > head_limit {
             result_lines.truncate(head_limit);
+            partial = true;
+        }
+        if partial {
+            result_lines
+                .push("[PARTIAL] Output was truncated. Narrow path/pattern and retry.".to_string());
         }
 
         let result = result_lines.join("\n");
@@ -421,6 +484,13 @@ mod tests {
             .result
             .lines()
             .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    fn non_partial_lines(result: &ToolResult) -> Vec<&str> {
+        result_lines(result)
+            .into_iter()
+            .filter(|line| !line.starts_with("[PARTIAL]"))
             .collect()
     }
 
@@ -501,10 +571,11 @@ mod tests {
             .await
             .unwrap();
 
-        let lines = result_lines(&result);
+        let lines = non_partial_lines(&result);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains(".rs:"));
         assert!(!lines[0].contains("c.txt"));
+        assert!(result.result.contains("[PARTIAL]"));
     }
 
     #[tokio::test]
@@ -596,8 +667,9 @@ mod tests {
             .await
             .unwrap();
 
-        let lines = result_lines(&result);
+        let lines = non_partial_lines(&result);
         assert_eq!(lines.len(), 200);
+        assert!(result.result.contains("[PARTIAL]"));
     }
 
     #[tokio::test]

@@ -303,23 +303,37 @@ fn find_markdown_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         return Ok(());
     }
 
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
+    let mut stack = vec![dir.to_path_buf()];
+    let mut visited = std::collections::HashSet::new();
 
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with('.') {
-                continue;
-            }
+    while let Some(current_dir) = stack.pop() {
+        let canonical = match fs::canonicalize(&current_dir) {
+            Ok(path) => path,
+            Err(_) => current_dir.clone(),
+        };
+        if !visited.insert(canonical) {
+            continue;
         }
 
-        if path.is_dir() {
-            find_markdown_files(&path, files)?;
-        } else if path.is_file() {
-            if let Some(ext) = path.extension() {
-                if ext == "md" {
-                    files.push(path);
+        for entry in fs::read_dir(&current_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with('.') {
+                    continue;
                 }
+            }
+
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+
+            if metadata.is_dir() {
+                stack.push(path);
+            } else if metadata.is_file() && path.extension().is_some_and(|ext| ext == "md") {
+                files.push(path);
             }
         }
     }
@@ -774,5 +788,26 @@ mod tests {
 
         assert_eq!(id_forward, "-home-user-file.md");
         assert_eq!(id_backslash, "-home-user-file.md");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_markdown_files_skips_symlink_loops() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let commands_root = dir.path().join("commands");
+        let nested = commands_root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("hello.md"), "# hello").unwrap();
+
+        // Create a cycle: nested/loop -> commands_root
+        symlink(&commands_root, nested.join("loop")).unwrap();
+
+        let mut files = Vec::new();
+        find_markdown_files(&commands_root, &mut files).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("hello.md"));
     }
 }

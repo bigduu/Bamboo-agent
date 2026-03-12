@@ -70,14 +70,21 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "Edit" => Some(guide(
             "Edit",
             ToolCategory::FileWriting,
-            "Use for precise in-place string replacements in existing files.",
-            "Do not use before Read on existing files; do not use for full-file rewrites.",
+            "Use for precise in-place updates in existing files. Prefer patch mode with SEARCH/REPLACE blocks and enough context to target unique locations.",
+            "Do not use before Read on existing files; do not use for full-file rewrites; do not use ambiguous SEARCH blocks that match multiple locations.",
             &["Read", "Write"],
-            vec![example(
-                "Replace a symbol",
-                json!({"file_path":"/workspace/project/src/main.rs","old_string":"foo","new_string":"bar"}),
-                "Use precise old/new strings.",
-            )],
+            vec![
+                example(
+                    "Patch a specific block",
+                    json!({"file_path":"/workspace/project/src/main.rs","patch":"<<<<<<< SEARCH\nfn b() {\n    let v = 1;\n}\n=======\nfn b() {\n    let v = 2;\n}\n>>>>>>> REPLACE"}),
+                    "Preferred for repeated code because context disambiguates the target.",
+                ),
+                example(
+                    "Legacy single replacement",
+                    json!({"file_path":"/workspace/project/src/main.rs","old_string":"foo","new_string":"bar"}),
+                    "Use only when old_string is known to match exactly once.",
+                ),
+            ],
         )),
         "Glob" => Some(guide(
             "Glob",
@@ -166,13 +173,13 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "Task" => Some(guide(
             "Task",
             ToolCategory::TaskManagement,
-            "Delegate a sub-task to a child agent/session.",
-            "Do not use for trivial single-step operations.",
+            "Delegate a sub-session (sub task/team agent/parallel worker). Always set a clear title and a single explicit responsibility.",
+            "Do not use for trivial single-step operations, and do not omit title/responsibility.",
             &["TodoWrite"],
             vec![example(
                 "Delegate research",
-                json!({"description":"Search refs","prompt":"Find parser entrypoints","subagent_type":"general-purpose"}),
-                "Use when work can be isolated.",
+                json!({"title":"Search refs","responsibility":"Find parser entrypoints and summarize findings","prompt":"Scan parser modules and report key entrypoints with file paths.","subagent_type":"general-purpose"}),
+                "Use when work can be isolated and run in parallel.",
             )],
         )),
         "TodoWrite" => Some(guide(

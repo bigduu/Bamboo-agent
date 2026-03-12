@@ -53,11 +53,6 @@ impl Tool for GetFileInfoTool {
                 "path must be a non-empty string".to_string(),
             ));
         }
-        if path.contains("..") {
-            return Err(ToolError::InvalidArguments(
-                "Invalid path: contains '..'".to_string(),
-            ));
-        }
 
         let metadata = match fs::metadata(path).await {
             Ok(metadata) => metadata,

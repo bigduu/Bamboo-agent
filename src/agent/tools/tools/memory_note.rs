@@ -4,12 +4,27 @@
 //! is loaded into the system prompt at the start of each round.
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use serde_json::json;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Mutex;
 
 use crate::agent::core::memory::ExternalMemory;
 use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 
 const MAX_NOTE_CHARS: usize = 12_000;
+
+fn note_locks() -> &'static DashMap<String, Arc<Mutex<()>>> {
+    static NOTE_LOCKS: OnceLock<DashMap<String, Arc<Mutex<()>>>> = OnceLock::new();
+    NOTE_LOCKS.get_or_init(DashMap::new)
+}
+
+fn session_lock(session_id: &str) -> Arc<Mutex<()>> {
+    note_locks()
+        .entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
 
 #[derive(Debug, Default)]
 pub struct MemoryNoteTool;
@@ -74,6 +89,8 @@ impl Tool for MemoryNoteTool {
             .to_lowercase();
 
         let memory = ExternalMemory::with_defaults();
+        let session_guard = session_lock(session_id);
+        let _guard = session_guard.lock().await;
 
         match action.as_str() {
             "read" => {

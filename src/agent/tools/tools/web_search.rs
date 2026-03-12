@@ -41,6 +41,10 @@ impl WebSearchTool {
             .ok()
             .and_then(|parsed| parsed.host_str().map(|host| host.to_ascii_lowercase()))
     }
+
+    fn domain_matches(host: &str, domain: &str) -> bool {
+        host == domain || host.ends_with(&format!(".{}", domain))
+    }
 }
 
 impl Default for WebSearchTool {
@@ -136,11 +140,17 @@ impl Tool for WebSearchTool {
                 continue;
             };
 
-            if blocked.contains(&host) {
+            if blocked
+                .iter()
+                .any(|blocked_domain| Self::domain_matches(&host, blocked_domain))
+            {
                 continue;
             }
             if let Some(allowed_set) = &allowed {
-                if !allowed_set.contains(&host) {
+                if !allowed_set
+                    .iter()
+                    .any(|allowed_domain| Self::domain_matches(&host, allowed_domain))
+                {
                     continue;
                 }
             }
@@ -170,5 +180,40 @@ impl Tool for WebSearchTool {
             .to_string(),
             display_preference: Some("Collapsible".to_string()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn domain_matches_supports_subdomains() {
+        assert!(WebSearchTool::domain_matches("example.com", "example.com"));
+        assert!(WebSearchTool::domain_matches(
+            "docs.example.com",
+            "example.com"
+        ));
+        assert!(!WebSearchTool::domain_matches(
+            "notexample.com",
+            "example.com"
+        ));
+        assert!(!WebSearchTool::domain_matches(
+            "evil-example.com",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn host_of_normalizes_case() {
+        let host = WebSearchTool::host_of("https://Docs.Example.Com/path").unwrap();
+        assert_eq!(host, "docs.example.com");
+    }
+
+    #[test]
+    fn decode_duckduckgo_url_extracts_uddg_param() {
+        let raw = "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&rut=whatever";
+        let decoded = WebSearchTool::decode_duckduckgo_url(raw).unwrap();
+        assert_eq!(decoded, "https://example.com/page");
     }
 }

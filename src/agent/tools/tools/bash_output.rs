@@ -10,6 +10,8 @@ use super::bash_runtime;
 struct BashOutputArgs {
     bash_id: String,
     #[serde(default)]
+    cursor: Option<usize>,
+    #[serde(default)]
     filter: Option<String>,
 }
 
@@ -48,6 +50,10 @@ impl Tool for BashOutputTool {
                 "filter": {
                     "type": "string",
                     "description": "Optional regular expression to filter output lines"
+                },
+                "cursor": {
+                    "type": "number",
+                    "description": "Read output starting from this cursor (0 for beginning)"
                 }
             },
             "required": ["bash_id"],
@@ -73,7 +79,9 @@ impl Tool for BashOutputTool {
             })
             .transpose()?;
 
-        let (lines, next_cursor) = shell.read_new_output(regex.as_ref()).await;
+        let cursor = parsed.cursor.unwrap_or(0);
+        let (lines, next_cursor, dropped_lines) =
+            shell.read_output_since(cursor, regex.as_ref()).await;
         let status = shell.status();
         let exit_code = shell.exit_code().await;
 
@@ -84,6 +92,7 @@ impl Tool for BashOutputTool {
                 "status": status,
                 "exit_code": exit_code,
                 "next_cursor": next_cursor,
+                "dropped_lines": dropped_lines,
                 "output": lines.join("\n"),
             })
             .to_string(),
@@ -146,11 +155,12 @@ mod tests {
             .unwrap();
         let first_payload: Value = serde_json::from_str(&first.result).unwrap();
         let first_output = first_payload["output"].as_str().unwrap_or_default();
+        let next_cursor = first_payload["next_cursor"].as_u64().unwrap_or(0);
         assert!(first_output.contains("alpha"));
         assert!(first_output.contains("beta"));
 
         let second = output_tool
-            .execute(json!({ "bash_id": shell_id }))
+            .execute(json!({ "bash_id": shell_id, "cursor": next_cursor }))
             .await
             .unwrap();
         let second_payload: Value = serde_json::from_str(&second.result).unwrap();
@@ -171,6 +181,7 @@ mod tests {
             .await
             .unwrap();
         let filtered_payload: Value = serde_json::from_str(&filtered.result).unwrap();
+        let next_cursor = filtered_payload["next_cursor"].as_u64().unwrap_or(0);
         assert!(filtered_payload["output"]
             .as_str()
             .unwrap_or_default()
@@ -181,7 +192,7 @@ mod tests {
             .contains("beta"));
 
         let second = output_tool
-            .execute(json!({ "bash_id": shell_id }))
+            .execute(json!({ "bash_id": shell_id, "cursor": next_cursor }))
             .await
             .unwrap();
         let second_payload: Value = serde_json::from_str(&second.result).unwrap();

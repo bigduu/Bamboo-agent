@@ -49,7 +49,7 @@ impl<'a> ToolExecutionContext<'a> {
                 },
                 other => other,
             };
-            let _ = tx.send(event).await;
+            let _ = tx.try_send(event);
         }
     }
 
@@ -60,5 +60,40 @@ impl<'a> ToolExecutionContext<'a> {
             content: content.into(),
         })
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn emit_does_not_block_when_channel_is_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(AgentEvent::Token {
+            content: "full".to_string(),
+        })
+        .await
+        .unwrap();
+        let ctx = ToolExecutionContext {
+            session_id: Some("session_1"),
+            tool_call_id: "call_1",
+            event_tx: Some(&tx),
+        };
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            ctx.emit(AgentEvent::Token {
+                content: "next".to_string(),
+            }),
+        )
+        .await
+        .expect("emit should not block on full channel");
+
+        let first = rx.recv().await.unwrap();
+        match first {
+            AgentEvent::Token { content } => assert_eq!(content, "full"),
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }

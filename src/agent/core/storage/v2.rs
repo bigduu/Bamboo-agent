@@ -61,6 +61,13 @@ pub struct SessionIndexEntry {
     pub last_activity_at: DateTime<Utc>,
     pub message_count: usize,
     pub has_attachments: bool,
+    /// Last known run status for this session
+    /// ("pending" | "running" | "completed" | "error" | "cancelled" | "skipped").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_status: Option<String>,
+    /// Last known terminal error message, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_error: Option<String>,
     /// Last token usage information (updated after each LLM call).
     ///
     /// Stored in the global index so the frontend can display token usage without
@@ -260,6 +267,16 @@ impl SessionStoreV2 {
         rel_path: String,
     ) -> io::Result<()> {
         let has_attachments = self.compute_has_attachments(&session.id).await;
+        let last_run_status = session
+            .metadata
+            .get("last_run_status")
+            .cloned()
+            .filter(|value| !value.trim().is_empty());
+        let last_run_error = session
+            .metadata
+            .get("last_run_error")
+            .cloned()
+            .filter(|value| !value.trim().is_empty());
         let created_by_schedule_id = session
             .metadata
             .get("created_by_schedule_id")
@@ -283,6 +300,8 @@ impl SessionStoreV2 {
                     last_activity_at: session.updated_at,
                     message_count: session.messages.len(),
                     has_attachments,
+                    last_run_status,
+                    last_run_error,
                     token_usage: session.token_usage.clone(),
                 },
             );

@@ -1,10 +1,12 @@
-use crate::agent::core::tools::{Tool, ToolError, ToolResult};
+use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use async_trait::async_trait;
 use globset::{GlobBuilder, GlobSetBuilder};
 use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+use super::workspace_state;
 
 const DEFAULT_GLOB_MATCHES: usize = 100;
 const MAX_GLOB_MATCHES: usize = 200;
@@ -93,6 +95,15 @@ impl Tool for GlobTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        self.execute_with_context(args, ToolExecutionContext::none("Glob"))
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let parsed: GlobArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid Glob args: {}", e)))?;
 
@@ -102,11 +113,19 @@ impl Tool for GlobTool {
             ));
         }
 
+        let default_root = workspace_state::workspace_or_process_cwd(ctx.session_id);
         let root = parsed
             .path
             .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            .map(|value| {
+                let path = PathBuf::from(value);
+                if path.is_absolute() {
+                    path
+                } else {
+                    default_root.join(path)
+                }
+            })
+            .unwrap_or(default_root);
 
         if !root.exists() || !root.is_dir() {
             return Err(ToolError::Execution(format!(

@@ -26,7 +26,12 @@ pub fn check_permissions(
             )]))
         }
         "Bash" => {
-            let command = required_string_arg(args, "command")?;
+            let command = required_string_arg(args, "command")?.trim();
+            if command.is_empty() {
+                return Err(PermissionError::CheckFailed(
+                    "Missing or invalid 'command' parameter".to_string(),
+                ));
+            }
             let mut contexts = Vec::new();
             if is_delete_command(command) {
                 contexts.push(PermissionContext::new(
@@ -41,6 +46,22 @@ pub fn check_permissions(
                 format!("Execute command: {}", command),
             ));
             Ok(Some(contexts))
+        }
+        "memory_note" => {
+            let action = required_string_arg(args, "action")?
+                .trim()
+                .to_ascii_lowercase();
+            if matches!(action.as_str(), "append" | "replace" | "clear") {
+                let notes_dir = crate::core::paths::bamboo_dir().join("notes");
+                let notes_path = crate::core::paths::path_to_display_string(&notes_dir);
+                Ok(Some(vec![PermissionContext::new(
+                    PermissionType::WriteFile,
+                    notes_path.clone(),
+                    format!("memory_note action={} in {}", action, notes_path),
+                )]))
+            } else {
+                Ok(None)
+            }
         }
         "BashOutput" => {
             let bash_id = required_string_arg(args, "bash_id")?;
@@ -134,5 +155,25 @@ mod tests {
         let contexts = check_permissions("WebFetch", &args).unwrap().unwrap();
         assert_eq!(contexts[0].permission_type, PermissionType::HttpRequest);
         assert_eq!(contexts[0].resource, "example.com");
+    }
+
+    #[test]
+    fn check_permissions_bash_trims_command() {
+        let args = json!({"command": "   ls -la   "});
+        let contexts = check_permissions("Bash", &args).unwrap().unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].resource, "ls -la");
+    }
+
+    #[test]
+    fn check_permissions_memory_note_write_actions_require_write_context() {
+        let append = check_permissions("memory_note", &json!({"action": "append"}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(append.len(), 1);
+        assert_eq!(append[0].permission_type, PermissionType::WriteFile);
+
+        let read = check_permissions("memory_note", &json!({"action": "read"})).unwrap();
+        assert!(read.is_none());
     }
 }

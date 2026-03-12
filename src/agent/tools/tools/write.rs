@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
 
+use super::read_tracker::ReadState;
 use super::{file_change, read_tracker};
 
 #[derive(Debug, Deserialize)]
@@ -78,27 +79,28 @@ impl Tool for WriteTool {
 
         if path.exists() {
             if let Some(session_id) = ctx.session_id {
-                if !read_tracker::has_read(session_id, file_path).await {
-                    return Err(ToolError::Execution(
-                        "Write requires reading the target file first via Read".to_string(),
-                    ));
+                match read_tracker::read_state(session_id, file_path).await {
+                    ReadState::Unread => {
+                        return Err(ToolError::Execution(
+                            "Write requires reading the target file first via Read".to_string(),
+                        ));
+                    }
+                    ReadState::Stale => {
+                        return Err(ToolError::Execution(
+                            "Target file changed after last Read; call Read again before Write"
+                                .to_string(),
+                        ));
+                    }
+                    ReadState::Fresh => {}
                 }
             }
-        }
-
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ToolError::Execution(format!("Failed to create parent directory: {}", e))
-            })?;
         }
 
         let previous_bytes = file_change::read_existing_bytes(path).await?;
         let checkpoint = file_change::create_checkpoint(path, previous_bytes.as_deref()).await?;
         let next_content = parsed.content;
 
-        tokio::fs::write(path, &next_content)
-            .await
-            .map_err(|e| ToolError::Execution(format!("Failed to write file: {}", e)))?;
+        file_change::atomic_write_text(path, &next_content).await?;
 
         let previous_text = file_change::bytes_to_lossy_text(previous_bytes.as_deref());
         let payload = file_change::build_file_change_payload(
@@ -115,5 +117,86 @@ impl Tool for WriteTool {
             result: payload,
             display_preference: Some("Default".to_string()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::tools::tools::ReadTool;
+    use serde_json::json;
+
+    fn ctx<'a>(session_id: &'a str) -> ToolExecutionContext<'a> {
+        ToolExecutionContext {
+            session_id: Some(session_id),
+            tool_call_id: "call_1",
+            event_tx: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn write_requires_fresh_read_for_existing_files() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "v1").await.unwrap();
+        let write_tool = WriteTool::new();
+        let read_tool = ReadTool::new();
+
+        let denied = write_tool
+            .execute_with_context(
+                json!({"file_path": file.path(), "content": "v2"}),
+                ctx("session_a"),
+            )
+            .await;
+        assert!(matches!(denied, Err(ToolError::Execution(_))));
+
+        let _ = read_tool
+            .execute_with_context(json!({"file_path": file.path()}), ctx("session_a"))
+            .await
+            .unwrap();
+
+        tokio::fs::write(file.path(), "external change")
+            .await
+            .unwrap();
+
+        let stale = write_tool
+            .execute_with_context(
+                json!({"file_path": file.path(), "content": "v3"}),
+                ctx("session_a"),
+            )
+            .await;
+        assert!(matches!(stale, Err(ToolError::Execution(msg)) if msg.contains("changed")));
+
+        let _ = read_tool
+            .execute_with_context(json!({"file_path": file.path()}), ctx("session_a"))
+            .await
+            .unwrap();
+        let ok = write_tool
+            .execute_with_context(
+                json!({"file_path": file.path(), "content": "final"}),
+                ctx("session_a"),
+            )
+            .await
+            .unwrap();
+        assert!(ok.success);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_rejects_symlinked_path_components() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        tokio::fs::create_dir_all(&real).await.unwrap();
+        symlink(&real, &link).unwrap();
+
+        let write_tool = WriteTool::new();
+        let result = write_tool
+            .execute(json!({
+                "file_path": link.join("test.txt"),
+                "content": "hello"
+            }))
+            .await;
+        assert!(matches!(result, Err(ToolError::Execution(msg)) if msg.contains("symlinked")));
     }
 }

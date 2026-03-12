@@ -145,6 +145,25 @@ async fn test_get_filtered_tools_with_chat_id() {
 }
 
 #[actix_web::test]
+async fn test_get_filtered_tools_with_session_id() {
+    let state = crate::e2e::common::create_test_app().await;
+
+    let app = test::init_service(App::new().app_data(state).route(
+        "/v1/skills/filtered-tools",
+        web::get().to(skill::get_filtered_tools),
+    ))
+    .await;
+
+    let req = test::TestRequest::get()
+        .uri("/v1/skills/filtered-tools?session_id=test-session-123")
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+
+    assert!(resp.status().is_success());
+}
+
+#[actix_web::test]
 async fn test_get_available_workflows_endpoint() {
     let state = crate::e2e::common::create_test_app().await;
 
@@ -196,10 +215,11 @@ async fn test_skills_endpoints_with_query_params() {
     assert!(resp.status().is_success());
 
     // Test filtered-tools with query params
-    let req = test::TestRequest::get()
-        .uri("/v1/skills/filtered-tools?chat_id=test-chat")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert!(resp.status().is_success());
+    for query in ["chat_id=test-chat", "session_id=test-session"] {
+        let req = test::TestRequest::get()
+            .uri(&format!("/v1/skills/filtered-tools?{query}"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+    }
 }
