@@ -8,6 +8,7 @@ use crate::agent::core::{agent::Role, tools::ToolSchema, Message};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::tool_schema::sanitize_openai_function_parameters_schema;
 use crate::agent::llm::provider::Result;
 use crate::agent::llm::types::LLMChunk;
 
@@ -56,7 +57,19 @@ pub fn messages_to_openai_compat_json(messages: &[Message]) -> Vec<Value> {
 
 /// Convert internal [`ToolSchema`] values to the OpenAI `tools` array JSON.
 pub fn tools_to_openai_compat_json(tools: &[ToolSchema]) -> Vec<Value> {
-    tools.iter().map(|t| json!(t)).collect()
+    tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": t.schema_type,
+                "function": {
+                    "name": t.function.name,
+                    "description": t.function.description,
+                    "parameters": sanitize_openai_function_parameters_schema(&t.function.parameters),
+                }
+            })
+        })
+        .collect()
 }
 
 /// Build a standard OpenAI-compatible streaming chat request body.
@@ -280,6 +293,32 @@ mod tests {
         assert!(out[0].get("schema_type").is_none());
         assert_eq!(out[0]["function"]["name"], "search");
         assert_eq!(out[0]["function"]["description"], "Search the web");
+        assert_eq!(out[0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn tools_to_openai_compat_json_sanitizes_top_level_combinators() {
+        let tools = vec![ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "edit".to_string(),
+                description: "Edit file".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string" },
+                        "patch": { "type": "string" }
+                    },
+                    "oneOf": [
+                        { "required": ["patch"] },
+                        { "required": ["old_string", "new_string"] }
+                    ]
+                }),
+            },
+        }];
+
+        let out = super::tools_to_openai_compat_json(&tools);
+        assert!(out[0]["function"]["parameters"]["oneOf"].is_null());
         assert_eq!(out[0]["function"]["parameters"]["type"], "object");
     }
 

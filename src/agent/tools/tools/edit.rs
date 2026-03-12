@@ -230,10 +230,6 @@ impl Tool for EditTool {
                 }
             },
             "required": ["file_path"],
-            "oneOf": [
-                { "required": ["old_string", "new_string"] },
-                { "required": ["patch"] }
-            ],
             "additionalProperties": false
         })
     }

@@ -4,6 +4,7 @@
 //! OpenAI Responses API instead of Chat Completions. We normalize Responses SSE
 //! events into [`LLMChunk`] so the rest of Bamboo can stay provider-agnostic.
 
+use super::tool_schema::sanitize_openai_function_parameters_schema;
 use crate::agent::core::{agent::Role, tools::ToolSchema, Message};
 use crate::agent::llm::models::ContentPart;
 use crate::agent::llm::provider::Result;
@@ -147,7 +148,7 @@ pub fn tools_to_responses_json(tools: &[ToolSchema]) -> Vec<Value> {
                 "type": t.schema_type,
                 "name": t.function.name,
                 "description": t.function.description,
-                "parameters": t.function.parameters,
+                "parameters": sanitize_openai_function_parameters_schema(&t.function.parameters),
             })
         })
         .collect()
@@ -375,6 +376,32 @@ mod tests {
         assert_eq!(out[0]["description"], "Search things");
         assert!(out[0].get("function").is_none());
         assert!(out[0].get("parameters").is_some());
+    }
+
+    #[test]
+    fn tools_to_responses_json_sanitizes_top_level_combinators() {
+        let tools = vec![ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "edit".to_string(),
+                description: "Edit file".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string" },
+                        "patch": { "type": "string" }
+                    },
+                    "oneOf": [
+                        { "required": ["patch"] },
+                        { "required": ["old_string", "new_string"] }
+                    ]
+                }),
+            },
+        }];
+
+        let out = tools_to_responses_json(&tools);
+        assert!(out[0]["parameters"]["oneOf"].is_null());
+        assert_eq!(out[0]["parameters"]["type"], "object");
     }
 
     #[test]

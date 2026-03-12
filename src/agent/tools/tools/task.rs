@@ -116,10 +116,7 @@ impl Tool for TaskTool {
                     "description": "The type of specialized agent to use"
                 }
             },
-            "oneOf": [
-                {"required": ["title", "responsibility", "prompt", "subagent_type"]},
-                {"required": ["description", "responsibility", "prompt", "subagent_type"]}
-            ],
+            "required": ["responsibility", "prompt", "subagent_type"],
             "additionalProperties": false
         })
     }

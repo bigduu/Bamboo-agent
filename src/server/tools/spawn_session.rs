@@ -149,10 +149,7 @@ impl Tool for SpawnSessionTool {
                 "prompt": { "type": "string", "description": "Detailed task instructions and expected output for the child session." },
                 "subagent_type": { "type": "string", "description": "Specialized agent profile to use (for example: general-purpose, researcher, coder)." }
             },
-            "oneOf": [
-                { "required": ["title", "responsibility", "prompt", "subagent_type"] },
-                { "required": ["description", "responsibility", "prompt", "subagent_type"] }
-            ],
+            "required": ["responsibility", "prompt", "subagent_type"],
             "additionalProperties": false
         })
     }

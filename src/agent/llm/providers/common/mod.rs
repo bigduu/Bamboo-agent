@@ -5,5 +5,6 @@ pub mod openai_compat;
 pub mod openai_responses;
 pub mod sse;
 pub mod stream_tool_accumulator;
+pub mod tool_schema;
 
 pub use masking_decorator::MaskingProviderDecorator;

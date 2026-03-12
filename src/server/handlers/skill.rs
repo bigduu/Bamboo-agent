@@ -126,10 +126,7 @@ pub async fn get_filtered_tools(
     state: web::Data<AppState>,
     query: web::Query<FilteredToolsQuery>,
 ) -> Result<HttpResponse, AppError> {
-    let session_id = query
-        .session_id
-        .as_deref()
-        .or(query.chat_id.as_deref());
+    let session_id = query.session_id.as_deref().or(query.chat_id.as_deref());
     let allowed_tools = state
         .skill_manager
         .as_ref()

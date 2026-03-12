@@ -665,11 +665,7 @@ mod tests {
         assert_eq!(edit["properties"]["new_string"]["type"], "string");
         assert_eq!(edit["properties"]["patch"]["type"], "string");
         assert_eq!(edit["properties"]["replace_all"]["type"], "boolean");
-        assert_eq!(
-            edit["oneOf"][0]["required"],
-            json!(["old_string", "new_string"])
-        );
-        assert_eq!(edit["oneOf"][1]["required"], json!(["patch"]));
+        assert!(edit.get("oneOf").is_none());
 
         let bash = get_params("Bash");
         assert_eq!(bash["required"], json!(["command"]));
@@ -678,6 +674,30 @@ mod tests {
         let bash_output = get_params("BashOutput");
         assert_eq!(bash_output["required"], json!(["bash_id"]));
         assert_eq!(bash_output["properties"]["filter"]["type"], "string");
+    }
+
+    #[test]
+    fn test_tool_schemas_avoid_openai_forbidden_top_level_keywords() {
+        let executor = BuiltinToolExecutor::new();
+        let tools = executor.list_tools();
+        let forbidden = ["oneOf", "anyOf", "allOf", "not", "enum"];
+
+        for tool in tools {
+            let params = &tool.function.parameters;
+            assert_eq!(
+                params["type"], "object",
+                "tool '{}' parameters must be a top-level object schema",
+                tool.function.name
+            );
+            for key in forbidden {
+                assert!(
+                    params.get(key).is_none(),
+                    "tool '{}' parameters contains forbidden top-level keyword '{}'",
+                    tool.function.name,
+                    key
+                );
+            }
+        }
     }
 
     #[test]
