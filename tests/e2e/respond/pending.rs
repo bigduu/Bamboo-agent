@@ -1,0 +1,21 @@
+use super::*;
+
+#[actix_web::test]
+async fn test_get_pending_question_endpoint() {
+    let state = crate::e2e::common::create_test_app().await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/respond/{session_id}/pending",
+        web::get().to(handlers::respond::get_pending_question),
+    ))
+    .await;
+
+    let uri = format!("/api/v1/respond/{}/pending", session_id);
+    let req = test::TestRequest::get().uri(&uri).to_request();
+
+    let resp = test::call_service(&app, req).await;
+
+    // Should return pending question or not found
+    assert!(resp.status().is_success() || resp.status().is_client_error());
+}

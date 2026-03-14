@@ -6,16 +6,16 @@
 //! # Handler Organization
 //!
 //! - **agent/** - Core agent API handlers (chat, execute, events, etc.)
-//! - **agent_api.rs** - Agent management endpoints
+//! - **agent_api/** - Agent management endpoints
 //! - **command.rs** - Command execution endpoints
-//! - **openai.rs** - OpenAI-compatible API endpoints
+//! - **openai/** - OpenAI-compatible API endpoints
 //! - **anthropic/** - Anthropic Claude API endpoints
 //! - **gemini.rs** - Google Gemini API endpoints
-//! - **settings.rs** - Configuration management
+//! - **settings/** - Configuration management
 //! - **skill.rs** - Skill management endpoints
 //! - **tools.rs** - Tool execution endpoints
 //! - **workspace.rs** - Workspace management
-//! - **copilot_auth.rs** - GitHub Copilot authentication
+//! - **copilot_auth/** - GitHub Copilot authentication
 //!
 //! # API Architecture
 //!

@@ -68,3 +68,6 @@ impl Default for AgentLoopConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

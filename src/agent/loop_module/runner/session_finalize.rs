@@ -1,0 +1,40 @@
+//! Session finalization helpers for the agent loop runner.
+
+use tokio::sync::mpsc;
+
+use crate::agent::core::{AgentEvent, Session};
+use crate::agent::loop_module::config::AgentLoopConfig;
+use crate::agent::loop_module::todo_context::TodoLoopContext;
+use crate::agent::metrics::MetricsCollector;
+
+mod completion_event;
+mod completion_metrics;
+
+use completion_event::send_complete_event_if_needed;
+use completion_metrics::record_session_resolution;
+
+pub(super) async fn finalize_session(
+    todo_context: Option<TodoLoopContext>,
+    session: &mut Session,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    session_id: &str,
+    config: &AgentLoopConfig,
+    metrics_collector: Option<&MetricsCollector>,
+    sent_complete: bool,
+) {
+    super::todo_lifecycle::finalize_todo_context(
+        todo_context,
+        session,
+        event_tx,
+        session_id,
+        config,
+    )
+    .await;
+
+    send_complete_event_if_needed(event_tx, sent_complete).await;
+
+    record_session_resolution(metrics_collector, session_id, session);
+}
+
+#[cfg(test)]
+mod tests;
