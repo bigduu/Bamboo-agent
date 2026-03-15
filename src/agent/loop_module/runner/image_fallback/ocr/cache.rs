@@ -16,7 +16,7 @@ pub(super) async fn ensure_session_image_ocr_cached(
             continue;
         };
 
-        let image_urls = super::super::super::persistable_image_urls(parts);
+        let image_urls = super::super::persistable_image_urls(parts);
         if image_urls.is_empty() {
             continue;
         }

@@ -17,7 +17,7 @@ pub(super) async fn rewrite_parts_to_ocr_text(
             ContentPart::Text { text } => out.push_str(text),
             ContentPart::ImageUrl { image_url } => {
                 image_index += 1;
-                let summary = super::super::super::placeholder::summarize_image_url(&image_url.url);
+                let summary = super::super::placeholder::summarize_image_url(&image_url.url);
 
                 let cached_lines = cached.and_then(|items| {
                     items
