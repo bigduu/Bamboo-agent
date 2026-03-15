@@ -6,6 +6,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::server::{app_state::AppState, error::AppError};
 
 use super::PreparedChatRequest;
+use crate::agent::llm::LLMRequestOptions;
 use sse::wrap_sse_data;
 use worker::{spawn_stream_worker, StreamWorkerArgs};
 
@@ -24,6 +25,7 @@ pub(super) async fn handle_streaming_chat(
         internal_messages,
         internal_tools,
         max_tokens,
+        reasoning_effort,
         estimated_prompt_tokens,
         ..
     } = prepared;
@@ -38,11 +40,12 @@ pub(super) async fn handle_streaming_chat(
     let provider = app_state.get_provider().await;
 
     let stream_result = provider
-        .chat_stream(
+        .chat_stream_with_options(
             &internal_messages,
             &internal_tools,
             max_tokens,
             resolved_model.as_str(),
+            Some(&LLMRequestOptions { reasoning_effort }),
         )
         .await
         .map_err(super::map_provider_error)?;

@@ -42,8 +42,11 @@ pub(super) async fn handle_round_post_llm(
     let stream_output = round_llm_output.stream_output;
 
     if stream_output.tool_calls.is_empty() {
+        let reasoning = (!stream_output.reasoning_content.trim().is_empty())
+            .then_some(stream_output.reasoning_content);
         return Ok(no_tool_calls::handle_no_tool_calls(
             stream_output.content,
+            reasoning,
             round_llm_output.prompt_tokens,
             round_llm_output.completion_tokens,
             round_llm_output.round_usage,

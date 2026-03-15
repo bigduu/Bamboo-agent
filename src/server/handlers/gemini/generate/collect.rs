@@ -18,6 +18,7 @@ where
     while let Some(chunk) = stream.next().await {
         match chunk? {
             LLMChunk::Token(token) => collected.full_content.push_str(&token),
+            LLMChunk::ReasoningToken(_) => {}
             LLMChunk::Done => break,
             // Keep the last tool call batch, matching the original behavior.
             LLMChunk::ToolCalls(calls) => collected.tool_calls = Some(calls),

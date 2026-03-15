@@ -272,6 +272,7 @@ mod comprehensive_config_tests {
             api_key_encrypted: None,
             base_url: None,
             model: Some("claude-3".to_string()),
+            reasoning_effort: None,
             max_tokens: None,
             extra: Default::default(),
         });

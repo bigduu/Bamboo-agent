@@ -64,12 +64,14 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
         &[],
         128,
         "test-model",
+        None,
         "session-stream-1",
     )
     .await
     .expect("execute llm stream");
 
     assert_eq!(stream_output.content, "hi");
+    assert!(stream_output.reasoning_content.is_empty());
     assert!(session.token_usage.is_some());
 
     let first = event_rx.recv().await.expect("budget event expected");

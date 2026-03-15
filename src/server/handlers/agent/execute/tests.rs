@@ -1,4 +1,5 @@
 use super::ExecuteRequest;
+use crate::core::ReasoningEffort;
 use crate::server::app_state::{AgentRunner, AgentStatus};
 
 #[test]
@@ -72,6 +73,7 @@ fn execute_request_requires_model() {
 fn execute_request_empty_model_fails_validation() {
     let request = ExecuteRequest {
         model: "   ".to_string(),
+        reasoning_effort: None,
     };
 
     // Handler validation: trim and check if empty.
@@ -89,4 +91,27 @@ fn execute_request_with_valid_model_succeeds() {
     let request: ExecuteRequest =
         serde_json::from_str(json).expect("execute request should deserialize");
     assert_eq!(request.model, "gpt-4o-mini");
+}
+
+#[test]
+fn execute_request_accepts_reasoning_effort() {
+    let json = r#"{
+            "model": "gpt-4o-mini",
+            "reasoning_effort": "xhigh"
+        }"#;
+
+    let request: ExecuteRequest =
+        serde_json::from_str(json).expect("execute request should deserialize");
+    assert_eq!(request.reasoning_effort, Some(ReasoningEffort::Xhigh));
+}
+
+#[test]
+fn execute_request_rejects_invalid_reasoning_effort() {
+    let json = r#"{
+            "model": "gpt-4o-mini",
+            "reasoning_effort": "extreme"
+        }"#;
+
+    let result: Result<ExecuteRequest, _> = serde_json::from_str(json);
+    assert!(result.is_err());
 }

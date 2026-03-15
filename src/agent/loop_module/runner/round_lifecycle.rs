@@ -54,6 +54,7 @@ pub(super) async fn execute_llm_round(
         tool_schemas,
         prepared.budget.max_output_tokens,
         model,
+        config.reasoning_effort,
         session_id,
     )
     .await?;
@@ -74,10 +75,11 @@ pub(super) async fn execute_llm_round(
     };
 
     log::debug!(
-        "[{}] LLM response completed in {}ms, {} chars streamed, {} estimated tokens",
+        "[{}] LLM response completed in {}ms, answer_chars={}, reasoning_chars={}, {} estimated tokens",
         session_id,
         llm_duration,
         stream_output.token_count,
+        stream_output.reasoning_content.len(),
         round_usage.total_tokens
     );
 

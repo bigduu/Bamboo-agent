@@ -25,6 +25,7 @@ fn build_config_with_mcp_secrets(temp_dir: &std::path::Path) -> Config {
                 api_key_encrypted: None,
                 base_url: None,
                 model: Some("gpt-4o".to_string()),
+                reasoning_effort: None,
                 responses_only_models: vec![],
                 extra: Default::default(),
             }),

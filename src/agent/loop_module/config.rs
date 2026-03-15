@@ -8,6 +8,7 @@ use crate::agent::core::tools::ToolSchema;
 use crate::agent::metrics::MetricsCollector;
 use crate::agent::skill::SkillManager;
 use crate::agent::tools::ToolRegistry;
+use crate::core::ReasoningEffort;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFallbackMode {
@@ -40,6 +41,8 @@ pub struct AgentLoopConfig {
     pub metrics_collector: Option<MetricsCollector>,
     /// Model name used for metrics attribution
     pub model_name: Option<String>,
+    /// Optional request-time reasoning effort override.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Token budget for context management (optional, defaults to model's limits)
     pub token_budget: Option<TokenBudget>,
     /// Optional image fallback behavior applied to *LLM requests only* (never persisted).
@@ -63,6 +66,7 @@ impl Default for AgentLoopConfig {
             attachment_reader: None,
             metrics_collector: None,
             model_name: None,
+            reasoning_effort: None,
             token_budget: None,
             image_fallback: None,
         }

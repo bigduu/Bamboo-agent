@@ -55,6 +55,7 @@ pub async fn create_provider_with_dir(
                     provider = provider
                         .with_responses_only_models(copilot_cfg.responses_only_models.clone());
                 }
+                provider = provider.with_reasoning_effort(copilot_cfg.reasoning_effort);
             }
 
             // Try to authenticate (using cache if available)
@@ -102,6 +103,8 @@ pub async fn create_provider_with_dir(
                     .with_responses_only_models(openai_config.responses_only_models.clone());
             }
 
+            provider = provider.with_reasoning_effort(openai_config.reasoning_effort);
+
             Ok(Arc::new(MaskingProviderDecorator::new(
                 provider,
                 masking_config.clone(),
@@ -131,6 +134,8 @@ pub async fn create_provider_with_dir(
                 provider = provider.with_max_tokens(max_tokens);
             }
 
+            provider = provider.with_reasoning_effort(anthropic_config.reasoning_effort);
+
             Ok(Arc::new(MaskingProviderDecorator::new(
                 provider,
                 masking_config.clone(),
@@ -156,6 +161,8 @@ pub async fn create_provider_with_dir(
                     provider = provider.with_base_url(base_url);
                 }
             }
+
+            provider = provider.with_reasoning_effort(gemini_config.reasoning_effort);
 
             Ok(Arc::new(MaskingProviderDecorator::new(
                 provider,
@@ -269,6 +276,7 @@ mod tests {
                     api_key_encrypted: None,
                     base_url: None,
                     model: None,
+                    reasoning_effort: None,
                     responses_only_models: vec![],
                     extra: Default::default(),
                 }),
@@ -297,6 +305,7 @@ mod tests {
                     api_key_encrypted: None,
                     base_url: Some("https://custom.openai.com/v1".to_string()),
                     model: Some("gpt-4o".to_string()),
+                    reasoning_effort: None,
                     responses_only_models: vec![],
                     extra: Default::default(),
                 }),
@@ -320,6 +329,7 @@ mod tests {
                     base_url: None,
                     model: Some("claude-3-5-sonnet-20241022".to_string()),
                     max_tokens: Some(4096),
+                    reasoning_effort: None,
                     extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()
@@ -341,6 +351,7 @@ mod tests {
                     api_key_encrypted: None,
                     base_url: None,
                     model: Some("gemini-pro".to_string()),
+                    reasoning_effort: None,
                     extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()

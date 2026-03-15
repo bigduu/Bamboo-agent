@@ -114,6 +114,10 @@ impl Tool for ScheduleTasksTool {
                         "system_prompt": { "type": "string" },
                         "task_message": { "type": "string" },
                         "model": { "type": "string" },
+                        "reasoning_effort": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high", "xhigh"]
+                        },
                         "workspace_path": { "type": "string" },
                         "enhance_prompt": { "type": "string" },
                         "auto_execute": { "type": "boolean" }

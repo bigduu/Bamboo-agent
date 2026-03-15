@@ -107,7 +107,7 @@ pub use protocol::{
     AnthropicProtocol, FromProvider, GeminiProtocol, OpenAIProtocol, ProtocolError, ProtocolResult,
     ToProvider,
 };
-pub use provider::{LLMError, LLMProvider, LLMStream};
+pub use provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream};
 pub use provider_factory::{
     create_provider, create_provider_with_dir, validate_provider_config, AVAILABLE_PROVIDERS,
 };

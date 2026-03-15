@@ -4,6 +4,7 @@ use bytes::Bytes;
 use serde_json::json;
 
 use crate::agent::llm::api::models::ChatCompletionRequest;
+use crate::agent::llm::LLMRequestOptions;
 use crate::agent::metrics::types::ForwardStatus;
 use crate::server::{app_state::AppState, error::AppError};
 
@@ -37,11 +38,14 @@ pub(super) async fn handle_streaming_messages(
 
     // Start streaming.
     let stream_result = provider
-        .chat_stream(
+        .chat_stream_with_options(
             &prepared.internal_messages,
             &prepared.internal_tools,
             prepared.max_tokens,
             openai_request.model.as_str(),
+            Some(&LLMRequestOptions {
+                reasoning_effort: prepared.reasoning_effort,
+            }),
         )
         .await;
 

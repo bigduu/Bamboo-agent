@@ -7,7 +7,8 @@ use crate::agent::core::agent::events::TokenBudgetUsage;
 use crate::agent::core::budget::PreparedContext;
 use crate::agent::core::tools::ToolSchema;
 use crate::agent::core::{AgentError, AgentEvent, Session};
-use crate::agent::llm::LLMProvider;
+use crate::agent::llm::{LLMProvider, LLMRequestOptions};
+use crate::core::ReasoningEffort;
 
 pub(super) async fn execute_llm_stream(
     session: &mut Session,
@@ -18,6 +19,7 @@ pub(super) async fn execute_llm_stream(
     tool_schemas: &[ToolSchema],
     max_output_tokens: u32,
     model: &str,
+    reasoning_effort: Option<ReasoningEffort>,
     session_id: &str,
 ) -> Result<
     (
@@ -27,12 +29,14 @@ pub(super) async fn execute_llm_stream(
     AgentError,
 > {
     let llm_started_at = std::time::Instant::now();
+    let request_options = LLMRequestOptions { reasoning_effort };
     let stream = llm
-        .chat_stream(
+        .chat_stream_with_options(
             &prepared_context.messages,
             tool_schemas,
             Some(max_output_tokens),
             model,
+            Some(&request_options),
         )
         .await
         .map_err(|error| AgentError::LLM(error.to_string()))?;

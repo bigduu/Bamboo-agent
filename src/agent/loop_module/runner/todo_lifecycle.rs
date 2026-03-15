@@ -9,6 +9,7 @@ use crate::agent::llm::LLMProvider;
 use crate::agent::loop_module::config::AgentLoopConfig;
 use crate::agent::loop_module::todo_context::TodoLoopContext;
 use crate::agent::metrics::TokenUsage as MetricsTokenUsage;
+use crate::core::ReasoningEffort;
 
 mod evaluation;
 mod finalize;
@@ -21,6 +22,7 @@ pub(super) async fn evaluate_round_todo_progress(
     session_id: &str,
     round_number: usize,
     model_name: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<MetricsTokenUsage, AgentError> {
     evaluation::evaluate_round_todo_progress(
         todo_context,
@@ -30,6 +32,7 @@ pub(super) async fn evaluate_round_todo_progress(
         session_id,
         round_number,
         model_name,
+        reasoning_effort,
     )
     .await
 }

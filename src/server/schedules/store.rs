@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::core::ReasoningEffort;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -30,6 +31,9 @@ pub struct ScheduleRunConfig {
     /// Model used when auto-executing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Optional reasoning effort override used when auto-executing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Optional workspace path context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,

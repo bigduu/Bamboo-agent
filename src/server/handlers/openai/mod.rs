@@ -1,6 +1,6 @@
 mod chat;
 mod config;
-mod helpers;
+pub(crate) mod helpers;
 mod models;
 mod responses;
 mod types;

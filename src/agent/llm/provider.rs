@@ -5,6 +5,7 @@
 
 use crate::agent::core::{tools::ToolSchema, Message};
 use crate::agent::llm::types::LLMChunk;
+use crate::core::ReasoningEffort;
 use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
@@ -43,6 +44,13 @@ pub type Result<T> = std::result::Result<T, LLMError>;
 
 /// Type alias for boxed streaming LLM responses
 pub type LLMStream = Pin<Box<dyn Stream<Item = Result<LLMChunk>> + Send>>;
+
+/// Optional request-time controls for provider calls.
+#[derive(Debug, Clone, Default)]
+pub struct LLMRequestOptions {
+    /// Override reasoning effort for this request.
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
 
 /// Trait for LLM provider implementations
 ///
@@ -99,6 +107,22 @@ pub trait LLMProvider: Send + Sync {
         max_output_tokens: Option<u32>,
         model: &str,
     ) -> Result<LLMStream>;
+
+    /// Stream chat completion with optional request-level controls.
+    ///
+    /// Default implementation preserves backward compatibility by delegating to
+    /// [`LLMProvider::chat_stream`].
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        _options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
+        self.chat_stream(messages, tools, max_output_tokens, model)
+            .await
+    }
 
     /// Lists available models from this provider
     ///

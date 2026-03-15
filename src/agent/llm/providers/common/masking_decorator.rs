@@ -4,7 +4,7 @@ use crate::agent::core::{tools::ToolSchema, Message};
 use crate::agent::llm::models::ContentPart;
 use crate::core::keyword_masking::KeywordMaskingConfig;
 
-use crate::agent::llm::provider::{LLMProvider, LLMStream, Result};
+use crate::agent::llm::provider::{LLMProvider, LLMRequestOptions, LLMStream, Result};
 
 /// Decorates an [`LLMProvider`] by applying keyword masking to outgoing messages.
 ///
@@ -70,6 +70,54 @@ impl<P: LLMProvider> LLMProvider for MaskingProviderDecorator<P> {
 
         self.inner
             .chat_stream(&masked_messages, tools, max_output_tokens, model)
+            .await
+    }
+
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
+        if self.masking_config.entries.is_empty() {
+            return self
+                .inner
+                .chat_stream_with_options(messages, tools, max_output_tokens, model, options)
+                .await;
+        }
+
+        let masked_messages: Vec<Message> = messages
+            .iter()
+            .map(|m| {
+                let mut masked = m.clone();
+                masked.content = self.masking_config.apply_masking(&m.content);
+                if let Some(parts) = m.content_parts.as_ref() {
+                    let masked_parts = parts
+                        .iter()
+                        .map(|part| match part {
+                            ContentPart::Text { text } => ContentPart::Text {
+                                text: self.masking_config.apply_masking(text),
+                            },
+                            ContentPart::ImageUrl { image_url } => ContentPart::ImageUrl {
+                                image_url: image_url.clone(),
+                            },
+                        })
+                        .collect::<Vec<_>>();
+                    masked.content_parts = Some(masked_parts);
+                }
+                masked
+            })
+            .collect();
+
+        log::debug!(
+            "Applied keyword masking to {} messages",
+            masked_messages.len()
+        );
+
+        self.inner
+            .chat_stream_with_options(&masked_messages, tools, max_output_tokens, model, options)
             .await
     }
 

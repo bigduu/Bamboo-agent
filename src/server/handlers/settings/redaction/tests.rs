@@ -17,6 +17,7 @@ fn config_with_openai_key() -> Config {
             api_key_encrypted: Some("enc-key".to_string()),
             base_url: None,
             model: None,
+            reasoning_effort: None,
             responses_only_models: vec![],
             extra: BTreeMap::new(),
         }),

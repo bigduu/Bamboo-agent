@@ -71,6 +71,9 @@ enum AgentEvent {
     Token {
         content: String,
     },
+    ReasoningToken {
+        content: String,
+    },
     ToolToken {
         #[allow(dead_code)]
         tool_call_id: String,
@@ -329,6 +332,10 @@ async fn stream_message(
                             print!("{}", content.green());
                             io::stdout().flush()?;
                             content_buffer.push_str(content);
+                        }
+                        AgentEvent::ReasoningToken { content } => {
+                            print!("{}", content.blue().dimmed());
+                            io::stdout().flush()?;
                         }
                         AgentEvent::ToolToken { content, .. } => {
                             // Don't mix tool output into the assistant content buffer.

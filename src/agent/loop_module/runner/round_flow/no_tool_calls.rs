@@ -10,6 +10,7 @@ use super::RoundFlowOutcome;
 
 pub(super) async fn handle_no_tool_calls(
     content: String,
+    reasoning: Option<String>,
     prompt_tokens: u64,
     completion_tokens: u64,
     round_usage: MetricsTokenUsage,
@@ -19,7 +20,7 @@ pub(super) async fn handle_no_tool_calls(
     round_id: &str,
     session_id: &str,
 ) -> RoundFlowOutcome {
-    session.add_message(Message::assistant(content, None));
+    session.add_message(Message::assistant_with_reasoning(content, None, reasoning));
 
     let _ = event_tx
         .send(AgentEvent::Complete {
@@ -58,6 +59,7 @@ mod tests {
 
         let outcome = handle_no_tool_calls(
             "final answer".to_string(),
+            Some("reasoning trace".to_string()),
             11,
             7,
             MetricsTokenUsage {
@@ -78,6 +80,10 @@ mod tests {
         assert_eq!(session.messages.len(), 1);
         assert!(matches!(session.messages[0].role, Role::Assistant));
         assert_eq!(session.messages[0].content, "final answer");
+        assert_eq!(
+            session.messages[0].reasoning.as_deref(),
+            Some("reasoning trace")
+        );
 
         let event = rx.recv().await.expect("complete event should be sent");
         match event {

@@ -29,6 +29,7 @@ impl FromProvider<AnthropicMessage> for Message {
             id: String::new(),
             role,
             content,
+            reasoning: None,
             content_parts: None,
             image_ocr: None,
             tool_calls: None, // Anthropic messages don't have tool_calls at this level
@@ -253,6 +254,7 @@ impl AnthropicResponseConverter {
             id: response.id,
             role: Role::Assistant,
             content,
+            reasoning: None,
             content_parts: None,
             image_ocr: None,
             tool_calls,

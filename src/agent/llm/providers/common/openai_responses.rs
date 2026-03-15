@@ -9,6 +9,7 @@ use crate::agent::core::{agent::Role, tools::ToolSchema, Message};
 use crate::agent::llm::models::ContentPart;
 use crate::agent::llm::provider::Result;
 use crate::agent::llm::types::LLMChunk;
+use crate::core::ReasoningEffort;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -160,6 +161,7 @@ pub fn build_responses_body(
     messages: &[Message],
     tools: &[ToolSchema],
     max_output_tokens: Option<u32>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> Value {
     let mut body = json!({
         "model": model,
@@ -175,6 +177,12 @@ pub fn build_responses_body(
 
     if let Some(max_tokens) = max_output_tokens {
         body["max_output_tokens"] = json!(max_tokens);
+    }
+
+    if let Some(reasoning_effort) = reasoning_effort {
+        body["reasoning"] = json!({
+            "effort": reasoning_effort.as_str()
+        });
     }
 
     body
@@ -201,12 +209,37 @@ struct AccFnCall {
 pub struct ResponsesSseParser {
     // item_id -> accumulated function call
     fn_calls: HashMap<String, AccFnCall>,
+    provider_label: String,
+    model: String,
+    requested_reasoning_effort: Option<ReasoningEffort>,
+    request_reasoning_enabled: bool,
+    observed_reasoning_signal: bool,
+    reasoning_event_count: usize,
+    reasoning_text_chars: usize,
+    logged_summary: bool,
 }
 
 impl ResponsesSseParser {
+    #[allow(dead_code)] // Used in tests and retained for backward compatibility.
     pub fn new() -> Self {
+        Self::new_with_context("Responses", "", None)
+    }
+
+    pub fn new_with_context(
+        provider_label: &str,
+        model: &str,
+        requested_reasoning_effort: Option<ReasoningEffort>,
+    ) -> Self {
         Self {
             fn_calls: HashMap::new(),
+            provider_label: provider_label.to_string(),
+            model: model.to_string(),
+            requested_reasoning_effort,
+            request_reasoning_enabled: requested_reasoning_effort.is_some(),
+            observed_reasoning_signal: false,
+            reasoning_event_count: 0,
+            reasoning_text_chars: 0,
+            logged_summary: false,
         }
     }
 
@@ -256,6 +289,43 @@ impl ResponsesSseParser {
         })
     }
 
+    fn log_reasoning_summary_if_needed(&mut self, usage: Option<&Value>) {
+        if self.logged_summary {
+            return;
+        }
+
+        if !(self.request_reasoning_enabled || self.observed_reasoning_signal) {
+            return;
+        }
+
+        let reasoning_tokens = usage
+            .and_then(|value| value.get("output_tokens_details"))
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(|tokens| tokens.as_u64())
+            .or_else(|| {
+                usage
+                    .and_then(|value| value.get("reasoning_tokens"))
+                    .and_then(|tokens| tokens.as_u64())
+            });
+
+        log::info!(
+            "{} responses reasoning summary: model='{}' requested_effort={} request_reasoning_enabled={} observed_reasoning_signal={} reasoning_event_count={} reasoning_text_chars={} reasoning_tokens={}",
+            self.provider_label,
+            if self.model.is_empty() { "<unknown>" } else { self.model.as_str() },
+            self.requested_reasoning_effort
+                .map(ReasoningEffort::as_str)
+                .unwrap_or("none"),
+            self.request_reasoning_enabled,
+            self.observed_reasoning_signal,
+            self.reasoning_event_count,
+            self.reasoning_text_chars,
+            reasoning_tokens
+                .map(|tokens| tokens.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        self.logged_summary = true;
+    }
+
     pub fn handle_event(&mut self, event: &str, data: &str) -> Result<Option<LLMChunk>> {
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             // Be lenient: some upstreams occasionally send non-JSON keepalives.
@@ -263,6 +333,24 @@ impl ResponsesSseParser {
         };
 
         let event_type = self.event_type(event, &v);
+
+        if event_type.contains("reasoning") {
+            self.observed_reasoning_signal = true;
+            self.reasoning_event_count = self.reasoning_event_count.saturating_add(1);
+            let reasoning_chunk = v
+                .get("delta")
+                .and_then(|value| value.as_str())
+                .or_else(|| v.get("text").and_then(|value| value.as_str()))
+                .or_else(|| v.get("summary").and_then(|value| value.as_str()))
+                .unwrap_or("");
+            self.reasoning_text_chars = self
+                .reasoning_text_chars
+                .saturating_add(reasoning_chunk.len());
+            if reasoning_chunk.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(LLMChunk::ReasoningToken(reasoning_chunk.to_string())));
+        }
 
         match event_type {
             "response.output_text.delta" => {
@@ -332,7 +420,14 @@ impl ResponsesSseParser {
                 Ok(Some(LLMChunk::ToolCalls(vec![call])))
             }
 
-            "response.completed" => Ok(Some(LLMChunk::Done)),
+            "response.completed" => {
+                let usage = v
+                    .get("response")
+                    .and_then(|response| response.get("usage"))
+                    .or_else(|| v.get("usage"));
+                self.log_reasoning_summary_if_needed(usage);
+                Ok(Some(LLMChunk::Done))
+            }
 
             _ => Ok(None),
         }
@@ -347,7 +442,7 @@ mod tests {
 
     #[test]
     fn build_responses_body_includes_input_and_stream() {
-        let body = build_responses_body("gpt-5.3-codex", &[], &[], Some(123));
+        let body = build_responses_body("gpt-5.3-codex", &[], &[], Some(123), None);
         assert_eq!(body["model"], "gpt-5.3-codex");
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_output_tokens"], 123);
@@ -445,6 +540,21 @@ mod tests {
         match out {
             Some(LLMChunk::Token(t)) => assert_eq!(t, "hi"),
             other => panic!("expected token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_emits_reasoning_token_on_reasoning_delta() {
+        let mut p = ResponsesSseParser::new();
+        let out = p
+            .handle_event(
+                "response.reasoning.delta",
+                r#"{"type":"response.reasoning.delta","delta":"think"}"#,
+            )
+            .unwrap();
+        match out {
+            Some(LLMChunk::ReasoningToken(t)) => assert_eq!(t, "think"),
+            other => panic!("expected reasoning token, got {other:?}"),
         }
     }
 

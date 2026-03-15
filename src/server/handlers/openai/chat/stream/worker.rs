@@ -48,6 +48,7 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                     }
                 }
             }
+            Ok(LLMChunk::ReasoningToken(_)) => {}
             Ok(LLMChunk::ToolCalls(calls)) => {
                 if let Some(chunk) = openai_chunk_bytes(LLMChunk::ToolCalls(calls), &args.model) {
                     if args.tx.send(Ok(chunk)).await.is_err() {

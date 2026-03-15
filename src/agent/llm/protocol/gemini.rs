@@ -242,6 +242,7 @@ impl FromProvider<GeminiContent> for Message {
             id: String::new(),
             role,
             content: content_text,
+            reasoning: None,
             content_parts: has_image_parts.then_some(content_parts),
             image_ocr: None,
             tool_calls: if tool_calls.is_empty() {

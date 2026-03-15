@@ -26,6 +26,7 @@ fn provider_validation_issue_returns_provider_path_when_openai_key_present() {
         api_key_encrypted: None,
         base_url: None,
         model: None,
+        reasoning_effort: None,
         responses_only_models: vec![],
         extra: BTreeMap::new(),
     });

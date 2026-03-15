@@ -42,6 +42,7 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                     break;
                 }
             }
+            Ok(LLMChunk::ReasoningToken(_)) => {}
             Ok(LLMChunk::ToolCalls(calls)) => tool_calls.extend(calls),
             Ok(LLMChunk::Done) => break,
             Err(error) => {

@@ -5,8 +5,9 @@ use std::path::PathBuf;
 
 pub mod auth;
 use crate::agent::core::{tools::ToolSchema, Message};
-use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
+use crate::agent::llm::provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, Result};
 use crate::agent::llm::types::LLMChunk;
+use crate::core::ReasoningEffort;
 use auth::{CopilotAuthHandler, DeviceCodeResponse};
 
 use super::common::openai_compat::{
@@ -37,6 +38,7 @@ pub struct CopilotProvider {
     auth_handler: Option<CopilotAuthHandler>,
     // Patterns (case-insensitive) for models that require Responses API upstream.
     responses_only_models: Vec<String>,
+    default_reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl CopilotProvider {
@@ -48,6 +50,7 @@ impl CopilotProvider {
             token_expires_at: None,
             auth_handler: None,
             responses_only_models: vec![],
+            default_reasoning_effort: None,
         }
     }
 
@@ -59,6 +62,7 @@ impl CopilotProvider {
             token_expires_at: None,
             auth_handler: None,
             responses_only_models: vec![],
+            default_reasoning_effort: None,
         }
     }
 
@@ -89,12 +93,19 @@ impl CopilotProvider {
             token_expires_at: None,
             auth_handler: Some(auth_handler),
             responses_only_models: vec![],
+            default_reasoning_effort: None,
         }
     }
 
     /// Configure models that must use Responses API upstream.
     pub fn with_responses_only_models(mut self, models: Vec<String>) -> Self {
         self.responses_only_models = models;
+        self
+    }
+
+    /// Configure default reasoning effort for requests sent through this provider.
+    pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.default_reasoning_effort = effort;
         self
     }
 
@@ -309,6 +320,23 @@ impl CopilotProvider {
         b.contains("/responses") || b.contains("responses api") || b.contains("use responses")
     }
 
+    fn looks_like_reasoning_unsupported_error(status: reqwest::StatusCode, body: &str) -> bool {
+        if !(status == 400 || status == 404 || status == 405 || status == 409 || status == 422) {
+            return false;
+        }
+
+        let b = body.to_ascii_lowercase();
+        let mentions_reasoning = b.contains("reasoning")
+            || b.contains("reasoning_effort")
+            || b.contains("thinking")
+            || b.contains("unknown parameter");
+        let mentions_unsupported = b.contains("unsupported")
+            || b.contains("not supported")
+            || b.contains("unknown")
+            || b.contains("invalid");
+        mentions_reasoning && mentions_unsupported
+    }
+
     async fn chat_stream_via_responses(
         &self,
         token: &str,
@@ -316,11 +344,26 @@ impl CopilotProvider {
         tools: &[ToolSchema],
         max_output_tokens: Option<u32>,
         model: &str,
+        reasoning_effort: Option<ReasoningEffort>,
+        reasoning_source: &str,
     ) -> Result<LLMStream> {
         let url = "https://api.githubcopilot.com/responses";
-        let body = build_responses_body(model, messages, tools, max_output_tokens);
+        let body =
+            build_responses_body(model, messages, tools, max_output_tokens, reasoning_effort);
 
         log::debug!("Copilot provider using Responses API model: {}", model);
+        log::info!(
+            "Copilot request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
+            model,
+            reasoning_effort
+                .map(ReasoningEffort::as_str)
+                .unwrap_or("none"),
+            reasoning_source,
+            reasoning_effort.is_some(),
+            max_output_tokens
+                .map(|tokens| tokens.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
 
         let mut response = self
             .client
@@ -353,6 +396,56 @@ impl CopilotProvider {
                 let status = response.status();
                 let text = response.text().await.unwrap_or_default();
 
+                if reasoning_effort.is_some()
+                    && Self::looks_like_reasoning_unsupported_error(status, &text)
+                {
+                    log::warn!(
+                        "Copilot /responses rejected reasoning for model '{}'; retrying without reasoning_effort",
+                        model
+                    );
+                    let fallback_body =
+                        build_responses_body(model, messages, tools, max_output_tokens, None);
+                    let mut fallback = self
+                        .client
+                        .post(url)
+                        .headers(Self::build_headers_with_token(token)?)
+                        .json(&fallback_body)
+                        .send()
+                        .await
+                        .map_err(LLMError::Http)?;
+
+                    if !fallback.status().is_success() {
+                        let fallback_status = fallback.status();
+                        if (fallback_status == 401 || fallback_status == 403)
+                            && self.auth_handler.is_some()
+                        {
+                            if let Some(handler) = &self.auth_handler {
+                                if let Ok(Some(refreshed)) =
+                                    handler.force_refresh_chat_token().await
+                                {
+                                    fallback = self
+                                        .client
+                                        .post(url)
+                                        .headers(Self::build_headers_with_token(&refreshed)?)
+                                        .json(&fallback_body)
+                                        .send()
+                                        .await
+                                        .map_err(LLMError::Http)?;
+                                }
+                            }
+                        }
+                    }
+
+                    if fallback.status().is_success() {
+                        let mut parser =
+                            ResponsesSseParser::new_with_context("Copilot", model, None);
+                        let stream = llm_stream_from_sse(fallback, move |event, data| {
+                            parser.handle_event(event, data)
+                        });
+                        return Ok(stream);
+                    }
+                }
+
                 if status == 401 || status == 403 {
                     return Err(LLMError::Auth(format!(
                         "Authentication failed: {}. Please run authenticate() again.",
@@ -365,7 +458,7 @@ impl CopilotProvider {
             }
         }
 
-        let mut parser = ResponsesSseParser::new();
+        let mut parser = ResponsesSseParser::new_with_context("Copilot", model, reasoning_effort);
         let stream = llm_stream_from_sse(response, move |event, data| {
             parser.handle_event(event, data)
         });
@@ -382,7 +475,30 @@ impl LLMProvider for CopilotProvider {
         max_output_tokens: Option<u32>,
         model: &str,
     ) -> Result<LLMStream> {
+        self.chat_stream_with_options(messages, tools, max_output_tokens, model, None)
+            .await
+    }
+
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
         let token = self.get_token_for_request().await?;
+        let reasoning_effort = options
+            .and_then(|o| o.reasoning_effort)
+            .or(self.default_reasoning_effort);
+        let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
+        let reasoning_source = if request_reasoning_effort.is_some() {
+            "request"
+        } else if self.default_reasoning_effort.is_some() {
+            "provider_default"
+        } else {
+            "none"
+        };
 
         // Copilot supports multiple upstream model IDs. We don't store a default model in the provider
         // instance (it is resolved by the caller and passed in per request).
@@ -404,6 +520,8 @@ impl LLMProvider for CopilotProvider {
                     tools,
                     max_output_tokens,
                     upstream_model,
+                    reasoning_effort,
+                    reasoning_source,
                 )
                 .await;
         }
@@ -423,6 +541,22 @@ impl LLMProvider for CopilotProvider {
         if let Some(max_tokens) = max_output_tokens {
             body["max_tokens"] = json!(max_tokens);
         }
+
+        if let Some(reasoning_effort) = reasoning_effort {
+            body["reasoning_effort"] = json!(reasoning_effort.as_str());
+        }
+        log::info!(
+            "Copilot request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
+            upstream_model,
+            reasoning_effort
+                .map(ReasoningEffort::as_str)
+                .unwrap_or("none"),
+            reasoning_source,
+            reasoning_effort.is_some(),
+            max_output_tokens
+                .map(|tokens| tokens.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
 
         log::debug!(
             "Sending request to Copilot API with {} messages and {} tools",
@@ -472,6 +606,48 @@ impl LLMProvider for CopilotProvider {
                     )));
                 }
 
+                if reasoning_effort.is_some()
+                    && Self::looks_like_reasoning_unsupported_error(status, &text)
+                {
+                    log::warn!(
+                        "Copilot /chat/completions rejected reasoning for model '{}'; retrying without reasoning_effort",
+                        upstream_model
+                    );
+
+                    let mut body_no_reasoning = json!({
+                        "model": upstream_model,
+                        "messages": messages_to_openai_compat_json(messages),
+                        "stream": true,
+                    });
+                    if !tools.is_empty() {
+                        body_no_reasoning["tools"] = json!(tools_to_openai_compat_json(tools));
+                        body_no_reasoning["tool_choice"] = json!("auto");
+                    }
+                    if let Some(max_tokens) = max_output_tokens {
+                        body_no_reasoning["max_tokens"] = json!(max_tokens);
+                    }
+
+                    let retry = self
+                        .client
+                        .post(url)
+                        .headers(Self::build_headers_with_token(&token)?)
+                        .json(&body_no_reasoning)
+                        .send()
+                        .await
+                        .map_err(LLMError::Http)?;
+
+                    if retry.status().is_success() {
+                        let stream = llm_stream_from_sse(retry, |_event, data| {
+                            let chunk = parse_openai_compat_sse_data_lenient(data)?;
+                            match chunk {
+                                LLMChunk::Done => Ok(Some(LLMChunk::Done)),
+                                other => Ok(Some(other)),
+                            }
+                        });
+                        return Ok(stream);
+                    }
+                }
+
                 // If this model only supports Responses API, retry with /responses.
                 if Self::looks_like_responses_only_error(status, &text) {
                     log::info!(
@@ -485,6 +661,8 @@ impl LLMProvider for CopilotProvider {
                             tools,
                             max_output_tokens,
                             upstream_model,
+                            reasoning_effort,
+                            reasoning_source,
                         )
                         .await;
                 }
@@ -494,10 +672,61 @@ impl LLMProvider for CopilotProvider {
             }
         }
 
-        let stream = llm_stream_from_sse(response, |_event, data| {
+        let model_for_log = upstream_model.to_string();
+        let requested_reasoning = reasoning_effort;
+        let mut observed_reasoning_signal = false;
+        let mut reasoning_chars = 0usize;
+        let mut logged_summary = false;
+        let stream = llm_stream_from_sse(response, move |_event, data| {
+            let mut reasoning_chunk_to_emit: Option<String> = None;
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(delta) = v
+                    .get("choices")
+                    .and_then(|choices| choices.get(0))
+                    .and_then(|choice| choice.get("delta"))
+                {
+                    let has_answer_content = delta
+                        .get("content")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|value| !value.is_empty());
+                    let reasoning_chunk = delta
+                        .get("reasoning_content")
+                        .and_then(|value| value.as_str())
+                        .or_else(|| delta.get("reasoning").and_then(|value| value.as_str()));
+
+                    if let Some(reasoning_chunk) = reasoning_chunk {
+                        observed_reasoning_signal = true;
+                        reasoning_chars = reasoning_chars.saturating_add(reasoning_chunk.len());
+                        if !reasoning_chunk.is_empty() && !has_answer_content {
+                            reasoning_chunk_to_emit = Some(reasoning_chunk.to_string());
+                        }
+                    }
+                }
+            }
+
+            if let Some(reasoning_chunk) = reasoning_chunk_to_emit {
+                return Ok(Some(LLMChunk::ReasoningToken(reasoning_chunk)));
+            }
+
             let chunk = parse_openai_compat_sse_data_lenient(data)?;
             match chunk {
-                LLMChunk::Done => Ok(Some(LLMChunk::Done)),
+                LLMChunk::Done => {
+                    if !logged_summary
+                        && (requested_reasoning.is_some() || observed_reasoning_signal)
+                    {
+                        log::info!(
+                            "Copilot chat_completions reasoning summary: model='{}' requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
+                            model_for_log,
+                            requested_reasoning
+                                .map(ReasoningEffort::as_str)
+                                .unwrap_or("none"),
+                            observed_reasoning_signal,
+                            reasoning_chars
+                        );
+                        logged_summary = true;
+                    }
+                    Ok(Some(LLMChunk::Done))
+                }
                 other => Ok(Some(other)),
             }
         });

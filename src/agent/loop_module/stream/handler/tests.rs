@@ -15,6 +15,7 @@ fn build_stream(items: Vec<crate::agent::llm::provider::Result<LLMChunk>>) -> LL
 #[tokio::test]
 async fn consume_llm_stream_accumulates_tokens_and_tool_calls() {
     let stream = build_stream(vec![
+        Ok(LLMChunk::ReasoningToken("thinking".to_string())),
         Ok(LLMChunk::Token("hi".to_string())),
         Ok(LLMChunk::ToolCalls(vec![ToolCall {
             id: "call_1".to_string(),
@@ -41,10 +42,14 @@ async fn consume_llm_stream_accumulates_tokens_and_tool_calls() {
         .expect("stream should succeed");
 
     assert_eq!(output.content, "hi");
+    assert_eq!(output.reasoning_content, "thinking");
     assert_eq!(output.token_count, 2);
     assert_eq!(output.tool_calls.len(), 1);
     assert_eq!(output.tool_calls[0].function.name, "test_tool");
     assert_eq!(output.tool_calls[0].function.arguments, "{}");
+
+    let reasoning_event = event_rx.recv().await.expect("missing reasoning event");
+    assert!(matches!(reasoning_event, AgentEvent::ReasoningToken { .. }));
 
     let token_event = event_rx.recv().await.expect("missing token event");
     assert!(matches!(token_event, AgentEvent::Token { .. }));
@@ -62,6 +67,7 @@ async fn consume_llm_stream_silent_does_not_emit_events() {
         .expect("silent stream should succeed");
 
     assert_eq!(output.content, "hello");
+    assert!(output.reasoning_content.is_empty());
     assert_eq!(output.token_count, 5);
     assert!(output.tool_calls.is_empty());
 }

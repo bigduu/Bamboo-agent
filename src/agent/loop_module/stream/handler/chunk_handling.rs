@@ -19,6 +19,15 @@ pub(super) async fn handle_chunk_result(
             }
             Ok(())
         }
+        Ok(LLMChunk::ReasoningToken(token)) => {
+            state.append_reasoning_token(&token);
+            if let Some(event_tx) = event_tx {
+                let _ = event_tx
+                    .send(AgentEvent::ReasoningToken { content: token })
+                    .await;
+            }
+            Ok(())
+        }
         Ok(LLMChunk::ToolCalls(partial_calls)) => {
             log::trace!(
                 "[{}] Received {} tool call parts",

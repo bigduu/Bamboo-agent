@@ -1,6 +1,7 @@
 use actix_web::{web, HttpResponse};
 use futures::StreamExt;
 
+use crate::agent::llm::LLMRequestOptions;
 use crate::agent::metrics::types::ForwardStatus;
 use crate::server::{app_state::AppState, error::AppError};
 
@@ -24,11 +25,14 @@ pub(super) async fn handle_non_streaming_response(
 
     let provider = app_state.get_provider().await;
     let mut stream = provider
-        .chat_stream(
+        .chat_stream_with_options(
             &prepared.internal_messages,
             &prepared.internal_tools,
             prepared.max_tokens,
             prepared.resolved_model.as_str(),
+            Some(&LLMRequestOptions {
+                reasoning_effort: prepared.reasoning_effort,
+            }),
         )
         .await
         .map_err(map_provider_error)?;
@@ -39,6 +43,7 @@ pub(super) async fn handle_non_streaming_response(
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(crate::agent::llm::types::LLMChunk::Token(text)) => content.push_str(&text),
+            Ok(crate::agent::llm::types::LLMChunk::ReasoningToken(_)) => {}
             Ok(crate::agent::llm::types::LLMChunk::ToolCalls(calls)) => tool_calls.extend(calls),
             Ok(crate::agent::llm::types::LLMChunk::Done) => break,
             Err(error) => {

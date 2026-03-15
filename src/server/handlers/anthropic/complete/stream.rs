@@ -3,6 +3,7 @@ use async_stream::stream;
 use bytes::Bytes;
 use serde_json::json;
 
+use crate::agent::llm::LLMRequestOptions;
 use crate::agent::metrics::types::ForwardStatus;
 use crate::server::{app_state::AppState, error::AppError};
 
@@ -25,6 +26,7 @@ pub(super) async fn handle_streaming_complete(
         internal_messages,
         internal_tools,
         max_tokens,
+        reasoning_effort,
         estimated_prompt_tokens,
     } = prepared;
 
@@ -38,11 +40,12 @@ pub(super) async fn handle_streaming_complete(
 
     let provider = app_state.get_provider().await;
     let stream_result = provider
-        .chat_stream(
+        .chat_stream_with_options(
             &internal_messages,
             &internal_tools,
             max_tokens,
             mapped_model.as_str(),
+            Some(&LLMRequestOptions { reasoning_effort }),
         )
         .await;
 

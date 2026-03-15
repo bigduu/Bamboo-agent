@@ -1,3 +1,4 @@
+use crate::core::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 
 /// Response returned after triggering agent execution.
@@ -40,4 +41,9 @@ pub struct ExecuteResponse {
 pub struct ExecuteRequest {
     /// Model to use for execution (required)
     pub model: String,
+    /// Optional reasoning effort override for this execution.
+    ///
+    /// When omitted, the active provider default from config is used.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }

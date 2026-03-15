@@ -138,6 +138,7 @@ fn build_system_prompt(base: &str, enhance: Option<&str>, workspace_path: Option
 async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(), String> {
     let now = Utc::now();
     let session_id = Uuid::new_v4().to_string();
+    let config_snapshot = ctx.config.read().await.clone();
 
     let requested_model = job
         .run_config
@@ -154,8 +155,7 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
     let model = if let Some(m) = requested_model.clone() {
         m
     } else {
-        let snapshot = ctx.config.read().await.clone();
-        match snapshot
+        match config_snapshot
             .get_model()
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty())
@@ -170,6 +170,8 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
             }
         }
     };
+    let requested_reasoning_effort = job.run_config.reasoning_effort;
+    let reasoning_effort = requested_reasoning_effort.or(config_snapshot.get_reasoning_effort());
 
     let title = format!("{} ({})", job.schedule_name, now.to_rfc3339());
     let global_default_prompt =
@@ -211,6 +213,11 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
             .metadata
             .insert("workspace_path".to_string(), path.to_string());
     }
+    if let Some(effort) = reasoning_effort {
+        session
+            .metadata
+            .insert("reasoning_effort".to_string(), effort.as_str().to_string());
+    }
     session.add_message(Message::system(system_prompt));
 
     if let Some(task) = job
@@ -242,7 +249,7 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
             .unwrap_or(false);
 
     log::info!(
-        "[schedule:{}] created session {} (auto_execute={}, model={}, model_source={})",
+        "[schedule:{}] created session {} (auto_execute={}, model={}, model_source={}, reasoning_effort={}, reasoning_source={})",
         job.schedule_id,
         session_id,
         job.run_config.auto_execute,
@@ -251,6 +258,12 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
             "schedule.run_config.model"
         } else {
             "config.get_model()"
+        },
+        reasoning_effort.map(|value| value.as_str()).unwrap_or("none"),
+        if requested_reasoning_effort.is_some() {
+            "schedule.run_config.reasoning_effort"
+        } else {
+            "config.get_reasoning_effort()"
         }
     );
     if !should_execute {
@@ -343,6 +356,7 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
                 attachment_reader: Some(attachment_reader),
                 metrics_collector: Some(metrics),
                 model_name: Some(model.clone()),
+                reasoning_effort,
                 ..Default::default()
             },
         )

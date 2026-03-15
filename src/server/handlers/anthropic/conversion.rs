@@ -148,6 +148,7 @@ pub(super) fn convert_llm_chunk_to_openai(
                 usage: None,
             })
         }
+        crate::agent::llm::types::LLMChunk::ReasoningToken(_) => None,
         crate::agent::llm::types::LLMChunk::Done => Some(ChatCompletionStreamChunk {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             object: Some("chat.completion.chunk".to_string()),

@@ -9,6 +9,7 @@ use crate::{
         core::{AgentEvent, Session},
         loop_module::{run_agent_loop_with_config, AgentLoopConfig, ImageFallbackConfig},
     },
+    core::ReasoningEffort,
     server::app_state::{AgentStatus, AppState},
 };
 
@@ -20,6 +21,8 @@ pub(in crate::server::handlers::agent::execute) struct SpawnAgentExecution {
     pub(in crate::server::handlers::agent::execute) session: Session,
     pub(in crate::server::handlers::agent::execute) is_child_session: bool,
     pub(in crate::server::handlers::agent::execute) model: String,
+    pub(in crate::server::handlers::agent::execute) reasoning_effort: Option<ReasoningEffort>,
+    pub(in crate::server::handlers::agent::execute) reasoning_effort_source: String,
     pub(in crate::server::handlers::agent::execute) cancel_token: CancellationToken,
     pub(in crate::server::handlers::agent::execute) mpsc_tx: mpsc::Sender<AgentEvent>,
     pub(in crate::server::handlers::agent::execute) image_fallback: Option<ImageFallbackConfig>,
@@ -35,6 +38,8 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
             mut session,
             is_child_session,
             model,
+            reasoning_effort,
+            reasoning_effort_source,
             cancel_token,
             mpsc_tx,
             image_fallback,
@@ -51,7 +56,15 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
         };
 
         // Use model from request (not from session - session.model is just for recording/debugging).
-        log::info!("[{}] Using model from request: {}", session_id, model);
+        log::info!(
+            "[{}] Using model from request: {}, reasoning_effort={}, reasoning_source={}",
+            session_id,
+            model,
+            reasoning_effort
+                .map(crate::core::ReasoningEffort::as_str)
+                .unwrap_or("none"),
+            reasoning_effort_source
+        );
 
         // Update session.model for debugging/recording purposes.
         session.model = model.clone();
@@ -85,6 +98,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
                 attachment_reader: Some(state.session_store.clone()),
                 metrics_collector: Some(state.metrics_service.collector()),
                 model_name: Some(model),
+                reasoning_effort,
                 image_fallback,
                 ..Default::default()
             },

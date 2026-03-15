@@ -3,7 +3,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::agent::core::{AgentError, AgentEvent, Session, TodoItemStatus};
-use crate::agent::llm::LLMProvider;
+use crate::agent::llm::{LLMProvider, LLMRequestOptions};
+use crate::core::ReasoningEffort;
 
 use super::super::todo_context::TodoLoopContext;
 use super::message_builder::build_todo_evaluation_messages;
@@ -35,6 +36,7 @@ pub async fn evaluate_todo_progress(
     event_tx: &mpsc::Sender<AgentEvent>,
     session_id: &str,
     model: &str,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<TodoEvaluationResult, AgentError> {
     use crate::agent::loop_module::stream::handler::consume_llm_stream_silent;
 
@@ -74,7 +76,11 @@ pub async fn evaluate_todo_progress(
     // Use model from parameter (passed from config), not from session.
     log::debug!("[{}] Todo evaluation using model: {}", session_id, model);
 
-    match llm.chat_stream(&messages, &tools, Some(500), model).await {
+    let request_options = LLMRequestOptions { reasoning_effort };
+    match llm
+        .chat_stream_with_options(&messages, &tools, Some(500), model, Some(&request_options))
+        .await
+    {
         Ok(stream) => {
             let stream_output = consume_llm_stream_silent(
                 stream,

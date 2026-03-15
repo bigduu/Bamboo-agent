@@ -21,6 +21,12 @@ use serde_json::Value;
 pub struct GeminiStreamState {
     /// Counter for generating unique tool call IDs
     next_tool_id: usize,
+    /// Whether stream contained explicit thinking/thought signal.
+    pub observed_thinking_signal: bool,
+    /// Count of thought parts observed.
+    pub thinking_parts_count: usize,
+    /// Approximate characters contained in thought text chunks.
+    pub thinking_text_chars: usize,
 }
 
 impl GeminiStreamState {
@@ -124,9 +130,31 @@ pub fn parse_gemini_sse_event(
     // Process the first part (Gemini typically sends one part per chunk)
     let part = &parts[0];
 
+    // Best-effort thinking signal detection.
+    let is_thinking_part = part
+        .get("thought")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || part.get("thoughtSignature").is_some()
+        || part.get("thinking").is_some();
+
+    if is_thinking_part {
+        state.observed_thinking_signal = true;
+        state.thinking_parts_count = state.thinking_parts_count.saturating_add(1);
+        let text_len = part
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(str::len)
+            .unwrap_or(0);
+        state.thinking_text_chars = state.thinking_text_chars.saturating_add(text_len);
+    }
+
     // Check for text content
     if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
         if !text.is_empty() {
+            if is_thinking_part {
+                return Ok(Some(LLMChunk::ReasoningToken(text.to_string())));
+            }
             return Ok(Some(LLMChunk::Token(text.to_string())));
         }
         return Ok(None);
@@ -185,6 +213,23 @@ mod tests {
             LLMChunk::Token(text) => assert_eq!(text, "Hello"),
             other => panic!("expected LLMChunk::Token, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_thought_text_chunk_emits_reasoning_token() {
+        let mut state = GeminiStreamState::default();
+        let data = r#"{"candidates":[{"content":{"parts":[{"thought":true,"text":"Thinking..."}],"role":"model"}}]}"#;
+
+        let chunk = parse_gemini_sse_event(&mut state, "", data)
+            .unwrap()
+            .expect("chunk");
+
+        match chunk {
+            LLMChunk::ReasoningToken(text) => assert_eq!(text, "Thinking..."),
+            other => panic!("expected LLMChunk::ReasoningToken, got {:?}", other),
+        }
+        assert!(state.observed_thinking_signal);
+        assert_eq!(state.thinking_parts_count, 1);
     }
 
     #[test]

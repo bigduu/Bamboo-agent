@@ -56,6 +56,7 @@ use std::path::PathBuf;
 
 use crate::core::keyword_masking::KeywordMaskingConfig;
 use crate::core::model_mapping::{AnthropicModelMapping, GeminiModelMapping};
+use crate::core::ReasoningEffort;
 
 /// Main configuration structure for Bamboo agent
 ///
@@ -229,6 +230,9 @@ pub struct OpenAIConfig {
     /// Default model to use (e.g., "gpt-4", "gpt-3.5-turbo")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Default reasoning effort for OpenAI requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 
     /// Models that must use the OpenAI Responses API upstream (instead of chat/completions).
     ///
@@ -274,6 +278,9 @@ pub struct AnthropicConfig {
     /// Maximum tokens in model response
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Default reasoning effort for Anthropic requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 
     /// Preserve unknown keys under `providers.anthropic`.
     #[serde(default, flatten)]
@@ -306,6 +313,9 @@ pub struct GeminiConfig {
     /// Default model to use (e.g., "gemini-2.0-flash-exp")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Default reasoning effort for Gemini requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 
     /// Preserve unknown keys under `providers.gemini`.
     #[serde(default, flatten)]
@@ -334,6 +344,9 @@ pub struct CopilotConfig {
     /// Default model to use for Copilot (used when clients request the "default" model)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Default reasoning effort for Copilot requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 
     /// Models that must use the OpenAI Responses API upstream (instead of chat/completions).
     ///
@@ -542,6 +555,33 @@ impl Config {
                     .and_then(|c| c.model.clone())
                     .unwrap_or_else(|| "gpt-4o".to_string()),
             ),
+            _ => None,
+        }
+    }
+
+    /// Get the default reasoning effort for the currently active provider.
+    pub fn get_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        match self.provider.as_str() {
+            "openai" => self
+                .providers
+                .openai
+                .as_ref()
+                .and_then(|c| c.reasoning_effort),
+            "anthropic" => self
+                .providers
+                .anthropic
+                .as_ref()
+                .and_then(|c| c.reasoning_effort),
+            "gemini" => self
+                .providers
+                .gemini
+                .as_ref()
+                .and_then(|c| c.reasoning_effort),
+            "copilot" => self
+                .providers
+                .copilot
+                .as_ref()
+                .and_then(|c| c.reasoning_effort),
             _ => None,
         }
     }
@@ -1246,6 +1286,7 @@ mod tests {
             api_key_encrypted: None,
             base_url: None,
             model: None,
+            reasoning_effort: None,
             responses_only_models: vec![],
             extra: Default::default(),
         });

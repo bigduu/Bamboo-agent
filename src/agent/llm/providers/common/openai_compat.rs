@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use super::tool_schema::sanitize_openai_function_parameters_schema;
 use crate::agent::llm::provider::Result;
 use crate::agent::llm::types::LLMChunk;
+use crate::core::ReasoningEffort;
 
 /// Convert internal [`Message`] values to an OpenAI-compatible JSON array.
 ///
@@ -79,6 +80,7 @@ pub fn build_openai_compat_body(
     tools: &[ToolSchema],
     tool_choice: Option<Value>,
     max_output_tokens: Option<u32>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> Value {
     let mut body = json!({
         "model": model,
@@ -93,6 +95,10 @@ pub fn build_openai_compat_body(
 
     if let Some(max_tokens) = max_output_tokens {
         body["max_tokens"] = json!(max_tokens);
+    }
+
+    if let Some(reasoning_effort) = reasoning_effort {
+        body["reasoning_effort"] = json!(reasoning_effort.as_str());
     }
 
     body
@@ -327,7 +333,8 @@ mod tests {
         let messages = vec![Message::user("Hello")];
         let tools: Vec<ToolSchema> = Vec::new();
 
-        let body = super::build_openai_compat_body("gpt-4o-mini", &messages, &tools, None, None);
+        let body =
+            super::build_openai_compat_body("gpt-4o-mini", &messages, &tools, None, None, None);
 
         assert_eq!(body["model"], "gpt-4o-mini");
         assert_eq!(body["stream"], true);
@@ -484,8 +491,14 @@ mod tests {
         let tools: Vec<ToolSchema> = Vec::new();
         let tool_choice = serde_json::json!("auto");
 
-        let body =
-            super::build_openai_compat_body("gpt-4", &messages, &tools, Some(tool_choice), None);
+        let body = super::build_openai_compat_body(
+            "gpt-4",
+            &messages,
+            &tools,
+            Some(tool_choice),
+            None,
+            None,
+        );
 
         assert_eq!(body["tool_choice"], "auto");
     }
@@ -495,7 +508,8 @@ mod tests {
         let messages = vec![Message::user("Hello")];
         let tools: Vec<ToolSchema> = Vec::new();
 
-        let body = super::build_openai_compat_body("gpt-4", &messages, &tools, None, Some(4096));
+        let body =
+            super::build_openai_compat_body("gpt-4", &messages, &tools, None, Some(4096), None);
 
         assert_eq!(body["max_tokens"], 4096);
     }

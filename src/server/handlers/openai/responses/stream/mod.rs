@@ -3,6 +3,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::agent::llm::LLMRequestOptions;
 use crate::server::{app_state::AppState, error::AppError};
 
 use super::super::helpers::now_unix_ts;
@@ -31,11 +32,14 @@ pub(super) async fn handle_streaming_response(
 
     let provider = app_state.get_provider().await;
     let stream_result = provider
-        .chat_stream(
+        .chat_stream_with_options(
             &prepared.internal_messages,
             &prepared.internal_tools,
             prepared.max_tokens,
             prepared.resolved_model.as_str(),
+            Some(&LLMRequestOptions {
+                reasoning_effort: prepared.reasoning_effort,
+            }),
         )
         .await
         .map_err(errors::map_provider_error)?;

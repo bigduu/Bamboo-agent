@@ -11,6 +11,7 @@ mod stream_state;
 
 pub struct StreamHandlingOutput {
     pub content: String,
+    pub reasoning_content: String,
     pub token_count: usize,
     pub tool_calls: Vec<ToolCall>,
 }

@@ -1,5 +1,6 @@
 mod completion;
 mod conversion;
+mod reasoning;
 mod responses_input;
 mod stream_utils;
 
@@ -44,4 +45,10 @@ pub(super) fn build_completion_response(
     model: &str,
 ) -> crate::agent::llm::api::models::ChatCompletionResponse {
     completion::build_completion_response(content, tool_calls, model)
+}
+
+pub(crate) fn parse_reasoning_effort(
+    parameters: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<crate::core::ReasoningEffort> {
+    reasoning::parse_reasoning_effort(parameters)
 }

@@ -2,6 +2,7 @@ use crate::agent::llm::api::models::{
     ChatCompletionResponse, ChatMessage, Content, FunctionCall, ResponseChoice, Role, ToolCall,
     Usage,
 };
+use crate::agent::llm::LLMRequestOptions;
 use crate::agent::metrics::types::ForwardStatus;
 use crate::server::{app_state::AppState, error::AppError};
 use actix_web::{web, HttpResponse};
@@ -20,6 +21,7 @@ pub(super) async fn handle_non_streaming_complete(
         internal_messages,
         internal_tools,
         max_tokens,
+        reasoning_effort,
         estimated_prompt_tokens,
     } = prepared;
 
@@ -33,11 +35,12 @@ pub(super) async fn handle_non_streaming_complete(
 
     let provider = app_state.get_provider().await;
     let mut stream = match provider
-        .chat_stream(
+        .chat_stream_with_options(
             &internal_messages,
             &internal_tools,
             max_tokens,
             mapped_model.as_str(),
+            Some(&LLMRequestOptions { reasoning_effort }),
         )
         .await
     {
@@ -67,6 +70,7 @@ pub(super) async fn handle_non_streaming_complete(
             Ok(crate::agent::llm::types::LLMChunk::Token(text)) => {
                 content.push_str(&text);
             }
+            Ok(crate::agent::llm::types::LLMChunk::ReasoningToken(_)) => {}
             Ok(crate::agent::llm::types::LLMChunk::ToolCalls(calls)) => {
                 tool_calls = Some(convert_tool_calls(calls));
             }

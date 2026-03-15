@@ -44,6 +44,7 @@ impl FromProvider<OpenAIChatMessage> for Message {
             id: String::new(), // Will be generated if needed
             role,
             content,
+            reasoning: None,
             content_parts,
             image_ocr: None,
             tool_calls,

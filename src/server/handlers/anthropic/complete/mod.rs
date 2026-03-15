@@ -63,6 +63,9 @@ pub async fn complete(
         .get("max_tokens")
         .and_then(|value| value.as_u64())
         .map(|value| value as u32);
+    let reasoning_effort = crate::server::handlers::openai::helpers::parse_reasoning_effort(
+        &openai_request.parameters,
+    );
     let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
 
     let prepared = PreparedCompleteRequest {
@@ -71,6 +74,7 @@ pub async fn complete(
         internal_messages,
         internal_tools,
         max_tokens,
+        reasoning_effort,
         estimated_prompt_tokens,
     };
 
@@ -87,5 +91,6 @@ struct PreparedCompleteRequest {
     internal_messages: Vec<Message>,
     internal_tools: Vec<ToolSchema>,
     max_tokens: Option<u32>,
+    reasoning_effort: Option<crate::core::ReasoningEffort>,
     estimated_prompt_tokens: u64,
 }

@@ -85,6 +85,7 @@ pub async fn handler(
         Ok(model) => model,
         Err(response) => return response,
     };
+    let request_reasoning_effort = req.reasoning_effort;
 
     log::debug!(
         "[{}] Execute request received with model: {}",
@@ -92,7 +93,7 @@ pub async fn handler(
         model
     );
 
-    let session = match load_session(&state, &session_id).await {
+    let mut session = match load_session(&state, &session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -104,6 +105,15 @@ pub async fn handler(
     // is intended for LLM request construction only. Persisted session history must keep
     // the original multimodal parts so the frontend can render attachments.
     let config_snapshot = state.config.read().await.clone();
+    let default_reasoning_effort = config_snapshot.get_reasoning_effort();
+    let effective_reasoning_effort = request_reasoning_effort.or(default_reasoning_effort);
+    let reasoning_effort_source = if request_reasoning_effort.is_some() {
+        "request"
+    } else if default_reasoning_effort.is_some() {
+        "provider_default"
+    } else {
+        "none"
+    };
     let image_fallback = match resolve_image_fallback(&config_snapshot) {
         Ok(value) => value,
         Err(error) => return internal_server_error_response(error),
@@ -119,6 +129,20 @@ pub async fn handler(
             session_id
         );
         return completed_response(&session_id);
+    }
+
+    if let Some(reasoning_effort) = effective_reasoning_effort {
+        session.metadata.insert(
+            "reasoning_effort".to_string(),
+            reasoning_effort.as_str().to_string(),
+        );
+        session.metadata.insert(
+            "reasoning_effort_source".to_string(),
+            reasoning_effort_source.to_string(),
+        );
+    } else {
+        session.metadata.remove("reasoning_effort");
+        session.metadata.remove("reasoning_effort_source");
     }
 
     // Stable, long-lived session event sender (also used for background jobs).
@@ -146,6 +170,8 @@ pub async fn handler(
         session,
         is_child_session,
         model,
+        reasoning_effort: effective_reasoning_effort,
+        reasoning_effort_source: reasoning_effort_source.to_string(),
         cancel_token,
         mpsc_tx,
         image_fallback,

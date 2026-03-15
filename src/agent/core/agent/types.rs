@@ -124,6 +124,12 @@ pub struct Message {
     pub role: Role,
     /// Message content text
     pub content: String,
+    /// Optional model reasoning/thinking trace for this assistant turn.
+    ///
+    /// This is persisted for UI replay/debugging and only set on assistant
+    /// messages when the provider emits reasoning tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     /// Optional multimodal content parts (e.g. text + images).
     ///
     /// This keeps image inputs available for preflight hooks (OCR / image fallback)
@@ -202,6 +208,7 @@ impl Message {
             id: Uuid::new_v4().to_string(),
             role: Role::User,
             content: content.into(),
+            reasoning: None,
             content_parts: None,
             image_ocr: None,
             tool_calls: None,
@@ -221,6 +228,7 @@ impl Message {
             id: Uuid::new_v4().to_string(),
             role: Role::User,
             content: content.into(),
+            reasoning: None,
             content_parts: Some(parts),
             image_ocr: None,
             tool_calls: None,
@@ -245,10 +253,20 @@ impl Message {
     /// let msg_with_tools = Message::assistant("Let me help", Some(vec![tool_call]));
     /// ```
     pub fn assistant(content: impl Into<String>, tool_calls: Option<Vec<ToolCall>>) -> Self {
+        Self::assistant_with_reasoning(content, tool_calls, None)
+    }
+
+    /// Create an assistant message with optional reasoning trace.
+    pub fn assistant_with_reasoning(
+        content: impl Into<String>,
+        tool_calls: Option<Vec<ToolCall>>,
+        reasoning: Option<String>,
+    ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             role: Role::Assistant,
             content: content.into(),
+            reasoning,
             content_parts: None,
             image_ocr: None,
             tool_calls,
@@ -277,6 +295,7 @@ impl Message {
             id: Uuid::new_v4().to_string(),
             role: Role::Tool,
             content: content.into(),
+            reasoning: None,
             content_parts: None,
             image_ocr: None,
             tool_calls: None,
@@ -304,6 +323,7 @@ impl Message {
             id: Uuid::new_v4().to_string(),
             role: Role::System,
             content: content.into(),
+            reasoning: None,
             content_parts: None,
             image_ocr: None,
             tool_calls: None,

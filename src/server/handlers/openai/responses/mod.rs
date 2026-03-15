@@ -14,6 +14,7 @@ pub(super) struct PreparedResponsesRequest {
     pub(super) internal_messages: Vec<crate::agent::core::Message>,
     pub(super) internal_tools: Vec<crate::agent::core::tools::ToolSchema>,
     pub(super) max_tokens: Option<u32>,
+    pub(super) reasoning_effort: Option<crate::core::ReasoningEffort>,
     pub(super) estimated_prompt_tokens: u64,
 }
 

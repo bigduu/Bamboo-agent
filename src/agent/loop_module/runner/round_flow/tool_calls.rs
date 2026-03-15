@@ -31,9 +31,12 @@ pub(super) async fn handle_tool_calls_path(
     todo_context: &mut Option<TodoLoopContext>,
     llm: Arc<dyn LLMProvider>,
 ) -> Result<RoundFlowOutcome, AgentError> {
-    session.add_message(Message::assistant(
+    let reasoning = (!stream_output.reasoning_content.trim().is_empty())
+        .then_some(stream_output.reasoning_content);
+    session.add_message(Message::assistant_with_reasoning(
         stream_output.content,
         Some(stream_output.tool_calls.clone()),
+        reasoning,
     ));
 
     let mut state = ToolCallsRoundState::default();
@@ -70,6 +73,7 @@ pub(super) async fn handle_tool_calls_path(
         context.session_id,
         context.round + 1,
         config.model_name.as_deref(),
+        config.reasoning_effort,
     )
     .await?;
     accumulate_round_usage(&mut round_usage, todo_evaluation_usage);

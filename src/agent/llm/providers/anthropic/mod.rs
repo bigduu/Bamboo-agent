@@ -14,16 +14,18 @@ pub use stream::{
     format_sse_data, format_sse_event, map_completion_stream_chunk, AnthropicStreamAdapter,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::agent::core::{agent::Role, tools::ToolSchema, Message};
 use async_trait::async_trait;
 use reqwest::{header::HeaderMap, Client};
 use serde_json::{json, Value};
 
+use crate::agent::llm::provider::LLMRequestOptions;
 use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
 use crate::agent::llm::types::LLMChunk;
 use crate::agent::llm::ContentPart;
+use crate::core::ReasoningEffort;
 
 /// Anthropic Messages API provider.
 pub struct AnthropicProvider {
@@ -31,6 +33,7 @@ pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
     max_tokens: u32,
+    default_reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl AnthropicProvider {
@@ -40,6 +43,7 @@ impl AnthropicProvider {
             api_key: api_key.into(),
             base_url: "https://api.anthropic.com/v1".to_string(),
             max_tokens: 1024,
+            default_reasoning_effort: None,
         }
     }
 
@@ -59,6 +63,12 @@ impl AnthropicProvider {
         self
     }
 
+    /// Configure default reasoning effort for requests sent through this provider.
+    pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.default_reasoning_effort = effort;
+        self
+    }
+
     fn build_headers(&self) -> Result<HeaderMap> {
         use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 
@@ -73,6 +83,23 @@ impl AnthropicProvider {
 
         Ok(headers)
     }
+
+    fn looks_like_reasoning_unsupported_error(status: reqwest::StatusCode, body: &str) -> bool {
+        if !(status == 400 || status == 404 || status == 405 || status == 409 || status == 422) {
+            return false;
+        }
+
+        let b = body.to_ascii_lowercase();
+        let mentions_reasoning = b.contains("reasoning")
+            || b.contains("thinking")
+            || b.contains("budget_tokens")
+            || b.contains("unknown parameter");
+        let mentions_unsupported = b.contains("unsupported")
+            || b.contains("not supported")
+            || b.contains("unknown")
+            || b.contains("invalid");
+        mentions_reasoning && mentions_unsupported
+    }
 }
 
 #[async_trait]
@@ -84,17 +111,61 @@ impl LLMProvider for AnthropicProvider {
         max_output_tokens: Option<u32>,
         model: &str,
     ) -> Result<LLMStream> {
+        self.chat_stream_with_options(messages, tools, max_output_tokens, model, None)
+            .await
+    }
+
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
         let max_tokens = max_output_tokens.unwrap_or(self.max_tokens);
+        let reasoning_effort = options
+            .and_then(|o| o.reasoning_effort)
+            .or(self.default_reasoning_effort);
+        let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
+        let reasoning_source = if request_reasoning_effort.is_some() {
+            "request"
+        } else if self.default_reasoning_effort.is_some() {
+            "provider_default"
+        } else {
+            "none"
+        };
 
         log::debug!("Anthropic provider using model: {}", model);
 
-        let body = build_anthropic_request(messages, tools, model, max_tokens, true);
+        let body =
+            build_anthropic_request(messages, tools, model, max_tokens, true, reasoning_effort);
+        let mut applied_reasoning_effort = reasoning_effort;
+        let mut thinking_enabled = body.get("thinking").is_some();
+        let mut thinking_budget_tokens = body
+            .get("thinking")
+            .and_then(|thinking| thinking.get("budget_tokens"))
+            .and_then(|value| value.as_u64());
+        log::info!(
+            "Anthropic request model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_enabled={} thinking_budget_tokens={} max_tokens={}",
+            model,
+            applied_reasoning_effort
+                .map(ReasoningEffort::as_str)
+                .unwrap_or("none"),
+            reasoning_source,
+            applied_reasoning_effort.is_some(),
+            thinking_enabled,
+            thinking_budget_tokens
+                .map(|tokens| tokens.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            max_tokens
+        );
         let headers = self.build_headers()?;
 
-        let response = self
+        let mut response = self
             .client
             .post(format!("{}/messages", self.base_url))
-            .headers(headers)
+            .headers(headers.clone())
             .json(&body)
             .send()
             .await
@@ -104,21 +175,72 @@ impl LLMProvider for AnthropicProvider {
             let status = response.status();
             let text = response.text().await.map_err(LLMError::Http)?;
 
-            if status == 401 || status == 403 {
-                return Err(LLMError::Auth(format!(
-                    "Anthropic authentication failed: {}. Please check your API key.",
-                    text
+            if reasoning_effort.is_some()
+                && Self::looks_like_reasoning_unsupported_error(status, &text)
+            {
+                log::warn!(
+                    "Anthropic /messages rejected reasoning for model '{}'; retrying without reasoning_effort",
+                    model
+                );
+
+                let fallback_body =
+                    build_anthropic_request(messages, tools, model, max_tokens, true, None);
+                applied_reasoning_effort = None;
+                thinking_enabled = false;
+                thinking_budget_tokens = None;
+                log::info!(
+                    "Anthropic request retry model='{}' reasoning_effort=none reasoning_source={} request_reasoning_enabled=false thinking_enabled=false thinking_budget_tokens=none max_tokens={}",
+                    model,
+                    reasoning_source,
+                    max_tokens
+                );
+                response = self
+                    .client
+                    .post(format!("{}/messages", self.base_url))
+                    .headers(headers.clone())
+                    .json(&fallback_body)
+                    .send()
+                    .await
+                    .map_err(LLMError::Http)?;
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let text = response.text().await.map_err(LLMError::Http)?;
+
+                    if status == 401 || status == 403 {
+                        return Err(LLMError::Auth(format!(
+                            "Anthropic authentication failed: {}. Please check your API key.",
+                            text
+                        )));
+                    }
+
+                    return Err(LLMError::Api(format!(
+                        "Anthropic API error: HTTP {}: {}",
+                        status, text
+                    )));
+                }
+            } else {
+                if status == 401 || status == 403 {
+                    return Err(LLMError::Auth(format!(
+                        "Anthropic authentication failed: {}. Please check your API key.",
+                        text
+                    )));
+                }
+
+                return Err(LLMError::Api(format!(
+                    "Anthropic API error: HTTP {}: {}",
+                    status, text
                 )));
             }
-
-            return Err(LLMError::Api(format!(
-                "Anthropic API error: HTTP {}: {}",
-                status, text
-            )));
         }
 
         // Use shared SSE adapter with Anthropic-specific parser
-        let mut state = AnthropicStreamState::default();
+        let mut state = AnthropicStreamState {
+            requested_reasoning_effort: applied_reasoning_effort,
+            request_thinking_enabled: thinking_enabled,
+            request_thinking_budget_tokens: thinking_budget_tokens,
+            ..Default::default()
+        };
 
         let stream = crate::agent::llm::providers::common::sse::llm_stream_from_sse(
             response,
@@ -139,6 +261,7 @@ pub fn build_anthropic_request(
     model: &str,
     max_tokens: u32,
     stream: bool,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> Value {
     let (system, anthropic_messages) = messages_to_anthropic_json(messages);
 
@@ -154,7 +277,35 @@ pub fn build_anthropic_request(
         body["system"] = json!(system);
     }
 
+    if let Some(thinking) = anthropic_thinking_from_effort(reasoning_effort, max_tokens) {
+        body["thinking"] = thinking;
+    }
+
     body
+}
+
+fn anthropic_thinking_from_effort(
+    reasoning_effort: Option<ReasoningEffort>,
+    max_tokens: u32,
+) -> Option<Value> {
+    let effort = reasoning_effort?;
+    let target_budget = match effort {
+        ReasoningEffort::Low => return None,
+        ReasoningEffort::Medium => 1024,
+        ReasoningEffort::High => 4096,
+        ReasoningEffort::Xhigh => 8192,
+    };
+
+    // Keep some room for final answer tokens.
+    let available_budget = max_tokens.saturating_sub(128);
+    if available_budget == 0 {
+        return None;
+    }
+
+    Some(json!({
+        "type": "enabled",
+        "budget_tokens": target_budget.min(available_budget),
+    }))
 }
 
 fn messages_to_anthropic_json(messages: &[Message]) -> (Option<String>, Vec<Value>) {
@@ -371,6 +522,13 @@ fn tools_to_anthropic_json(tools: &[ToolSchema]) -> Vec<Value> {
 #[derive(Default)]
 pub struct AnthropicStreamState {
     tool_uses_by_index: HashMap<usize, (String, String)>, // (id, name)
+    thinking_blocks_by_index: HashSet<usize>,
+    thinking_blocks_started: usize,
+    thinking_chars_streamed: usize,
+    saw_thinking_signal: bool,
+    requested_reasoning_effort: Option<ReasoningEffort>,
+    request_thinking_enabled: bool,
+    request_thinking_budget_tokens: Option<u64>,
 }
 
 /// Parse a single Anthropic SSE event into an optional [`LLMChunk`].
@@ -403,6 +561,30 @@ pub fn parse_anthropic_sse_event(
                                 log::debug!("Anthropic stream stop_reason={stop_reason}");
                             }
                         }
+
+                        if let Some(usage) = v.get("usage").and_then(|u| u.as_object()) {
+                            let output_tokens =
+                                usage.get("output_tokens").and_then(|value| value.as_u64());
+                            let thinking_tokens = usage
+                                .get("thinking_tokens")
+                                .and_then(|value| value.as_u64())
+                                .or_else(|| {
+                                    usage
+                                        .get("reasoning_tokens")
+                                        .and_then(|value| value.as_u64())
+                                });
+
+                            if let Some(thinking_tokens) = thinking_tokens {
+                                state.saw_thinking_signal = true;
+                                log::info!(
+                                    "Anthropic stream usage output_tokens={} thinking_tokens={}",
+                                    output_tokens.unwrap_or(0),
+                                    thinking_tokens
+                                );
+                            } else if let Some(output_tokens) = output_tokens {
+                                log::debug!("Anthropic stream usage output_tokens={output_tokens}");
+                            }
+                        }
                     }
                     Err(error) => {
                         log::debug!(
@@ -416,6 +598,24 @@ pub fn parse_anthropic_sse_event(
             Ok(None)
         }
         "message_stop" => {
+            if state.request_thinking_enabled || state.saw_thinking_signal {
+                log::info!(
+                    "Anthropic reasoning summary: requested_effort={} request_thinking_enabled={} request_thinking_budget_tokens={} observed_thinking_signal={} thinking_blocks_started={} thinking_chars_streamed={}",
+                    state
+                        .requested_reasoning_effort
+                        .map(ReasoningEffort::as_str)
+                        .unwrap_or("none"),
+                    state.request_thinking_enabled,
+                    state
+                        .request_thinking_budget_tokens
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    state.saw_thinking_signal,
+                    state.thinking_blocks_started,
+                    state.thinking_chars_streamed
+                );
+            }
+
             if !state.tool_uses_by_index.is_empty() {
                 let open_blocks: Vec<String> = state
                     .tool_uses_by_index
@@ -429,6 +629,8 @@ pub fn parse_anthropic_sse_event(
                 );
                 state.tool_uses_by_index.clear();
             }
+
+            state.thinking_blocks_by_index.clear();
             Ok(Some(LLMChunk::Done))
         }
         "error" => Err(LLMError::Api(format!("Anthropic error event: {data}"))),
@@ -453,6 +655,19 @@ pub fn parse_anthropic_sse_event(
                 .get("type")
                 .and_then(|t| t.as_str())
                 .unwrap_or_default();
+
+            if block_type == "thinking" || block_type == "redacted_thinking" {
+                let index = index as usize;
+                state.saw_thinking_signal = true;
+                state.thinking_blocks_started = state.thinking_blocks_started.saturating_add(1);
+                state.thinking_blocks_by_index.insert(index);
+                log::info!(
+                    "Anthropic thinking block started: index={} type={}",
+                    index,
+                    block_type
+                );
+                return Ok(None);
+            }
 
             if block_type != "tool_use" {
                 return Ok(None);
@@ -550,6 +765,44 @@ pub fn parse_anthropic_sse_event(
                         },
                     ])))
                 }
+                "thinking_delta" => {
+                    let Some(index) = v.get("index").and_then(|i| i.as_u64()) else {
+                        return Ok(None);
+                    };
+                    let index = index as usize;
+
+                    if state.thinking_blocks_by_index.contains(&index) {
+                        state.saw_thinking_signal = true;
+                        let delta_len = delta
+                            .get("thinking")
+                            .and_then(|value| value.as_str())
+                            .map(str::len)
+                            .or_else(|| {
+                                delta
+                                    .get("text")
+                                    .and_then(|value| value.as_str())
+                                    .map(str::len)
+                            })
+                            .unwrap_or(0);
+                        state.thinking_chars_streamed =
+                            state.thinking_chars_streamed.saturating_add(delta_len);
+                        log::trace!(
+                            "Anthropic thinking_delta: index={}, chunk_len={}",
+                            index,
+                            delta_len
+                        );
+
+                        let reasoning_chunk = delta
+                            .get("thinking")
+                            .and_then(|value| value.as_str())
+                            .or_else(|| delta.get("text").and_then(|value| value.as_str()))
+                            .unwrap_or("");
+                        if !reasoning_chunk.is_empty() {
+                            return Ok(Some(LLMChunk::ReasoningToken(reasoning_chunk.to_string())));
+                        }
+                    }
+                    Ok(None)
+                }
                 _ => Ok(None),
             }
         }
@@ -561,7 +814,9 @@ pub fn parse_anthropic_sse_event(
 
             let v: Value = serde_json::from_str(data)?;
             if let Some(index) = v.get("index").and_then(|i| i.as_u64()) {
-                state.tool_uses_by_index.remove(&(index as usize));
+                let index = index as usize;
+                state.tool_uses_by_index.remove(&index);
+                state.thinking_blocks_by_index.remove(&index);
             }
             Ok(None)
         }
@@ -584,7 +839,7 @@ mod anthropic_request_building {
             Message::assistant("Hello!", None),
         ];
 
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
+        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
 
         assert_eq!(out["system"], "You are helpful.\n\nBe concise.");
         assert_eq!(out["messages"].as_array().unwrap().len(), 2);
@@ -594,7 +849,7 @@ mod anthropic_request_building {
     fn tool_messages_become_tool_result_blocks() {
         let messages = vec![Message::tool_result("call_1", "OK")];
 
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
+        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
 
         assert_eq!(out["messages"].as_array().unwrap().len(), 1);
         assert_eq!(out["messages"][0]["role"], "user");
@@ -616,7 +871,7 @@ mod anthropic_request_building {
 
         let messages = vec![Message::assistant("", Some(vec![tool_call]))];
 
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
+        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
 
         assert_eq!(out["messages"].as_array().unwrap().len(), 1);
         assert_eq!(out["messages"][0]["role"], "assistant");
@@ -643,7 +898,7 @@ mod anthropic_request_building {
             ],
         )];
 
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
+        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
 
         assert_eq!(out["messages"][0]["content"][1]["type"], "image");
         assert_eq!(out["messages"][0]["content"][1]["source"]["type"], "base64");
@@ -669,7 +924,7 @@ mod anthropic_request_building {
             }],
         )];
 
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
+        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
 
         assert_eq!(out["messages"][0]["content"][0]["type"], "image");
         assert_eq!(out["messages"][0]["content"][0]["source"]["type"], "url");
@@ -904,7 +1159,7 @@ mod anthropic_request_building_edge_cases {
     #[test]
     fn empty_messages_list() {
         let messages: Vec<Message> = vec![];
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
+        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
 
         assert!(out["system"].is_null());
         assert_eq!(out["messages"].as_array().unwrap().len(), 0);
@@ -913,7 +1168,7 @@ mod anthropic_request_building_edge_cases {
     #[test]
     fn only_system_messages() {
         let messages = vec![Message::system("Be helpful")];
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
+        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
 
         assert_eq!(out["system"], "Be helpful");
         assert_eq!(out["messages"].as_array().unwrap().len(), 0);
@@ -926,7 +1181,7 @@ mod anthropic_request_building_edge_cases {
             Message::system("Be concise"),
             Message::system("Be safe"),
         ];
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
+        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
 
         assert_eq!(out["system"], "Be helpful\n\nBe concise\n\nBe safe");
     }
@@ -948,7 +1203,7 @@ mod anthropic_request_building_edge_cases {
             "Let me search for that.",
             Some(vec![tool_call]),
         )];
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
+        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
 
         assert_eq!(out["messages"][0]["role"], "assistant");
         assert_eq!(out["messages"][0]["content"].as_array().unwrap().len(), 2);
@@ -974,7 +1229,7 @@ mod anthropic_request_building_edge_cases {
         };
 
         let messages = vec![Message::assistant("", Some(vec![tool_call]))];
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
+        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
 
         // Invalid JSON should be kept as a string
         assert_eq!(out["messages"][0]["content"][0]["input"], "not valid json");
@@ -985,18 +1240,18 @@ mod anthropic_request_building_edge_cases {
         let messages = vec![Message::user("Hello")];
 
         let out_stream_true =
-            super::build_anthropic_request(&messages, &[], "claude-test", 64, true);
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, true, None);
         assert_eq!(out_stream_true["stream"], true);
 
         let out_stream_false =
-            super::build_anthropic_request(&messages, &[], "claude-test", 64, false);
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
         assert_eq!(out_stream_false["stream"], false);
     }
 
     #[test]
     fn max_tokens_included_in_request() {
         let messages = vec![Message::user("Hello")];
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 2048, false);
+        let out = super::build_anthropic_request(&messages, &[], "claude-test", 2048, false, None);
 
         assert_eq!(out["max_tokens"], 2048);
     }
@@ -1004,8 +1259,14 @@ mod anthropic_request_building_edge_cases {
     #[test]
     fn model_included_in_request() {
         let messages = vec![Message::user("Hello")];
-        let out =
-            super::build_anthropic_request(&messages, &[], "claude-3-opus-20240229", 64, false);
+        let out = super::build_anthropic_request(
+            &messages,
+            &[],
+            "claude-3-opus-20240229",
+            64,
+            false,
+            None,
+        );
 
         assert_eq!(out["model"], "claude-3-opus-20240229");
     }
