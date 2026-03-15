@@ -184,6 +184,8 @@ fn parse_bamboo_attachment_url(url: &str) -> Option<(String, String)> {
 
 #[cfg(windows)]
 async fn rewrite_parts_to_ocr_text(state: Option<&AppState>, parts: &[ContentPart]) -> String {
+    const OCR_COORDINATE_GUIDANCE: &str = "Coordinate format: (x,y,w,h) in pixels relative to the image top-left corner. Use spatial relationships (left/right/above/below/overlap) between boxes when interpreting the content.";
+
     let mut out = String::new();
     let mut image_index = 0usize;
 
@@ -201,6 +203,8 @@ async fn rewrite_parts_to_ocr_text(state: Option<&AppState>, parts: &[ContentPar
                         out.push_str(": ");
                         out.push_str(&summary);
                         out.push_str("]\n");
+                        out.push_str(OCR_COORDINATE_GUIDANCE);
+                        out.push('\n');
                         for l in lines {
                             // Format: x,y,w,h are in pixels, relative to the image.
                             out.push_str(&format!(

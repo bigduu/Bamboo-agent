@@ -69,6 +69,7 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> imp
     let session = session.unwrap();
     HttpResponse::Ok().json(serde_json::json!({
         "session_id": session_id,
-        "messages": session.messages
+        "messages": session.messages,
+        "compression_events": session.compression_events
     }))
 }

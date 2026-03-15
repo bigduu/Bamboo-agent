@@ -35,6 +35,7 @@ async fn root_tools_include_server_overlays_and_memory_note() {
 
     assert!(names.contains("Task"));
     assert!(names.contains("schedule_tasks"));
+    assert!(names.contains("sub_session_manager"));
     assert!(names.contains("session_inspector"));
     assert!(names.contains("memory_note"));
 }
@@ -51,6 +52,7 @@ async fn child_tools_exclude_schedule_and_session_inspector() {
         .collect();
 
     assert!(!names.contains("schedule_tasks"));
+    assert!(!names.contains("sub_session_manager"));
     assert!(!names.contains("session_inspector"));
     assert!(names.contains("memory_note"));
 }
@@ -81,6 +83,18 @@ async fn overlay_tools_require_session_context() {
         .await;
     assert!(matches!(
         inspector_result,
+        Err(ToolError::Execution(msg)) if msg.contains("session_id")
+    ));
+
+    let sub_session_manager_result = state
+        .tools
+        .execute(&make_tool_call(
+            "sub_session_manager",
+            json!({ "action": "list" }),
+        ))
+        .await;
+    assert!(matches!(
+        sub_session_manager_result,
         Err(ToolError::Execution(msg)) if msg.contains("session_id")
     ));
 }

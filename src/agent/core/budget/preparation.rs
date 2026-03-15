@@ -3,9 +3,9 @@
 //! Implements the hybrid context preparation algorithm that enforces token
 //! budgets while preserving tool-call chain atomicity.
 
-use crate::agent::core::agent::types::Session;
+use crate::agent::core::agent::types::{Role, Session};
 use crate::agent::core::budget::counter::TokenCounter;
-use crate::agent::core::budget::segmenter::MessageSegmenter;
+use crate::agent::core::budget::segmenter::{MessageSegment, MessageSegmenter};
 use crate::agent::core::budget::types::{
     BudgetError, BudgetStrategy, PreparedContext, TokenBudget, TokenUsageBreakdown,
 };
@@ -48,33 +48,97 @@ pub fn prepare_hybrid_context(
     counter: &dyn TokenCounter,
 ) -> Result<PreparedContext, BudgetError> {
     let segmenter = MessageSegmenter::new();
+    let active_messages: Vec<_> = session
+        .messages
+        .iter()
+        .filter(|message| !message.compressed)
+        .cloned()
+        .collect();
 
     // 1. Extract system messages (always included) - takes ownership, no clone needed
-    let (system_messages, mut segments) = segmenter.segment_with_system(session.messages.clone());
+    let (system_messages, mut segments) = segmenter.segment_with_system(active_messages);
 
     // 2. Count system tokens
     let system_tokens = counter.count_messages(&system_messages);
 
     // 3. Check if system prompt alone exceeds budget
-    let available = budget.available_input_tokens();
-    if system_tokens > available {
+    let hard_available = budget.available_input_tokens();
+    if system_tokens > hard_available {
         return Err(BudgetError::SystemPromptTooLarge {
             system_tokens,
-            available_tokens: available,
+            available_tokens: hard_available,
         });
     }
 
-    // 4. Calculate remaining budget after system messages
-    let remaining_budget = available.saturating_sub(system_tokens);
+    // 4. Calculate remaining budget after system messages.
+    // Use proactive threshold so compression can occur before the hard limit.
+    let proactive_limit = budget.compression_trigger_input_tokens();
+    let target_limit = budget.compression_target_input_tokens();
+    let proactive_remaining_budget = proactive_limit.saturating_sub(system_tokens);
 
     // 5. Count tokens for each segment
     for segment in &mut segments {
         segment.token_estimate = counter.count_messages(&segment.messages);
     }
 
+    let pre_window_tokens: u32 = segments.iter().fold(0u32, |acc, segment| {
+        acc.saturating_add(segment.token_estimate)
+    });
+    let compression_needed = pre_window_tokens > proactive_remaining_budget;
+    let remaining_budget = if compression_needed {
+        target_limit.saturating_sub(system_tokens)
+    } else {
+        proactive_remaining_budget
+    };
+    if compression_needed {
+        let pre_total_tokens = system_tokens.saturating_add(pre_window_tokens);
+        let pre_usage_pct = if hard_available == 0 {
+            0.0
+        } else {
+            (pre_total_tokens as f64 / hard_available as f64) * 100.0
+        };
+        let target_effective_pct = if hard_available == 0 {
+            0
+        } else {
+            target_limit
+                .saturating_mul(100)
+                .saturating_div(hard_available)
+        };
+        log::info!(
+            "[{}] Context compression needed: pre_total={} (system={}, window={}), proactive_limit={} (trigger={}%), target_limit={} (target_config={}%, target_effective={}%), hard_limit={}, usage={:.1}%",
+            session.id,
+            pre_total_tokens,
+            system_tokens,
+            pre_window_tokens,
+            proactive_limit,
+            budget.compression_trigger_percent,
+            target_limit,
+            budget.compression_target_percent,
+            target_effective_pct,
+            hard_available,
+            pre_usage_pct
+        );
+    }
+
     // 6. Select segments from the end until budget is filled
-    let (mut selected_segments, removed_count) =
-        select_segments_within_budget(segments, remaining_budget, &budget.strategy);
+    let selection = select_segments_within_budget(segments, remaining_budget, &budget.strategy);
+    let mut selected_segments = selection.selected;
+    let removed_count = selection.removed.len();
+    let removed_messages_count: usize = selection.removed.iter().map(|s| s.messages.len()).sum();
+    let removed_tool_segments_count = selection
+        .removed
+        .iter()
+        .filter(|segment| segment.is_tool_chain)
+        .count();
+    let removed_tokens: u32 = selection.removed.iter().fold(0u32, |acc, segment| {
+        acc.saturating_add(segment.token_estimate)
+    });
+    let compressed_message_ids: Vec<String> = selection
+        .removed
+        .iter()
+        .flat_map(|segment| segment.messages.iter())
+        .map(|message| message.id.clone())
+        .collect();
 
     // 7. Build final message list
     let mut prepared_messages = system_messages;
@@ -92,6 +156,7 @@ pub fn prepare_hybrid_context(
     let window_tokens: u32 = selected_segments
         .iter()
         .fold(0u32, |acc, s| acc.saturating_add(s.token_estimate));
+    let kept_messages_count: usize = selected_segments.iter().map(|s| s.messages.len()).sum();
 
     let total_tokens = system_tokens
         .saturating_add(summary_tokens)
@@ -102,16 +167,38 @@ pub fn prepare_hybrid_context(
         summary_tokens,
         window_tokens,
         total_tokens,
-        budget_limit: available,
+        budget_limit: hard_available,
     };
 
     let truncation_occurred = removed_count > 0;
+    if truncation_occurred {
+        let applied_limit = if compression_needed {
+            target_limit
+        } else {
+            proactive_limit
+        };
+        log::info!(
+            "[{}] Context compression result: removed_segments={}, removed_messages={}, removed_tool_segments={}, removed_tokens={}, kept_segments={}, kept_messages={}, final_total={} / {} ({:.1}%), applied_limit={}",
+            session.id,
+            removed_count,
+            removed_messages_count,
+            removed_tool_segments_count,
+            removed_tokens,
+            selected_segments.len(),
+            kept_messages_count,
+            total_tokens,
+            hard_available,
+            token_usage.usage_percentage(),
+            applied_limit
+        );
+    }
 
     Ok(PreparedContext {
         messages: prepared_messages,
         token_usage,
         truncation_occurred,
         segments_removed: removed_count,
+        compressed_message_ids,
     })
 }
 
@@ -120,68 +207,129 @@ pub fn prepare_hybrid_context(
 /// Takes segments from the end (most recent) until budget is filled.
 /// Respects tool-chain atomicity - never splits tool calls from their results.
 fn select_segments_within_budget(
-    segments: Vec<crate::agent::core::budget::segmenter::MessageSegment>,
+    segments: Vec<MessageSegment>,
     remaining_budget: u32,
     _strategy: &BudgetStrategy,
-) -> (
-    Vec<crate::agent::core::budget::segmenter::MessageSegment>,
-    usize,
-) {
-    let total_segments = segments.len();
-    let mut selected: Vec<crate::agent::core::budget::segmenter::MessageSegment> = Vec::new();
-    let mut current_tokens: u32 = 0;
-    let mut oversized_skipped_count: usize = 0;
-    let mut oversized_max_tokens: u32 = 0;
+) -> SegmentSelectionResult {
+    let total_tokens = segments.iter().fold(0u32, |acc, segment| {
+        acc.saturating_add(segment.token_estimate)
+    });
+    if total_tokens <= remaining_budget {
+        return SegmentSelectionResult {
+            selected: segments,
+            removed: Vec::new(),
+        };
+    }
 
-    // Iterate from the end (most recent) backwards
-    for segment in segments.into_iter().rev() {
-        let segment_tokens = segment.token_estimate;
+    let mut keep_flags = vec![true; segments.len()];
+    let mut protected_flags = vec![false; segments.len()];
+    let mut current_tokens = total_tokens;
 
-        // Check if this segment alone exceeds the budget
-        if segment_tokens > remaining_budget {
-            if selected.is_empty() {
-                // Edge case: single message exceeds entire budget
-                // Skip oversized segments and log a summarized warning later.
-                oversized_skipped_count = oversized_skipped_count.saturating_add(1);
-                oversized_max_tokens = oversized_max_tokens.max(segment_tokens);
-                // Skip this segment and continue to try to find smaller ones
-                continue;
-            } else {
-                // Budget filled, stop selecting
-                break;
-            }
-        }
+    // Prefer preserving the original question and latest textual outcome.
+    if let Some(first_user_index) = segments.iter().position(segment_contains_user) {
+        protected_flags[first_user_index] = true;
+    }
+    if let Some(last_user_index) = segments.iter().rposition(segment_contains_user) {
+        protected_flags[last_user_index] = true;
+    }
+    if let Some(last_assistant_text_index) =
+        segments.iter().rposition(segment_contains_assistant_text)
+    {
+        protected_flags[last_assistant_text_index] = true;
+    }
 
-        // Check if adding this segment would exceed budget
-        if current_tokens.saturating_add(segment_tokens) > remaining_budget {
+    // Phase 1: drop oldest tool chains first (usually intermediate execution traces).
+    for index in 0..segments.len() {
+        if current_tokens <= remaining_budget {
             break;
         }
-
-        current_tokens = current_tokens.saturating_add(segment_tokens);
-        selected.push(segment);
+        if !keep_flags[index] || protected_flags[index] {
+            continue;
+        }
+        if segments[index].is_tool_chain {
+            keep_flags[index] = false;
+            current_tokens = current_tokens.saturating_sub(segments[index].token_estimate);
+        }
     }
 
-    // Reverse to restore chronological order
-    selected.reverse();
-
-    let removed_count = total_segments - selected.len();
-
-    if oversized_skipped_count > 0 {
-        tracing::warn!(
-            "Skipped {count} oversized segment(s); largest={largest} tokens exceeds remaining budget={budget}",
-            count = oversized_skipped_count,
-            largest = oversized_max_tokens,
-            budget = remaining_budget
-        );
+    // Phase 2: if still over, drop oldest non-tool segments except protected anchors.
+    for index in 0..segments.len() {
+        if current_tokens <= remaining_budget {
+            break;
+        }
+        if !keep_flags[index] || protected_flags[index] {
+            continue;
+        }
+        if !segments[index].is_tool_chain {
+            keep_flags[index] = false;
+            current_tokens = current_tokens.saturating_sub(segments[index].token_estimate);
+        }
     }
 
-    (selected, removed_count)
+    // Phase 3: remove any remaining non-protected segments.
+    for index in 0..segments.len() {
+        if current_tokens <= remaining_budget {
+            break;
+        }
+        if !keep_flags[index] || protected_flags[index] {
+            continue;
+        }
+        keep_flags[index] = false;
+        current_tokens = current_tokens.saturating_sub(segments[index].token_estimate);
+    }
+
+    // Phase 4 (fallback): if anchors still don't fit, remove protected segments from oldest first.
+    for index in 0..segments.len() {
+        if current_tokens <= remaining_budget {
+            break;
+        }
+        if !keep_flags[index] || !protected_flags[index] {
+            continue;
+        }
+        keep_flags[index] = false;
+        current_tokens = current_tokens.saturating_sub(segments[index].token_estimate);
+    }
+
+    let mut selected = Vec::new();
+    let mut removed = Vec::new();
+    for (index, segment) in segments.into_iter().enumerate() {
+        if keep_flags[index] {
+            selected.push(segment);
+        } else {
+            removed.push(segment);
+        }
+    }
+
+    SegmentSelectionResult { selected, removed }
+}
+
+struct SegmentSelectionResult {
+    selected: Vec<MessageSegment>,
+    removed: Vec<MessageSegment>,
+}
+
+fn segment_contains_user(segment: &MessageSegment) -> bool {
+    segment
+        .messages
+        .iter()
+        .any(|message| message.role == Role::User)
+}
+
+fn segment_contains_assistant_text(segment: &MessageSegment) -> bool {
+    segment.messages.iter().any(|message| {
+        message.role == Role::Assistant
+            && !message.content.trim().is_empty()
+            && message
+                .tool_calls
+                .as_ref()
+                .map_or(true, |calls| calls.is_empty())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::core::agent::types::Message;
+    use crate::agent::core::agent::types::{Message, Role};
     use crate::agent::core::budget::counter::HeuristicTokenCounter;
     use crate::agent::core::tools::{FunctionCall, ToolCall};
 
@@ -512,6 +660,195 @@ mod tests {
         assert!(
             prepared.token_usage.total_tokens <= prepared.token_usage.budget_limit,
             "Total tokens should not exceed budget limit"
+        );
+    }
+
+    #[test]
+    fn excludes_precompressed_messages_from_llm_context() {
+        let counter = HeuristicTokenCounter::default();
+        let budget = TokenBudget::for_model(128_000);
+
+        let mut archived = Message::user("Archived context");
+        archived.compressed = true;
+        archived.compressed_by_event_id = Some("evt-1".to_string());
+
+        let messages = vec![
+            Message::system("System"),
+            archived,
+            Message::user("Active message"),
+            Message::assistant("Active response", None),
+        ];
+        let session = make_session_with_messages(messages);
+
+        let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
+        assert!(
+            prepared
+                .messages
+                .iter()
+                .all(|message| !message.content.contains("Archived context")),
+            "Compressed messages must be excluded from LLM context"
+        );
+    }
+
+    #[test]
+    fn returns_newly_compressed_message_ids_when_truncated() {
+        let counter = HeuristicTokenCounter::default();
+        let budget = TokenBudget::new(500, 200, BudgetStrategy::Window { size: 50 });
+
+        let mut messages = vec![Message::system("System")];
+        for i in 0..24 {
+            messages.push(Message::user(format!("Older message {}", i)));
+            messages.push(Message::assistant(format!("Older response {}", i), None));
+        }
+
+        let session = make_session_with_messages(messages);
+        let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
+
+        assert!(prepared.truncation_occurred);
+        assert!(
+            !prepared.compressed_message_ids.is_empty(),
+            "Truncation should return IDs for archived messages"
+        );
+    }
+
+    #[test]
+    fn prefers_purging_intermediate_tool_traces_under_budget_pressure() {
+        let counter = HeuristicTokenCounter::default();
+        let mut budget =
+            TokenBudget::with_safety_margin(800, 200, BudgetStrategy::Window { size: 50 }, 100);
+        budget.compression_trigger_percent = 70;
+
+        let messages = vec![
+            Message::system("System"),
+            Message::user("How do we migrate database schema safely?"),
+            Message::assistant(
+                "Running analysis step 1",
+                Some(vec![create_tool_call("call_1")]),
+            ),
+            Message::tool_result("call_1", "intermediate-tool-output-1 ".repeat(180)),
+            Message::assistant(
+                "Running analysis step 2",
+                Some(vec![create_tool_call("call_2")]),
+            ),
+            Message::tool_result("call_2", "intermediate-tool-output-2 ".repeat(180)),
+            Message::assistant(
+                "Final answer: use an online migration with backfill and cutover.",
+                None,
+            ),
+        ];
+        let session = make_session_with_messages(messages);
+
+        let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
+        let has_question = prepared.messages.iter().any(|message| {
+            message.role == Role::User && message.content.contains("migrate database schema")
+        });
+        let has_final_answer = prepared.messages.iter().any(|message| {
+            message.role == Role::Assistant
+                && message
+                    .tool_calls
+                    .as_ref()
+                    .map_or(true, |calls| calls.is_empty())
+                && message.content.contains("Final answer")
+        });
+        let tool_results_kept = prepared
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .count();
+
+        assert!(prepared.truncation_occurred);
+        assert!(has_question, "Original user question should be preserved");
+        assert!(
+            has_final_answer,
+            "Final assistant conclusion should be preserved"
+        );
+        assert!(
+            tool_results_kept < 2,
+            "At least one intermediate tool result should be purged"
+        );
+    }
+
+    #[test]
+    fn proactive_trigger_compresses_before_hard_limit() {
+        let counter = HeuristicTokenCounter::default();
+        let mut proactive_budget =
+            TokenBudget::with_safety_margin(400, 100, BudgetStrategy::Window { size: 50 }, 100);
+        proactive_budget.compression_trigger_percent = 50;
+
+        let mut hard_only_budget = proactive_budget.clone();
+        hard_only_budget.compression_trigger_percent = 100;
+
+        let messages = vec![
+            Message::system("System"),
+            Message::user("Message A with enough content to consume noticeable token budget."),
+            Message::assistant(
+                "Response A with enough content to consume noticeable token budget.",
+                None,
+            ),
+            Message::user("Message B with enough content to consume noticeable token budget."),
+            Message::assistant(
+                "Response B with enough content to consume noticeable token budget.",
+                None,
+            ),
+            Message::user("Message C with enough content to consume noticeable token budget."),
+            Message::assistant(
+                "Response C with enough content to consume noticeable token budget.",
+                None,
+            ),
+        ];
+        let session = make_session_with_messages(messages);
+
+        let proactive = prepare_hybrid_context(&session, &proactive_budget, &counter).unwrap();
+        let hard_only = prepare_hybrid_context(&session, &hard_only_budget, &counter).unwrap();
+
+        assert!(
+            proactive.truncation_occurred,
+            "Proactive trigger should truncate before hard budget is exceeded"
+        );
+        assert!(
+            !hard_only.truncation_occurred,
+            "Hard-limit-only budget should keep this context"
+        );
+    }
+
+    #[test]
+    fn compression_reduces_context_to_target_threshold() {
+        let counter = HeuristicTokenCounter::default();
+        let mut budget =
+            TokenBudget::with_safety_margin(900, 200, BudgetStrategy::Window { size: 80 }, 100);
+        budget.compression_trigger_percent = 80;
+        budget.compression_target_percent = 50;
+
+        let mut messages = vec![Message::system("System prompt")];
+        for i in 0..20 {
+            messages.push(Message::user(format!(
+                "Question {} with enough content to pressure token usage in the context window.",
+                i
+            )));
+            messages.push(Message::assistant(
+                format!(
+                    "Answer {} with enough content to pressure token usage in the context window.",
+                    i
+                ),
+                None,
+            ));
+        }
+
+        let session = make_session_with_messages(messages);
+        let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
+        let keeps_latest_goal = prepared
+            .messages
+            .iter()
+            .any(|message| message.role == Role::User && message.content.contains("Question 19"));
+
+        assert!(prepared.truncation_occurred);
+        assert!(
+            prepared.token_usage.total_tokens <= budget.compression_target_input_tokens(),
+            "Post-compression context should be at or below target threshold"
+        );
+        assert!(
+            keeps_latest_goal,
+            "Latest user goal/request should survive compression"
         );
     }
 }

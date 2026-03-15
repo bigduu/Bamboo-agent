@@ -70,7 +70,6 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
     }
 
     log::info!("Skill metadata context built: {} chars", context.len());
-    log::debug!("Skill context content:\n{}", context);
 
     context
 }

@@ -48,10 +48,9 @@ fn build_enhanced_system_prompt_appends_workspace_context_before_skills() {
         Some("/tmp/workspace"),
     );
 
-    let workspace_segment = format!(
-        "Workspace path: /tmp/workspace\n{}",
-        crate::server::app_state::workspace_prompt_guidance()
-    );
+    let workspace_segment =
+        crate::server::app_state::build_workspace_prompt_context("/tmp/workspace")
+            .expect("workspace segment");
 
     assert!(prompt.contains(&workspace_segment));
 }

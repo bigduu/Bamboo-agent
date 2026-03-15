@@ -58,6 +58,12 @@ pub(super) async fn execute_llm_round(
     )
     .await?;
 
+    if stream_output.tool_calls.is_empty() && stream_output.content.trim().is_empty() {
+        return Err(AgentError::LLM(
+            "empty assistant response from LLM (retryable)".to_string(),
+        ));
+    }
+
     let prompt_tokens = estimate_prompt_tokens(&prepared.prepared_context.messages);
     let completion_tokens =
         estimate_completion_tokens(&stream_output.content, &stream_output.tool_calls);

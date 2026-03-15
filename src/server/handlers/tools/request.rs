@@ -62,6 +62,7 @@ pub(super) fn requires_session_context(tool_name: &str) -> bool {
             | "Task"
             | "memory_note"
             | "schedule_tasks"
+            | "sub_session_manager"
             | "session_inspector"
     )
 }

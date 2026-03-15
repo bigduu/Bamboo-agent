@@ -42,7 +42,7 @@ impl Tool for MemoryNoteTool {
     }
 
     fn description(&self) -> &str {
-        "Read or update the persistent per-session memory note (markdown). Use this to store durable facts/preferences/decisions across turns. If the note would exceed the length limit, compress it (rewrite more concisely) and try again."
+        "Read or update the persistent per-session memory note (markdown). Use this to store durable facts/preferences/decisions across turns. Hard limit: 12000 characters; compress before append/replace if needed."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

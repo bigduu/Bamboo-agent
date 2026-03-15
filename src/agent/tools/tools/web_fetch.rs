@@ -97,7 +97,7 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a URL and process its content with a prompt"
+        "Fetch an HTTP(S) URL and return a cleaned text excerpt plus metadata. The `prompt` field is caller context only; this tool does not run an extra model."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -111,7 +111,7 @@ impl Tool for WebFetchTool {
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Prompt describing what to extract"
+                    "description": "Caller-supplied extraction intent note; echoed in output for downstream processing"
                 }
             },
             "required": ["url", "prompt"],

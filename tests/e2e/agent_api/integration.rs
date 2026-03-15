@@ -2,7 +2,7 @@ use super::*;
 
 #[actix_web::test]
 async fn test_full_project_workflow() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
     let temp_project = create_temp_project();
     let project_path = temp_project.to_string_lossy().to_string();
@@ -53,7 +53,7 @@ async fn test_full_project_workflow() {
 
 #[actix_web::test]
 async fn test_settings_and_prompt_integration() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
 
     let app = test::init_service(

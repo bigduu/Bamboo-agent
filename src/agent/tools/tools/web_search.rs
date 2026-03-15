@@ -60,7 +60,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web and return filtered result links"
+        "Search DuckDuckGo and return up to 10 filtered results (title, url, domain) with optional allow/block domain filters."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

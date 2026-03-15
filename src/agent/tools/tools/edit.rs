@@ -200,7 +200,7 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> &str {
-        "Perform exact string replacements in files"
+        "Edit existing files via exact replacements or SEARCH/REPLACE patch blocks. IMPORTANT: call Read first in this session or Edit will fail."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

@@ -39,6 +39,22 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api/v1")
             .route("/chat", web::post().to(agent::chat::handler))
+            .route(
+                "/prompt-presets",
+                web::get().to(agent::prompt_presets::list_prompt_presets),
+            )
+            .route(
+                "/prompt-presets",
+                web::post().to(agent::prompt_presets::create_prompt_preset),
+            )
+            .route(
+                "/prompt-presets/{preset_id}",
+                web::patch().to(agent::prompt_presets::patch_prompt_preset),
+            )
+            .route(
+                "/prompt-presets/{preset_id}",
+                web::delete().to(agent::prompt_presets::delete_prompt_preset),
+            )
             // Session index / management (V2)
             .route("/sessions", web::get().to(agent::sessions::list_sessions))
             .route("/sessions", web::post().to(agent::sessions::create_session))
@@ -49,6 +65,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             .route(
                 "/sessions/{session_id}",
                 web::get().to(agent::sessions::get_session),
+            )
+            .route(
+                "/sessions/{session_id}/system-prompt",
+                web::get().to(agent::sessions::get_system_prompt_snapshot),
             )
             .route(
                 "/sessions/{session_id}",

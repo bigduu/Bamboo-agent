@@ -143,6 +143,12 @@ pub struct Message {
     /// Tool call ID (for Tool result messages)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Whether this message is archived/compressed and excluded from LLM requests.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub compressed: bool,
+    /// Compression event ID that archived this message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compressed_by_event_id: Option<String>,
     /// Message creation timestamp
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
@@ -174,6 +180,10 @@ fn generate_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl Message {
     /// Create a user message.
     ///
@@ -196,6 +206,8 @@ impl Message {
             image_ocr: None,
             tool_calls: None,
             tool_call_id: None,
+            compressed: false,
+            compressed_by_event_id: None,
             created_at: Utc::now(),
         }
     }
@@ -213,6 +225,8 @@ impl Message {
             image_ocr: None,
             tool_calls: None,
             tool_call_id: None,
+            compressed: false,
+            compressed_by_event_id: None,
             created_at: Utc::now(),
         }
     }
@@ -239,6 +253,8 @@ impl Message {
             image_ocr: None,
             tool_calls,
             tool_call_id: None,
+            compressed: false,
+            compressed_by_event_id: None,
             created_at: Utc::now(),
         }
     }
@@ -265,6 +281,8 @@ impl Message {
             image_ocr: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
+            compressed: false,
+            compressed_by_event_id: None,
             created_at: Utc::now(),
         }
     }
@@ -290,6 +308,8 @@ impl Message {
             image_ocr: None,
             tool_calls: None,
             tool_call_id: None,
+            compressed: false,
+            compressed_by_event_id: None,
             created_at: Utc::now(),
         }
     }
@@ -416,6 +436,33 @@ impl ConversationSummary {
     }
 }
 
+/// Persistent context-compression event.
+///
+/// Each event captures one compaction operation so the UI can display
+/// a timeline of multiple compression boundaries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressionEvent {
+    /// Unique compression event identifier.
+    pub id: String,
+    /// Event timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Number of messages archived by this event.
+    pub messages_compressed: usize,
+    /// Number of segments removed in budget preparation for this event.
+    pub segments_removed: usize,
+}
+
+impl CompressionEvent {
+    pub fn new(messages_compressed: usize, segments_removed: usize) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            created_at: Utc::now(),
+            messages_compressed,
+            segments_removed,
+        }
+    }
+}
+
 /// A complete conversation session with state management.
 ///
 /// Represents a full conversation session including message history,
@@ -505,6 +552,9 @@ pub struct Session {
     /// Conversation summary for context management
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_summary: Option<ConversationSummary>,
+    /// Historical compression events used by the UI to render compression separators.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compression_events: Vec<CompressionEvent>,
 }
 
 /// Session type marker for spawn-session support.
@@ -555,6 +605,7 @@ impl Session {
             token_budget: None,
             token_usage: None,
             conversation_summary: None,
+            compression_events: Vec::new(),
         }
     }
 
@@ -586,6 +637,7 @@ impl Session {
             token_budget: None,
             token_usage: None,
             conversation_summary: None,
+            compression_events: Vec::new(),
         }
     }
 

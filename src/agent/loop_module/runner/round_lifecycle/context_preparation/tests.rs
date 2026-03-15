@@ -1,4 +1,5 @@
 use super::prepare_round_context;
+use crate::agent::core::budget::{BudgetStrategy, TokenBudget};
 use crate::agent::core::{Message, Role, Session};
 use crate::agent::llm::models::{ContentPart, ImageUrl};
 use crate::agent::loop_module::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
@@ -44,4 +45,48 @@ async fn prepare_round_context_applies_placeholder_fallback_only_to_prepared_con
         .find(|m| matches!(m.role, Role::User))
         .expect("persisted user message should exist");
     assert!(persisted_user.content_parts.is_some());
+}
+
+#[tokio::test]
+async fn prepare_round_context_records_compression_events_and_marks_messages() {
+    let mut session = Session::new("session-cp-2", "test-model");
+    session.token_budget = Some(TokenBudget::new(
+        600,
+        200,
+        BudgetStrategy::Window { size: 50 },
+    ));
+    session.messages.push(Message::system("System prompt"));
+    for index in 0..20 {
+        session
+            .messages
+            .push(Message::user(format!("Old user message {}", index)));
+        session.messages.push(Message::assistant(
+            format!("Old assistant response {}", index),
+            None,
+        ));
+    }
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+
+    let _prepared = prepare_round_context(&mut session, &config, "test-model", "session-cp-2")
+        .await
+        .expect("prepare round context");
+
+    assert!(
+        !session.compression_events.is_empty(),
+        "Expected at least one compression event"
+    );
+    let archived_count = session.messages.iter().filter(|m| m.compressed).count();
+    assert!(archived_count > 0, "Expected archived messages");
+    assert!(
+        session
+            .messages
+            .iter()
+            .filter(|m| m.compressed)
+            .all(|m| m.compressed_by_event_id.is_some()),
+        "Archived messages should reference a compression event"
+    );
 }

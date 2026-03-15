@@ -50,12 +50,18 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         Ok(session) => session,
         Err(response) => return response,
     };
+    let global_default_prompt =
+        crate::server::prompt_defaults::read_global_default_system_prompt_template();
 
     let base_prompt = session::resolve_base_prompt(
         &mut session,
         request::optional_non_empty(req.system_prompt.as_deref()),
+        global_default_prompt.as_str(),
     );
-    let enhance_prompt = request::optional_non_empty(req.enhance_prompt.as_deref());
+    let enhance_prompt = session::resolve_enhance_prompt(
+        &mut session,
+        request::optional_non_empty(req.enhance_prompt.as_deref()),
+    );
     let workspace_path = session::resolve_workspace_path(
         &mut session,
         request::optional_non_empty(req.workspace_path.as_deref()),
@@ -65,7 +71,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     // keep stale tool instructions after backend upgrades.
     let system_prompt = build_enhanced_system_prompt(
         base_prompt.as_str(),
-        enhance_prompt,
+        enhance_prompt.as_deref(),
         workspace_path.as_deref(),
     );
     upsert_system_prompt_message(&mut session, system_prompt);

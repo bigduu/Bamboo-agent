@@ -1,6 +1,6 @@
 use actix_web::{web, HttpResponse};
 
-use crate::agent::core::Session;
+use crate::agent::core::{Role, Session};
 use crate::server::app_state::AppState;
 
 pub(super) async fn load_or_create_session(
@@ -35,6 +35,7 @@ pub(super) async fn load_or_create_session(
 pub(super) fn resolve_base_prompt(
     session: &mut Session,
     base_prompt_from_request: Option<&str>,
+    global_default_template: &str,
 ) -> String {
     // Persist the base system prompt on the session so the frontend does not need to
     // store chat history (or system prompt config) in localStorage.
@@ -42,16 +43,38 @@ pub(super) fn resolve_base_prompt(
     // IMPORTANT: The agent loop may mutate the in-session system message by merging
     // in skills/tool guide context. We therefore treat `metadata.base_system_prompt`
     // as the stable "source of truth" for future prompt construction.
-    if let Some(prompt) = base_prompt_from_request {
-        session
-            .metadata
-            .insert("base_system_prompt".to_string(), prompt.to_string());
-    }
-
-    base_prompt_from_request
+    let resolved = base_prompt_from_request
         .map(ToString::to_string)
-        .or_else(|| session.metadata.get("base_system_prompt").cloned())
-        .unwrap_or_else(|| crate::server::app_state::DEFAULT_BASE_PROMPT.to_string())
+        .or_else(|| {
+            session
+                .metadata
+                .get("base_system_prompt")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            session
+                .messages
+                .iter()
+                .find(|message| matches!(message.role, Role::System))
+                .map(|message| message.content.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| {
+            let trimmed = global_default_template.trim();
+            if trimmed.is_empty() {
+                crate::server::app_state::DEFAULT_BASE_PROMPT.to_string()
+            } else {
+                trimmed.to_string()
+            }
+        });
+
+    session
+        .metadata
+        .insert("base_system_prompt".to_string(), resolved.clone());
+    resolved
 }
 
 pub(super) fn resolve_workspace_path(
@@ -67,6 +90,21 @@ pub(super) fn resolve_workspace_path(
     workspace_path_from_request
         .map(ToString::to_string)
         .or_else(|| session.metadata.get("workspace_path").cloned())
+}
+
+pub(super) fn resolve_enhance_prompt(
+    session: &mut Session,
+    enhance_prompt_from_request: Option<&str>,
+) -> Option<String> {
+    if let Some(prompt) = enhance_prompt_from_request {
+        session
+            .metadata
+            .insert("enhance_prompt".to_string(), prompt.to_string());
+    } else {
+        session.metadata.remove("enhance_prompt");
+    }
+
+    enhance_prompt_from_request.map(ToString::to_string)
 }
 
 pub(super) async fn cache_and_save_session(

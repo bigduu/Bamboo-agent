@@ -6,18 +6,23 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 16] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
     "ask_user",
     "Bash",
     "BashOutput",
     "Edit",
     "ExitPlanMode",
+    "FileExists",
     "Glob",
+    "GetCurrentDir",
+    "GetFileInfo",
     "Grep",
     "KillShell",
+    "memory_note",
     "NotebookEdit",
     "Read",
-    "SlashCommand",
+    "SetWorkspace",
+    "Sleep",
     "Task",
     "TodoWrite",
     "WebFetch",
@@ -138,11 +143,11 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             "KillShell",
             ToolCategory::CommandExecution,
             "Terminate a background shell.",
-            "Do not use for foreground commands.",
+            "Do not use for foreground commands; use the ID returned by Bash(run_in_background=true), not chat session_id.",
             &["Bash", "BashOutput"],
             vec![example(
                 "Stop runaway process",
-                json!({"shell_id":"abc"}),
+                json!({"shell_id":"<bash_id-from-Bash>"}),
                 "Use when process should no longer run.",
             )],
         )),
@@ -206,16 +211,28 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Use after producing a concrete implementation plan.",
             )],
         )),
+        "FileExists" => Some(guide(
+            "FileExists",
+            ToolCategory::FileReading,
+            "Check quickly whether a path exists before reading, editing, or writing conditionally.",
+            "Do not use to inspect file content or metadata details.",
+            &["GetFileInfo", "Read", "Write"],
+            vec![example(
+                "Guard before write",
+                json!({"path":"/workspace/project/.env"}),
+                "Use as a fast existence probe before deciding create vs update.",
+            )],
+        )),
         "WebFetch" => Some(guide(
             "WebFetch",
             ToolCategory::CommandExecution,
-            "Fetch a specific webpage and summarize content for a prompt.",
+            "Fetch a webpage by URL when you need cleaned page text from a known target.",
             "Do not use for broad discovery queries.",
             &["WebSearch"],
             vec![example(
-                "Fetch docs page",
-                json!({"url":"https://example.com/docs","prompt":"Extract setup steps"}),
-                "Use when you already know the URL.",
+                "Fetch a target page",
+                json!({"url":"https://target-host/path","prompt":"Extract setup steps"}),
+                "The prompt field is context for downstream handling; WebFetch itself returns cleaned text + metadata.",
             )],
         )),
         "WebSearch" => Some(guide(
@@ -228,6 +245,66 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Search official docs",
                 json!({"query":"rust async trait object", "allowed_domains":["doc.rust-lang.org"]}),
                 "Use before WebFetch when URL is unknown.",
+            )],
+        )),
+        "GetCurrentDir" => Some(guide(
+            "GetCurrentDir",
+            ToolCategory::CommandExecution,
+            "Retrieve the session's current workspace directory before running relative-path operations.",
+            "Do not use when absolute paths are already known.",
+            &["SetWorkspace", "Bash", "Read"],
+            vec![example(
+                "Inspect working directory",
+                json!({}),
+                "Useful before commands or file ops that rely on relative paths.",
+            )],
+        )),
+        "GetFileInfo" => Some(guide(
+            "GetFileInfo",
+            ToolCategory::FileReading,
+            "Read metadata (file/dir, size, modified time) without loading file content.",
+            "Do not use when you need actual content; use Read instead.",
+            &["FileExists", "Read"],
+            vec![example(
+                "Check metadata before processing",
+                json!({"path":"/workspace/project/logs/app.log"}),
+                "Use to branch behavior based on file type/size.",
+            )],
+        )),
+        "memory_note" => Some(guide(
+            "memory_note",
+            ToolCategory::TaskManagement,
+            "Store durable per-session facts/decisions and retrieve them across turns.",
+            "Do not store secrets/tokens or transient one-turn scratch text.",
+            &["TodoWrite"],
+            vec![example(
+                "Persist a durable decision",
+                json!({"action":"append","content":"User prefers pnpm and strict TypeScript."}),
+                "Use append for new durable facts; use replace to compress long notes.",
+            )],
+        )),
+        "SetWorkspace" => Some(guide(
+            "SetWorkspace",
+            ToolCategory::CommandExecution,
+            "Change the current session workspace so relative paths and shell commands run in the intended project.",
+            "Do not use with non-directory or missing paths.",
+            &["GetCurrentDir", "Bash", "Read"],
+            vec![example(
+                "Switch session workspace",
+                json!({"path":"/workspace/project"}),
+                "Use before running commands or edits in another repo root.",
+            )],
+        )),
+        "Sleep" => Some(guide(
+            "Sleep",
+            ToolCategory::CommandExecution,
+            "Pause briefly when waiting for an external state change before polling again.",
+            "Do not use for normal reasoning pauses or long waits when another tool can fetch status directly.",
+            &["BashOutput", "WebFetch"],
+            vec![example(
+                "Wait before next poll",
+                json!({"seconds":2,"reason":"wait for background process output"}),
+                "Use short waits between repeated status checks.",
             )],
         )),
         _ => None,
@@ -265,6 +342,8 @@ fn example(scenario: &str, parameters: serde_json::Value, explanation: &str) -> 
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::tools::executor::BUILTIN_TOOL_NAMES;
+
     use super::{builtin_guide_spec, BUILTIN_GUIDE_NAMES};
 
     #[test]
@@ -273,6 +352,17 @@ mod tests {
             assert!(
                 builtin_guide_spec(name).is_some(),
                 "missing guide for {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_guides_cover_all_builtin_tool_names() {
+        for name in BUILTIN_TOOL_NAMES {
+            assert!(
+                builtin_guide_spec(name).is_some(),
+                "missing builtin guide coverage for {}",
                 name
             );
         }

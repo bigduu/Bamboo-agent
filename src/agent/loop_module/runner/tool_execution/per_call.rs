@@ -11,6 +11,21 @@ use crate::agent::metrics::MetricsCollector;
 use super::execution_paths;
 use super::loop_state::RoundExecutionState;
 
+fn preview_for_log(value: &str, max_chars: usize) -> String {
+    let mut iter = value.chars();
+    let mut preview = String::new();
+    for _ in 0..max_chars {
+        match iter.next() {
+            Some(ch) => preview.push(ch),
+            None => break,
+        }
+    }
+    if iter.next().is_some() {
+        preview.push_str("...");
+    }
+    preview.replace('\n', "\\n").replace('\r', "\\r")
+}
+
 pub(super) struct PerToolExecutionContext<'a> {
     pub tool_call: &'a ToolCall,
     pub event_tx: &'a mpsc::Sender<AgentEvent>,
@@ -26,8 +41,32 @@ pub(super) struct PerToolExecutionContext<'a> {
 }
 
 pub(super) async fn execute_single_tool_call(ctx: PerToolExecutionContext<'_>) -> bool {
-    let args = parse_tool_args(&ctx.tool_call.function.arguments)
-        .unwrap_or_else(|_| serde_json::json!({}));
+    let raw_arguments = ctx.tool_call.function.arguments.trim();
+    let args = match parse_tool_args(&ctx.tool_call.function.arguments) {
+        Ok(args) => args,
+        Err(error) => {
+            log::warn!(
+                "[{}][round:{}] Failed to parse tool call arguments before ToolStart event; using empty object: tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", error={}",
+                ctx.session_id,
+                ctx.round,
+                ctx.tool_call.id,
+                ctx.tool_call.function.name,
+                raw_arguments.len(),
+                preview_for_log(raw_arguments, 180),
+                error
+            );
+            serde_json::json!({})
+        }
+    };
+
+    log::debug!(
+        "[{}][round:{}] Starting tool execution: tool_call_id={}, tool_name={}, raw_args_len={}",
+        ctx.session_id,
+        ctx.round,
+        ctx.tool_call.id,
+        ctx.tool_call.function.name,
+        raw_arguments.len()
+    );
 
     super::events::send_event_with_metrics(
         ctx.event_tx,

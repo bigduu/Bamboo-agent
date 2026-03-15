@@ -2,7 +2,7 @@ use super::*;
 
 #[actix_web::test]
 async fn test_get_system_prompt_default() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
 
     let app = test::init_service(App::new().app_data(state).route(
@@ -26,7 +26,7 @@ async fn test_get_system_prompt_default() {
 
 #[actix_web::test]
 async fn test_save_and_get_system_prompt() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
 
     let app = test::init_service(

@@ -34,7 +34,7 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write a file to the local filesystem"
+        "Write a local file (create or replace full content). IMPORTANT: for existing files, call Read first in this session or Write will fail."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

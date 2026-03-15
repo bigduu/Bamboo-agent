@@ -33,6 +33,8 @@ impl FromProvider<AnthropicMessage> for Message {
             image_ocr: None,
             tool_calls: None, // Anthropic messages don't have tool_calls at this level
             tool_call_id: None,
+            compressed: false,
+            compressed_by_event_id: None,
             created_at: chrono::Utc::now(),
         })
     }
@@ -62,6 +64,21 @@ impl FromProvider<AnthropicTool> for ToolSchema {
 pub struct AnthropicRequest {
     pub system: Option<String>,
     pub messages: Vec<AnthropicMessage>,
+}
+
+fn preview_for_log(value: &str, max_chars: usize) -> String {
+    let mut iter = value.chars();
+    let mut preview = String::new();
+    for _ in 0..max_chars {
+        match iter.next() {
+            Some(ch) => preview.push(ch),
+            None => break,
+        }
+    }
+    if iter.next().is_some() {
+        preview.push_str("...");
+    }
+    preview.replace('\n', "\\n").replace('\r', "\\r")
 }
 
 impl ToProvider<AnthropicRequest> for Vec<Message> {
@@ -136,8 +153,21 @@ impl ToProvider<AnthropicMessage> for Message {
                 // Add tool calls as tool_use blocks
                 if let Some(tool_calls) = &self.tool_calls {
                     for tc in tool_calls {
-                        let input: Value = serde_json::from_str(&tc.function.arguments)
-                            .unwrap_or_else(|_| Value::String(tc.function.arguments.clone()));
+                        let raw_arguments = tc.function.arguments.trim();
+                        let input: Value = match serde_json::from_str(raw_arguments) {
+                            Ok(parsed) => parsed,
+                            Err(error) => {
+                                log::warn!(
+                                    "Anthropic protocol conversion fallback to string input due to invalid JSON arguments: tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", error={}",
+                                    tc.id,
+                                    tc.function.name,
+                                    raw_arguments.len(),
+                                    preview_for_log(raw_arguments, 180),
+                                    error
+                                );
+                                Value::String(tc.function.arguments.clone())
+                            }
+                        };
 
                         blocks.push(AnthropicContentBlock::ToolUse {
                             id: tc.id.clone(),
@@ -227,6 +257,8 @@ impl AnthropicResponseConverter {
             image_ocr: None,
             tool_calls,
             tool_call_id: None,
+            compressed: false,
+            compressed_by_event_id: None,
             created_at: chrono::Utc::now(),
         })
     }

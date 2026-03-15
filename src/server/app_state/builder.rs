@@ -157,6 +157,7 @@ impl AppState {
             session_store.clone(),
             storage.clone(),
             spawn_scheduler.clone(),
+            session_event_senders.clone(),
         );
 
         let schedule_store = init_schedule_store(&data_dir).await;
@@ -180,6 +181,10 @@ impl AppState {
             schedule_manager.clone(),
             session_store.clone(),
             storage.clone(),
+            spawn_scheduler.clone(),
+            sessions.clone(),
+            agent_runners.clone(),
+            session_event_senders.clone(),
         );
 
         Self {
@@ -412,12 +417,14 @@ fn build_tools_with_task(
     session_store: Arc<SessionStoreV2>,
     storage: Arc<dyn Storage>,
     spawn_scheduler: Arc<SpawnScheduler>,
+    session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
 ) -> Arc<dyn ToolExecutor> {
     // Root tools include `Task` via a lightweight overlay executor.
     let spawn_tool = Arc::new(crate::server::tools::SpawnSessionTool::new(
         session_store,
         storage,
         spawn_scheduler,
+        session_event_senders,
     ));
 
     Arc::new(crate::server::tools::OverlayToolExecutor::new(
@@ -473,6 +480,10 @@ fn build_root_tools(
     schedule_manager: Arc<ScheduleManager>,
     session_store: Arc<SessionStoreV2>,
     storage: Arc<dyn Storage>,
+    spawn_scheduler: Arc<SpawnScheduler>,
+    sessions: Arc<RwLock<HashMap<String, crate::agent::core::Session>>>,
+    agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+    session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
 ) -> Arc<dyn ToolExecutor> {
     // Root sessions can manage schedules via `schedule_tasks`.
     // Background schedule runs intentionally use `tools_for_schedules` above and therefore
@@ -487,13 +498,27 @@ fn build_root_tools(
         crate::server::tools::OverlayToolExecutor::new(tools_with_task, schedule_tasks_tool),
     );
 
+    let sub_session_manager_tool = Arc::new(crate::server::tools::SubSessionManagerTool::new(
+        session_store.clone(),
+        storage.clone(),
+        spawn_scheduler,
+        sessions,
+        agent_runners,
+        session_event_senders,
+    ));
+    let tools_with_sub_session_manager: Arc<dyn ToolExecutor> =
+        Arc::new(crate::server::tools::OverlayToolExecutor::new(
+            tools_with_schedule,
+            sub_session_manager_tool,
+        ));
+
     let session_inspector_tool = Arc::new(crate::server::tools::SessionInspectorTool::new(
         session_store,
         storage,
     ));
 
     Arc::new(crate::server::tools::OverlayToolExecutor::new(
-        tools_with_schedule,
+        tools_with_sub_session_manager,
         session_inspector_tool,
     ))
 }

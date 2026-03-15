@@ -28,10 +28,12 @@ pub(super) fn build_enhanced_system_prompt(
         .map(str::trim)
         .filter(|workspace_path| !workspace_path.is_empty())
     {
-        merged_prompt.push_str("\n\nWorkspace path: ");
-        merged_prompt.push_str(workspace_path);
-        merged_prompt.push('\n');
-        merged_prompt.push_str(&crate::server::app_state::workspace_prompt_guidance());
+        if let Some(workspace_context) =
+            crate::server::app_state::build_workspace_prompt_context(workspace_path)
+        {
+            merged_prompt.push_str("\n\n");
+            merged_prompt.push_str(&workspace_context);
+        }
     }
 
     merged_prompt

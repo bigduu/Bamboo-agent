@@ -7,7 +7,25 @@ use super::bash_runtime;
 
 #[derive(Debug, Deserialize)]
 struct KillShellArgs {
-    shell_id: String,
+    #[serde(default)]
+    shell_id: Option<String>,
+    #[serde(default)]
+    bash_id: Option<String>,
+}
+
+impl KillShellArgs {
+    fn resolved_shell_id(&self) -> Option<&str> {
+        self.shell_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                self.bash_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+    }
 }
 
 pub struct KillShellTool;
@@ -31,7 +49,7 @@ impl Tool for KillShellTool {
     }
 
     fn description(&self) -> &str {
-        "Kill a running background Bash shell by its shell_id"
+        "Kill a running background Bash shell by ID (use the bash_id returned by Bash run_in_background)"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -40,7 +58,11 @@ impl Tool for KillShellTool {
             "properties": {
                 "shell_id": {
                     "type": "string",
-                    "description": "The ID of the background shell to kill"
+                    "description": "The ID of the background shell to kill (recommended: pass Bash's bash_id here)"
+                },
+                "bash_id": {
+                    "type": "string",
+                    "description": "Legacy alias for shell_id; use the id returned by Bash"
                 }
             },
             "required": ["shell_id"],
@@ -52,9 +74,16 @@ impl Tool for KillShellTool {
         let parsed: KillShellArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid KillShell args: {}", e)))?;
 
-        let shell_id = parsed.shell_id.trim();
+        let shell_id = parsed.resolved_shell_id().ok_or_else(|| {
+            ToolError::InvalidArguments(
+                "KillShell requires 'shell_id' (or legacy alias 'bash_id') from Bash run_in_background".to_string(),
+            )
+        })?;
         let shell = bash_runtime::get_shell(shell_id).ok_or_else(|| {
-            ToolError::Execution(format!("Background shell '{}' not found", parsed.shell_id))
+            ToolError::Execution(format!(
+                "Background shell '{}' not found. Use the bash_id returned by Bash(run_in_background=true), not chat session_id.",
+                shell_id
+            ))
         })?;
 
         if shell.status() == "running" {
@@ -65,7 +94,8 @@ impl Tool for KillShellTool {
         Ok(ToolResult {
             success: true,
             result: json!({
-                "shell_id": parsed.shell_id,
+                "shell_id": shell_id,
+                "bash_id": shell_id,
                 "status": "killed"
             })
             .to_string(),
@@ -116,5 +146,28 @@ mod tests {
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         let killed_id = payload["shell_id"].as_str().unwrap();
         assert!(super::bash_runtime::get_shell(killed_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn kill_shell_accepts_bash_id_alias() {
+        let bash = BashTool::new();
+        let spawned = bash
+            .execute(json!({
+                "command": long_running_command(),
+                "run_in_background": true
+            }))
+            .await
+            .unwrap();
+        let spawned_payload: Value = serde_json::from_str(&spawned.result).unwrap();
+        let shell_id = spawned_payload["bash_id"].as_str().unwrap().to_string();
+
+        let kill = KillShellTool::new();
+        let result = kill
+            .execute(json!({
+                "bash_id": shell_id
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
     }
 }

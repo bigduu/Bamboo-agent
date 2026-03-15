@@ -2,7 +2,7 @@ use super::*;
 
 #[actix_web::test]
 async fn test_list_projects_empty() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
 
     let app = test::init_service(App::new().app_data(state).route(
@@ -25,7 +25,7 @@ async fn test_list_projects_empty() {
 
 #[actix_web::test]
 async fn test_create_project_success() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
     let temp_project = create_temp_project();
     let project_path = temp_project.to_string_lossy().to_string();
@@ -56,7 +56,7 @@ async fn test_create_project_success() {
 
 #[actix_web::test]
 async fn test_create_project_invalid_path() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
 
     let app = test::init_service(App::new().app_data(state).route(
@@ -76,7 +76,7 @@ async fn test_create_project_invalid_path() {
 
 #[actix_web::test]
 async fn test_get_project_sessions_nonexistent() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
 
     let app = test::init_service(App::new().app_data(state).route(

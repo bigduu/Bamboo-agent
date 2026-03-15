@@ -307,6 +307,8 @@ pub fn create_budget_for_model(
         max_output_tokens: limit.get_max_output_tokens(),
         strategy,
         safety_margin: limit.get_safety_margin(),
+        compression_trigger_percent: 80,
+        compression_target_percent: 50,
     }
 }
 

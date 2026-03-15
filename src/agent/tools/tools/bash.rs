@@ -210,7 +210,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a bash command, optionally in background, with streaming output support"
+        "Execute shell commands with streaming output (supports background mode). Default timeout is 120000ms (max 600000ms); captured stdout/stderr are each capped at 512KB."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -223,11 +223,11 @@ impl Tool for BashTool {
                 },
                 "timeout": {
                     "type": "number",
-                    "description": "Optional timeout in milliseconds (max 600000)"
+                    "description": "Optional timeout in milliseconds (default 120000, max 600000)"
                 },
                 "description": {
                     "type": "string",
-                    "description": "Clear, concise description of what this command does in 5-10 words"
+                    "description": "Optional short context label for the command"
                 },
                 "run_in_background": {
                     "type": "boolean",

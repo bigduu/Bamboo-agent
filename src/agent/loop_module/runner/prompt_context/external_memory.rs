@@ -1,13 +1,18 @@
 use crate::agent::core::{ExternalMemory, Session};
 
-use super::system_sections::strip_existing_prompt_section;
+use super::system_sections::strip_existing_prompt_block;
 
-const EXTERNAL_MEMORY_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n";
+const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
+const EXTERNAL_MEMORY_END_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_END -->";
 const EXTERNAL_MEMORY_PROMPT_MAX_CHARS: usize = 4_000;
 const EXTERNAL_MEMORY_TOOL_NAME: &str = "memory_note";
 
 pub(super) fn strip_existing_external_memory(prompt: &str) -> String {
-    strip_existing_prompt_section(prompt, EXTERNAL_MEMORY_MARKER)
+    strip_existing_prompt_block(
+        prompt,
+        EXTERNAL_MEMORY_START_MARKER,
+        EXTERNAL_MEMORY_END_MARKER,
+    )
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
@@ -30,8 +35,8 @@ pub(super) async fn inject_external_memory_into_system_message(session: &mut Ses
         return;
     };
 
-    // Remove any previously injected memory (and everything after it, e.g. todo list),
-    // then re-append a fresh memory section for this round.
+    // Remove any previously injected memory block, then re-append a fresh
+    // memory section for this round.
     let base_prompt = strip_existing_external_memory(&system_message.content);
 
     let memory = ExternalMemory::with_defaults();
@@ -59,7 +64,8 @@ pub(super) async fn inject_external_memory_into_system_message(session: &mut Ses
 
     let mut section = String::new();
     section.push_str("\n\n");
-    section.push_str(EXTERNAL_MEMORY_MARKER);
+    section.push_str(EXTERNAL_MEMORY_START_MARKER);
+    section.push('\n');
     section.push_str("## External Memory (Persistent)\n\n");
     section.push_str("You have access to a persistent per-session memory note.\n");
     section.push_str("- If you learn durable information that will help later (preferences, key decisions, constraints, environment details), update the note using the tool.\n");
@@ -88,6 +94,8 @@ pub(super) async fn inject_external_memory_into_system_message(session: &mut Ses
             EXTERNAL_MEMORY_PROMPT_MAX_CHARS, note_len, EXTERNAL_MEMORY_TOOL_NAME
         ));
     }
+    section.push('\n');
+    section.push_str(EXTERNAL_MEMORY_END_MARKER);
 
     system_message.content = format!("{}{}", base_prompt.trim_end(), section);
 }

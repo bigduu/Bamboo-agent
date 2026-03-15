@@ -1,7 +1,7 @@
 use crate::agent::core::Session;
 
 use super::request::{optional_non_empty, resolve_session_id, validate_and_normalize_model};
-use super::session::{resolve_base_prompt, resolve_workspace_path};
+use super::session::{resolve_base_prompt, resolve_enhance_prompt, resolve_workspace_path};
 
 #[test]
 fn validate_and_normalize_model_rejects_empty_values() {
@@ -30,7 +30,7 @@ fn resolve_session_id_uses_provided_value_without_trimming() {
 #[test]
 fn resolve_base_prompt_prefers_request_and_persists_metadata() {
     let mut session = Session::new("session-1", "model");
-    let base_prompt = resolve_base_prompt(&mut session, Some("request prompt"));
+    let base_prompt = resolve_base_prompt(&mut session, Some("request prompt"), "fallback");
     assert_eq!(base_prompt, "request prompt");
     assert_eq!(
         session
@@ -49,8 +49,38 @@ fn resolve_base_prompt_falls_back_to_existing_metadata() {
         "stored prompt".to_string(),
     );
 
-    let base_prompt = resolve_base_prompt(&mut session, None);
+    let base_prompt = resolve_base_prompt(&mut session, None, "fallback");
     assert_eq!(base_prompt, "stored prompt");
+}
+
+#[test]
+fn resolve_base_prompt_falls_back_to_existing_system_message_before_global_default() {
+    let mut session = Session::new("session-1", "model");
+    session.add_message(crate::agent::core::Message::system("Existing system"));
+
+    let base_prompt = resolve_base_prompt(&mut session, None, "global default");
+    assert_eq!(base_prompt, "Existing system");
+    assert_eq!(
+        session
+            .metadata
+            .get("base_system_prompt")
+            .map(String::as_str),
+        Some("Existing system")
+    );
+}
+
+#[test]
+fn resolve_base_prompt_uses_global_default_when_missing_everywhere() {
+    let mut session = Session::new("session-1", "model");
+    let base_prompt = resolve_base_prompt(&mut session, None, "global default");
+    assert_eq!(base_prompt, "global default");
+    assert_eq!(
+        session
+            .metadata
+            .get("base_system_prompt")
+            .map(String::as_str),
+        Some("global default")
+    );
 }
 
 #[test]
@@ -66,4 +96,20 @@ fn resolve_workspace_path_uses_request_then_metadata() {
 
     let from_metadata = resolve_workspace_path(&mut session, None);
     assert_eq!(from_metadata.as_deref(), Some("/tmp/workspace"));
+}
+
+#[test]
+fn resolve_enhance_prompt_stores_and_clears_metadata() {
+    let mut session = Session::new("session-1", "model");
+
+    let from_request = resolve_enhance_prompt(&mut session, Some("Extra guidance"));
+    assert_eq!(from_request.as_deref(), Some("Extra guidance"));
+    assert_eq!(
+        session.metadata.get("enhance_prompt").map(String::as_str),
+        Some("Extra guidance")
+    );
+
+    let from_empty_request = resolve_enhance_prompt(&mut session, None);
+    assert_eq!(from_empty_request, None);
+    assert!(!session.metadata.contains_key("enhance_prompt"));
 }

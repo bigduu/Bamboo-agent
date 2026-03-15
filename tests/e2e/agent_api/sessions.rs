@@ -2,7 +2,7 @@ use super::*;
 
 #[actix_web::test]
 async fn test_list_running_sessions() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
 
     let app = test::init_service(App::new().app_data(state).route(
@@ -25,7 +25,7 @@ async fn test_list_running_sessions() {
 
 #[actix_web::test]
 async fn test_claude_events_returns_not_found_for_missing_runner() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
 
     let app = test::init_service(App::new().app_data(state).route(
@@ -49,7 +49,7 @@ async fn test_claude_events_returns_not_found_for_missing_runner() {
 
 #[actix_web::test]
 async fn test_claude_events_returns_one_shot_complete_for_completed_runner() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
     let session_id = "completed-session";
 
@@ -76,7 +76,7 @@ async fn test_claude_events_returns_one_shot_complete_for_completed_runner() {
 
 #[actix_web::test]
 async fn test_claude_events_returns_one_shot_error_for_errored_runner() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
     let session_id = "errored-session";
 
@@ -104,7 +104,7 @@ async fn test_claude_events_returns_one_shot_error_for_errored_runner() {
 
 #[actix_web::test]
 async fn test_execute_claude_code() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
 
     let app = test::init_service(App::new().app_data(state).route(
@@ -132,7 +132,7 @@ async fn test_execute_claude_code() {
 
 #[actix_web::test]
 async fn test_execute_with_session_id() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
 
     let app = test::init_service(App::new().app_data(state).route(
@@ -156,7 +156,7 @@ async fn test_execute_with_session_id() {
 
 #[actix_web::test]
 async fn test_cancel_execution() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
 
     let app = test::init_service(App::new().app_data(state).route(
@@ -183,7 +183,7 @@ async fn test_cancel_execution() {
 
 #[actix_web::test]
 async fn test_get_session_jsonl_missing_project_id() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
 
     let app = test::init_service(App::new().app_data(state).route(
@@ -202,7 +202,7 @@ async fn test_get_session_jsonl_missing_project_id() {
 
 #[actix_web::test]
 async fn test_get_session_jsonl_nonexistent() {
-    let _lock = crate::e2e::common::claude_fs_lock();
+    let _lock = crate::e2e::common::data_dir_lock();
     let state = crate::e2e::common::create_test_app().await;
 
     let app = test::init_service(App::new().app_data(state).route(

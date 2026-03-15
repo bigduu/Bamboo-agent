@@ -9,6 +9,14 @@ const DEFAULT_SAFETY_MARGIN_PERCENT: f64 = 0.01;
 const MIN_SAFETY_MARGIN: u32 = 100;
 /// Maximum safety margin in tokens.
 const MAX_SAFETY_MARGIN: u32 = 2000;
+/// Default percentage of available input budget where proactive compression starts.
+const DEFAULT_COMPRESSION_TRIGGER_PERCENT: u8 = 80;
+/// Default percentage of available input budget to target after compression.
+const DEFAULT_COMPRESSION_TARGET_PERCENT: u8 = 50;
+/// Minimum allowed compression target percent.
+const MIN_COMPRESSION_TARGET_PERCENT: u32 = 20;
+/// Maximum allowed compression target percent.
+const MAX_COMPRESSION_TARGET_PERCENT: u32 = 50;
 
 /// Token budget configuration for a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,11 +30,32 @@ pub struct TokenBudget {
     /// Safety margin for tokenizer estimation errors
     #[serde(default = "default_safety_margin")]
     pub safety_margin: u32,
+    /// Proactive compression trigger threshold as a percentage of available input tokens.
+    ///
+    /// Example: `80` means start compressing once context reaches 80% of available input budget,
+    /// rather than waiting until the hard limit is exceeded.
+    #[serde(default = "default_compression_trigger_percent")]
+    pub compression_trigger_percent: u8,
+    /// Compression target threshold as a percentage of available input tokens.
+    ///
+    /// Once compression is triggered, context is reduced to this target percentage
+    /// to avoid repeatedly compressing around the trigger line. Values are clamped
+    /// to the supported range `[20, 50]`.
+    #[serde(default = "default_compression_target_percent")]
+    pub compression_target_percent: u8,
 }
 
 fn default_safety_margin() -> u32 {
     // Default for deserialization when field is missing
     1000
+}
+
+fn default_compression_trigger_percent() -> u8 {
+    DEFAULT_COMPRESSION_TRIGGER_PERCENT
+}
+
+fn default_compression_target_percent() -> u8 {
+    DEFAULT_COMPRESSION_TARGET_PERCENT
 }
 
 impl TokenBudget {
@@ -38,6 +67,8 @@ impl TokenBudget {
             max_output_tokens,
             strategy,
             safety_margin,
+            compression_trigger_percent: default_compression_trigger_percent(),
+            compression_target_percent: default_compression_target_percent(),
         }
     }
 
@@ -53,6 +84,8 @@ impl TokenBudget {
             max_output_tokens,
             strategy,
             safety_margin,
+            compression_trigger_percent: default_compression_trigger_percent(),
+            compression_target_percent: default_compression_target_percent(),
         }
     }
 
@@ -61,6 +94,45 @@ impl TokenBudget {
         self.max_context_tokens
             .saturating_sub(self.max_output_tokens)
             .saturating_sub(self.safety_margin)
+    }
+
+    /// Calculate proactive compression limit for input tokens.
+    ///
+    /// Returns a value <= `available_input_tokens()`.
+    /// `compression_trigger_percent = 100` disables proactive compression (hard-limit only).
+    pub fn compression_trigger_input_tokens(&self) -> u32 {
+        let available = self.available_input_tokens();
+        if available == 0 {
+            return 0;
+        }
+
+        let percent = normalize_trigger_percent(self.compression_trigger_percent);
+        let trigger = available.saturating_mul(percent).saturating_div(100);
+        trigger.clamp(1, available)
+    }
+
+    /// Calculate compression target limit for input tokens.
+    ///
+    /// This value is used only once proactive compression is triggered and is
+    /// guaranteed to be strictly below the trigger limit (when possible).
+    pub fn compression_target_input_tokens(&self) -> u32 {
+        let available = self.available_input_tokens();
+        if available == 0 {
+            return 0;
+        }
+
+        let trigger = self.compression_trigger_input_tokens();
+        let percent = normalize_target_percent(self.compression_target_percent);
+        let mut target = available
+            .saturating_mul(percent)
+            .saturating_div(100)
+            .clamp(1, available);
+
+        if target >= trigger {
+            target = if trigger > 1 { trigger - 1 } else { 1 };
+        }
+
+        target.clamp(1, available)
     }
 
     /// Create a default budget for a model with the given context window.
@@ -80,6 +152,26 @@ impl TokenBudget {
 fn calculate_safety_margin(max_context_tokens: u32) -> u32 {
     let margin = (max_context_tokens as f64 * DEFAULT_SAFETY_MARGIN_PERCENT) as u32;
     margin.clamp(MIN_SAFETY_MARGIN, MAX_SAFETY_MARGIN)
+}
+
+fn normalize_trigger_percent(value: u8) -> u32 {
+    match value {
+        0 => 100, // Treat 0 as disabled rather than "always compress".
+        1..=100 => value as u32,
+        _ => 100,
+    }
+}
+
+fn normalize_target_percent(value: u8) -> u32 {
+    let raw = match value {
+        0 => DEFAULT_COMPRESSION_TARGET_PERCENT as u32,
+        1..=100 => value as u32,
+        _ => DEFAULT_COMPRESSION_TARGET_PERCENT as u32,
+    };
+    raw.clamp(
+        MIN_COMPRESSION_TARGET_PERCENT,
+        MAX_COMPRESSION_TARGET_PERCENT,
+    )
 }
 
 /// Calculate max output tokens, reserving ~25% but clamping to reasonable limits.
@@ -135,6 +227,8 @@ pub struct PreparedContext {
     pub truncation_occurred: bool,
     /// Number of message segments removed
     pub segments_removed: usize,
+    /// Message IDs newly archived by this preparation pass.
+    pub compressed_message_ids: Vec<String>,
 }
 
 /// Detailed token usage breakdown.
@@ -186,4 +280,70 @@ pub enum BudgetError {
     /// Message segmentation error
     #[error("Failed to segment messages: {0}")]
     SegmentationError(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BudgetStrategy, TokenBudget};
+
+    #[test]
+    fn compression_trigger_defaults_to_eighty_percent() {
+        let budget = TokenBudget::for_model(128_000);
+        assert_eq!(budget.compression_trigger_percent, 80);
+    }
+
+    #[test]
+    fn compression_target_defaults_to_fifty_percent() {
+        let budget = TokenBudget::for_model(128_000);
+        assert_eq!(budget.compression_target_percent, 50);
+    }
+
+    #[test]
+    fn compression_trigger_input_tokens_respects_percent() {
+        let mut budget =
+            TokenBudget::with_safety_margin(1000, 200, BudgetStrategy::Window { size: 20 }, 100);
+        // available = 1000 - 200 - 100 = 700
+        budget.compression_trigger_percent = 50;
+        assert_eq!(budget.available_input_tokens(), 700);
+        assert_eq!(budget.compression_trigger_input_tokens(), 350);
+    }
+
+    #[test]
+    fn compression_target_input_tokens_respects_percent() {
+        let mut budget =
+            TokenBudget::with_safety_margin(1000, 200, BudgetStrategy::Window { size: 20 }, 100);
+        // available = 700, target 50% => 350
+        budget.compression_target_percent = 50;
+        assert_eq!(budget.compression_target_input_tokens(), 350);
+    }
+
+    #[test]
+    fn compression_target_percent_is_clamped_to_supported_range() {
+        let mut budget =
+            TokenBudget::with_safety_margin(1000, 200, BudgetStrategy::Window { size: 20 }, 100);
+        // available = 700, clamped target 20% => 140
+        budget.compression_target_percent = 10;
+        assert_eq!(budget.compression_target_input_tokens(), 140);
+    }
+
+    #[test]
+    fn compression_target_always_stays_below_trigger_limit() {
+        let mut budget =
+            TokenBudget::with_safety_margin(1000, 200, BudgetStrategy::Window { size: 20 }, 100);
+        // available = 700, trigger 30% => 210, target 50% would be 350, so it should be clamped below trigger
+        budget.compression_trigger_percent = 30;
+        budget.compression_target_percent = 50;
+        assert_eq!(budget.compression_target_input_tokens(), 209);
+    }
+
+    #[test]
+    fn trigger_percent_zero_means_disabled() {
+        let mut budget =
+            TokenBudget::with_safety_margin(1000, 200, BudgetStrategy::Window { size: 20 }, 100);
+        budget.compression_trigger_percent = 0;
+        assert_eq!(
+            budget.compression_trigger_input_tokens(),
+            budget.available_input_tokens()
+        );
+    }
 }

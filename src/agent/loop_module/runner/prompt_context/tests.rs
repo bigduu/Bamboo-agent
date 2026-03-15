@@ -9,7 +9,9 @@ fn merge_system_prompt_with_contexts_appends_both_contexts() {
         "## Tool Usage Guidelines\n\n### File Reading Tools\nDetails",
     );
     assert!(merged.starts_with("You are a helpful assistant."));
+    assert!(merged.contains("<!-- BAMBOO_SKILL_CONTEXT_START -->"));
     assert!(merged.contains("## Skill System"));
+    assert!(merged.contains("<!-- BAMBOO_TOOL_GUIDE_START -->"));
     assert!(merged.contains("## Tool Usage Guidelines"));
 }
 
@@ -22,29 +24,36 @@ fn merge_system_prompt_with_contexts_handles_empty_base_prompt() {
     );
     assert_eq!(
         merged,
-        "## Skill System\n\n### Available Skills\n\n## Tool Usage Guidelines\n\n### File Reading Tools"
+        "<!-- BAMBOO_SKILL_CONTEXT_START -->\n## Skill System\n\n### Available Skills\n<!-- BAMBOO_SKILL_CONTEXT_END -->\n\n<!-- BAMBOO_TOOL_GUIDE_START -->\n## Tool Usage Guidelines\n\n### File Reading Tools\n<!-- BAMBOO_TOOL_GUIDE_END -->"
     );
 }
 
 #[test]
 fn strip_existing_skill_context_removes_previous_section() {
     let stripped = strip_existing_skill_context(
-        "Base prompt\n\n## Skill System\n\n### Available Skills\nInstructions",
+        "Base prompt\n\n<!-- BAMBOO_SKILL_CONTEXT_START -->\n## Skill System\n\n### Available Skills\nInstructions\n<!-- BAMBOO_SKILL_CONTEXT_END -->",
     );
     assert_eq!(stripped, "Base prompt");
 }
 
 #[test]
-fn strip_existing_skill_context_removes_legacy_section_marker() {
-    let stripped =
-        strip_existing_skill_context("Base prompt\n\n## Available Skills\n\n### One\nInstructions");
-    assert_eq!(stripped, "Base prompt");
+fn strip_existing_skill_context_does_not_remove_user_heading_without_markers() {
+    let original = "Base prompt\n\n## Skill System\nThis heading belongs to user prompt.";
+    let stripped = strip_existing_skill_context(original);
+    assert_eq!(stripped, original);
 }
 
 #[test]
 fn strip_existing_tool_guide_context_removes_previous_section() {
     let stripped = strip_existing_tool_guide_context(
-        "Base prompt\n\n## Tool Usage Guidelines\n\n### File Reading Tools\nInstructions",
+        "Base prompt\n\n<!-- BAMBOO_TOOL_GUIDE_START -->\n## Tool Usage Guidelines\n\n### File Reading Tools\nInstructions\n<!-- BAMBOO_TOOL_GUIDE_END -->",
     );
     assert_eq!(stripped, "Base prompt");
+}
+
+#[test]
+fn strip_existing_tool_guide_context_does_not_remove_user_heading_without_markers() {
+    let original = "Base prompt\n\n## Tool Usage Guidelines\nUser custom section.";
+    let stripped = strip_existing_tool_guide_context(original);
+    assert_eq!(stripped, original);
 }

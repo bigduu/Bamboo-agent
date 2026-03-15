@@ -1,11 +1,13 @@
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
 use crate::agent::core::storage::{SessionStoreV2, Storage};
 use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
-use crate::agent::core::{Message, Session, SessionKind};
+use crate::agent::core::{AgentEvent, Message, Session, SessionKind};
 use crate::server::spawn_scheduler::{SpawnJob, SpawnScheduler};
 
 const CHILD_SYSTEM_PROMPT: &str = r#"You are a **Child Session**, delegated by a parent session.
@@ -101,6 +103,7 @@ pub struct SpawnSessionTool {
     session_store: Arc<SessionStoreV2>,
     storage: Arc<dyn Storage>,
     scheduler: Arc<SpawnScheduler>,
+    session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
 }
 
 impl SpawnSessionTool {
@@ -108,11 +111,13 @@ impl SpawnSessionTool {
         session_store: Arc<SessionStoreV2>,
         storage: Arc<dyn Storage>,
         scheduler: Arc<SpawnScheduler>,
+        session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     ) -> Self {
         Self {
             session_store,
             storage,
             scheduler,
+            session_event_senders,
         }
     }
 
@@ -126,6 +131,17 @@ impl SpawnSessionTool {
                 "failed to load session {session_id}: {e}"
             ))),
         }
+    }
+
+    async fn get_or_create_sender(&self, session_id: &str) -> broadcast::Sender<AgentEvent> {
+        let mut senders = self.session_event_senders.write().await;
+        if let Some(existing) = senders.get(session_id) {
+            return existing.clone();
+        }
+
+        let (tx, _) = broadcast::channel(1000);
+        senders.insert(session_id.to_string(), tx.clone());
+        tx
     }
 }
 
@@ -202,6 +218,9 @@ impl Tool for SpawnSessionTool {
             .insert("responsibility".to_string(), parsed.responsibility.clone());
         child
             .metadata
+            .insert("assignment_prompt".to_string(), parsed.prompt.clone());
+        child
+            .metadata
             .insert("last_run_status".to_string(), "pending".to_string());
         child.metadata.remove("last_run_error");
         child.metadata.insert(
@@ -231,6 +250,15 @@ impl Tool for SpawnSessionTool {
             })
             .await
             .map_err(ToolError::Execution)?;
+
+        // Emit "created + queued" immediately so the UI can render child sessions
+        // progressively, without waiting for scheduler dequeue.
+        let parent_tx = self.get_or_create_sender(&parent.id).await;
+        let _ = parent_tx.send(AgentEvent::SubSessionStarted {
+            parent_session_id: parent.id.clone(),
+            child_session_id: child_id.clone(),
+            title: Some(parsed.title.clone()),
+        });
 
         ctx.emit_tool_token(format!("Spawned child session: {child_id}"))
             .await;
@@ -264,6 +292,7 @@ mod tests {
 
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::time::Duration;
     use tokio::sync::{broadcast, RwLock};
 
     use crate::agent::core::tools::{ToolCall, ToolExecutor, ToolSchema};
@@ -395,6 +424,10 @@ mod tests {
 
         let metrics_storage = Arc::new(SqliteMetricsStorage::new(bamboo_home.join("metrics.db")));
         let metrics_collector = MetricsCollector::spawn(metrics_storage, 7);
+        let session_event_senders = Arc::new(RwLock::new(HashMap::<
+            String,
+            broadcast::Sender<crate::agent::core::AgentEvent>,
+        >::new()));
 
         let ctx = crate::server::spawn_scheduler::SpawnContext {
             session_store: session_store.clone(),
@@ -405,14 +438,11 @@ mod tests {
             metrics_collector,
             sessions_cache: Arc::new(RwLock::new(HashMap::new())),
             agent_runners: Arc::new(RwLock::new(HashMap::new())),
-            session_event_senders: Arc::new(RwLock::new(HashMap::<
-                String,
-                broadcast::Sender<crate::agent::core::AgentEvent>,
-            >::new())),
+            session_event_senders: session_event_senders.clone(),
         };
         let scheduler = Arc::new(SpawnScheduler::new(ctx));
 
-        let tool = SpawnSessionTool::new(session_store, storage, scheduler);
+        let tool = SpawnSessionTool::new(session_store, storage, scheduler, session_event_senders);
 
         let err = tool
             .execute_with_context(
@@ -432,5 +462,102 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn task_emits_sub_session_started_event_after_queueing() {
+        let bamboo_home = make_temp_dir("bamboo-spawn-session-started-event-test");
+        tokio::fs::create_dir_all(&bamboo_home).await.unwrap();
+
+        let session_store = Arc::new(SessionStoreV2::new(bamboo_home.clone()).await.unwrap());
+        let storage_dir = bamboo_home.join("storage");
+        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
+        let jsonl = crate::agent::core::storage::JsonlStorage::new(&storage_dir);
+        jsonl.init().await.unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(jsonl);
+
+        let mut parent = Session::new("root-session", "gpt-5");
+        parent.title = "Root".to_string();
+        storage.save_session(&parent).await.unwrap();
+        let parent_session_id = parent.id.clone();
+
+        let metrics_storage = Arc::new(SqliteMetricsStorage::new(bamboo_home.join("metrics.db")));
+        let metrics_collector = MetricsCollector::spawn(metrics_storage, 7);
+
+        let (parent_tx, mut parent_rx) = broadcast::channel(1000);
+        let session_event_senders = Arc::new(RwLock::new(HashMap::<
+            String,
+            broadcast::Sender<crate::agent::core::AgentEvent>,
+        >::new()));
+        {
+            let mut senders = session_event_senders.write().await;
+            senders.insert(parent_session_id.clone(), parent_tx);
+        }
+
+        let ctx = crate::server::spawn_scheduler::SpawnContext {
+            session_store: session_store.clone(),
+            storage: storage.clone(),
+            provider: Arc::new(NoopProvider),
+            tools: Arc::new(NoopToolExecutor),
+            skill_manager: Arc::new(SkillManager::new()),
+            metrics_collector,
+            sessions_cache: Arc::new(RwLock::new(HashMap::new())),
+            agent_runners: Arc::new(RwLock::new(HashMap::new())),
+            session_event_senders: session_event_senders.clone(),
+        };
+        let scheduler = Arc::new(SpawnScheduler::new(ctx));
+        let tool = SpawnSessionTool::new(
+            session_store,
+            storage,
+            scheduler,
+            session_event_senders.clone(),
+        );
+
+        let result = tool
+            .execute_with_context(
+                json!({
+                    "title": "Child A",
+                    "responsibility": "Investigate one module",
+                    "prompt": "Read module and summarize",
+                    "subagent_type": "general-purpose"
+                }),
+                ToolExecutionContext {
+                    session_id: Some(parent_session_id.as_str()),
+                    tool_call_id: "tool_call_1",
+                    event_tx: None,
+                },
+            )
+            .await
+            .expect("Task should enqueue a child session");
+
+        let parsed_result: serde_json::Value =
+            serde_json::from_str(&result.result).expect("tool result should be JSON");
+        let child_session_id = parsed_result
+            .get("child_session_id")
+            .and_then(|value| value.as_str())
+            .expect("tool result should include child_session_id")
+            .to_string();
+
+        let started_event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match parent_rx.recv().await {
+                    Ok(AgentEvent::SubSessionStarted {
+                        parent_session_id: pid,
+                        child_session_id: cid,
+                        ..
+                    }) => break (pid, cid),
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        panic!("parent stream closed before start event")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("should receive SubSessionStarted event quickly");
+
+        assert_eq!(started_event.0, parent_session_id);
+        assert_eq!(started_event.1, child_session_id);
     }
 }

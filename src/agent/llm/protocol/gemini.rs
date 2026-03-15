@@ -250,6 +250,8 @@ impl FromProvider<GeminiContent> for Message {
                 Some(tool_calls)
             },
             tool_call_id: None,
+            compressed: false,
+            compressed_by_event_id: None,
             created_at: chrono::Utc::now(),
         })
     }

@@ -92,7 +92,11 @@ use crate::server::spawn_scheduler::{SpawnContext, SpawnScheduler};
 
 /// Default system prompt for agent interactions
 pub const DEFAULT_BASE_PROMPT: &str =
-    "You are a helpful AI assistant with access to various tools and skills. For recurring or delayed tasks, use the schedule_tasks tool to create and manage schedule jobs.";
+    "You are Bodhi, a highly capable AI assistant.\n\nYou help users solve problems quickly and correctly. Be concise, practical, and proactive.\nIf requirements are unclear, ask focused clarifying questions before proceeding.";
+
+pub const WORKSPACE_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_WORKSPACE_CONTEXT_START -->";
+pub const WORKSPACE_CONTEXT_END_MARKER: &str = "<!-- BAMBOO_WORKSPACE_CONTEXT_END -->";
+pub const WORKSPACE_CONTEXT_PREFIX: &str = "Workspace path: ";
 
 /// Guidance for workspace-based interactions
 pub fn workspace_prompt_guidance() -> String {
@@ -103,6 +107,18 @@ pub fn workspace_prompt_guidance() -> String {
         crate::core::paths::bamboo_dir_display(),
         config_path
     )
+}
+
+pub fn build_workspace_prompt_context(workspace_path: &str) -> Option<String> {
+    let workspace_path = workspace_path.trim();
+    if workspace_path.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "{WORKSPACE_CONTEXT_START_MARKER}\n{WORKSPACE_CONTEXT_PREFIX}{workspace_path}\n{}\n{WORKSPACE_CONTEXT_END_MARKER}",
+        workspace_prompt_guidance()
+    ))
 }
 
 /// Placeholder provider used when the configured provider cannot be initialized.

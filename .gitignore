@@ -37,9 +37,9 @@ temp/
 .env.*.local
 
 # Data directories (for local development)
-data/
-sessions/
-workflows/
+/data/
+/sessions/
+/workflows/
 *.db
 *.db-journal
 

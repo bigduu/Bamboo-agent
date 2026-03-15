@@ -312,9 +312,37 @@ fn parse_data_url_base64(url: &str) -> Option<(String, String)> {
     Some((media_type.to_string(), data.to_string()))
 }
 
+fn preview_for_log(value: &str, max_chars: usize) -> String {
+    let mut iter = value.chars();
+    let mut preview = String::new();
+    for _ in 0..max_chars {
+        match iter.next() {
+            Some(ch) => preview.push(ch),
+            None => break,
+        }
+    }
+    if iter.next().is_some() {
+        preview.push_str("...");
+    }
+    preview.replace('\n', "\\n").replace('\r', "\\r")
+}
+
 fn tool_call_to_tool_use_block(tool_call: &crate::agent::core::tools::ToolCall) -> Value {
-    let input: Value = serde_json::from_str(&tool_call.function.arguments)
-        .unwrap_or_else(|_| Value::String(tool_call.function.arguments.clone()));
+    let raw_arguments = tool_call.function.arguments.trim();
+    let input: Value = match serde_json::from_str(raw_arguments) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            log::warn!(
+                "Anthropic tool_use conversion fallback to string input due to invalid JSON arguments: tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", error={}",
+                tool_call.id,
+                tool_call.function.name,
+                raw_arguments.len(),
+                preview_for_log(raw_arguments, 180),
+                error
+            );
+            Value::String(tool_call.function.arguments.clone())
+        }
+    };
 
     json!({
         "type": "tool_use",
@@ -357,8 +385,52 @@ pub fn parse_anthropic_sse_event(
     data: &str,
 ) -> Result<Option<LLMChunk>> {
     match event_type {
-        "ping" | "message_start" | "message_delta" => Ok(None),
-        "message_stop" => Ok(Some(LLMChunk::Done)),
+        "ping" | "message_start" => Ok(None),
+        "message_delta" => {
+            if !data.is_empty() {
+                match serde_json::from_str::<Value>(data) {
+                    Ok(v) => {
+                        if let Some(stop_reason) = v
+                            .get("delta")
+                            .and_then(|delta| delta.get("stop_reason"))
+                            .and_then(|reason| reason.as_str())
+                        {
+                            if stop_reason == "max_tokens" {
+                                log::warn!(
+                                    "Anthropic stream stop_reason=max_tokens; response may be truncated"
+                                );
+                            } else {
+                                log::debug!("Anthropic stream stop_reason={stop_reason}");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        log::debug!(
+                            "Failed to parse Anthropic message_delta payload for logging: {} (payload={})",
+                            error,
+                            preview_for_log(data, 120)
+                        );
+                    }
+                }
+            }
+            Ok(None)
+        }
+        "message_stop" => {
+            if !state.tool_uses_by_index.is_empty() {
+                let open_blocks: Vec<String> = state
+                    .tool_uses_by_index
+                    .iter()
+                    .map(|(index, (id, name))| format!("{index}:{name}:{id}"))
+                    .collect();
+                log::warn!(
+                    "Anthropic message_stop received with {} open tool_use blocks (possible incomplete tool arguments): {}",
+                    open_blocks.len(),
+                    open_blocks.join(", ")
+                );
+                state.tool_uses_by_index.clear();
+            }
+            Ok(Some(LLMChunk::Done))
+        }
         "error" => Err(LLMError::Api(format!("Anthropic error event: {data}"))),
         "content_block_start" => {
             if data.is_empty() {
@@ -401,6 +473,12 @@ pub fn parse_anthropic_sse_event(
             state
                 .tool_uses_by_index
                 .insert(index, (id.to_string(), name.to_string()));
+            log::debug!(
+                "Anthropic tool_use started: index={}, tool_call_id={}, tool_name={}",
+                index,
+                id,
+                name
+            );
 
             Ok(Some(LLMChunk::ToolCalls(vec![
                 crate::agent::core::tools::ToolCall {
@@ -453,6 +531,13 @@ pub fn parse_anthropic_sse_event(
                             "Anthropic input_json_delta for unknown tool_use index {index}: {data}"
                         )));
                     };
+                    log::trace!(
+                        "Anthropic tool_use input_json_delta: index={}, tool_call_id={}, tool_name={}, chunk_len={}",
+                        index,
+                        id,
+                        name,
+                        partial.len()
+                    );
 
                     Ok(Some(LLMChunk::ToolCalls(vec![
                         crate::agent::core::tools::ToolCall {

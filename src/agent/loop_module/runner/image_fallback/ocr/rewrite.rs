@@ -7,6 +7,8 @@ pub(super) async fn rewrite_parts_to_ocr_text(
     parts: &[ContentPart],
     cached: Option<&[ImageOcrResult]>,
 ) -> std::result::Result<String, String> {
+    const OCR_COORDINATE_GUIDANCE: &str = "Coordinate format: (x,y,w,h) in pixels relative to the image top-left corner. Use spatial relationships (left/right/above/below/overlap) between boxes when interpreting the content.";
+
     let mut out = String::new();
     let mut image_index = 0usize;
 
@@ -41,6 +43,8 @@ pub(super) async fn rewrite_parts_to_ocr_text(
                         out.push_str(": ");
                         out.push_str(&summary);
                         out.push_str("]\n");
+                        out.push_str(OCR_COORDINATE_GUIDANCE);
+                        out.push('\n');
                         for l in lines {
                             out.push_str(&format!(
                                 "({},{},{},{}) {}\n",

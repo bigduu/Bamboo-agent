@@ -72,7 +72,7 @@ pub fn check_permissions(
             )]))
         }
         "KillShell" => {
-            let shell_id = required_string_arg(args, "shell_id")?;
+            let shell_id = first_present_string_arg(args, &["shell_id", "bash_id"])?;
             Ok(Some(vec![PermissionContext::new(
                 PermissionType::TerminalSession,
                 shell_id,
@@ -125,6 +125,21 @@ fn required_string_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, Permis
         })
 }
 
+fn first_present_string_arg<'a>(
+    args: &'a Value,
+    keys: &[&str],
+) -> Result<&'a str, PermissionError> {
+    for key in keys {
+        if let Some(value) = args.get(key).and_then(|value| value.as_str()) {
+            return Ok(value);
+        }
+    }
+    Err(PermissionError::CheckFailed(format!(
+        "Missing or invalid parameter (expected one of: {})",
+        keys.join(", ")
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -175,5 +190,14 @@ mod tests {
 
         let read = check_permissions("memory_note", &json!({"action": "read"})).unwrap();
         assert!(read.is_none());
+    }
+
+    #[test]
+    fn check_permissions_kill_shell_accepts_bash_id_alias() {
+        let args = json!({"bash_id": "abc-123"});
+        let contexts = check_permissions("KillShell", &args).unwrap().unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].permission_type, PermissionType::TerminalSession);
+        assert_eq!(contexts[0].resource, "abc-123");
     }
 }

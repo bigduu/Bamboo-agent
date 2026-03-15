@@ -55,7 +55,7 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file from the local filesystem"
+        "Read a local file with line-numbered output (supports offset/limit). Use this before Edit/Write on existing files."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

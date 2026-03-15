@@ -48,6 +48,7 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
         },
         truncation_occurred: false,
         segments_removed: 0,
+        compressed_message_ids: Vec::new(),
     };
 
     let llm: Arc<dyn LLMProvider> = Arc::new(MockLlmProvider {

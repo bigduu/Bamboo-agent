@@ -125,14 +125,12 @@ fn build_system_prompt(base: &str, enhance: Option<&str>, workspace_path: Option
         prompt.push_str(extra);
     }
     if let Some(path) = workspace_path.map(str::trim).filter(|v| !v.is_empty()) {
-        let segment = format!(
-            "Workspace path: {path}\n{}",
-            crate::server::app_state::workspace_prompt_guidance()
-        );
-        if !prompt.is_empty() {
-            prompt.push_str("\n\n");
+        if let Some(segment) = crate::server::app_state::build_workspace_prompt_context(path) {
+            if !prompt.is_empty() {
+                prompt.push_str("\n\n");
+            }
+            prompt.push_str(&segment);
         }
-        prompt.push_str(&segment);
     }
     prompt
 }
@@ -174,13 +172,15 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
     };
 
     let title = format!("{} ({})", job.schedule_name, now.to_rfc3339());
+    let global_default_prompt =
+        crate::server::prompt_defaults::read_global_default_system_prompt_template();
     let base_system_prompt = job
         .run_config
         .system_prompt
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .unwrap_or(crate::server::app_state::DEFAULT_BASE_PROMPT);
+        .unwrap_or(global_default_prompt.as_str());
     let workspace_path = job
         .run_config
         .workspace_path

@@ -3,7 +3,7 @@ use crate::agent::core::tools::{
 };
 use async_trait::async_trait;
 use std::sync::Arc;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::agent::mcp::error::McpError;
 use crate::agent::mcp::manager::McpServerManager;
@@ -19,6 +19,21 @@ pub struct McpToolExecutor {
 impl McpToolExecutor {
     pub fn new(manager: Arc<McpServerManager>, index: Arc<ToolIndex>) -> Self {
         Self { manager, index }
+    }
+
+    fn preview_for_log(value: &str, max_chars: usize) -> String {
+        let mut iter = value.chars();
+        let mut preview = String::new();
+        for _ in 0..max_chars {
+            match iter.next() {
+                Some(ch) => preview.push(ch),
+                None => break,
+            }
+        }
+        if iter.next().is_some() {
+            preview.push_str("...");
+        }
+        preview.replace('\n', "\\n").replace('\r', "\\r")
     }
 
     /// Convert MCP result to string representation
@@ -65,8 +80,19 @@ impl ToolExecutor for McpToolExecutor {
         );
 
         // Parse arguments
-        let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
-            .map_err(|e| ToolError::InvalidArguments(format!("Invalid JSON: {}", e)))?;
+        let args_raw = call.function.arguments.trim();
+        let args: serde_json::Value = serde_json::from_str(args_raw).map_err(|error| {
+            warn!(
+                "MCP tool argument parsing failed: tool_call_id={}, tool_name={}, server_id={}, args_len={}, args_preview=\"{}\", error={}",
+                call.id,
+                tool_name,
+                alias.server_id,
+                args_raw.len(),
+                Self::preview_for_log(args_raw, 180),
+                error
+            );
+            ToolError::InvalidArguments(format!("Invalid JSON: {}", error))
+        })?;
 
         // Execute via manager
         match self

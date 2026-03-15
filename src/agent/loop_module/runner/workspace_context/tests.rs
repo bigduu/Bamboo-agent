@@ -113,6 +113,8 @@ fn upsert_workspace_context_replaces_existing_segment() {
 
     assert!(updated.contains("Workspace path: /new/path"));
     assert!(!updated.contains("Workspace path: /old/path"));
+    assert!(updated.contains(crate::server::app_state::WORKSPACE_CONTEXT_START_MARKER));
+    assert!(updated.contains(crate::server::app_state::WORKSPACE_CONTEXT_END_MARKER));
     assert!(updated.contains("## Tool Usage Guidelines"));
 }
 
@@ -134,4 +136,6 @@ fn apply_workspace_path_to_session_updates_metadata_and_prompt() {
         .map(|message| message.content.clone())
         .unwrap_or_default();
     assert!(system_content.contains("Workspace path: /tmp/workspace"));
+    assert!(system_content.contains(crate::server::app_state::WORKSPACE_CONTEXT_START_MARKER));
+    assert!(system_content.contains(crate::server::app_state::WORKSPACE_CONTEXT_END_MARKER));
 }

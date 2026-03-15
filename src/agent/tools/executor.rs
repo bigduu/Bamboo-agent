@@ -18,6 +18,21 @@ use crate::agent::tools::tools::{
 use crate::core::Config;
 use tokio::sync::RwLock;
 
+fn preview_for_log(value: &str, max_chars: usize) -> String {
+    let mut iter = value.chars();
+    let mut preview = String::new();
+    for _ in 0..max_chars {
+        match iter.next() {
+            Some(ch) => preview.push(ch),
+            None => break,
+        }
+    }
+    if iter.next().is_some() {
+        preview.push_str("...");
+    }
+    preview.replace('\n', "\\n").replace('\r', "\\r")
+}
+
 /// List of all built-in tool names.
 ///
 /// This list intentionally includes only tools that are always registered by
@@ -302,9 +317,24 @@ impl ToolExecutor for BuiltinToolExecutor {
         let mut args: serde_json::Value = if args_raw.is_empty() {
             json!({})
         } else {
-            serde_json::from_str(args_raw).map_err(|e| {
-                ToolError::InvalidArguments(format!("Invalid JSON arguments: {}", e))
-            })?
+            match serde_json::from_str(args_raw) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    log::warn!(
+                        "Builtin tool argument parsing failed: session_id={:?}, tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", error={}",
+                        ctx.session_id,
+                        call.id,
+                        call.function.name,
+                        args_raw.len(),
+                        preview_for_log(args_raw, 180),
+                        error
+                    );
+                    return Err(ToolError::InvalidArguments(format!(
+                        "Invalid JSON arguments: {}",
+                        error
+                    )));
+                }
+            }
         };
 
         let raw_tool_name = normalize_tool_name(&call.function.name);

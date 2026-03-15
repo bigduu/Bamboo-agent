@@ -88,21 +88,84 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
     let parent_tx = get_or_create_sender(&ctx.session_event_senders, &job.parent_session_id).await;
     let child_tx = get_or_create_sender(&ctx.session_event_senders, &job.child_session_id).await;
 
-    let child_entry = ctx
-        .session_store
-        .get_index_entry(&job.child_session_id)
-        .await;
-    let child_title = child_entry
-        .as_ref()
-        .map(|e| e.title.clone())
-        .unwrap_or_default();
+    let emit_error_completion = |error: String| {
+        let _ = parent_tx.send(AgentEvent::SubSessionCompleted {
+            parent_session_id: job.parent_session_id.clone(),
+            child_session_id: job.child_session_id.clone(),
+            status: "error".to_string(),
+            error: Some(error.clone()),
+        });
+        error
+    };
 
-    // High-level start event.
-    let _ = parent_tx.send(AgentEvent::SubSessionStarted {
-        parent_session_id: job.parent_session_id.clone(),
-        child_session_id: job.child_session_id.clone(),
-        title: Some(child_title),
-    });
+    // Start child execution if not already running.
+    // Load child session.
+    let mut session = match ctx.storage.load_session(&job.child_session_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Err(emit_error_completion("child session not found".to_string())),
+        Err(e) => {
+            return Err(emit_error_completion(format!(
+                "failed to load child session: {e}"
+            )))
+        }
+    };
+
+    if session.kind != SessionKind::Child {
+        return Err(emit_error_completion(
+            "spawn job child session is not kind=child".to_string(),
+        ));
+    }
+
+    // Ensure last message is user (otherwise nothing to do).
+    let last_is_user = session
+        .messages
+        .last()
+        .map(|m| matches!(m.role, Role::User))
+        .unwrap_or(false);
+    if !last_is_user {
+        session
+            .metadata
+            .insert("last_run_status".to_string(), "skipped".to_string());
+        session.metadata.insert(
+            "last_run_error".to_string(),
+            "No pending message to execute".to_string(),
+        );
+        let _ = ctx.storage.save_session(&session).await;
+        let _ = parent_tx.send(AgentEvent::SubSessionCompleted {
+            parent_session_id: job.parent_session_id.clone(),
+            child_session_id: job.child_session_id.clone(),
+            status: "skipped".to_string(),
+            error: Some("No pending message to execute".to_string()),
+        });
+        return Ok(());
+    }
+
+    // Persist a running marker early so list_sessions can reconstruct status
+    // even if the parent UI briefly misses streamed events.
+    session
+        .metadata
+        .insert("last_run_status".to_string(), "running".to_string());
+    session.metadata.remove("last_run_error");
+    let _ = ctx.storage.save_session(&session).await;
+
+    // Insert runner status (for cancellation/status introspection).
+    let cancel_token = {
+        let mut runners = ctx.agent_runners.write().await;
+        if let Some(runner) = runners.get(&job.child_session_id) {
+            if matches!(runner.status, AgentStatus::Running) {
+                return Ok(());
+            }
+        }
+
+        runners.remove(&job.child_session_id);
+        let mut runner = AgentRunner::new();
+        runner.status = AgentStatus::Running;
+        // Use the stable session event sender for this session id.
+        runner.event_sender = child_tx.clone();
+        let cancel_token = runner.cancel_token.clone();
+        runners.insert(job.child_session_id.clone(), runner);
+        cancel_token
+    };
 
     // Forward ALL child events to parent, wrapped so the UI can demux.
     // Also emit a heartbeat while the child is running.
@@ -156,71 +219,6 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
             }
         });
     }
-
-    // Start child execution if not already running.
-    // Load child session.
-    let mut session = match ctx.storage.load_session(&job.child_session_id).await {
-        Ok(Some(s)) => s,
-        Ok(None) => return Err("child session not found".to_string()),
-        Err(e) => return Err(format!("failed to load child session: {e}")),
-    };
-
-    if session.kind != SessionKind::Child {
-        return Err("spawn job child session is not kind=child".to_string());
-    }
-
-    // Ensure last message is user (otherwise nothing to do).
-    let last_is_user = session
-        .messages
-        .last()
-        .map(|m| matches!(m.role, Role::User))
-        .unwrap_or(false);
-    if !last_is_user {
-        session
-            .metadata
-            .insert("last_run_status".to_string(), "skipped".to_string());
-        session.metadata.insert(
-            "last_run_error".to_string(),
-            "No pending message to execute".to_string(),
-        );
-        let _ = ctx.storage.save_session(&session).await;
-        forwarder_done.cancel();
-        let _ = parent_tx.send(AgentEvent::SubSessionCompleted {
-            parent_session_id: job.parent_session_id.clone(),
-            child_session_id: job.child_session_id.clone(),
-            status: "skipped".to_string(),
-            error: Some("No pending message to execute".to_string()),
-        });
-        return Ok(());
-    }
-
-    // Persist a running marker early so list_sessions can reconstruct status
-    // even if the parent UI briefly misses streamed events.
-    session
-        .metadata
-        .insert("last_run_status".to_string(), "running".to_string());
-    session.metadata.remove("last_run_error");
-    let _ = ctx.storage.save_session(&session).await;
-
-    // Insert runner status (for cancellation/status introspection).
-    let cancel_token = {
-        let mut runners = ctx.agent_runners.write().await;
-        if let Some(runner) = runners.get(&job.child_session_id) {
-            if matches!(runner.status, AgentStatus::Running) {
-                forwarder_done.cancel();
-                return Ok(());
-            }
-        }
-
-        runners.remove(&job.child_session_id);
-        let mut runner = AgentRunner::new();
-        runner.status = AgentStatus::Running;
-        // Use the stable session event sender for this session id.
-        runner.event_sender = child_tx.clone();
-        let cancel_token = runner.cancel_token.clone();
-        runners.insert(job.child_session_id.clone(), runner);
-        cancel_token
-    };
 
     // Create mpsc channel for agent loop -> session events sender.
     let (mpsc_tx, mut mpsc_rx) = tokio::sync::mpsc::channel::<crate::agent::core::AgentEvent>(100);
