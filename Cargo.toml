@@ -16,7 +16,15 @@ categories = [
     "web-programming",
     "asynchronous",
 ]
-include = ["Cargo.toml", "LICENSE", "src/**/*"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE",
+    "README.md",
+    "build.rs",
+    "src/**/*",
+    "builtin_skills/**/*",
+]
 
 [dependencies]
 # Async runtime
