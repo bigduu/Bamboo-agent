@@ -584,8 +584,8 @@ mod tests {
     fn skips_oversized_segments() {
         // Test that segments exceeding remaining budget are skipped
         let counter = HeuristicTokenCounter::default();
-        // Very small budget
-        let budget = TokenBudget::new(200, 50, BudgetStrategy::Window { size: 50 });
+        // Tight budget: large message should not fit, but small message should.
+        let budget = TokenBudget::new(400, 100, BudgetStrategy::Window { size: 50 });
 
         let messages = vec![
             Message::system("System"),

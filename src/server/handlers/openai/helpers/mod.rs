@@ -5,8 +5,6 @@ mod responses_input;
 mod responses_options;
 mod stream_utils;
 
-use bytes::Bytes;
-
 pub(super) fn convert_messages(
     messages: Vec<crate::agent::llm::api::models::ChatMessage>,
 ) -> Result<Vec<crate::agent::core::Message>, crate::server::error::AppError> {
@@ -27,10 +25,6 @@ pub(super) fn responses_input_to_chat_messages(
 
 pub(super) fn now_unix_ts() -> u64 {
     stream_utils::now_unix_ts()
-}
-
-pub(super) fn sse_data(json: &str) -> Bytes {
-    stream_utils::sse_data(json)
 }
 
 pub(super) fn convert_chunk_to_openai(

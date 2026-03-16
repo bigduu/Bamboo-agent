@@ -32,6 +32,11 @@ pub fn claude_fs_lock() -> std::sync::MutexGuard<'static, ()> {
         .expect("claude fs lock poisoned")
 }
 
+/// Serialize tests that mutate shared agent data directories.
+pub fn data_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+    claude_fs_lock()
+}
+
 /// Create a test app with AppState
 pub async fn create_test_app() -> actix_web::web::Data<AppState> {
     ensure_test_home_dir();

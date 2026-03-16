@@ -6,5 +6,6 @@ use bamboo_agent::server::handlers::agent::messages;
 use serde_json::json;
 
 mod delete;
+mod patch;
 mod restore;
 mod truncate;

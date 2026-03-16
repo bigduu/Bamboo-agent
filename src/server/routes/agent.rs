@@ -89,6 +89,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             )
             .route(
                 "/sessions/{session_id}/messages/{message_id}",
+                web::patch().to(agent::messages::patch_message),
+            )
+            .route(
+                "/sessions/{session_id}/messages/{message_id}",
                 web::delete().to(agent::messages::delete_message),
             )
             .route(

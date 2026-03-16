@@ -1,4 +1,7 @@
+use std::time::Duration;
+
 use actix_web::{web, HttpResponse};
+use tokio::time::timeout;
 
 use crate::{
     agent::llm::providers::copilot::auth::DeviceCodeResponse,
@@ -76,12 +79,23 @@ pub async fn complete_copilot_auth(
         Ok(_) => {
             log::info!("Copilot authentication completed successfully");
 
-            app_state.reload_provider().await.map_err(|err| {
-                AppError::InternalError(anyhow::anyhow!(
-                    "Failed to reload provider after authentication: {}",
-                    err
-                ))
-            })?;
+            // Authentication is already persisted to disk above. Reloading the in-memory provider
+            // is best-effort: in proxy-restricted environments this can occasionally block on
+            // network-dependent refresh paths. Don't hold the auth response hostage.
+            match timeout(Duration::from_secs(8), app_state.reload_provider()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    log::warn!(
+                        "Copilot auth succeeded but provider reload failed (non-fatal): {}",
+                        err
+                    );
+                }
+                Err(_) => {
+                    log::warn!(
+                        "Copilot auth succeeded but provider reload timed out (non-fatal)"
+                    );
+                }
+            }
 
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "success": true,

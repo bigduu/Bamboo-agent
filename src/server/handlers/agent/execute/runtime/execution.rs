@@ -70,12 +70,11 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
         session.model = model.clone();
 
         if let Some(prompt) = system_prompt.as_ref() {
-            println!("\n========== SYSTEM PROMPT ==========");
-            println!("Session: {}", session_id);
-            println!("Final prompt length: {} chars", prompt.len());
-            println!("-----------------------------------");
-            println!("{}", prompt);
-            println!("========== END SYSTEM PROMPT ==========\n");
+            log::info!("[{}] ========== SYSTEM PROMPT ==========", session_id);
+            log::info!("[{}] Final prompt length: {} chars", session_id, prompt.len());
+            log::info!("[{}] -----------------------------------", session_id);
+            log::info!("[{}] {}", session_id, prompt);
+            log::info!("[{}] ========== END SYSTEM PROMPT ==========", session_id);
         }
 
         // Run agent loop.
