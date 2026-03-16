@@ -31,15 +31,17 @@ pub(super) async fn handle_streaming_response(
     );
 
     let provider = app_state.get_provider().await;
+    let request_options = LLMRequestOptions {
+        reasoning_effort: prepared.reasoning_effort,
+        responses: Some(prepared.responses_options.clone()),
+    };
     let stream_result = provider
         .chat_stream_with_options(
             &prepared.internal_messages,
             &prepared.internal_tools,
             prepared.max_tokens,
             prepared.resolved_model.as_str(),
-            Some(&LLMRequestOptions {
-                reasoning_effort: prepared.reasoning_effort,
-            }),
+            Some(&request_options),
         )
         .await
         .map_err(errors::map_provider_error)?;

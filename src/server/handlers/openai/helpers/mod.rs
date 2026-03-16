@@ -2,6 +2,7 @@ mod completion;
 mod conversion;
 mod reasoning;
 mod responses_input;
+mod responses_options;
 mod stream_utils;
 
 use bytes::Bytes;
@@ -51,4 +52,10 @@ pub(crate) fn parse_reasoning_effort(
     parameters: &std::collections::HashMap<String, serde_json::Value>,
 ) -> Option<crate::core::ReasoningEffort> {
     reasoning::parse_reasoning_effort(parameters)
+}
+
+pub(crate) fn parse_responses_request_options(
+    parameters: &std::collections::HashMap<String, serde_json::Value>,
+) -> crate::agent::llm::provider::ResponsesRequestOptions {
+    responses_options::parse_responses_request_options(parameters)
 }

@@ -7,6 +7,7 @@
 use super::tool_schema::sanitize_openai_function_parameters_schema;
 use crate::agent::core::{agent::Role, tools::ToolSchema, Message};
 use crate::agent::llm::models::ContentPart;
+use crate::agent::llm::provider::ResponsesRequestOptions;
 use crate::agent::llm::provider::Result;
 use crate::agent::llm::types::LLMChunk;
 use crate::core::ReasoningEffort;
@@ -162,6 +163,7 @@ pub fn build_responses_body(
     tools: &[ToolSchema],
     max_output_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
+    responses_options: Option<&ResponsesRequestOptions>,
 ) -> Value {
     let mut body = json!({
         "model": model,
@@ -179,11 +181,42 @@ pub fn build_responses_body(
         body["max_output_tokens"] = json!(max_tokens);
     }
 
-    if let Some(reasoning_effort) = reasoning_effort {
-        body["reasoning"] = json!({
-            "effort": reasoning_effort.as_str()
-        });
+    let reasoning_summary = responses_options
+        .and_then(|opts| opts.reasoning_summary.as_deref())
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty());
+    if reasoning_effort.is_some() || reasoning_summary.is_some() {
+        let mut reasoning = serde_json::Map::new();
+        if let Some(effort) = reasoning_effort {
+            reasoning.insert("effort".to_string(), json!(effort.as_str()));
+        }
+        if let Some(summary) = reasoning_summary {
+            reasoning.insert("summary".to_string(), json!(summary));
+        }
+        if !reasoning.is_empty() {
+            body["reasoning"] = Value::Object(reasoning);
+        }
     }
+
+    if let Some(include) = responses_options
+        .and_then(|opts| opts.include.as_ref())
+        .filter(|values| !values.is_empty())
+    {
+        body["include"] = json!(include);
+    }
+
+    if let Some(truncation) = responses_options
+        .and_then(|opts| opts.truncation.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        body["truncation"] = json!(truncation);
+    }
+
+    let store = responses_options
+        .and_then(|opts| opts.store)
+        .unwrap_or(false);
+    body["store"] = json!(store);
 
     body
 }
@@ -442,11 +475,37 @@ mod tests {
 
     #[test]
     fn build_responses_body_includes_input_and_stream() {
-        let body = build_responses_body("gpt-5.3-codex", &[], &[], Some(123), None);
+        let body = build_responses_body("gpt-5.3-codex", &[], &[], Some(123), None, None);
         assert_eq!(body["model"], "gpt-5.3-codex");
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_output_tokens"], 123);
+        assert_eq!(body["store"], false);
         assert!(body.get("input").is_some());
+    }
+
+    #[test]
+    fn build_responses_body_applies_responses_options() {
+        let body = build_responses_body(
+            "gpt-5.4",
+            &[],
+            &[],
+            None,
+            Some(ReasoningEffort::High),
+            Some(&ResponsesRequestOptions {
+                reasoning_summary: Some("detailed".to_string()),
+                include: Some(vec!["reasoning.encrypted_content".to_string()]),
+                store: Some(true),
+                truncation: Some("auto".to_string()),
+            }),
+        );
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+        assert_eq!(body["store"], true);
+        assert_eq!(body["truncation"], "auto");
     }
 
     #[test]

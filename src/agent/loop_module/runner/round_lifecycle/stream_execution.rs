@@ -29,7 +29,10 @@ pub(super) async fn execute_llm_stream(
     AgentError,
 > {
     let llm_started_at = std::time::Instant::now();
-    let request_options = LLMRequestOptions { reasoning_effort };
+    let request_options = LLMRequestOptions {
+        reasoning_effort,
+        responses: None,
+    };
     let stream = llm
         .chat_stream_with_options(
             &prepared_context.messages,

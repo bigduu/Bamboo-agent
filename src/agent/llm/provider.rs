@@ -47,9 +47,26 @@ pub type LLMStream = Pin<Box<dyn Stream<Item = Result<LLMChunk>> + Send>>;
 
 /// Optional request-time controls for provider calls.
 #[derive(Debug, Clone, Default)]
+pub struct ResponsesRequestOptions {
+    /// Optional reasoning summary control for Responses API requests
+    /// (e.g. "auto", "concise", "detailed").
+    pub reasoning_summary: Option<String>,
+    /// Optional include list for Responses API requests.
+    pub include: Option<Vec<String>>,
+    /// Whether Responses API should store the response server-side.
+    pub store: Option<bool>,
+    /// Optional truncation mode for Responses API requests
+    /// (e.g. "auto", "disabled").
+    pub truncation: Option<String>,
+}
+
+/// Optional request-time controls for provider calls.
+#[derive(Debug, Clone, Default)]
 pub struct LLMRequestOptions {
     /// Override reasoning effort for this request.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Responses API specific overrides.
+    pub responses: Option<ResponsesRequestOptions>,
 }
 
 /// Trait for LLM provider implementations

@@ -76,7 +76,10 @@ pub async fn evaluate_todo_progress(
     // Use model from parameter (passed from config), not from session.
     log::debug!("[{}] Todo evaluation using model: {}", session_id, model);
 
-    let request_options = LLMRequestOptions { reasoning_effort };
+    let request_options = LLMRequestOptions {
+        reasoning_effort,
+        responses: None,
+    };
     match llm
         .chat_stream_with_options(&messages, &tools, Some(500), model, Some(&request_options))
         .await

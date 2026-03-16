@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 pub mod auth;
 use crate::agent::core::{tools::ToolSchema, Message};
-use crate::agent::llm::provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, Result};
+use crate::agent::llm::provider::{
+    LLMError, LLMProvider, LLMRequestOptions, LLMStream, ResponsesRequestOptions, Result,
+};
 use crate::agent::llm::types::LLMChunk;
 use crate::core::ReasoningEffort;
 use auth::{CopilotAuthHandler, DeviceCodeResponse};
@@ -345,11 +347,18 @@ impl CopilotProvider {
         max_output_tokens: Option<u32>,
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
+        responses_options: Option<&ResponsesRequestOptions>,
         reasoning_source: &str,
     ) -> Result<LLMStream> {
         let url = "https://api.githubcopilot.com/responses";
-        let body =
-            build_responses_body(model, messages, tools, max_output_tokens, reasoning_effort);
+        let body = build_responses_body(
+            model,
+            messages,
+            tools,
+            max_output_tokens,
+            reasoning_effort,
+            responses_options,
+        );
 
         log::debug!("Copilot provider using Responses API model: {}", model);
         log::info!(
@@ -403,8 +412,16 @@ impl CopilotProvider {
                         "Copilot /responses rejected reasoning for model '{}'; retrying without reasoning_effort",
                         model
                     );
-                    let fallback_body =
-                        build_responses_body(model, messages, tools, max_output_tokens, None);
+                    let mut fallback_options = responses_options.cloned().unwrap_or_default();
+                    fallback_options.reasoning_summary = None;
+                    let fallback_body = build_responses_body(
+                        model,
+                        messages,
+                        tools,
+                        max_output_tokens,
+                        None,
+                        Some(&fallback_options),
+                    );
                     let mut fallback = self
                         .client
                         .post(url)
@@ -492,6 +509,7 @@ impl LLMProvider for CopilotProvider {
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
+        let responses_options = options.and_then(|o| o.responses.as_ref());
         let reasoning_source = if request_reasoning_effort.is_some() {
             "request"
         } else if self.default_reasoning_effort.is_some() {
@@ -521,6 +539,7 @@ impl LLMProvider for CopilotProvider {
                     max_output_tokens,
                     upstream_model,
                     reasoning_effort,
+                    responses_options,
                     reasoning_source,
                 )
                 .await;
@@ -662,6 +681,7 @@ impl LLMProvider for CopilotProvider {
                             max_output_tokens,
                             upstream_model,
                             reasoning_effort,
+                            responses_options,
                             reasoning_source,
                         )
                         .await;

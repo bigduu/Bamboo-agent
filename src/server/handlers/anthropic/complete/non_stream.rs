@@ -40,7 +40,10 @@ pub(super) async fn handle_non_streaming_complete(
             &internal_tools,
             max_tokens,
             mapped_model.as_str(),
-            Some(&LLMRequestOptions { reasoning_effort }),
+            Some(&LLMRequestOptions {
+                reasoning_effort,
+                responses: None,
+            }),
         )
         .await
     {

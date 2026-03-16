@@ -41,7 +41,10 @@ pub(super) async fn handle_non_streaming_chat(
             &internal_tools,
             max_tokens,
             resolved_model.as_str(),
-            Some(&LLMRequestOptions { reasoning_effort }),
+            Some(&LLMRequestOptions {
+                reasoning_effort,
+                responses: None,
+            }),
         )
         .await
         .map_err(map_provider_error)?;

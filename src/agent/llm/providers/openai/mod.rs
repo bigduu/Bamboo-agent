@@ -8,7 +8,9 @@ use reqwest::Client;
 use serde_json::Value;
 
 use crate::agent::core::{tools::ToolSchema, Message};
-use crate::agent::llm::provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, Result};
+use crate::agent::llm::provider::{
+    LLMError, LLMProvider, LLMRequestOptions, LLMStream, ResponsesRequestOptions, Result,
+};
 use crate::agent::llm::types::LLMChunk;
 use crate::core::ReasoningEffort;
 
@@ -122,10 +124,17 @@ impl OpenAIProvider {
         max_output_tokens: Option<u32>,
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
+        responses_options: Option<&ResponsesRequestOptions>,
         reasoning_source: &str,
     ) -> Result<LLMStream> {
-        let body =
-            build_responses_body(model, messages, tools, max_output_tokens, reasoning_effort);
+        let body = build_responses_body(
+            model,
+            messages,
+            tools,
+            max_output_tokens,
+            reasoning_effort,
+            responses_options,
+        );
         log::info!(
             "OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
             model,
@@ -159,8 +168,16 @@ impl OpenAIProvider {
                     model
                 );
 
-                let fallback_body =
-                    build_responses_body(model, messages, tools, max_output_tokens, None);
+                let mut fallback_options = responses_options.cloned().unwrap_or_default();
+                fallback_options.reasoning_summary = None;
+                let fallback_body = build_responses_body(
+                    model,
+                    messages,
+                    tools,
+                    max_output_tokens,
+                    None,
+                    Some(&fallback_options),
+                );
                 let fallback = self
                     .client
                     .post(format!("{}/responses", self.base_url))
@@ -222,6 +239,7 @@ impl LLMProvider for OpenAIProvider {
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
+        let responses_options = options.and_then(|o| o.responses.as_ref());
         let reasoning_source = if request_reasoning_effort.is_some() {
             "request"
         } else if self.default_reasoning_effort.is_some() {
@@ -238,6 +256,7 @@ impl LLMProvider for OpenAIProvider {
                     max_output_tokens,
                     model,
                     reasoning_effort,
+                    responses_options,
                     reasoning_source,
                 )
                 .await;
@@ -323,6 +342,7 @@ impl LLMProvider for OpenAIProvider {
                         max_output_tokens,
                         model,
                         reasoning_effort,
+                        responses_options,
                         reasoning_source,
                     )
                     .await;
