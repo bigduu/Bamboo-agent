@@ -89,6 +89,11 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                     json!({"file_path":"/workspace/project/src/main.rs","old_string":"foo","new_string":"bar"}),
                     "Use only when old_string is known to match exactly once.",
                 ),
+                example(
+                    "Legacy replacement with line hint",
+                    json!({"file_path":"/workspace/project/src/main.rs","old_string":"value = 1","new_string":"value = 2","line_number":42}),
+                    "Use line_number when old_string may appear in multiple places.",
+                ),
             ],
         )),
         "Glob" => Some(guide(
