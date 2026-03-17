@@ -53,3 +53,152 @@ fn validate_entry_limits(entries: &[KeywordEntry]) -> Result<(), AppError> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::keyword_masking::MatchType;
+
+    #[test]
+    fn test_validate_entries_with_empty_list() {
+        let entries = vec![];
+        let result = validate_entries_only(entries);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_entries_with_valid_entry() {
+        let entries = vec![KeywordEntry {
+            pattern: "test".to_string(),
+            match_type: MatchType::Exact,
+            enabled: true,
+        }];
+        let result = validate_entries_only(entries);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_entries_with_invalid_regex() {
+        let entries = vec![KeywordEntry {
+            pattern: "[invalid(regex".to_string(),
+            match_type: MatchType::Regex,
+            enabled: true,
+        }];
+        let result = validate_entries_only(entries);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn test_validate_entry_limits_with_too_many_entries() {
+        let entries: Vec<KeywordEntry> = (0..=MAX_ENTRIES)
+            .map(|i| KeywordEntry {
+                pattern: format!("pattern{}", i),
+                match_type: MatchType::Exact,
+                enabled: true,
+            })
+            .collect();
+        let result = validate_entry_limits(&entries);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_entry_limits_with_max_entries() {
+        let entries: Vec<KeywordEntry> = (0..MAX_ENTRIES)
+            .map(|i| KeywordEntry {
+                pattern: format!("pattern{}", i),
+                match_type: MatchType::Exact,
+                enabled: true,
+            })
+            .collect();
+        let result = validate_entry_limits(&entries);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_entry_limits_with_pattern_too_long() {
+        let entries = vec![KeywordEntry {
+            pattern: "a".repeat(MAX_PATTERN_LENGTH + 1),
+            match_type: MatchType::Exact,
+            enabled: true,
+        }];
+        let result = validate_entry_limits(&entries);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_entry_limits_with_max_pattern_length() {
+        let entries = vec![KeywordEntry {
+            pattern: "a".repeat(MAX_PATTERN_LENGTH),
+            match_type: MatchType::Exact,
+            enabled: true,
+        }];
+        let result = validate_entry_limits(&entries);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_validated_config_with_empty_entries() {
+        let entries = vec![];
+        let result = build_validated_config(entries);
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert!(config.entries.is_empty());
+    }
+
+    #[test]
+    fn test_build_validated_config_with_valid_entries() {
+        let entries = vec![
+            KeywordEntry {
+                pattern: "secret1".to_string(),
+                match_type: MatchType::Exact,
+                enabled: true,
+            },
+            KeywordEntry {
+                pattern: r"\d{4}".to_string(),
+                match_type: MatchType::Regex,
+                enabled: true,
+            },
+        ];
+        let result = build_validated_config(entries);
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.entries.len(), 2);
+    }
+
+    #[test]
+    fn test_build_validated_config_with_invalid_regex() {
+        let entries = vec![KeywordEntry {
+            pattern: "[invalid".to_string(),
+            match_type: MatchType::Regex,
+            enabled: true,
+        }];
+        let result = build_validated_config(entries);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_validated_config_with_too_many_entries() {
+        let entries: Vec<KeywordEntry> = (0..=MAX_ENTRIES)
+            .map(|i| KeywordEntry {
+                pattern: format!("pattern{}", i),
+                match_type: MatchType::Exact,
+                enabled: true,
+            })
+            .collect();
+        let result = build_validated_config(entries);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_validated_config_with_disabled_entry() {
+        let entries = vec![KeywordEntry {
+            pattern: "test".to_string(),
+            match_type: MatchType::Exact,
+            enabled: false,
+        }];
+        let result = build_validated_config(entries);
+        assert!(result.is_ok());
+    }
+}

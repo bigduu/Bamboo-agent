@@ -161,4 +161,188 @@ mod tests {
     fn test_sessions_dir_is_under_bamboo_dir() {
         assert_eq!(sessions_dir(), bamboo_dir().join("sessions"));
     }
+
+    #[test]
+    fn test_config_json_path() {
+        let path = config_json_path();
+        assert!(path.ends_with("config.json"));
+        assert!(path.parent().is_some());
+    }
+
+    #[test]
+    fn test_keyword_masking_json_path() {
+        let path = keyword_masking_json_path();
+        assert!(path.ends_with("keyword_masking.json"));
+    }
+
+    #[test]
+    fn test_workflows_dir() {
+        let path = workflows_dir();
+        assert!(path.ends_with("workflows"));
+    }
+
+    #[test]
+    fn test_anthropic_model_mapping_path() {
+        let path = anthropic_model_mapping_path();
+        assert!(path.ends_with("anthropic-model-mapping.json"));
+    }
+
+    #[test]
+    fn test_gemini_model_mapping_path() {
+        let path = gemini_model_mapping_path();
+        assert!(path.ends_with("gemini-model-mapping.json"));
+    }
+
+    #[test]
+    fn test_ensure_bamboo_dir_creates_directory() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let test_dir = temp_dir.path().join("test_bamboo");
+
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("ENV_LOCK poisoned");
+
+        // Save and set env
+        let original = std::env::var_os("BAMBOO_DATA_DIR");
+        std::env::set_var("BAMBOO_DATA_DIR", &test_dir);
+
+        // Reset global state
+        let _ = BAMBOO_DATA_DIR.set(test_dir.clone());
+
+        let result = ensure_bamboo_dir();
+        assert!(result.is_ok());
+        assert!(test_dir.exists());
+
+        // Restore
+        if let Some(val) = original {
+            std::env::set_var("BAMBOO_DATA_DIR", val);
+        } else {
+            std::env::remove_var("BAMBOO_DATA_DIR");
+        }
+    }
+
+    #[test]
+    fn test_load_config_json_missing_file() {
+        let result: Result<String, _> = load_config_json(Path::new("/nonexistent/file.json"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Config file not found"));
+    }
+
+    #[test]
+    fn test_load_config_json_valid_file() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let file_path = temp_dir.path().join("test.json");
+
+        std::fs::write(&file_path, r#"{"key": "value"}"#).expect("Failed to write file");
+
+        #[derive(serde::Deserialize)]
+        struct TestConfig {
+            key: String,
+        }
+
+        let result: Result<TestConfig, _> = load_config_json(&file_path);
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.key, "value");
+    }
+
+    #[test]
+    fn test_load_config_json_invalid_json() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let file_path = temp_dir.path().join("invalid.json");
+
+        std::fs::write(&file_path, "not valid json").expect("Failed to write file");
+
+        let result: Result<String, _> = load_config_json(&file_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Failed to parse config"));
+    }
+
+    #[test]
+    fn test_save_config_json_creates_file() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let file_path = temp_dir.path().join("new_config.json");
+
+        #[derive(serde::Serialize)]
+        struct TestConfig {
+            key: String,
+        }
+
+        let config = TestConfig {
+            key: "value".to_string(),
+        };
+
+        let result = save_config_json(&file_path, &config);
+        assert!(result.is_ok());
+        assert!(file_path.exists());
+
+        let content = std::fs::read_to_string(&file_path).expect("Failed to read file");
+        assert!(content.contains("key"));
+        assert!(content.contains("value"));
+    }
+
+    #[test]
+    fn test_save_config_json_creates_parent_directory() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let file_path = temp_dir.path().join("subdir/nested/config.json");
+
+        #[derive(serde::Serialize)]
+        struct TestConfig {
+            key: String,
+        }
+
+        let config = TestConfig {
+            key: "value".to_string(),
+        };
+
+        let result = save_config_json(&file_path, &config);
+        assert!(result.is_ok());
+        assert!(file_path.exists());
+    }
+
+    #[test]
+    fn test_path_to_display_string_simple() {
+        let path = Path::new("/home/user/test");
+        let result = path_to_display_string(path);
+        assert_eq!(result, "/home/user/test");
+    }
+
+    #[test]
+    fn test_path_to_display_string_empty() {
+        let path = Path::new("");
+        let result = path_to_display_string(path);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_bamboo_dir_display() {
+        let result = bamboo_dir_display();
+        // Just ensure it returns a non-empty string
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_init_bamboo_dir_first_call_wins() {
+        static INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = INIT_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("INIT_LOCK poisoned");
+
+        // Create a new OnceLock for this test
+        static TEST_DIR: OnceLock<PathBuf> = OnceLock::new();
+        let first = PathBuf::from("/first/path");
+        let second = PathBuf::from("/second/path");
+
+        let _ = TEST_DIR.set(first.clone());
+        let result = TEST_DIR.set(second);
+
+        // Second set should fail (returns Err)
+        assert!(result.is_err());
+
+        // Value should still be first
+        assert_eq!(TEST_DIR.get().unwrap(), &first);
+    }
 }

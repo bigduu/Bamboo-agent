@@ -107,3 +107,231 @@ pub struct CleanupRequest {
     #[serde(default)]
     pub keep_pinned: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    #[test]
+    fn test_create_session_request_minimal() {
+        let json = r#"{}"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+
+        assert!(req.title.is_none());
+        assert!(req.system_prompt.is_none());
+        assert!(req.model.is_none());
+    }
+
+    #[test]
+    fn test_create_session_request_full() {
+        let json = r#"{"title":"Test Session","system_prompt":"You are helpful","model":"gpt-4"}"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(req.title, Some("Test Session".to_string()));
+        assert_eq!(req.system_prompt, Some("You are helpful".to_string()));
+        assert_eq!(req.model, Some("gpt-4".to_string()));
+    }
+
+    #[test]
+    fn test_create_session_request_debug() {
+        let req = CreateSessionRequest {
+            title: Some("Test".to_string()),
+            system_prompt: None,
+            model: None,
+        };
+
+        let debug_str = format!("{:?}", req);
+        assert!(debug_str.contains("CreateSessionRequest"));
+    }
+
+    #[test]
+    fn test_patch_session_request_partial() {
+        let json = r#"{"title":"New Title"}"#;
+        let req: PatchSessionRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(req.title, Some("New Title".to_string()));
+        assert!(req.pinned.is_none());
+    }
+
+    #[test]
+    fn test_patch_session_request_both() {
+        let json = r#"{"title":"New Title","pinned":true}"#;
+        let req: PatchSessionRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(req.title, Some("New Title".to_string()));
+        assert_eq!(req.pinned, Some(true));
+    }
+
+    #[test]
+    fn test_patch_session_request_empty() {
+        let json = r#"{}"#;
+        let req: PatchSessionRequest = serde_json::from_str(json).unwrap();
+
+        assert!(req.title.is_none());
+        assert!(req.pinned.is_none());
+    }
+
+    #[test]
+    fn test_cleanup_request_minimal() {
+        let json = r#"{"mode":"all"}"#;
+        let req: CleanupRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(req.mode, "all");
+        assert!(!req.keep_pinned);
+    }
+
+    #[test]
+    fn test_cleanup_request_with_keep_pinned() {
+        let json = r#"{"mode":"old","keep_pinned":true}"#;
+        let req: CleanupRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(req.mode, "old");
+        assert!(req.keep_pinned);
+    }
+
+    #[test]
+    fn test_list_sessions_response_serialization() {
+        let response = ListSessionsResponse { sessions: vec![] };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"sessions\":[]"));
+    }
+
+    #[test]
+    fn test_create_session_response_serialization() {
+        let summary = SessionSummary {
+            id: "test-id".to_string(),
+            kind: crate::agent::core::SessionKind::Root,
+            title: "Test".to_string(),
+            pinned: false,
+            parent_session_id: None,
+            root_session_id: "root-id".to_string(),
+            spawn_depth: 0,
+            created_by_schedule_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_activity_at: Utc::now(),
+            message_count: 0,
+            has_attachments: false,
+            is_running: false,
+            last_run_status: None,
+            last_run_error: None,
+            token_usage: None,
+        };
+
+        let response = CreateSessionResponse { session: summary };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"session\""));
+        assert!(json.contains("\"test-id\""));
+    }
+
+    #[test]
+    fn test_get_session_response_serialization() {
+        let summary = SessionSummary {
+            id: "session-123".to_string(),
+            kind: crate::agent::core::SessionKind::Child,
+            title: "My Session".to_string(),
+            pinned: true,
+            parent_session_id: Some("parent-id".to_string()),
+            root_session_id: "root-id".to_string(),
+            spawn_depth: 1,
+            created_by_schedule_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_activity_at: Utc::now(),
+            message_count: 5,
+            has_attachments: true,
+            is_running: false,
+            last_run_status: Some("success".to_string()),
+            last_run_error: None,
+            token_usage: None,
+        };
+
+        let response = GetSessionResponse { session: summary };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"session-123\""));
+        assert!(json.contains("\"My Session\""));
+        assert!(json.contains("\"pinned\":true"));
+    }
+
+    #[test]
+    fn test_session_system_prompt_response_minimal() {
+        let response = SessionSystemPromptResponse {
+            session_id: "session-id".to_string(),
+            base_system_prompt: "You are helpful".to_string(),
+            enhancement_prompt: None,
+            workspace_context: None,
+            skill_context: None,
+            tool_guide_context: None,
+            external_memory: None,
+            todo_list: None,
+            effective_system_prompt: "You are helpful".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"session_id\""));
+        assert!(json.contains("\"You are helpful\""));
+        assert!(!json.contains("\"enhancement_prompt\""));
+    }
+
+    #[test]
+    fn test_session_system_prompt_response_full() {
+        let response = SessionSystemPromptResponse {
+            session_id: "session-id".to_string(),
+            base_system_prompt: "Base".to_string(),
+            enhancement_prompt: Some("Enhancement".to_string()),
+            workspace_context: Some("Workspace".to_string()),
+            skill_context: Some("Skill".to_string()),
+            tool_guide_context: Some("Tool guide".to_string()),
+            external_memory: Some("Memory".to_string()),
+            todo_list: Some("Todo".to_string()),
+            effective_system_prompt: "Full prompt".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"enhancement_prompt\""));
+        assert!(json.contains("\"workspace_context\""));
+        assert!(json.contains("\"skill_context\""));
+    }
+
+    #[test]
+    fn test_session_summary_debug() {
+        let summary = SessionSummary {
+            id: "test".to_string(),
+            kind: crate::agent::core::SessionKind::Root,
+            title: "Test".to_string(),
+            pinned: false,
+            parent_session_id: None,
+            root_session_id: "root".to_string(),
+            spawn_depth: 0,
+            created_by_schedule_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_activity_at: Utc::now(),
+            message_count: 0,
+            has_attachments: false,
+            is_running: false,
+            last_run_status: None,
+            last_run_error: None,
+            token_usage: None,
+        };
+
+        let debug_str = format!("{:?}", summary);
+        assert!(debug_str.contains("SessionSummary"));
+        assert!(debug_str.contains("test"));
+    }
+
+    #[test]
+    fn test_cleanup_request_debug() {
+        let req = CleanupRequest {
+            mode: "all".to_string(),
+            keep_pinned: true,
+        };
+
+        let debug_str = format!("{:?}", req);
+        assert!(debug_str.contains("CleanupRequest"));
+    }
+}

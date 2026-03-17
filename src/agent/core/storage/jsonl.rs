@@ -218,6 +218,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_init_creates_directory() -> io::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("jsonl-init-test-{}", Uuid::new_v4()));
+        let storage = JsonlStorage::new(&temp_dir);
+
+        assert!(!temp_dir.exists());
+        storage.init().await?;
+        assert!(temp_dir.exists());
+
+        fs::remove_dir_all(temp_dir).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_save_and_load_session() -> io::Result<()> {
+        let (storage, temp_dir) = create_temp_storage().await?;
+        let session = Session::new("session-1", "test-model");
+
+        storage.save_session(&session).await?;
+        let loaded = storage.load_session(&session.id).await?;
+
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.id, session.id);
+        assert_eq!(loaded.model, session.model);
+
+        fs::remove_dir_all(temp_dir).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_load_session_returns_none_when_not_found() -> io::Result<()> {
+        let (storage, temp_dir) = create_temp_storage().await?;
+
+        let loaded = storage.load_session("nonexistent").await?;
+        assert!(loaded.is_none());
+
+        fs::remove_dir_all(temp_dir).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_and_load_single_event() -> io::Result<()> {
+        let (storage, temp_dir) = create_temp_storage().await?;
+        let session_id = "session-1";
+        let event = AgentEvent::Token {
+            content: "hello".to_string(),
+        };
+
+        storage.append_event(&session_id, &event).await?;
+        let events = storage.load_events(&session_id).await?;
+
+        assert_eq!(events.len(), 1);
+
+        fs::remove_dir_all(temp_dir).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_and_load_multiple_events() -> io::Result<()> {
+        let (storage, temp_dir) = create_temp_storage().await?;
+        let session_id = "session-1";
+
+        for i in 0..5 {
+            let event = AgentEvent::Token {
+                content: format!("token-{}", i),
+            };
+            storage.append_event(&session_id, &event).await?;
+        }
+
+        let events = storage.load_events(&session_id).await?;
+        assert_eq!(events.len(), 5);
+
+        fs::remove_dir_all(temp_dir).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_load_events_returns_empty_when_not_found() -> io::Result<()> {
+        let (storage, temp_dir) = create_temp_storage().await?;
+
+        let events = storage.load_events("nonexistent").await?;
+        assert!(events.is_empty());
+
+        fs::remove_dir_all(temp_dir).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn delete_session_removes_metadata_and_events_files() -> io::Result<()> {
         let (storage, temp_dir) = create_temp_storage().await?;
         let session = Session::new("session-1", "test-model");
@@ -252,6 +340,95 @@ mod tests {
         let deleted = storage.delete_session("missing-session").await?;
 
         assert!(!deleted);
+
+        fs::remove_dir_all(temp_dir).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_session_path_format() -> io::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("jsonl-path-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).await?;
+        let storage = JsonlStorage::new(&temp_dir);
+
+        let session_path = storage.session_path("test-123");
+        let events_path = storage.events_path("test-123");
+
+        assert_eq!(session_path.file_name().unwrap(), "test-123.json");
+        assert_eq!(events_path.file_name().unwrap(), "test-123.jsonl");
+
+        fs::remove_dir_all(temp_dir).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_existing_session() -> io::Result<()> {
+        let (storage, temp_dir) = create_temp_storage().await?;
+
+        let session1 = Session::new("session-1", "model-1");
+        storage.save_session(&session1).await?;
+
+        let session2 = Session::new("session-1", "model-2");
+        storage.save_session(&session2).await?;
+
+        let loaded = storage.load_session("session-1").await?.unwrap();
+        assert_eq!(loaded.model, "model-2");
+
+        fs::remove_dir_all(temp_dir).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_storage_trait_implementation() -> io::Result<()> {
+        let (storage, temp_dir) = create_temp_storage().await?;
+        let trait_obj: &dyn Storage = &storage;
+
+        let session = Session::new("session-1", "test-model");
+        trait_obj.save_session(&session).await?;
+
+        let loaded = trait_obj.load_session(&session.id).await?;
+        assert!(loaded.is_some());
+
+        let event = AgentEvent::Token {
+            content: "test".to_string(),
+        };
+        trait_obj.append_event(&session.id, &event).await?;
+
+        let events = trait_obj.load_events(&session.id).await?;
+        assert_eq!(events.len(), 1);
+
+        let deleted = trait_obj.delete_session(&session.id).await?;
+        assert!(deleted);
+
+        fs::remove_dir_all(temp_dir).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_events_with_different_types() -> io::Result<()> {
+        let (storage, temp_dir) = create_temp_storage().await?;
+        let session_id = "session-1";
+
+        let events = vec![
+            AgentEvent::Token {
+                content: "hello".to_string(),
+            },
+            AgentEvent::Error {
+                message: "test error".to_string(),
+            },
+            AgentEvent::ToolStart {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "test_tool".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+
+        for event in &events {
+            storage.append_event(&session_id, event).await?;
+        }
+
+        let loaded = storage.load_events(&session_id).await?;
+        assert_eq!(loaded.len(), 3);
 
         fs::remove_dir_all(temp_dir).await?;
         Ok(())

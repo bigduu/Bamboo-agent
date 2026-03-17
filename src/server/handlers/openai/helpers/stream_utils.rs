@@ -128,7 +128,11 @@ mod tests {
     fn converts_tool_calls_chunk_to_openai_stream_chunk() {
         let tool_calls = vec![
             tool_call("call_1", "read_file", r#"{"path":"README.md"}"#),
-            tool_call("call_2", "write_file", r#"{"path":"out.txt","content":"ok"}"#),
+            tool_call(
+                "call_2",
+                "write_file",
+                r#"{"path":"out.txt","content":"ok"}"#,
+            ),
         ];
         let chunk = convert_chunk_to_openai(LLMChunk::ToolCalls(tool_calls), "gpt-5")
             .expect("tool-calls chunk should convert");

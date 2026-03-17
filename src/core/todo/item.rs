@@ -185,4 +185,190 @@ mod tests {
         assert!(!item.is_blocking());
         assert!(item.is_async());
     }
+
+    #[test]
+    fn test_todo_item_start() {
+        let mut item = TodoItem::new(
+            TodoItemType::ToolCall {
+                tool_name: "test_tool".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            "Test task",
+        );
+
+        assert!(matches!(item.status, TodoStatus::Pending));
+        assert!(item.started_at.is_none());
+
+        item.start();
+
+        assert!(matches!(item.status, TodoStatus::InProgress));
+        assert!(item.started_at.is_some());
+    }
+
+    #[test]
+    fn test_todo_item_complete() {
+        let mut item = TodoItem::new(
+            TodoItemType::ToolCall {
+                tool_name: "test_tool".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            "Test task",
+        );
+
+        item.start();
+        let result = Some(serde_json::json!({"output": "success"}));
+        item.complete(result.clone());
+
+        assert!(matches!(item.status, TodoStatus::Completed));
+        assert!(item.completed_at.is_some());
+        assert_eq!(item.execution.result, result);
+        assert!(item.execution.duration_ms.is_some());
+    }
+
+    #[test]
+    fn test_todo_item_fail() {
+        let mut item = TodoItem::new(
+            TodoItemType::ToolCall {
+                tool_name: "test_tool".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            "Test task",
+        );
+
+        item.start();
+        item.fail("Something went wrong");
+
+        match item.status {
+            TodoStatus::Failed { error } => {
+                assert_eq!(error, "Something went wrong");
+            }
+            _ => panic!("Expected Failed status"),
+        }
+        assert!(item.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_workflow_step_is_blocking() {
+        let item = TodoItem::new(
+            TodoItemType::WorkflowStep {
+                workflow_name: "test_workflow".to_string(),
+                step_index: 0,
+                step_description: "First step".to_string(),
+            },
+            "Execute workflow step",
+        );
+
+        assert!(item.is_blocking());
+        assert!(!item.is_async());
+    }
+
+    #[test]
+    fn test_todo_item_type_label() {
+        let chat_type = TodoItemType::Chat {
+            streaming_message_id: None,
+        };
+        assert_eq!(chat_type.label(), "Chat");
+
+        let tool_type = TodoItemType::ToolCall {
+            tool_name: "read_file".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        assert_eq!(tool_type.label(), "read_file");
+
+        let workflow_type = TodoItemType::WorkflowStep {
+            workflow_name: "deployment".to_string(),
+            step_index: 0,
+            step_description: "Deploy".to_string(),
+        };
+        assert_eq!(workflow_type.label(), "deployment");
+    }
+
+    #[test]
+    fn test_todo_item_serialization() {
+        let item = TodoItem::new(
+            TodoItemType::ToolCall {
+                tool_name: "test".to_string(),
+                arguments: serde_json::json!({"arg": "value"}),
+            },
+            "Test description",
+        );
+
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("test"));
+        assert!(json.contains("Test description"));
+    }
+
+    #[test]
+    fn test_todo_item_with_children() {
+        let mut parent = TodoItem::new(
+            TodoItemType::WorkflowStep {
+                workflow_name: "parent".to_string(),
+                step_index: 0,
+                step_description: "Parent step".to_string(),
+            },
+            "Parent task",
+        );
+
+        let child = TodoItem::new(
+            TodoItemType::ToolCall {
+                tool_name: "child_tool".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            "Child task",
+        );
+
+        parent.children.push(child);
+        assert_eq!(parent.children.len(), 1);
+    }
+
+    #[test]
+    fn test_chat_with_streaming_message_id() {
+        let message_id = Uuid::new_v4();
+        let item = TodoItem::new(
+            TodoItemType::Chat {
+                streaming_message_id: Some(message_id),
+            },
+            "Streaming chat",
+        );
+
+        assert!(item.is_async());
+        if let TodoItemType::Chat {
+            streaming_message_id,
+        } = item.item_type
+        {
+            assert_eq!(streaming_message_id, Some(message_id));
+        } else {
+            panic!("Expected Chat type");
+        }
+    }
+
+    #[test]
+    fn test_todo_item_complete_without_start() {
+        let mut item = TodoItem::new(
+            TodoItemType::ToolCall {
+                tool_name: "test".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            "Test",
+        );
+
+        // Complete without starting - duration should be None
+        item.complete(Some(serde_json::json!("result")));
+        assert!(item.execution.duration_ms.is_none());
+    }
+
+    #[test]
+    fn test_todo_item_order() {
+        let mut item = TodoItem::new(
+            TodoItemType::ToolCall {
+                tool_name: "test".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            "Test",
+        );
+
+        assert_eq!(item.order, 0);
+        item.order = 5;
+        assert_eq!(item.order, 5);
+    }
 }

@@ -764,3 +764,480 @@ pub struct AnthropicModel {
     /// ISO 8601 timestamp of when the model was created.
     pub created_at: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // AnthropicRole tests
+    #[test]
+    fn test_anthropic_role_serialization() {
+        let role = AnthropicRole::User;
+        let json = serde_json::to_string(&role).unwrap();
+        assert_eq!(json, "\"user\"");
+
+        let role = AnthropicRole::Assistant;
+        let json = serde_json::to_string(&role).unwrap();
+        assert_eq!(json, "\"assistant\"");
+    }
+
+    #[test]
+    fn test_anthropic_role_deserialization() {
+        let role: AnthropicRole = serde_json::from_str("\"user\"").unwrap();
+        assert_eq!(role, AnthropicRole::User);
+
+        let role: AnthropicRole = serde_json::from_str("\"assistant\"").unwrap();
+        assert_eq!(role, AnthropicRole::Assistant);
+
+        let role: AnthropicRole = serde_json::from_str("\"system\"").unwrap();
+        assert_eq!(role, AnthropicRole::System);
+    }
+
+    #[test]
+    fn test_anthropic_role_debug() {
+        let role = AnthropicRole::User;
+        let debug_str = format!("{:?}", role);
+        assert!(debug_str.contains("User"));
+    }
+
+    #[test]
+    fn test_anthropic_role_clone() {
+        let role = AnthropicRole::Assistant;
+        let cloned = role.clone();
+        assert_eq!(role, cloned);
+    }
+
+    #[test]
+    fn test_anthropic_role_eq() {
+        assert_eq!(AnthropicRole::User, AnthropicRole::User);
+        assert_ne!(AnthropicRole::User, AnthropicRole::Assistant);
+    }
+
+    // AnthropicContent tests
+    #[test]
+    fn test_anthropic_content_text() {
+        let json = r#""Hello""#;
+        let content: AnthropicContent = serde_json::from_str(json).unwrap();
+        match content {
+            AnthropicContent::Text(s) => assert_eq!(s, "Hello"),
+            _ => panic!("Expected Text variant"),
+        }
+    }
+
+    #[test]
+    fn test_anthropic_content_blocks() {
+        let json = r#"[{"type":"text","text":"Hello"}]"#;
+        let content: AnthropicContent = serde_json::from_str(json).unwrap();
+        match content {
+            AnthropicContent::Blocks(blocks) => assert_eq!(blocks.len(), 1),
+            _ => panic!("Expected Blocks variant"),
+        }
+    }
+
+    // AnthropicContentBlock tests
+    #[test]
+    fn test_anthropic_content_block_text() {
+        let json = r#"{"type":"text","text":"Hello world"}"#;
+        let block: AnthropicContentBlock = serde_json::from_str(json).unwrap();
+        match block {
+            AnthropicContentBlock::Text { text } => assert_eq!(text, "Hello world"),
+            _ => panic!("Expected Text block"),
+        }
+    }
+
+    #[test]
+    fn test_anthropic_content_block_image_base64() {
+        let json = r#"{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc123"}}"#;
+        let block: AnthropicContentBlock = serde_json::from_str(json).unwrap();
+        match block {
+            AnthropicContentBlock::Image { source } => match source {
+                AnthropicImageSource::Base64 { media_type, data } => {
+                    assert_eq!(media_type, "image/png");
+                    assert_eq!(data, "abc123");
+                }
+                _ => panic!("Expected Base64 source"),
+            },
+            _ => panic!("Expected Image block"),
+        }
+    }
+
+    #[test]
+    fn test_anthropic_content_block_image_url() {
+        let json =
+            r#"{"type":"image","source":{"type":"url","url":"https://example.com/image.png"}}"#;
+        let block: AnthropicContentBlock = serde_json::from_str(json).unwrap();
+        match block {
+            AnthropicContentBlock::Image { source } => match source {
+                AnthropicImageSource::Url { url } => {
+                    assert_eq!(url, "https://example.com/image.png");
+                }
+                _ => panic!("Expected Url source"),
+            },
+            _ => panic!("Expected Image block"),
+        }
+    }
+
+    #[test]
+    fn test_anthropic_content_block_tool_use() {
+        let json = r#"{"type":"tool_use","id":"tool-123","name":"get_weather","input":{"location":"NYC"}}"#;
+        let block: AnthropicContentBlock = serde_json::from_str(json).unwrap();
+        match block {
+            AnthropicContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "tool-123");
+                assert_eq!(name, "get_weather");
+                assert_eq!(input["location"], "NYC");
+            }
+            _ => panic!("Expected ToolUse block"),
+        }
+    }
+
+    #[test]
+    fn test_anthropic_content_block_tool_result() {
+        let json = r#"{"type":"tool_result","tool_use_id":"tool-123","content":{"temp":72}}"#;
+        let block: AnthropicContentBlock = serde_json::from_str(json).unwrap();
+        match block {
+            AnthropicContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => {
+                assert_eq!(tool_use_id, "tool-123");
+                assert_eq!(content["temp"], 72);
+            }
+            _ => panic!("Expected ToolResult block"),
+        }
+    }
+
+    // AnthropicImageSource tests
+    #[test]
+    fn test_anthropic_image_source_debug() {
+        let source = AnthropicImageSource::Base64 {
+            media_type: "image/png".to_string(),
+            data: "test".to_string(),
+        };
+        let debug_str = format!("{:?}", source);
+        assert!(debug_str.contains("Base64"));
+    }
+
+    #[test]
+    fn test_anthropic_image_source_clone() {
+        let source = AnthropicImageSource::Url {
+            url: "https://example.com".to_string(),
+        };
+        let cloned = source.clone();
+        match (source, cloned) {
+            (AnthropicImageSource::Url { url: u1 }, AnthropicImageSource::Url { url: u2 }) => {
+                assert_eq!(u1, u2);
+            }
+            _ => panic!("Both should be Url variant"),
+        }
+    }
+
+    // AnthropicSystem tests
+    #[test]
+    fn test_anthropic_system_text() {
+        let json = r#""You are helpful""#;
+        let system: AnthropicSystem = serde_json::from_str(json).unwrap();
+        match system {
+            AnthropicSystem::Text(s) => assert_eq!(s, "You are helpful"),
+            _ => panic!("Expected Text variant"),
+        }
+    }
+
+    #[test]
+    fn test_anthropic_system_blocks() {
+        let json = r#"[{"type":"text","text":"Be helpful"}]"#;
+        let system: AnthropicSystem = serde_json::from_str(json).unwrap();
+        match system {
+            AnthropicSystem::Blocks(blocks) => assert_eq!(blocks.len(), 1),
+            _ => panic!("Expected Blocks variant"),
+        }
+    }
+
+    // AnthropicSystemBlock tests
+    #[test]
+    fn test_anthropic_system_block_text() {
+        let json = r#"{"type":"text","text":"System prompt"}"#;
+        let block: AnthropicSystemBlock = serde_json::from_str(json).unwrap();
+        match block {
+            AnthropicSystemBlock::Text { text } => assert_eq!(text, "System prompt"),
+        }
+    }
+
+    // AnthropicTool tests
+    #[test]
+    fn test_anthropic_tool_minimal() {
+        let json = r#"{"name":"get_weather","input_schema":{"type":"object"}}"#;
+        let tool: AnthropicTool = serde_json::from_str(json).unwrap();
+        assert_eq!(tool.name, "get_weather");
+        assert!(tool.description.is_none());
+    }
+
+    #[test]
+    fn test_anthropic_tool_with_description() {
+        let json = r#"{"name":"get_weather","description":"Get weather","input_schema":{"type":"object"}}"#;
+        let tool: AnthropicTool = serde_json::from_str(json).unwrap();
+        assert_eq!(tool.name, "get_weather");
+        assert_eq!(tool.description, Some("Get weather".to_string()));
+    }
+
+    #[test]
+    fn test_anthropic_tool_debug() {
+        let tool = AnthropicTool {
+            name: "test".to_string(),
+            description: None,
+            input_schema: serde_json::json!({}),
+        };
+        let debug_str = format!("{:?}", tool);
+        assert!(debug_str.contains("AnthropicTool"));
+    }
+
+    #[test]
+    fn test_anthropic_tool_clone() {
+        let tool = AnthropicTool {
+            name: "test".to_string(),
+            description: Some("desc".to_string()),
+            input_schema: serde_json::json!({}),
+        };
+        let cloned = tool.clone();
+        assert_eq!(tool.name, cloned.name);
+    }
+
+    // AnthropicToolChoice tests
+    #[test]
+    fn test_anthropic_tool_choice_string() {
+        let json = r#""auto""#;
+        let choice: AnthropicToolChoice = serde_json::from_str(json).unwrap();
+        match choice {
+            AnthropicToolChoice::String(s) => assert_eq!(s, "auto"),
+            _ => panic!("Expected String variant"),
+        }
+    }
+
+    #[test]
+    fn test_anthropic_tool_choice_tool() {
+        let json = r#"{"type":"tool","name":"get_weather"}"#;
+        let choice: AnthropicToolChoice = serde_json::from_str(json).unwrap();
+        match choice {
+            AnthropicToolChoice::Tool { tool_type, name } => {
+                assert_eq!(tool_type, "tool");
+                assert_eq!(name, "get_weather");
+            }
+            _ => panic!("Expected Tool variant"),
+        }
+    }
+
+    // AnthropicMessagesRequest tests
+    #[test]
+    fn test_anthropic_messages_request_minimal() {
+        let json = r#"{"model":"claude-3","messages":[]}"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model, "claude-3");
+        assert!(req.messages.is_empty());
+        assert!(req.system.is_none());
+        assert!(req.max_tokens.is_none());
+    }
+
+    #[test]
+    fn test_anthropic_messages_request_full() {
+        let json = r#"{
+            "model":"claude-3",
+            "messages":[{"role":"user","content":"Hello"}],
+            "system":"You are helpful",
+            "max_tokens":1024,
+            "temperature":0.7
+        }"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model, "claude-3");
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.max_tokens, Some(1024));
+        assert_eq!(req.temperature, Some(0.7));
+    }
+
+    #[test]
+    fn test_anthropic_messages_request_with_tools() {
+        let json = r#"{
+            "model":"claude-3",
+            "messages":[],
+            "tools":[{"name":"bash","input_schema":{"type":"object"}}]
+        }"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.tools.unwrap().len(), 1);
+    }
+
+    // AnthropicMessage tests
+    #[test]
+    fn test_anthropic_message_simple() {
+        let json = r#"{"role":"user","content":"Hello"}"#;
+        let msg: AnthropicMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.role, AnthropicRole::User);
+    }
+
+    #[test]
+    fn test_anthropic_message_with_blocks() {
+        let json = r#"{"role":"assistant","content":[{"type":"text","text":"Hi"}]}"#;
+        let msg: AnthropicMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.role, AnthropicRole::Assistant);
+    }
+
+    // AnthropicCompleteRequest tests
+    #[test]
+    fn test_anthropic_complete_request_minimal() {
+        let json = r#"{"model":"claude-3","prompt":"Hello","max_tokens_to_sample":100}"#;
+        let req: AnthropicCompleteRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model, "claude-3");
+        assert_eq!(req.prompt, "Hello");
+        assert_eq!(req.max_tokens_to_sample, 100);
+    }
+
+    #[test]
+    fn test_anthropic_complete_request_with_options() {
+        let json = r#"{"model":"claude-3","prompt":"Hello","max_tokens_to_sample":100,"temperature":0.7,"stream":true}"#;
+        let req: AnthropicCompleteRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.temperature, Some(0.7));
+        assert_eq!(req.stream, Some(true));
+    }
+
+    // AnthropicMessagesResponse tests
+    #[test]
+    fn test_anthropic_messages_response_serialization() {
+        let response = AnthropicMessagesResponse {
+            id: "msg-123".to_string(),
+            response_type: "message".to_string(),
+            role: "assistant".to_string(),
+            content: vec![],
+            model: "claude-3".to_string(),
+            stop_reason: "end_turn".to_string(),
+            stop_sequence: None,
+            usage: AnthropicUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+            },
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"id\":\"msg-123\""));
+        assert!(json.contains("\"type\":\"message\""));
+    }
+
+    // AnthropicResponseContentBlock tests
+    #[test]
+    fn test_anthropic_response_content_block_text() {
+        let block = AnthropicResponseContentBlock::Text {
+            text: "Hello".to_string(),
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        assert!(json.contains("\"type\":\"text\""));
+        assert!(json.contains("\"text\":\"Hello\""));
+    }
+
+    #[test]
+    fn test_anthropic_response_content_block_tool_use() {
+        let block = AnthropicResponseContentBlock::ToolUse {
+            id: "tool-123".to_string(),
+            name: "get_weather".to_string(),
+            input: serde_json::json!({"location": "NYC"}),
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        assert!(json.contains("\"type\":\"tool_use\""));
+        assert!(json.contains("\"name\":\"get_weather\""));
+    }
+
+    // AnthropicUsage tests
+    #[test]
+    fn test_anthropic_usage_serialization() {
+        let usage = AnthropicUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(json.contains("\"input_tokens\":100"));
+        assert!(json.contains("\"output_tokens\":50"));
+    }
+
+    // AnthropicCompleteResponse tests
+    #[test]
+    fn test_anthropic_complete_response_serialization() {
+        let response = AnthropicCompleteResponse {
+            response_type: "completion".to_string(),
+            completion: "Hello".to_string(),
+            model: "claude-3".to_string(),
+            stop_reason: "stop_sequence".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"completion\""));
+        assert!(json.contains("\"completion\":\"Hello\""));
+    }
+
+    // AnthropicErrorEnvelope tests
+    #[test]
+    fn test_anthropic_error_envelope_serialization() {
+        let envelope = AnthropicErrorEnvelope {
+            error_type: "error".to_string(),
+            error: AnthropicErrorDetail {
+                error_type: "invalid_request_error".to_string(),
+                message: "Missing required field".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(json.contains("\"type\":\"error\""));
+        assert!(json.contains("\"invalid_request_error\""));
+    }
+
+    // AnthropicErrorDetail tests
+    #[test]
+    fn test_anthropic_error_detail_serialization() {
+        let detail = AnthropicErrorDetail {
+            error_type: "rate_limit_error".to_string(),
+            message: "Too many requests".to_string(),
+        };
+        let json = serde_json::to_string(&detail).unwrap();
+        assert!(json.contains("\"type\":\"rate_limit_error\""));
+        assert!(json.contains("\"message\":\"Too many requests\""));
+    }
+
+    // AnthropicListModelsResponse tests
+    #[test]
+    fn test_anthropic_list_models_response_serialization() {
+        let response = AnthropicListModelsResponse {
+            data: vec![],
+            has_more: false,
+            first_id: None,
+            last_id: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"has_more\":false"));
+    }
+
+    #[test]
+    fn test_anthropic_list_models_response_with_models() {
+        let response = AnthropicListModelsResponse {
+            data: vec![AnthropicModel {
+                model_type: "model".to_string(),
+                id: "claude-3".to_string(),
+                display_name: "Claude 3".to_string(),
+                created_at: "2024-01-01".to_string(),
+            }],
+            has_more: true,
+            first_id: Some("claude-3".to_string()),
+            last_id: Some("claude-3".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"claude-3\""));
+        assert!(json.contains("\"has_more\":true"));
+    }
+
+    // AnthropicModel tests
+    #[test]
+    fn test_anthropic_model_serialization() {
+        let model = AnthropicModel {
+            model_type: "model".to_string(),
+            id: "claude-3-opus".to_string(),
+            display_name: "Claude 3 Opus".to_string(),
+            created_at: "2024-02-29T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&model).unwrap();
+        assert!(json.contains("\"type\":\"model\""));
+        assert!(json.contains("\"id\":\"claude-3-opus\""));
+        assert!(json.contains("\"Claude 3 Opus\""));
+    }
+}

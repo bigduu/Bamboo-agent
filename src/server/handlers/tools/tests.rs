@@ -92,3 +92,140 @@ fn build_execution_response_defaults_display_preference() {
     assert_eq!(payload["tool_name"], "get_current_dir");
     assert_eq!(payload["display_preference"], "Default");
 }
+
+#[test]
+fn build_execution_response_uses_custom_display_preference() {
+    let result = ToolResult {
+        success: true,
+        result: "{\"data\":\"test\"}".to_string(),
+        display_preference: Some("Collapsible".to_string()),
+    };
+
+    let response =
+        build_execution_response("read_file".to_string(), result).expect("response builds");
+    let payload: serde_json::Value =
+        serde_json::from_str(&response.result).expect("payload should be valid json");
+
+    assert_eq!(payload["tool_name"], "read_file");
+    assert_eq!(payload["display_preference"], "Collapsible");
+    assert_eq!(payload["result"], "{\"data\":\"test\"}");
+}
+
+#[test]
+fn build_execution_response_preserves_result_content() {
+    let complex_result = serde_json::json!({
+        "status": "success",
+        "data": {
+            "files": ["a.txt", "b.txt"],
+            "count": 2
+        }
+    });
+
+    let result = ToolResult {
+        success: true,
+        result: complex_result.to_string(),
+        display_preference: Some("Hidden".to_string()),
+    };
+
+    let response =
+        build_execution_response("list_files".to_string(), result).expect("response builds");
+    let payload: serde_json::Value =
+        serde_json::from_str(&response.result).expect("payload should be valid json");
+
+    assert_eq!(payload["tool_name"], "list_files");
+    assert_eq!(payload["display_preference"], "Hidden");
+
+    // Result is stored as a string in the payload
+    let result_str = payload["result"].as_str().expect("result should be string");
+    let result_value: serde_json::Value =
+        serde_json::from_str(result_str).expect("result should be valid json");
+    assert_eq!(result_value["status"], "success");
+    assert_eq!(result_value["data"]["count"], 2);
+}
+
+#[test]
+fn build_execution_response_handles_failed_tool_result() {
+    let result = ToolResult {
+        success: false,
+        result: "Error: File not found".to_string(),
+        display_preference: None,
+    };
+
+    let response =
+        build_execution_response("read_file".to_string(), result).expect("response builds");
+    let payload: serde_json::Value =
+        serde_json::from_str(&response.result).expect("payload should be valid json");
+
+    assert_eq!(payload["tool_name"], "read_file");
+    assert_eq!(payload["display_preference"], "Default");
+    assert_eq!(payload["result"], "Error: File not found");
+}
+
+#[test]
+fn build_execution_response_handles_empty_result() {
+    let result = ToolResult {
+        success: true,
+        result: "".to_string(),
+        display_preference: Some("Default".to_string()),
+    };
+
+    let response =
+        build_execution_response("empty_tool".to_string(), result).expect("response builds");
+    let payload: serde_json::Value =
+        serde_json::from_str(&response.result).expect("payload should be valid json");
+
+    assert_eq!(payload["tool_name"], "empty_tool");
+    assert_eq!(payload["result"], "");
+}
+
+#[test]
+fn build_execution_response_handles_special_characters_in_result() {
+    let result = ToolResult {
+        success: true,
+        result: "Result with special chars: <>&\"'\\n\\t".to_string(),
+        display_preference: None,
+    };
+
+    let response = build_execution_response("special_chars_tool".to_string(), result)
+        .expect("response builds");
+    let payload: serde_json::Value =
+        serde_json::from_str(&response.result).expect("payload should be valid json");
+
+    assert_eq!(payload["tool_name"], "special_chars_tool");
+    assert!(payload["result"].as_str().unwrap().contains("<>&\"'"));
+}
+
+#[test]
+fn build_execution_response_handles_unicode_in_result() {
+    let result = ToolResult {
+        success: true,
+        result: "Unicode: 你好世界 🌍".to_string(),
+        display_preference: Some("Default".to_string()),
+    };
+
+    let response =
+        build_execution_response("unicode_tool".to_string(), result).expect("response builds");
+    let payload: serde_json::Value =
+        serde_json::from_str(&response.result).expect("payload should be valid json");
+
+    assert_eq!(payload["tool_name"], "unicode_tool");
+    assert!(payload["result"].as_str().unwrap().contains("你好世界"));
+}
+
+#[test]
+fn build_execution_response_handles_large_result() {
+    let large_data = "x".repeat(10000);
+    let result = ToolResult {
+        success: true,
+        result: large_data.clone(),
+        display_preference: None,
+    };
+
+    let response =
+        build_execution_response("large_tool".to_string(), result).expect("response builds");
+    let payload: serde_json::Value =
+        serde_json::from_str(&response.result).expect("payload should be valid json");
+
+    assert_eq!(payload["tool_name"], "large_tool");
+    assert_eq!(payload["result"].as_str().unwrap().len(), 10000);
+}

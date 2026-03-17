@@ -77,6 +77,8 @@ pub(super) fn parse_responses_request_options(
 #[cfg(test)]
 mod tests {
     use super::parse_responses_request_options;
+    use serde_json::Value;
+    use std::collections::HashMap;
 
     #[test]
     fn parses_responses_options_from_parameters() {
@@ -100,11 +102,203 @@ mod tests {
 
     #[test]
     fn ignores_invalid_truncation_value() {
-        let params = serde_json::from_value(serde_json::json!({
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
             "truncation": "drop_oldest"
         }))
         .expect("valid params");
         let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.truncation, None);
+    }
+
+    #[test]
+    fn parses_reasoning_summary_from_legacy_field() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "reasoning_summary": "concise"
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.reasoning_summary.as_deref(), Some("concise"));
+    }
+
+    #[test]
+    fn prefers_nested_reasoning_over_legacy() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "reasoning": { "summary": "detailed" },
+            "reasoning_summary": "concise"
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.reasoning_summary.as_deref(), Some("detailed"));
+    }
+
+    #[test]
+    fn trims_reasoning_summary() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "reasoning_summary": "  concise  "
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.reasoning_summary.as_deref(), Some("concise"));
+    }
+
+    #[test]
+    fn rejects_empty_reasoning_summary() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "reasoning_summary": "   "
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.reasoning_summary, None);
+    }
+
+    #[test]
+    fn parses_single_include_string() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "include": "reasoning.encrypted_content"
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(
+            parsed.include,
+            Some(vec!["reasoning.encrypted_content".to_string()])
+        );
+    }
+
+    #[test]
+    fn parses_include_array_with_duplicates() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "include": ["file_search_call", "web_search_call", "file_search_call"]
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(
+            parsed.include,
+            Some(vec![
+                "file_search_call".to_string(),
+                "web_search_call".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn trims_include_entries() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "include": ["  file_search_call  "]
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.include, Some(vec!["file_search_call".to_string()]));
+    }
+
+    #[test]
+    fn ignores_empty_include_entries() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "include": ["file_search_call", "  ", ""]
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.include, Some(vec!["file_search_call".to_string()]));
+    }
+
+    #[test]
+    fn rejects_empty_include_array() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "include": []
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.include, None);
+    }
+
+    #[test]
+    fn rejects_empty_include_string() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "include": "   "
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.include, None);
+    }
+
+    #[test]
+    fn parses_truncation_disabled() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "truncation": "disabled"
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.truncation.as_deref(), Some("disabled"));
+    }
+
+    #[test]
+    fn normalizes_truncation_case() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "truncation": "AUTO"
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.truncation.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn trims_truncation_value() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "truncation": "  auto  "
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.truncation.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn parses_store_false() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "store": false
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.store, Some(false));
+    }
+
+    #[test]
+    fn handles_missing_all_fields() {
+        let params: HashMap<String, Value> = HashMap::new();
+        let parsed = parse_responses_request_options(&params);
+
+        assert_eq!(parsed.reasoning_summary, None);
+        assert_eq!(parsed.include, None);
+        assert_eq!(parsed.store, None);
+        assert_eq!(parsed.truncation, None);
+    }
+
+    #[test]
+    fn handles_mixed_valid_and_invalid_fields() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "reasoning_summary": "",
+            "include": ["file_search_call", ""],
+            "store": true,
+            "truncation": "invalid"
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.reasoning_summary, None);
+        assert_eq!(parsed.include, Some(vec!["file_search_call".to_string()]));
+        assert_eq!(parsed.store, Some(true));
         assert_eq!(parsed.truncation, None);
     }
 }

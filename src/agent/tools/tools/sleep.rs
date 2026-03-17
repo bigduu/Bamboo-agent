@@ -108,4 +108,169 @@ mod tests {
         assert!(result.success);
         assert!(start.elapsed().as_millis() >= 10);
     }
+
+    #[tokio::test]
+    async fn sleep_tool_accepts_valid_seconds() {
+        let tool = SleepTool::new();
+
+        // Minimum value
+        let result = tool.execute(json!({"seconds": 0.0})).await.unwrap();
+        assert!(result.success);
+
+        // Small positive value
+        let result = tool.execute(json!({"seconds": 0.001})).await.unwrap();
+        assert!(result.success);
+
+        // Maximum allowed value (300.0)
+        let result = tool.execute(json!({"seconds": 300.0})).await.unwrap();
+        assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn sleep_tool_rejects_negative_seconds() {
+        let tool = SleepTool::new();
+        let result = tool.execute(json!({"seconds": -1.0})).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[tokio::test]
+    async fn sleep_tool_rejects_seconds_exceeding_max() {
+        let tool = SleepTool::new();
+        let result = tool.execute(json!({"seconds": 300.1})).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        if let ToolError::InvalidArguments(msg) = error {
+            assert!(msg.contains("cannot exceed"));
+            assert!(msg.contains("300"));
+        } else {
+            panic!("Expected InvalidArguments error");
+        }
+    }
+
+    #[tokio::test]
+    async fn sleep_tool_includes_reason_in_result() {
+        let tool = SleepTool::new();
+        let result = tool
+            .execute(json!({
+                "seconds": 0.001,
+                "reason": "testing sleep"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.result.contains("testing sleep"));
+        assert!(result.result.contains("(testing sleep)"));
+    }
+
+    #[tokio::test]
+    async fn sleep_tool_works_without_reason() {
+        let tool = SleepTool::new();
+        let result = tool.execute(json!({"seconds": 0.001})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.result.contains("Slept for 0.001 seconds"));
+        assert!(!result.result.contains("("));
+    }
+
+    #[tokio::test]
+    async fn sleep_tool_rejects_missing_seconds() {
+        let tool = SleepTool::new();
+        let result = tool.execute(json!({})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn sleep_tool_rejects_invalid_seconds_type() {
+        let tool = SleepTool::new();
+        let result = tool.execute(json!({"seconds": "not a number"})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn sleep_tool_accepts_fractional_seconds() {
+        let tool = SleepTool::new();
+        let start = Instant::now();
+        let result = tool.execute(json!({"seconds": 0.05})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.result.contains("0.05"));
+        assert!(start.elapsed().as_millis() >= 50);
+    }
+
+    #[test]
+    fn sleep_tool_has_correct_name() {
+        let tool = SleepTool::new();
+        assert_eq!(tool.name(), "Sleep");
+    }
+
+    #[test]
+    fn sleep_tool_has_description() {
+        let tool = SleepTool::new();
+        assert!(!tool.description().is_empty());
+        assert!(tool.description().contains("300"));
+    }
+
+    #[test]
+    fn sleep_tool_parameters_schema_has_required_fields() {
+        let tool = SleepTool::new();
+        let schema = tool.parameters_schema();
+
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["seconds"].is_object());
+        assert!(schema["properties"]["reason"].is_object());
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("seconds")));
+    }
+
+    #[tokio::test]
+    async fn sleep_tool_default_impl() {
+        let tool = SleepTool::default();
+        let result = tool.execute(json!({"seconds": 0.001})).await.unwrap();
+        assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn sleep_tool_handles_zero_seconds() {
+        let tool = SleepTool::new();
+        let result = tool.execute(json!({"seconds": 0.0})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.result.contains("0 seconds"));
+    }
+
+    #[tokio::test]
+    async fn sleep_tool_reason_with_special_characters() {
+        let tool = SleepTool::new();
+        let result = tool
+            .execute(json!({
+                "seconds": 0.001,
+                "reason": "等待数据 🎯 (waiting for data)"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.result.contains("等待数据 🎯"));
+    }
+
+    #[tokio::test]
+    async fn sleep_tool_reason_empty_string() {
+        let tool = SleepTool::new();
+        let result = tool
+            .execute(json!({
+                "seconds": 0.001,
+                "reason": ""
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        // Empty string is still treated as a reason, so it will show " ()"
+        assert!(result.result.contains(" ()"));
+    }
 }

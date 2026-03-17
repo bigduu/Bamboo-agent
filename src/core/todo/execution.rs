@@ -109,5 +109,140 @@ mod tests {
             error: "test".into()
         }
         .is_terminal());
+        assert!(TodoStatus::Skipped {
+            reason: "test".into()
+        }
+        .is_terminal());
+    }
+
+    #[test]
+    fn test_status_is_pending() {
+        assert!(TodoStatus::Pending.is_pending());
+        assert!(TodoStatus::AwaitingApproval {
+            approval_id: Uuid::new_v4()
+        }
+        .is_pending());
+        assert!(!TodoStatus::InProgress.is_pending());
+        assert!(!TodoStatus::Completed.is_pending());
+        assert!(!TodoStatus::Failed {
+            error: "test".into()
+        }
+        .is_pending());
+    }
+
+    #[test]
+    fn test_status_as_str() {
+        assert_eq!(TodoStatus::Pending.as_str(), "pending");
+        assert_eq!(
+            TodoStatus::AwaitingApproval {
+                approval_id: Uuid::new_v4()
+            }
+            .as_str(),
+            "awaiting_approval"
+        );
+        assert_eq!(TodoStatus::InProgress.as_str(), "in_progress");
+        assert_eq!(TodoStatus::Completed.as_str(), "completed");
+        assert_eq!(
+            TodoStatus::Failed {
+                error: "test".into()
+            }
+            .as_str(),
+            "failed"
+        );
+        assert_eq!(
+            TodoStatus::Skipped {
+                reason: "test".into()
+            }
+            .as_str(),
+            "skipped"
+        );
+    }
+
+    #[test]
+    fn test_status_default() {
+        let status = TodoStatus::default();
+        assert!(matches!(status, TodoStatus::Pending));
+    }
+
+    #[test]
+    fn test_status_serialization() {
+        let status = TodoStatus::InProgress;
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("in_progress"));
+    }
+
+    #[test]
+    fn test_status_deserialization() {
+        let json = r#"{"status":"completed"}"#;
+        let status: TodoStatus = serde_json::from_str(json).unwrap();
+        assert!(matches!(status, TodoStatus::Completed));
+    }
+
+    #[test]
+    fn test_status_clone() {
+        let status = TodoStatus::InProgress;
+        let cloned = status.clone();
+        assert!(matches!(cloned, TodoStatus::InProgress));
+    }
+
+    #[test]
+    fn test_status_debug() {
+        let status = TodoStatus::Pending;
+        let debug_str = format!("{:?}", status);
+        assert!(debug_str.contains("Pending"));
+    }
+
+    #[test]
+    fn test_execution_default() {
+        let execution = TodoExecution::default();
+        assert!(execution.result.is_none());
+        assert!(execution.error.is_none());
+        assert!(execution.duration_ms.is_none());
+        assert!(execution.approval_id.is_none());
+        assert_eq!(execution.retry_count, 0);
+        assert!(execution.metadata.is_none());
+    }
+
+    #[test]
+    fn test_execution_with_result() {
+        let result = serde_json::json!({"key": "value"});
+        let execution = TodoExecution::with_result(result.clone());
+        assert_eq!(execution.result, Some(result));
+        assert!(execution.error.is_none());
+    }
+
+    #[test]
+    fn test_execution_with_error() {
+        let execution = TodoExecution::with_error("Something went wrong");
+        assert!(execution.result.is_none());
+        assert_eq!(execution.error, Some("Something went wrong".to_string()));
+    }
+
+    #[test]
+    fn test_execution_clone() {
+        let execution = TodoExecution::with_result(serde_json::json!({"test": "data"}));
+        let cloned = execution.clone();
+        assert_eq!(execution.result, cloned.result);
+    }
+
+    #[test]
+    fn test_execution_debug() {
+        let execution = TodoExecution::default();
+        let debug_str = format!("{:?}", execution);
+        assert!(debug_str.contains("TodoExecution"));
+    }
+
+    #[test]
+    fn test_execution_serialization() {
+        let execution = TodoExecution::with_result(serde_json::json!({"output": "success"}));
+        let json = serde_json::to_string(&execution).unwrap();
+        assert!(json.contains("output"));
+    }
+
+    #[test]
+    fn test_execution_deserialization() {
+        let json = r#"{"result":null,"error":null,"duration_ms":100,"approval_id":null,"retry_count":0,"metadata":null}"#;
+        let execution: TodoExecution = serde_json::from_str(json).unwrap();
+        assert_eq!(execution.duration_ms, Some(100));
     }
 }

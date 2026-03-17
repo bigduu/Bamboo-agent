@@ -53,3 +53,132 @@ pub struct ChatResponse {
     /// Current session status (e.g., "streaming")
     pub status: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chat_request_deserialization_minimal() {
+        let json = r#"{"message":"Hello","model":"gpt-4"}"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.message, "Hello");
+        assert_eq!(req.model, "gpt-4");
+        assert!(req.session_id.is_none());
+        assert!(req.system_prompt.is_none());
+        assert!(req.images.is_none());
+    }
+
+    #[test]
+    fn test_chat_request_deserialization_full() {
+        let json = r#"{
+            "message":"Hello",
+            "session_id":"sess-123",
+            "system_prompt":"Be helpful",
+            "enhance_prompt":"Be concise",
+            "workspace_path":"/home/user",
+            "model":"claude-3"
+        }"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.message, "Hello");
+        assert_eq!(req.session_id, Some("sess-123".to_string()));
+        assert_eq!(req.system_prompt, Some("Be helpful".to_string()));
+        assert_eq!(req.enhance_prompt, Some("Be concise".to_string()));
+        assert_eq!(req.workspace_path, Some("/home/user".to_string()));
+        assert_eq!(req.model, "claude-3");
+    }
+
+    #[test]
+    fn test_chat_request_with_images() {
+        let json = r#"{
+            "message":"Check this",
+            "model":"gpt-4",
+            "images":[{"base64":"aGVsbG8=","name":"test.png","size":1024,"type":"image/png"}]
+        }"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert!(req.images.is_some());
+        let images = req.images.unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].base64, "aGVsbG8=");
+        assert_eq!(images[0].name, Some("test.png".to_string()));
+        assert_eq!(images[0].size, Some(1024));
+        assert_eq!(images[0].mime_type, Some("image/png".to_string()));
+    }
+
+    #[test]
+    fn test_chat_image_deserialization_minimal() {
+        let json = r#"{"base64":"YWJj"}"#;
+        let img: ChatImage = serde_json::from_str(json).unwrap();
+        assert_eq!(img.base64, "YWJj");
+        assert!(img.name.is_none());
+        assert!(img.size.is_none());
+        assert!(img.mime_type.is_none());
+    }
+
+    #[test]
+    fn test_chat_request_debug() {
+        let req = ChatRequest {
+            message: "Test".to_string(),
+            session_id: None,
+            system_prompt: None,
+            enhance_prompt: None,
+            workspace_path: None,
+            images: None,
+            model: "gpt-4".to_string(),
+        };
+        let debug_str = format!("{:?}", req);
+        assert!(debug_str.contains("ChatRequest"));
+        assert!(debug_str.contains("Test"));
+    }
+
+    #[test]
+    fn test_chat_image_debug() {
+        let img = ChatImage {
+            base64: "test".to_string(),
+            name: Some("image.png".to_string()),
+            size: Some(2048),
+            mime_type: Some("image/png".to_string()),
+        };
+        let debug_str = format!("{:?}", img);
+        assert!(debug_str.contains("ChatImage"));
+    }
+
+    #[test]
+    fn test_chat_response_serialization() {
+        let resp = ChatResponse {
+            session_id: "sess-456".to_string(),
+            stream_url: "/stream/sess-456".to_string(),
+            status: "streaming".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("sess-456"));
+        assert!(json.contains("/stream/sess-456"));
+        assert!(json.contains("streaming"));
+    }
+
+    #[test]
+    fn test_chat_response_debug() {
+        let resp = ChatResponse {
+            session_id: "test".to_string(),
+            stream_url: "/stream".to_string(),
+            status: "active".to_string(),
+        };
+        let debug_str = format!("{:?}", resp);
+        assert!(debug_str.contains("ChatResponse"));
+    }
+
+    #[test]
+    fn test_chat_request_empty_message() {
+        let json = r#"{"message":"","model":"gpt-4"}"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.message, "");
+    }
+
+    #[test]
+    fn test_chat_request_special_characters() {
+        let json = r#"{"message":"Hello\nWorld\t!","model":"gpt-4"}"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert!(req.message.contains('\n'));
+        assert!(req.message.contains('\t'));
+    }
+}

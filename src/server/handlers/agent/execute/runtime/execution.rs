@@ -71,7 +71,11 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
 
         if let Some(prompt) = system_prompt.as_ref() {
             log::info!("[{}] ========== SYSTEM PROMPT ==========", session_id);
-            log::info!("[{}] Final prompt length: {} chars", session_id, prompt.len());
+            log::info!(
+                "[{}] Final prompt length: {} chars",
+                session_id,
+                prompt.len()
+            );
             log::info!("[{}] -----------------------------------", session_id);
             log::info!("[{}] {}", session_id, prompt);
             log::info!("[{}] ========== END SYSTEM PROMPT ==========", session_id);

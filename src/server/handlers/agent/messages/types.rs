@@ -21,3 +21,64 @@ pub struct RestoreSessionRequest {
     #[serde(default)]
     pub restore_files: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_patch_message_request_deserialization() {
+        let json = r#"{"content":"Hello, world!"}"#;
+        let req: PatchMessageRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.content, "Hello, world!");
+    }
+
+    #[test]
+    fn test_patch_message_request_debug() {
+        let req = PatchMessageRequest {
+            content: "Test message".to_string(),
+        };
+        let debug_str = format!("{:?}", req);
+        assert!(debug_str.contains("PatchMessageRequest"));
+    }
+
+    #[test]
+    fn test_truncate_request_after_last_user() {
+        let json = r#"{"mode":"after_last_user"}"#;
+        let req: TruncateRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(req, TruncateRequest::AfterLastUser));
+    }
+
+    #[test]
+    fn test_truncate_request_debug() {
+        let req = TruncateRequest::AfterLastUser;
+        let debug_str = format!("{:?}", req);
+        assert!(debug_str.contains("AfterLastUser"));
+    }
+
+    #[test]
+    fn test_restore_session_request_basic() {
+        let json = r#"{"target_message_id":"msg-123"}"#;
+        let req: RestoreSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.target_message_id, "msg-123");
+        assert!(!req.restore_files); // default false
+    }
+
+    #[test]
+    fn test_restore_session_request_with_files() {
+        let json = r#"{"target_message_id":"msg-456","restore_files":true}"#;
+        let req: RestoreSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.target_message_id, "msg-456");
+        assert!(req.restore_files);
+    }
+
+    #[test]
+    fn test_restore_session_request_debug() {
+        let req = RestoreSessionRequest {
+            target_message_id: "test-id".to_string(),
+            restore_files: true,
+        };
+        let debug_str = format!("{:?}", req);
+        assert!(debug_str.contains("RestoreSessionRequest"));
+    }
+}

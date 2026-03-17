@@ -750,3 +750,239 @@ impl AttachmentReader for SessionStoreV2 {
         SessionStoreV2::read_attachment(self, session_id, attachment_id).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use tempfile::TempDir;
+
+    async fn create_temp_storage() -> io::Result<(SessionStoreV2, TempDir)> {
+        let temp_dir = TempDir::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let bamboo_home = temp_dir.path().to_path_buf();
+        let storage = SessionStoreV2::new(bamboo_home).await?;
+        Ok((storage, temp_dir))
+    }
+
+    #[tokio::test]
+    async fn test_new_creates_sessions_directory() -> io::Result<()> {
+        let temp_dir = TempDir::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let bamboo_home = temp_dir.path().to_path_buf();
+        let sessions_dir = bamboo_home.join("sessions");
+
+        assert!(!sessions_dir.exists());
+        let _storage = SessionStoreV2::new(bamboo_home).await?;
+        assert!(sessions_dir.exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_new_creates_index_file() -> io::Result<()> {
+        let temp_dir = TempDir::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let bamboo_home = temp_dir.path().to_path_buf();
+        let index_path = bamboo_home.join("sessions.json");
+
+        assert!(!index_path.exists());
+        let _storage = SessionStoreV2::new(bamboo_home).await?;
+        assert!(index_path.exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_save_and_load_session() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let session = Session::new("session-1", "test-model");
+
+        storage.save_session(&session).await?;
+        let loaded = storage.load_session(&session.id).await?;
+
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.id, session.id);
+        assert_eq!(loaded.model, session.model);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_load_session_returns_none_when_not_found() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let loaded = storage.load_session("nonexistent").await?;
+        assert!(loaded.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_and_load_events() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let session = Session::new("session-1", "test-model");
+
+        storage.save_session(&session).await?;
+
+        let event1 = AgentEvent::Token {
+            content: "hello".to_string(),
+        };
+        let event2 = AgentEvent::Error {
+            message: "test error".to_string(),
+        };
+
+        storage.append_event(&session.id, &event1).await?;
+        storage.append_event(&session.id, &event2).await?;
+
+        let events = storage.load_events(&session.id).await?;
+        assert_eq!(events.len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_load_events_returns_empty_when_not_found() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let events = storage.load_events("nonexistent").await?;
+        assert!(events.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_index_entries_empty() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let entries = storage.list_index_entries().await;
+        assert!(entries.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_index_entries_with_sessions() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+
+        let session1 = Session::new("session-1", "model-1");
+        let session2 = Session::new("session-2", "model-2");
+
+        storage.save_session(&session1).await?;
+        storage.save_session(&session2).await?;
+
+        let entries = storage.list_index_entries().await;
+        assert_eq!(entries.len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_index_entry() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let session = Session::new("session-1", "test-model");
+
+        storage.save_session(&session).await?;
+
+        let entry = storage.get_index_entry(&session.id).await;
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        assert_eq!(entry.id, session.id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_index_entry_returns_none_when_not_found() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let entry = storage.get_index_entry("nonexistent").await;
+        assert!(entry.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_session() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let session = Session::new("session-1", "test-model");
+
+        storage.save_session(&session).await?;
+        assert!(storage.load_session(&session.id).await?.is_some());
+
+        let deleted = storage.delete_session(&session.id).await?;
+        assert!(deleted);
+        assert!(storage.load_session(&session.id).await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_session_returns_false_when_not_found() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let deleted = storage.delete_session("nonexistent").await?;
+        assert!(!deleted);
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_session_id_empty() {
+        assert!(validate_session_id("").is_err());
+    }
+
+    #[test]
+    fn test_validate_session_id_with_slash() {
+        assert!(validate_session_id("session/1").is_err());
+    }
+
+    #[test]
+    fn test_validate_session_id_with_backslash() {
+        assert!(validate_session_id("session\\1").is_err());
+    }
+
+    #[test]
+    fn test_validate_session_id_with_double_dot() {
+        assert!(validate_session_id("session..1").is_err());
+    }
+
+    #[test]
+    fn test_validate_session_id_valid() {
+        assert!(validate_session_id("session-123").is_ok());
+    }
+
+    #[test]
+    fn test_root_rel_path() {
+        let path = SessionStoreV2::root_rel_path("session-123");
+        assert_eq!(path, "sessions/session-123");
+    }
+
+    #[test]
+    fn test_child_rel_path() {
+        let path = SessionStoreV2::child_rel_path("root-1", "child-2");
+        assert_eq!(path, "sessions/root-1/children/child-2");
+    }
+
+    #[test]
+    fn test_mime_to_extension() {
+        assert_eq!(mime_to_extension("image/png"), Some("png"));
+        assert_eq!(mime_to_extension("image/jpeg"), Some("jpg"));
+        assert_eq!(mime_to_extension("image/webp"), Some("webp"));
+        assert_eq!(mime_to_extension("image/gif"), Some("gif"));
+        assert_eq!(mime_to_extension("image/bmp"), Some("bmp"));
+        assert_eq!(mime_to_extension("unknown/type"), None);
+    }
+
+    #[test]
+    fn test_extension_to_mime() {
+        assert_eq!(extension_to_mime("png"), Some("image/png"));
+        assert_eq!(extension_to_mime("jpg"), Some("image/jpeg"));
+        assert_eq!(extension_to_mime("jpeg"), Some("image/jpeg"));
+        assert_eq!(extension_to_mime("webp"), Some("image/webp"));
+        assert_eq!(extension_to_mime("gif"), Some("image/gif"));
+        assert_eq!(extension_to_mime("bmp"), Some("image/bmp"));
+        assert_eq!(extension_to_mime("unknown"), None);
+    }
+
+    #[test]
+    fn test_extension_to_mime_case_insensitive() {
+        assert_eq!(extension_to_mime("PNG"), Some("image/png"));
+        assert_eq!(extension_to_mime("JPG"), Some("image/jpeg"));
+        assert_eq!(extension_to_mime("JPEG"), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn test_extension_to_mime_with_whitespace() {
+        assert_eq!(extension_to_mime("  png  "), Some("image/png"));
+        assert_eq!(extension_to_mime("\tjpg\t"), Some("image/jpeg"));
+    }
+}

@@ -45,7 +45,7 @@ pub struct ToolExecutionResponse {
 }
 
 /// Internal tool execution result payload.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ToolExecutionResultPayload {
     /// Name of the executed tool.
     pub tool_name: String,

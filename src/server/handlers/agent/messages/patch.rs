@@ -74,4 +74,3 @@ pub async fn patch_message(
         "message_count": message_count,
     })))
 }
-

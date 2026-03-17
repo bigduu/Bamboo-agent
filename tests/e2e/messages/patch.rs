@@ -123,10 +123,8 @@ async fn test_patch_message_rejects_assistant_tool_call_messages() {
     let session_id = "session-patch-3".to_string();
     let mut session = Session::new(session_id.clone(), "test-model");
     session.add_message(Message::system("sys"));
-    let assistant_with_tool = Message::assistant(
-        "calling tool",
-        Some(vec![create_tool_call("tool-call-1")]),
-    );
+    let assistant_with_tool =
+        Message::assistant("calling tool", Some(vec![create_tool_call("tool-call-1")]));
     let message_id = assistant_with_tool.id.clone();
     session.add_message(assistant_with_tool);
     state

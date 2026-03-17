@@ -66,3 +66,117 @@ pub(super) async fn validate_auto_execute_run_config(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_schedule_name_accepts_valid_name() {
+        let result = validate_schedule_name("Daily Backup");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Daily Backup");
+    }
+
+    #[test]
+    fn validate_schedule_name_trims_whitespace() {
+        let result = validate_schedule_name("  Weekly Report  ");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Weekly Report");
+    }
+
+    #[test]
+    fn validate_schedule_name_rejects_empty_string() {
+        let result = validate_schedule_name("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_schedule_name_rejects_whitespace_only() {
+        let result = validate_schedule_name("   ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_schedule_name_rejects_tabs_only() {
+        let result = validate_schedule_name("\t\t");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_schedule_name_rejects_newlines_only() {
+        let result = validate_schedule_name("\n\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_schedule_name_rejects_mixed_whitespace() {
+        let result = validate_schedule_name(" \t\n ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_schedule_name_accepts_single_character() {
+        let result = validate_schedule_name("A");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "A");
+    }
+
+    #[test]
+    fn validate_schedule_name_accepts_numbers() {
+        let result = validate_schedule_name("Schedule 123");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Schedule 123");
+    }
+
+    #[test]
+    fn validate_schedule_name_accepts_special_characters() {
+        let result = validate_schedule_name("Backup (Daily) - v2.0!");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Backup (Daily) - v2.0!");
+    }
+
+    #[test]
+    fn validate_schedule_name_accepts_unicode() {
+        let result = validate_schedule_name("任务计划 🎯");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "任务计划 🎯");
+    }
+
+    #[test]
+    fn validate_create_interval_seconds_accepts_positive_values() {
+        assert!(validate_create_interval_seconds(1).is_ok());
+        assert!(validate_create_interval_seconds(60).is_ok());
+        assert!(validate_create_interval_seconds(3600).is_ok());
+        assert!(validate_create_interval_seconds(86400).is_ok());
+        assert!(validate_create_interval_seconds(u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn validate_create_interval_seconds_rejects_zero() {
+        let result = validate_create_interval_seconds(0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_create_interval_seconds_accepts_minimum_value() {
+        // 1 second is the minimum allowed
+        assert!(validate_create_interval_seconds(1).is_ok());
+    }
+
+    #[test]
+    fn validate_schedule_name_preserves_internal_whitespace() {
+        let result = validate_schedule_name("Multi  Word  Name");
+        assert!(result.is_ok());
+        // Note: trim() only removes leading/trailing whitespace, not internal
+        assert_eq!(result.unwrap(), "Multi  Word  Name");
+    }
+
+    #[test]
+    fn validate_schedule_name_accepts_long_names() {
+        let long_name = "A".repeat(1000);
+        let result = validate_schedule_name(&long_name);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1000);
+    }
+}

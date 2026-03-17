@@ -325,3 +325,330 @@ pub struct ForwardMetricsFilter {
     pub model: Option<String>,
     pub limit: Option<u32>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_token_usage_default() {
+        let usage = TokenUsage::default();
+        assert_eq!(usage.prompt_tokens, 0);
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn test_token_usage_add_assign() {
+        let mut usage1 = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+        };
+        let usage2 = TokenUsage {
+            prompt_tokens: 200,
+            completion_tokens: 100,
+            total_tokens: 300,
+        };
+
+        usage1.add_assign(usage2);
+
+        assert_eq!(usage1.prompt_tokens, 300);
+        assert_eq!(usage1.completion_tokens, 150);
+        assert_eq!(usage1.total_tokens, 450);
+    }
+
+    #[test]
+    fn test_token_usage_serialization() {
+        let usage = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+        };
+
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(json.contains("\"prompt_tokens\":100"));
+        assert!(json.contains("\"completion_tokens\":50"));
+    }
+
+    #[test]
+    fn test_round_status_as_str() {
+        assert_eq!(RoundStatus::Running.as_str(), "running");
+        assert_eq!(RoundStatus::Success.as_str(), "success");
+        assert_eq!(RoundStatus::Error.as_str(), "error");
+        assert_eq!(RoundStatus::Cancelled.as_str(), "cancelled");
+    }
+
+    #[test]
+    fn test_round_status_from_db() {
+        assert_eq!(RoundStatus::from_db("running"), Some(RoundStatus::Running));
+        assert_eq!(RoundStatus::from_db("success"), Some(RoundStatus::Success));
+        assert_eq!(RoundStatus::from_db("invalid"), None);
+    }
+
+    #[test]
+    fn test_round_status_serialization() {
+        let status = RoundStatus::Success;
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"success\""));
+    }
+
+    #[test]
+    fn test_session_status_as_str() {
+        assert_eq!(SessionStatus::Running.as_str(), "running");
+        assert_eq!(SessionStatus::Completed.as_str(), "completed");
+        assert_eq!(SessionStatus::Error.as_str(), "error");
+        assert_eq!(SessionStatus::Cancelled.as_str(), "cancelled");
+    }
+
+    #[test]
+    fn test_session_status_from_db() {
+        assert_eq!(
+            SessionStatus::from_db("running"),
+            Some(SessionStatus::Running)
+        );
+        assert_eq!(
+            SessionStatus::from_db("completed"),
+            Some(SessionStatus::Completed)
+        );
+        assert_eq!(SessionStatus::from_db("invalid"), None);
+    }
+
+    #[test]
+    fn test_forward_status_as_str() {
+        assert_eq!(ForwardStatus::Success.as_str(), "success");
+        assert_eq!(ForwardStatus::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn test_forward_status_from_db() {
+        assert_eq!(
+            ForwardStatus::from_db("success"),
+            Some(ForwardStatus::Success)
+        );
+        assert_eq!(ForwardStatus::from_db("error"), Some(ForwardStatus::Error));
+        assert_eq!(ForwardStatus::from_db("invalid"), None);
+    }
+
+    #[test]
+    fn test_metrics_date_filter_default() {
+        let filter = MetricsDateFilter::default();
+        assert!(filter.start_date.is_none());
+        assert!(filter.end_date.is_none());
+    }
+
+    #[test]
+    fn test_session_metrics_filter_default() {
+        let filter = SessionMetricsFilter::default();
+        assert!(filter.start_date.is_none());
+        assert!(filter.model.is_none());
+        assert!(filter.limit.is_none());
+    }
+
+    #[test]
+    fn test_forward_metrics_filter_default() {
+        let filter = ForwardMetricsFilter::default();
+        assert!(filter.start_date.is_none());
+        assert!(filter.endpoint.is_none());
+        assert!(filter.limit.is_none());
+    }
+
+    #[test]
+    fn test_tool_call_metrics_serialization() {
+        let metrics = ToolCallMetrics {
+            tool_call_id: "call-123".to_string(),
+            tool_name: "bash".to_string(),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            success: Some(true),
+            error: None,
+            duration_ms: Some(150),
+        };
+
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(json.contains("\"tool_call_id\":\"call-123\""));
+        assert!(json.contains("\"tool_name\":\"bash\""));
+    }
+
+    #[test]
+    fn test_round_metrics_serialization() {
+        let metrics = RoundMetrics {
+            round_id: "round-1".to_string(),
+            session_id: "session-1".to_string(),
+            model: "gpt-4".to_string(),
+            started_at: Utc::now(),
+            completed_at: None,
+            token_usage: TokenUsage::default(),
+            tool_calls: vec![],
+            status: RoundStatus::Running,
+            error: None,
+            duration_ms: None,
+        };
+
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(json.contains("\"round_id\":\"round-1\""));
+        assert!(json.contains("\"model\":\"gpt-4\""));
+    }
+
+    #[test]
+    fn test_session_metrics_serialization() {
+        let metrics = SessionMetrics {
+            session_id: "session-1".to_string(),
+            model: "gpt-4".to_string(),
+            started_at: Utc::now(),
+            completed_at: None,
+            total_rounds: 5,
+            total_token_usage: TokenUsage::default(),
+            tool_call_count: 10,
+            tool_breakdown: HashMap::new(),
+            status: SessionStatus::Running,
+            message_count: 15,
+            duration_ms: None,
+        };
+
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(json.contains("\"session_id\":\"session-1\""));
+        assert!(json.contains("\"total_rounds\":5"));
+    }
+
+    #[test]
+    fn test_daily_metrics_serialization() {
+        let metrics = DailyMetrics {
+            date: NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),
+            total_sessions: 10,
+            total_rounds: 50,
+            total_token_usage: TokenUsage::default(),
+            total_tool_calls: 100,
+            model_breakdown: HashMap::new(),
+            tool_breakdown: HashMap::new(),
+        };
+
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(json.contains("\"total_sessions\":10"));
+        assert!(json.contains("\"total_rounds\":50"));
+    }
+
+    #[test]
+    fn test_metrics_summary_serialization() {
+        let summary = MetricsSummary {
+            total_sessions: 100,
+            total_tokens: TokenUsage::default(),
+            total_tool_calls: 500,
+            active_sessions: 5,
+        };
+
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"total_sessions\":100"));
+        assert!(json.contains("\"active_sessions\":5"));
+    }
+
+    #[test]
+    fn test_model_metrics_serialization() {
+        let metrics = ModelMetrics {
+            model: "gpt-4".to_string(),
+            sessions: 50,
+            rounds: 200,
+            tokens: TokenUsage::default(),
+            tool_calls: 100,
+        };
+
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(json.contains("\"model\":\"gpt-4\""));
+        assert!(json.contains("\"sessions\":50"));
+    }
+
+    #[test]
+    fn test_forward_request_metrics_serialization() {
+        let metrics = ForwardRequestMetrics {
+            forward_id: "fwd-123".to_string(),
+            endpoint: "/api/chat".to_string(),
+            model: "gpt-4".to_string(),
+            is_stream: true,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            status_code: Some(200),
+            status: Some(ForwardStatus::Success),
+            token_usage: None,
+            error: None,
+            duration_ms: Some(250),
+        };
+
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(json.contains("\"forward_id\":\"fwd-123\""));
+        assert!(json.contains("\"endpoint\":\"/api/chat\""));
+    }
+
+    #[test]
+    fn test_forward_metrics_summary_serialization() {
+        let summary = ForwardMetricsSummary {
+            total_requests: 1000,
+            successful_requests: 950,
+            failed_requests: 50,
+            total_tokens: TokenUsage::default(),
+            avg_duration_ms: Some(200),
+        };
+
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"total_requests\":1000"));
+        assert!(json.contains("\"successful_requests\":950"));
+    }
+
+    #[test]
+    fn test_token_usage_clone() {
+        let usage = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+        };
+        let cloned = usage.clone();
+        assert_eq!(usage.prompt_tokens, cloned.prompt_tokens);
+    }
+
+    #[test]
+    fn test_round_status_clone() {
+        let status = RoundStatus::Success;
+        let cloned = status.clone();
+        assert_eq!(status, cloned);
+    }
+
+    #[test]
+    fn test_session_status_clone() {
+        let status = SessionStatus::Completed;
+        let cloned = status.clone();
+        assert_eq!(status, cloned);
+    }
+
+    #[test]
+    fn test_forward_status_clone() {
+        let status = ForwardStatus::Success;
+        let cloned = status.clone();
+        assert_eq!(status, cloned);
+    }
+
+    #[test]
+    fn test_token_usage_eq() {
+        let usage1 = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+        };
+        let usage2 = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+        };
+        assert_eq!(usage1, usage2);
+    }
+
+    #[test]
+    fn test_round_status_eq() {
+        assert_eq!(RoundStatus::Running, RoundStatus::Running);
+        assert_ne!(RoundStatus::Running, RoundStatus::Success);
+    }
+
+    #[test]
+    fn test_session_status_eq() {
+        assert_eq!(SessionStatus::Running, SessionStatus::Running);
+        assert_ne!(SessionStatus::Running, SessionStatus::Completed);
+    }
+}

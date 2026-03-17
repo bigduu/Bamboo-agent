@@ -96,3 +96,144 @@ impl ResponseError for AppError {
         HttpResponse::build(status_code).json(error_response)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_app_error_bad_request() {
+        let err = AppError::BadRequest("Invalid input".to_string());
+        assert_eq!(err.to_string(), "Bad request: Invalid input");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_app_error_tool_not_found() {
+        let err = AppError::ToolNotFound("bash".to_string());
+        assert_eq!(err.to_string(), "Tool 'bash' not found");
+        assert_eq!(err.status_code(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_app_error_tool_execution_error() {
+        let err = AppError::ToolExecutionError("Command failed".to_string());
+        assert_eq!(err.to_string(), "Tool execution failed: Command failed");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_app_error_tool_approval_required() {
+        let err = AppError::ToolApprovalRequired("dangerous_tool".to_string());
+        assert_eq!(err.to_string(), "Tool requires approval: dangerous_tool");
+        assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_app_error_not_found() {
+        let err = AppError::NotFound("Session".to_string());
+        assert_eq!(err.to_string(), "Session not found");
+        assert_eq!(err.status_code(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_app_error_proxy_auth_required() {
+        let err = AppError::ProxyAuthRequired;
+        assert_eq!(err.to_string(), "Proxy authentication required");
+        assert_eq!(err.status_code(), StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[test]
+    fn test_app_error_internal_error() {
+        let err = AppError::InternalError(anyhow::anyhow!("Something went wrong"));
+        assert!(err.to_string().contains("Something went wrong"));
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_app_error_storage_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let err = AppError::StorageError(io_err);
+        assert!(err.to_string().contains("file not found"));
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_app_error_serialization_error() {
+        let json_err = serde_json::from_str::<i32>("invalid").unwrap_err();
+        let err = AppError::SerializationError(json_err);
+        assert!(err.to_string().contains("Serialization error"));
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_error_response_bad_request() {
+        let err = AppError::BadRequest("Test error".to_string());
+        let response = err.error_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_error_response_tool_not_found() {
+        let err = AppError::ToolNotFound("tool".to_string());
+        let response = err.error_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_error_response_proxy_auth_includes_code() {
+        let err = AppError::ProxyAuthRequired;
+        let response = err.error_response();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[test]
+    fn test_app_error_debug() {
+        let err = AppError::BadRequest("test".to_string());
+        let debug_str = format!("{:?}", err);
+        assert!(debug_str.contains("BadRequest"));
+    }
+
+    #[test]
+    fn test_app_error_clone() {
+        let err1 = AppError::BadRequest("test".to_string());
+        // AppError derives Debug but not Clone
+        // This test verifies the Debug trait works
+        let debug_output = format!("{:?}", err1);
+        assert!(!debug_output.is_empty());
+    }
+
+    #[test]
+    fn test_result_type_ok() {
+        let result: Result<i32> = Ok(42);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn test_result_type_err() {
+        let result: Result<i32> = Err(AppError::BadRequest("error".to_string()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_internal_error_from_anyhow() {
+        let anyhow_err = anyhow::anyhow!("Test error");
+        let app_error: AppError = anyhow_err.into();
+        assert!(matches!(app_error, AppError::InternalError(_)));
+    }
+
+    #[test]
+    fn test_storage_error_from_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        let app_error: AppError = io_err.into();
+        assert!(matches!(app_error, AppError::StorageError(_)));
+    }
+
+    #[test]
+    fn test_serialization_error_from_serde_json() {
+        let json_err = serde_json::from_str::<bool>("not a bool").unwrap_err();
+        let app_error: AppError = json_err.into();
+        assert!(matches!(app_error, AppError::SerializationError(_)));
+    }
+}

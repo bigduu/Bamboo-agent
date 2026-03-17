@@ -33,3 +33,106 @@ pub(super) fn extract_target_file_path_from_tool_call(tool_call: &ToolCall) -> O
         .filter(|value| !value.is_empty())
         .map(str::to_string)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::core::tools::{FunctionCall, ToolCall};
+
+    fn make_tool_call(name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: "call-123".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: args.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_is_write_or_edit_tool_name_write() {
+        assert!(is_write_or_edit_tool_name("Write".to_string()));
+    }
+
+    #[test]
+    fn test_is_write_or_edit_tool_name_edit() {
+        assert!(is_write_or_edit_tool_name("Edit".to_string()));
+    }
+
+    #[test]
+    fn test_is_write_or_edit_tool_name_notebook() {
+        assert!(is_write_or_edit_tool_name("NotebookEdit".to_string()));
+    }
+
+    #[test]
+    fn test_is_write_or_edit_tool_name_other() {
+        assert!(!is_write_or_edit_tool_name("Bash".to_string()));
+        assert!(!is_write_or_edit_tool_name("Read".to_string()));
+    }
+
+    #[test]
+    fn test_extract_target_file_path_write() {
+        let tool_call = make_tool_call("Write", r#"{"file_path":"/test.txt","content":"hello"}"#);
+        let path = extract_target_file_path_from_tool_call(&tool_call);
+        assert_eq!(path, Some("/test.txt".to_string()));
+    }
+
+    #[test]
+    fn test_extract_target_file_path_edit() {
+        let tool_call = make_tool_call(
+            "Edit",
+            r#"{"file_path":"/src/main.rs","old":"a","new":"b"}"#,
+        );
+        let path = extract_target_file_path_from_tool_call(&tool_call);
+        assert_eq!(path, Some("/src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn test_extract_target_file_path_notebook() {
+        let tool_call = make_tool_call(
+            "NotebookEdit",
+            r#"{"notebook_path":"/test.ipynb","cell_number":0}"#,
+        );
+        let path = extract_target_file_path_from_tool_call(&tool_call);
+        assert_eq!(path, Some("/test.ipynb".to_string()));
+    }
+
+    #[test]
+    fn test_extract_target_file_path_other_tool() {
+        let tool_call = make_tool_call("Bash", r#"{"command":"ls"}"#);
+        let path = extract_target_file_path_from_tool_call(&tool_call);
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn test_extract_target_file_path_empty() {
+        let tool_call = make_tool_call("Write", r#"{"file_path":"   ","content":"x"}"#);
+        let path = extract_target_file_path_from_tool_call(&tool_call);
+        assert!(path.is_none()); // trimmed empty string filtered out
+    }
+
+    #[test]
+    fn test_extract_target_file_path_invalid_json() {
+        let tool_call = make_tool_call("Write", r#"invalid json"#);
+        let path = extract_target_file_path_from_tool_call(&tool_call);
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn test_extract_target_file_path_missing_key() {
+        let tool_call = make_tool_call("Write", r#"{"content":"test"}"#);
+        let path = extract_target_file_path_from_tool_call(&tool_call);
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn test_extract_target_file_path_trims_whitespace() {
+        let tool_call = make_tool_call(
+            "Write",
+            r#"{"file_path":"  /path/to/file  ","content":"x"}"#,
+        );
+        let path = extract_target_file_path_from_tool_call(&tool_call);
+        assert_eq!(path, Some("/path/to/file".to_string()));
+    }
+}

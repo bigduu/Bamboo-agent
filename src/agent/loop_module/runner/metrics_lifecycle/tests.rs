@@ -101,7 +101,8 @@ async fn record_session_started_writes_initial_session_metrics() {
 
     record_session_started(Some(&collector), "metrics-s1", "test-model", started_at, 3);
 
-    let session = wait_for_session(storage.as_ref(), "metrics-s1").await;
+    let session =
+        wait_for_session_state(storage.as_ref(), "metrics-s1", SessionStatus::Running, 3).await;
     assert_eq!(session.model, "test-model");
     assert_eq!(session.message_count, 3);
     assert_eq!(session.status, SessionStatus::Running);

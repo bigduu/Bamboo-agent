@@ -128,7 +128,10 @@ fn test_decrypt_invalid_format_no_colon() {
 
     let result = encryption::decrypt("invalidhexstring");
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Invalid encrypted format"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid encrypted format"));
 }
 
 #[test]
@@ -138,7 +141,10 @@ fn test_decrypt_invalid_format_wrong_parts() {
 
     let result = encryption::decrypt("part1:part2:part3");
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Invalid encrypted format"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid encrypted format"));
 }
 
 #[test]
@@ -167,7 +173,10 @@ fn test_decrypt_wrong_nonce_length() {
     // Nonce should be 12 bytes (24 hex chars), this is only 10 bytes
     let result = encryption::decrypt("0123456789abcdef0123:0123456789abcdef");
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Invalid nonce length"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid nonce length"));
 }
 
 #[test]
@@ -221,7 +230,10 @@ fn test_get_encryption_key_with_invalid_env_var_too_short() {
 fn test_get_encryption_key_with_invalid_env_var_not_hex() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
 
-    let _key = EnvVarGuard::set("BAMBOO_CONFIG_ENCRYPTION_KEY", "not_valid_hex_12345678901234567890123456789012");
+    let _key = EnvVarGuard::set(
+        "BAMBOO_CONFIG_ENCRYPTION_KEY",
+        "not_valid_hex_12345678901234567890123456789012",
+    );
 
     // Should fall back to alternative methods
     let key = encryption::get_encryption_key();
@@ -245,12 +257,17 @@ fn test_encryption_key_caching() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let _key = EnvVarGuard::unset("BAMBOO_CONFIG_ENCRYPTION_KEY");
 
-    // Multiple calls should use cached key (no file I/O after first call)
-    let _key1 = encryption::get_encryption_key();
-    let _key2 = encryption::get_encryption_key();
-    let _key3 = encryption::get_encryption_key();
+    let key1 = encryption::get_encryption_key();
 
-    // If we reach here without errors, caching is working
+    // In the runtime build, the key is cached after first resolution; later
+    // env changes should not alter it during the same process.
+    let _override = EnvVarGuard::set(
+        "BAMBOO_CONFIG_ENCRYPTION_KEY",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+    );
+    let key2 = encryption::get_encryption_key();
+
+    assert_eq!(key1, key2);
 }
 
 #[test]

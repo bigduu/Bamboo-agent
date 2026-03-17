@@ -34,3 +34,31 @@ pub(super) fn log_round_start(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_update_todo_round_state_none() {
+        let mut todo_context: Option<TodoLoopContext> = None;
+        update_todo_round_state(&mut todo_context, 3, 10);
+        assert!(todo_context.is_none());
+    }
+
+    #[test]
+    fn test_build_round_id() {
+        let id = build_round_id("session-123", 0);
+        assert_eq!(id, "session-123-round-1");
+
+        let id = build_round_id("test", 4);
+        assert_eq!(id, "test-round-5");
+    }
+
+    #[test]
+    fn test_log_round_start_does_not_panic() {
+        // Should not panic regardless of debug_enabled
+        log_round_start(false, "test", 0, 10, 5);
+        log_round_start(true, "test", 2, 10, 3);
+    }
+}
