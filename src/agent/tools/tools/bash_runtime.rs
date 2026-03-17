@@ -1,5 +1,9 @@
-use crate::core::process_utils::{hide_window_for_tokio_command, trace_windows_command};
+use crate::core::process_utils::{
+    decode_process_line_lossy, hide_window_for_tokio_command, preferred_bash_shell,
+    trace_windows_command,
+};
 use dashmap::DashMap;
+use log::warn;
 use regex::Regex;
 use std::path::Path;
 use std::process::Stdio;
@@ -12,11 +16,6 @@ use tokio::time::{sleep, Duration};
 
 const MAX_OUTPUT_LINES: usize = 20_000;
 const COMPLETED_SESSION_TTL_SECS: u64 = 300;
-
-#[cfg(target_os = "windows")]
-const SHELL: (&str, &str) = ("cmd", "/c");
-#[cfg(not(target_os = "windows"))]
-const SHELL: (&str, &str) = ("sh", "-c");
 
 #[derive(Debug)]
 pub struct ShellSession {
@@ -95,18 +94,49 @@ async fn push_line(output: &Arc<Mutex<Vec<String>>>, base_index: &Arc<Mutex<usiz
     }
 }
 
+async fn pump_stream_lines<T>(
+    stream_name: &'static str,
+    reader: T,
+    output: Arc<Mutex<Vec<String>>>,
+    base_index: Arc<Mutex<usize>>,
+) where
+    T: tokio::io::AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(reader);
+    let mut line_bytes = Vec::new();
+
+    loop {
+        line_bytes.clear();
+        match reader.read_until(b'\n', &mut line_bytes).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let line = decode_process_line_lossy(&mut line_bytes);
+                push_line(&output, &base_index, line).await;
+            }
+            Err(e) => {
+                warn!("Background shell {stream_name} read failed: {e}");
+                break;
+            }
+        }
+    }
+}
+
 pub async fn spawn_background(
     command: &str,
     cwd: Option<&Path>,
 ) -> Result<Arc<ShellSession>, String> {
-    let (shell, arg) = SHELL;
-    trace_windows_command("agent.bash.background", shell, [arg, command]);
-    let mut cmd = Command::new(shell);
+    let shell = preferred_bash_shell();
+    trace_windows_command(
+        "agent.bash.background",
+        &shell.program,
+        [shell.arg, command],
+    );
+    let mut cmd = Command::new(&shell.program);
     hide_window_for_tokio_command(&mut cmd);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
-    cmd.arg(arg)
+    cmd.arg(shell.arg)
         .arg(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -146,10 +176,7 @@ pub async fn spawn_background(
         let output = output.clone();
         let base_index = base_index.clone();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                push_line(&output, &base_index, line).await;
-            }
+            pump_stream_lines("stdout", stdout, output, base_index).await;
         });
     }
 
@@ -157,10 +184,7 @@ pub async fn spawn_background(
         let output = output.clone();
         let base_index = base_index.clone();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                push_line(&output, &base_index, line).await;
-            }
+            pump_stream_lines("stderr", stderr, output, base_index).await;
         });
     }
 

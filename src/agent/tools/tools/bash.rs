@@ -1,7 +1,7 @@
 use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use crate::core::process_utils::{
-    hide_window_for_tokio_command, render_command_line, trace_windows_command,
-    windows_command_trace_enabled,
+    decode_process_line_lossy, hide_window_for_tokio_command, preferred_bash_shell,
+    render_command_line, trace_windows_command, windows_command_trace_enabled,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -13,11 +13,6 @@ use tokio::process::Command;
 use tokio::time::{Duration, Instant};
 
 use super::{bash_runtime, workspace_state};
-
-#[cfg(target_os = "windows")]
-const SHELL: (&str, &str) = ("cmd", "/c");
-#[cfg(not(target_os = "windows"))]
-const SHELL: (&str, &str) = ("sh", "-c");
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -81,20 +76,24 @@ impl BashTool {
         cwd: Option<&Path>,
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let (shell, arg) = SHELL;
-        trace_windows_command("agent.bash.foreground", shell, [arg, command]);
+        let shell = preferred_bash_shell();
+        trace_windows_command(
+            "agent.bash.foreground",
+            &shell.program,
+            [shell.arg, command],
+        );
         if windows_command_trace_enabled() {
-            let rendered = render_command_line(shell, [arg, command]);
+            let rendered = render_command_line(&shell.program, [shell.arg, command]);
             ctx.emit_tool_token(format!("[windows-cmd-trace] {rendered}\n"))
                 .await;
         }
 
-        let mut cmd = Command::new(shell);
+        let mut cmd = Command::new(&shell.program);
         hide_window_for_tokio_command(&mut cmd);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
-        cmd.arg(arg)
+        cmd.arg(shell.arg)
             .arg(command)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -114,8 +113,10 @@ impl BashTool {
             .take()
             .ok_or_else(|| ToolError::Execution("Failed to capture stderr".to_string()))?;
 
-        let mut stdout_lines = BufReader::new(stdout).lines();
-        let mut stderr_lines = BufReader::new(stderr).lines();
+        let mut stdout_reader = BufReader::new(stdout);
+        let mut stderr_reader = BufReader::new(stderr);
+        let mut stdout_line_bytes = Vec::new();
+        let mut stderr_line_bytes = Vec::new();
 
         let mut stdout_buf = String::new();
         let mut stderr_buf = String::new();
@@ -134,25 +135,27 @@ impl BashTool {
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             tokio::select! {
-                line = stdout_lines.next_line(), if !stdout_done => {
+                line = stdout_reader.read_until(b'\n', &mut stdout_line_bytes), if !stdout_done => {
                     match line {
-                        Ok(Some(line)) => {
+                        Ok(0) => stdout_done = true,
+                        Ok(_) => {
+                            let line = decode_process_line_lossy(&mut stdout_line_bytes);
                             Self::append_capped(&mut stdout_buf, &line, &mut stdout_truncated);
                             ctx.emit_tool_token(format!("{}\n", line)).await;
                         }
-                        Ok(None) => stdout_done = true,
                         Err(e) => {
                             return Err(ToolError::Execution(format!("Failed reading stdout: {}", e)));
                         }
                     }
                 }
-                line = stderr_lines.next_line(), if !stderr_done => {
+                line = stderr_reader.read_until(b'\n', &mut stderr_line_bytes), if !stderr_done => {
                     match line {
-                        Ok(Some(line)) => {
+                        Ok(0) => stderr_done = true,
+                        Ok(_) => {
+                            let line = decode_process_line_lossy(&mut stderr_line_bytes);
                             Self::append_capped(&mut stderr_buf, &line, &mut stderr_truncated);
                             ctx.emit_tool_token(format!("{}\n", line)).await;
                         }
-                        Ok(None) => stderr_done = true,
                         Err(e) => {
                             return Err(ToolError::Execution(format!("Failed reading stderr: {}", e)));
                         }
@@ -313,6 +316,21 @@ mod tests {
         "printf 'out\\n'; printf 'err\\n' 1>&2"
     }
 
+    #[cfg(target_os = "windows")]
+    fn invalid_utf8_stderr_command() -> String {
+        let shell = crate::core::process_utils::preferred_bash_shell();
+        if shell.arg == "-lc" {
+            "printf '\\377\\n' 1>&2".to_string()
+        } else {
+            "powershell -NoProfile -Command \"$bytes = [byte[]](0xFF,0x0A); [Console]::OpenStandardError().Write($bytes,0,$bytes.Length)\"".to_string()
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn invalid_utf8_stderr_command() -> String {
+        "printf '\\377\\n' 1>&2".to_string()
+    }
+
     #[tokio::test]
     async fn bash_foreground_returns_stdout_stderr_and_streams_tokens() {
         let tool = BashTool::new();
@@ -355,6 +373,21 @@ mod tests {
 
         assert!(streamed.iter().any(|line| line.contains("out")));
         assert!(streamed.iter().any(|line| line.contains("err")));
+    }
+
+    #[tokio::test]
+    async fn bash_foreground_tolerates_invalid_utf8_stderr() {
+        let tool = BashTool::new();
+        let result = tool
+            .execute(json!({
+                "command": invalid_utf8_stderr_command()
+            }))
+            .await;
+
+        assert!(result.is_ok(), "invalid UTF-8 stderr should not fail");
+        let payload: Value = serde_json::from_str(&result.unwrap().result).unwrap();
+        let stderr = payload["stderr"].as_str().unwrap_or_default();
+        assert!(!stderr.is_empty());
     }
 
     #[cfg(not(target_os = "windows"))]

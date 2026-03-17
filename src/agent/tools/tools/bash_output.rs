@@ -118,11 +118,40 @@ mod tests {
         "printf 'alpha\\n'; printf 'beta\\n'"
     }
 
+    #[cfg(target_os = "windows")]
+    fn invalid_utf8_background_command() -> String {
+        let shell = crate::core::process_utils::preferred_bash_shell();
+        if shell.arg == "-lc" {
+            "printf '\\377\\n'".to_string()
+        } else {
+            "powershell -NoProfile -Command \"$bytes = [byte[]](0xFF,0x0A); [Console]::OpenStandardOutput().Write($bytes,0,$bytes.Length)\"".to_string()
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn invalid_utf8_background_command() -> String {
+        "printf '\\377\\n'".to_string()
+    }
+
     async fn spawn_background_shell_id() -> String {
         let bash = BashTool::new();
         let result = bash
             .execute(json!({
                 "command": background_command(),
+                "run_in_background": true
+            }))
+            .await
+            .unwrap();
+
+        let payload: Value = serde_json::from_str(&result.result).unwrap();
+        payload["bash_id"].as_str().unwrap().to_string()
+    }
+
+    async fn spawn_background_shell_id_for_command(command: String) -> String {
+        let bash = BashTool::new();
+        let result = bash
+            .execute(json!({
+                "command": command,
                 "run_in_background": true
             }))
             .await
@@ -197,5 +226,21 @@ mod tests {
             .unwrap();
         let second_payload: Value = serde_json::from_str(&second.result).unwrap();
         assert_eq!(second_payload["output"], "");
+    }
+
+    #[tokio::test]
+    async fn bash_output_tolerates_invalid_utf8_streams() {
+        let shell_id =
+            spawn_background_shell_id_for_command(invalid_utf8_background_command()).await;
+        wait_until_completed(&shell_id).await;
+
+        let output_tool = BashOutputTool::new();
+        let result = output_tool
+            .execute(json!({ "bash_id": shell_id }))
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_str(&result.result).unwrap();
+        let output = payload["output"].as_str().unwrap_or_default();
+        assert!(!output.is_empty());
     }
 }
