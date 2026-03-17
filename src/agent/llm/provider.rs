@@ -153,40 +153,75 @@ pub trait LLMProvider: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    // ========== MODEL REQUIREMENT ARCHITECTURE TESTS ==========
-    // These tests ensure the design principle:
-    // "Provider chat_stream must require model parameter, not have default model field"
+    use std::sync::{Arc, Mutex};
 
-    /// Test: LLMProvider::chat_stream requires model: &str (not Option<&str>)
-    /// This is a compile-time verification test.
-    ///
-    /// The trait signature is:
-    /// async fn chat_stream(
-    ///     &self,
-    ///     messages: &[Message],
-    ///     tools: &[ToolSchema],
-    ///     max_output_tokens: Option<u32>,
-    ///     model: &str,  // <-- Required, not Option<&str>
-    /// ) -> Result<LLMStream>;
-    ///
-    /// If someone tries to change `model: &str` to `model: Option<&str>`,
-    /// all implementations would need to be updated, preventing accidental regression.
-    #[test]
-    fn provider_chat_stream_requires_model_parameter() {
-        // This is a documentation test
-        // The actual enforcement happens at compile time
-        assert!(
-            true,
-            "Model parameter requirement is enforced by trait signature"
+    use async_trait::async_trait;
+    use futures::{stream, StreamExt};
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct RecordingProvider {
+        requested_models: Arc<Mutex<Vec<String>>>,
+        requested_max_tokens: Arc<Mutex<Vec<Option<u32>>>>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for RecordingProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            max_output_tokens: Option<u32>,
+            model: &str,
+        ) -> Result<LLMStream> {
+            if let Ok(mut models) = self.requested_models.lock() {
+                models.push(model.to_string());
+            }
+            if let Ok(mut max_tokens) = self.requested_max_tokens.lock() {
+                max_tokens.push(max_output_tokens);
+            }
+
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_stream_with_options_delegates_to_chat_stream_with_same_model_and_tokens() {
+        let provider = RecordingProvider::default();
+        let options = LLMRequestOptions::default();
+
+        let mut stream = provider
+            .chat_stream_with_options(&[], &[], Some(512), "gpt-test", Some(&options))
+            .await
+            .expect("delegation should succeed");
+        assert!(stream.next().await.is_none());
+
+        assert_eq!(
+            provider
+                .requested_models
+                .lock()
+                .expect("lock poisoned")
+                .as_slice(),
+            ["gpt-test"]
+        );
+        assert_eq!(
+            provider
+                .requested_max_tokens
+                .lock()
+                .expect("lock poisoned")
+                .as_slice(),
+            [Some(512)]
         );
     }
 
-    /// Test: LLMProvider trait documentation states model is required
-    #[test]
-    fn provider_trait_docs_state_model_required() {
-        // Verify the trait documentation exists
-        // This test ensures we don't accidentally remove the documentation
-        // that explains model parameter is required
-        assert!(true, "Trait documentation should explain model is required");
+    #[tokio::test]
+    async fn list_models_returns_empty_by_default() {
+        let provider = RecordingProvider::default();
+        let models = provider
+            .list_models()
+            .await
+            .expect("default list_models should succeed");
+        assert!(models.is_empty());
     }
 }

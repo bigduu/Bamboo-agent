@@ -1,10 +1,16 @@
-use crate::agent::core::todo::{TodoItem, TodoList};
-use crate::agent::core::TodoItemStatus;
-use crate::agent::loop_module::todo_context::{TodoLoopContext, TodoLoopItem, ToolCallRecord};
-use chrono::Utc;
+use std::sync::{Arc, Mutex};
 
-use super::build_todo_evaluation_messages;
+use crate::agent::core::todo::{TodoItem, TodoList};
+use crate::agent::core::tools::ToolSchema;
+use crate::agent::core::{AgentEvent, Message, TodoItemStatus};
+use crate::agent::llm::{LLMError, LLMProvider, LLMStream};
+use crate::agent::loop_module::todo_context::{TodoLoopContext, TodoLoopItem, ToolCallRecord};
+use async_trait::async_trait;
+use chrono::Utc;
+use tokio::sync::mpsc;
+
 use super::message_builder::format_recent_tools;
+use super::{build_todo_evaluation_messages, evaluate_todo_progress};
 
 fn create_test_context() -> TodoLoopContext {
     let mut session = crate::agent::core::Session::new("test", "test-model");
@@ -89,8 +95,63 @@ fn in_progress_items_require_evaluation() {
         .any(|item| matches!(item.status, TodoItemStatus::InProgress)));
 }
 
-#[test]
-fn todo_evaluation_requires_model_parameter() {
-    // Compile-time documentation test: evaluate_todo_progress includes `model: &str`.
-    assert!(true);
+#[derive(Clone, Default)]
+struct RecordingFailingProvider {
+    requested_models: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordingFailingProvider {
+    fn last_requested_model(&self) -> Option<String> {
+        self.requested_models
+            .lock()
+            .ok()
+            .and_then(|models| models.last().cloned())
+    }
+}
+
+#[async_trait]
+impl LLMProvider for RecordingFailingProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        model: &str,
+    ) -> crate::agent::llm::provider::Result<LLMStream> {
+        if let Ok(mut models) = self.requested_models.lock() {
+            models.push(model.to_string());
+        }
+
+        Err(LLMError::Api("intentional provider failure".to_string()))
+    }
+}
+
+#[tokio::test]
+async fn todo_evaluation_uses_explicit_model_parameter_for_provider_request() {
+    let context = create_test_context();
+    let session = crate::agent::core::Session::new("test-session", "session-model");
+    let provider = Arc::new(RecordingFailingProvider::default());
+    let llm: Arc<dyn LLMProvider> = provider.clone();
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(4);
+
+    let result = evaluate_todo_progress(
+        &context,
+        &session,
+        llm,
+        &event_tx,
+        "test-session",
+        "evaluation-model",
+        None,
+    )
+    .await
+    .expect("evaluation should gracefully handle provider failure");
+
+    assert_eq!(
+        provider.last_requested_model().as_deref(),
+        Some("evaluation-model")
+    );
+    assert!(!result.needs_evaluation);
+    assert!(result.updates.is_empty());
+    assert!(result.reasoning.contains("Evaluation failed:"));
+    assert!(result.reasoning.contains("intentional provider failure"));
 }

@@ -7,11 +7,21 @@ mod tests {
     // Note: These are placeholder tests that verify the module structure
     // Full integration tests would require starting the server and making HTTP requests
 
-    #[test]
-    fn test_health_check_endpoint_exists() {
-        // Verify that the health check module exists and can be imported
-        // This is a basic sanity check
-        assert!(true);
+    #[actix_web::test]
+    async fn test_health_check_endpoint_exists() {
+        use actix_web::{http::StatusCode, test, App};
+
+        let app = test::init_service(
+            App::new().configure(bamboo_agent::server::routes::configure_routes),
+        )
+        .await;
+
+        let req = test::TestRequest::get().uri("/api/v1/health").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = test::read_body(resp).await;
+        assert_eq!(body.as_ref(), b"OK");
     }
 
     #[test]
@@ -80,12 +90,17 @@ mod tests {
         assert!(session.messages.is_empty());
     }
 
-    #[test]
-    fn test_workflow_operations() {
-        // These would need to be async in practice; we just verify symbols exist.
-        let _ = bamboo_agent::commands::save_workflow;
-        let _ = bamboo_agent::commands::delete_workflow;
-        assert!(true);
+    #[tokio::test]
+    async fn test_workflow_operations() {
+        let save_result =
+            bamboo_agent::commands::save_workflow("../unsafe".to_string(), "content".to_string())
+                .await;
+        assert!(save_result.is_err());
+        assert_eq!(save_result.unwrap_err(), "Invalid workflow name");
+
+        let delete_result = bamboo_agent::commands::delete_workflow("../unsafe".to_string()).await;
+        assert!(delete_result.is_err());
+        assert_eq!(delete_result.unwrap_err(), "Invalid workflow name");
     }
 
     #[test]

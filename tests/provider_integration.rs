@@ -6,16 +6,16 @@
 mod tests {
     #[test]
     fn test_provider_types_exist() {
-        // Verify that provider types are accessible
-        // This is a module structure test
+        use std::collections::HashSet;
 
-        // Create provider enum variants
-        let _provider_type = "openai";
-        let _provider_type = "anthropic";
-        let _provider_type = "gemini";
-        let _provider_type = "copilot";
+        let providers = bamboo_agent::agent::llm::AVAILABLE_PROVIDERS;
+        let provider_set: HashSet<&str> = providers.iter().copied().collect();
 
-        assert!(true);
+        assert!(provider_set.contains("openai"));
+        assert!(provider_set.contains("anthropic"));
+        assert!(provider_set.contains("gemini"));
+        assert!(provider_set.contains("copilot"));
+        assert_eq!(provider_set.len(), providers.len());
     }
 
     #[test]
@@ -55,10 +55,7 @@ mod tests {
 
         // Test done chunk
         let done_chunk = LLMChunk::Done;
-        match done_chunk {
-            LLMChunk::Done => assert!(true),
-            _ => panic!("Expected Done variant"),
-        }
+        assert!(matches!(done_chunk, LLMChunk::Done));
     }
 
     #[test]
@@ -108,12 +105,16 @@ mod tests {
 
     #[test]
     fn test_protocol_enums() {
-        // Test that protocol types exist and can be referenced
-        // This verifies the module structure
-        let _openai: Option<bamboo_agent::agent::llm::protocol::OpenAIProtocol> = None;
-        let _anthropic: Option<bamboo_agent::agent::llm::protocol::AnthropicProtocol> = None;
-        let _gemini: Option<bamboo_agent::agent::llm::protocol::GeminiProtocol> = None;
-        assert!(true);
+        let openai_type =
+            std::any::type_name::<bamboo_agent::agent::llm::protocol::OpenAIProtocol>();
+        let anthropic_type =
+            std::any::type_name::<bamboo_agent::agent::llm::protocol::AnthropicProtocol>();
+        let gemini_type =
+            std::any::type_name::<bamboo_agent::agent::llm::protocol::GeminiProtocol>();
+
+        assert!(openai_type.ends_with("OpenAIProtocol"));
+        assert!(anthropic_type.ends_with("AnthropicProtocol"));
+        assert!(gemini_type.ends_with("GeminiProtocol"));
     }
 
     #[test]
