@@ -103,6 +103,10 @@ impl AppState {
         let data_dir = bamboo_home_dir.clone();
         let (session_store, storage) = init_storage_components(&data_dir).await;
 
+        // In-memory session cache (shared across handlers and background jobs).
+        let sessions: Arc<RwLock<HashMap<String, crate::agent::core::Session>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
         let config = Arc::new(RwLock::new(config));
 
         let claude_cli_path: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
@@ -110,9 +114,16 @@ impl AppState {
 
         let permission_checker = load_permission_checker(&bamboo_home_dir).await;
         let mcp_manager = init_mcp_manager(config.clone());
-        let base_tools = build_base_tools(config.clone(), permission_checker, mcp_manager.clone());
 
         let skill_manager = init_skill_manager(&data_dir).await;
+        let base_tools = build_base_tools(
+            config.clone(),
+            permission_checker,
+            mcp_manager.clone(),
+            skill_manager.clone(),
+            storage.clone(),
+            sessions.clone(),
+        );
         let metrics_service = init_metrics_service(&data_dir).await;
 
         let agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>> =
@@ -127,10 +138,6 @@ impl AppState {
         let process_registry = Arc::new(ProcessRegistry::new());
 
         let (provider_lock, provider_handle) = build_provider_handles(provider);
-
-        // In-memory session cache (shared across handlers and background jobs).
-        let sessions: Arc<RwLock<HashMap<String, crate::agent::core::Session>>> =
-            Arc::new(RwLock::new(HashMap::new()));
 
         // Long-lived session event senders map (UI subscriptions + background tasks).
         let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
@@ -295,6 +302,9 @@ fn build_base_tools(
     config: Arc<RwLock<Config>>,
     permission_checker: Arc<PermissionChecker>,
     mcp_manager: Arc<McpServerManager>,
+    skill_manager: Arc<SkillManager>,
+    storage: Arc<dyn Storage>,
+    sessions: Arc<RwLock<HashMap<String, crate::agent::core::Session>>>,
 ) -> Arc<dyn ToolExecutor> {
     // Initialize built-in tools with permission checks.
     // If no permission config has been persisted yet, keep checks disabled for backward
@@ -313,9 +323,28 @@ fn build_base_tools(
         mcp_manager.tool_index(),
     ));
 
-    Arc::new(crate::agent::mcp::CompositeToolExecutor::new(
+    let base: Arc<dyn ToolExecutor> = Arc::new(crate::agent::mcp::CompositeToolExecutor::new(
         builtin_tools,
         mcp_tools,
+    ));
+
+    let load_skill_tool = Arc::new(crate::server::tools::LoadSkillTool::new(
+        skill_manager.clone(),
+        sessions.clone(),
+        storage.clone(),
+    ));
+    let with_load_skill: Arc<dyn ToolExecutor> = Arc::new(
+        crate::server::tools::OverlayToolExecutor::new(base, load_skill_tool),
+    );
+
+    let read_skill_resource_tool = Arc::new(crate::server::tools::ReadSkillResourceTool::new(
+        skill_manager,
+        sessions,
+        storage,
+    ));
+    Arc::new(crate::server::tools::OverlayToolExecutor::new(
+        with_load_skill,
+        read_skill_resource_tool,
     ))
 }
 

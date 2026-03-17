@@ -37,6 +37,8 @@ async fn root_tools_include_server_overlays_and_memory_note() {
     assert!(names.contains("schedule_tasks"));
     assert!(names.contains("sub_session_manager"));
     assert!(names.contains("session_inspector"));
+    assert!(names.contains("load_skill"));
+    assert!(names.contains("read_skill_resource"));
     assert!(names.contains("memory_note"));
 }
 
@@ -54,6 +56,8 @@ async fn child_tools_exclude_schedule_and_session_inspector() {
     assert!(!names.contains("schedule_tasks"));
     assert!(!names.contains("sub_session_manager"));
     assert!(!names.contains("session_inspector"));
+    assert!(names.contains("load_skill"));
+    assert!(names.contains("read_skill_resource"));
     assert!(names.contains("memory_note"));
 }
 

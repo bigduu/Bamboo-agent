@@ -1,0 +1,461 @@
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::json;
+use tokio::sync::RwLock;
+use walkdir::WalkDir;
+
+use crate::agent::core::storage::Storage;
+use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use crate::agent::core::Session;
+use crate::agent::skill::SkillManager;
+
+const SELECTED_SKILL_IDS_METADATA_KEY: &str = "selected_skill_ids";
+const MAX_RESOURCE_CONTENT_CHARS: usize = 50_000;
+
+#[derive(Clone)]
+struct SkillToolAccess {
+    skill_manager: Arc<SkillManager>,
+    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    storage: Arc<dyn Storage>,
+    skills_dir: PathBuf,
+}
+
+impl SkillToolAccess {
+    fn new(
+        skill_manager: Arc<SkillManager>,
+        sessions: Arc<RwLock<HashMap<String, Session>>>,
+        storage: Arc<dyn Storage>,
+    ) -> Self {
+        Self {
+            skill_manager,
+            sessions,
+            storage,
+            skills_dir: crate::core::paths::bamboo_dir().join("skills"),
+        }
+    }
+
+    async fn selected_skill_allowlist(&self, session_id: Option<&str>) -> Option<HashSet<String>> {
+        let session_id = session_id?;
+
+        let in_memory = {
+            let sessions = self.sessions.read().await;
+            sessions.get(session_id).cloned()
+        };
+
+        let session = match in_memory {
+            Some(session) => Some(session),
+            None => self.storage.load_session(session_id).await.ok().flatten(),
+        }?;
+
+        let selected = session
+            .metadata
+            .get(SELECTED_SKILL_IDS_METADATA_KEY)
+            .and_then(|raw| {
+                crate::agent::skill::selection::parse_selected_skill_ids_metadata(raw)
+            })?;
+
+        Some(selected.into_iter().collect())
+    }
+
+    async fn ensure_skill_allowed(
+        &self,
+        skill_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<(), ToolError> {
+        let Some(allowlist) = self.selected_skill_allowlist(session_id).await else {
+            return Ok(());
+        };
+
+        if allowlist.contains(skill_id) {
+            return Ok(());
+        }
+
+        Err(ToolError::Execution(format!(
+            "Skill '{skill_id}' is not selected for this request"
+        )))
+    }
+
+    fn skill_root(&self, skill_id: &str) -> PathBuf {
+        self.skills_dir.join(skill_id)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LoadSkillArgs {
+    skill_id: String,
+}
+
+pub struct LoadSkillTool {
+    access: SkillToolAccess,
+}
+
+impl LoadSkillTool {
+    pub fn new(
+        skill_manager: Arc<SkillManager>,
+        sessions: Arc<RwLock<HashMap<String, Session>>>,
+        storage: Arc<dyn Storage>,
+    ) -> Self {
+        Self {
+            access: SkillToolAccess::new(skill_manager, sessions, storage),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for LoadSkillTool {
+    fn name(&self) -> &str {
+        "load_skill"
+    }
+
+    fn description(&self) -> &str {
+        "Load a skill's detailed SKILL.md instructions by skill_id."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "skill_id": {
+                    "type": "string",
+                    "description": "Skill ID from the advertised skill list (for example: skill-creator)."
+                }
+            },
+            "required": ["skill_id"]
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        self.execute_with_context(args, ToolExecutionContext::none("tool_call"))
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let parsed: LoadSkillArgs = serde_json::from_value(args).map_err(|err| {
+            ToolError::InvalidArguments(format!("Invalid load_skill args: {err}"))
+        })?;
+        let skill_id = parsed.skill_id.trim();
+        if skill_id.is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "skill_id must be a non-empty string".to_string(),
+            ));
+        }
+
+        self.access
+            .ensure_skill_allowed(skill_id, ctx.session_id)
+            .await?;
+
+        let skill = self
+            .access
+            .skill_manager
+            .store()
+            .get_skill(skill_id)
+            .await
+            .map_err(|err| {
+                ToolError::Execution(format!("Failed to load skill '{skill_id}': {err}"))
+            })?;
+
+        let resources =
+            list_skill_resource_paths(&self.access.skill_root(skill_id)).map_err(|err| {
+                ToolError::Execution(format!("Failed to list skill resources: {err}"))
+            })?;
+
+        Ok(ToolResult {
+            success: true,
+            result: json!({
+                "skill_id": skill.id,
+                "name": skill.name,
+                "description": skill.description,
+                "license": skill.license,
+                "compatibility": skill.compatibility,
+                "allowed_tools": skill.tool_refs,
+                "instructions": skill.prompt,
+                "resource_files": resources
+            })
+            .to_string(),
+            display_preference: Some("Collapsible".to_string()),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadSkillResourceArgs {
+    skill_id: String,
+    resource_path: String,
+}
+
+pub struct ReadSkillResourceTool {
+    access: SkillToolAccess,
+}
+
+impl ReadSkillResourceTool {
+    pub fn new(
+        skill_manager: Arc<SkillManager>,
+        sessions: Arc<RwLock<HashMap<String, Session>>>,
+        storage: Arc<dyn Storage>,
+    ) -> Self {
+        Self {
+            access: SkillToolAccess::new(skill_manager, sessions, storage),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ReadSkillResourceTool {
+    fn name(&self) -> &str {
+        "read_skill_resource"
+    }
+
+    fn description(&self) -> &str {
+        "Read a resource file under a skill directory by relative resource_path."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "skill_id": {
+                    "type": "string",
+                    "description": "Skill ID that owns the resource."
+                },
+                "resource_path": {
+                    "type": "string",
+                    "description": "Relative path inside the skill folder (for example: references/policies.md)."
+                }
+            },
+            "required": ["skill_id", "resource_path"]
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        self.execute_with_context(args, ToolExecutionContext::none("tool_call"))
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let parsed: ReadSkillResourceArgs = serde_json::from_value(args).map_err(|err| {
+            ToolError::InvalidArguments(format!("Invalid read_skill_resource args: {err}"))
+        })?;
+        let skill_id = parsed.skill_id.trim();
+        if skill_id.is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "skill_id must be a non-empty string".to_string(),
+            ));
+        }
+
+        self.access
+            .ensure_skill_allowed(skill_id, ctx.session_id)
+            .await?;
+
+        let resource_path = normalize_relative_resource_path(&parsed.resource_path)?;
+        if resource_path == Path::new("SKILL.md") {
+            return Err(ToolError::InvalidArguments(
+                "Use load_skill for SKILL.md instructions; read_skill_resource is for auxiliary files"
+                    .to_string(),
+            ));
+        }
+
+        let canonical_root = tokio::fs::canonicalize(self.access.skill_root(skill_id))
+            .await
+            .map_err(|_| {
+                ToolError::Execution(format!(
+                    "Skill directory not found for '{skill_id}'. Load the skill list first."
+                ))
+            })?;
+        let canonical_resource =
+            tokio::fs::canonicalize(self.access.skill_root(skill_id).join(&resource_path))
+                .await
+                .map_err(|_| {
+                    ToolError::Execution(format!(
+                        "Skill resource not found: {}/{}",
+                        skill_id,
+                        display_relative_path(&resource_path)
+                    ))
+                })?;
+
+        if !canonical_resource.starts_with(&canonical_root) {
+            return Err(ToolError::InvalidArguments(
+                "resource_path must stay inside the skill directory".to_string(),
+            ));
+        }
+
+        let metadata = tokio::fs::metadata(&canonical_resource)
+            .await
+            .map_err(|err| ToolError::Execution(format!("Failed to stat resource: {err}")))?;
+        if !metadata.is_file() {
+            return Err(ToolError::InvalidArguments(format!(
+                "resource_path must reference a file: {}",
+                display_relative_path(&resource_path)
+            )));
+        }
+
+        let bytes = tokio::fs::read(&canonical_resource)
+            .await
+            .map_err(|err| ToolError::Execution(format!("Failed to read skill resource: {err}")))?;
+        let size_bytes = bytes.len();
+
+        let result = match String::from_utf8(bytes) {
+            Ok(text) => {
+                let (excerpt, truncated) = truncate_text(&text, MAX_RESOURCE_CONTENT_CHARS);
+                json!({
+                    "skill_id": skill_id,
+                    "resource_path": display_relative_path(&resource_path),
+                    "size_bytes": size_bytes,
+                    "truncated": truncated,
+                    "content": excerpt
+                })
+            }
+            Err(_) => json!({
+                "skill_id": skill_id,
+                "resource_path": display_relative_path(&resource_path),
+                "size_bytes": size_bytes,
+                "binary": true,
+                "message": "Resource is not UTF-8 text. Use file tools when binary handling is required."
+            }),
+        };
+
+        Ok(ToolResult {
+            success: true,
+            result: result.to_string(),
+            display_preference: Some("Collapsible".to_string()),
+        })
+    }
+}
+
+fn list_skill_resource_paths(skill_root: &Path) -> std::io::Result<Vec<String>> {
+    if !skill_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut resources = Vec::new();
+    for entry in WalkDir::new(skill_root)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let Ok(relative) = entry.path().strip_prefix(skill_root) else {
+            continue;
+        };
+        if relative == Path::new("SKILL.md") {
+            continue;
+        }
+
+        resources.push(display_relative_path(relative));
+    }
+
+    resources.sort();
+    resources.dedup();
+    Ok(resources)
+}
+
+fn normalize_relative_resource_path(raw: &str) -> Result<PathBuf, ToolError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ToolError::InvalidArguments(
+            "resource_path must be a non-empty relative path".to_string(),
+        ));
+    }
+
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err(ToolError::InvalidArguments(
+            "resource_path must be relative, absolute paths are not allowed".to_string(),
+        ));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                return Err(ToolError::InvalidArguments(
+                    "resource_path cannot contain '..' or root/prefix segments".to_string(),
+                ))
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return Err(ToolError::InvalidArguments(
+            "resource_path must resolve to a file path".to_string(),
+        ));
+    }
+
+    Ok(normalized)
+}
+
+fn truncate_text(content: &str, max_chars: usize) -> (&str, bool) {
+    if max_chars == 0 {
+        return ("", !content.is_empty());
+    }
+
+    let mut count = 0usize;
+    for (index, _) in content.char_indices() {
+        if count == max_chars {
+            return (&content[..index], true);
+        }
+        count += 1;
+    }
+
+    (content, false)
+}
+
+fn display_relative_path(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(segment) => Some(segment.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_relative_resource_path, truncate_text};
+    use std::path::Path;
+
+    #[test]
+    fn normalize_relative_resource_path_rejects_invalid_paths() {
+        assert!(normalize_relative_resource_path("").is_err());
+        assert!(normalize_relative_resource_path("../secrets.txt").is_err());
+        assert!(normalize_relative_resource_path("/tmp/test.txt").is_err());
+    }
+
+    #[test]
+    fn normalize_relative_resource_path_accepts_nested_file() {
+        let path =
+            normalize_relative_resource_path("references/policy.md").expect("path should parse");
+        assert_eq!(path, Path::new("references/policy.md"));
+    }
+
+    #[test]
+    fn truncate_text_reports_truncation() {
+        let (text, truncated) = truncate_text("abcde", 3);
+        assert_eq!(text, "abc");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn truncate_text_keeps_short_text() {
+        let (text, truncated) = truncate_text("abc", 10);
+        assert_eq!(text, "abc");
+        assert!(!truncated);
+    }
+}

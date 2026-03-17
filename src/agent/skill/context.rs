@@ -3,7 +3,7 @@ use crate::agent::skill::types::SkillDefinition;
 /// Build system prompt context text from available skills.
 /// Only includes metadata (id, name, description, allowed tools).
 /// The detailed skill content (SKILL.md body) is NOT included to save context space.
-/// When a user's request matches a skill's description, read the full skill file for detailed instructions.
+/// When a user's request matches a skill's description, load detailed instructions on demand.
 pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
     if skills.is_empty() {
         log::debug!("No skills available, returning empty context");
@@ -22,20 +22,16 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
 
     let mut context = String::from("\n\n## Skill System\n");
     context.push_str("You have access to specialized skills that provide domain expertise, workflows, and tools. ");
-    context.push_str("When a user's request matches a skill's description, read the skill file to get detailed instructions and follow them.\n\n");
+    context.push_str("When a user's request matches a skill's description, load the skill instructions and follow them.\n\n");
     context.push_str("### How to Use Skills\n");
     context.push_str("1. Analyze the user's request\n");
     context
         .push_str("2. Match it against the available skills below based on their descriptions\n");
-
-    let skills_root = crate::core::paths::bamboo_dir().join("skills");
-    let skills_root_display = crate::core::paths::path_to_display_string(&skills_root);
-    context.push_str(&format!(
-        "3. If there's a match, read the skill file (skills dir: {}): `Read({{\"file_path\": \"{}/<skill_id>/SKILL.md\"}})`\n",
-        skills_root_display, skills_root_display
-    ));
-    context.push_str("4. Follow the instructions in the skill file to help the user\n");
-    context.push_str("5. If compatibility constraints might matter (tools/dependencies), read the `compatibility` field from the same SKILL.md frontmatter before acting\n\n");
+    context.push_str(
+        "3. If there's a match, call `load_skill` with `skill_id` to fetch full instructions\n",
+    );
+    context.push_str("4. If supporting files are needed, call `read_skill_resource` with `skill_id` and `resource_path`\n");
+    context.push_str("5. Follow the loaded instructions to help the user\n\n");
     context.push_str("### Available Skills\n");
 
     for skill in skills {
@@ -56,16 +52,8 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
             ));
         }
 
-        // Tell AI where to find the full skill content
-        let skill_path = skills_root.join(&skill.id).join("SKILL.md");
-        context.push_str(&format!(
-            "- Skill file: `{}`\n",
-            crate::core::paths::path_to_display_string(&skill_path)
-        ));
         if skill.compatibility.is_some() {
-            context.push_str(
-                "- Compatibility details are in SKILL.md frontmatter (`compatibility`)\n",
-            );
+            context.push_str("- Compatibility details are available in the loaded skill payload\n");
         }
     }
 
@@ -102,28 +90,15 @@ mod tests {
         assert!(context.contains("## Skill System"));
         assert!(context.contains("How to Use Skills"));
         assert!(context.contains("Match it against the available skills"));
-        assert!(context.contains("Read"));
-        assert!(context.contains("compatibility"));
-        let expected_skills_root = crate::core::paths::path_to_display_string(
-            &crate::core::paths::bamboo_dir().join("skills"),
-        );
-        assert!(context.contains(&format!("{}/<skill_id>/SKILL.md", expected_skills_root)));
+        assert!(context.contains("load_skill"));
+        assert!(context.contains("read_skill_resource"));
 
         // Should contain skill metadata
         assert!(context.contains("Demo Skill"));
         assert!(context.contains("demo-skill"));
         assert!(context.contains("A demo skill for testing"));
         assert!(context.contains("Provides tools: read_file"));
-        let expected_skill_path = crate::core::paths::bamboo_dir()
-            .join("skills")
-            .join("demo-skill")
-            .join("SKILL.md");
-        let expected_line = format!(
-            "Skill file: `{}`",
-            crate::core::paths::path_to_display_string(&expected_skill_path)
-        );
-        assert!(context.contains(&expected_line));
-        assert!(context.contains("Compatibility details are in SKILL.md frontmatter"));
+        assert!(context.contains("Compatibility details are available in the loaded skill payload"));
 
         // Should NOT contain the detailed prompt
         assert!(!context.contains("This detailed prompt should NOT appear"));
