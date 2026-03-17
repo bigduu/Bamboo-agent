@@ -21,8 +21,7 @@ pub(super) async fn prepare_session_for_loop(
     metrics_collector: Option<&MetricsCollector>,
     session_id: &str,
 ) -> Option<TodoLoopContext> {
-    let skill_context =
-        skill_context::load_skill_context(config, session_id, session.id.as_str()).await;
+    let skill_context = skill_context::load_skill_context(config, session_id).await;
 
     let base_prompt_for_language = prompt_setup::resolve_base_prompt_for_language(config, session);
     let tool_schemas = resolve_available_tool_schemas(config, tools);

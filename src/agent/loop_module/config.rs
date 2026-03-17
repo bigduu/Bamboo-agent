@@ -26,6 +26,9 @@ pub struct ImageFallbackConfig {
 pub struct AgentLoopConfig {
     pub max_rounds: usize,
     pub system_prompt: Option<String>,
+    /// Optional explicit skill selection for this execution.
+    /// When set, only these skill IDs are considered for skill context and allowlists.
+    pub selected_skill_ids: Option<Vec<String>>,
     pub additional_tool_schemas: Vec<ToolSchema>,
     pub tool_registry: Arc<ToolRegistry>,
     pub composition_executor: Option<Arc<CompositionExecutor>>,
@@ -57,6 +60,7 @@ impl Default for AgentLoopConfig {
         Self {
             max_rounds: 50,
             system_prompt: None,
+            selected_skill_ids: None,
             additional_tool_schemas: Vec::new(),
             tool_registry: Arc::new(ToolRegistry::new()),
             composition_executor: None,

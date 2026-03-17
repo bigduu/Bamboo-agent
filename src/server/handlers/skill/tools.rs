@@ -26,10 +26,11 @@ pub async fn get_filtered_tools(
     query: web::Query<FilteredToolsQuery>,
 ) -> Result<HttpResponse, AppError> {
     let session_id = resolve_session_identifier(&query);
+    let selected_skill_ids = selected_skill_ids_for_session(state.get_ref(), session_id).await;
     let allowed_tools = state
         .skill_manager
         .as_ref()
-        .get_allowed_tools(session_id)
+        .get_allowed_tools_for_selection(selected_skill_ids.as_deref())
         .await;
     debug!("Skill filtered tools allowed list: {:?}", allowed_tools);
 
@@ -46,6 +47,28 @@ pub async fn get_filtered_tools(
 
 pub(super) fn resolve_session_identifier(query: &FilteredToolsQuery) -> Option<&str> {
     query.session_id.as_deref().or(query.chat_id.as_deref())
+}
+
+async fn selected_skill_ids_for_session(
+    state: &AppState,
+    session_id: Option<&str>,
+) -> Option<Vec<String>> {
+    let session_id = session_id?;
+
+    let in_memory = {
+        let sessions = state.sessions.read().await;
+        sessions.get(session_id).cloned()
+    };
+
+    let session = match in_memory {
+        Some(session) => Some(session),
+        None => state.storage.load_session(session_id).await.ok().flatten(),
+    }?;
+
+    session
+        .metadata
+        .get("selected_skill_ids")
+        .and_then(|raw| crate::agent::skill::selection::parse_selected_skill_ids_metadata(raw))
 }
 
 pub(super) fn select_tools_by_allowlist(

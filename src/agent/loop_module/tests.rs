@@ -31,6 +31,7 @@ fn agent_loop_config_default() {
     assert!(config.tool_registry.is_empty());
     assert!(config.composition_executor.is_none());
     assert!(config.skill_manager.is_none());
+    assert!(config.selected_skill_ids.is_none());
     assert!(!config.skip_initial_user_message);
 }
 

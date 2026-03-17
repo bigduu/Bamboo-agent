@@ -1,6 +1,7 @@
 //! Agent skill management crate.
 
 pub mod context;
+pub mod selection;
 pub mod store;
 pub mod types;
 
@@ -41,18 +42,76 @@ impl SkillManager {
         &self.store
     }
 
-    /// Build system prompt context from all skills.
-    pub async fn build_skill_context(&self, _chat_id: Option<&str>) -> String {
-        // Reload to get latest skills
+    async fn list_skills_for_selection(
+        &self,
+        selected_skill_ids: Option<&[String]>,
+    ) -> Vec<SkillDefinition> {
+        // Reload to get latest skills.
         let skills = self.store.list_skills(None, true).await;
-        log::info!("Building skill context with {} skill(s)", skills.len());
+        let Some(selected_skill_ids) = selected_skill_ids else {
+            return skills;
+        };
+
+        let selected_set: HashSet<&str> = selected_skill_ids
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .collect();
+        if selected_set.is_empty() {
+            return skills;
+        }
+
+        let filtered: Vec<SkillDefinition> = skills
+            .into_iter()
+            .filter(|skill| selected_set.contains(skill.id.as_str()))
+            .collect();
+
+        if filtered.len() != selected_set.len() {
+            let missing: Vec<&str> = selected_set
+                .iter()
+                .copied()
+                .filter(|selected| !filtered.iter().any(|skill| skill.id == *selected))
+                .collect();
+            if !missing.is_empty() {
+                log::warn!(
+                    "Some selected skills were not found on disk and will be ignored: {:?}",
+                    missing
+                );
+            }
+        }
+
+        filtered
+    }
+
+    /// Build system prompt context from a selected subset of skills.
+    pub async fn build_skill_context_for_selection(
+        &self,
+        selected_skill_ids: Option<&[String]>,
+    ) -> String {
+        let skills = self.list_skills_for_selection(selected_skill_ids).await;
+        log::info!(
+            "Building skill context with {} skill(s), selection_mode={}",
+            skills.len(),
+            if selected_skill_ids.is_some() {
+                "selected"
+            } else {
+                "all"
+            }
+        );
         context::build_skill_context(&skills)
     }
 
-    /// Get allowed tool refs from all skills.
-    pub async fn get_allowed_tools(&self, _chat_id: Option<&str>) -> Vec<String> {
-        // Reload to get latest skills
-        let skills = self.store.list_skills(None, true).await;
+    /// Build system prompt context from all skills.
+    pub async fn build_skill_context(&self, _chat_id: Option<&str>) -> String {
+        self.build_skill_context_for_selection(None).await
+    }
+
+    /// Get allowed tool refs from a selected subset of skills.
+    pub async fn get_allowed_tools_for_selection(
+        &self,
+        selected_skill_ids: Option<&[String]>,
+    ) -> Vec<String> {
+        let skills = self.list_skills_for_selection(selected_skill_ids).await;
 
         let mut tools: Vec<String> = skills
             .into_iter()
@@ -63,6 +122,11 @@ impl SkillManager {
 
         tools.sort();
         tools
+    }
+
+    /// Get allowed tool refs from all skills.
+    pub async fn get_allowed_tools(&self, _chat_id: Option<&str>) -> Vec<String> {
+        self.get_allowed_tools_for_selection(None).await
     }
 }
 

@@ -1,13 +1,9 @@
 use crate::agent::loop_module::config::AgentLoopConfig;
 
-pub(super) async fn load_skill_context(
-    config: &AgentLoopConfig,
-    session_id: &str,
-    skill_session_id: &str,
-) -> String {
+pub(super) async fn load_skill_context(config: &AgentLoopConfig, session_id: &str) -> String {
     if let Some(skill_manager) = config.skill_manager.as_ref() {
         let context = skill_manager
-            .build_skill_context(Some(skill_session_id))
+            .build_skill_context_for_selection(config.selected_skill_ids.as_deref())
             .await;
         if !context.is_empty() {
             log::info!(

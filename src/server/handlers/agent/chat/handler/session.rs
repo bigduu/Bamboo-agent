@@ -3,6 +3,8 @@ use actix_web::{web, HttpResponse};
 use crate::agent::core::{Role, Session};
 use crate::server::app_state::AppState;
 
+const SELECTED_SKILL_IDS_METADATA_KEY: &str = "selected_skill_ids";
+
 pub(super) async fn load_or_create_session(
     state: &web::Data<AppState>,
     session_id: &str,
@@ -105,6 +107,82 @@ pub(super) fn resolve_enhance_prompt(
     }
 
     enhance_prompt_from_request.map(ToString::to_string)
+}
+
+pub(super) fn resolve_selected_skill_ids(
+    session: &mut Session,
+    selected_skill_ids_from_request: Option<&[String]>,
+    message: &str,
+) -> Option<Vec<String>> {
+    if let Some(request_ids) = selected_skill_ids_from_request {
+        let normalized = crate::agent::skill::selection::normalize_selected_skill_ids(
+            request_ids.iter().cloned(),
+        );
+        persist_selected_skill_ids_metadata(session, normalized.as_deref());
+        return normalized;
+    }
+
+    let from_hint = crate::agent::skill::selection::normalize_selected_skill_ids(
+        extract_skill_ids_from_hint(message),
+    );
+    if let Some(ids) = from_hint.as_ref() {
+        persist_selected_skill_ids_metadata(session, Some(ids));
+        return from_hint;
+    }
+
+    // Explicit per-message selection behavior: if this request does not specify
+    // or hint any selected skill, clear stale session metadata from prior turns.
+    session.metadata.remove(SELECTED_SKILL_IDS_METADATA_KEY);
+    None
+}
+
+fn persist_selected_skill_ids_metadata(
+    session: &mut Session,
+    selected_skill_ids: Option<&[String]>,
+) {
+    match selected_skill_ids {
+        Some(ids) if !ids.is_empty() => {
+            if let Ok(serialized) = serde_json::to_string(ids) {
+                session
+                    .metadata
+                    .insert(SELECTED_SKILL_IDS_METADATA_KEY.to_string(), serialized);
+            } else {
+                log::warn!("Failed to serialize selected skill IDs; clearing metadata");
+                session.metadata.remove(SELECTED_SKILL_IDS_METADATA_KEY);
+            }
+        }
+        _ => {
+            session.metadata.remove(SELECTED_SKILL_IDS_METADATA_KEY);
+        }
+    }
+}
+
+fn extract_skill_ids_from_hint(message: &str) -> Vec<String> {
+    const HINT_PREFIX: &str = "[User explicitly selected skill:";
+    let mut extracted = Vec::new();
+
+    for line in message.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with(HINT_PREFIX) || !trimmed.ends_with(']') {
+            continue;
+        }
+
+        // Expected format:
+        // [User explicitly selected skill: <display label> (ID: <skill-id>)]
+        let Some(id_marker_index) = trimmed.rfind("(ID:") else {
+            continue;
+        };
+        let id_segment = &trimmed[id_marker_index + "(ID:".len()..];
+        let Some(close_paren_index) = id_segment.find(')') else {
+            continue;
+        };
+        let id = id_segment[..close_paren_index].trim();
+        if !id.is_empty() {
+            extracted.push(id.to_string());
+        }
+    }
+
+    extracted
 }
 
 pub(super) async fn cache_and_save_session(

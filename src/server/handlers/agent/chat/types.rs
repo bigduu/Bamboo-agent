@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 /// * `system_prompt` - Optional custom system prompt. If empty, uses the default
 /// * `enhance_prompt` - Optional additional prompt instructions appended to the system prompt
 /// * `workspace_path` - Optional workspace path to include in the system prompt
+/// * `selected_skill_ids` - Optional explicit skill IDs selected for this request
 /// * `model` - Required model identifier (e.g., "gpt-4o-mini", "claude-3-opus")
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -20,6 +21,8 @@ pub struct ChatRequest {
     pub enhance_prompt: Option<String>,
     #[serde(default)]
     pub workspace_path: Option<String>,
+    #[serde(default)]
+    pub selected_skill_ids: Option<Vec<String>>,
     /// Optional image attachments (data URLs) associated with this message.
     #[serde(default)]
     pub images: Option<Vec<ChatImage>>,
@@ -77,6 +80,7 @@ mod tests {
             "system_prompt":"Be helpful",
             "enhance_prompt":"Be concise",
             "workspace_path":"/home/user",
+            "selected_skill_ids":["pdf","skill-creator"],
             "model":"claude-3"
         }"#;
         let req: ChatRequest = serde_json::from_str(json).unwrap();
@@ -85,6 +89,10 @@ mod tests {
         assert_eq!(req.system_prompt, Some("Be helpful".to_string()));
         assert_eq!(req.enhance_prompt, Some("Be concise".to_string()));
         assert_eq!(req.workspace_path, Some("/home/user".to_string()));
+        assert_eq!(
+            req.selected_skill_ids,
+            Some(vec!["pdf".to_string(), "skill-creator".to_string()])
+        );
         assert_eq!(req.model, "claude-3");
     }
 
@@ -123,6 +131,7 @@ mod tests {
             system_prompt: None,
             enhance_prompt: None,
             workspace_path: None,
+            selected_skill_ids: None,
             images: None,
             model: "gpt-4".to_string(),
         };

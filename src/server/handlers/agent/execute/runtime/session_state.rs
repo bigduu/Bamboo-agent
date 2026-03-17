@@ -26,3 +26,10 @@ pub(super) fn initial_user_message_for_session(session: &Session) -> String {
         .map(|message| message.content.clone())
         .unwrap_or_default()
 }
+
+pub(super) fn selected_skill_ids_for_session(session: &Session) -> Option<Vec<String>> {
+    session
+        .metadata
+        .get("selected_skill_ids")
+        .and_then(|raw| crate::agent::skill::selection::parse_selected_skill_ids_metadata(raw))
+}

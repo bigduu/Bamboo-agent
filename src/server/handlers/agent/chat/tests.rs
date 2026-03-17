@@ -134,6 +134,7 @@ fn chat_request_empty_model_fails_validation() {
         system_prompt: None,
         enhance_prompt: None,
         workspace_path: None,
+        selected_skill_ids: None,
         images: None,
         model: "   ".to_string(), // Empty/whitespace
     };

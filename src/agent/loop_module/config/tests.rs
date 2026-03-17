@@ -9,6 +9,10 @@ fn agent_loop_config_model_name_defaults_to_none() {
         config.model_name.is_none(),
         "model_name should default to None, forcing explicit setting"
     );
+    assert!(
+        config.selected_skill_ids.is_none(),
+        "selected_skill_ids should default to None"
+    );
 }
 
 #[test]

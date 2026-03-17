@@ -6,7 +6,8 @@ use crate::{
 use super::{
     execution::{status_from_execution_result, terminal_error_event_for_result},
     session_state::{
-        has_pending_user_message, initial_user_message_for_session, system_prompt_for_session,
+        has_pending_user_message, initial_user_message_for_session, selected_skill_ids_for_session,
+        system_prompt_for_session,
     },
 };
 
@@ -36,6 +37,20 @@ fn session_prompt_extractors_select_expected_messages() {
     assert_eq!(
         initial_user_message_for_session(&session),
         "latest user".to_string()
+    );
+}
+
+#[test]
+fn selected_skill_ids_for_session_parses_metadata_json() {
+    let mut session = Session::new("session-1", "gpt-4o-mini");
+    session.metadata.insert(
+        "selected_skill_ids".to_string(),
+        "[\"pdf\",\"skill-creator\"]".to_string(),
+    );
+
+    assert_eq!(
+        selected_skill_ids_for_session(&session),
+        Some(vec!["pdf".to_string(), "skill-creator".to_string()])
     );
 }
 

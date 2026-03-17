@@ -66,6 +66,11 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         &mut session,
         request::optional_non_empty(req.workspace_path.as_deref()),
     );
+    session::resolve_selected_skill_ids(
+        &mut session,
+        req.selected_skill_ids.as_deref(),
+        req.message.as_str(),
+    );
 
     // Always refresh the persisted system prompt so existing sessions don't
     // keep stale tool instructions after backend upgrades.

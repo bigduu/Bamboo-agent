@@ -1,7 +1,9 @@
 use crate::agent::core::Session;
 
 use super::request::{optional_non_empty, resolve_session_id, validate_and_normalize_model};
-use super::session::{resolve_base_prompt, resolve_enhance_prompt, resolve_workspace_path};
+use super::session::{
+    resolve_base_prompt, resolve_enhance_prompt, resolve_selected_skill_ids, resolve_workspace_path,
+};
 
 #[test]
 fn validate_and_normalize_model_rejects_empty_values() {
@@ -112,4 +114,63 @@ fn resolve_enhance_prompt_stores_and_clears_metadata() {
     let from_empty_request = resolve_enhance_prompt(&mut session, None);
     assert_eq!(from_empty_request, None);
     assert!(!session.metadata.contains_key("enhance_prompt"));
+}
+
+#[test]
+fn resolve_selected_skill_ids_prefers_structured_request_and_persists_as_json() {
+    let mut session = Session::new("session-1", "model");
+    let selected = resolve_selected_skill_ids(
+        &mut session,
+        Some(&[
+            "pdf".to_string(),
+            "skill-creator".to_string(),
+            "pdf".to_string(),
+        ]),
+        "hello",
+    )
+    .expect("selected skills should be present");
+
+    assert_eq!(
+        selected,
+        vec!["pdf".to_string(), "skill-creator".to_string()]
+    );
+    assert_eq!(
+        session
+            .metadata
+            .get("selected_skill_ids")
+            .map(String::as_str),
+        Some("[\"pdf\",\"skill-creator\"]")
+    );
+}
+
+#[test]
+fn resolve_selected_skill_ids_falls_back_to_legacy_hint_when_structured_field_absent() {
+    let mut session = Session::new("session-1", "model");
+    let selected = resolve_selected_skill_ids(
+        &mut session,
+        None,
+        "[User explicitly selected skill: PDF Skill (ID: pdf)]\n\nPlease parse this file",
+    )
+    .expect("selected skills should be present");
+
+    assert_eq!(selected, vec!["pdf".to_string()]);
+    assert_eq!(
+        session
+            .metadata
+            .get("selected_skill_ids")
+            .map(String::as_str),
+        Some("[\"pdf\"]")
+    );
+}
+
+#[test]
+fn resolve_selected_skill_ids_clears_stale_metadata_when_no_selection_provided() {
+    let mut session = Session::new("session-1", "model");
+    session
+        .metadata
+        .insert("selected_skill_ids".to_string(), "[\"pdf\"]".to_string());
+
+    let selected = resolve_selected_skill_ids(&mut session, None, "normal prompt");
+    assert!(selected.is_none());
+    assert!(!session.metadata.contains_key("selected_skill_ids"));
 }
