@@ -1,4 +1,5 @@
 use crate::{core::config::CopilotConfig, Config};
+use actix_web::http::StatusCode;
 
 use super::{client::resolve_headless_auth, status_logout::auth_status_from_token_content};
 
@@ -52,4 +53,25 @@ fn auth_status_from_token_content_reports_expired_when_token_is_expired() {
 fn auth_status_from_token_content_returns_none_when_payload_missing_expiry() {
     let status = auth_status_from_token_content(r#"{"access_token":"x"}"#, 100);
     assert!(status.is_none());
+}
+
+#[actix_web::test]
+async fn copilot_auth_config_registers_expected_routes() {
+    let app = actix_web::test::init_service(actix_web::App::new().configure(super::config)).await;
+
+    for uri in [
+        "/bamboo/copilot/auth/start",
+        "/bamboo/copilot/auth/complete",
+        "/bamboo/copilot/authenticate",
+        "/bamboo/copilot/auth/status",
+        "/bamboo/copilot/logout",
+    ] {
+        let req = actix_web::test::TestRequest::post().uri(uri).to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "expected copilot auth route to be registered: {uri}"
+        );
+    }
 }

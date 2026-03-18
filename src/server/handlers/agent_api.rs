@@ -5,6 +5,8 @@ mod projects;
 mod routes;
 mod sessions;
 mod settings;
+#[cfg(test)]
+mod tests;
 mod types;
 
 pub use projects::{create_project, get_project_sessions, list_projects};

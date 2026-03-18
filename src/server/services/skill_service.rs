@@ -31,3 +31,73 @@ pub async fn list_workflows(data_dir: &Path) -> Result<Vec<String>, AppError> {
     workflows.sort();
     Ok(workflows)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::list_workflows;
+    use crate::server::error::AppError;
+    use tempfile::tempdir;
+    use tokio::fs;
+
+    #[tokio::test]
+    async fn list_workflows_returns_empty_when_workflows_dir_missing() {
+        let tmp = tempdir().expect("create temp dir");
+
+        let workflows = list_workflows(tmp.path())
+            .await
+            .expect("list workflows should succeed");
+
+        assert!(workflows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_workflows_returns_sorted_file_stems_and_ignores_directories() {
+        let tmp = tempdir().expect("create temp dir");
+        let workflows_dir = tmp.path().join("workflows");
+        fs::create_dir_all(&workflows_dir)
+            .await
+            .expect("create workflows dir");
+
+        fs::write(workflows_dir.join("zeta.yaml"), "# zeta")
+            .await
+            .expect("write zeta");
+        fs::write(workflows_dir.join("alpha.md"), "# alpha")
+            .await
+            .expect("write alpha");
+        fs::write(workflows_dir.join("bravo"), "# bravo")
+            .await
+            .expect("write bravo");
+        fs::create_dir_all(workflows_dir.join("nested"))
+            .await
+            .expect("create nested dir");
+
+        let workflows = list_workflows(tmp.path())
+            .await
+            .expect("list workflows should succeed");
+
+        assert_eq!(workflows, vec!["alpha", "bravo", "zeta"]);
+    }
+
+    #[tokio::test]
+    async fn list_workflows_returns_internal_error_when_workflows_path_is_file() {
+        let tmp = tempdir().expect("create temp dir");
+        let workflows_path = tmp.path().join("workflows");
+        fs::write(&workflows_path, "not a directory")
+            .await
+            .expect("write file at workflows path");
+
+        let error = list_workflows(tmp.path())
+            .await
+            .expect_err("listing should fail when workflows path is not a directory");
+
+        match error {
+            AppError::InternalError(inner) => {
+                assert!(
+                    inner.to_string().contains("Failed to read workflows dir"),
+                    "unexpected error message: {inner}"
+                );
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+    }
+}
