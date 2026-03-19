@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::agent::tools::normalize_tool_ref;
-use log::warn;
+use tracing::warn;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::skill::types::{SkillDefinition, SkillError, SkillResult};

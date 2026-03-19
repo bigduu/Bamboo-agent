@@ -28,6 +28,7 @@ pub(super) struct Model {
 /// - `model`
 /// - `input` (string or array of message-like objects)
 /// - `instructions` (mapped to a system message)
+/// - `previous_response_id` (passed via flattened parameters for stateful continuation)
 /// - `tools` (OpenAI tool schema; reuses existing OpenAI-compatible tool model)
 /// - `stream`
 /// - `max_output_tokens` (mapped to provider max tokens)
@@ -382,7 +383,8 @@ mod tests {
 
     #[test]
     fn test_responses_create_request_with_extra_parameters() {
-        let json = r#"{"model":"gpt-4","temperature":0.7,"top_p":0.9}"#;
+        let json =
+            r#"{"model":"gpt-4","temperature":0.7,"top_p":0.9,"previous_response_id":"resp_123"}"#;
         let req: ResponsesCreateRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.model, "gpt-4");
         assert_eq!(
@@ -392,6 +394,10 @@ mod tests {
         assert_eq!(
             req.parameters.get("top_p").unwrap(),
             &serde_json::json!(0.9)
+        );
+        assert_eq!(
+            req.parameters.get("previous_response_id").unwrap(),
+            &serde_json::json!("resp_123")
         );
     }
 

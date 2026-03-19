@@ -17,7 +17,7 @@ pub(super) async fn finalize_todo_context(
     };
 
     if ctx.is_all_completed() {
-        log::info!("[{}] All todo items completed", session_id);
+        tracing::info!("[{}] All todo items completed", session_id);
 
         let _ = event_tx
             .send(AgentEvent::TodoListCompleted {
@@ -36,7 +36,7 @@ pub(super) async fn finalize_todo_context(
     session.todo_list = Some(ctx.into_todo_list());
     session.updated_at = Utc::now();
 
-    log::debug!(
+    tracing::debug!(
         "[{}] Synced TodoLoopContext to session, version={}",
         session_id,
         version
@@ -44,13 +44,13 @@ pub(super) async fn finalize_todo_context(
 
     if let Some(ref storage) = config.storage {
         if let Err(error) = storage.save_session(session).await {
-            log::warn!(
+            tracing::warn!(
                 "[{}] Failed to save session after agent loop: {}",
                 session_id,
                 error
             );
         } else {
-            log::debug!("[{}] Session saved with updated todo list", session_id);
+            tracing::debug!("[{}] Session saved with updated todo list", session_id);
         }
     }
 }

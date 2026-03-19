@@ -70,6 +70,12 @@ pub(super) fn parse_responses_request_options(
         reasoning_summary: parse_reasoning_summary(parameters),
         include: parse_include(parameters),
         store: parameters.get("store").and_then(|value| value.as_bool()),
+        previous_response_id: parameters
+            .get("previous_response_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
         truncation: parse_truncation(parameters),
     }
 }
@@ -86,6 +92,7 @@ mod tests {
             "reasoning": { "summary": "detailed" },
             "include": ["reasoning.encrypted_content"],
             "store": true,
+            "previous_response_id": "resp_123",
             "truncation": "auto"
         }))
         .expect("valid params");
@@ -97,6 +104,7 @@ mod tests {
             Some(vec!["reasoning.encrypted_content".to_string()])
         );
         assert_eq!(parsed.store, Some(true));
+        assert_eq!(parsed.previous_response_id.as_deref(), Some("resp_123"));
         assert_eq!(parsed.truncation.as_deref(), Some("auto"));
     }
 
@@ -153,6 +161,17 @@ mod tests {
 
         let parsed = parse_responses_request_options(&params);
         assert_eq!(parsed.reasoning_summary, None);
+    }
+
+    #[test]
+    fn trims_previous_response_id() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "previous_response_id": "  resp_456  "
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.previous_response_id.as_deref(), Some("resp_456"));
     }
 
     #[test]

@@ -18,7 +18,9 @@ impl AppState {
     ///
     /// #[tokio::main]
     /// async fn main() {
-    ///     let state = AppState::new(PathBuf::from("/path/to/.bamboo")).await;
+    ///     let state = AppState::new(PathBuf::from("/path/to/.bamboo"))
+    ///         .await
+    ///         .expect("failed to initialize app state");
     ///     let provider = state.get_provider().await;
     ///
     ///     // Use provider to make LLM requests...
@@ -39,9 +41,9 @@ impl AppState {
     /// MCP servers are not left running as orphaned processes.
     #[allow(dead_code)]
     pub async fn shutdown(&self) {
-        log::info!("Shutting down MCP servers...");
+        tracing::info!("Shutting down MCP servers...");
         self.mcp_manager.shutdown_all().await;
-        log::info!("MCP servers shut down complete");
+        tracing::info!("MCP servers shut down complete");
     }
 
     /// Get all tool schemas from the composite tool executor

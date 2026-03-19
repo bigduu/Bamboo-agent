@@ -93,7 +93,11 @@ async fn skill_config_registers_expected_routes() {
 #[tokio::test]
 async fn get_available_workflows_returns_sorted_workflow_names() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let app_state = web::Data::new(AppState::new(temp_dir.path().to_path_buf()).await);
+    let app_state = web::Data::new(
+        AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize"),
+    );
     let workflows_dir = app_state.app_data_dir.join("workflows");
 
     tokio::fs::create_dir_all(&workflows_dir)
@@ -123,7 +127,11 @@ async fn get_available_workflows_returns_sorted_workflow_names() {
 #[tokio::test]
 async fn get_available_workflows_maps_listing_failures_to_internal_error() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let app_state = web::Data::new(AppState::new(temp_dir.path().to_path_buf()).await);
+    let app_state = web::Data::new(
+        AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize"),
+    );
     let workflows_path = app_state.app_data_dir.join("workflows");
 
     if workflows_path.exists() {

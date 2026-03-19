@@ -22,11 +22,6 @@ impl AppState {
     /// # Returns
     ///
     /// A fully initialized AppState with all components ready for use.
-    ///
-    /// # Panics
-    ///
-    /// Panics if storage initialization fails (critical error).
-    ///
     /// # Example
     ///
     /// ```rust,no_run
@@ -35,12 +30,14 @@ impl AppState {
     ///
     /// #[tokio::main]
     /// async fn main() {
-    ///     let state = AppState::new(PathBuf::from("/path/to/bamboo-data-dir")).await;
+    ///     let state = AppState::new(PathBuf::from("/path/to/bamboo-data-dir"))
+    ///         .await
+    ///         .expect("failed to initialize app state");
     ///     let provider = state.get_provider().await;
     ///     let _models = provider.list_models().await.ok();
     /// }
     /// ```
-    pub async fn new(bamboo_home_dir: PathBuf) -> Self {
+    pub async fn new(bamboo_home_dir: PathBuf) -> Result<Self, AppError> {
         // Ensure all helpers that rely on `core::paths::bamboo_dir()` see the same
         // directory as the server runtime.
         crate::core::paths::init_bamboo_dir(bamboo_home_dir.clone());
@@ -57,7 +54,7 @@ impl AppState {
                 Err(e) => {
                     // Keep the server usable for configuration/UI even when provider init fails,
                     // but do not silently fall back to a different provider.
-                    log::error!("Failed to create provider: {}.", e);
+                    tracing::error!("Failed to create provider: {}.", e);
                     Arc::new(UnconfiguredProvider {
                         message: e.to_string(),
                     })
@@ -91,17 +88,13 @@ impl AppState {
     /// 7. Initialize skill manager
     /// 8. Initialize metrics service with SQLite backend
     /// 9. Start runner cleanup task (removes completed runners after 5 minutes)
-    ///
-    /// # Panics
-    ///
-    /// Panics if storage or metrics initialization fails.
     pub async fn new_with_provider(
         bamboo_home_dir: PathBuf,
         config: Config,
         provider: Arc<dyn LLMProvider>,
-    ) -> Self {
+    ) -> Result<Self, AppError> {
         let data_dir = bamboo_home_dir.clone();
-        let (session_store, storage) = init_storage_components(&data_dir).await;
+        let (session_store, storage) = init_storage_components(&data_dir).await?;
 
         // In-memory session cache (shared across handlers and background jobs).
         let sessions: Arc<RwLock<HashMap<String, crate::agent::core::Session>>> =
@@ -124,7 +117,7 @@ impl AppState {
             storage.clone(),
             sessions.clone(),
         );
-        let metrics_service = init_metrics_service(&data_dir).await;
+        let metrics_service = init_metrics_service(&data_dir).await?;
 
         let agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -168,7 +161,7 @@ impl AppState {
             session_event_senders.clone(),
         );
 
-        let schedule_store = init_schedule_store(&data_dir).await;
+        let schedule_store = init_schedule_store(&data_dir).await?;
         let schedule_manager = build_schedule_manager(
             schedule_store.clone(),
             session_store.clone(),
@@ -195,7 +188,7 @@ impl AppState {
             session_event_senders.clone(),
         );
 
-        Self {
+        Ok(Self {
             app_data_dir: bamboo_home_dir,
             config,
             provider: provider_lock,
@@ -219,27 +212,33 @@ impl AppState {
             claude_runners,
             claude_session_aliases: Arc::new(RwLock::new(HashMap::new())),
             metrics_bus: None, // Will be set by server if needed
-        }
+        })
     }
 }
 
-async fn init_storage_components(data_dir: &PathBuf) -> (Arc<SessionStoreV2>, Arc<dyn Storage>) {
-    log::info!("Initializing session store V2 at: {:?}", data_dir);
+async fn init_storage_components(
+    data_dir: &PathBuf,
+) -> Result<(Arc<SessionStoreV2>, Arc<dyn Storage>), AppError> {
+    tracing::info!("Initializing session store V2 at: {:?}", data_dir);
     let session_store = Arc::new(
         SessionStoreV2::new(data_dir.clone())
             .await
-            .unwrap_or_else(|e| {
-                log::error!("Failed to init SessionStoreV2 at {:?}: {}", data_dir, e);
-                panic!("Failed to init SessionStoreV2: {}", e);
-            }),
+            .map_err(|error| {
+                tracing::error!(
+                    "Failed to initialize SessionStoreV2 at {:?}: {}",
+                    data_dir,
+                    error
+                );
+                AppError::StorageError(error)
+            })?,
     );
     let storage: Arc<dyn Storage> = session_store.clone();
-    log::info!(
+    tracing::info!(
         "Session store V2 initialized (index: {:?}, sessions: {:?})",
         session_store.index_path(),
         session_store.sessions_root_dir()
     );
-    (session_store, storage)
+    Ok((session_store, storage))
 }
 
 async fn load_permission_checker(bamboo_home_dir: &PathBuf) -> Arc<PermissionChecker> {
@@ -252,7 +251,7 @@ async fn load_permission_checker(bamboo_home_dir: &PathBuf) -> Arc<PermissionChe
             cfg
         }
         Err(error) => {
-            log::warn!("Failed to load permission config; defaulting to disabled: {error}");
+            tracing::warn!("Failed to load permission config; defaulting to disabled: {error}");
             let cfg = crate::agent::tools::permission::PermissionConfig::new();
             cfg.set_enabled(false);
             cfg
@@ -275,9 +274,9 @@ fn spawn_claude_cli_discovery_task(claude_cli_path: Arc<RwLock<Option<String>>>)
 
         if let Some(path) = discovered {
             *claude_cli_path.write().await = Some(path.clone());
-            log::info!("Claude Code CLI discovered (found at: {})", path);
+            tracing::info!("Claude Code CLI discovered (found at: {})", path);
         } else {
-            log::warn!("Claude Code CLI not found; Claude integration disabled");
+            tracing::warn!("Claude Code CLI not found; Claude integration disabled");
         }
     });
 }
@@ -355,21 +354,22 @@ async fn init_skill_manager(data_dir: &PathBuf) -> Arc<SkillManager> {
         skills_dir: data_dir.join("skills"),
     }));
     if let Err(error) = skill_manager.initialize().await {
-        log::warn!("Failed to initialize skill manager: {}", error);
+        tracing::warn!("Failed to initialize skill manager: {}", error);
     }
     skill_manager
 }
 
-async fn init_metrics_service(data_dir: &PathBuf) -> Arc<MetricsService> {
+async fn init_metrics_service(data_dir: &PathBuf) -> Result<Arc<MetricsService>, AppError> {
     // Initialize metrics service
-    Arc::new(
-        MetricsService::new(data_dir.join("metrics.db"))
-            .await
-            .unwrap_or_else(|error| {
-                log::error!("Failed to initialize metrics storage: {}", error);
-                panic!("Failed to init metrics storage: {}", error);
-            }),
-    )
+    let service = MetricsService::new(data_dir.join("metrics.db"))
+        .await
+        .map_err(|error| {
+            tracing::error!("Failed to initialize metrics storage: {}", error);
+            AppError::InternalError(anyhow::anyhow!(
+                "Failed to initialize metrics storage: {error}"
+            ))
+        })?;
+    Ok(Arc::new(service))
 }
 
 fn spawn_runner_cleanup_task(
@@ -396,9 +396,9 @@ fn spawn_runner_cleanup_task(
 
                 if !should_keep {
                     if let Some(prefix) = log_prefix {
-                        log::debug!("[{}:{}] Cleaning up completed runner", prefix, session_id);
+                        tracing::debug!("[{}:{}] Cleaning up completed runner", prefix, session_id);
                     } else {
-                        log::debug!("[{}] Cleaning up completed runner", session_id);
+                        tracing::debug!("[{}] Cleaning up completed runner", session_id);
                     }
                 }
 
@@ -464,16 +464,19 @@ fn build_tools_with_task(
     ))
 }
 
-async fn init_schedule_store(data_dir: &PathBuf) -> Arc<ScheduleStore> {
+async fn init_schedule_store(data_dir: &PathBuf) -> Result<Arc<ScheduleStore>, AppError> {
     // Initialize schedule store + manager (timed tasks).
-    Arc::new(
-        ScheduleStore::new(data_dir.clone())
-            .await
-            .unwrap_or_else(|e| {
-                log::error!("Failed to init ScheduleStore at {:?}: {}", data_dir, e);
-                panic!("Failed to init ScheduleStore: {}", e);
-            }),
-    )
+    let store = ScheduleStore::new(data_dir.clone())
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                "Failed to initialize ScheduleStore at {:?}: {}",
+                data_dir,
+                error
+            );
+            AppError::StorageError(error)
+        })?;
+    Ok(Arc::new(store))
 }
 
 fn build_schedule_manager(

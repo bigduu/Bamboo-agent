@@ -12,6 +12,6 @@ impl DebugLogger {
             return;
         }
 
-        log::debug!("[{}] {}: {}", session_id, event_type, details);
+        tracing::debug!("[{}] {}: {}", session_id, event_type, details);
     }
 }

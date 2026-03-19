@@ -54,7 +54,7 @@ pub(super) async fn prepare_session_for_loop(
 
     let todo_context = TodoLoopContext::from_session(session);
     if todo_context.is_some() {
-        log::debug!("[{}] TodoLoopContext initialized", session_id);
+        tracing::debug!("[{}] TodoLoopContext initialized", session_id);
     }
     todo_context
 }

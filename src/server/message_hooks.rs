@@ -92,7 +92,7 @@ async fn apply_image_fallback_hook(
                 }
                 #[cfg(not(windows))]
                 {
-                    log::info!(
+                    tracing::info!(
                         "OCR hook enabled but OCR is currently Windows-only; leaving images intact."
                     );
                 }
@@ -108,7 +108,7 @@ async fn apply_image_fallback_hook(
     }
 
     if images_seen > 0 && mode == "placeholder" && rewritten_messages > 0 {
-        log::warn!(
+        tracing::warn!(
             "Image inputs detected ({} part(s)); rewrote {} message(s) to placeholder text. Disable hooks.image_fallback.enabled to preserve images.",
             images_seen,
             rewritten_messages
@@ -221,7 +221,7 @@ async fn rewrite_parts_to_ocr_text(state: Option<&AppState>, parts: &[ContentPar
                         out.push_str("]\n(no text detected)\n");
                     }
                     Err(err) => {
-                        log::warn!(
+                        tracing::warn!(
                             "OCR failed for image {} ({}): {}",
                             image_index,
                             summary,

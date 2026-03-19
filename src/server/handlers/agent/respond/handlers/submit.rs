@@ -27,7 +27,7 @@ pub async fn submit_response(
     let user_response = req.response.clone();
     let requested_model = req.model.clone();
 
-    log::info!("[{}] Received user response: {}", session_id, user_response);
+    tracing::info!("[{}] Received user response: {}", session_id, user_response);
 
     let Some(mut session) = load_session_from_memory_or_storage(&state, &session_id).await else {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
@@ -54,12 +54,12 @@ pub async fn submit_response(
     }
 
     let tool_call_id = pending.tool_call_id.clone();
-    log::debug!(
+    tracing::debug!(
         "[{}] Looking for tool result message with tool_call_id: {}",
         session_id,
         tool_call_id
     );
-    log::debug!(
+    tracing::debug!(
         "[{}] Session has {} messages",
         session_id,
         session.messages.len()
@@ -67,9 +67,9 @@ pub async fn submit_response(
 
     let found = update_or_append_tool_result_message(&mut session, &tool_call_id, &user_response);
     if found {
-        log::info!("[{}] Updated existing tool result message", session_id);
+        tracing::info!("[{}] Updated existing tool result message", session_id);
     } else {
-        log::warn!(
+        tracing::warn!(
             "[{}] Tool result message not found for tool_call_id: {}, added fallback message",
             session_id,
             tool_call_id
@@ -81,8 +81,16 @@ pub async fn submit_response(
         .metadata
         .insert(ASK_USER_RESUME_PENDING_KEY.to_string(), "true".to_string());
 
+    // Resolve reasoning_effort: request → session metadata fallback.
+    // Read from session *before* it is moved into the sessions map.
+    let metadata_reasoning_effort = session
+        .metadata
+        .get("reasoning_effort")
+        .and_then(|v| crate::core::ReasoningEffort::parse(v));
+    let effective_reasoning_effort = req.reasoning_effort.or(metadata_reasoning_effort);
+
     if let Err(error) = state.storage.save_session(&session).await {
-        log::warn!(
+        tracing::warn!(
             "[{}] Failed to save session after response: {}",
             session_id,
             error
@@ -94,13 +102,18 @@ pub async fn submit_response(
         sessions.insert(session_id.clone(), session);
     }
 
-    log::info!(
+    tracing::info!(
         "[{}] Response processed successfully, agent loop can resume",
         session_id
     );
 
-    let auto_resume_status =
-        trigger_auto_resume_if_requested(state.clone(), &session_id, requested_model).await;
+    let auto_resume_status = trigger_auto_resume_if_requested(
+        state.clone(),
+        &session_id,
+        requested_model,
+        effective_reasoning_effort,
+    )
+    .await;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
@@ -114,6 +127,7 @@ async fn trigger_auto_resume_if_requested(
     state: web::Data<AppState>,
     session_id: &str,
     requested_model: Option<String>,
+    reasoning_effort: Option<crate::core::ReasoningEffort>,
 ) -> String {
     let Some(model) = requested_model.map(|model| model.trim().to_string()) else {
         return "not_requested".to_string();
@@ -127,7 +141,7 @@ async fn trigger_auto_resume_if_requested(
         web::Path::from(session_id.to_string()),
         web::Json(crate::server::handlers::agent::execute::ExecuteRequest {
             model,
-            reasoning_effort: None,
+            reasoning_effort,
         }),
     )
     .await;

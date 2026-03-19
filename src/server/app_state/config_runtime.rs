@@ -24,7 +24,9 @@ impl AppState {
     ///
     /// #[tokio::main]
     /// async fn main() {
-    ///     let state = AppState::new(PathBuf::from("/path/to/.bamboo")).await;
+    ///     let state = AppState::new(PathBuf::from("/path/to/.bamboo"))
+    ///         .await
+    ///         .expect("failed to initialize app state");
     ///
     ///     // User updated config file...
     ///     state.reload_provider().await.expect("Provider reload failed");
@@ -57,7 +59,7 @@ impl AppState {
             _ => None,
         };
 
-        log::info!(
+        tracing::info!(
             "Reloading provider: type={}, model={:?}",
             config.provider,
             configured_model
@@ -69,7 +71,7 @@ impl AppState {
         let mut provider = self.provider.write().await;
         *provider = new_provider;
 
-        log::info!("Provider reloaded successfully to: {}", config.provider);
+        tracing::info!("Provider reloaded successfully to: {}", config.provider);
         Ok(())
     }
 
@@ -91,7 +93,9 @@ impl AppState {
     ///
     /// #[tokio::main]
     /// async fn main() {
-    ///     let state = AppState::new(PathBuf::from("/path/to/.bamboo")).await;
+    ///     let state = AppState::new(PathBuf::from("/path/to/.bamboo"))
+    ///         .await
+    ///         .expect("failed to initialize app state");
     ///
     ///     // Reload config from disk
     ///     let new_config = state.reload_config().await;

@@ -23,6 +23,7 @@ pub(in crate::server::handlers::agent::execute) struct SpawnAgentExecution {
     pub(in crate::server::handlers::agent::execute) session_id: String,
     pub(in crate::server::handlers::agent::execute) session: Session,
     pub(in crate::server::handlers::agent::execute) is_child_session: bool,
+    pub(in crate::server::handlers::agent::execute) provider_name: String,
     pub(in crate::server::handlers::agent::execute) model: String,
     pub(in crate::server::handlers::agent::execute) reasoning_effort: Option<ReasoningEffort>,
     pub(in crate::server::handlers::agent::execute) reasoning_effort_source: String,
@@ -41,6 +42,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
             session_id,
             mut session,
             is_child_session,
+            provider_name,
             model,
             reasoning_effort,
             reasoning_effort_source,
@@ -62,7 +64,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
         };
 
         // Use model from request (not from session - session.model is just for recording/debugging).
-        log::info!(
+        tracing::info!(
             "[{}] Using model from request: {}, reasoning_effort={}, reasoning_source={}",
             session_id,
             model,
@@ -76,15 +78,15 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
         session.model = model.clone();
 
         if let Some(prompt) = system_prompt.as_ref() {
-            log::info!("[{}] ========== SYSTEM PROMPT ==========", session_id);
-            log::info!(
+            tracing::info!("[{}] ========== SYSTEM PROMPT ==========", session_id);
+            tracing::info!(
                 "[{}] Final prompt length: {} chars",
                 session_id,
                 prompt.len()
             );
-            log::info!("[{}] -----------------------------------", session_id);
-            log::info!("[{}] {}", session_id, prompt);
-            log::info!("[{}] ========== END SYSTEM PROMPT ==========", session_id);
+            tracing::info!("[{}] -----------------------------------", session_id);
+            tracing::info!("[{}] {}", session_id, prompt);
+            tracing::info!("[{}] ========== END SYSTEM PROMPT ==========", session_id);
         }
 
         // Run agent loop.
@@ -99,7 +101,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
             tools,
             cancel_token,
             AgentLoopConfig {
-                max_rounds: 50,
+                max_rounds: 200,
                 system_prompt,
                 selected_skill_ids,
                 skill_manager: Some(state.skill_manager.clone()),
@@ -108,6 +110,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
                 attachment_reader: Some(state.session_store.clone()),
                 metrics_collector: Some(state.metrics_service.collector()),
                 model_name: Some(model),
+                provider_name: Some(provider_name),
                 reasoning_effort,
                 disabled_tools,
                 image_fallback,
@@ -145,7 +148,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
             tokens.remove(&session_id);
         }
 
-        log::info!("[{}] Agent execution completed", session_id);
+        tracing::info!("[{}] Agent execution completed", session_id);
     });
 }
 

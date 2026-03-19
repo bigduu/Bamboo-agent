@@ -22,19 +22,24 @@ impl WebFetchTool {
         Self
     }
 
-    fn strip_html(input: &str) -> String {
-        let script_re = Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap();
-        let style_re = Regex::new(r"(?is)<style[^>]*>.*?</style>").unwrap();
-        let tag_re = Regex::new(r"(?is)<[^>]+>").unwrap();
-        let whitespace_re = Regex::new(r"[ \t\n\r]+").unwrap();
+    fn strip_html(input: &str) -> Result<String, ToolError> {
+        let script_re = Regex::new(r"(?is)<script[^>]*>.*?</script>")
+            .map_err(|e| ToolError::Execution(format!("Failed to compile script regex: {}", e)))?;
+        let style_re = Regex::new(r"(?is)<style[^>]*>.*?</style>")
+            .map_err(|e| ToolError::Execution(format!("Failed to compile style regex: {}", e)))?;
+        let tag_re = Regex::new(r"(?is)<[^>]+>")
+            .map_err(|e| ToolError::Execution(format!("Failed to compile tag regex: {}", e)))?;
+        let whitespace_re = Regex::new(r"[ \t\n\r]+").map_err(|e| {
+            ToolError::Execution(format!("Failed to compile whitespace regex: {}", e))
+        })?;
 
         let without_scripts = script_re.replace_all(input, " ");
         let without_styles = style_re.replace_all(&without_scripts, " ");
         let without_tags = tag_re.replace_all(&without_styles, " ");
-        whitespace_re
+        Ok(whitespace_re
             .replace_all(&without_tags, " ")
             .trim()
-            .to_string()
+            .to_string())
     }
 
     fn is_disallowed_ip(ip: IpAddr) -> bool {
@@ -184,7 +189,7 @@ impl Tool for WebFetchTool {
 
         let body = String::from_utf8_lossy(&bytes).to_string();
 
-        let text = Self::strip_html(&body);
+        let text = Self::strip_html(&body)?;
         let excerpt: String = text.chars().take(20_000).collect();
 
         Ok(ToolResult {

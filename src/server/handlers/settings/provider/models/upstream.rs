@@ -10,7 +10,7 @@ pub(super) async fn fetch_models_from_api(
 ) -> Result<Vec<String>, AppError> {
     let request = build_provider_models_request(provider, api_key, base_url)?;
 
-    log::info!("Fetching models from: {}", request.url);
+    tracing::info!("Fetching models from: {}", request.url);
 
     let mut http_request = client.get(&request.url);
     if let Some((header_name, header_value)) = request.auth_header {
@@ -37,7 +37,7 @@ pub(super) async fn fetch_models_from_api(
     })?;
 
     let models = extract_model_ids(json)?;
-    log::info!("Fetched {} models", models.len());
+    tracing::info!("Fetched {} models", models.len());
     Ok(models)
 }
 

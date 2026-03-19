@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use actix_web::{web, App, HttpServer};
-use log::{error, info};
+use tracing::{error, info};
 use tokio::sync::oneshot;
 
 use super::listeners::DEFAULT_WORKER_COUNT;
@@ -45,7 +45,11 @@ impl WebService {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         self.port = port;
 
-        let app_state = web::Data::new(AppState::new(self.bamboo_home_dir.clone()).await);
+        let app_state = web::Data::new(
+            AppState::new(self.bamboo_home_dir.clone())
+                .await
+                .map_err(|e| format!("Failed to initialize app state: {e}"))?,
+        );
         let bind_addr = "127.0.0.1".to_string();
 
         let server = HttpServer::new(move || {

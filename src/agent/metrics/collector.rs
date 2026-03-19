@@ -79,7 +79,7 @@ impl MetricsCollector {
 
         tokio::spawn(async move {
             if let Err(error) = storage.init().await {
-                log::error!("metrics storage initialization failed: {}", error);
+                tracing::error!("metrics storage initialization failed: {}", error);
             }
 
             while let Some(command) = rx.recv().await {
@@ -195,7 +195,7 @@ impl MetricsCollector {
                 };
 
                 if let Err(error) = outcome {
-                    log::warn!("metrics collector command failed: {}", error);
+                    tracing::warn!("metrics collector command failed: {}", error);
                 }
             }
         });

@@ -67,7 +67,7 @@ pub async fn set_proxy_auth(
         .await?;
 
     if let Err(e) = app_state.reload_provider().await {
-        log::warn!("Proxy auth updated but provider reload failed: {}", e);
+        tracing::warn!("Proxy auth updated but provider reload failed: {}", e);
     }
 
     Ok(HttpResponse::Ok().json(serde_json::json!({ "success": true })))

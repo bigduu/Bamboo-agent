@@ -100,6 +100,7 @@ pub(super) fn convert_llm_chunk_to_openai(
     model: &str,
 ) -> Option<ChatCompletionStreamChunk> {
     match chunk {
+        crate::agent::llm::types::LLMChunk::ResponseId(_) => None,
         crate::agent::llm::types::LLMChunk::Token(text) => Some(ChatCompletionStreamChunk {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             object: Some("chat.completion.chunk".to_string()),

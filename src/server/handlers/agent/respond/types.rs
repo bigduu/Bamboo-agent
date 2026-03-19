@@ -1,3 +1,4 @@
+use crate::core::ReasoningEffort;
 use serde::Deserialize;
 
 /// Request payload for submitting a user response.
@@ -11,6 +12,10 @@ pub struct RespondRequest {
     pub response: String,
     /// Optional model to auto-resume execution after recording response.
     pub model: Option<String>,
+    /// Optional reasoning effort to use when auto-resuming execution.
+    /// Falls back to the value stored in session metadata if not provided.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[cfg(test)]
@@ -53,6 +58,7 @@ mod tests {
         let req = RespondRequest {
             response: "test response".to_string(),
             model: None,
+            reasoning_effort: None,
         };
         let debug_str = format!("{:?}", req);
         assert!(debug_str.contains("RespondRequest"));
@@ -71,5 +77,21 @@ mod tests {
         let json = r#"{"response":"   "}"#;
         let req: RespondRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.response, "   ");
+    }
+
+    #[test]
+    fn test_respond_request_with_reasoning_effort() {
+        let json = r#"{"response":"yes","model":"gpt-5-mini","reasoning_effort":"high"}"#;
+        let req: RespondRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.response, "yes");
+        assert_eq!(req.model.as_deref(), Some("gpt-5-mini"));
+        assert_eq!(req.reasoning_effort, Some(crate::core::ReasoningEffort::High));
+    }
+
+    #[test]
+    fn test_respond_request_without_reasoning_effort() {
+        let json = r#"{"response":"yes","model":"gpt-5-mini"}"#;
+        let req: RespondRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.reasoning_effort, None);
     }
 }

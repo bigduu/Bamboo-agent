@@ -6,9 +6,33 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::core::agent::events::TokenBudgetUsage;
 use crate::agent::core::budget::PreparedContext;
 use crate::agent::core::tools::ToolSchema;
-use crate::agent::core::{AgentError, AgentEvent, Session};
+use crate::agent::core::{AgentError, AgentEvent, Message, Role, Session};
+use crate::agent::llm::provider::ResponsesRequestOptions;
 use crate::agent::llm::{LLMProvider, LLMRequestOptions};
 use crate::core::ReasoningEffort;
+
+const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
+
+fn session_previous_response_id(session: &Session) -> Option<&str> {
+    session
+        .metadata
+        .get(SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn continuation_messages(messages: &[Message]) -> Option<&[Message]> {
+    let last_assistant_index = messages
+        .iter()
+        .rposition(|message| matches!(message.role, Role::Assistant))?;
+    let continuation = messages.get(last_assistant_index + 1..)?;
+    (!continuation.is_empty()).then_some(continuation)
+}
+
+fn provider_supports_previous_response_id(provider_name: Option<&str>) -> bool {
+    !matches!(provider_name.map(str::trim), Some("copilot"))
+}
 
 pub(super) async fn execute_llm_stream(
     session: &mut Session,
@@ -19,6 +43,7 @@ pub(super) async fn execute_llm_stream(
     tool_schemas: &[ToolSchema],
     max_output_tokens: u32,
     model: &str,
+    provider_name: Option<&str>,
     reasoning_effort: Option<ReasoningEffort>,
     session_id: &str,
 ) -> Result<
@@ -29,13 +54,46 @@ pub(super) async fn execute_llm_stream(
     AgentError,
 > {
     let llm_started_at = std::time::Instant::now();
+    let supports_previous_response_id = provider_supports_previous_response_id(provider_name);
+    let previous_response_id = if supports_previous_response_id {
+        session_previous_response_id(session)
+    } else {
+        None
+    };
+    let request_messages = if previous_response_id.is_some() {
+        continuation_messages(&prepared_context.messages)
+            .unwrap_or(prepared_context.messages.as_slice())
+    } else {
+        prepared_context.messages.as_slice()
+    };
     let request_options = LLMRequestOptions {
         reasoning_effort,
-        responses: None,
+        responses: previous_response_id.map(|response_id| ResponsesRequestOptions {
+            previous_response_id: Some(response_id.to_string()),
+            store: Some(false),
+            ..Default::default()
+        }),
     };
+
+    if !supports_previous_response_id {
+        tracing::debug!(
+            "[{}] Responses API previous_response_id disabled for provider={}",
+            session_id,
+            provider_name.unwrap_or("unknown")
+        );
+    } else if let Some(response_id) = previous_response_id {
+        tracing::debug!(
+            "[{}] Continuing Responses API turn with previous_response_id={} using {} delta messages ({} total messages in context)",
+            session_id,
+            response_id,
+            request_messages.len(),
+            prepared_context.messages.len()
+        );
+    }
+
     let stream = llm
         .chat_stream_with_options(
-            &prepared_context.messages,
+            request_messages,
             tool_schemas,
             Some(max_output_tokens),
             model,
@@ -60,7 +118,7 @@ pub(super) async fn execute_llm_stream(
 
     let budget_event = AgentEvent::TokenBudgetUpdated { usage };
     if let Err(error) = event_tx.send(budget_event).await {
-        log::warn!(
+        tracing::warn!(
             "[{}] Failed to send token budget event: {}",
             session_id,
             error
@@ -74,6 +132,28 @@ pub(super) async fn execute_llm_stream(
         session_id,
     )
     .await?;
+
+    if supports_previous_response_id {
+        if let Some(response_id) = stream_output
+            .response_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            session.metadata.insert(
+                SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY.to_string(),
+                response_id.to_string(),
+            );
+        } else {
+            session
+                .metadata
+                .remove(SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+        }
+    } else {
+        session
+            .metadata
+            .remove(SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+    }
 
     let llm_duration = llm_started_at.elapsed().as_millis();
 

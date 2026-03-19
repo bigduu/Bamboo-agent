@@ -126,7 +126,8 @@ impl Tool for WebSearchTool {
                 .map_err(|e| {
                     ToolError::Execution(format!("Failed to compile parser regex: {}", e))
                 })?;
-        let tag_re = Regex::new(r"(?is)<[^>]+>").unwrap();
+        let tag_re = Regex::new(r"(?is)<[^>]+>")
+            .map_err(|e| ToolError::Execution(format!("Failed to compile tag regex: {}", e)))?;
 
         let mut results = Vec::new();
         for capture in link_re.captures_iter(&html) {

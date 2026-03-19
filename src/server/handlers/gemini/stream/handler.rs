@@ -23,7 +23,7 @@ pub async fn stream_generate_content(
         resolve_model(&config.gemini_model_mapping, &gemini_model)
     };
 
-    log::info!(
+    tracing::info!(
         "Gemini streamGenerateContent: requested='{}', mapped='{}'",
         gemini_model,
         if resolution.mapped_model.is_empty() {

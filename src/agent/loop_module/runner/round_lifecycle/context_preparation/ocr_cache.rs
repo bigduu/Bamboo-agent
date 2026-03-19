@@ -27,7 +27,7 @@ pub(super) async fn maybe_cache_ocr_results(
         if changed {
             if let Some(ref storage) = config.storage {
                 if let Err(error) = storage.save_session(session).await {
-                    log::warn!(
+                    tracing::warn!(
                         "[{}] Failed to save session after OCR caching: {}",
                         session_id,
                         error

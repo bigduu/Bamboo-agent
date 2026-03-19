@@ -53,7 +53,9 @@
 //! async fn main() {
 //!     // Initialize app state
 //!     let app_data_dir = PathBuf::from("/path/to/.bamboo");
-//!     let state = AppState::new(app_data_dir).await;
+//!     let state = AppState::new(app_data_dir)
+//!         .await
+//!         .expect("failed to initialize app state");
 //!
 //!     // Access components
 //!     let provider = state.get_provider().await;

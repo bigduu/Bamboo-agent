@@ -18,7 +18,7 @@ pub async fn handler(
     _req: HttpRequest,
 ) -> impl Responder {
     let session_id = path.into_inner();
-    log::debug!("[{}] Events subscription requested", session_id);
+    tracing::debug!("[{}] Events subscription requested", session_id);
 
     // Validate session exists (index-backed).
     if state
@@ -27,7 +27,7 @@ pub async fn handler(
         .await
         .is_none()
     {
-        log::warn!("[{}] Session not found for events subscription", session_id);
+        tracing::warn!("[{}] Session not found for events subscription", session_id);
         return HttpResponse::NotFound().json(serde_json::json!({
             "error": "Session not found",
             "session_id": session_id

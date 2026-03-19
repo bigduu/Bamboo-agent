@@ -136,7 +136,7 @@ impl LLMProvider for AnthropicProvider {
             "none"
         };
 
-        log::debug!("Anthropic provider using model: {}", model);
+        tracing::debug!("Anthropic provider using model: {}", model);
 
         let body =
             build_anthropic_request(messages, tools, model, max_tokens, true, reasoning_effort);
@@ -146,7 +146,7 @@ impl LLMProvider for AnthropicProvider {
             .get("thinking")
             .and_then(|thinking| thinking.get("budget_tokens"))
             .and_then(|value| value.as_u64());
-        log::info!(
+        tracing::info!(
             "Anthropic request model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_enabled={} thinking_budget_tokens={} max_tokens={}",
             model,
             applied_reasoning_effort
@@ -178,7 +178,7 @@ impl LLMProvider for AnthropicProvider {
             if reasoning_effort.is_some()
                 && Self::looks_like_reasoning_unsupported_error(status, &text)
             {
-                log::warn!(
+                tracing::warn!(
                     "Anthropic /messages rejected reasoning for model '{}'; retrying without reasoning_effort",
                     model
                 );
@@ -188,7 +188,7 @@ impl LLMProvider for AnthropicProvider {
                 applied_reasoning_effort = None;
                 thinking_enabled = false;
                 thinking_budget_tokens = None;
-                log::info!(
+                tracing::info!(
                     "Anthropic request retry model='{}' reasoning_effort=none reasoning_source={} request_reasoning_enabled=false thinking_enabled=false thinking_budget_tokens=none max_tokens={}",
                     model,
                     reasoning_source,
@@ -293,7 +293,7 @@ fn anthropic_thinking_from_effort(
         ReasoningEffort::Low => return None,
         ReasoningEffort::Medium => 1024,
         ReasoningEffort::High => 4096,
-        ReasoningEffort::Xhigh => 8192,
+        ReasoningEffort::Xhigh | ReasoningEffort::Max => 8192,
     };
 
     // Keep some room for final answer tokens.
@@ -357,10 +357,20 @@ fn message_to_anthropic_json(message: &Message) -> Value {
             })
         }
         Role::Tool => {
-            let tool_use_id = message
-                .tool_call_id
-                .as_deref()
-                .expect("tool messages must include tool_call_id");
+            let Some(tool_use_id) = message.tool_call_id.as_deref() else {
+                tracing::warn!(
+                    "Anthropic conversion received tool message without tool_call_id; emitting plain text block"
+                );
+                return json!({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": message.content,
+                        }
+                    ],
+                });
+            };
 
             json!({
                 "role": "user",
@@ -483,7 +493,7 @@ fn tool_call_to_tool_use_block(tool_call: &crate::agent::core::tools::ToolCall) 
     let input: Value = match serde_json::from_str(raw_arguments) {
         Ok(parsed) => parsed,
         Err(error) => {
-            log::warn!(
+            tracing::warn!(
                 "Anthropic tool_use conversion fallback to string input due to invalid JSON arguments: tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", error={}",
                 tool_call.id,
                 tool_call.function.name,
@@ -554,11 +564,11 @@ pub fn parse_anthropic_sse_event(
                             .and_then(|reason| reason.as_str())
                         {
                             if stop_reason == "max_tokens" {
-                                log::warn!(
+                                tracing::warn!(
                                     "Anthropic stream stop_reason=max_tokens; response may be truncated"
                                 );
                             } else {
-                                log::debug!("Anthropic stream stop_reason={stop_reason}");
+                                tracing::debug!("Anthropic stream stop_reason={stop_reason}");
                             }
                         }
 
@@ -576,18 +586,18 @@ pub fn parse_anthropic_sse_event(
 
                             if let Some(thinking_tokens) = thinking_tokens {
                                 state.saw_thinking_signal = true;
-                                log::info!(
+                                tracing::info!(
                                     "Anthropic stream usage output_tokens={} thinking_tokens={}",
                                     output_tokens.unwrap_or(0),
                                     thinking_tokens
                                 );
                             } else if let Some(output_tokens) = output_tokens {
-                                log::debug!("Anthropic stream usage output_tokens={output_tokens}");
+                                tracing::debug!("Anthropic stream usage output_tokens={output_tokens}");
                             }
                         }
                     }
                     Err(error) => {
-                        log::debug!(
+                        tracing::debug!(
                             "Failed to parse Anthropic message_delta payload for logging: {} (payload={})",
                             error,
                             preview_for_log(data, 120)
@@ -599,7 +609,7 @@ pub fn parse_anthropic_sse_event(
         }
         "message_stop" => {
             if state.request_thinking_enabled || state.saw_thinking_signal {
-                log::info!(
+                tracing::info!(
                     "Anthropic reasoning summary: requested_effort={} request_thinking_enabled={} request_thinking_budget_tokens={} observed_thinking_signal={} thinking_blocks_started={} thinking_chars_streamed={}",
                     state
                         .requested_reasoning_effort
@@ -622,7 +632,7 @@ pub fn parse_anthropic_sse_event(
                     .iter()
                     .map(|(index, (id, name))| format!("{index}:{name}:{id}"))
                     .collect();
-                log::warn!(
+                tracing::warn!(
                     "Anthropic message_stop received with {} open tool_use blocks (possible incomplete tool arguments): {}",
                     open_blocks.len(),
                     open_blocks.join(", ")
@@ -661,7 +671,7 @@ pub fn parse_anthropic_sse_event(
                 state.saw_thinking_signal = true;
                 state.thinking_blocks_started = state.thinking_blocks_started.saturating_add(1);
                 state.thinking_blocks_by_index.insert(index);
-                log::info!(
+                tracing::info!(
                     "Anthropic thinking block started: index={} type={}",
                     index,
                     block_type
@@ -688,7 +698,7 @@ pub fn parse_anthropic_sse_event(
             state
                 .tool_uses_by_index
                 .insert(index, (id.to_string(), name.to_string()));
-            log::debug!(
+            tracing::debug!(
                 "Anthropic tool_use started: index={}, tool_call_id={}, tool_name={}",
                 index,
                 id,
@@ -746,7 +756,7 @@ pub fn parse_anthropic_sse_event(
                             "Anthropic input_json_delta for unknown tool_use index {index}: {data}"
                         )));
                     };
-                    log::trace!(
+                    tracing::trace!(
                         "Anthropic tool_use input_json_delta: index={}, tool_call_id={}, tool_name={}, chunk_len={}",
                         index,
                         id,
@@ -786,7 +796,7 @@ pub fn parse_anthropic_sse_event(
                             .unwrap_or(0);
                         state.thinking_chars_streamed =
                             state.thinking_chars_streamed.saturating_add(delta_len);
-                        log::trace!(
+                        tracing::trace!(
                             "Anthropic thinking_delta: index={}, chunk_len={}",
                             index,
                             delta_len

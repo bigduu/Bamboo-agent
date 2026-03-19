@@ -16,14 +16,14 @@ pub(super) async fn load_session(
         match state.storage.load_session(session_id).await {
             Ok(Some(restored)) => session = Some(restored),
             Ok(None) => {
-                log::warn!("[{}] Session not found", session_id);
+                tracing::warn!("[{}] Session not found", session_id);
                 return Err(HttpResponse::NotFound().json(serde_json::json!({
                     "error": "Session not found",
                     "session_id": session_id
                 })));
             }
             Err(error) => {
-                log::error!("[{}] Failed to load session: {}", session_id, error);
+                tracing::error!("[{}] Failed to load session: {}", session_id, error);
                 return Err(HttpResponse::InternalServerError().json(serde_json::json!({
                     "error": format!("Failed to load session: {}", error)
                 })));
@@ -31,5 +31,16 @@ pub(super) async fn load_session(
         }
     }
 
-    Ok(session.expect("session must be loaded from memory or storage"))
+    let Some(session) = session else {
+        tracing::error!(
+            "[{}] Session load completed without data after successful checks",
+            session_id
+        );
+        return Err(HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": "Session load unexpectedly returned no data",
+            "session_id": session_id
+        })));
+    };
+
+    Ok(session)
 }

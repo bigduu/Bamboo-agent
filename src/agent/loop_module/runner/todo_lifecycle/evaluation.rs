@@ -23,7 +23,7 @@ pub(super) async fn evaluate_round_todo_progress(
         return Ok(MetricsTokenUsage::default());
     };
 
-    log::debug!(
+    tracing::debug!(
         "[{}] Evaluating todo list progress at end of round {}",
         session_id,
         round_number
@@ -50,7 +50,7 @@ pub(super) async fn evaluate_round_todo_progress(
             usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
 
             if evaluation_result.needs_evaluation && !evaluation_result.updates.is_empty() {
-                log::info!(
+                tracing::info!(
                     "[{}] LLM evaluated {} todo item updates",
                     session_id,
                     evaluation_result.updates.len()
@@ -67,7 +67,7 @@ pub(super) async fn evaluate_round_todo_progress(
             }
         }
         Err(error) => {
-            log::warn!("[{}] Todo evaluation failed: {}", session_id, error);
+            tracing::warn!("[{}] Todo evaluation failed: {}", session_id, error);
         }
     }
 

@@ -73,7 +73,7 @@ impl SkillManager {
                 .filter(|selected| !filtered.iter().any(|skill| skill.id == *selected))
                 .collect();
             if !missing.is_empty() {
-                log::warn!(
+                tracing::warn!(
                     "Some selected skills were not found on disk and will be ignored: {:?}",
                     missing
                 );
@@ -89,7 +89,7 @@ impl SkillManager {
         selected_skill_ids: Option<&[String]>,
     ) -> String {
         let skills = self.list_skills_for_selection(selected_skill_ids).await;
-        log::info!(
+        tracing::info!(
             "Building skill context with {} skill(s), selection_mode={}",
             skills.len(),
             if selected_skill_ids.is_some() {

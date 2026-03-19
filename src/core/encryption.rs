@@ -377,7 +377,12 @@ pub fn decrypt(encrypted: &str) -> Result<String> {
     let cipher =
         Aes256Gcm::new_from_slice(&key).map_err(|e| anyhow!("Failed to create cipher: {e}"))?;
 
-    let nonce_array: [u8; 12] = nonce_bytes.try_into().expect("nonce length checked above");
+    let nonce_array: [u8; 12] = nonce_bytes.as_slice().try_into().map_err(|_| {
+        anyhow!(
+            "Invalid nonce length: expected 12, got {}",
+            nonce_bytes.len()
+        )
+    })?;
     let nonce = Nonce::from(nonce_array);
     let plaintext = cipher
         .decrypt(&nonce, ciphertext.as_ref())

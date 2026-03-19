@@ -30,7 +30,7 @@ impl TodoLoopContext {
                     .collect(),
                 active_item_id: None,
                 current_round: 0,
-                max_rounds: 50,
+                max_rounds: 200,
                 created_at: todo_list.created_at,
                 updated_at: todo_list.updated_at,
                 version: existing_version,

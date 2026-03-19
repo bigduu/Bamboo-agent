@@ -76,7 +76,7 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Res
     let deleted_from_storage = match state.storage.delete_session(&session_id).await {
         Ok(deleted) => deleted,
         Err(error) => {
-            log::error!(
+            tracing::error!(
                 "[{}] Failed to delete session from storage: {}",
                 session_id,
                 error
@@ -116,7 +116,7 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Res
     };
 
     if deleted_from_storage || removed_from_memory || cancelled_in_flight || cancelled_runner {
-        log::info!(
+        tracing::info!(
             "[{}] Session deleted successfully (storage: {}, memory: {}, cancelled: {}, runner_cancelled: {})",
             session_id,
             deleted_from_storage,

@@ -56,7 +56,7 @@ impl SpawnScheduler {
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
                 if let Err(err) = run_spawn_job(ctx.clone(), job).await {
-                    log::warn!("spawn job failed: {}", err);
+                    tracing::warn!("spawn job failed: {}", err);
                 }
             }
         });
@@ -278,6 +278,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
 
         let config_snapshot = ctx.config.read().await.clone();
         let disabled_tools = config_snapshot.disabled_tool_names();
+        let provider_name = config_snapshot.provider.clone();
 
         session.model = model.clone();
 
@@ -289,7 +290,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
             tools,
             cancel_token,
             AgentLoopConfig {
-                max_rounds: 50,
+                max_rounds: 200,
                 system_prompt,
                 additional_tool_schemas: Vec::new(),
                 skill_manager: Some(skill_manager),
@@ -298,6 +299,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
                 attachment_reader: Some(attachment_reader),
                 metrics_collector: Some(metrics),
                 model_name: Some(model),
+                provider_name: Some(provider_name),
                 disabled_tools,
                 ..Default::default()
             },

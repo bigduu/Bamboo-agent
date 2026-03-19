@@ -136,7 +136,9 @@ impl MessageSegmenter {
 
                                     // If all results collected, close the segment
                                     if pending_tool_calls.is_empty() {
-                                        segments.push(current_segment.take().unwrap());
+                                        if let Some(seg) = current_segment.take() {
+                                            segments.push(seg);
+                                        }
                                     }
                                     continue;
                                 }
@@ -152,7 +154,9 @@ impl MessageSegmenter {
                                 pending_tool_calls
                             );
                         }
-                        segments.push(current_segment.take().unwrap());
+                        if let Some(seg) = current_segment.take() {
+                            segments.push(seg);
+                        }
                     }
 
                     // Start new standalone segment for this message
@@ -171,8 +175,10 @@ impl MessageSegmenter {
                 Role::Assistant => {
                     // Check if this assistant is responding to a user message
                     // (no tool calls = standalone message)
-                    let has_tool_calls = message.tool_calls.is_some()
-                        && !message.tool_calls.as_ref().unwrap().is_empty();
+                    let has_tool_calls = message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| !calls.is_empty());
 
                     if !has_tool_calls {
                         // Close any pending segment

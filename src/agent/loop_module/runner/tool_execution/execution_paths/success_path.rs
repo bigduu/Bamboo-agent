@@ -63,7 +63,7 @@ pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -
             .mark_unsuccessful_tool(&ctx.tool_call.function.name);
     }
 
-    log::debug!(
+    tracing::debug!(
         "[{}] tool_complete: {}",
         ctx.session_id,
         serde_json::json!({

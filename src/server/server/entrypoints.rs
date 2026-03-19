@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use actix_files as fs;
 use actix_web::{web, App, HttpServer};
-use log::{error, info};
+use tracing::{error, info};
 
 use super::listeners::{build_bind_listeners, build_desktop_listeners, resolve_worker_count};
 use crate::server::app_state::AppState;
@@ -23,7 +23,11 @@ use crate::server::routes::{configure_routes, configure_routes_with_rate_limitin
 pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
     info!("Starting unified server in desktop mode...");
 
-    let app_state = web::Data::new(AppState::new(bamboo_home_dir.clone()).await);
+    let app_state = web::Data::new(
+        AppState::new(bamboo_home_dir.clone())
+            .await
+            .map_err(|e| format!("Failed to initialize app state: {e}"))?,
+    );
     let workers = resolve_worker_count();
 
     let app_factory = move || {
@@ -70,7 +74,11 @@ pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
 pub async fn run_with_bind(bamboo_home_dir: PathBuf, port: u16, bind: &str) -> Result<(), String> {
     info!("Starting unified server on {}:{}", bind, port);
 
-    let app_state = web::Data::new(AppState::new(bamboo_home_dir.clone()).await);
+    let app_state = web::Data::new(
+        AppState::new(bamboo_home_dir.clone())
+            .await
+            .map_err(|e| format!("Failed to initialize app state: {e}"))?,
+    );
     let workers = resolve_worker_count();
 
     let bind_for_cors = bind.to_string();
@@ -155,7 +163,11 @@ pub async fn run_with_bind_and_static(
         None => None,
     };
 
-    let app_state = web::Data::new(AppState::new(bamboo_home_dir.clone()).await);
+    let app_state = web::Data::new(
+        AppState::new(bamboo_home_dir.clone())
+            .await
+            .map_err(|e| format!("Failed to initialize app state: {e}"))?,
+    );
     let workers = resolve_worker_count();
 
     let bind_for_cors = bind.to_string();

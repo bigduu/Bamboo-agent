@@ -27,7 +27,7 @@ pub async fn execute_claude_code(
 ) -> Result<HttpResponse, AppError> {
     let claude_path = state.claude_cli_path.read().await.clone();
     let Some(claude_path) = claude_path else {
-        log::warn!("Claude Code CLI not available; refusing to execute");
+        tracing::warn!("Claude Code CLI not available; refusing to execute");
         return Ok(disabled_cli_response());
     };
 
@@ -37,7 +37,7 @@ pub async fn execute_claude_code(
         resolve_session_ids(req.session_id.clone());
 
     if alias_used {
-        log::warn!(
+        tracing::warn!(
             "Non-UUID session_id provided ({}); using generated Claude session UUID ({})",
             client_session_id,
             claude_session_id

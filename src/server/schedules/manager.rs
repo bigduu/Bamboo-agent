@@ -56,7 +56,7 @@ impl ScheduleManager {
             async move {
                 while let Some(job) = rx.recv().await {
                     if let Err(e) = run_schedule_job(ctx.clone(), job).await {
-                        log::warn!("schedule job failed: {e}");
+                        tracing::warn!("schedule job failed: {e}");
                     }
                 }
             }
@@ -74,7 +74,7 @@ impl ScheduleManager {
                     let claimed: Vec<ClaimedScheduleRun> = match store.claim_due_runs(now).await {
                         Ok(v) => v,
                         Err(e) => {
-                            log::warn!("claim_due_runs failed: {e}");
+                            tracing::warn!("claim_due_runs failed: {e}");
                             continue;
                         }
                     };
@@ -162,7 +162,7 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
         {
             Some(m) => m,
             None => {
-                log::warn!(
+                tracing::warn!(
                     "[schedule:{}] skipping run: no model configured (run_config.model is empty and config.get_model() returned None)",
                     job.schedule_id
                 );
@@ -249,7 +249,7 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
             .map(|m| matches!(m.role, Role::User))
             .unwrap_or(false);
 
-    log::info!(
+    tracing::info!(
         "[schedule:{}] created session {} (auto_execute={}, model={}, model_source={}, reasoning_effort={}, reasoning_source={})",
         job.schedule_id,
         session_id,
@@ -340,6 +340,7 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
             .filter(|m| matches!(m.role, Role::User))
             .map(|m| m.content.clone())
             .unwrap_or_default();
+        let provider_name = ctx.config.read().await.provider.clone();
 
         let result = run_agent_loop_with_config(
             &mut session,
@@ -349,7 +350,7 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
             tools,
             cancel_token,
             AgentLoopConfig {
-                max_rounds: 50,
+                max_rounds: 200,
                 system_prompt,
                 skill_manager: Some(skill_manager),
                 skip_initial_user_message: true,
@@ -357,6 +358,7 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
                 attachment_reader: Some(attachment_reader),
                 metrics_collector: Some(metrics),
                 model_name: Some(model.clone()),
+                provider_name: Some(provider_name),
                 reasoning_effort,
                 disabled_tools,
                 ..Default::default()
@@ -371,14 +373,14 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
                 format!("❌ Scheduled run failed: {e}"),
                 None,
             ));
-            log::warn!(
+            tracing::warn!(
                 "[schedule:{}][session:{}] scheduled run failed: {}",
                 schedule_id_for_log,
                 session_id_clone,
                 e
             );
         } else {
-            log::info!(
+            tracing::info!(
                 "[schedule:{}][session:{}] scheduled run completed",
                 schedule_id_for_log,
                 session_id_clone

@@ -116,7 +116,7 @@ impl Tool for ScheduleTasksTool {
                         "model": { "type": "string" },
                         "reasoning_effort": {
                             "type": "string",
-                            "enum": ["low", "medium", "high", "xhigh"]
+                            "enum": ["low", "medium", "high", "xhigh", "max"]
                         },
                         "workspace_path": { "type": "string" },
                         "enhance_prompt": { "type": "string" },

@@ -53,7 +53,7 @@ pub mod storage;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use log::info;
+use tracing::info;
 use tokio::sync::RwLock;
 
 use crate::agent::skill::store::builtin::load_builtin_skill_bundles;
@@ -270,7 +270,7 @@ impl SkillStore {
         // Optionally reload from disk to pick up new/updated skills
         if refresh {
             if let Err(e) = self.reload().await {
-                log::warn!("Failed to reload skills: {}", e);
+                tracing::warn!("Failed to reload skills: {}", e);
             }
         }
 

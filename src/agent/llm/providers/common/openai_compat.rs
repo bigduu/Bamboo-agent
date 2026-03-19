@@ -98,7 +98,7 @@ pub fn build_openai_compat_body(
     }
 
     if let Some(reasoning_effort) = reasoning_effort {
-        body["reasoning_effort"] = json!(reasoning_effort.as_str());
+        body["reasoning_effort"] = json!(reasoning_effort.to_wire_format(model));
     }
 
     body

@@ -2,6 +2,7 @@ use crate::agent::core::tools::ToolCall;
 
 #[derive(Debug, Clone)]
 pub enum LLMChunk {
+    ResponseId(String),
     Token(String),
     ReasoningToken(String),
     ToolCalls(Vec<ToolCall>),
@@ -27,6 +28,15 @@ mod tests {
         match chunk {
             LLMChunk::ReasoningToken(s) => assert_eq!(s, "Thinking..."),
             _ => panic!("Expected ReasoningToken variant"),
+        }
+    }
+
+    #[test]
+    fn test_llm_chunk_response_id() {
+        let chunk = LLMChunk::ResponseId("resp_123".to_string());
+        match chunk {
+            LLMChunk::ResponseId(id) => assert_eq!(id, "resp_123"),
+            _ => panic!("Expected ResponseId variant"),
         }
     }
 
@@ -64,6 +74,14 @@ mod tests {
         let debug_str = format!("{:?}", chunk);
         assert!(debug_str.contains("Token"));
         assert!(debug_str.contains("test"));
+    }
+
+    #[test]
+    fn test_llm_chunk_debug_response_id() {
+        let chunk = LLMChunk::ResponseId("resp_123".to_string());
+        let debug_str = format!("{:?}", chunk);
+        assert!(debug_str.contains("ResponseId"));
+        assert!(debug_str.contains("resp_123"));
     }
 
     #[test]

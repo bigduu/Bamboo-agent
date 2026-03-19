@@ -10,12 +10,12 @@ pub(super) async fn resolve_token_budget(
 ) -> TokenBudget {
     // Priority: session override > config override > model defaults.
     if let Some(ref budget) = session.token_budget {
-        log::debug!("Using session-specific token budget");
+        tracing::debug!("Using session-specific token budget");
         return budget.clone();
     }
 
     if let Some(ref budget) = config.token_budget {
-        log::debug!("Using config token budget");
+        tracing::debug!("Using config token budget");
         return budget.clone();
     }
 
@@ -33,14 +33,14 @@ pub(super) async fn resolve_token_budget(
     {
         Ok(Ok(limits)) => limits,
         Ok(Err(error)) => {
-            log::warn!(
+            tracing::warn!(
                 "Failed to parse model limits from config.json key 'model_limits': {}. Falling back to legacy file.",
                 error
             );
             None
         }
         Err(error) => {
-            log::warn!(
+            tracing::warn!(
                 "Failed to load model limits from config.json: {}. Falling back to legacy file.",
                 error
             );
@@ -53,7 +53,7 @@ pub(super) async fn resolve_token_budget(
             registry.add_limit(limit);
         }
     } else if let Err(error) = registry.load_user_config().await {
-        log::warn!(
+        tracing::warn!(
             "Failed to load model limits from legacy {:?}: {}",
             crate::agent::core::budget::limits::get_default_config_path(),
             error
@@ -66,7 +66,7 @@ pub(super) async fn resolve_token_budget(
         .unwrap_or_else(|| registry.get_or_default(model_name));
 
     if matched_limit.is_some() {
-        log::debug!(
+        tracing::debug!(
             "Using model limit for '{}': context={}, max_output={}, safety_margin={}",
             model_name,
             model_limit.max_context_tokens,
@@ -74,7 +74,7 @@ pub(super) async fn resolve_token_budget(
             model_limit.get_safety_margin()
         );
     } else {
-        log::info!(
+        tracing::info!(
             "No model limit match for '{}', using fallback '{}' (context={}). Override via {:?}",
             model_name,
             model_limit.model_pattern,

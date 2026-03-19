@@ -27,7 +27,7 @@ fn should_retry_round_error(error: &crate::agent::core::AgentError) -> bool {
         return false;
     }
 
-    // Hard failures should fail fast.
+    // Hard failures that should fail fast — everything else is retried.
     let non_retryable_patterns = [
         "authentication error",
         "invalid api key",
@@ -39,41 +39,8 @@ fn should_retry_round_error(error: &crate::agent::core::AgentError) -> bool {
         "http 403",
         "http 404",
     ];
-    if non_retryable_patterns
-        .iter()
-        .any(|pattern| message.contains(pattern))
-    {
-        return false;
-    }
 
-    // Retry on transient transport/API errors and empty generations.
-    let retryable_patterns = [
-        "empty assistant response",
-        "timeout",
-        "timed out",
-        "connection reset",
-        "connection refused",
-        "connection closed",
-        "broken pipe",
-        "temporarily unavailable",
-        "service unavailable",
-        "rate limit",
-        "too many requests",
-        "network",
-        "stream error",
-        "transport error",
-        "eof",
-        "http 408",
-        "http 409",
-        "http 425",
-        "http 429",
-        "http 500",
-        "http 502",
-        "http 503",
-        "http 504",
-    ];
-
-    retryable_patterns
+    !non_retryable_patterns
         .iter()
         .any(|pattern| message.contains(pattern))
 }
@@ -126,7 +93,7 @@ pub(super) async fn run_rounds(
                 Err(error) => {
                     if should_retry_round_error(&error) && attempt < MAX_LLM_ROUND_ATTEMPTS {
                         let delay_ms = LLM_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1));
-                        log::warn!(
+                        tracing::warn!(
                             "[{}] Round {} LLM call failed (attempt {}/{}): {}. Retrying in {}ms",
                             state.session_id,
                             round + 1,
@@ -139,6 +106,14 @@ pub(super) async fn run_rounds(
                         continue;
                     }
 
+                    tracing::error!(
+                        "[{}] Round {} LLM call failed terminally (attempt {}/{}): {}",
+                        state.session_id,
+                        round + 1,
+                        attempt,
+                        MAX_LLM_ROUND_ATTEMPTS,
+                        error,
+                    );
                     terminal_error = Some(error);
                     break;
                 }
@@ -169,7 +144,7 @@ pub(super) async fn run_rounds(
                 Err(error) => {
                     if should_retry_round_error(&error) && attempt < MAX_LLM_ROUND_ATTEMPTS {
                         let delay_ms = LLM_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1));
-                        log::warn!(
+                        tracing::warn!(
                             "[{}] Round {} post-LLM handling failed (attempt {}/{}): {}. Retrying in {}ms",
                             state.session_id,
                             round + 1,
@@ -182,6 +157,14 @@ pub(super) async fn run_rounds(
                         continue;
                     }
 
+                    tracing::error!(
+                        "[{}] Round {} post-LLM handling failed terminally (attempt {}/{}): {}",
+                        state.session_id,
+                        round + 1,
+                        attempt,
+                        MAX_LLM_ROUND_ATTEMPTS,
+                        error,
+                    );
                     terminal_error = Some(error);
                     break;
                 }
@@ -240,12 +223,49 @@ mod tests {
     }
 
     #[test]
+    fn retries_reqwest_transport_errors() {
+        // This was the original bug: "error sending request" was not retried.
+        assert!(should_retry_round_error(&AgentError::LLM(
+            "HTTP error: error sending request for url (https://api.githubcopilot.com/chat/completions)".to_string(),
+        )));
+    }
+
+    #[test]
+    fn retries_unknown_llm_errors_by_default() {
+        // Any LLM error that doesn't match non-retryable patterns should be retried.
+        assert!(should_retry_round_error(&AgentError::LLM(
+            "some completely unknown error".to_string(),
+        )));
+    }
+
+    #[test]
     fn does_not_retry_non_retryable_llm_errors() {
         assert!(!should_retry_round_error(&AgentError::LLM(
             "Authentication error: Invalid API key".to_string(),
         )));
         assert!(!should_retry_round_error(&AgentError::LLM(
             "API error: HTTP 400: invalid request".to_string(),
+        )));
+    }
+
+    #[test]
+    fn does_not_retry_non_llm_errors() {
+        assert!(!should_retry_round_error(&AgentError::Cancelled));
+        assert!(!should_retry_round_error(&AgentError::Tool(
+            "tool failed".to_string(),
+        )));
+        assert!(!should_retry_round_error(&AgentError::Budget(
+            "budget exceeded".to_string(),
+        )));
+    }
+
+    #[test]
+    fn does_not_retry_empty_llm_error() {
+        assert!(!should_retry_round_error(&AgentError::LLM(
+            "".to_string(),
+        )));
+        assert!(!should_retry_round_error(&AgentError::LLM(
+            "   ".to_string(),
         )));
     }
 }

@@ -55,6 +55,8 @@ pub struct ResponsesRequestOptions {
     pub include: Option<Vec<String>>,
     /// Whether Responses API should store the response server-side.
     pub store: Option<bool>,
+    /// Optional continuation handle for stateful Responses API turns.
+    pub previous_response_id: Option<String>,
     /// Optional truncation mode for Responses API requests
     /// (e.g. "auto", "disabled").
     pub truncation: Option<String>,

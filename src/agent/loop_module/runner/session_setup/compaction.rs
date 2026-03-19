@@ -10,14 +10,14 @@ pub(super) async fn compact_oversized_tool_messages(
     // calculations or context payloads in subsequent rounds.
     let compacted_messages = session.compact_oversized_tool_messages();
     if compacted_messages > 0 {
-        log::warn!(
+        tracing::warn!(
             "[{}] Compacted {} oversized tool message(s) to protect context budget",
             session_id,
             compacted_messages
         );
         if let Some(ref storage) = config.storage {
             if let Err(error) = storage.save_session(session).await {
-                log::warn!(
+                tracing::warn!(
                     "[{}] Failed to persist compacted tool messages: {}",
                     session_id,
                     error

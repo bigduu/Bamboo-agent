@@ -1,19 +1,13 @@
-/// Initialize the logging system
+/// Initialize the logging system using tracing-subscriber.
 pub fn init_logging(debug: bool) {
+    use tracing_subscriber::EnvFilter;
+
     let filter = if debug { "debug" } else { "info" };
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(filter))
-        .format(|buf, record| {
-            use std::io::Write;
-            writeln!(
-                buf,
-                "[{}] {} [{}] {} - {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-                record.level(),
-                record.target(),
-                record.module_path().unwrap_or("unknown"),
-                record.args()
-            )
-        })
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
+        )
+        .with_target(true)
         .init();
 }

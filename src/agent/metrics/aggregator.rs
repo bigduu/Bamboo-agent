@@ -23,10 +23,7 @@ pub fn aggregate_weekly(daily_metrics: &[DailyMetrics]) -> Vec<PeriodMetrics> {
 }
 
 pub fn aggregate_monthly(daily_metrics: &[DailyMetrics]) -> Vec<PeriodMetrics> {
-    aggregate_by_period(daily_metrics, |date| {
-        date.with_day(1)
-            .expect("day one should always be valid for a date")
-    })
+    aggregate_by_period(daily_metrics, |date| date.with_day(1).unwrap_or(date))
 }
 
 fn aggregate_by_period<F>(

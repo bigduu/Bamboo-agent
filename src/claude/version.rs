@@ -1,4 +1,4 @@
-use log::{debug, warn};
+use tracing::{debug, warn};
 use regex::Regex;
 use std::cmp::Ordering;
 

@@ -20,13 +20,13 @@ pub(in crate::server::handlers::agent::execute) async fn reserve_runner(
     // Check if there's already a running runner for this session.
     if let Some(runner) = runners.get(session_id) {
         if matches!(runner.status, AgentStatus::Running) {
-            log::debug!(
+            tracing::debug!(
                 "[{}] Runner already running, returning status: already_running",
                 session_id
             );
             return RunnerReservation::AlreadyRunning;
         }
-        log::debug!(
+        tracing::debug!(
             "[{}] Existing runner with status {:?}, will restart",
             session_id,
             runner.status

@@ -57,7 +57,7 @@ impl GeminiProvider {
             ReasoningEffort::Low => None,
             ReasoningEffort::Medium => Some(1024),
             ReasoningEffort::High => Some(4096),
-            ReasoningEffort::Xhigh => Some(8192),
+            ReasoningEffort::Xhigh | ReasoningEffort::Max => Some(8192),
         }
     }
 
@@ -101,7 +101,7 @@ impl LLMProvider for GeminiProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
-        log::debug!("Gemini provider using model: {}", model);
+        tracing::debug!("Gemini provider using model: {}", model);
         let reasoning_effort = options
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
@@ -154,7 +154,7 @@ impl LLMProvider for GeminiProvider {
         };
 
         let request = build_request(reasoning_effort)?;
-        log::info!(
+        tracing::info!(
             "Gemini request protocol=streamGenerateContent model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_budget={} max_output_tokens={}",
             model,
             reasoning_effort
@@ -169,7 +169,7 @@ impl LLMProvider for GeminiProvider {
                 .map(|tokens| tokens.to_string())
                 .unwrap_or_else(|| "none".to_string())
         );
-        log::debug!(
+        tracing::debug!(
             "Gemini request: {}",
             serde_json::to_string_pretty(&request).unwrap_or_default()
         );
@@ -190,7 +190,7 @@ impl LLMProvider for GeminiProvider {
             if reasoning_effort.is_some()
                 && Self::looks_like_reasoning_unsupported_error(status, &text)
             {
-                log::warn!(
+                tracing::warn!(
                     "Gemini streamGenerateContent rejected reasoning for model '{}'; retrying without reasoning_effort",
                     model
                 );
@@ -198,7 +198,7 @@ impl LLMProvider for GeminiProvider {
                 let fallback_request = build_request(None)?;
                 applied_reasoning_effort = None;
                 applied_thinking_budget = None;
-                log::info!(
+                tracing::info!(
                     "Gemini request retry protocol=streamGenerateContent model='{}' reasoning_effort=none reasoning_source={} request_reasoning_enabled=false thinking_budget=none max_output_tokens={}",
                     model,
                     reasoning_source,
@@ -246,7 +246,7 @@ impl LLMProvider for GeminiProvider {
             )));
         }
 
-        log::debug!("Gemini stream started successfully");
+        tracing::debug!("Gemini stream started successfully");
 
         // Parse SSE stream with Gemini-specific parser
         let mut state = GeminiStreamState::default();
@@ -264,7 +264,7 @@ impl LLMProvider for GeminiProvider {
                     && !logged_summary
                     && (requested_reasoning_for_log.is_some() || state.observed_thinking_signal)
                 {
-                    log::info!(
+                    tracing::info!(
                         "Gemini reasoning summary: model='{}' requested_effort={} request_thinking_budget={} observed_thinking_signal={} thinking_parts_count={} thinking_text_chars={}",
                         model_for_log,
                         requested_reasoning_for_log

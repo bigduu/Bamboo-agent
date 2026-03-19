@@ -18,7 +18,7 @@ pub struct ValidationError {
 
 /// Get the global keyword masking configuration
 pub async fn get_keyword_masking_config() -> Result<KeywordMaskingResponse, String> {
-    log::info!("Getting keyword masking configuration");
+    tracing::info!("Getting keyword masking configuration");
 
     let config = Config::new();
 
@@ -31,7 +31,7 @@ pub async fn get_keyword_masking_config() -> Result<KeywordMaskingResponse, Stri
 pub async fn update_keyword_masking_config(
     entries: Vec<KeywordEntry>,
 ) -> Result<KeywordMaskingResponse, String> {
-    log::info!(
+    tracing::info!(
         "Updating keyword masking configuration with {} entries",
         entries.len()
     );
@@ -51,7 +51,7 @@ pub async fn update_keyword_masking_config(
     root.keyword_masking = config.clone();
     root.save().map_err(|e| e.to_string())?;
 
-    log::info!("Keyword masking configuration saved successfully");
+    tracing::info!("Keyword masking configuration saved successfully");
 
     Ok(KeywordMaskingResponse {
         entries: config.entries,

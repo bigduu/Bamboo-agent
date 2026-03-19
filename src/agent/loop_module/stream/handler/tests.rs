@@ -15,6 +15,7 @@ fn build_stream(items: Vec<crate::agent::llm::provider::Result<LLMChunk>>) -> LL
 #[tokio::test]
 async fn consume_llm_stream_accumulates_tokens_and_tool_calls() {
     let stream = build_stream(vec![
+        Ok(LLMChunk::ResponseId("resp_123".to_string())),
         Ok(LLMChunk::ReasoningToken("thinking".to_string())),
         Ok(LLMChunk::Token("hi".to_string())),
         Ok(LLMChunk::ToolCalls(vec![ToolCall {
@@ -41,6 +42,7 @@ async fn consume_llm_stream_accumulates_tokens_and_tool_calls() {
         .await
         .expect("stream should succeed");
 
+    assert_eq!(output.response_id.as_deref(), Some("resp_123"));
     assert_eq!(output.content, "hi");
     assert_eq!(output.reasoning_content, "thinking");
     assert_eq!(output.token_count, 2);
@@ -66,6 +68,7 @@ async fn consume_llm_stream_silent_does_not_emit_events() {
         .await
         .expect("silent stream should succeed");
 
+    assert!(output.response_id.is_none());
     assert_eq!(output.content, "hello");
     assert!(output.reasoning_content.is_empty());
     assert_eq!(output.token_count, 5);

@@ -11,6 +11,7 @@ pub enum ReasoningEffort {
     Medium,
     High,
     Xhigh,
+    Max,
 }
 
 impl ReasoningEffort {
@@ -22,18 +23,67 @@ impl ReasoningEffort {
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
             "xhigh" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
             _ => None,
         }
     }
 
-    /// Return the lowercase wire-format representation.
+    /// Return the canonical lowercase representation (provider-agnostic).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
             Self::Xhigh => "xhigh",
+            Self::Max => "max",
         }
+    }
+
+    /// Return the provider/model-appropriate wire-format string.
+    ///
+    /// Different model families expect different reasoning effort values:
+    /// - **GPT / o-series**: `low`, `medium`, `high`, `xhigh` (`max` → `xhigh`)
+    /// - **Claude**: `low`, `medium`, `high`, `max` (`xhigh` → `max`)
+    /// - **Gemini**: `low`, `medium`, `high` (`xhigh`/`max` → `high`)
+    ///
+    /// This method inspects the model name to determine the correct mapping.
+    /// When the model family is unknown, it falls back to the GPT/OpenAI format.
+    pub fn to_wire_format(self, model: &str) -> &'static str {
+        let model_lower = model.trim().to_ascii_lowercase();
+
+        if Self::is_claude_model(&model_lower) {
+            return match self {
+                Self::Low => "low",
+                Self::Medium => "medium",
+                Self::High => "high",
+                Self::Xhigh | Self::Max => "max",
+            };
+        }
+
+        if Self::is_gemini_model(&model_lower) {
+            return match self {
+                Self::Low => "low",
+                Self::Medium => "medium",
+                Self::High | Self::Xhigh | Self::Max => "high",
+            };
+        }
+
+        // Default: GPT / o-series / unknown → OpenAI format
+        // GPT doesn't support "max", so map it to "xhigh"
+        match self {
+            Self::Max => "xhigh",
+            other => other.as_str(),
+        }
+    }
+
+    fn is_claude_model(model_lower: &str) -> bool {
+        model_lower.starts_with("claude")
+            || model_lower.contains("anthropic")
+    }
+
+    fn is_gemini_model(model_lower: &str) -> bool {
+        model_lower.starts_with("gemini")
+            || model_lower.contains("google")
     }
 }
 
@@ -53,6 +103,7 @@ mod tests {
             ReasoningEffort::parse("xhigh"),
             Some(ReasoningEffort::Xhigh)
         );
+        assert_eq!(ReasoningEffort::parse("max"), Some(ReasoningEffort::Max));
     }
 
     #[test]
@@ -67,6 +118,7 @@ mod tests {
             ReasoningEffort::parse("XHIGH"),
             Some(ReasoningEffort::Xhigh)
         );
+        assert_eq!(ReasoningEffort::parse("MAX"), Some(ReasoningEffort::Max));
     }
 
     #[test]
@@ -81,6 +133,7 @@ mod tests {
             ReasoningEffort::parse("XhIgH"),
             Some(ReasoningEffort::Xhigh)
         );
+        assert_eq!(ReasoningEffort::parse("MaX"), Some(ReasoningEffort::Max));
     }
 
     #[test]
@@ -110,7 +163,6 @@ mod tests {
         assert_eq!(ReasoningEffort::parse("unknown"), None);
         assert_eq!(ReasoningEffort::parse("extreme"), None);
         assert_eq!(ReasoningEffort::parse("ultra"), None);
-        assert_eq!(ReasoningEffort::parse("max"), None);
     }
 
     #[test]
@@ -127,6 +179,7 @@ mod tests {
         assert_eq!(ReasoningEffort::Medium.as_str(), "medium");
         assert_eq!(ReasoningEffort::High.as_str(), "high");
         assert_eq!(ReasoningEffort::Xhigh.as_str(), "xhigh");
+        assert_eq!(ReasoningEffort::Max.as_str(), "max");
     }
 
     #[test]
@@ -142,6 +195,9 @@ mod tests {
 
         let xhigh = serde_json::to_string(&ReasoningEffort::Xhigh).unwrap();
         assert_eq!(xhigh, "\"xhigh\"");
+
+        let max = serde_json::to_string(&ReasoningEffort::Max).unwrap();
+        assert_eq!(max, "\"max\"");
     }
 
     #[test]
@@ -157,6 +213,9 @@ mod tests {
 
         let xhigh: ReasoningEffort = serde_json::from_str("\"xhigh\"").unwrap();
         assert_eq!(xhigh, ReasoningEffort::Xhigh);
+
+        let max: ReasoningEffort = serde_json::from_str("\"max\"").unwrap();
+        assert_eq!(max, ReasoningEffort::Max);
     }
 
     #[test]
@@ -226,5 +285,57 @@ mod tests {
         assert_eq!(ReasoningEffort::parse("@medium"), None);
         assert_eq!(ReasoningEffort::parse("high#"), None);
         assert_eq!(ReasoningEffort::parse("$xhigh"), None);
+    }
+
+    // --- to_wire_format tests ---
+
+    #[test]
+    fn wire_format_gpt_models_use_openai_values() {
+        assert_eq!(ReasoningEffort::Low.to_wire_format("gpt-4o"), "low");
+        assert_eq!(ReasoningEffort::Medium.to_wire_format("gpt-4o"), "medium");
+        assert_eq!(ReasoningEffort::High.to_wire_format("gpt-4o"), "high");
+        assert_eq!(ReasoningEffort::Xhigh.to_wire_format("gpt-4o"), "xhigh");
+        // Max → xhigh for GPT (GPT doesn't support "max")
+        assert_eq!(ReasoningEffort::Max.to_wire_format("gpt-4o"), "xhigh");
+        assert_eq!(ReasoningEffort::Max.to_wire_format("o1-preview"), "xhigh");
+        assert_eq!(ReasoningEffort::Max.to_wire_format("o3-mini"), "xhigh");
+    }
+
+    #[test]
+    fn wire_format_claude_models_map_xhigh_and_max_to_max() {
+        assert_eq!(ReasoningEffort::Low.to_wire_format("claude-3.5-sonnet"), "low");
+        assert_eq!(ReasoningEffort::Medium.to_wire_format("claude-3.5-sonnet"), "medium");
+        assert_eq!(ReasoningEffort::High.to_wire_format("claude-sonnet-4"), "high");
+        // Both xhigh and max → "max" for Claude
+        assert_eq!(ReasoningEffort::Xhigh.to_wire_format("claude-sonnet-4"), "max");
+        assert_eq!(ReasoningEffort::Max.to_wire_format("claude-sonnet-4"), "max");
+        assert_eq!(ReasoningEffort::Max.to_wire_format("claude-3-opus"), "max");
+    }
+
+    #[test]
+    fn wire_format_gemini_models_cap_at_high() {
+        assert_eq!(ReasoningEffort::Low.to_wire_format("gemini-2.5-pro"), "low");
+        assert_eq!(ReasoningEffort::Medium.to_wire_format("gemini-2.5-pro"), "medium");
+        assert_eq!(ReasoningEffort::High.to_wire_format("gemini-2.5-pro"), "high");
+        // Both xhigh and max → "high" for Gemini
+        assert_eq!(ReasoningEffort::Xhigh.to_wire_format("gemini-2.5-pro"), "high");
+        assert_eq!(ReasoningEffort::Max.to_wire_format("gemini-2.5-pro"), "high");
+    }
+
+    #[test]
+    fn wire_format_unknown_models_default_to_openai() {
+        assert_eq!(ReasoningEffort::Xhigh.to_wire_format("some-unknown-model"), "xhigh");
+        assert_eq!(ReasoningEffort::Max.to_wire_format("some-unknown-model"), "xhigh");
+        assert_eq!(ReasoningEffort::High.to_wire_format("llama-3"), "high");
+    }
+
+    #[test]
+    fn wire_format_case_insensitive_model_matching() {
+        assert_eq!(ReasoningEffort::Xhigh.to_wire_format("Claude-3.5-Sonnet"), "max");
+        assert_eq!(ReasoningEffort::Max.to_wire_format("Claude-3.5-Sonnet"), "max");
+        assert_eq!(ReasoningEffort::Xhigh.to_wire_format("GEMINI-2.5-PRO"), "high");
+        assert_eq!(ReasoningEffort::Max.to_wire_format("GEMINI-2.5-PRO"), "high");
+        assert_eq!(ReasoningEffort::Xhigh.to_wire_format("GPT-4o"), "xhigh");
+        assert_eq!(ReasoningEffort::Max.to_wire_format("GPT-4o"), "xhigh");
     }
 }

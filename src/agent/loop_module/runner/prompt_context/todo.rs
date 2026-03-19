@@ -28,7 +28,7 @@ pub(super) fn inject_todo_list_into_system_message(session: &mut Session) {
                     todo_context.trim(),
                 );
             }
-            log::info!(
+            tracing::info!(
                 "Injected todo list into system message ({} chars)",
                 todo_context.len()
             );
@@ -44,7 +44,7 @@ pub(super) fn inject_todo_list_into_system_message(session: &mut Session) {
                 todo_context.trim()
             )),
         );
-        log::info!(
+        tracing::info!(
             "Created system message with todo list ({} chars)",
             todo_context.len()
         );

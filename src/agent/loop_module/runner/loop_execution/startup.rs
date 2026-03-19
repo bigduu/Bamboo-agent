@@ -20,7 +20,7 @@ pub(super) async fn initialize_loop_state(
     config: &AgentLoopConfig,
     tools: &dyn ToolExecutor,
 ) -> LoopRunState {
-    let debug_logger = DebugLogger::new(log::log_enabled!(log::Level::Debug));
+    let debug_logger = DebugLogger::new(tracing::enabled!(tracing::Level::DEBUG));
     let session_id = session.id.clone();
     let metrics_collector = config.metrics_collector.clone();
     let model_name = config
@@ -36,7 +36,7 @@ pub(super) async fn initialize_loop_state(
         session.messages.len() as u32,
     );
 
-    log::debug!(
+    tracing::debug!(
         "[{}] Starting agent loop with message: {}",
         session_id,
         initial_message

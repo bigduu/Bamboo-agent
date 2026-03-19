@@ -6,7 +6,7 @@ pub(super) struct ModelResolution {
 }
 
 pub(super) fn resolve_model(mapping: &AnthropicModelMapping, model: &str) -> ModelResolution {
-    log::info!(
+    tracing::info!(
         "Resolving model '{}', available mappings: {:?}",
         model,
         mapping.mappings
@@ -22,7 +22,7 @@ pub(super) fn resolve_model(mapping: &AnthropicModelMapping, model: &str) -> Mod
     } else if model_lower.contains("haiku") {
         "haiku"
     } else {
-        log::warn!(
+        tracing::warn!(
             "No Anthropic model mapping found for '{}', falling back to default model",
             model
         );
@@ -37,7 +37,7 @@ pub(super) fn resolve_model(mapping: &AnthropicModelMapping, model: &str) -> Mod
         .get(model_type)
         .filter(|value| !value.trim().is_empty())
     {
-        log::info!(
+        tracing::info!(
             "Model '{}' (type: {}) mapped to '{}'",
             model,
             model_type,
@@ -49,7 +49,7 @@ pub(super) fn resolve_model(mapping: &AnthropicModelMapping, model: &str) -> Mod
         };
     }
 
-    log::warn!(
+    tracing::warn!(
         "No mapping configured for model type '{}', falling back to default model",
         model_type
     );

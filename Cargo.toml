@@ -34,8 +34,6 @@ tokio = { version = "1", features = ["full"] }
 actix-web = "4"
 actix-cors = "0.7"
 actix-files = "0.6"
-tower = "0.5"
-tower-http = "0.6"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -45,8 +43,6 @@ serde_yaml = "0.9"
 # Logging and tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-log = "0.4"
-env_logger = "0.11"
 
 # Error handling
 anyhow = "1"

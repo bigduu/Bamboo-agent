@@ -1,4 +1,4 @@
-use log::{debug, warn};
+use tracing::{debug, warn};
 use std::path::PathBuf;
 use std::process::Command;
 

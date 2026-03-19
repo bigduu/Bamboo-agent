@@ -45,7 +45,7 @@ pub async fn set_bamboo_config(
 
     if effects.reload_provider == config_manager::ReloadMode::BestEffort {
         if let Err(error) = app_state.reload_provider().await {
-            log::warn!(
+            tracing::warn!(
                 "Config updated (provider={}, requested_reload=true) but provider reload failed: {}",
                 new_config.provider,
                 error

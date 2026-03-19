@@ -21,7 +21,7 @@ pub(super) async fn load_or_create_session(
             Ok(Some(session)) => Ok(session),
             Ok(None) => Ok(Session::new(session_id.to_string(), model.to_string())),
             Err(error) => {
-                log::error!(
+                tracing::error!(
                     "[{}] Failed to load session from storage: {}",
                     session_id,
                     error
@@ -147,7 +147,7 @@ fn persist_selected_skill_ids_metadata(
                     .metadata
                     .insert(SELECTED_SKILL_IDS_METADATA_KEY.to_string(), serialized);
             } else {
-                log::warn!("Failed to serialize selected skill IDs; clearing metadata");
+                tracing::warn!("Failed to serialize selected skill IDs; clearing metadata");
                 session.metadata.remove(SELECTED_SKILL_IDS_METADATA_KEY);
             }
         }
@@ -196,7 +196,7 @@ pub(super) async fn cache_and_save_session(
     }
 
     if let Err(error) = state.storage.save_session(&session).await {
-        log::error!("[{}] Failed to save session: {}", session_id, error);
+        tracing::error!("[{}] Failed to save session: {}", session_id, error);
         return Err(HttpResponse::InternalServerError().json(serde_json::json!({
             "error": format!("Failed to save session: {}", error)
         })));

@@ -37,7 +37,7 @@
 //! async fn main() {
 //!     let config = Config::new();
 //!     let server = BambooServer::new(config);
-//!     // server.start().await.unwrap(); // Not yet implemented
+//!     server.start().await.unwrap();
 //! }
 //! ```
 
@@ -84,10 +84,36 @@ impl BambooServer {
         Self { config, data_dir }
     }
 
-    /// Start the HTTP server (blocking)
+    /// Start the HTTP server (blocking).
+    ///
+    /// Delegates to the appropriate server entrypoint based on the configuration:
+    /// - If `static_dir` is set, serves static files alongside the API (Docker mode).
+    /// - Otherwise, runs the API server with the configured bind address and port.
+    ///
+    /// This method blocks until the server shuts down.
     pub async fn start(self) -> Result<()> {
-        // TODO: Implement server startup
-        todo!("Server startup not yet implemented")
+        core::paths::init_bamboo_dir(self.data_dir.clone());
+
+        let result = if self.config.server.static_dir.is_some() {
+            server::run_with_bind_and_static(
+                self.data_dir,
+                self.config.server.port,
+                &self.config.server.bind,
+                self.config.server.static_dir.clone(),
+            )
+            .await
+        } else if self.config.server.bind == "127.0.0.1" {
+            server::run(self.data_dir, self.config.server.port).await
+        } else {
+            server::run_with_bind(
+                self.data_dir,
+                self.config.server.port,
+                &self.config.server.bind,
+            )
+            .await
+        };
+
+        result.map_err(BambooError::HttpServer)
     }
 
     /// Get the server address

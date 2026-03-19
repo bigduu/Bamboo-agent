@@ -18,7 +18,7 @@ pub(super) fn maybe_apply_workspace_update(
                 session,
                 &workspace_path,
             );
-            log::info!(
+            tracing::info!(
                 "[{}] Updated session workspace_path via {}: {}",
                 session_id,
                 tool_call.function.name,

@@ -56,7 +56,7 @@ pub async fn evaluate_todo_progress(
         ));
     }
 
-    log::info!(
+    tracing::info!(
         "[{}] Evaluating {} in-progress todo items",
         session_id,
         in_progress_count
@@ -74,7 +74,7 @@ pub async fn evaluate_todo_progress(
     let tools = get_todo_evaluation_tools();
 
     // Use model from parameter (passed from config), not from session.
-    log::debug!("[{}] Todo evaluation using model: {}", session_id, model);
+    tracing::debug!("[{}] Todo evaluation using model: {}", session_id, model);
 
     let request_options = LLMRequestOptions {
         reasoning_effort,
@@ -99,7 +99,7 @@ pub async fn evaluate_todo_progress(
             )
         }
         Err(error) => {
-            log::warn!("[{}] Todo evaluation failed: {}", session_id, error);
+            tracing::warn!("[{}] Todo evaluation failed: {}", session_id, error);
             Ok(skipped_evaluation(&format!("Evaluation failed: {}", error)))
         }
     }

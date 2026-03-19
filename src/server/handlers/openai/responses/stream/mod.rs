@@ -8,7 +8,6 @@ use crate::server::{app_state::AppState, error::AppError};
 
 use super::super::helpers::now_unix_ts;
 use super::PreparedResponsesRequest;
-use events::{created_event, event_to_sse_bytes};
 use worker::{spawn_stream_worker, StreamWorkerArgs};
 
 mod errors;
@@ -48,25 +47,15 @@ pub(super) async fn handle_streaming_response(
 
     let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, anyhow::Error>>(10);
 
-    let response_id = format!("resp_{}", uuid::Uuid::new_v4());
     let message_id = format!("msg_{}", uuid::Uuid::new_v4());
     let created_at = now_unix_ts();
-
-    // Send an initial response.created event (in_progress).
-    let _ = tx
-        .send(Ok(event_to_sse_bytes(&created_event(
-            response_id.clone(),
-            prepared.resolved_model.clone(),
-            created_at,
-        ))))
-        .await;
 
     spawn_stream_worker(StreamWorkerArgs {
         stream_result,
         tx,
         metrics: app_state.metrics_service.collector(),
         forward_id,
-        response_id,
+        fallback_response_id: format!("resp_{}", uuid::Uuid::new_v4()),
         message_id,
         created_at,
         resolved_model: prepared.resolved_model,

@@ -512,7 +512,7 @@ impl Config {
                         config
                     })
                     .unwrap_or_else(|e| {
-                        log::warn!("Failed to parse config.json ({}), using defaults", e);
+                        tracing::warn!("Failed to parse config.json ({}), using defaults", e);
                         Self::create_default()
                     })
             } else {
@@ -677,9 +677,9 @@ impl Config {
                     self.extra.remove("http_proxy_auth_encrypted");
                     self.extra.remove("https_proxy_auth_encrypted");
                 }
-                Err(e) => log::warn!("Failed to parse decrypted proxy auth JSON: {}", e),
+                Err(e) => tracing::warn!("Failed to parse decrypted proxy auth JSON: {}", e),
             },
-            Err(e) => log::warn!("Failed to decrypt proxy auth: {}", e),
+            Err(e) => tracing::warn!("Failed to decrypt proxy auth: {}", e),
         }
     }
 
@@ -709,7 +709,7 @@ impl Config {
                 if let Some(encrypted) = openai.api_key_encrypted.as_deref() {
                     match crate::core::encryption::decrypt(encrypted) {
                         Ok(value) => openai.api_key = value,
-                        Err(e) => log::warn!("Failed to decrypt OpenAI api_key: {}", e),
+                        Err(e) => tracing::warn!("Failed to decrypt OpenAI api_key: {}", e),
                     }
                 }
             }
@@ -720,7 +720,7 @@ impl Config {
                 if let Some(encrypted) = anthropic.api_key_encrypted.as_deref() {
                     match crate::core::encryption::decrypt(encrypted) {
                         Ok(value) => anthropic.api_key = value,
-                        Err(e) => log::warn!("Failed to decrypt Anthropic api_key: {}", e),
+                        Err(e) => tracing::warn!("Failed to decrypt Anthropic api_key: {}", e),
                     }
                 }
             }
@@ -731,7 +731,7 @@ impl Config {
                 if let Some(encrypted) = gemini.api_key_encrypted.as_deref() {
                     match crate::core::encryption::decrypt(encrypted) {
                         Ok(value) => gemini.api_key = value,
-                        Err(e) => log::warn!("Failed to decrypt Gemini api_key: {}", e),
+                        Err(e) => tracing::warn!("Failed to decrypt Gemini api_key: {}", e),
                     }
                 }
             }
@@ -801,7 +801,7 @@ impl Config {
                             Ok(value) => {
                                 stdio.env.insert(key, value);
                             }
-                            Err(e) => log::warn!("Failed to decrypt MCP stdio env var: {}", e),
+                            Err(e) => tracing::warn!("Failed to decrypt MCP stdio env var: {}", e),
                         }
                     }
                 }
@@ -815,7 +815,7 @@ impl Config {
                         };
                         match crate::core::encryption::decrypt(encrypted) {
                             Ok(value) => header.value = value,
-                            Err(e) => log::warn!("Failed to decrypt MCP SSE header value: {}", e),
+                            Err(e) => tracing::warn!("Failed to decrypt MCP SSE header value: {}", e),
                         }
                     }
                 }

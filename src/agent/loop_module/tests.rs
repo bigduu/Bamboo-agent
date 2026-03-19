@@ -25,7 +25,7 @@ fn make_tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
 #[test]
 fn agent_loop_config_default() {
     let config = AgentLoopConfig::default();
-    assert_eq!(config.max_rounds, 50);
+    assert_eq!(config.max_rounds, 200);
     assert!(config.system_prompt.is_none());
     assert!(config.additional_tool_schemas.is_empty());
     assert!(config.tool_registry.is_empty());

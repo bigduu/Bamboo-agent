@@ -150,7 +150,7 @@ pub async fn execute_tool_call_with_context(
         let args_raw = tool_call.function.arguments.trim();
         let (args, parse_warning) = parse_tool_args_best_effort(&tool_call.function.arguments);
         if let Some(warning) = parse_warning {
-            log::warn!(
+            tracing::warn!(
                 "Composition executor tool args fallback applied: tool_call_id={}, tool_name={}, args_len={}, warning={}",
                 tool_call.id,
                 tool_call.function.name,

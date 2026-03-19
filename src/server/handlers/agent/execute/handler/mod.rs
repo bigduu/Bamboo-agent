@@ -87,7 +87,7 @@ pub async fn handler(
     };
     let request_reasoning_effort = req.reasoning_effort;
 
-    log::debug!(
+    tracing::debug!(
         "[{}] Execute request received with model: {}",
         session_id,
         model
@@ -125,7 +125,7 @@ pub async fn handler(
     }
 
     if !has_pending_user_message(&session) {
-        log::debug!(
+        tracing::debug!(
             "[{}] No pending user message, returning completed status",
             session_id
         );
@@ -156,7 +156,7 @@ pub async fn handler(
 
     consume_pending_ask_user_resume(&mut session);
 
-    log::info!("[{}] Starting agent execution", session_id);
+    tracing::info!("[{}] Starting agent execution", session_id);
 
     // Create mpsc channel for agent loop.
     let (mpsc_tx, mpsc_rx) = mpsc::channel::<crate::agent::core::AgentEvent>(100);
@@ -172,6 +172,7 @@ pub async fn handler(
         session_id: session_id.clone(),
         session,
         is_child_session,
+        provider_name: config_snapshot.provider.clone(),
         model,
         reasoning_effort: effective_reasoning_effort,
         reasoning_effort_source: reasoning_effort_source.to_string(),

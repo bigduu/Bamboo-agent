@@ -1,4 +1,6 @@
-use crate::agent::llm::api::models::{ChatMessage, Content, ContentPart, ImageUrl, Role};
+use crate::agent::llm::api::models::{
+    ChatMessage, Content, ContentPart, FunctionCall, ImageUrl, Role, ToolCall,
+};
 use crate::server::error::AppError;
 
 pub(super) fn role_str_to_openai_role(role: &str) -> Role {
@@ -49,6 +51,64 @@ pub(super) fn responses_input_to_chat_messages(
             continue;
         };
 
+        // Check `type` field first for function_call / function_call_output items
+        let item_type = obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("message");
+
+        if item_type == "function_call" {
+            let call_id = obj
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let arguments = obj
+                .get("arguments")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            messages.push(ChatMessage {
+                role: Role::Assistant,
+                content: Content::Text(String::new()),
+                tool_calls: Some(vec![ToolCall {
+                    id: call_id,
+                    tool_type: "function".to_string(),
+                    function: FunctionCall { name, arguments },
+                }]),
+                tool_call_id: None,
+            });
+            continue;
+        }
+
+        if item_type == "function_call_output" {
+            let call_id = obj
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let output = obj
+                .get("output")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            messages.push(ChatMessage {
+                role: Role::Tool,
+                content: Content::Text(output),
+                tool_calls: None,
+                tool_call_id: Some(call_id),
+            });
+            continue;
+        }
+
+        // Default: treat as message item
         let role = obj
             .get("role")
             .and_then(|value| value.as_str())

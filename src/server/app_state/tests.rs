@@ -17,7 +17,9 @@ fn make_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
 #[tokio::test]
 async fn test_app_state_creation() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp_dir.path().to_path_buf()).await;
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
 
     // Verify basic fields
     assert!(state.sessions.read().await.is_empty());
@@ -26,7 +28,9 @@ async fn test_app_state_creation() {
 #[tokio::test]
 async fn root_tools_include_server_overlays_and_memory_note() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp_dir.path().to_path_buf()).await;
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
     let names: std::collections::HashSet<String> = state
         .get_all_tool_schemas()
         .into_iter()
@@ -45,7 +49,9 @@ async fn root_tools_include_server_overlays_and_memory_note() {
 #[tokio::test]
 async fn child_tools_exclude_schedule_and_session_inspector() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp_dir.path().to_path_buf()).await;
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
     let names: std::collections::HashSet<String> = state
         .child_tools
         .list_tools()
@@ -64,7 +70,9 @@ async fn child_tools_exclude_schedule_and_session_inspector() {
 #[tokio::test]
 async fn overlay_tools_require_session_context() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp_dir.path().to_path_buf()).await;
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
 
     let schedule_result = state
         .tools
@@ -112,7 +120,9 @@ async fn app_state_uses_persisted_permission_config_in_data_dir() {
     config.add_rule(PermissionRule::new(PermissionType::WriteFile, "*", false));
     storage.save(&config).await.unwrap();
 
-    let state = AppState::new(temp_dir.path().to_path_buf()).await;
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
     let target = temp_dir.path().join("blocked.txt");
     let call = make_tool_call(
         "Write",

@@ -42,7 +42,7 @@ impl ToolExecutor for OverlayToolExecutor {
             let args_raw = call.function.arguments.trim();
             let (args, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
             if let Some(warning) = parse_warning {
-                log::warn!(
+                tracing::warn!(
                     "Overlay tool argument parsing fallback applied: tool_call_id={}, tool_name={}, args_len={}, warning={}",
                     call.id,
                     call.function.name,

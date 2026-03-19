@@ -104,7 +104,7 @@ pub fn prepare_hybrid_context(
                 .saturating_mul(100)
                 .saturating_div(hard_available)
         };
-        log::info!(
+        tracing::info!(
             "[{}] Context compression needed: pre_total={} (system={}, window={}), proactive_limit={} (trigger={}%), target_limit={} (target_config={}%, target_effective={}%), hard_limit={}, usage={:.1}%",
             session.id,
             pre_total_tokens,
@@ -177,7 +177,7 @@ pub fn prepare_hybrid_context(
         } else {
             proactive_limit
         };
-        log::info!(
+        tracing::info!(
             "[{}] Context compression result: removed_segments={}, removed_messages={}, removed_tool_segments={}, removed_tokens={}, kept_segments={}, kept_messages={}, final_total={} / {} ({:.1}%), applied_limit={}",
             session.id,
             removed_count,

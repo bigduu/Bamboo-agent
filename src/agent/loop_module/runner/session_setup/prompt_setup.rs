@@ -34,7 +34,7 @@ pub(super) fn build_tool_guide_context(
         tool_schemas,
         &guide_context,
     );
-    log::info!(
+    tracing::info!(
         "[{}] Tool guide context built, length: {} chars",
         session_id,
         tool_guide_context.len()

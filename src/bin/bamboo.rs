@@ -72,7 +72,11 @@ async fn main() {
             bamboo_agent::core::paths::init_bamboo_dir(bamboo_home_dir.clone());
             // Keep runtime path resolution consistent: most helpers derive their base dir from
             // BAMBOO_DATA_DIR / `${HOME}/.bamboo` via `core::paths::bamboo_dir()`.
-            std::env::set_var("BAMBOO_DATA_DIR", bamboo_home_dir.as_os_str());
+            // SAFETY: Called on the main thread before any async runtime work begins,
+            // so no concurrent reads of the env are possible.
+            unsafe {
+                std::env::set_var("BAMBOO_DATA_DIR", bamboo_home_dir.as_os_str());
+            }
 
             // Load config (with env var overrides already applied)
             // If --data-dir is specified, load from that directory.
@@ -95,8 +99,11 @@ async fn main() {
 
             // Map config-level worker count into an env var that the server entrypoints can
             // consume without requiring breaking signature changes.
+            // SAFETY: Still on the main thread before async work begins.
             if workers.is_some() || std::env::var("BAMBOO_WORKERS").is_err() {
-                std::env::set_var("BAMBOO_WORKERS", config.server.workers.to_string());
+                unsafe {
+                    std::env::set_var("BAMBOO_WORKERS", config.server.workers.to_string());
+                }
             }
 
             // Start server using the unified config
@@ -132,7 +139,13 @@ async fn main() {
                 );
             } else {
                 let config = bamboo_agent::core::Config::new();
-                let mut config_value = serde_json::to_value(&config).unwrap();
+                let mut config_value = match serde_json::to_value(&config) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        eprintln!("Failed to serialize config: {}", e);
+                        std::process::exit(1);
+                    }
+                };
 
                 if !show_secrets {
                     // Redact sensitive fields
@@ -152,7 +165,13 @@ async fn main() {
                     }
                 }
 
-                println!("{}", serde_json::to_string_pretty(&config_value).unwrap());
+                match serde_json::to_string_pretty(&config_value) {
+                    Ok(json) => println!("{}", json),
+                    Err(e) => {
+                        eprintln!("Failed to render config as JSON: {}", e);
+                        std::process::exit(1);
+                    }
+                }
             }
         }
     }

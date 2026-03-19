@@ -6,11 +6,11 @@ use crate::agent::skill::types::SkillDefinition;
 /// When a user's request matches a skill's description, load detailed instructions on demand.
 pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
     if skills.is_empty() {
-        log::debug!("No skills available, returning empty context");
+        tracing::debug!("No skills available, returning empty context");
         return String::new();
     }
 
-    log::info!(
+    tracing::info!(
         "Building skill metadata context from {} skill(s): [{}]",
         skills.len(),
         skills
@@ -35,7 +35,7 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
     context.push_str("### Available Skills\n");
 
     for skill in skills {
-        log::debug!(
+        tracing::debug!(
             "Adding skill metadata '{}' with {} tool(s)",
             skill.id,
             skill.tool_refs.len(),
@@ -57,7 +57,7 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
         }
     }
 
-    log::info!("Skill metadata context built: {} chars", context.len());
+    tracing::info!("Skill metadata context built: {} chars", context.len());
 
     context
 }

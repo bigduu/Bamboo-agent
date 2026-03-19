@@ -8,7 +8,7 @@ mod runner;
 mod stream_json;
 mod version;
 
-use log::{info, warn};
+use tracing::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 

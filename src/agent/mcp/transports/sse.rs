@@ -102,7 +102,7 @@ impl SseTransport {
         let mut headers = HeaderMap::new();
         headers.insert(
             reqwest::header::ACCEPT,
-            "text/event-stream".parse().unwrap(),
+            reqwest::header::HeaderValue::from_static("text/event-stream"),
         );
 
         for HeaderConfig { name, value, .. } in &self.config.headers {

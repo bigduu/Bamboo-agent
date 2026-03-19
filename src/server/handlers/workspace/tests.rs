@@ -64,8 +64,11 @@ async fn browse_folder_returns_not_found_when_path_is_a_file() {
     let file_path = temp.path().join("README.md");
     std::fs::write(&file_path, "hello").expect("write test file");
 
-    let app_state =
-        web::Data::new(crate::server::app_state::AppState::new(temp.path().to_path_buf()).await);
+    let app_state = web::Data::new(
+        crate::server::app_state::AppState::new(temp.path().to_path_buf())
+            .await
+            .expect("app state should initialize"),
+    );
     let app = actix_web::test::init_service(
         actix_web::App::new()
             .app_data(app_state)
@@ -93,8 +96,11 @@ async fn browse_folder_returns_only_directories_sorted_case_insensitively() {
     std::fs::create_dir_all(&zeta).expect("create zeta dir");
     std::fs::write(workspace_root.join("notes.txt"), "ignore file").expect("write plain file");
 
-    let app_state =
-        web::Data::new(crate::server::app_state::AppState::new(temp.path().to_path_buf()).await);
+    let app_state = web::Data::new(
+        crate::server::app_state::AppState::new(temp.path().to_path_buf())
+            .await
+            .expect("app state should initialize"),
+    );
     let app = actix_web::test::init_service(
         actix_web::App::new()
             .app_data(app_state)
@@ -134,8 +140,11 @@ async fn list_workspace_files_respects_depth_and_hidden_flag() {
     std::fs::create_dir_all(&nested).expect("create nested dir");
     std::fs::write(nested.join("deep.txt"), "d").expect("write deep file");
 
-    let app_state =
-        web::Data::new(crate::server::app_state::AppState::new(temp.path().to_path_buf()).await);
+    let app_state = web::Data::new(
+        crate::server::app_state::AppState::new(temp.path().to_path_buf())
+            .await
+            .expect("app state should initialize"),
+    );
     let app = actix_web::test::init_service(
         actix_web::App::new()
             .app_data(app_state)
@@ -173,8 +182,11 @@ async fn list_workspace_files_returns_not_found_for_missing_workspace() {
     let temp = tempdir().expect("create temp dir");
     let missing_path = temp.path().join("does-not-exist");
 
-    let app_state =
-        web::Data::new(crate::server::app_state::AppState::new(temp.path().to_path_buf()).await);
+    let app_state = web::Data::new(
+        crate::server::app_state::AppState::new(temp.path().to_path_buf())
+            .await
+            .expect("app state should initialize"),
+    );
     let app = actix_web::test::init_service(
         actix_web::App::new()
             .app_data(app_state)

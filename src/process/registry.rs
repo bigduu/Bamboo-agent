@@ -642,7 +642,7 @@ impl ProcessRegistry {
     /// - Unix: Uses SIGTERM first, then SIGKILL if needed
     /// - Windows: Uses taskkill /F
     pub async fn kill_process(&self, run_id: i64) -> Result<bool, String> {
-        use log::{error, info, warn};
+        use tracing::{error, info, warn};
 
         let (pid, child_arc) = {
             let processes = self.processes.lock().await;
@@ -772,7 +772,7 @@ impl ProcessRegistry {
     /// - Unix: Tries SIGTERM first, waits 2 seconds, then SIGKILL
     /// - Windows: Uses taskkill /F immediately
     pub async fn kill_process_by_pid(&self, run_id: i64, pid: u32) -> Result<bool, String> {
-        use log::{error, info, warn};
+        use tracing::{error, info, warn};
 
         info!("Attempting to kill process {} by PID {}", run_id, pid);
 

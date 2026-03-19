@@ -10,6 +10,7 @@ mod consume;
 mod stream_state;
 
 pub struct StreamHandlingOutput {
+    pub response_id: Option<String>,
     pub content: String,
     pub reasoning_content: String,
     pub token_count: usize,

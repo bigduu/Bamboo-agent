@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use tokio::fs;
 
 use crate::agent::skill::store::parser::{parse_markdown_skill, render_skill_markdown};

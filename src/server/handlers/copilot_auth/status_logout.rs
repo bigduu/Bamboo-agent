@@ -34,13 +34,13 @@ pub async fn logout_copilot(app_state: web::Data<AppState>) -> Result<HttpRespon
     success &= remove_if_exists(&copilot_token_path, ".copilot_token.json", &mut messages);
 
     if success {
-        log::info!("Copilot logged out successfully");
+        tracing::info!("Copilot logged out successfully");
         Ok(HttpResponse::Ok().json(serde_json::json!({
             "success": true,
             "message": "Logged out successfully"
         })))
     } else {
-        log::error!("Failed to logout: {}", messages.join(", "));
+        tracing::error!("Failed to logout: {}", messages.join(", "));
         Ok(HttpResponse::InternalServerError().json(serde_json::json!({
             "success": false,
             "error": messages.join(", ")

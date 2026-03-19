@@ -77,7 +77,7 @@ where
     {
         if windows_command_trace_enabled() {
             let command_line = render_command_line(program, args);
-            log::info!("[windows-cmd-trace] {}: {}", scope, command_line);
+            tracing::info!("[windows-cmd-trace] {}: {}", scope, command_line);
         }
     }
 

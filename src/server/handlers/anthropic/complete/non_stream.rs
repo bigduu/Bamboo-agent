@@ -70,6 +70,7 @@ pub(super) async fn handle_non_streaming_complete(
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
+            Ok(crate::agent::llm::types::LLMChunk::ResponseId(_)) => {}
             Ok(crate::agent::llm::types::LLMChunk::Token(text)) => {
                 content.push_str(&text);
             }

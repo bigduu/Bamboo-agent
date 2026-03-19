@@ -66,7 +66,12 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> imp
         }
     }
 
-    let session = session.unwrap();
+    let Some(session) = session else {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": "Session load unexpectedly returned no data",
+            "session_id": session_id
+        }));
+    };
     HttpResponse::Ok().json(serde_json::json!({
         "session_id": session_id,
         "messages": session.messages,

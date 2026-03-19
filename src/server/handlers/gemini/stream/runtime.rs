@@ -25,6 +25,7 @@ pub(super) fn build_gemini_event_stream(
 
         while let Some(chunk) = stream.next().await {
             match chunk {
+                Ok(LLMChunk::ResponseId(_)) => {}
                 Ok(LLMChunk::Token(token)) => {
                     streamed_text.push_str(&token);
                     match sse::token_chunk_bytes(token) {

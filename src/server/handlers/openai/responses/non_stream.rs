@@ -41,9 +41,13 @@ pub(super) async fn handle_non_streaming_response(
 
     let mut content = String::new();
     let mut tool_calls: Vec<crate::agent::core::tools::ToolCall> = Vec::new();
+    let mut upstream_response_id: Option<String> = None;
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
+            Ok(crate::agent::llm::types::LLMChunk::ResponseId(response_id)) => {
+                upstream_response_id = Some(response_id);
+            }
             Ok(crate::agent::llm::types::LLMChunk::Token(text)) => content.push_str(&text),
             Ok(crate::agent::llm::types::LLMChunk::ReasoningToken(_)) => {}
             Ok(crate::agent::llm::types::LLMChunk::ToolCalls(calls)) => tool_calls.extend(calls),
@@ -66,7 +70,8 @@ pub(super) async fn handle_non_streaming_response(
     }
 
     let completion_tokens = estimate_completion_tokens(&content);
-    let response_id = format!("resp_{}", uuid::Uuid::new_v4());
+    let response_id =
+        upstream_response_id.unwrap_or_else(|| format!("resp_{}", uuid::Uuid::new_v4()));
     let message_id = format!("msg_{}", uuid::Uuid::new_v4());
     let created_at = now_unix_ts();
 

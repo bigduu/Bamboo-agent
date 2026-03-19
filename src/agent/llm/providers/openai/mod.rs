@@ -135,7 +135,7 @@ impl OpenAIProvider {
             reasoning_effort,
             responses_options,
         );
-        log::info!(
+        tracing::info!(
             "OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
             model,
             reasoning_effort
@@ -163,7 +163,7 @@ impl OpenAIProvider {
             if reasoning_effort.is_some()
                 && Self::looks_like_reasoning_unsupported_error(status, &text)
             {
-                log::warn!(
+                tracing::warn!(
                     "OpenAI /responses rejected reasoning for model '{}'; retrying without reasoning_effort",
                     model
                 );
@@ -234,7 +234,7 @@ impl LLMProvider for OpenAIProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
-        log::debug!("OpenAI provider using model: {}", model);
+        tracing::debug!("OpenAI provider using model: {}", model);
         let reasoning_effort = options
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
@@ -270,7 +270,7 @@ impl LLMProvider for OpenAIProvider {
             max_output_tokens,
             reasoning_effort,
         );
-        log::info!(
+        tracing::info!(
             "OpenAI request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
             model,
             reasoning_effort
@@ -298,7 +298,7 @@ impl LLMProvider for OpenAIProvider {
             if reasoning_effort.is_some()
                 && Self::looks_like_reasoning_unsupported_error(status, &text)
             {
-                log::warn!(
+                tracing::warn!(
                     "OpenAI /chat/completions rejected reasoning for model '{}'; retrying without reasoning_effort",
                     model
                 );
@@ -331,7 +331,7 @@ impl LLMProvider for OpenAIProvider {
             }
 
             if Self::looks_like_responses_only_error(status, &text) {
-                log::info!(
+                tracing::info!(
                     "OpenAI chat/completions rejected model '{}'; retrying via /responses",
                     model
                 );
@@ -397,7 +397,7 @@ impl LLMProvider for OpenAIProvider {
                     if !logged_summary
                         && (requested_reasoning.is_some() || observed_reasoning_signal)
                     {
-                        log::info!(
+                        tracing::info!(
                             "OpenAI chat_completions reasoning summary: model='{}' requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
                             model_for_log,
                             requested_reasoning

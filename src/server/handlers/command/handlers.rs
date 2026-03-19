@@ -13,7 +13,7 @@ pub async fn list_commands(app_state: web::Data<AppState>) -> Result<HttpRespons
     match list_workflows_as_commands(&app_state.app_data_dir).await {
         Ok(workflows) => commands.extend(workflows),
         Err(error) => {
-            log::warn!("Failed to load workflows: {error}");
+            tracing::warn!("Failed to load workflows: {error}");
         }
     }
 
@@ -28,7 +28,7 @@ pub async fn list_commands(app_state: web::Data<AppState>) -> Result<HttpRespons
     match list_mcp_tools_as_commands(app_state.get_ref()).await {
         Ok(mcp_tools) => commands.extend(mcp_tools),
         Err(error) => {
-            log::warn!("Failed to load MCP tools: {error}");
+            tracing::warn!("Failed to load MCP tools: {error}");
         }
     }
 

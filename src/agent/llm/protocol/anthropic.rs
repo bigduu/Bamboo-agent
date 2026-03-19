@@ -158,7 +158,7 @@ impl ToProvider<AnthropicMessage> for Message {
                         let input: Value = match serde_json::from_str(raw_arguments) {
                             Ok(parsed) => parsed,
                             Err(error) => {
-                                log::warn!(
+                                tracing::warn!(
                                     "Anthropic protocol conversion fallback to string input due to invalid JSON arguments: tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", error={}",
                                     tc.id,
                                     tc.function.name,

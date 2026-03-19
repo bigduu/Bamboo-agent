@@ -13,7 +13,7 @@ pub(super) async fn build_success_result(
     session_id: &str,
     prompt_tokens: u64,
 ) -> TodoEvaluationResult {
-    log::info!(
+    tracing::info!(
         "[{}] Todo evaluation completed: {} tokens, {} tool calls",
         session_id,
         stream_output.token_count,
@@ -24,7 +24,7 @@ pub(super) async fn build_success_result(
     let reasoning = summarize_updates(&updates);
 
     if !stream_output.content.trim().is_empty() {
-        log::debug!(
+        tracing::debug!(
             "[{}] Todo evaluation raw reasoning suppressed ({} chars)",
             session_id,
             stream_output.content.len()

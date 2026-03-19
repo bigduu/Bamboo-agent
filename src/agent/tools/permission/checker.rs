@@ -208,7 +208,7 @@ impl<T: PermissionChecker> LoggingPermissionChecker<T> {
 impl<T: PermissionChecker> PermissionChecker for LoggingPermissionChecker<T> {
     async fn needs_confirmation(&self, perm_type: PermissionType, resource: &str) -> bool {
         let needs = self.inner.needs_confirmation(perm_type, resource).await;
-        log::debug!(
+        tracing::debug!(
             "Permission check: {:?} for '{}' - needs_confirmation: {}",
             perm_type,
             resource,
@@ -218,18 +218,18 @@ impl<T: PermissionChecker> PermissionChecker for LoggingPermissionChecker<T> {
     }
 
     async fn request_confirmation(&self, ctx: PermissionContext) -> Result<bool, PermissionError> {
-        log::info!(
+        tracing::info!(
             "Requesting user confirmation: {:?} for '{}'",
             ctx.permission_type,
             ctx.resource
         );
         let result = self.inner.request_confirmation(ctx).await;
-        log::debug!("User confirmation result: {:?}", result);
+        tracing::debug!("User confirmation result: {:?}", result);
         result
     }
 
     fn grant_session_permission(&self, perm_type: PermissionType, resource: String) {
-        log::info!(
+        tracing::info!(
             "Granting session permission: {:?} for '{}'",
             perm_type,
             resource

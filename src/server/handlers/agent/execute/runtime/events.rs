@@ -18,7 +18,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_event_forwarder(
                 let mut runners = state.agent_runners.write().await;
                 if let Some(runner) = runners.get_mut(&session_id) {
                     runner.last_budget_event = Some(event.clone());
-                    log::debug!("[{}] Stored budget event for late subscribers", session_id);
+                    tracing::debug!("[{}] Stored budget event for late subscribers", session_id);
                 }
             }
 
@@ -26,7 +26,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_event_forwarder(
                 dropped_without_subscribers = dropped_without_subscribers.saturating_add(1);
                 if !no_subscriber_mode {
                     no_subscriber_mode = true;
-                    log::debug!(
+                    tracing::debug!(
                         "[{}] No subscribers for event stream; suppressing repeated logs",
                         session_id
                     );
@@ -35,7 +35,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_event_forwarder(
             }
 
             if no_subscriber_mode {
-                log::debug!(
+                tracing::debug!(
                     "[{}] Subscribers resumed; dropped {} events while unsubscribed",
                     session_id,
                     dropped_without_subscribers
@@ -48,13 +48,13 @@ pub(in crate::server::handlers::agent::execute) fn spawn_event_forwarder(
         }
 
         if dropped_without_subscribers > 0 {
-            log::debug!(
+            tracing::debug!(
                 "[{}] Event forwarder finished after dropping {} events with no subscribers",
                 session_id,
                 dropped_without_subscribers
             );
         } else {
-            log::debug!("[{}] Event forwarder finished", session_id);
+            tracing::debug!("[{}] Event forwarder finished", session_id);
         }
     });
 }

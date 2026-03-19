@@ -34,7 +34,7 @@ pub(super) async fn maybe_handle_user_question_tool(
         return false;
     };
 
-    log::info!(
+    tracing::info!(
         "[{}] {} called, awaiting user response",
         session_id,
         tool_call.function.name

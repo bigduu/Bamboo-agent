@@ -38,6 +38,8 @@ pub struct CopilotProvider {
     token: Option<String>,
     token_expires_at: Option<u64>,
     auth_handler: Option<CopilotAuthHandler>,
+    vscode_session_id: String,
+    vscode_machine_id: String,
     // Patterns (case-insensitive) for models that require Responses API upstream.
     responses_only_models: Vec<String>,
     default_reasoning_effort: Option<ReasoningEffort>,
@@ -51,6 +53,8 @@ impl CopilotProvider {
             token: None,
             token_expires_at: None,
             auth_handler: None,
+            vscode_session_id: Self::generate_vscode_session_id(),
+            vscode_machine_id: Self::generate_vscode_machine_id(),
             responses_only_models: vec![],
             default_reasoning_effort: None,
         }
@@ -63,6 +67,8 @@ impl CopilotProvider {
             token: Some(token.into()),
             token_expires_at: None,
             auth_handler: None,
+            vscode_session_id: Self::generate_vscode_session_id(),
+            vscode_machine_id: Self::generate_vscode_machine_id(),
             responses_only_models: vec![],
             default_reasoning_effort: None,
         }
@@ -94,6 +100,8 @@ impl CopilotProvider {
             token: None,
             token_expires_at: None,
             auth_handler: Some(auth_handler),
+            vscode_session_id: Self::generate_vscode_session_id(),
+            vscode_machine_id: Self::generate_vscode_machine_id(),
             responses_only_models: vec![],
             default_reasoning_effort: None,
         }
@@ -207,7 +215,7 @@ impl CopilotProvider {
 
         self.token = None;
         self.token_expires_at = None;
-        log::info!("Logged out and deleted cached tokens");
+        tracing::info!("Logged out and deleted cached tokens");
         Ok(())
     }
 
@@ -248,6 +256,103 @@ impl CopilotProvider {
         Ok(headers)
     }
 
+    fn generate_vscode_session_id() -> String {
+        format!(
+            "{}{}",
+            uuid::Uuid::new_v4(),
+            chrono::Utc::now().timestamp_millis()
+        )
+    }
+
+    fn generate_vscode_machine_id() -> String {
+        uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .repeat(2)
+            .chars()
+            .take(64)
+            .collect()
+    }
+
+    fn infer_request_initiator(messages: &[Message]) -> &'static str {
+        messages
+            .iter()
+            .rev()
+            .find(|message| !matches!(message.role, crate::agent::core::agent::Role::System))
+            .map(|message| match message.role {
+                crate::agent::core::agent::Role::User => "user",
+                crate::agent::core::agent::Role::Assistant
+                | crate::agent::core::agent::Role::Tool => "agent",
+                crate::agent::core::agent::Role::System => "user",
+            })
+            .unwrap_or("user")
+    }
+
+    fn infer_openai_intent(messages: &[Message], tools: &[ToolSchema]) -> &'static str {
+        let has_agent_activity = messages.iter().any(|message| {
+            matches!(
+                message.role,
+                crate::agent::core::agent::Role::Assistant
+                    | crate::agent::core::agent::Role::Tool
+            ) || message.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty())
+        });
+
+        if !tools.is_empty() || has_agent_activity {
+            "conversation-agent"
+        } else {
+            "conversation-panel"
+        }
+    }
+
+    fn build_llm_headers(
+        &self,
+        token: &str,
+        messages: &[Message],
+        tools: &[ToolSchema],
+    ) -> std::result::Result<reqwest::header::HeaderMap, LLMError> {
+        use reqwest::header::HeaderValue;
+
+        let mut headers = Self::build_headers_with_token(token)?;
+        headers.insert(
+            "openai-organization",
+            HeaderValue::from_static("github-copilot"),
+        );
+        headers.insert(
+            "openai-intent",
+            HeaderValue::from_static(Self::infer_openai_intent(messages, tools)),
+        );
+        headers.insert(
+            "x-github-api-version",
+            HeaderValue::from_static("2025-05-01"),
+        );
+        headers.insert(
+            "x-initiator",
+            HeaderValue::from_static(Self::infer_request_initiator(messages)),
+        );
+        headers.insert(
+            "x-interaction-id",
+            HeaderValue::from_str(&self.vscode_session_id)
+                .map_err(|e| LLMError::Auth(format!("Invalid x-interaction-id: {}", e)))?,
+        );
+        headers.insert(
+            "vscode-sessionid",
+            HeaderValue::from_str(&self.vscode_session_id)
+                .map_err(|e| LLMError::Auth(format!("Invalid vscode-sessionid: {}", e)))?,
+        );
+        headers.insert(
+            "vscode-machineid",
+            HeaderValue::from_str(&self.vscode_machine_id)
+                .map_err(|e| LLMError::Auth(format!("Invalid vscode-machineid: {}", e)))?,
+        );
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())
+                .map_err(|e| LLMError::Auth(format!("Invalid x-request-id: {}", e)))?,
+        );
+
+        Ok(headers)
+    }
+
     /// Build request headers using the in-memory token (primarily for tests and manual token mode).
     #[allow(dead_code)] // Used by unit tests + handy for debugging token formatting.
     fn build_headers(&self) -> std::result::Result<reqwest::header::HeaderMap, LLMError> {
@@ -255,7 +360,7 @@ impl CopilotProvider {
             .token
             .as_ref()
             .ok_or_else(|| LLMError::Auth("Not authenticated".to_string()))?;
-        Self::build_headers_with_token(token)
+        self.build_llm_headers(token, &[], &[])
     }
 
     async fn get_token_for_request(&self) -> std::result::Result<String, LLMError> {
@@ -339,6 +444,22 @@ impl CopilotProvider {
         mentions_reasoning && mentions_unsupported
     }
 
+    fn looks_like_previous_response_id_unsupported_error(
+        status: reqwest::StatusCode,
+        body: &str,
+    ) -> bool {
+        if !(status == 400 || status == 409 || status == 422) {
+            return false;
+        }
+
+        let b = body.to_ascii_lowercase();
+        let mentions_previous_response_id = b.contains("previous_response_id");
+        let mentions_unsupported = b.contains("unsupported_value")
+            || b.contains("not supported")
+            || b.contains("unsupported");
+        mentions_previous_response_id && mentions_unsupported
+    }
+
     async fn chat_stream_via_responses(
         &self,
         token: &str,
@@ -351,17 +472,24 @@ impl CopilotProvider {
         reasoning_source: &str,
     ) -> Result<LLMStream> {
         let url = "https://api.githubcopilot.com/responses";
+        let mut effective_responses_options = responses_options.cloned().unwrap_or_default();
+        if effective_responses_options.store == Some(true) {
+            tracing::warn!(
+                "Copilot /responses does not support store=true; forcing store=false"
+            );
+        }
+        effective_responses_options.store = Some(false);
         let body = build_responses_body(
             model,
             messages,
             tools,
             max_output_tokens,
             reasoning_effort,
-            responses_options,
+            Some(&effective_responses_options),
         );
 
-        log::debug!("Copilot provider using Responses API model: {}", model);
-        log::info!(
+        tracing::debug!("Copilot provider using Responses API model: {}", model);
+        tracing::info!(
             "Copilot request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
             model,
             reasoning_effort
@@ -377,7 +505,7 @@ impl CopilotProvider {
         let mut response = self
             .client
             .post(url)
-            .headers(Self::build_headers_with_token(token)?)
+            .headers(self.build_llm_headers(token, messages, tools)?)
             .json(&body)
             .send()
             .await
@@ -392,7 +520,7 @@ impl CopilotProvider {
                         response = self
                             .client
                             .post(url)
-                            .headers(Self::build_headers_with_token(&refreshed)?)
+                            .headers(self.build_llm_headers(&refreshed, messages, tools)?)
                             .json(&body)
                             .send()
                             .await
@@ -403,16 +531,42 @@ impl CopilotProvider {
 
             if !response.status().is_success() {
                 let status = response.status();
+                let request_id = response
+                    .headers()
+                    .get("x-request-id")
+                    .or_else(|| response.headers().get("x-github-request-id"))
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("-")
+                    .to_string();
+                let response_headers_debug: String = response
+                    .headers()
+                    .iter()
+                    .filter(|(k, _)| {
+                        let name = k.as_str();
+                        !matches!(
+                            name,
+                            "set-cookie"
+                                | "cookie"
+                                | "authorization"
+                                | "accept-ranges"
+                                | "access-control-allow-origin"
+                        )
+                    })
+                    .map(|(k, v)| {
+                        format!("{}={}", k, v.to_str().unwrap_or("<binary>"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let text = response.text().await.unwrap_or_default();
 
                 if reasoning_effort.is_some()
                     && Self::looks_like_reasoning_unsupported_error(status, &text)
                 {
-                    log::warn!(
+                    tracing::warn!(
                         "Copilot /responses rejected reasoning for model '{}'; retrying without reasoning_effort",
                         model
                     );
-                    let mut fallback_options = responses_options.cloned().unwrap_or_default();
+                    let mut fallback_options = effective_responses_options.clone();
                     fallback_options.reasoning_summary = None;
                     let fallback_body = build_responses_body(
                         model,
@@ -425,7 +579,7 @@ impl CopilotProvider {
                     let mut fallback = self
                         .client
                         .post(url)
-                        .headers(Self::build_headers_with_token(token)?)
+                        .headers(self.build_llm_headers(token, messages, tools)?)
                         .json(&fallback_body)
                         .send()
                         .await
@@ -443,7 +597,9 @@ impl CopilotProvider {
                                     fallback = self
                                         .client
                                         .post(url)
-                                        .headers(Self::build_headers_with_token(&refreshed)?)
+                                        .headers(
+                                            self.build_llm_headers(&refreshed, messages, tools)?,
+                                        )
                                         .json(&fallback_body)
                                         .send()
                                         .await
@@ -470,8 +626,36 @@ impl CopilotProvider {
                     )));
                 }
 
-                log::error!("Copilot Responses API error: HTTP {} - {}", status, text);
-                return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
+                if effective_responses_options.previous_response_id.is_some()
+                    && Self::looks_like_previous_response_id_unsupported_error(status, &text)
+                {
+                    return Err(LLMError::Api(format!(
+                        "HTTP {} (request_id={}): Copilot HTTP /responses does not support previous_response_id; same-request tool continuation requires the websocket transport used by VS Code Copilot Chat. Upstream response: {}",
+                        status, request_id, text
+                    )));
+                }
+
+                let request_body_bytes = serde_json::to_vec(&body).map(|v| v.len()).unwrap_or(0);
+                tracing::error!(
+                    "Copilot Responses API error: HTTP {} - {} (request_id={}, model='{}', messages={}, tools={}, request_body_bytes={}, max_output_tokens={:?}, reasoning_effort={:?})",
+                    status,
+                    text,
+                    request_id,
+                    model,
+                    messages.len(),
+                    tools.len(),
+                    request_body_bytes,
+                    max_output_tokens,
+                    reasoning_effort
+                );
+                tracing::debug!(
+                    "Copilot Responses API error response headers: [{}]",
+                    response_headers_debug
+                );
+                return Err(LLMError::Api(format!(
+                    "HTTP {} (request_id={}): {}",
+                    status, request_id, text
+                )));
             }
         }
 
@@ -527,7 +711,7 @@ impl LLMProvider for CopilotProvider {
             ));
         }
 
-        log::debug!("Copilot provider using upstream model: {}", upstream_model);
+        tracing::debug!("Copilot provider using upstream model: {}", upstream_model);
 
         // Some models only support Responses API.
         if self.uses_responses_api(upstream_model) {
@@ -562,9 +746,9 @@ impl LLMProvider for CopilotProvider {
         }
 
         if let Some(reasoning_effort) = reasoning_effort {
-            body["reasoning_effort"] = json!(reasoning_effort.as_str());
+            body["reasoning_effort"] = json!(reasoning_effort.to_wire_format(upstream_model));
         }
-        log::info!(
+        tracing::info!(
             "Copilot request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
             upstream_model,
             reasoning_effort
@@ -577,7 +761,7 @@ impl LLMProvider for CopilotProvider {
                 .unwrap_or_else(|| "none".to_string())
         );
 
-        log::debug!(
+        tracing::debug!(
             "Sending request to Copilot API with {} messages and {} tools",
             messages.len(),
             tools.len()
@@ -588,7 +772,7 @@ impl LLMProvider for CopilotProvider {
         let mut response = self
             .client
             .post(url)
-            .headers(Self::build_headers_with_token(&token)?)
+            .headers(self.build_llm_headers(&token, messages, tools)?)
             .json(&body)
             .send()
             .await
@@ -604,7 +788,7 @@ impl LLMProvider for CopilotProvider {
                         response = self
                             .client
                             .post(url)
-                            .headers(Self::build_headers_with_token(&refreshed)?)
+                            .headers(self.build_llm_headers(&refreshed, messages, tools)?)
                             .json(&body)
                             .send()
                             .await
@@ -615,6 +799,34 @@ impl LLMProvider for CopilotProvider {
 
             if !response.status().is_success() {
                 let status = response.status();
+                // Capture diagnostic headers before consuming the body.
+                let request_id = response
+                    .headers()
+                    .get("x-request-id")
+                    .or_else(|| response.headers().get("x-github-request-id"))
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("-")
+                    .to_string();
+                let response_headers_debug: String = response
+                    .headers()
+                    .iter()
+                    .filter(|(k, _)| {
+                        let name = k.as_str();
+                        // Include error/debug-relevant headers, skip noisy ones.
+                        !matches!(
+                            name,
+                            "set-cookie"
+                                | "cookie"
+                                | "authorization"
+                                | "accept-ranges"
+                                | "access-control-allow-origin"
+                        )
+                    })
+                    .map(|(k, v)| {
+                        format!("{}={}", k, v.to_str().unwrap_or("<binary>"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let text = response.text().await.unwrap_or_default();
 
                 // Check for auth errors
@@ -628,7 +840,7 @@ impl LLMProvider for CopilotProvider {
                 if reasoning_effort.is_some()
                     && Self::looks_like_reasoning_unsupported_error(status, &text)
                 {
-                    log::warn!(
+                    tracing::warn!(
                         "Copilot /chat/completions rejected reasoning for model '{}'; retrying without reasoning_effort",
                         upstream_model
                     );
@@ -646,14 +858,38 @@ impl LLMProvider for CopilotProvider {
                         body_no_reasoning["max_tokens"] = json!(max_tokens);
                     }
 
-                    let retry = self
+                    let mut retry = self
                         .client
                         .post(url)
-                        .headers(Self::build_headers_with_token(&token)?)
+                        .headers(self.build_llm_headers(&token, messages, tools)?)
                         .json(&body_no_reasoning)
                         .send()
                         .await
                         .map_err(LLMError::Http)?;
+
+                    if !retry.status().is_success() {
+                        let retry_status = retry.status();
+                        if (retry_status == 401 || retry_status == 403)
+                            && self.auth_handler.is_some()
+                        {
+                            if let Some(handler) = &self.auth_handler {
+                                if let Ok(Some(refreshed)) =
+                                    handler.force_refresh_chat_token().await
+                                {
+                                    retry = self
+                                        .client
+                                        .post(url)
+                                        .headers(
+                                            self.build_llm_headers(&refreshed, messages, tools)?,
+                                        )
+                                        .json(&body_no_reasoning)
+                                        .send()
+                                        .await
+                                        .map_err(LLMError::Http)?;
+                                }
+                            }
+                        }
+                    }
 
                     if retry.status().is_success() {
                         let stream = llm_stream_from_sse(retry, |_event, data| {
@@ -669,7 +905,7 @@ impl LLMProvider for CopilotProvider {
 
                 // If this model only supports Responses API, retry with /responses.
                 if Self::looks_like_responses_only_error(status, &text) {
-                    log::info!(
+                    tracing::info!(
                         "Copilot chat/completions rejected model '{}'; retrying via /responses",
                         upstream_model
                     );
@@ -687,8 +923,27 @@ impl LLMProvider for CopilotProvider {
                         .await;
                 }
 
-                log::error!("Copilot API error: HTTP {} - {}", status, text);
-                return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
+                let request_body_bytes = serde_json::to_vec(&body).map(|v| v.len()).unwrap_or(0);
+                tracing::error!(
+                    "Copilot API error: HTTP {} - {} (request_id={}, model='{}', messages={}, tools={}, request_body_bytes={}, max_output_tokens={:?}, reasoning_effort={:?})",
+                    status,
+                    text,
+                    request_id,
+                    upstream_model,
+                    messages.len(),
+                    tools.len(),
+                    request_body_bytes,
+                    max_output_tokens,
+                    reasoning_effort
+                );
+                tracing::debug!(
+                    "Copilot API error response headers: [{}]",
+                    response_headers_debug
+                );
+                return Err(LLMError::Api(format!(
+                    "HTTP {} (request_id={}): {}",
+                    status, request_id, text
+                )));
             }
         }
 
@@ -734,7 +989,7 @@ impl LLMProvider for CopilotProvider {
                     if !logged_summary
                         && (requested_reasoning.is_some() || observed_reasoning_signal)
                     {
-                        log::info!(
+                        tracing::info!(
                             "Copilot chat_completions reasoning summary: model='{}' requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
                             model_for_log,
                             requested_reasoning
@@ -795,7 +1050,7 @@ impl LLMProvider for CopilotProvider {
                     )));
                 }
 
-                log::error!("Copilot API error: HTTP {} - {}", status, text);
+                tracing::error!("Copilot API error: HTTP {} - {}", status, text);
                 return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
             }
         }
@@ -968,6 +1223,14 @@ mod tests {
         assert!(headers.contains_key("accept"));
         assert!(headers.contains_key("accept-encoding"));
         assert!(headers.contains_key("copilot-integration-id"));
+        assert!(headers.contains_key("openai-organization"));
+        assert!(headers.contains_key("openai-intent"));
+        assert!(headers.contains_key("x-github-api-version"));
+        assert!(headers.contains_key("x-request-id"));
+        assert!(headers.contains_key("x-initiator"));
+        assert!(headers.contains_key("x-interaction-id"));
+        assert!(headers.contains_key("vscode-sessionid"));
+        assert!(headers.contains_key("vscode-machineid"));
 
         // Verify specific VS Code mimic values
         assert_eq!(headers.get("editor-version").unwrap(), "vscode/1.99.2");
@@ -984,6 +1247,35 @@ mod tests {
             "vscode-chat"
         );
         assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        assert_eq!(
+            headers.get("openai-organization").unwrap(),
+            "github-copilot"
+        );
+        assert_eq!(headers.get("openai-intent").unwrap(), "conversation-panel");
+        assert_eq!(headers.get("x-github-api-version").unwrap(), "2025-05-01");
+        assert_eq!(headers.get("x-initiator").unwrap(), "user");
+        assert!(uuid::Uuid::parse_str(
+            headers.get("x-request-id").unwrap().to_str().unwrap()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn infer_openai_intent_uses_agent_for_tool_loops() {
+        let messages = vec![
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ];
+
+        assert_eq!(
+            CopilotProvider::infer_openai_intent(&messages, &[]),
+            "conversation-agent"
+        );
+        assert_eq!(
+            CopilotProvider::infer_request_initiator(&messages),
+            "agent"
+        );
     }
 
     // ============================================

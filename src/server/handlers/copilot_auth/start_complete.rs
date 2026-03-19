@@ -20,7 +20,7 @@ pub async fn start_copilot_auth(app_state: web::Data<AppState>) -> Result<HttpRe
     let handler = match build_auth_handler(&config, app_data_dir) {
         Ok(handler) => handler,
         Err(err) => {
-            log::error!("Failed to build Copilot auth HTTP client (proxy?): {}", err);
+            tracing::error!("Failed to build Copilot auth HTTP client (proxy?): {}", err);
             return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                 "success": false,
                 "error": format!("Failed to build HTTP client: {}", err),
@@ -30,7 +30,7 @@ pub async fn start_copilot_auth(app_state: web::Data<AppState>) -> Result<HttpRe
 
     match handler.start_authentication().await {
         Ok(device_code) => {
-            log::info!("Device code obtained: {}", device_code.user_code);
+            tracing::info!("Device code obtained: {}", device_code.user_code);
             Ok(HttpResponse::Ok().json(DeviceCodeInfo {
                 device_code: device_code.device_code,
                 user_code: device_code.user_code,
@@ -40,7 +40,7 @@ pub async fn start_copilot_auth(app_state: web::Data<AppState>) -> Result<HttpRe
             }))
         }
         Err(err) => {
-            log::error!("Failed to get device code: {}", err);
+            tracing::error!("Failed to get device code: {}", err);
             Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                 "success": false,
                 "error": format!("Failed to get device code: {}", err)
@@ -59,7 +59,7 @@ pub async fn complete_copilot_auth(
     let handler = match build_auth_handler(&config, app_data_dir) {
         Ok(handler) => handler,
         Err(err) => {
-            log::error!("Failed to build Copilot auth HTTP client (proxy?): {}", err);
+            tracing::error!("Failed to build Copilot auth HTTP client (proxy?): {}", err);
             return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                 "success": false,
                 "error": format!("Failed to build HTTP client: {}", err),
@@ -77,7 +77,7 @@ pub async fn complete_copilot_auth(
 
     match handler.complete_authentication(&device_code).await {
         Ok(_) => {
-            log::info!("Copilot authentication completed successfully");
+            tracing::info!("Copilot authentication completed successfully");
 
             // Authentication is already persisted to disk above. Reloading the in-memory provider
             // is best-effort: in proxy-restricted environments this can occasionally block on
@@ -85,13 +85,13 @@ pub async fn complete_copilot_auth(
             match timeout(Duration::from_secs(8), app_state.reload_provider()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    log::warn!(
+                    tracing::warn!(
                         "Copilot auth succeeded but provider reload failed (non-fatal): {}",
                         err
                     );
                 }
                 Err(_) => {
-                    log::warn!("Copilot auth succeeded but provider reload timed out (non-fatal)");
+                    tracing::warn!("Copilot auth succeeded but provider reload timed out (non-fatal)");
                 }
             }
 
@@ -101,7 +101,7 @@ pub async fn complete_copilot_auth(
             })))
         }
         Err(err) => {
-            log::error!("Copilot authentication completion failed: {}", err);
+            tracing::error!("Copilot authentication completion failed: {}", err);
             Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                 "success": false,
                 "error": format!("Authentication failed: {}", err)

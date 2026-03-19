@@ -71,7 +71,7 @@ async fn apply_fallback_to_message(
 
             #[cfg(not(windows))]
             {
-                log::info!(
+                tracing::info!(
                     "OCR image fallback requested but OCR is currently Windows-only; leaving images intact."
                 );
             }

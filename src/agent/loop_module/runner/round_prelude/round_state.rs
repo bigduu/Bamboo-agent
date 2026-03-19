@@ -23,7 +23,7 @@ pub(super) fn log_round_start(
     message_count: usize,
 ) {
     if debug_enabled {
-        log::debug!(
+        tracing::debug!(
             "[{}] round_start: {}",
             session_id,
             serde_json::json!({

@@ -315,7 +315,7 @@ impl ToolExecutor for BuiltinToolExecutor {
         let args_raw = call.function.arguments.trim();
         let (mut args, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
         if let Some(warning) = parse_warning {
-            log::warn!(
+            tracing::warn!(
                 "Builtin tool argument parsing fallback applied: session_id={:?}, tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", warning={}",
                 ctx.session_id,
                 call.id,

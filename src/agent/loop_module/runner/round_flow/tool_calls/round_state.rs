@@ -47,7 +47,7 @@ impl ToolCallsRoundState {
         message_count: usize,
     ) {
         if context.debug_enabled {
-            log::debug!(
+            tracing::debug!(
                 "[{}] round_complete: {}",
                 context.session_id,
                 serde_json::json!({

@@ -14,7 +14,7 @@ pub async fn reset_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpR
     // Reset in-memory config and best-effort reload provider.
     let new_config = app_state.reload_config().await;
     if let Err(error) = app_state.reload_provider().await {
-        log::warn!(
+        tracing::warn!(
             "Config reset updated config to provider={}, but provider reload failed: {}",
             new_config.provider,
             error

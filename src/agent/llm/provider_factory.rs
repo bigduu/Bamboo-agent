@@ -61,15 +61,15 @@ pub async fn create_provider_with_dir(
             // Try to authenticate (using cache if available)
             match provider.try_authenticate_silent().await {
                 Ok(true) => {
-                    log::info!("Copilot authenticated using cached token");
+                    tracing::info!("Copilot authenticated using cached token");
                 }
                 Ok(false) => {
-                    log::warn!("Copilot not authenticated. Use POST /v1/bamboo/copilot/auth/start to authenticate.");
+                    tracing::warn!("Copilot not authenticated. Use POST /v1/bamboo/copilot/auth/start to authenticate.");
                     // Provider is created but not authenticated - will fail on first use
                     // This allows the user to see the authentication error and know what to do
                 }
                 Err(e) => {
-                    log::warn!("Copilot silent authentication failed: {}. Use POST /v1/bamboo/copilot/auth/start to authenticate.", e);
+                    tracing::warn!("Copilot silent authentication failed: {}. Use POST /v1/bamboo/copilot/auth/start to authenticate.", e);
                 }
             }
             Ok(Arc::new(MaskingProviderDecorator::new(

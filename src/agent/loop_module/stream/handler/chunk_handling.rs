@@ -12,6 +12,11 @@ pub(super) async fn handle_chunk_result(
     session_id: &str,
 ) -> Result<(), AgentError> {
     match chunk_result {
+        Ok(LLMChunk::ResponseId(response_id)) => {
+            tracing::debug!("[{}] Received upstream response_id={}", session_id, response_id);
+            state.set_response_id(response_id);
+            Ok(())
+        }
         Ok(LLMChunk::Token(token)) => {
             state.append_token(&token);
             if let Some(event_tx) = event_tx {
@@ -29,7 +34,7 @@ pub(super) async fn handle_chunk_result(
             Ok(())
         }
         Ok(LLMChunk::ToolCalls(partial_calls)) => {
-            log::trace!(
+            tracing::trace!(
                 "[{}] Received {} tool call parts",
                 session_id,
                 partial_calls.len()
@@ -38,7 +43,7 @@ pub(super) async fn handle_chunk_result(
             Ok(())
         }
         Ok(LLMChunk::Done) => {
-            log::debug!("[{}] LLM stream completed", session_id);
+            tracing::debug!("[{}] LLM stream completed", session_id);
             Ok(())
         }
         Err(error) => {

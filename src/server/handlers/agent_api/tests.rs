@@ -55,8 +55,11 @@ async fn agent_api_config_registers_expected_routes() {
 #[actix_web::test]
 async fn cancel_route_rejects_empty_session_id() {
     let temp = tempdir().expect("create temp dir");
-    let app_state =
-        web::Data::new(crate::server::app_state::AppState::new(temp.path().to_path_buf()).await);
+    let app_state = web::Data::new(
+        crate::server::app_state::AppState::new(temp.path().to_path_buf())
+            .await
+            .expect("app state should initialize"),
+    );
     let app = actix_web::test::init_service(
         actix_web::App::new()
             .app_data(app_state)
@@ -84,8 +87,11 @@ async fn cancel_route_rejects_empty_session_id() {
 #[actix_web::test]
 async fn cancel_route_resolves_alias_when_session_not_running() {
     let temp = tempdir().expect("create temp dir");
-    let state =
-        web::Data::new(crate::server::app_state::AppState::new(temp.path().to_path_buf()).await);
+    let state = web::Data::new(
+        crate::server::app_state::AppState::new(temp.path().to_path_buf())
+            .await
+            .expect("app state should initialize"),
+    );
     let alias = "friendly-session";
     let target_session_id = Uuid::new_v4().to_string();
     state
@@ -127,8 +133,11 @@ async fn cancel_route_resolves_alias_when_session_not_running() {
 #[actix_web::test]
 async fn execute_route_returns_bad_request_for_non_directory_project_path() {
     let temp = tempdir().expect("create temp dir");
-    let state =
-        web::Data::new(crate::server::app_state::AppState::new(temp.path().to_path_buf()).await);
+    let state = web::Data::new(
+        crate::server::app_state::AppState::new(temp.path().to_path_buf())
+            .await
+            .expect("app state should initialize"),
+    );
     *state.claude_cli_path.write().await = Some("claude".to_string());
 
     let app = actix_web::test::init_service(

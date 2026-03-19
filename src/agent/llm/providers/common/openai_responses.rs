@@ -16,24 +16,23 @@ use std::collections::HashMap;
 
 /// Convert internal [`Message`] values to a Responses API `input` array.
 ///
-/// We intentionally keep this conservative:
-/// - `role`
-/// - `content`
+/// The Responses API uses a heterogeneous input array containing:
+/// - `{"type": "message", "role": "...", "content": "..."}` for regular messages
+/// - `{"type": "function_call", "call_id": "...", "name": "...", "arguments": "..."}` for tool invocations
+/// - `{"type": "function_call_output", "call_id": "...", "output": "..."}` for tool results
 ///
-/// NOTE: Many upstreams implementing the Responses API *do not* accept a `tool`
-/// role in the input (they only allow: system/developer/user/assistant). Bamboo
-/// internally represents tool results as `Role::Tool`; when serializing for
-/// Responses, we convert these tool-result messages into a regular `user`
-/// message with a clear prefix so the model can incorporate the observation.
+/// This function properly serializes the full tool-call chain so the model
+/// maintains structured context across rounds, instead of degrading tool
+/// interactions into plain-text user messages.
 ///
-/// We also intentionally avoid sending assistant `tool_calls` back in the input
-/// since the Responses API input format differs across providers and versions.
+/// For assistant messages that contain `tool_calls`, we:
+/// 1. Emit a `message` item for any text content the assistant produced.
+/// 2. Emit a `function_call` item for each tool call.
+///
+/// For tool-result messages (`Role::Tool`), we emit a `function_call_output` item.
 pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
     // If any message contains image parts, emit a "typed" content array shape so
     // multimodal inputs have a chance to reach upstream Responses implementations.
-    //
-    // For text-only requests, we keep the conservative string content shape that
-    // has proven to work across multiple upstreams.
     let has_images = messages.iter().any(|m| {
         m.content_parts.as_ref().is_some_and(|parts| {
             parts
@@ -42,98 +41,101 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
         })
     });
 
-    // Best-effort index so we can add a tool name in the serialized observation.
-    let mut call_id_to_name: HashMap<&str, &str> = HashMap::new();
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+
     for m in messages {
-        if m.role != Role::Assistant {
-            continue;
-        }
-        let Some(calls) = m.tool_calls.as_ref() else {
-            continue;
-        };
-        for c in calls {
-            if !c.id.is_empty() && !c.function.name.is_empty() {
-                call_id_to_name.insert(c.id.as_str(), c.function.name.as_str());
+        match m.role {
+            Role::Assistant => {
+                // Emit assistant text content as a message item (even if empty, for completeness).
+                let has_text = !m.content.trim().is_empty();
+                if has_text || m.tool_calls.is_none() {
+                    let content = build_content_value(m, has_images, None);
+                    out.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": content,
+                    }));
+                }
+
+                // Emit each tool call as a structured function_call item.
+                if let Some(calls) = m.tool_calls.as_ref() {
+                    for c in calls {
+                        out.push(json!({
+                            "type": "function_call",
+                            "call_id": c.id,
+                            "name": c.function.name,
+                            "arguments": c.function.arguments,
+                        }));
+                    }
+                }
+            }
+
+            Role::Tool => {
+                // Emit tool result as a structured function_call_output item.
+                let call_id = m.tool_call_id.as_deref().unwrap_or("");
+                if !call_id.is_empty() {
+                    out.push(json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": m.content,
+                    }));
+                } else {
+                    // Fallback: no call_id available — degrade to user message with prefix.
+                    let content = json!(format!("[tool_result]\n{}", m.content));
+                    out.push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": content,
+                    }));
+                }
+            }
+
+            Role::System | Role::User => {
+                let role = if m.role == Role::System {
+                    "system"
+                } else {
+                    "user"
+                };
+                let content = build_content_value(m, has_images, None);
+                out.push(json!({
+                    "type": "message",
+                    "role": role,
+                    "content": content,
+                }));
             }
         }
     }
 
-    messages
-        .iter()
-        .map(|m| {
-            let role = match m.role {
-                Role::System => "system",
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::Tool => "user",
-            };
+    out
+}
 
-            let tool_observation_text: Option<String> = if m.role == Role::Tool {
-                // Preserve the call id as plain text; some upstreams reject `tool_call_id`.
-                let call_id = m.tool_call_id.as_deref().unwrap_or("");
-                let tool_name = if !call_id.is_empty() {
-                    call_id_to_name.get(call_id).copied().unwrap_or("")
-                } else {
-                    ""
-                };
-
-                if !tool_name.is_empty() && !call_id.is_empty() {
-                    Some(format!(
-                        "[tool_result name={tool_name} call_id={call_id}]\n{}",
-                        m.content
-                    ))
-                } else if !call_id.is_empty() {
-                    Some(format!("[tool_result call_id={call_id}]\n{}", m.content))
-                } else {
-                    Some(format!("[tool_result]\n{}", m.content))
-                }
-            } else {
-                None
-            };
-
-            let content: Value = if has_images {
-                // Typed content array (best-effort for multimodal responses).
-                let mut out = Vec::new();
-
-                if let Some(parts) = m.content_parts.as_ref() {
-                    for part in parts {
-                        match part {
-                            ContentPart::Text { text } => {
-                                out.push(json!({"type": "input_text", "text": text}));
-                            }
-                            ContentPart::ImageUrl { image_url } => {
-                                out.push(
-                                    json!({"type": "input_image", "image_url": image_url.url}),
-                                );
-                            }
-                        }
+/// Build the `content` value for a message item.
+///
+/// If `has_images` is true, uses typed content array (`input_text` / `input_image`).
+/// Otherwise, uses a plain string value.
+fn build_content_value(m: &Message, has_images: bool, text_override: Option<&str>) -> Value {
+    if has_images {
+        let mut parts = Vec::new();
+        if let Some(content_parts) = m.content_parts.as_ref() {
+            for part in content_parts {
+                match part {
+                    ContentPart::Text { text } => {
+                        parts.push(json!({"type": "input_text", "text": text}));
                     }
-                } else {
-                    // No parts: degrade to a typed text entry (or tool observation text).
-                    let text = tool_observation_text
-                        .clone()
-                        .unwrap_or_else(|| m.content.clone());
-                    out.push(json!({"type": "input_text", "text": text}));
+                    ContentPart::ImageUrl { image_url } => {
+                        parts.push(json!({"type": "input_image", "image_url": image_url.url}));
+                    }
                 }
-
-                json!(out)
-            } else {
-                // Conservative string content (widely compatible).
-                if let Some(text) = tool_observation_text {
-                    json!(text)
-                } else {
-                    json!(m.content)
-                }
-            };
-
-            let msg = json!({
-                "role": role,
-                "content": content,
-            });
-
-            msg
-        })
-        .collect()
+            }
+        } else {
+            let text = text_override.unwrap_or(&m.content);
+            parts.push(json!({"type": "input_text", "text": text}));
+        }
+        json!(parts)
+    } else {
+        let text = text_override.unwrap_or(&m.content);
+        json!(text)
+    }
 }
 
 /// Convert internal tool schemas to a Responses API `tools` array JSON.
@@ -171,6 +173,14 @@ pub fn build_responses_body(
         "stream": true,
     });
 
+    if let Some(previous_response_id) = responses_options
+        .and_then(|opts| opts.previous_response_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        body["previous_response_id"] = json!(previous_response_id);
+    }
+
     if !tools.is_empty() {
         body["tools"] = json!(tools_to_responses_json(tools));
         // Best-effort default; upstreams may ignore/override.
@@ -188,7 +198,7 @@ pub fn build_responses_body(
     if reasoning_effort.is_some() || reasoning_summary.is_some() {
         let mut reasoning = serde_json::Map::new();
         if let Some(effort) = reasoning_effort {
-            reasoning.insert("effort".to_string(), json!(effort.as_str()));
+            reasoning.insert("effort".to_string(), json!(effort.to_wire_format(model)));
         }
         if let Some(summary) = reasoning_summary {
             reasoning.insert("summary".to_string(), json!(summary));
@@ -250,6 +260,7 @@ pub struct ResponsesSseParser {
     reasoning_event_count: usize,
     reasoning_text_chars: usize,
     logged_summary: bool,
+    emitted_response_id: Option<String>,
 }
 
 impl ResponsesSseParser {
@@ -273,6 +284,7 @@ impl ResponsesSseParser {
             reasoning_event_count: 0,
             reasoning_text_chars: 0,
             logged_summary: false,
+            emitted_response_id: None,
         }
     }
 
@@ -341,7 +353,7 @@ impl ResponsesSseParser {
                     .and_then(|tokens| tokens.as_u64())
             });
 
-        log::info!(
+        tracing::info!(
             "{} responses reasoning summary: model='{}' requested_effort={} request_reasoning_enabled={} observed_reasoning_signal={} reasoning_event_count={} reasoning_text_chars={} reasoning_tokens={}",
             self.provider_label,
             if self.model.is_empty() { "<unknown>" } else { self.model.as_str() },
@@ -359,6 +371,29 @@ impl ResponsesSseParser {
         self.logged_summary = true;
     }
 
+    fn response_id_from_value<'a>(&self, value: &'a Value) -> Option<&'a str> {
+        value
+            .get("response")
+            .and_then(|response| response.get("id"))
+            .and_then(|id| id.as_str())
+            .or_else(|| value.get("response_id").and_then(|id| id.as_str()))
+    }
+
+    fn maybe_emit_response_id(&mut self, event_type: &str, value: &Value) -> Option<LLMChunk> {
+        if !matches!(
+            event_type,
+            "response.created" | "response.in_progress" | "response.completed"
+        ) {
+            return None;
+        }
+        let response_id = self.response_id_from_value(value)?;
+        if self.emitted_response_id.as_deref() == Some(response_id) {
+            return None;
+        }
+        self.emitted_response_id = Some(response_id.to_string());
+        Some(LLMChunk::ResponseId(response_id.to_string()))
+    }
+
     pub fn handle_event(&mut self, event: &str, data: &str) -> Result<Option<LLMChunk>> {
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             // Be lenient: some upstreams occasionally send non-JSON keepalives.
@@ -366,6 +401,10 @@ impl ResponsesSseParser {
         };
 
         let event_type = self.event_type(event, &v);
+
+        if let Some(chunk) = self.maybe_emit_response_id(event_type, &v) {
+            return Ok(Some(chunk));
+        }
 
         if event_type.contains("reasoning") {
             self.observed_reasoning_signal = true;
@@ -495,6 +534,7 @@ mod tests {
                 reasoning_summary: Some("detailed".to_string()),
                 include: Some(vec!["reasoning.encrypted_content".to_string()]),
                 store: Some(true),
+                previous_response_id: Some("resp_123".to_string()),
                 truncation: Some("auto".to_string()),
             }),
         );
@@ -505,6 +545,7 @@ mod tests {
             serde_json::json!(["reasoning.encrypted_content"])
         );
         assert_eq!(body["store"], true);
+        assert_eq!(body["previous_response_id"], "resp_123");
         assert_eq!(body["truncation"], "auto");
     }
 
@@ -559,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn messages_to_responses_input_json_converts_tool_role_to_user_observation() {
+    fn messages_to_responses_input_json_serializes_tool_calls_structurally() {
         let messages = vec![
             Message::assistant(
                 "Calling a tool...",
@@ -576,15 +617,149 @@ mod tests {
         ];
 
         let out = messages_to_responses_input_json(&messages);
+        // Should produce 3 items: assistant message, function_call, function_call_output
+        assert_eq!(out.len(), 3);
+
+        // Item 0: assistant message with text content
+        assert_eq!(out[0]["type"], "message");
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["content"], "Calling a tool...");
+
+        // Item 1: structured function_call
+        assert_eq!(out[1]["type"], "function_call");
+        assert_eq!(out[1]["call_id"], "call_1");
+        assert_eq!(out[1]["name"], "search");
+        assert_eq!(out[1]["arguments"], r#"{"q":"x"}"#);
+
+        // Item 2: structured function_call_output
+        assert_eq!(out[2]["type"], "function_call_output");
+        assert_eq!(out[2]["call_id"], "call_1");
+        assert_eq!(out[2]["output"], "result payload");
+    }
+
+    #[test]
+    fn messages_to_responses_input_json_assistant_with_only_tool_calls_no_text() {
+        // When assistant has empty content and tool_calls, skip the message item
+        let messages = vec![
+            Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: r#"{"path":"/tmp/test"}"#.to_string(),
+                    },
+                }]),
+            ),
+            Message::tool_result("call_1", "file contents"),
+        ];
+
+        let out = messages_to_responses_input_json(&messages);
+        // Should produce 2 items: function_call, function_call_output (no empty assistant message)
         assert_eq!(out.len(), 2);
-        assert_eq!(out[1]["role"], "user");
-        assert!(out[1]["content"]
+
+        assert_eq!(out[0]["type"], "function_call");
+        assert_eq!(out[0]["call_id"], "call_1");
+        assert_eq!(out[0]["name"], "read_file");
+
+        assert_eq!(out[1]["type"], "function_call_output");
+        assert_eq!(out[1]["call_id"], "call_1");
+        assert_eq!(out[1]["output"], "file contents");
+    }
+
+    #[test]
+    fn messages_to_responses_input_json_multiple_tool_calls_in_one_round() {
+        let messages = vec![
+            Message::user("Search and read"),
+            Message::assistant(
+                "",
+                Some(vec![
+                    ToolCall {
+                        id: "call_1".to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "search".to_string(),
+                            arguments: r#"{"q":"test"}"#.to_string(),
+                        },
+                    },
+                    ToolCall {
+                        id: "call_2".to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "read_file".to_string(),
+                            arguments: r#"{"path":"/tmp"}"#.to_string(),
+                        },
+                    },
+                ]),
+            ),
+            Message::tool_result("call_1", "search results"),
+            Message::tool_result("call_2", "file contents"),
+        ];
+
+        let out = messages_to_responses_input_json(&messages);
+        // user_msg + 2x function_call + 2x function_call_output = 5 items
+        assert_eq!(out.len(), 5);
+
+        assert_eq!(out[0]["type"], "message");
+        assert_eq!(out[0]["role"], "user");
+
+        assert_eq!(out[1]["type"], "function_call");
+        assert_eq!(out[1]["call_id"], "call_1");
+        assert_eq!(out[1]["name"], "search");
+
+        assert_eq!(out[2]["type"], "function_call");
+        assert_eq!(out[2]["call_id"], "call_2");
+        assert_eq!(out[2]["name"], "read_file");
+
+        assert_eq!(out[3]["type"], "function_call_output");
+        assert_eq!(out[3]["call_id"], "call_1");
+
+        assert_eq!(out[4]["type"], "function_call_output");
+        assert_eq!(out[4]["call_id"], "call_2");
+    }
+
+    #[test]
+    fn messages_to_responses_input_json_tool_result_without_call_id_falls_back() {
+        let messages = vec![Message::tool_result("", "orphan result")];
+
+        let out = messages_to_responses_input_json(&messages);
+        assert_eq!(out.len(), 1);
+        // Fallback: degrade to user message with prefix
+        assert_eq!(out[0]["type"], "message");
+        assert_eq!(out[0]["role"], "user");
+        assert!(out[0]["content"]
             .as_str()
             .unwrap_or("")
-            .contains("tool_result"));
-        assert!(out[1]["content"].as_str().unwrap_or("").contains("call_1"));
-        assert!(out[1]["content"].as_str().unwrap_or("").contains("search"));
-        assert!(out[1].get("tool_call_id").is_none());
+            .contains("[tool_result]"));
+    }
+
+    #[test]
+    fn messages_to_responses_input_json_system_and_user_messages() {
+        let messages = vec![
+            Message::system("You are helpful"),
+            Message::user("Hello"),
+        ];
+
+        let out = messages_to_responses_input_json(&messages);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["type"], "message");
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "You are helpful");
+        assert_eq!(out[1]["type"], "message");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"], "Hello");
+    }
+
+    #[test]
+    fn messages_to_responses_input_json_assistant_without_tool_calls() {
+        let messages = vec![Message::assistant("Just a text reply", None)];
+
+        let out = messages_to_responses_input_json(&messages);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "message");
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["content"], "Just a text reply");
     }
 
     #[test]
@@ -600,6 +775,33 @@ mod tests {
             Some(LLMChunk::Token(t)) => assert_eq!(t, "hi"),
             other => panic!("expected token, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parser_emits_response_id_on_created_event() {
+        let mut p = ResponsesSseParser::new();
+        let out = p
+            .handle_event(
+                "response.created",
+                r#"{"type":"response.created","response":{"id":"resp_123","status":"in_progress"}}"#,
+            )
+            .unwrap();
+        match out {
+            Some(LLMChunk::ResponseId(response_id)) => assert_eq!(response_id, "resp_123"),
+            other => panic!("expected response id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_does_not_confuse_item_id_with_response_id() {
+        let mut p = ResponsesSseParser::new();
+        let out = p
+            .handle_event(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"id":"item_1","type":"function_call","call_id":"call_1","name":"search","arguments":"{}"}}"#,
+            )
+            .unwrap();
+        assert!(out.is_none());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::server::app_state::{AgentStatus, AppState};
 /// `POST /api/v1/stop/{session_id}`
 pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let session_id = path.into_inner();
-    log::info!("[{}] Stop request received", session_id);
+    tracing::info!("[{}] Stop request received", session_id);
 
     let runner_cancelled = cancel_running_runner(&state, &session_id).await;
     let legacy_cancelled = cancel_legacy_token(&state, &session_id).await;
@@ -20,7 +20,7 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> imp
             message: "Agent execution stopped".to_string(),
         })
     } else {
-        log::warn!("[{}] No active runner or cancel token found", session_id);
+        tracing::warn!("[{}] No active runner or cancel token found", session_id);
         HttpResponse::NotFound().json(StopResponse {
             success: false,
             message: "No active agent execution found".to_string(),
@@ -35,7 +35,7 @@ async fn cancel_running_runner(state: &web::Data<AppState>, session_id: &str) ->
     };
 
     if !matches!(runner.status, AgentStatus::Running) {
-        log::warn!(
+        tracing::warn!(
             "[{}] Runner not in Running status: {:?}",
             session_id,
             runner.status
@@ -44,7 +44,7 @@ async fn cancel_running_runner(state: &web::Data<AppState>, session_id: &str) ->
     }
 
     runner.cancel_token.cancel();
-    log::info!("[{}] Runner cancellation triggered", session_id);
+    tracing::info!("[{}] Runner cancellation triggered", session_id);
     true
 }
 
@@ -55,7 +55,7 @@ async fn cancel_legacy_token(state: &web::Data<AppState>, session_id: &str) -> b
     };
     token.cancel();
     tokens.remove(session_id);
-    log::info!("[{}] Legacy cancellation triggered", session_id);
+    tracing::info!("[{}] Legacy cancellation triggered", session_id);
     true
 }
 

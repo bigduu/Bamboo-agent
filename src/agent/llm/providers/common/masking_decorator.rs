@@ -63,7 +63,7 @@ impl<P: LLMProvider> LLMProvider for MaskingProviderDecorator<P> {
             })
             .collect();
 
-        log::debug!(
+        tracing::debug!(
             "Applied keyword masking to {} messages",
             masked_messages.len()
         );
@@ -111,7 +111,7 @@ impl<P: LLMProvider> LLMProvider for MaskingProviderDecorator<P> {
             })
             .collect();
 
-        log::debug!(
+        tracing::debug!(
             "Applied keyword masking to {} messages",
             masked_messages.len()
         );

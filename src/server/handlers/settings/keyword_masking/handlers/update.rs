@@ -32,7 +32,7 @@ pub async fn update_keyword_masking_config(
         .await?;
 
     if let Err(error) = app_state.reload_provider().await {
-        log::warn!(
+        tracing::warn!(
             "Keyword masking updated but provider reload failed: {}",
             error
         );

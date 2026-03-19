@@ -5,7 +5,7 @@ use crate::core::model_mapping::GeminiModelMapping;
 /// This no longer performs any file I/O. The mapping should be sourced from the
 /// unified `Config` (`config.gemini_model_mapping`) and passed in.
 pub fn resolve_model(mapping: &GeminiModelMapping, gemini_model: &str) -> ModelResolution {
-    log::info!(
+    tracing::info!(
         "Resolving Gemini model '{}', available mappings: {:?}",
         gemini_model,
         mapping.mappings
@@ -27,7 +27,7 @@ pub fn resolve_model(mapping: &GeminiModelMapping, gemini_model: &str) -> ModelR
     } else if model_lower.contains("pro") {
         "pro"
     } else {
-        log::warn!(
+        tracing::warn!(
             "No Gemini model mapping found for '{}', falling back to default model",
             gemini_model
         );
@@ -42,7 +42,7 @@ pub fn resolve_model(mapping: &GeminiModelMapping, gemini_model: &str) -> ModelR
         .get(model_type)
         .filter(|value| !value.trim().is_empty())
     {
-        log::info!(
+        tracing::info!(
             "Model '{}' (type: {}) mapped to '{}'",
             gemini_model,
             model_type,
@@ -54,7 +54,7 @@ pub fn resolve_model(mapping: &GeminiModelMapping, gemini_model: &str) -> ModelR
         };
     }
 
-    log::warn!(
+    tracing::warn!(
         "No mapping configured for model type '{}', falling back to default model",
         model_type
     );

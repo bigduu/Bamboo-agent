@@ -44,7 +44,7 @@ pub(super) async fn inject_external_memory_into_system_message(session: &mut Ses
         Ok(Some(content)) => content,
         Ok(None) => String::new(),
         Err(error) => {
-            log::warn!(
+            tracing::warn!(
                 "[{}] Failed to read external memory note: {}",
                 session.id,
                 error

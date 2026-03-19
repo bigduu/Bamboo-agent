@@ -16,7 +16,7 @@ pub(super) fn append_waiting_tool_result_message(
         tool_call.id.clone(),
         tool_result_payload.to_string(),
     );
-    log::debug!(
+    tracing::debug!(
         "[{}] Adding tool result message for {}, tool_call_id: {}, message_id: {}",
         session_id,
         tool_call.function.name,
@@ -49,7 +49,7 @@ pub(super) async fn persist_session_after_question(
 ) {
     if let Some(ref storage) = config.storage {
         if let Err(error) = storage.save_session(session).await {
-            log::warn!(
+            tracing::warn!(
                 "[{}] Failed to save session after user-question tool: {}",
                 session_id,
                 error

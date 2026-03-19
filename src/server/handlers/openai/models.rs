@@ -45,7 +45,7 @@ pub async fn get_models(app_state: web::Data<AppState>) -> Result<HttpResponse, 
             }
             // Keep this endpoint best-effort so UIs/SDKs can call it even when the provider
             // is not configured yet.
-            log::warn!("Failed to fetch models (returning empty list): {}", error);
+            tracing::warn!("Failed to fetch models (returning empty list): {}", error);
             return Ok(HttpResponse::Ok().json(ListModelsResponse {
                 success: true,
                 object: "list".to_string(),

@@ -3,7 +3,7 @@ use crate::core::process_utils::{
     trace_windows_command,
 };
 use dashmap::DashMap;
-use log::warn;
+use tracing::warn;
 use regex::Regex;
 use std::path::Path;
 use std::process::Stdio;

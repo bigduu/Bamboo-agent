@@ -45,6 +45,8 @@ pub struct AgentLoopConfig {
     pub metrics_collector: Option<MetricsCollector>,
     /// Model name used for metrics attribution
     pub model_name: Option<String>,
+    /// Provider name used for provider-specific request behavior.
+    pub provider_name: Option<String>,
     /// Optional request-time reasoning effort override.
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Tool names that should be excluded from schemas sent to the LLM.
@@ -61,7 +63,7 @@ pub struct AgentLoopConfig {
 impl Default for AgentLoopConfig {
     fn default() -> Self {
         Self {
-            max_rounds: 50,
+            max_rounds: 200,
             system_prompt: None,
             selected_skill_ids: None,
             additional_tool_schemas: Vec::new(),
@@ -73,6 +75,7 @@ impl Default for AgentLoopConfig {
             attachment_reader: None,
             metrics_collector: None,
             model_name: None,
+            provider_name: None,
             reasoning_effort: None,
             disabled_tools: BTreeSet::new(),
             token_budget: None,

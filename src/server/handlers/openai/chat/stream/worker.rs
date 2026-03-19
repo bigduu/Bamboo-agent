@@ -31,6 +31,7 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
 
     while let Some(chunk_result) = args.stream_result.next().await {
         match chunk_result {
+            Ok(LLMChunk::ResponseId(_)) => {}
             Ok(LLMChunk::Done) => {
                 saw_done = true;
                 if let Some(done_chunk) = openai_chunk_bytes(LLMChunk::Done, &args.model) {
@@ -57,7 +58,7 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                 }
             }
             Err(error) => {
-                log::error!("Stream error: {}", error);
+                tracing::error!("Stream error: {}", error);
                 had_error = true;
                 args.metrics.forward_completed(
                     args.forward_id.clone(),

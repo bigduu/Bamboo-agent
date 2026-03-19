@@ -27,7 +27,7 @@ pub(super) async fn maybe_handle_todowrite(
     };
 
     session.set_todo_list(todo_list.clone());
-    log::info!(
+    tracing::info!(
         "[{}] TodoWrite updated todo list '{}' with {} items",
         session_id,
         todo_list.title,
@@ -48,13 +48,13 @@ pub(super) async fn maybe_handle_todowrite(
 async fn persist_todo_list(config: &AgentLoopConfig, session: &Session, session_id: &str) {
     if let Some(ref storage) = config.storage {
         if let Err(error) = storage.save_session(session).await {
-            log::warn!(
+            tracing::warn!(
                 "[{}] Failed to save session after todo list creation: {}",
                 session_id,
                 error
             );
         } else {
-            log::debug!("[{}] Session saved after TodoWrite update", session_id);
+            tracing::debug!("[{}] Session saved after TodoWrite update", session_id);
         }
     }
 }
@@ -67,7 +67,7 @@ fn reinitialize_todo_context(
     // IMPORTANT: Re-initialize TodoLoopContext from session.
     *todo_context = TodoLoopContext::from_session(session);
     if todo_context.is_some() {
-        log::debug!(
+        tracing::debug!(
             "[{}] TodoLoopContext re-initialized after TodoWrite",
             session_id
         );

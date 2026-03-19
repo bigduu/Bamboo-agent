@@ -37,10 +37,9 @@ pub fn path_to_display_string(path: &Path) -> String {
 pub fn resolve_bamboo_dir() -> PathBuf {
     std::env::var("BAMBOO_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .expect("Could not determine home directory")
-                .join(".bamboo")
+        .unwrap_or_else(|_| match dirs::home_dir() {
+            Some(home) => home.join(".bamboo"),
+            None => PathBuf::from(".bamboo"),
         })
 }
 

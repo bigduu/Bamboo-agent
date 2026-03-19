@@ -1,6 +1,6 @@
 use std::net::TcpListener;
 
-use log::warn;
+use tracing::warn;
 
 pub(super) const DEFAULT_WORKER_COUNT: usize = 10;
 

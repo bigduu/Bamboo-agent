@@ -7,7 +7,7 @@ use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use log::warn;
+use tracing::warn;
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};

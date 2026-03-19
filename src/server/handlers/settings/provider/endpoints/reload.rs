@@ -28,7 +28,7 @@ pub(super) async fn handle_reload_provider_config(
         .reconcile_from_config(&new_config.mcp)
         .await;
 
-    log::info!("Provider reloaded successfully: {}", new_config.provider);
+    tracing::info!("Provider reloaded successfully: {}", new_config.provider);
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,

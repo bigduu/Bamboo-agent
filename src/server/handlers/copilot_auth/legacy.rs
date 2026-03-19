@@ -20,7 +20,7 @@ pub async fn authenticate_copilot(
     let mut provider = match build_provider_with_auth_handler(&config, app_data_dir) {
         Ok(provider) => provider,
         Err(err) => {
-            log::error!("Failed to build Copilot HTTP client (proxy?): {}", err);
+            tracing::error!("Failed to build Copilot HTTP client (proxy?): {}", err);
             return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                 "success": false,
                 "error": format!("Failed to build HTTP client: {}", err),
@@ -30,7 +30,7 @@ pub async fn authenticate_copilot(
 
     match provider.authenticate().await {
         Ok(_) => {
-            log::info!("Copilot authentication successful");
+            tracing::info!("Copilot authentication successful");
 
             app_state.reload_provider().await.map_err(|err| {
                 AppError::InternalError(anyhow::anyhow!(
@@ -45,7 +45,7 @@ pub async fn authenticate_copilot(
             })))
         }
         Err(err) => {
-            log::error!("Copilot authentication failed: {}", err);
+            tracing::error!("Copilot authentication failed: {}", err);
             Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                 "success": false,
                 "error": format!("Authentication failed: {}", err)

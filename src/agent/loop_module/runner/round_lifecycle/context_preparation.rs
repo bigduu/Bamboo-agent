@@ -76,7 +76,7 @@ fn record_compression_event(
     session.compression_events.push(event.clone());
     session.updated_at = Utc::now();
 
-    log::info!(
+    tracing::info!(
         "[{}] Context compression event {} recorded: messages={}, segments_removed={}",
         session_id,
         event.id,

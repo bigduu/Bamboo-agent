@@ -46,7 +46,7 @@ pub(super) async fn execute_single_tool_call(ctx: PerToolExecutionContext<'_>) -
     let raw_arguments = ctx.tool_call.function.arguments.trim();
     let (args, parse_warning) = parse_tool_args_best_effort(&ctx.tool_call.function.arguments);
     if let Some(warning) = parse_warning {
-        log::warn!(
+        tracing::warn!(
             "[{}][round:{}] Tool call arguments required fallback before ToolStart: tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", warning={}",
             ctx.session_id,
             ctx.round,
@@ -58,7 +58,7 @@ pub(super) async fn execute_single_tool_call(ctx: PerToolExecutionContext<'_>) -
         );
     }
 
-    log::debug!(
+    tracing::debug!(
         "[{}][round:{}] Starting tool execution: tool_call_id={}, tool_name={}, raw_args_len={}",
         ctx.session_id,
         ctx.round,

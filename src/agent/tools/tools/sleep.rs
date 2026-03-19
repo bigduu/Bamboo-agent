@@ -72,9 +72,9 @@ impl Tool for SleepTool {
         }
 
         if let Some(reason) = parsed.reason.as_deref() {
-            log::info!("Sleeping for {} seconds: {}", parsed.seconds, reason);
+            tracing::info!("Sleeping for {} seconds: {}", parsed.seconds, reason);
         } else {
-            log::info!("Sleeping for {} seconds", parsed.seconds);
+            tracing::info!("Sleeping for {} seconds", parsed.seconds);
         }
 
         sleep(Duration::from_secs_f64(parsed.seconds)).await;

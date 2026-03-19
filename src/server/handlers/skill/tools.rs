@@ -1,7 +1,7 @@
 use crate::agent::core::tools::ToolSchema;
 use crate::agent::tools::BuiltinToolExecutor;
 use actix_web::{web, HttpResponse};
-use log::{debug, info};
+use tracing::{debug, info};
 
 use crate::server::app_state::AppState;
 use crate::server::error::AppError;

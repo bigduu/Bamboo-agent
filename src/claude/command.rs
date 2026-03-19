@@ -1,7 +1,7 @@
 use crate::core::process_utils::{
     hide_window_for_std_command, hide_window_for_tokio_command, trace_windows_command,
 };
-use log::{debug, info};
+use tracing::{debug, info};
 
 #[cfg(windows)]
 fn resolve_windows_program(program: &str) -> (String, Vec<String>) {

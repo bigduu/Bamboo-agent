@@ -52,7 +52,7 @@
 
 use anyhow::{Context, Result};
 use dirs;
-use log::{debug, error, info};
+use tracing::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -212,9 +212,11 @@ fn extract_command_info(file_path: &Path, base_path: &Path) -> Result<(String, O
     if components.len() == 1 {
         Ok((components[0].to_string(), None))
     } else {
-        let command_name = components.last().unwrap().to_string();
-        let namespace = components[..components.len() - 1].join(":");
-        Ok((command_name, Some(namespace)))
+        let Some((command_name, namespace_parts)) = components.split_last() else {
+            return Err(anyhow::anyhow!("Invalid command path"));
+        };
+        let namespace = namespace_parts.join(":");
+        Ok(((*command_name).to_string(), Some(namespace)))
     }
 }
 

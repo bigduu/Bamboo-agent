@@ -60,7 +60,7 @@ pub(super) async fn rewrite_parts_to_ocr_text(
                         out.push_str("]\n(no text detected)\n");
                     }
                     Err(err) => {
-                        log::warn!(
+                        tracing::warn!(
                             "OCR failed for image {} ({}): {}",
                             image_index,
                             summary,

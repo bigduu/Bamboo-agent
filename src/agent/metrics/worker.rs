@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use log::{error, info, warn};
+use tracing::{error, info, warn};
 use tokio::sync::mpsc;
 
 use crate::agent::metrics::bus::MetricsBus;
