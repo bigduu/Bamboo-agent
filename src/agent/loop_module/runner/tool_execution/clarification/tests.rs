@@ -44,9 +44,10 @@ async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events(
     assert!(handled);
     assert_eq!(session.messages.len(), 1);
     assert!(matches!(session.messages[0].role, Role::Tool));
-    assert!(session.messages[0]
-        .content
-        .contains("Waiting for user response to: Continue?"));
+    let saved_payload: serde_json::Value =
+        serde_json::from_str(&session.messages[0].content).expect("saved tool result payload");
+    assert_eq!(saved_payload["question"], "Continue?");
+    assert_eq!(saved_payload["allow_custom"], false);
 
     let pending = session
         .pending_question

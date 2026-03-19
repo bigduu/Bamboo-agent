@@ -20,6 +20,7 @@ use crate::agent::llm::LLMProvider;
 use crate::agent::loop_module::{run_agent_loop_with_config, AgentLoopConfig};
 use crate::agent::metrics::MetricsCollector;
 use crate::agent::skill::SkillManager;
+use crate::core::Config;
 use crate::server::app_state::{AgentRunner, AgentStatus};
 
 #[derive(Debug, Clone)]
@@ -35,6 +36,7 @@ pub struct SpawnContext {
     pub storage: Arc<dyn Storage>,
     pub provider: Arc<dyn LLMProvider>,
     pub tools: Arc<dyn ToolExecutor>,
+    pub config: Arc<RwLock<Config>>,
     pub skill_manager: Arc<SkillManager>,
     pub metrics_collector: MetricsCollector,
     pub sessions_cache: Arc<RwLock<HashMap<String, Session>>>,
@@ -274,6 +276,9 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
             .map(|m| m.content.clone())
             .unwrap_or_default();
 
+        let config_snapshot = ctx.config.read().await.clone();
+        let disabled_tools = config_snapshot.disabled_tool_names();
+
         session.model = model.clone();
 
         let result = run_agent_loop_with_config(
@@ -293,6 +298,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
                 attachment_reader: Some(attachment_reader),
                 metrics_collector: Some(metrics),
                 model_name: Some(model),
+                disabled_tools,
                 ..Default::default()
             },
         )

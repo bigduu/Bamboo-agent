@@ -172,6 +172,7 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
     };
     let requested_reasoning_effort = job.run_config.reasoning_effort;
     let reasoning_effort = requested_reasoning_effort.or(config_snapshot.get_reasoning_effort());
+    let disabled_tools = config_snapshot.disabled_tool_names();
 
     let title = format!("{} ({})", job.schedule_name, now.to_rfc3339());
     let global_default_prompt =
@@ -357,6 +358,7 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
                 metrics_collector: Some(metrics),
                 model_name: Some(model.clone()),
                 reasoning_effort,
+                disabled_tools,
                 ..Default::default()
             },
         )

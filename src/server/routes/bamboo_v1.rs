@@ -132,6 +132,7 @@ fn bamboo_v1_scope() -> impl HttpServiceFactory {
             "/bamboo/anthropic-model-mapping",
             web::post().to(settings::set_anthropic_model_mapping),
         )
+        .route("/bamboo/tools", web::get().to(settings::get_bamboo_tools))
         // Skill routes
         .route("/skills", web::get().to(skill::list_skills))
         .route(

@@ -30,6 +30,139 @@ pub fn parse_tool_args(arguments: &str) -> std::result::Result<serde_json::Value
         .map_err(|error| ToolError::InvalidArguments(format!("Invalid JSON arguments: {error}")))
 }
 
+fn trim_end_whitespace_in_place(value: &mut String) {
+    let trimmed_len = value.trim_end_matches(char::is_whitespace).len();
+    value.truncate(trimmed_len);
+}
+
+fn strip_trailing_commas_in_place(value: &mut String) {
+    loop {
+        trim_end_whitespace_in_place(value);
+        if value.ends_with(',') {
+            value.pop();
+            continue;
+        }
+        break;
+    }
+}
+
+fn preview_for_log(value: &str, max_chars: usize) -> String {
+    let mut iter = value.chars();
+    let mut preview = String::new();
+    for _ in 0..max_chars {
+        match iter.next() {
+            Some(ch) => preview.push(ch),
+            None => break,
+        }
+    }
+    if iter.next().is_some() {
+        preview.push_str("...");
+    }
+    preview.replace('\n', "\\n").replace('\r', "\\r")
+}
+
+fn attempt_repair_truncated_json(arguments: &str) -> Option<String> {
+    let args_raw = arguments.trim();
+    if args_raw.is_empty() {
+        return None;
+    }
+    if !args_raw.starts_with('{') && !args_raw.starts_with('[') {
+        return None;
+    }
+
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in args_raw.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.last().copied() == Some(ch) {
+                    stack.pop();
+                } else {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !in_string && stack.is_empty() {
+        return None;
+    }
+
+    let mut repaired = args_raw.to_string();
+    if in_string {
+        repaired.push('"');
+    }
+
+    while let Some(closing) = stack.pop() {
+        strip_trailing_commas_in_place(&mut repaired);
+        repaired.push(closing);
+    }
+
+    strip_trailing_commas_in_place(&mut repaired);
+    Some(repaired)
+}
+
+/// Parse tool args with graceful fallback:
+/// 1) strict JSON parse
+/// 2) attempt repair for truncated/incomplete JSON
+/// 3) fallback to empty object to keep the session alive
+pub fn parse_tool_args_best_effort(arguments: &str) -> (serde_json::Value, Option<String>) {
+    let args_raw = arguments.trim();
+    if args_raw.is_empty() {
+        return (serde_json::json!({}), None);
+    }
+
+    match serde_json::from_str::<serde_json::Value>(args_raw) {
+        Ok(parsed) => (parsed, None),
+        Err(primary_error) => {
+            if let Some(repaired_json) = attempt_repair_truncated_json(args_raw) {
+                match serde_json::from_str::<serde_json::Value>(&repaired_json) {
+                    Ok(parsed) => {
+                        let warning = format!(
+                            "Invalid JSON arguments recovered via auto-repair: original_error={}, repaired_preview=\"{}\"",
+                            primary_error,
+                            preview_for_log(&repaired_json, 180)
+                        );
+                        return (parsed, Some(warning));
+                    }
+                    Err(repair_error) => {
+                        let warning = format!(
+                            "Invalid JSON arguments: {} (auto-repair failed: {}); falling back to empty object",
+                            primary_error, repair_error
+                        );
+                        return (serde_json::json!({}), Some(warning));
+                    }
+                }
+            }
+
+            let warning = format!(
+                "Invalid JSON arguments: {}; falling back to empty object",
+                primary_error
+            );
+            (serde_json::json!({}), Some(warning))
+        }
+    }
+}
+
 pub fn try_parse_agentic_result(result: &ToolResult) -> Option<AgenticToolResult> {
     if result.result.trim_start().starts_with('{') {
         if let Ok(parsed) = serde_json::from_str::<AgenticToolResult>(&result.result) {
@@ -393,5 +526,24 @@ mod tests {
     fn parse_tool_args_rejects_invalid_json() {
         let error = parse_tool_args("not-json").expect_err("invalid json should fail");
         assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn parse_tool_args_best_effort_repairs_truncated_json() {
+        let (parsed, warning) = parse_tool_args_best_effort(r#"{"path":"README.md""#);
+
+        assert_eq!(
+            parsed.get("path").and_then(|v| v.as_str()),
+            Some("README.md")
+        );
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn parse_tool_args_best_effort_falls_back_to_empty_object() {
+        let (parsed, warning) = parse_tool_args_best_effort("not-json");
+
+        assert_eq!(parsed, serde_json::json!({}));
+        assert!(warning.is_some());
     }
 }

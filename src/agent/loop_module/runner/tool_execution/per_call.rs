@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::agent::core::tools::{parse_tool_args, ToolCall, ToolExecutionContext, ToolExecutor};
+use crate::agent::core::tools::{
+    parse_tool_args_best_effort, ToolCall, ToolExecutionContext, ToolExecutor,
+};
 use crate::agent::core::{AgentEvent, Session};
 use crate::agent::loop_module::config::AgentLoopConfig;
 use crate::agent::loop_module::todo_context::TodoLoopContext;
@@ -42,22 +44,19 @@ pub(super) struct PerToolExecutionContext<'a> {
 
 pub(super) async fn execute_single_tool_call(ctx: PerToolExecutionContext<'_>) -> bool {
     let raw_arguments = ctx.tool_call.function.arguments.trim();
-    let args = match parse_tool_args(&ctx.tool_call.function.arguments) {
-        Ok(args) => args,
-        Err(error) => {
-            log::warn!(
-                "[{}][round:{}] Failed to parse tool call arguments before ToolStart event; using empty object: tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", error={}",
-                ctx.session_id,
-                ctx.round,
-                ctx.tool_call.id,
-                ctx.tool_call.function.name,
-                raw_arguments.len(),
-                preview_for_log(raw_arguments, 180),
-                error
-            );
-            serde_json::json!({})
-        }
-    };
+    let (args, parse_warning) = parse_tool_args_best_effort(&ctx.tool_call.function.arguments);
+    if let Some(warning) = parse_warning {
+        log::warn!(
+            "[{}][round:{}] Tool call arguments required fallback before ToolStart: tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", warning={}",
+            ctx.session_id,
+            ctx.round,
+            ctx.tool_call.id,
+            ctx.tool_call.function.name,
+            raw_arguments.len(),
+            preview_for_log(raw_arguments, 180),
+            warning
+        );
+    }
 
     log::debug!(
         "[{}][round:{}] Starting tool execution: tool_call_id={}, tool_name={}, raw_args_len={}",

@@ -50,7 +50,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -122,6 +122,12 @@ pub struct Config {
     #[serde(default)]
     pub hooks: HooksConfig,
 
+    /// Global tool toggles.
+    ///
+    /// Any tool listed in `disabled` is omitted from the tool schemas sent to the LLM.
+    #[serde(default, skip_serializing_if = "ToolsConfig::is_empty")]
+    pub tools: ToolsConfig,
+
     /// MCP server configuration.
     ///
     /// Previously persisted in `mcp.json` (now unified into `config.json`).
@@ -168,6 +174,20 @@ pub struct HooksConfig {
     /// Image fallback behavior for OpenAI-compatible requests (chat/responses).
     #[serde(default)]
     pub image_fallback: ImageFallbackHookConfig,
+}
+
+/// Global tool toggle configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolsConfig {
+    /// Tool names that are disabled globally.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled: Vec<String>,
+}
+
+impl ToolsConfig {
+    fn is_empty(&self) -> bool {
+        self.disabled.is_empty()
+    }
 }
 
 /// When a request contains image parts but the effective provider path is text-only,
@@ -488,6 +508,7 @@ impl Config {
                         config.hydrate_proxy_auth_from_encrypted();
                         config.hydrate_provider_api_keys_from_encrypted();
                         config.hydrate_mcp_secrets_from_encrypted();
+                        config.normalize_tool_settings();
                         config
                     })
                     .unwrap_or_else(|e| {
@@ -507,6 +528,7 @@ impl Config {
         config.hydrate_provider_api_keys_from_encrypted();
         // Decrypt encrypted MCP secrets into in-memory plaintext form.
         config.hydrate_mcp_secrets_from_encrypted();
+        config.normalize_tool_settings();
 
         // Legacy: `data_dir` is no longer a persisted config field. The data directory is
         // derived from runtime (BAMBOO_DATA_DIR or `${HOME}/.bamboo`).
@@ -584,6 +606,22 @@ impl Config {
                 .and_then(|c| c.reasoning_effort),
             _ => None,
         }
+    }
+
+    /// Get normalized disabled tool names.
+    pub fn disabled_tool_names(&self) -> BTreeSet<String> {
+        self.tools
+            .disabled
+            .iter()
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    /// Normalize tool settings (trim / dedupe / sort).
+    pub fn normalize_tool_settings(&mut self) {
+        self.tools.disabled = self.disabled_tool_names().into_iter().collect();
     }
 
     /// Populate `proxy_auth` (plaintext) from `proxy_auth_encrypted` if present.
@@ -838,6 +876,7 @@ impl Config {
             anthropic_model_mapping: AnthropicModelMapping::default(),
             gemini_model_mapping: GeminiModelMapping::default(),
             hooks: HooksConfig::default(),
+            tools: ToolsConfig::default(),
             mcp: crate::agent::mcp::McpConfig::default(),
             extra: BTreeMap::new(),
         }
@@ -871,6 +910,7 @@ impl Config {
         to_save.extra.remove("model");
         to_save.refresh_proxy_auth_encrypted()?;
         to_save.refresh_provider_api_keys_encrypted()?;
+        to_save.normalize_tool_settings();
         let content =
             serde_json::to_string_pretty(&to_save).context("Failed to serialize config to JSON")?;
         write_atomic(&path, content.as_bytes())
@@ -1100,6 +1140,38 @@ mod tests {
             config.https_proxy.is_empty(),
             "config should keep https_proxy empty when field is omitted"
         );
+    }
+
+    #[test]
+    fn normalize_tool_settings_trims_dedupes_and_sorts() {
+        let mut config = Config::default();
+        config.tools.disabled = vec![
+            "  read_file  ".to_string(),
+            "".to_string(),
+            "read_file".to_string(),
+            "bash".to_string(),
+        ];
+
+        config.normalize_tool_settings();
+
+        assert_eq!(config.tools.disabled, vec!["bash", "read_file"]);
+    }
+
+    #[test]
+    fn config_load_reads_disabled_tools() {
+        let _lock = env_lock_acquire();
+        let temp_home = TempHome::new();
+        temp_home.set_config_json(
+            r#"{
+  "tools": {
+    "disabled": ["bash", " read_file ", "bash"]
+  }
+}"#,
+        );
+
+        let config = Config::from_data_dir(Some(temp_home.path.clone()));
+        assert_eq!(config.tools.disabled, vec!["bash", "read_file"]);
+        assert!(config.disabled_tool_names().contains("bash"));
     }
 
     #[test]

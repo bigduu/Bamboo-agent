@@ -89,6 +89,7 @@ async fn test_submit_response_updates_tool_result_and_clears_pending_question() 
     let body: serde_json::Value = test::read_body_json(resp).await;
     assert_eq!(body["success"], true);
     assert_eq!(body["response"], "A");
+    assert_eq!(body["auto_resume_status"], "not_requested");
 
     let loaded = state
         .storage
@@ -101,9 +102,16 @@ async fn test_submit_response_updates_tool_result_and_clears_pending_question() 
         .messages
         .iter()
         .any(|message| message.content == "User selected: A"));
-    assert!(loaded.messages.iter().any(|message| message
+    assert!(!loaded.messages.iter().any(|message| message
         .content
         .contains("I chose 'A' in response to: Pick one")));
+    assert_eq!(
+        loaded
+            .metadata
+            .get("ask_user_resume_pending")
+            .map(String::as_str),
+        Some("true")
+    );
 }
 
 #[actix_web::test]

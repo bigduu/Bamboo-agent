@@ -9,12 +9,12 @@ use super::payload::UserQuestionPayload;
 pub(super) fn append_waiting_tool_result_message(
     session: &mut Session,
     tool_call: &ToolCall,
-    question: &str,
+    tool_result_payload: &str,
     session_id: &str,
 ) {
     let tool_result_msg = crate::agent::core::Message::tool_result(
         tool_call.id.clone(),
-        format!("Waiting for user response to: {}", question),
+        tool_result_payload.to_string(),
     );
     log::debug!(
         "[{}] Adding tool result message for {}, tool_call_id: {}, message_id: {}",

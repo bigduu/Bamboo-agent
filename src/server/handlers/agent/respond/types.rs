@@ -9,6 +9,8 @@ use serde::Deserialize;
 pub struct RespondRequest {
     /// The user's response - either one of the options or custom input
     pub response: String,
+    /// Optional model to auto-resume execution after recording response.
+    pub model: Option<String>,
 }
 
 #[cfg(test)]
@@ -20,6 +22,7 @@ mod tests {
         let json = r#"{"response":"yes"}"#;
         let req: RespondRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.response, "yes");
+        assert_eq!(req.model, None);
     }
 
     #[test]
@@ -27,6 +30,15 @@ mod tests {
         let json = r#"{"response":"I choose option 3"}"#;
         let req: RespondRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.response, "I choose option 3");
+        assert_eq!(req.model, None);
+    }
+
+    #[test]
+    fn test_respond_request_with_optional_model() {
+        let json = r#"{"response":"yes","model":"gpt-5-mini"}"#;
+        let req: RespondRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.response, "yes");
+        assert_eq!(req.model.as_deref(), Some("gpt-5-mini"));
     }
 
     #[test]
@@ -40,6 +52,7 @@ mod tests {
     fn test_respond_request_debug() {
         let req = RespondRequest {
             response: "test response".to_string(),
+            model: None,
         };
         let debug_str = format!("{:?}", req);
         assert!(debug_str.contains("RespondRequest"));

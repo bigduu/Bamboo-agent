@@ -25,6 +25,30 @@ async fn test_get_bamboo_config() {
 }
 
 #[actix_web::test]
+async fn test_get_bamboo_tools() {
+    let state = crate::e2e::common::create_test_app().await;
+
+    let app = test::init_service(App::new().app_data(state).route(
+        "/v1/bamboo/tools",
+        web::get().to(settings::get_bamboo_tools),
+    ))
+    .await;
+
+    let req = test::TestRequest::get()
+        .uri("/v1/bamboo/tools")
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert!(resp.status().is_success());
+
+    let body = test::read_body(resp).await;
+    let result: serde_json::Value =
+        serde_json::from_slice(&body).expect("Response should be valid JSON");
+
+    assert!(result["tools"].is_array());
+}
+
+#[actix_web::test]
 async fn test_set_bamboo_config() {
     let state = crate::e2e::common::create_test_app().await;
 

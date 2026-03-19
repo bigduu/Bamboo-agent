@@ -32,6 +32,7 @@ fn agent_loop_config_default() {
     assert!(config.composition_executor.is_none());
     assert!(config.skill_manager.is_none());
     assert!(config.selected_skill_ids.is_none());
+    assert!(config.disabled_tools.is_empty());
     assert!(!config.skip_initial_user_message);
 }
 

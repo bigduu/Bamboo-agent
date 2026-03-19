@@ -40,7 +40,7 @@ pub(super) async fn maybe_handle_user_question_tool(
         tool_call.function.name
     );
 
-    append_waiting_tool_result_message(session, tool_call, &question_payload.question, session_id);
+    append_waiting_tool_result_message(session, tool_call, &result.result, session_id);
 
     send_event_with_metrics(
         event_tx,

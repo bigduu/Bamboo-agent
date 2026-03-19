@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::agent::core::budget::TokenBudget;
@@ -46,6 +47,8 @@ pub struct AgentLoopConfig {
     pub model_name: Option<String>,
     /// Optional request-time reasoning effort override.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Tool names that should be excluded from schemas sent to the LLM.
+    pub disabled_tools: BTreeSet<String>,
     /// Token budget for context management (optional, defaults to model's limits)
     pub token_budget: Option<TokenBudget>,
     /// Optional image fallback behavior applied to *LLM requests only* (never persisted).
@@ -71,6 +74,7 @@ impl Default for AgentLoopConfig {
             metrics_collector: None,
             model_name: None,
             reasoning_effort: None,
+            disabled_tools: BTreeSet::new(),
             token_budget: None,
             image_fallback: None,
         }

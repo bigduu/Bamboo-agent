@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
 use crate::agent::core::tools::{
-    normalize_tool_name, parse_tool_args, Tool, ToolCall, ToolError, ToolExecutionContext,
-    ToolExecutor, ToolResult, ToolSchema,
+    normalize_tool_name, parse_tool_args_best_effort, Tool, ToolCall, ToolError,
+    ToolExecutionContext, ToolExecutor, ToolResult, ToolSchema,
 };
 use crate::agent::tools::normalize_tool_ref;
 
@@ -39,7 +39,17 @@ impl ToolExecutor for OverlayToolExecutor {
                 .as_deref()
                 .is_some_and(|normalized| normalized == self.overlay.name());
         if is_overlay_call {
-            let args = parse_tool_args(&call.function.arguments)?;
+            let args_raw = call.function.arguments.trim();
+            let (args, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
+            if let Some(warning) = parse_warning {
+                log::warn!(
+                    "Overlay tool argument parsing fallback applied: tool_call_id={}, tool_name={}, args_len={}, warning={}",
+                    call.id,
+                    call.function.name,
+                    args_raw.len(),
+                    warning
+                );
+            }
             return self.overlay.execute_with_context(args, ctx).await;
         }
         self.base.execute_with_context(call, ctx).await

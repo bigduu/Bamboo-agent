@@ -1,10 +1,10 @@
-use actix_web::{web, Responder};
+use actix_web::{web, HttpResponse};
 use tokio::sync::mpsc;
 
 use super::image_fallback::{resolve_image_fallback, validate_image_fallback_for_session};
 use super::runtime::{
-    has_pending_user_message, reserve_runner, spawn_agent_execution, spawn_event_forwarder,
-    RunnerReservation, SpawnAgentExecution,
+    consume_pending_ask_user_resume, has_pending_user_message, reserve_runner,
+    spawn_agent_execution, spawn_event_forwarder, RunnerReservation, SpawnAgentExecution,
 };
 use super::session::load_session;
 use super::ExecuteRequest;
@@ -79,7 +79,7 @@ pub async fn handler(
     state: web::Data<AppState>,
     path: web::Path<String>,
     req: web::Json<ExecuteRequest>,
-) -> impl Responder {
+) -> HttpResponse {
     let session_id = path.into_inner();
     let model = match validate_and_normalize_model(&req.model) {
         Ok(model) => model,
@@ -107,6 +107,7 @@ pub async fn handler(
     let config_snapshot = state.config.read().await.clone();
     let default_reasoning_effort = config_snapshot.get_reasoning_effort();
     let effective_reasoning_effort = request_reasoning_effort.or(default_reasoning_effort);
+    let disabled_tools = config_snapshot.disabled_tool_names();
     let reasoning_effort_source = if request_reasoning_effort.is_some() {
         "request"
     } else if default_reasoning_effort.is_some() {
@@ -153,6 +154,8 @@ pub async fn handler(
         RunnerReservation::AlreadyRunning => return already_running_response(&session_id),
     };
 
+    consume_pending_ask_user_resume(&mut session);
+
     log::info!("[{}] Starting agent execution", session_id);
 
     // Create mpsc channel for agent loop.
@@ -172,6 +175,7 @@ pub async fn handler(
         model,
         reasoning_effort: effective_reasoning_effort,
         reasoning_effort_source: reasoning_effort_source.to_string(),
+        disabled_tools,
         cancel_token,
         mpsc_tx,
         image_fallback,

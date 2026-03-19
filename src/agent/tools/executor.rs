@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
 use crate::agent::core::tools::{
-    normalize_tool_name, Tool, ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult,
-    ToolSchema,
+    normalize_tool_name, parse_tool_args_best_effort, Tool, ToolCall, ToolError,
+    ToolExecutionContext, ToolExecutor, ToolResult, ToolSchema,
 };
 use async_trait::async_trait;
-use serde_json::json;
 
 use crate::agent::tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
 use crate::agent::tools::permission::{check_permissions, PermissionChecker, PermissionError};
@@ -314,28 +313,18 @@ impl ToolExecutor for BuiltinToolExecutor {
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let args_raw = call.function.arguments.trim();
-        let mut args: serde_json::Value = if args_raw.is_empty() {
-            json!({})
-        } else {
-            match serde_json::from_str(args_raw) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    log::warn!(
-                        "Builtin tool argument parsing failed: session_id={:?}, tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", error={}",
-                        ctx.session_id,
-                        call.id,
-                        call.function.name,
-                        args_raw.len(),
-                        preview_for_log(args_raw, 180),
-                        error
-                    );
-                    return Err(ToolError::InvalidArguments(format!(
-                        "Invalid JSON arguments: {}",
-                        error
-                    )));
-                }
-            }
-        };
+        let (mut args, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
+        if let Some(warning) = parse_warning {
+            log::warn!(
+                "Builtin tool argument parsing fallback applied: session_id={:?}, tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", warning={}",
+                ctx.session_id,
+                call.id,
+                call.function.name,
+                args_raw.len(),
+                preview_for_log(args_raw, 180),
+                warning
+            );
+        }
 
         let raw_tool_name = normalize_tool_name(&call.function.name);
         if let Some(args_obj) = args.as_object_mut() {
@@ -478,6 +467,17 @@ mod tests {
             function: FunctionCall {
                 name: name.to_string(),
                 arguments: args.to_string(),
+            },
+        }
+    }
+
+    fn make_tool_call_with_raw_args(name: &str, raw_args: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: raw_args.to_string(),
             },
         }
     }
@@ -636,6 +636,32 @@ mod tests {
         let result = executor.execute(&call).await.unwrap();
         assert!(result.success);
         assert!(result.result.contains("canonical-list.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_executor_recovers_truncated_json_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovered-write.txt");
+
+        // Missing closing brace simulates EOF while parsing an object.
+        let malformed_args = format!(
+            r#"{{"file_path":"{}","content":"recovered content""#,
+            path.display()
+        );
+
+        let executor = BuiltinToolExecutor::new();
+        let call = make_tool_call_with_raw_args("Write", &malformed_args);
+
+        let result = executor
+            .execute(&call)
+            .await
+            .expect("truncated JSON should be auto-repaired");
+        assert!(result.success);
+
+        let written = fs::read_to_string(&path)
+            .await
+            .expect("file should be written");
+        assert_eq!(written, "recovered content");
     }
 
     #[test]

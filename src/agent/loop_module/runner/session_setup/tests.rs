@@ -70,3 +70,25 @@ fn resolve_available_tool_schemas_dedupes_and_merges_additional_entries() {
 
     assert_eq!(names, vec!["a_tool", "b_tool", "z_tool"]);
 }
+
+#[test]
+fn resolve_available_tool_schemas_excludes_disabled_tools() {
+    let config = crate::agent::loop_module::config::AgentLoopConfig {
+        additional_tool_schemas: vec![schema("b_tool")],
+        disabled_tools: ["a_tool".to_string(), "b_tool".to_string()]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("a_tool"), schema("z_tool")],
+    };
+
+    let resolved = resolve_available_tool_schemas(&config, &tools);
+    let names: Vec<&str> = resolved
+        .iter()
+        .map(|item| item.function.name.as_str())
+        .collect();
+
+    assert_eq!(names, vec!["z_tool"]);
+}

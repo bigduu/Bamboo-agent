@@ -1,5 +1,6 @@
 use crate::agent::core::tools::{
-    ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult, ToolSchema,
+    parse_tool_args_best_effort, ToolCall, ToolError, ToolExecutionContext, ToolExecutor,
+    ToolResult, ToolSchema,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -81,18 +82,18 @@ impl ToolExecutor for McpToolExecutor {
 
         // Parse arguments
         let args_raw = call.function.arguments.trim();
-        let args: serde_json::Value = serde_json::from_str(args_raw).map_err(|error| {
+        let (args, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
+        if let Some(warning) = parse_warning {
             warn!(
-                "MCP tool argument parsing failed: tool_call_id={}, tool_name={}, server_id={}, args_len={}, args_preview=\"{}\", error={}",
+                "MCP tool argument parsing fallback applied: tool_call_id={}, tool_name={}, server_id={}, args_len={}, args_preview=\"{}\", warning={}",
                 call.id,
                 tool_name,
                 alias.server_id,
                 args_raw.len(),
                 Self::preview_for_log(args_raw, 180),
-                error
+                warning
             );
-            ToolError::InvalidArguments(format!("Invalid JSON: {}", error))
-        })?;
+        }
 
         // Execute via manager
         match self

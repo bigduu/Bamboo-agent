@@ -1,13 +1,32 @@
 use crate::agent::core::{agent::Role, Session};
 
+const ASK_USER_RESUME_PENDING_KEY: &str = "ask_user_resume_pending";
+
 pub(in crate::server::handlers::agent::execute) fn has_pending_user_message(
     session: &Session,
 ) -> bool {
+    if has_pending_ask_user_resume(session) {
+        return true;
+    }
+
     session
         .messages
         .last()
         .map(|message| matches!(message.role, Role::User))
         .unwrap_or(false)
+}
+
+pub(in crate::server::handlers::agent::execute) fn consume_pending_ask_user_resume(
+    session: &mut Session,
+) {
+    session.metadata.remove(ASK_USER_RESUME_PENDING_KEY);
+}
+
+fn has_pending_ask_user_resume(session: &Session) -> bool {
+    session
+        .metadata
+        .get(ASK_USER_RESUME_PENDING_KEY)
+        .is_some_and(|value| value == "true")
 }
 
 pub(super) fn system_prompt_for_session(session: &Session) -> Option<String> {

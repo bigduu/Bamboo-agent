@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::agent::core::composition::{CompositionExecutor, ExecutionContext, ToolExpr};
 use crate::agent::core::tools::{ToolCall, ToolResult, ToolSchema};
 
-use super::result_handler::parse_tool_args;
+use super::result_handler::parse_tool_args_best_effort;
 use super::ToolExecutionContext;
 
 /// Errors that can occur during tool execution
@@ -147,7 +147,17 @@ pub async fn execute_tool_call_with_context(
     ctx: ToolExecutionContext<'_>,
 ) -> Result<ToolResult> {
     if let Some(executor) = composition_executor {
-        let args = parse_tool_args(&tool_call.function.arguments)?;
+        let args_raw = tool_call.function.arguments.trim();
+        let (args, parse_warning) = parse_tool_args_best_effort(&tool_call.function.arguments);
+        if let Some(warning) = parse_warning {
+            log::warn!(
+                "Composition executor tool args fallback applied: tool_call_id={}, tool_name={}, args_len={}, warning={}",
+                tool_call.id,
+                tool_call.function.name,
+                args_raw.len(),
+                warning
+            );
+        }
         let expr = ToolExpr::call(tool_call.function.name.clone(), args);
         let mut exec_ctx = ExecutionContext::new();
 

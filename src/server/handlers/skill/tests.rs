@@ -1,6 +1,6 @@
-use actix_web::{body::to_bytes, http::StatusCode, web};
 use crate::agent::tools::BuiltinToolExecutor;
 use crate::server::{app_state::AppState, error::AppError};
+use actix_web::{body::to_bytes, http::StatusCode, web};
 
 use super::tools::{resolve_session_identifier, select_tools_by_allowlist, to_openai_tools};
 use super::types::FilteredToolsQuery;
@@ -71,10 +71,7 @@ fn to_openai_tools_maps_function_fields() {
 
 #[actix_web::test]
 async fn skill_config_registers_expected_routes() {
-    let app = actix_web::test::init_service(
-        actix_web::App::new().configure(super::config),
-    )
-    .await;
+    let app = actix_web::test::init_service(actix_web::App::new().configure(super::config)).await;
 
     for uri in [
         "/skills",
@@ -120,10 +117,7 @@ async fn get_available_workflows_returns_sorted_workflow_names() {
     let payload: serde_json::Value =
         serde_json::from_slice(&body).expect("deserialize workflow response");
 
-    assert_eq!(
-        payload["workflows"],
-        serde_json::json!(["alpha", "zeta"])
-    );
+    assert_eq!(payload["workflows"], serde_json::json!(["alpha", "zeta"]));
 }
 
 #[tokio::test]

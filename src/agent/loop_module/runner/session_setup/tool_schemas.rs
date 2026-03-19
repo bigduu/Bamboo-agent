@@ -13,5 +13,8 @@ pub(super) fn resolve_available_tool_schemas(
     tool_schemas.extend(config.additional_tool_schemas.clone());
     tool_schemas.sort_by(|left, right| left.function.name.cmp(&right.function.name));
     tool_schemas.dedup_by(|left, right| left.function.name == right.function.name);
+    if !config.disabled_tools.is_empty() {
+        tool_schemas.retain(|schema| !config.disabled_tools.contains(&schema.function.name));
+    }
     tool_schemas
 }

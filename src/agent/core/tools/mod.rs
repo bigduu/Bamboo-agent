@@ -111,7 +111,8 @@ pub use executor::{execute_tool_call, execute_tool_call_with_context, ToolError,
 pub use registry::{global_registry, normalize_tool_name, RegistryError, Tool, ToolRegistry};
 pub use result_handler::{
     execute_sub_actions, handle_tool_result_with_agentic_support, parse_tool_args,
-    send_clarification_request, try_parse_agentic_result, ToolHandlingOutcome, MAX_SUB_ACTIONS,
+    parse_tool_args_best_effort, send_clarification_request, try_parse_agentic_result,
+    ToolHandlingOutcome, MAX_SUB_ACTIONS,
 };
 pub use smart_code_review::SmartCodeReviewTool;
 pub use types::{FunctionCall, FunctionSchema, ToolCall, ToolResult, ToolSchema};

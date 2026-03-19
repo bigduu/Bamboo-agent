@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -25,6 +26,7 @@ pub(in crate::server::handlers::agent::execute) struct SpawnAgentExecution {
     pub(in crate::server::handlers::agent::execute) model: String,
     pub(in crate::server::handlers::agent::execute) reasoning_effort: Option<ReasoningEffort>,
     pub(in crate::server::handlers::agent::execute) reasoning_effort_source: String,
+    pub(in crate::server::handlers::agent::execute) disabled_tools: BTreeSet<String>,
     pub(in crate::server::handlers::agent::execute) cancel_token: CancellationToken,
     pub(in crate::server::handlers::agent::execute) mpsc_tx: mpsc::Sender<AgentEvent>,
     pub(in crate::server::handlers::agent::execute) image_fallback: Option<ImageFallbackConfig>,
@@ -42,6 +44,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
             model,
             reasoning_effort,
             reasoning_effort_source,
+            disabled_tools,
             cancel_token,
             mpsc_tx,
             image_fallback,
@@ -106,6 +109,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
                 metrics_collector: Some(state.metrics_service.collector()),
                 model_name: Some(model),
                 reasoning_effort,
+                disabled_tools,
                 image_fallback,
                 ..Default::default()
             },
