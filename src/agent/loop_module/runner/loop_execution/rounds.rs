@@ -59,7 +59,7 @@ pub(super) async fn run_rounds(
     for round in 0..config.max_rounds {
         let round_id = super::super::round_prelude::prepare_round(
             session,
-            &mut state.todo_context,
+            &mut state.task_context,
             round,
             config.max_rounds,
             cancel_token,
@@ -70,8 +70,11 @@ pub(super) async fn run_rounds(
         )
         .await?;
 
-        let tool_schemas =
-            super::super::session_setup::resolve_available_tool_schemas(config, tools.as_ref());
+        let tool_schemas = super::super::session_setup::resolve_available_tool_schemas(
+            config,
+            tools.as_ref(),
+            session,
+        );
 
         let mut round_flow_outcome: Option<super::super::round_flow::RoundFlowOutcome> = None;
         let mut terminal_error: Option<crate::agent::core::AgentError> = None;
@@ -132,7 +135,7 @@ pub(super) async fn run_rounds(
                 state.metrics_collector.as_ref(),
                 &tools,
                 config,
-                &mut state.todo_context,
+                &mut state.task_context,
                 llm.clone(),
             )
             .await
@@ -261,9 +264,7 @@ mod tests {
 
     #[test]
     fn does_not_retry_empty_llm_error() {
-        assert!(!should_retry_round_error(&AgentError::LLM(
-            "".to_string(),
-        )));
+        assert!(!should_retry_round_error(&AgentError::LLM("".to_string(),)));
         assert!(!should_retry_round_error(&AgentError::LLM(
             "   ".to_string(),
         )));

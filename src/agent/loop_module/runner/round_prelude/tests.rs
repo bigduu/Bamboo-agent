@@ -2,15 +2,15 @@ use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 
 use super::prepare_round;
-use crate::agent::core::todo::{TodoItem, TodoItemStatus, TodoList};
 use crate::agent::core::{AgentError, Role, Session};
-use crate::agent::loop_module::todo_context::TodoLoopContext;
+use crate::agent::core::{TaskItem, TaskItemStatus, TaskList};
+use crate::agent::loop_module::task_context::TaskLoopContext;
 
-fn sample_todo_list(session_id: &str, status: TodoItemStatus) -> TodoList {
-    TodoList {
+fn sample_task_list(session_id: &str, status: TaskItemStatus) -> TaskList {
+    TaskList {
         session_id: session_id.to_string(),
         title: "Tasks".to_string(),
-        items: vec![TodoItem {
+        items: vec![TaskItem {
             id: "item-1".to_string(),
             description: "Test item".to_string(),
             status,
@@ -23,14 +23,14 @@ fn sample_todo_list(session_id: &str, status: TodoItemStatus) -> TodoList {
 }
 
 #[tokio::test]
-async fn prepare_round_updates_todo_context_and_returns_round_id() {
+async fn prepare_round_updates_task_context_and_returns_round_id() {
     let mut session = Session::new("session-prelude", "test-model");
-    session.set_todo_list(sample_todo_list("session-prelude", TodoItemStatus::Pending));
-    let mut todo_context = TodoLoopContext::from_session(&session);
+    session.set_task_list(sample_task_list("session-prelude", TaskItemStatus::Pending));
+    let mut task_context = TaskLoopContext::from_session(&session);
 
     let round_id = prepare_round(
         &mut session,
-        &mut todo_context,
+        &mut task_context,
         2,
         7,
         &CancellationToken::new(),
@@ -43,7 +43,7 @@ async fn prepare_round_updates_todo_context_and_returns_round_id() {
     .expect("round should prepare");
 
     assert_eq!(round_id, "session-prelude-round-3");
-    let ctx = todo_context.expect("todo context should exist");
+    let ctx = task_context.expect("task context should exist");
     assert_eq!(ctx.current_round, 2);
     assert_eq!(ctx.max_rounds, 7);
     assert!(session
@@ -55,13 +55,13 @@ async fn prepare_round_updates_todo_context_and_returns_round_id() {
 #[tokio::test]
 async fn prepare_round_returns_cancelled_error_when_token_cancelled() {
     let mut session = Session::new("session-cancelled", "test-model");
-    let mut todo_context = None;
+    let mut task_context = None;
     let cancel_token = CancellationToken::new();
     cancel_token.cancel();
 
     let result = prepare_round(
         &mut session,
-        &mut todo_context,
+        &mut task_context,
         0,
         5,
         &cancel_token,

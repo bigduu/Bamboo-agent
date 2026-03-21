@@ -49,6 +49,7 @@ impl FromProvider<OpenAIChatMessage> for Message {
             image_ocr: None,
             tool_calls,
             tool_call_id: msg.tool_call_id,
+            tool_success: None,
             compressed: false,
             compressed_by_event_id: None,
             created_at: chrono::Utc::now(),

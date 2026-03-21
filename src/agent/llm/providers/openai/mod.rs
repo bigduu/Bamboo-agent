@@ -125,6 +125,7 @@ impl OpenAIProvider {
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
         responses_options: Option<&ResponsesRequestOptions>,
+        parallel_tool_calls: Option<bool>,
         reasoning_source: &str,
     ) -> Result<LLMStream> {
         let body = build_responses_body(
@@ -134,6 +135,7 @@ impl OpenAIProvider {
             max_output_tokens,
             reasoning_effort,
             responses_options,
+            parallel_tool_calls,
         );
         tracing::info!(
             "OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
@@ -177,6 +179,7 @@ impl OpenAIProvider {
                     max_output_tokens,
                     None,
                     Some(&fallback_options),
+                    parallel_tool_calls,
                 );
                 let fallback = self
                     .client
@@ -239,6 +242,7 @@ impl LLMProvider for OpenAIProvider {
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
+        let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
         let responses_options = options.and_then(|o| o.responses.as_ref());
         let reasoning_source = if request_reasoning_effort.is_some() {
             "request"
@@ -257,6 +261,7 @@ impl LLMProvider for OpenAIProvider {
                     model,
                     reasoning_effort,
                     responses_options,
+                    parallel_tool_calls,
                     reasoning_source,
                 )
                 .await;
@@ -269,6 +274,7 @@ impl LLMProvider for OpenAIProvider {
             None,
             max_output_tokens,
             reasoning_effort,
+            parallel_tool_calls,
         );
         tracing::info!(
             "OpenAI request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
@@ -303,8 +309,15 @@ impl LLMProvider for OpenAIProvider {
                     model
                 );
 
-                let fallback_body =
-                    build_openai_compat_body(model, messages, tools, None, max_output_tokens, None);
+                let fallback_body = build_openai_compat_body(
+                    model,
+                    messages,
+                    tools,
+                    None,
+                    max_output_tokens,
+                    None,
+                    parallel_tool_calls,
+                );
                 let fallback = self
                     .client
                     .post(format!("{}/chat/completions", self.base_url))
@@ -343,6 +356,7 @@ impl LLMProvider for OpenAIProvider {
                         model,
                         reasoning_effort,
                         responses_options,
+                        parallel_tool_calls,
                         reasoning_source,
                     )
                     .await;
@@ -549,7 +563,8 @@ mod tests {
         let messages = vec![Message::user("Hello")];
         let tools: Vec<ToolSchema> = vec![];
 
-        let body = build_openai_compat_body("gpt-4o-mini", &messages, &tools, None, None, None);
+        let body =
+            build_openai_compat_body("gpt-4o-mini", &messages, &tools, None, None, None, None);
 
         assert_eq!(body["model"], "gpt-4o-mini");
         assert_eq!(body["stream"], true);
@@ -574,7 +589,8 @@ mod tests {
             },
         }];
 
-        let body = build_openai_compat_body("gpt-4o-mini", &messages, &tools, None, None, None);
+        let body =
+            build_openai_compat_body("gpt-4o-mini", &messages, &tools, None, None, None, None);
 
         assert_eq!(body["tools"].as_array().unwrap().len(), 1);
         assert_eq!(body["tools"][0]["type"], "function");
@@ -667,8 +683,15 @@ mod tests {
         let messages = vec![Message::user("Hello")];
         let tools: Vec<ToolSchema> = vec![];
 
-        let body =
-            build_openai_compat_body("gpt-4o-mini", &messages, &tools, None, Some(4096), None);
+        let body = build_openai_compat_body(
+            "gpt-4o-mini",
+            &messages,
+            &tools,
+            None,
+            Some(4096),
+            None,
+            None,
+        );
 
         assert_eq!(body["max_tokens"], 4096);
     }
@@ -683,7 +706,8 @@ mod tests {
         ];
         let tools: Vec<ToolSchema> = vec![];
 
-        let body = build_openai_compat_body("gpt-4o-mini", &messages, &tools, None, None, None);
+        let body =
+            build_openai_compat_body("gpt-4o-mini", &messages, &tools, None, None, None, None);
 
         assert_eq!(body["messages"].as_array().unwrap().len(), 4);
     }

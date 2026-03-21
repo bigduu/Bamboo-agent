@@ -13,7 +13,11 @@ pub(super) async fn handle_chunk_result(
 ) -> Result<(), AgentError> {
     match chunk_result {
         Ok(LLMChunk::ResponseId(response_id)) => {
-            tracing::debug!("[{}] Received upstream response_id={}", session_id, response_id);
+            tracing::debug!(
+                "[{}] Received upstream response_id={}",
+                session_id,
+                response_id
+            );
             state.set_response_id(response_id);
             Ok(())
         }

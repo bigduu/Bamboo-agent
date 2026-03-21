@@ -67,6 +67,11 @@ pub struct ResponsesRequestOptions {
 pub struct LLMRequestOptions {
     /// Override reasoning effort for this request.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Request provider-side parallel tool call planning when supported.
+    ///
+    /// - OpenAI/Copilot: maps to `parallel_tool_calls`
+    /// - Anthropic: maps to `tool_choice.disable_parallel_tool_use` (inverse)
+    pub parallel_tool_calls: Option<bool>,
     /// Responses API specific overrides.
     pub responses: Option<ResponsesRequestOptions>,
 }

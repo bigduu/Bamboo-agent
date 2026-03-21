@@ -3,7 +3,6 @@ use crate::core::process_utils::{
     trace_windows_command,
 };
 use dashmap::DashMap;
-use tracing::warn;
 use regex::Regex;
 use std::path::Path;
 use std::process::Stdio;
@@ -13,6 +12,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
+use tracing::warn;
 
 const MAX_OUTPUT_LINES: usize = 20_000;
 const COMPLETED_SESSION_TTL_SECS: u64 = 300;

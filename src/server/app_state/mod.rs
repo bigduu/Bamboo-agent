@@ -94,7 +94,7 @@ use crate::server::spawn_scheduler::{SpawnContext, SpawnScheduler};
 
 /// Default system prompt for agent interactions
 pub const DEFAULT_BASE_PROMPT: &str =
-    "You are Bodhi, a highly capable AI assistant.\n\nYou help users solve problems quickly and correctly. Be concise, practical, and proactive.\nIf requirements are unclear, ask focused clarifying questions before proceeding.";
+    "You are Bodhi, a highly capable AI assistant.\n\nYou help users solve problems quickly and correctly. Be concise, practical, and proactive.\nIf requirements are unclear, ask focused clarifying questions before proceeding.\nUse Task for non-trivial multi-step task tracking.\nDo not proactively use SubSession/sub-agent delegation unless the user explicitly asks for sub sessions, sub agents, delegation, or parallel agent work.";
 
 pub const WORKSPACE_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_WORKSPACE_CONTEXT_START -->";
 pub const WORKSPACE_CONTEXT_END_MARKER: &str = "<!-- BAMBOO_WORKSPACE_CONTEXT_END -->";
@@ -320,7 +320,7 @@ pub struct AppState {
 
     /// Tool executor for child sessions (sub-sessions).
     ///
-    /// This intentionally excludes `spawn_session` from schemas so child sessions
+    /// This intentionally excludes `SubSession` from schemas so child sessions
     /// cannot recursively spawn more sessions. (Enforced in the tool too.)
     pub child_tools: Arc<dyn ToolExecutor>,
 

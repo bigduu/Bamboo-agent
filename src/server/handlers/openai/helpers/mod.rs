@@ -1,5 +1,6 @@
 mod completion;
 mod conversion;
+mod parallel_tool_calls;
 mod reasoning;
 mod responses_input;
 mod responses_options;
@@ -46,6 +47,12 @@ pub(crate) fn parse_reasoning_effort(
     parameters: &std::collections::HashMap<String, serde_json::Value>,
 ) -> Option<crate::core::ReasoningEffort> {
     reasoning::parse_reasoning_effort(parameters)
+}
+
+pub(crate) fn parse_parallel_tool_calls(
+    parameters: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<bool> {
+    parallel_tool_calls::parse_parallel_tool_calls(parameters)
 }
 
 pub(crate) fn parse_responses_request_options(

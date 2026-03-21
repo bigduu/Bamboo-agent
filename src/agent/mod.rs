@@ -24,8 +24,8 @@ pub mod tools;
 
 // Re-export commonly used types from core
 pub use core::{
-    AgentError, AgentEvent, Message, MessageContent, Role, Session, TodoItem, TodoItemStatus,
-    TodoList, TokenBudgetUsage, TokenUsage,
+    AgentError, AgentEvent, Message, MessageContent, Role, Session, TaskItem, TaskItemStatus,
+    TaskList, TokenBudgetUsage, TokenUsage,
 };
 
 // Re-export commonly used types from llm

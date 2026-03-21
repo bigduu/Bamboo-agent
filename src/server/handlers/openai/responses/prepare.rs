@@ -3,8 +3,8 @@ use actix_web::web;
 use crate::server::{app_state::AppState, error::AppError};
 
 use super::super::helpers::{
-    convert_messages, convert_tools, parse_reasoning_effort, parse_responses_request_options,
-    responses_input_to_chat_messages,
+    convert_messages, convert_tools, parse_parallel_tool_calls, parse_reasoning_effort,
+    parse_responses_request_options, responses_input_to_chat_messages,
 };
 use super::super::types::ResponsesCreateRequest;
 use super::super::usage::estimate_prompt_tokens;
@@ -73,6 +73,7 @@ pub(super) async fn prepare_request(
             .map(|value| value as u32)
     });
     let reasoning_effort = parse_reasoning_effort(&request.parameters);
+    let parallel_tool_calls = parse_parallel_tool_calls(&request.parameters);
     let responses_options = parse_responses_request_options(&request.parameters);
 
     let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
@@ -83,6 +84,7 @@ pub(super) async fn prepare_request(
         internal_tools,
         max_tokens,
         reasoning_effort,
+        parallel_tool_calls,
         responses_options,
         estimated_prompt_tokens,
     })

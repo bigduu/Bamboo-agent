@@ -28,14 +28,14 @@ fn create_api_scope() -> actix_web::Scope {
             "/history/{session_id}",
             web::get().to(handlers::history::handler),
         )
-        // Todo endpoints
+        // Task endpoints
         .route(
-            "/todo/{session_id}",
-            web::get().to(handlers::todo::get_todo_list),
+            "/task/{session_id}",
+            web::get().to(handlers::task::get_task_list),
         )
         .route(
-            "/todo/{session_id}/exists",
-            web::get().to(handlers::todo::has_todo_list),
+            "/task/{session_id}/exists",
+            web::get().to(handlers::task::has_task_list),
         )
         // Respond endpoints
         .route(

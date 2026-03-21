@@ -38,6 +38,7 @@ async fn root_tools_include_server_overlays_and_memory_note() {
         .collect();
 
     assert!(names.contains("Task"));
+    assert!(names.contains("SubSession"));
     assert!(names.contains("schedule_tasks"));
     assert!(names.contains("sub_session_manager"));
     assert!(names.contains("session_inspector"));

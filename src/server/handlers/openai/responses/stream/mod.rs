@@ -32,6 +32,7 @@ pub(super) async fn handle_streaming_response(
     let provider = app_state.get_provider().await;
     let request_options = LLMRequestOptions {
         reasoning_effort: prepared.reasoning_effort,
+        parallel_tool_calls: prepared.parallel_tool_calls,
         responses: Some(prepared.responses_options.clone()),
     };
     let stream_result = provider

@@ -81,6 +81,7 @@ pub fn build_openai_compat_body(
     tool_choice: Option<Value>,
     max_output_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
+    parallel_tool_calls: Option<bool>,
 ) -> Value {
     let mut body = json!({
         "model": model,
@@ -99,6 +100,10 @@ pub fn build_openai_compat_body(
 
     if let Some(reasoning_effort) = reasoning_effort {
         body["reasoning_effort"] = json!(reasoning_effort.to_wire_format(model));
+    }
+
+    if let Some(parallel_tool_calls) = parallel_tool_calls {
+        body["parallel_tool_calls"] = json!(parallel_tool_calls);
     }
 
     body
@@ -333,8 +338,15 @@ mod tests {
         let messages = vec![Message::user("Hello")];
         let tools: Vec<ToolSchema> = Vec::new();
 
-        let body =
-            super::build_openai_compat_body("gpt-4o-mini", &messages, &tools, None, None, None);
+        let body = super::build_openai_compat_body(
+            "gpt-4o-mini",
+            &messages,
+            &tools,
+            None,
+            None,
+            None,
+            None,
+        );
 
         assert_eq!(body["model"], "gpt-4o-mini");
         assert_eq!(body["stream"], true);
@@ -498,6 +510,7 @@ mod tests {
             Some(tool_choice),
             None,
             None,
+            None,
         );
 
         assert_eq!(body["tool_choice"], "auto");
@@ -508,10 +521,35 @@ mod tests {
         let messages = vec![Message::user("Hello")];
         let tools: Vec<ToolSchema> = Vec::new();
 
-        let body =
-            super::build_openai_compat_body("gpt-4", &messages, &tools, None, Some(4096), None);
+        let body = super::build_openai_compat_body(
+            "gpt-4",
+            &messages,
+            &tools,
+            None,
+            Some(4096),
+            None,
+            None,
+        );
 
         assert_eq!(body["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn build_openai_compat_body_with_parallel_tool_calls() {
+        let messages = vec![Message::user("Hello")];
+        let tools: Vec<ToolSchema> = Vec::new();
+
+        let body = super::build_openai_compat_body(
+            "gpt-4",
+            &messages,
+            &tools,
+            None,
+            None,
+            None,
+            Some(true),
+        );
+
+        assert_eq!(body["parallel_tool_calls"], true);
     }
 
     #[test]

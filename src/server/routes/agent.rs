@@ -34,7 +34,7 @@ fn mcp_scope() -> impl HttpServiceFactory {
 
 /// Configure agent API routes (core agent functionality)
 ///
-/// Routes for chat, execute, events, stop, history, todo, respond, delete, health, metrics, mcp
+/// Routes for chat, execute, events, stop, history, task, respond, delete, health, metrics, mcp
 pub fn agent_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api/v1")
@@ -139,12 +139,12 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 web::get().to(agent::history::handler),
             )
             .route(
-                "/todo/{session_id}",
-                web::get().to(agent::todo::get_todo_list),
+                "/task/{session_id}",
+                web::get().to(agent::task::get_task_list),
             )
             .route(
-                "/todo/{session_id}/exists",
-                web::get().to(agent::todo::has_todo_list),
+                "/task/{session_id}/exists",
+                web::get().to(agent::task::has_task_list),
             )
             .route(
                 "/respond/{session_id}",

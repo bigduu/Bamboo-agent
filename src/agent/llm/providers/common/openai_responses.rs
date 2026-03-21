@@ -12,7 +12,7 @@ use crate::agent::llm::provider::Result;
 use crate::agent::llm::types::LLMChunk;
 use crate::core::ReasoningEffort;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Convert internal [`Message`] values to a Responses API `input` array.
 ///
@@ -166,6 +166,7 @@ pub fn build_responses_body(
     max_output_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
     responses_options: Option<&ResponsesRequestOptions>,
+    parallel_tool_calls: Option<bool>,
 ) -> Value {
     let mut body = json!({
         "model": model,
@@ -185,6 +186,10 @@ pub fn build_responses_body(
         body["tools"] = json!(tools_to_responses_json(tools));
         // Best-effort default; upstreams may ignore/override.
         body["tool_choice"] = json!("auto");
+    }
+
+    if let Some(parallel_tool_calls) = parallel_tool_calls {
+        body["parallel_tool_calls"] = json!(parallel_tool_calls);
     }
 
     if let Some(max_tokens) = max_output_tokens {
@@ -252,6 +257,12 @@ struct AccFnCall {
 pub struct ResponsesSseParser {
     // item_id -> accumulated function call
     fn_calls: HashMap<String, AccFnCall>,
+    // Text item IDs that already produced user-visible answer tokens.
+    // Used to avoid duplicating final `*.done` payloads after streaming deltas.
+    streamed_text_item_ids: HashSet<String>,
+    // Some upstreams omit item_id on text deltas; keep a coarse flag so
+    // `*.done` fallbacks can avoid obvious duplicate full-text emissions.
+    saw_unkeyed_text_delta: bool,
     provider_label: String,
     model: String,
     requested_reasoning_effort: Option<ReasoningEffort>,
@@ -276,6 +287,8 @@ impl ResponsesSseParser {
     ) -> Self {
         Self {
             fn_calls: HashMap::new(),
+            streamed_text_item_ids: HashSet::new(),
+            saw_unkeyed_text_delta: false,
             provider_label: provider_label.to_string(),
             model: model.to_string(),
             requested_reasoning_effort,
@@ -332,6 +345,57 @@ impl ResponsesSseParser {
                 arguments: acc.arguments,
             },
         })
+    }
+
+    fn text_item_id(v: &Value) -> Option<String> {
+        v.get("item_id")
+            .and_then(|id| id.as_str())
+            .or_else(|| {
+                v.get("item")
+                    .and_then(|item| item.get("id"))
+                    .and_then(|id| id.as_str())
+            })
+            .map(|id| id.to_string())
+            .filter(|id| !id.is_empty())
+    }
+
+    fn message_item_output_text(item: &Value) -> String {
+        let Some(content) = item.get("content").and_then(|value| value.as_array()) else {
+            return String::new();
+        };
+
+        let mut out = String::new();
+        for part in content {
+            let part_type = part.get("type").and_then(|value| value.as_str()).unwrap_or("");
+            if part_type != "output_text" {
+                continue;
+            }
+
+            if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
+                out.push_str(text);
+            }
+        }
+        out
+    }
+
+    fn emit_done_text(&mut self, item_id: Option<&str>, text: &str) -> Option<LLMChunk> {
+        if text.is_empty() {
+            return None;
+        }
+
+        if let Some(item_id) = item_id {
+            if self.streamed_text_item_ids.contains(item_id) {
+                return None;
+            }
+            self.streamed_text_item_ids.insert(item_id.to_string());
+            return Some(LLMChunk::Token(text.to_string()));
+        }
+
+        if self.saw_unkeyed_text_delta {
+            return None;
+        }
+
+        Some(LLMChunk::Token(text.to_string()))
     }
 
     fn log_reasoning_summary_if_needed(&mut self, usage: Option<&Value>) {
@@ -430,7 +494,22 @@ impl ResponsesSseParser {
                 if delta.is_empty() {
                     return Ok(None);
                 }
+                if let Some(item_id) = Self::text_item_id(&v) {
+                    self.streamed_text_item_ids.insert(item_id);
+                } else {
+                    self.saw_unkeyed_text_delta = true;
+                }
                 Ok(Some(LLMChunk::Token(delta.to_string())))
+            }
+
+            "response.output_text.done" => {
+                let text = v
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| v.get("delta").and_then(|value| value.as_str()))
+                    .unwrap_or("");
+                let item_id = Self::text_item_id(&v);
+                Ok(self.emit_done_text(item_id.as_deref(), text))
             }
 
             "response.output_item.added" => {
@@ -464,20 +543,23 @@ impl ResponsesSseParser {
 
             "response.output_item.done" => {
                 // Emit tool call when the function_call item is done.
-                let item_id = v
-                    .get("item_id")
-                    .and_then(|id| id.as_str())
-                    .or_else(|| {
-                        v.get("item")
-                            .and_then(|it| it.get("id"))
-                            .and_then(|id| id.as_str())
-                    })
-                    .unwrap_or("");
+                let item_id = Self::text_item_id(&v).unwrap_or_default();
 
                 if let Some(item) = v.get("item") {
                     let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if item_type == "message" {
+                        let text = Self::message_item_output_text(item);
+                        return Ok(self.emit_done_text(
+                            if item_id.is_empty() {
+                                None
+                            } else {
+                                Some(item_id.as_str())
+                            },
+                            text.as_str(),
+                        ));
+                    }
                     if item_type == "function_call" && !item_id.is_empty() {
-                        self.parse_fn_call_item(item_id, item);
+                        self.parse_fn_call_item(&item_id, item);
                     }
                 }
 
@@ -485,7 +567,7 @@ impl ResponsesSseParser {
                     return Ok(None);
                 }
 
-                let Some(call) = self.finalize_tool_call(item_id) else {
+                let Some(call) = self.finalize_tool_call(&item_id) else {
                     return Ok(None);
                 };
 
@@ -514,7 +596,7 @@ mod tests {
 
     #[test]
     fn build_responses_body_includes_input_and_stream() {
-        let body = build_responses_body("gpt-5.3-codex", &[], &[], Some(123), None, None);
+        let body = build_responses_body("gpt-5.3-codex", &[], &[], Some(123), None, None, None);
         assert_eq!(body["model"], "gpt-5.3-codex");
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_output_tokens"], 123);
@@ -537,6 +619,7 @@ mod tests {
                 previous_response_id: Some("resp_123".to_string()),
                 truncation: Some("auto".to_string()),
             }),
+            None,
         );
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "detailed");
@@ -547,6 +630,12 @@ mod tests {
         assert_eq!(body["store"], true);
         assert_eq!(body["previous_response_id"], "resp_123");
         assert_eq!(body["truncation"], "auto");
+    }
+
+    #[test]
+    fn build_responses_body_with_parallel_tool_calls() {
+        let body = build_responses_body("gpt-5.4", &[], &[], None, None, None, Some(false));
+        assert_eq!(body["parallel_tool_calls"], false);
     }
 
     #[test]
@@ -736,10 +825,7 @@ mod tests {
 
     #[test]
     fn messages_to_responses_input_json_system_and_user_messages() {
-        let messages = vec![
-            Message::system("You are helpful"),
-            Message::user("Hello"),
-        ];
+        let messages = vec![Message::system("You are helpful"), Message::user("Hello")];
 
         let out = messages_to_responses_input_json(&messages);
         assert_eq!(out.len(), 2);
@@ -775,6 +861,40 @@ mod tests {
             Some(LLMChunk::Token(t)) => assert_eq!(t, "hi"),
             other => panic!("expected token, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parser_emits_token_on_output_text_done_without_prior_delta() {
+        let mut p = ResponsesSseParser::new();
+        let out = p
+            .handle_event(
+                "response.output_text.done",
+                r#"{"type":"response.output_text.done","item_id":"msg_1","text":"hello"}"#,
+            )
+            .unwrap();
+        match out {
+            Some(LLMChunk::Token(t)) => assert_eq!(t, "hello"),
+            other => panic!("expected token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_skips_output_text_done_after_streaming_delta_for_same_item() {
+        let mut p = ResponsesSseParser::new();
+        let _ = p
+            .handle_event(
+                "response.output_text.delta",
+                r#"{"type":"response.output_text.delta","item_id":"msg_1","delta":"hel"}"#,
+            )
+            .unwrap();
+
+        let out = p
+            .handle_event(
+                "response.output_text.done",
+                r#"{"type":"response.output_text.done","item_id":"msg_1","text":"hello"}"#,
+            )
+            .unwrap();
+        assert!(out.is_none());
     }
 
     #[test]
@@ -853,5 +973,40 @@ mod tests {
             }
             other => panic!("expected tool_calls, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parser_emits_token_from_message_output_item_done_when_no_deltas_seen() {
+        let mut p = ResponsesSseParser::new();
+        let out = p
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item":{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"hello from item"}]}}"#,
+            )
+            .unwrap();
+
+        match out {
+            Some(LLMChunk::Token(t)) => assert_eq!(t, "hello from item"),
+            other => panic!("expected token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_skips_message_output_item_done_when_text_delta_already_streamed() {
+        let mut p = ResponsesSseParser::new();
+        let _ = p
+            .handle_event(
+                "response.output_text.delta",
+                r#"{"type":"response.output_text.delta","item_id":"msg_1","delta":"hello"}"#,
+            )
+            .unwrap();
+
+        let out = p
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item":{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"hello"}]}}"#,
+            )
+            .unwrap();
+        assert!(out.is_none());
     }
 }

@@ -1,11 +1,11 @@
-use crate::agent::loop_module::todo_context::TodoLoopContext;
+use crate::agent::loop_module::task_context::TaskLoopContext;
 
-pub(super) fn update_todo_round_state(
-    todo_context: &mut Option<TodoLoopContext>,
+pub(super) fn update_task_round_state(
+    task_context: &mut Option<TaskLoopContext>,
     round: usize,
     max_rounds: usize,
 ) {
-    if let Some(ctx) = todo_context.as_mut() {
+    if let Some(ctx) = task_context.as_mut() {
         ctx.current_round = round as u32;
         ctx.max_rounds = max_rounds as u32;
     }
@@ -40,10 +40,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_update_todo_round_state_none() {
-        let mut todo_context: Option<TodoLoopContext> = None;
-        update_todo_round_state(&mut todo_context, 3, 10);
-        assert!(todo_context.is_none());
+    fn test_update_task_round_state_none() {
+        let mut task_context: Option<TaskLoopContext> = None;
+        update_task_round_state(&mut task_context, 3, 10);
+        assert!(task_context.is_none());
     }
 
     #[test]

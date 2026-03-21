@@ -136,7 +136,7 @@ impl AppState {
         let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
-        // Child tools intentionally do not expose `Task` (no nested child spawns).
+        // Child tools intentionally do not expose `SubSession` (no nested child spawns).
         let child_tools: Arc<dyn ToolExecutor> = base_tools.clone();
 
         // Initialize sub-session spawn scheduler (async background jobs).
@@ -451,7 +451,7 @@ fn build_tools_with_task(
     spawn_scheduler: Arc<SpawnScheduler>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
 ) -> Arc<dyn ToolExecutor> {
-    // Root tools include `Task` via a lightweight overlay executor.
+    // Root tools include `SubSession` via a lightweight overlay executor.
     let spawn_tool = Arc::new(crate::server::tools::SpawnSessionTool::new(
         session_store,
         storage,

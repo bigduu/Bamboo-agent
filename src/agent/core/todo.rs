@@ -1,11 +1,11 @@
-//! Todo list types for task tracking in sessions
+//! Task list types for task tracking in sessions.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Todo item status
+/// Task item status.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub enum TodoItemStatus {
+pub enum TaskItemStatus {
     #[serde(rename = "pending")]
     #[default]
     Pending,
@@ -17,49 +17,49 @@ pub enum TodoItemStatus {
     Blocked,
 }
 
-/// Todo item for task tracking
+/// Task item for task tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TodoItem {
-    /// Unique identifier for the todo item
+pub struct TaskItem {
+    /// Unique identifier for the task item.
     pub id: String,
-    /// Human-readable description of the task
+    /// Human-readable description of the task.
     pub description: String,
-    /// Current status of the item
-    pub status: TodoItemStatus,
-    /// IDs of other items this item depends on
+    /// Current status of the item.
+    pub status: TaskItemStatus,
+    /// IDs of other items this item depends on.
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// Additional notes or context
+    /// Additional notes or context.
     #[serde(default)]
     pub notes: String,
 }
 
-/// Todo list for a session
+/// Task list for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TodoList {
-    /// Session ID this todo list belongs to
+pub struct TaskList {
+    /// Session ID this task list belongs to.
     pub session_id: String,
-    /// Title of the todo list
+    /// Title of the task list.
     pub title: String,
-    /// List of todo items
-    pub items: Vec<TodoItem>,
-    /// When the list was created
+    /// List of task items.
+    pub items: Vec<TaskItem>,
+    /// When the list was created.
     pub created_at: DateTime<Utc>,
-    /// When the list was last updated
+    /// When the list was last updated.
     pub updated_at: DateTime<Utc>,
 }
 
-impl TodoList {
-    /// Format todo list for display in system prompt
+impl TaskList {
+    /// Format task list for display in system prompt.
     pub fn format_for_prompt(&self) -> String {
         let mut output = format!("\n\n## Current Task List: {}\n", self.title);
 
         for item in &self.items {
             let status_icon = match item.status {
-                TodoItemStatus::Pending => "[ ]",
-                TodoItemStatus::InProgress => "[/]",
-                TodoItemStatus::Completed => "[x]",
-                TodoItemStatus::Blocked => "[!]",
+                TaskItemStatus::Pending => "[ ]",
+                TaskItemStatus::InProgress => "[/]",
+                TaskItemStatus::Completed => "[x]",
+                TaskItemStatus::Blocked => "[!]",
             };
 
             output.push_str(&format!(
@@ -82,7 +82,7 @@ impl TodoList {
         let completed = self
             .items
             .iter()
-            .filter(|i| i.status == TodoItemStatus::Completed)
+            .filter(|i| i.status == TaskItemStatus::Completed)
             .count();
         let total = self.items.len();
         output.push_str(&format!(
@@ -93,11 +93,11 @@ impl TodoList {
         output
     }
 
-    /// Update a todo item status
+    /// Update a task item status.
     pub fn update_item(
         &mut self,
         item_id: &str,
-        status: TodoItemStatus,
+        status: TaskItemStatus,
         notes: Option<&str>,
     ) -> Result<String, String> {
         if let Some(item) = self.items.iter_mut().find(|i| i.id == item_id) {
@@ -111,7 +111,7 @@ impl TodoList {
             self.updated_at = Utc::now();
             Ok(format!("Updated item '{}'", item_id))
         } else {
-            Err(format!("Todo item '{}' not found", item_id))
+            Err(format!("Task item '{}' not found", item_id))
         }
     }
 }

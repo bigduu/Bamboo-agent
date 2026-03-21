@@ -34,6 +34,7 @@ impl FromProvider<AnthropicMessage> for Message {
             image_ocr: None,
             tool_calls: None, // Anthropic messages don't have tool_calls at this level
             tool_call_id: None,
+            tool_success: None,
             compressed: false,
             compressed_by_event_id: None,
             created_at: chrono::Utc::now(),
@@ -259,6 +260,7 @@ impl AnthropicResponseConverter {
             image_ocr: None,
             tool_calls,
             tool_call_id: None,
+            tool_success: None,
             compressed: false,
             compressed_by_event_id: None,
             created_at: chrono::Utc::now(),

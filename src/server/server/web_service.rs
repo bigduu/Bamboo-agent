@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use actix_web::{web, App, HttpServer};
-use tracing::{error, info};
 use tokio::sync::oneshot;
+use tracing::{error, info};
 
 use super::listeners::DEFAULT_WORKER_COUNT;
 use crate::server::app_state::AppState;

@@ -42,8 +42,40 @@ use crate::server::app_state::AppState;
 pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let session_id = path.into_inner();
 
-    // Try memory first.
-    let mut session = {
+    // When an agent runner is active the in-memory session cache (`state.sessions`)
+    // may lag behind disk because the loop works with a local `&mut Session` and only
+    // writes back to the cache after `run_agent_loop` returns.  The agent *does* persist
+    // to disk after significant changes (ask_user, compaction, finalize), so reading
+    // from disk gives the frontend the freshest snapshot during execution.
+    let runner_active = {
+        let runners = state.agent_runners.read().await;
+        runners
+            .get(&session_id)
+            .map_or(false, |r| r.completed_at.is_none())
+    };
+
+    let mut session = if runner_active {
+        // Prefer disk – the agent loop may have persisted messages that
+        // are not yet in the memory cache.
+        match state.storage.load_session(&session_id).await {
+            Ok(Some(s)) => Some(s),
+            Ok(None) => {
+                // Fallback to memory (shouldn't happen but be defensive).
+                let sessions = state.sessions.read().await;
+                sessions.get(&session_id).cloned()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[{}] Disk read failed during active execution, falling back to memory: {}",
+                    session_id,
+                    e
+                );
+                let sessions = state.sessions.read().await;
+                sessions.get(&session_id).cloned()
+            }
+        }
+    } else {
+        // No active runner – memory cache is authoritative.
         let sessions = state.sessions.read().await;
         sessions.get(&session_id).cloned()
     };

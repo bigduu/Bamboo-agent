@@ -38,5 +38,6 @@ pub(super) struct PreparedChatRequest {
     pub(super) internal_tools: Vec<ToolSchema>,
     pub(super) max_tokens: Option<u32>,
     pub(super) reasoning_effort: Option<crate::core::ReasoningEffort>,
+    pub(super) parallel_tool_calls: Option<bool>,
     pub(super) estimated_prompt_tokens: u64,
 }

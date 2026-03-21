@@ -12,7 +12,7 @@
 //! - **composition**: Agent composition and orchestration
 //! - **memory**: External memory and conversation summarization
 //! - **storage**: Persistent storage backends (JSONL, etc.)
-//! - **todo**: Todo list management for task tracking
+//! - **task**: Task list management for task tracking
 //! - **tools**: Tool execution framework and types
 //!
 //! # Key Types
@@ -46,7 +46,7 @@
 //! - Tool types: [`ToolCall`], [`ToolResult`], [`ToolExecutor`], [`ToolError`]
 //! - Storage types: [`Storage`], [`JsonlStorage`]
 //! - Memory types: [`ExternalMemory`], [`format_summary_as_note`]
-//! - Todo types: [`TodoList`], [`TodoItem`], [`TodoItemStatus`]
+//! - Task types: [`TaskList`], [`TaskItem`], [`TaskItemStatus`]
 
 pub mod agent;
 pub mod budget;
@@ -66,7 +66,7 @@ pub use agent::AgentError;
 pub use budget::limits::create_budget_for_model;
 pub use memory::{format_summary_as_note, ExternalMemory};
 pub use storage::{JsonlStorage, Storage};
-pub use todo::{TodoItem, TodoItemStatus, TodoList};
+pub use todo::{TaskItem, TaskItemStatus, TaskList};
 pub use tools::{
     execute_tool_call, finalize_tool_calls, handle_tool_result_with_agentic_support,
     parse_tool_args, try_parse_agentic_result, AgenticContext, AgenticTool, AgenticToolResult,

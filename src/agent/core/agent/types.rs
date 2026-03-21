@@ -16,7 +16,7 @@
 //!
 //! 1. Create session with `Session::new(id, model)`
 //! 2. Add messages with `session.add_message(Message::user("..."))`
-//! 3. Track progress with todo list
+//! 3. Track progress with a task list
 //! 4. Persist to storage
 //!
 //! # Example
@@ -29,8 +29,8 @@
 //! session.add_message(Message::assistant("Hi there!", None));
 //! ```
 
-use crate::agent::core::todo::{TodoItemStatus, TodoList};
 use crate::agent::core::tools::ToolCall;
+use crate::agent::core::{TaskItemStatus, TaskList};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -149,6 +149,9 @@ pub struct Message {
     /// Tool call ID (for Tool result messages)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Tool execution success flag (for Tool result messages).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_success: Option<bool>,
     /// Whether this message is archived/compressed and excluded from LLM requests.
     #[serde(default, skip_serializing_if = "is_false")]
     pub compressed: bool,
@@ -213,6 +216,7 @@ impl Message {
             image_ocr: None,
             tool_calls: None,
             tool_call_id: None,
+            tool_success: None,
             compressed: false,
             compressed_by_event_id: None,
             created_at: Utc::now(),
@@ -233,6 +237,7 @@ impl Message {
             image_ocr: None,
             tool_calls: None,
             tool_call_id: None,
+            tool_success: None,
             compressed: false,
             compressed_by_event_id: None,
             created_at: Utc::now(),
@@ -271,6 +276,7 @@ impl Message {
             image_ocr: None,
             tool_calls,
             tool_call_id: None,
+            tool_success: None,
             compressed: false,
             compressed_by_event_id: None,
             created_at: Utc::now(),
@@ -291,6 +297,15 @@ impl Message {
     /// assert_eq!(result.role, Role::Tool);
     /// ```
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::tool_result_with_status(tool_call_id, content, true)
+    }
+
+    /// Create a tool result message with an explicit success flag.
+    pub fn tool_result_with_status(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        success: bool,
+    ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             role: Role::Tool,
@@ -300,6 +315,7 @@ impl Message {
             image_ocr: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
+            tool_success: Some(success),
             compressed: false,
             compressed_by_event_id: None,
             created_at: Utc::now(),
@@ -328,6 +344,7 @@ impl Message {
             image_ocr: None,
             tool_calls: None,
             tool_call_id: None,
+            tool_success: None,
             compressed: false,
             compressed_by_event_id: None,
             created_at: Utc::now(),
@@ -486,7 +503,7 @@ impl CompressionEvent {
 /// A complete conversation session with state management.
 ///
 /// Represents a full conversation session including message history,
-/// todo list, pending questions, and session metadata.
+/// task list, pending questions, and session metadata.
 ///
 /// # Fields
 ///
@@ -494,7 +511,7 @@ impl CompressionEvent {
 /// * `messages` - Conversation message history
 /// * `created_at` - Session creation timestamp
 /// * `updated_at` - Last update timestamp
-/// * `todo_list` - Optional task tracking list
+/// * `task_list` - Optional task tracking list
 /// * `pending_question` - Question waiting for user response
 /// * `model` - LLM model name for this session
 /// * `metadata` - Extensible key-value metadata
@@ -506,7 +523,7 @@ impl CompressionEvent {
 ///
 /// 1. Create: `Session::new("session-id", "gpt-4o-mini")`
 /// 2. Add messages: `session.add_message(Message::user("Hello"))`
-/// 3. Track tasks: `session.set_todo_list(todo_list)`
+/// 3. Track tasks: `session.set_task_list(task_list)`
 /// 4. Ask questions: `session.set_pending_question(...)`
 /// 5. Persist to storage
 ///
@@ -518,7 +535,7 @@ impl CompressionEvent {
 /// session.add_message(Message::assistant("I'd be happy to help!", None));
 ///
 /// // Track progress
-/// session.set_todo_list(todo_list);
+/// session.set_task_list(task_list);
 ///
 /// // Save
 /// storage.save_session(&session).await?;
@@ -551,9 +568,14 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     /// Last update timestamp
     pub updated_at: DateTime<Utc>,
-    /// Optional todo list for task tracking
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub todo_list: Option<TodoList>,
+    /// Optional task list for task tracking.
+    #[serde(
+        default,
+        rename = "task_list",
+        alias = "todo_list",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub task_list: Option<TaskList>,
     /// Pending question when waiting for user response via ask_user tool
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_question: Option<PendingQuestion>,
@@ -618,7 +640,7 @@ impl Session {
             messages: Vec::new(),
             created_at: now,
             updated_at: now,
-            todo_list: None,
+            task_list: None,
             pending_question: None,
             model: model.into(),
             metadata: std::collections::HashMap::new(),
@@ -650,7 +672,7 @@ impl Session {
             messages: Vec::new(),
             created_at: now,
             updated_at: now,
-            todo_list: None,
+            task_list: None,
             pending_question: None,
             model: model.into(),
             metadata: std::collections::HashMap::new(),
@@ -705,37 +727,35 @@ impl Session {
         compacted
     }
 
-    /// Set the todo list for this session
-    /// Set the todo list for this session.
+    /// Set the task list for this session.
     ///
     /// # Arguments
     ///
-    /// * `todo_list` - Todo list to set
-    pub fn set_todo_list(&mut self, todo_list: TodoList) {
-        self.todo_list = Some(todo_list);
+    /// * `task_list` - Task list to set
+    pub fn set_task_list(&mut self, task_list: TaskList) {
+        self.task_list = Some(task_list);
         self.updated_at = Utc::now();
     }
 
-    /// Update a todo item status
-    /// Update a todo item status.
+    /// Update a task item status.
     ///
     /// # Arguments
     ///
-    /// * `item_id` - ID of the todo item to update
+    /// * `item_id` - ID of the task item to update
     /// * `status` - New status
     /// * `notes` - Optional notes to append
     ///
     /// # Returns
     ///
     /// Success message or error string
-    pub fn update_todo_item(
+    pub fn update_task_item(
         &mut self,
         item_id: &str,
-        status: TodoItemStatus,
+        status: TaskItemStatus,
         notes: Option<&str>,
     ) -> Result<String, String> {
-        if let Some(ref mut todo_list) = self.todo_list {
-            if let Some(item) = todo_list.items.iter_mut().find(|i| i.id == item_id) {
+        if let Some(ref mut task_list) = self.task_list {
+            if let Some(item) = task_list.items.iter_mut().find(|i| i.id == item_id) {
                 item.status = status;
                 if let Some(n) = notes {
                     if !item.notes.is_empty() {
@@ -743,24 +763,23 @@ impl Session {
                     }
                     item.notes.push_str(n);
                 }
-                todo_list.updated_at = Utc::now();
+                task_list.updated_at = Utc::now();
                 self.updated_at = Utc::now();
                 Ok(format!("Updated item '{}' to {:?}", item_id, item.status))
             } else {
-                Err(format!("Todo item '{}' not found", item_id))
+                Err(format!("Task item '{}' not found", item_id))
             }
         } else {
-            Err("No todo list exists for this session".to_string())
+            Err("No task list exists for this session".to_string())
         }
     }
 
-    /// Format todo list for display in system prompt
-    /// Format todo list for display in system prompt.
+    /// Format task list for display in system prompt.
     ///
-    /// Returns a formatted string of the todo list suitable
+    /// Returns a formatted string of the task list suitable
     /// for inclusion in the LLM system prompt.
-    pub fn format_todo_list_for_prompt(&self) -> String {
-        self.todo_list
+    pub fn format_task_list_for_prompt(&self) -> String {
+        self.task_list
             .as_ref()
             .map_or_else(String::new, |list| list.format_for_prompt())
     }

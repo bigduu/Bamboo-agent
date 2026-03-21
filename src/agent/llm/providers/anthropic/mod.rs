@@ -128,6 +128,7 @@ impl LLMProvider for AnthropicProvider {
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
+        let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
         let reasoning_source = if request_reasoning_effort.is_some() {
             "request"
         } else if self.default_reasoning_effort.is_some() {
@@ -138,8 +139,15 @@ impl LLMProvider for AnthropicProvider {
 
         tracing::debug!("Anthropic provider using model: {}", model);
 
-        let body =
-            build_anthropic_request(messages, tools, model, max_tokens, true, reasoning_effort);
+        let body = build_anthropic_request(
+            messages,
+            tools,
+            model,
+            max_tokens,
+            true,
+            reasoning_effort,
+            parallel_tool_calls,
+        );
         let mut applied_reasoning_effort = reasoning_effort;
         let mut thinking_enabled = body.get("thinking").is_some();
         let mut thinking_budget_tokens = body
@@ -183,8 +191,15 @@ impl LLMProvider for AnthropicProvider {
                     model
                 );
 
-                let fallback_body =
-                    build_anthropic_request(messages, tools, model, max_tokens, true, None);
+                let fallback_body = build_anthropic_request(
+                    messages,
+                    tools,
+                    model,
+                    max_tokens,
+                    true,
+                    None,
+                    parallel_tool_calls,
+                );
                 applied_reasoning_effort = None;
                 thinking_enabled = false;
                 thinking_budget_tokens = None;
@@ -262,6 +277,7 @@ pub fn build_anthropic_request(
     max_tokens: u32,
     stream: bool,
     reasoning_effort: Option<ReasoningEffort>,
+    parallel_tool_calls: Option<bool>,
 ) -> Value {
     let (system, anthropic_messages) = messages_to_anthropic_json(messages);
 
@@ -279,6 +295,15 @@ pub fn build_anthropic_request(
 
     if let Some(thinking) = anthropic_thinking_from_effort(reasoning_effort, max_tokens) {
         body["thinking"] = thinking;
+    }
+
+    if !tools.is_empty() {
+        if let Some(parallel_tool_calls) = parallel_tool_calls {
+            body["tool_choice"] = json!({
+                "type": "auto",
+                "disable_parallel_tool_use": !parallel_tool_calls,
+            });
+        }
     }
 
     body
@@ -592,7 +617,9 @@ pub fn parse_anthropic_sse_event(
                                     thinking_tokens
                                 );
                             } else if let Some(output_tokens) = output_tokens {
-                                tracing::debug!("Anthropic stream usage output_tokens={output_tokens}");
+                                tracing::debug!(
+                                    "Anthropic stream usage output_tokens={output_tokens}"
+                                );
                             }
                         }
                     }
@@ -836,7 +863,7 @@ pub fn parse_anthropic_sse_event(
 
 #[cfg(test)]
 mod anthropic_request_building {
-    use crate::agent::core::tools::{FunctionCall, ToolCall};
+    use crate::agent::core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
     use crate::agent::core::Message;
     use crate::agent::llm::{ContentPart, ImageUrl};
 
@@ -849,7 +876,8 @@ mod anthropic_request_building {
             Message::assistant("Hello!", None),
         ];
 
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
         assert_eq!(out["system"], "You are helpful.\n\nBe concise.");
         assert_eq!(out["messages"].as_array().unwrap().len(), 2);
@@ -859,7 +887,8 @@ mod anthropic_request_building {
     fn tool_messages_become_tool_result_blocks() {
         let messages = vec![Message::tool_result("call_1", "OK")];
 
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
         assert_eq!(out["messages"].as_array().unwrap().len(), 1);
         assert_eq!(out["messages"][0]["role"], "user");
@@ -881,7 +910,8 @@ mod anthropic_request_building {
 
         let messages = vec![Message::assistant("", Some(vec![tool_call]))];
 
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
         assert_eq!(out["messages"].as_array().unwrap().len(), 1);
         assert_eq!(out["messages"][0]["role"], "assistant");
@@ -908,7 +938,8 @@ mod anthropic_request_building {
             ],
         )];
 
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
         assert_eq!(out["messages"][0]["content"][1]["type"], "image");
         assert_eq!(out["messages"][0]["content"][1]["source"]["type"], "base64");
@@ -934,7 +965,8 @@ mod anthropic_request_building {
             }],
         )];
 
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
         assert_eq!(out["messages"][0]["content"][0]["type"], "image");
         assert_eq!(out["messages"][0]["content"][0]["source"]["type"], "url");
@@ -942,6 +974,61 @@ mod anthropic_request_building {
             out["messages"][0]["content"][0]["source"]["url"],
             "https://example.com/cat.png"
         );
+    }
+
+    fn sample_tools() -> Vec<ToolSchema> {
+        vec![ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "search".to_string(),
+                description: "Search".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "q": {"type": "string"}
+                    },
+                    "required": ["q"]
+                }),
+            },
+        }]
+    }
+
+    #[test]
+    fn parallel_tool_calls_true_enables_parallel_tool_use() {
+        let messages = vec![Message::user("Hello")];
+        let tools = sample_tools();
+
+        let out = super::build_anthropic_request(
+            &messages,
+            &tools,
+            "claude-test",
+            64,
+            false,
+            None,
+            Some(true),
+        );
+
+        assert_eq!(out["tool_choice"]["type"], "auto");
+        assert_eq!(out["tool_choice"]["disable_parallel_tool_use"], false);
+    }
+
+    #[test]
+    fn parallel_tool_calls_false_disables_parallel_tool_use() {
+        let messages = vec![Message::user("Hello")];
+        let tools = sample_tools();
+
+        let out = super::build_anthropic_request(
+            &messages,
+            &tools,
+            "claude-test",
+            64,
+            false,
+            None,
+            Some(false),
+        );
+
+        assert_eq!(out["tool_choice"]["type"], "auto");
+        assert_eq!(out["tool_choice"]["disable_parallel_tool_use"], true);
     }
 }
 
@@ -1169,7 +1256,8 @@ mod anthropic_request_building_edge_cases {
     #[test]
     fn empty_messages_list() {
         let messages: Vec<Message> = vec![];
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
         assert!(out["system"].is_null());
         assert_eq!(out["messages"].as_array().unwrap().len(), 0);
@@ -1178,7 +1266,8 @@ mod anthropic_request_building_edge_cases {
     #[test]
     fn only_system_messages() {
         let messages = vec![Message::system("Be helpful")];
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
         assert_eq!(out["system"], "Be helpful");
         assert_eq!(out["messages"].as_array().unwrap().len(), 0);
@@ -1191,7 +1280,8 @@ mod anthropic_request_building_edge_cases {
             Message::system("Be concise"),
             Message::system("Be safe"),
         ];
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
         assert_eq!(out["system"], "Be helpful\n\nBe concise\n\nBe safe");
     }
@@ -1213,7 +1303,8 @@ mod anthropic_request_building_edge_cases {
             "Let me search for that.",
             Some(vec![tool_call]),
         )];
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
         assert_eq!(out["messages"][0]["role"], "assistant");
         assert_eq!(out["messages"][0]["content"].as_array().unwrap().len(), 2);
@@ -1239,7 +1330,8 @@ mod anthropic_request_building_edge_cases {
         };
 
         let messages = vec![Message::assistant("", Some(vec![tool_call]))];
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
         // Invalid JSON should be kept as a string
         assert_eq!(out["messages"][0]["content"][0]["input"], "not valid json");
@@ -1250,18 +1342,19 @@ mod anthropic_request_building_edge_cases {
         let messages = vec![Message::user("Hello")];
 
         let out_stream_true =
-            super::build_anthropic_request(&messages, &[], "claude-test", 64, true, None);
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, true, None, None);
         assert_eq!(out_stream_true["stream"], true);
 
         let out_stream_false =
-            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None);
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
         assert_eq!(out_stream_false["stream"], false);
     }
 
     #[test]
     fn max_tokens_included_in_request() {
         let messages = vec![Message::user("Hello")];
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 2048, false, None);
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 2048, false, None, None);
 
         assert_eq!(out["max_tokens"], 2048);
     }
@@ -1275,6 +1368,7 @@ mod anthropic_request_building_edge_cases {
             "claude-3-opus-20240229",
             64,
             false,
+            None,
             None,
         );
 

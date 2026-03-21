@@ -11,8 +11,8 @@ use crate::agent::tools::permission::{check_permissions, PermissionChecker, Perm
 use crate::agent::tools::tools::{
     AskUserTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, FileExistsTool,
     GetCurrentDirTool, GetFileInfoTool, GlobTool, GrepTool, KillShellTool, MemoryNoteTool,
-    NotebookEditTool, ReadTool, SetWorkspaceTool, SleepTool, TaskTool, TodoWriteTool, ToolRegistry,
-    WebFetchTool, WebSearchTool, WriteTool,
+    NotebookEditTool, ReadTool, SetWorkspaceTool, SleepTool, SummarizeContextTool, TaskTool,
+    ToolRegistry, WebFetchTool, WebSearchTool, WriteTool,
 };
 use crate::core::Config;
 use tokio::sync::RwLock;
@@ -37,7 +37,7 @@ fn preview_for_log(value: &str, max_chars: usize) -> String {
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
+pub const BUILTIN_TOOL_NAMES: [&str; 20] = [
     "ask_user",
     "Bash",
     "BashOutput",
@@ -55,10 +55,16 @@ pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
     "SetWorkspace",
     "Sleep",
     "Task",
-    "TodoWrite",
     "WebFetch",
     "WebSearch",
     "Write",
+];
+
+pub const SERVER_TOOL_NAMES: [&str; 4] = [
+    "SubSession",
+    "schedule_tasks",
+    "sub_session_manager",
+    "session_inspector",
 ];
 
 /// Normalizes a tool reference to a standard tool name
@@ -72,7 +78,9 @@ pub fn normalize_tool_ref(value: &str) -> Option<String> {
     }
     let raw_tool_name = trimmed.split("::").last().unwrap_or(trimmed);
     let normalized = normalize_builtin_alias(raw_tool_name);
-    if BUILTIN_TOOL_NAMES.iter().any(|name| name == &normalized) {
+    if BUILTIN_TOOL_NAMES.iter().any(|name| name == &normalized)
+        || SERVER_TOOL_NAMES.iter().any(|name| name == &normalized)
+    {
         Some(normalized.to_string())
     } else {
         None
@@ -94,16 +102,16 @@ fn normalize_builtin_alias(name: &str) -> &str {
         "set_workspace" => "SetWorkspace",
         "setWorkspace" => "SetWorkspace",
         "sleep" => "Sleep",
-        "spawn_session" => "Task",
-        "spawnSession" => "Task",
-        "sub_session" => "Task",
-        "subSession" => "Task",
-        "sub_task" => "Task",
-        "subTask" => "Task",
-        "team_agent" => "Task",
-        "teamAgent" => "Task",
-        "child_session" => "Task",
-        "childSession" => "Task",
+        "spawn_session" => "SubSession",
+        "spawnSession" => "SubSession",
+        "sub_session" => "SubSession",
+        "subSession" => "SubSession",
+        "sub_task" => "SubSession",
+        "subTask" => "SubSession",
+        "team_agent" => "SubSession",
+        "teamAgent" => "SubSession",
+        "child_session" => "SubSession",
+        "childSession" => "SubSession",
         "write_file" => "Write",
         _ => name,
     }
@@ -244,8 +252,8 @@ impl BuiltinToolExecutor {
         let _ = registry.register(ReadTool::new());
         let _ = registry.register(SetWorkspaceTool::new());
         let _ = registry.register(SleepTool::new());
+        let _ = registry.register(SummarizeContextTool::new());
         let _ = registry.register(TaskTool::new());
-        let _ = registry.register(TodoWriteTool::new());
         let _ = registry.register(WebFetchTool::new());
         let _ = registry.register(WebSearchTool::new());
         let _ = registry.register(WriteTool::new());
@@ -574,7 +582,7 @@ mod tests {
             "default::team_agent",
             "default::child_session",
         ] {
-            assert_eq!(normalize_tool_ref(alias), Some("Task".to_string()));
+            assert_eq!(normalize_tool_ref(alias), Some("SubSession".to_string()));
         }
     }
 

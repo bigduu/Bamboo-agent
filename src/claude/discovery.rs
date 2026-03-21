@@ -1,6 +1,6 @@
-use tracing::{debug, warn};
 use std::path::PathBuf;
 use std::process::Command;
+use tracing::{debug, warn};
 
 use super::version::{extract_version_from_output, get_claude_version};
 use super::{ClaudeInstallation, InstallationType};

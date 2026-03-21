@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tracing::{error, info, warn};
 use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 
 use crate::agent::metrics::bus::MetricsBus;
 use crate::agent::metrics::events::{ChatEvent, ForwardEvent, MetricsEvent, SystemEvent};

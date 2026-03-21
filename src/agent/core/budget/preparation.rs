@@ -143,9 +143,24 @@ pub fn prepare_hybrid_context(
     // 7. Build final message list
     let mut prepared_messages = system_messages;
 
-    // Add summary if available (Phase 2 - future)
-    // For now, summary is always 0
-    let summary_tokens = 0;
+    // Inject conversation summary between system messages and the window.
+    // This preserves context from earlier (compressed) parts of the conversation.
+    let summary_tokens = if let Some(ref summary) = session.conversation_summary {
+        let summary_message = crate::agent::core::agent::types::Message::user(format!(
+            "<!-- CONVERSATION_SUMMARY_START -->\n\
+             ## Previous Conversation Summary\n\
+             The following is a summary of earlier conversation that was removed \
+             due to context window limits. Use it to maintain continuity.\n\n\
+             {}\n\
+             <!-- CONVERSATION_SUMMARY_END -->",
+            summary.content
+        ));
+        let tokens = counter.count_messages(&[summary_message.clone()]);
+        prepared_messages.push(summary_message);
+        tokens
+    } else {
+        0
+    };
 
     // Add selected segments - use take to avoid cloning
     for segment in &mut selected_segments {

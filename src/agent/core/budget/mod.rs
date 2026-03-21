@@ -24,5 +24,7 @@ pub use counter::{HeuristicTokenCounter, TokenCounter};
 pub use limits::{create_budget_for_model, ModelLimitsRegistry};
 pub use preparation::prepare_hybrid_context;
 pub use segmenter::MessageSegmenter;
-pub use summarizer::{HeuristicSummarizer, Summarizer, SummaryManager, SummaryTrigger};
+pub use summarizer::{
+    HeuristicSummarizer, LlmSummarizer, Summarizer, SummaryManager, SummaryTrigger,
+};
 pub use types::{BudgetError, BudgetStrategy, PreparedContext, TokenBudget, TokenUsageBreakdown};

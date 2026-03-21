@@ -142,10 +142,7 @@ fn responses_input_function_call_output_item_becomes_tool_result() {
         _ => panic!("expected text content with output"),
     }
 
-    assert_eq!(
-        msgs[0].tool_call_id.as_deref(),
-        Some("call_abc")
-    );
+    assert_eq!(msgs[0].tool_call_id.as_deref(), Some("call_abc"));
     assert!(msgs[0].tool_calls.is_none());
 }
 

@@ -187,9 +187,10 @@ pub async fn handle_tool_result_with_agentic_support(
     composition_executor: Option<Arc<CompositionExecutor>>,
 ) -> ToolHandlingOutcome {
     let Some(agentic_result) = try_parse_agentic_result(result) else {
-        session.add_message(Message::tool_result(
+        session.add_message(Message::tool_result_with_status(
             tool_call.id.clone(),
             result.result.clone(),
+            result.success,
         ));
         return ToolHandlingOutcome::Continue;
     };
@@ -207,9 +208,10 @@ pub async fn handle_tool_result_with_agentic_support(
                 })
                 .await;
 
-            session.add_message(Message::tool_result(
+            session.add_message(Message::tool_result_with_status(
                 tool_call.id.clone(),
                 format!("Error: {error}"),
+                false,
             ));
 
             ToolHandlingOutcome::Continue
@@ -267,7 +269,11 @@ pub async fn execute_sub_actions(
                     error: error.clone(),
                 })
                 .await;
-            session.add_message(Message::tool_result(action.id.clone(), error));
+            session.add_message(Message::tool_result_with_status(
+                action.id.clone(),
+                error,
+                false,
+            ));
             return ToolHandlingOutcome::Continue;
         }
 
@@ -312,9 +318,10 @@ pub async fn execute_sub_actions(
                                 error: error.clone(),
                             })
                             .await;
-                        session.add_message(Message::tool_result(
+                        session.add_message(Message::tool_result_with_status(
                             action.id.clone(),
                             format!("Error: {error}"),
+                            false,
                         ));
                     }
                     Some(AgenticToolResult::NeedClarification { question, options }) => {
@@ -339,9 +346,10 @@ pub async fn execute_sub_actions(
                         pending.extend(next_actions);
                     }
                     None => {
-                        session.add_message(Message::tool_result(
+                        session.add_message(Message::tool_result_with_status(
                             action.id.clone(),
                             result.result.clone(),
+                            result.success,
                         ));
                     }
                 }
@@ -354,9 +362,10 @@ pub async fn execute_sub_actions(
                         error: error_msg.clone(),
                     })
                     .await;
-                session.add_message(Message::tool_result(
+                session.add_message(Message::tool_result_with_status(
                     action.id.clone(),
                     format!("Error: {error_msg}"),
+                    false,
                 ));
             }
         }

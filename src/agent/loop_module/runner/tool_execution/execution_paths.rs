@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use crate::agent::core::tools::{ToolCall, ToolExecutor, ToolResult};
 use crate::agent::core::{AgentEvent, Session};
 use crate::agent::loop_module::config::AgentLoopConfig;
-use crate::agent::loop_module::todo_context::TodoLoopContext;
+use crate::agent::loop_module::task_context::TaskLoopContext;
 use crate::agent::metrics::MetricsCollector;
 
 use super::loop_state::RoundExecutionState;
@@ -25,9 +25,9 @@ pub(super) struct SuccessPathContext<'a> {
     pub session: &'a mut Session,
     pub tools: &'a Arc<dyn ToolExecutor>,
     pub config: &'a AgentLoopConfig,
-    pub todo_context: &'a mut Option<TodoLoopContext>,
+    pub task_context: &'a mut Option<TaskLoopContext>,
     pub state: &'a mut RoundExecutionState,
-    pub tool_timer: std::time::Instant,
+    pub tool_duration: std::time::Duration,
 }
 
 pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -> bool {

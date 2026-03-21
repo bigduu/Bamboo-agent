@@ -7,10 +7,10 @@ use crate::agent::core::{AgentError, AgentEvent, Message, Session};
 use crate::agent::llm::LLMProvider;
 use crate::agent::loop_module::config::AgentLoopConfig;
 use crate::agent::loop_module::stream::handler::StreamHandlingOutput;
-use crate::agent::loop_module::todo_context::TodoLoopContext;
+use crate::agent::loop_module::task_context::TaskLoopContext;
 use crate::agent::metrics::{MetricsCollector, TokenUsage};
 
-use super::super::{todo_lifecycle, tool_execution};
+use super::super::{task_lifecycle, tool_execution};
 use super::{RoundFlowContext, RoundFlowOutcome};
 
 mod round_state;
@@ -28,7 +28,7 @@ pub(super) async fn handle_tool_calls_path(
     metrics_collector: Option<&MetricsCollector>,
     tools: &Arc<dyn ToolExecutor>,
     config: &AgentLoopConfig,
-    todo_context: &mut Option<TodoLoopContext>,
+    task_context: &mut Option<TaskLoopContext>,
     llm: Arc<dyn LLMProvider>,
 ) -> Result<RoundFlowOutcome, AgentError> {
     let reasoning = (!stream_output.reasoning_content.trim().is_empty())
@@ -50,7 +50,7 @@ pub(super) async fn handle_tool_calls_path(
         session,
         tools,
         config,
-        todo_context,
+        task_context,
     )
     .await;
     state.apply_tool_execution_result(tool_execution);
@@ -65,8 +65,8 @@ pub(super) async fn handle_tool_calls_path(
 
     state.log_round_complete_if_debug(&context, session.messages.len());
 
-    let todo_evaluation_usage = todo_lifecycle::evaluate_round_todo_progress(
-        todo_context,
+    let task_evaluation_usage = task_lifecycle::evaluate_round_task_progress(
+        task_context,
         session,
         llm,
         event_tx,
@@ -76,7 +76,7 @@ pub(super) async fn handle_tool_calls_path(
         config.reasoning_effort,
     )
     .await?;
-    accumulate_round_usage(&mut round_usage, todo_evaluation_usage);
+    accumulate_round_usage(&mut round_usage, task_evaluation_usage);
 
     state.record_round_completion(metrics_collector, &context, session, round_usage);
 

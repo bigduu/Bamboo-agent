@@ -68,6 +68,7 @@ pub(super) async fn execute_llm_stream(
     };
     let request_options = LLMRequestOptions {
         reasoning_effort,
+        parallel_tool_calls: Some(true),
         responses: previous_response_id.map(|response_id| ResponsesRequestOptions {
             previous_response_id: Some(response_id.to_string()),
             store: Some(false),
@@ -91,6 +92,15 @@ pub(super) async fn execute_llm_stream(
         );
     }
 
+    tracing::info!(
+        "[{}] LLM request: model={}, parallel_tool_calls={:?}, reasoning_effort={:?}, tools={}, messages={}",
+        session_id,
+        model,
+        request_options.parallel_tool_calls,
+        request_options.reasoning_effort,
+        tool_schemas.len(),
+        request_messages.len(),
+    );
     let stream = llm
         .chat_stream_with_options(
             request_messages,

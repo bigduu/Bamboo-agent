@@ -13,6 +13,11 @@ pub enum TruncateRequest {
     /// This is useful for "retry/regenerate" flows: keep the last user message
     /// but drop any assistant/tool tail so `POST /execute/{session_id}` can run again.
     AfterLastUser,
+    /// Preserve message history and mark the session for error retry.
+    ///
+    /// This is useful when a run failed transiently and we want to re-execute
+    /// from the existing context (including prior successful tool calls).
+    ErrorRetry,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +52,13 @@ mod tests {
         let json = r#"{"mode":"after_last_user"}"#;
         let req: TruncateRequest = serde_json::from_str(json).unwrap();
         assert!(matches!(req, TruncateRequest::AfterLastUser));
+    }
+
+    #[test]
+    fn test_truncate_request_error_retry() {
+        let json = r#"{"mode":"error_retry"}"#;
+        let req: TruncateRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(req, TruncateRequest::ErrorRetry));
     }
 
     #[test]

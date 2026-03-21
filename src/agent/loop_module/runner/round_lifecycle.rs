@@ -36,8 +36,15 @@ pub(super) async fn execute_llm_round(
     model_name: &str,
     tool_schemas: &[ToolSchema],
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
-    let prepared =
-        context_preparation::prepare_round_context(session, config, model_name, session_id).await?;
+    let prepared = context_preparation::prepare_round_context(
+        session,
+        config,
+        model_name,
+        session_id,
+        tool_schemas,
+        llm,
+    )
+    .await?;
 
     // Use model from config (provided by execute request), not from session.
     let model = config

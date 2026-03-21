@@ -44,5 +44,9 @@ pub async fn create_test_app() -> actix_web::web::Data<AppState> {
         .expect("Failed to create temp dir")
         .keep();
 
-    actix_web::web::Data::new(AppState::new(temp_dir.clone()).await)
+    actix_web::web::Data::new(
+        AppState::new(temp_dir.clone())
+            .await
+            .expect("Failed to create AppState for e2e test"),
+    )
 }

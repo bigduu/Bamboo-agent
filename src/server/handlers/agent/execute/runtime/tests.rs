@@ -40,6 +40,27 @@ fn has_pending_user_message_when_ask_user_resume_is_marked() {
 }
 
 #[test]
+fn has_pending_user_message_when_error_retry_resume_is_marked() {
+    let mut session = Session::new("session-1", "gpt-4o-mini");
+    session.add_message(Message::user("hello"));
+    session.add_message(Message::assistant("failed with rate limit", None));
+    assert!(!has_pending_user_message(&session));
+
+    session
+        .metadata
+        .insert("retry_resume_pending".to_string(), "true".to_string());
+    session
+        .metadata
+        .insert("retry_resume_reason".to_string(), "error_retry".to_string());
+    assert!(has_pending_user_message(&session));
+
+    consume_pending_ask_user_resume(&mut session);
+    assert!(!has_pending_user_message(&session));
+    assert!(!session.metadata.contains_key("retry_resume_pending"));
+    assert!(!session.metadata.contains_key("retry_resume_reason"));
+}
+
+#[test]
 fn session_prompt_extractors_select_expected_messages() {
     let mut session = Session::new("session-1", "gpt-4o-mini");
     session.add_message(Message::system("primary system prompt"));

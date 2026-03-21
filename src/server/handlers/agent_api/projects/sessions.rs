@@ -32,7 +32,7 @@ pub async fn get_project_sessions(path: web::Path<String>) -> Result<HttpRespons
                 id: session_id,
                 project_id: project_id.clone(),
                 project_path: project_path.clone(),
-                todo_data: None,
+                task_data: None,
                 created_at: filesystem_created_at(&session_path),
                 first_message: None,
                 message_timestamp: None,

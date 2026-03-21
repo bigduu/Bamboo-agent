@@ -2,6 +2,7 @@ use async_trait::async_trait;
 
 use super::resolve_available_tool_schemas;
 use crate::agent::core::tools::{FunctionSchema, ToolCall, ToolExecutor, ToolResult, ToolSchema};
+use crate::agent::core::Session;
 
 struct StaticToolExecutor {
     schemas: Vec<ToolSchema>,
@@ -43,7 +44,8 @@ fn resolve_available_tool_schemas_uses_executor_when_registry_empty() {
         schemas: vec![schema("z_tool"), schema("a_tool")],
     };
 
-    let resolved = resolve_available_tool_schemas(&config, &tools);
+    let session = Session::new("test", "test-model");
+    let resolved = resolve_available_tool_schemas(&config, &tools, &session);
     let names: Vec<&str> = resolved
         .iter()
         .map(|item| item.function.name.as_str())
@@ -62,7 +64,8 @@ fn resolve_available_tool_schemas_dedupes_and_merges_additional_entries() {
         schemas: vec![schema("a_tool"), schema("z_tool")],
     };
 
-    let resolved = resolve_available_tool_schemas(&config, &tools);
+    let session = Session::new("test", "test-model");
+    let resolved = resolve_available_tool_schemas(&config, &tools, &session);
     let names: Vec<&str> = resolved
         .iter()
         .map(|item| item.function.name.as_str())
@@ -84,7 +87,8 @@ fn resolve_available_tool_schemas_excludes_disabled_tools() {
         schemas: vec![schema("a_tool"), schema("z_tool")],
     };
 
-    let resolved = resolve_available_tool_schemas(&config, &tools);
+    let session = Session::new("test", "test-model");
+    let resolved = resolve_available_tool_schemas(&config, &tools, &session);
     let names: Vec<&str> = resolved
         .iter()
         .map(|item| item.function.name.as_str())

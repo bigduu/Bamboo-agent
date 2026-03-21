@@ -24,8 +24,9 @@ pub struct Session {
     pub project_id: String,
     /// File system path to the project.
     pub project_path: String,
-    /// Optional TODO data for the session.
-    pub todo_data: Option<serde_json::Value>,
+    /// Optional task data for the session.
+    #[serde(default, alias = "todo_data")]
+    pub task_data: Option<serde_json::Value>,
     /// Unix timestamp of session creation.
     pub created_at: u64,
     /// First message content (for preview).

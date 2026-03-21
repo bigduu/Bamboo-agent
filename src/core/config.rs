@@ -815,7 +815,9 @@ impl Config {
                         };
                         match crate::core::encryption::decrypt(encrypted) {
                             Ok(value) => header.value = value,
-                            Err(e) => tracing::warn!("Failed to decrypt MCP SSE header value: {}", e),
+                            Err(e) => {
+                                tracing::warn!("Failed to decrypt MCP SSE header value: {}", e)
+                            }
                         }
                     }
                 }

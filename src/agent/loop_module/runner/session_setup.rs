@@ -5,7 +5,7 @@ use chrono::Utc;
 use crate::agent::core::tools::{ToolExecutor, ToolSchema};
 use crate::agent::core::{Message, Session};
 use crate::agent::loop_module::config::AgentLoopConfig;
-use crate::agent::loop_module::todo_context::TodoLoopContext;
+use crate::agent::loop_module::task_context::TaskLoopContext;
 use crate::agent::metrics::MetricsCollector;
 
 mod compaction;
@@ -20,11 +20,11 @@ pub(super) async fn prepare_session_for_loop(
     tools: &dyn ToolExecutor,
     metrics_collector: Option<&MetricsCollector>,
     session_id: &str,
-) -> Option<TodoLoopContext> {
+) -> Option<TaskLoopContext> {
     let skill_context = skill_context::load_skill_context(config, session_id).await;
 
     let base_prompt_for_language = prompt_setup::resolve_base_prompt_for_language(config, session);
-    let tool_schemas = resolve_available_tool_schemas(config, tools);
+    let tool_schemas = resolve_available_tool_schemas(config, tools, session);
     let tool_guide_context = prompt_setup::build_tool_guide_context(
         config,
         &tool_schemas,
@@ -52,18 +52,19 @@ pub(super) async fn prepare_session_for_loop(
 
     compaction::compact_oversized_tool_messages(session, config, session_id).await;
 
-    let todo_context = TodoLoopContext::from_session(session);
-    if todo_context.is_some() {
-        tracing::debug!("[{}] TodoLoopContext initialized", session_id);
+    let task_context = TaskLoopContext::from_session(session);
+    if task_context.is_some() {
+        tracing::debug!("[{}] TaskLoopContext initialized", session_id);
     }
-    todo_context
+    task_context
 }
 
 pub(super) fn resolve_available_tool_schemas(
     config: &AgentLoopConfig,
     tools: &dyn ToolExecutor,
+    session: &Session,
 ) -> Vec<ToolSchema> {
-    tool_schemas::resolve_available_tool_schemas(config, tools)
+    tool_schemas::resolve_available_tool_schemas(config, tools, session)
 }
 
 #[cfg(test)]

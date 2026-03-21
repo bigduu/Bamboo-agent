@@ -1,8 +1,31 @@
+use std::sync::Arc;
+
 use super::prepare_round_context;
 use crate::agent::core::budget::{BudgetStrategy, TokenBudget};
 use crate::agent::core::{Message, Role, Session};
 use crate::agent::llm::models::{ContentPart, ImageUrl};
+use crate::agent::llm::provider::{LLMProvider, LLMStream};
 use crate::agent::loop_module::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
+
+/// A no-op LLM provider for tests that returns an empty stream.
+struct NoopLlmProvider;
+
+#[async_trait::async_trait]
+impl LLMProvider for NoopLlmProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[crate::agent::core::tools::ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> crate::agent::llm::provider::Result<LLMStream> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+}
+
+fn noop_llm() -> Arc<dyn LLMProvider> {
+    Arc::new(NoopLlmProvider)
+}
 
 #[tokio::test]
 async fn prepare_round_context_applies_placeholder_fallback_only_to_prepared_context() {
@@ -25,9 +48,17 @@ async fn prepare_round_context_applies_placeholder_fallback_only_to_prepared_con
         ..Default::default()
     };
 
-    let prepared = prepare_round_context(&mut session, &config, "test-model", "session-cp-1")
-        .await
-        .expect("prepare round context");
+    let llm = noop_llm();
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "session-cp-1",
+        &[],
+        &llm,
+    )
+    .await
+    .expect("prepare round context");
 
     let prepared_user = prepared
         .prepared_context
@@ -71,9 +102,17 @@ async fn prepare_round_context_records_compression_events_and_marks_messages() {
         ..Default::default()
     };
 
-    let _prepared = prepare_round_context(&mut session, &config, "test-model", "session-cp-2")
-        .await
-        .expect("prepare round context");
+    let llm = noop_llm();
+    let _prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "session-cp-2",
+        &[],
+        &llm,
+    )
+    .await
+    .expect("prepare round context");
 
     assert!(
         !session.compression_events.is_empty(),

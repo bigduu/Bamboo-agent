@@ -8,7 +8,7 @@ use crate::agent::tools::normalize_tool_ref;
 
 /// Tool executor that overlays a single tool on top of an existing executor.
 ///
-/// This is used to add server-only tools (like `spawn_session`) without mutating the
+/// This is used to add server-only tools (like `SubSession`) without mutating the
 /// underlying built-in/MCP executor.
 pub struct OverlayToolExecutor {
     base: std::sync::Arc<dyn ToolExecutor>,
@@ -101,16 +101,16 @@ mod tests {
         }
     }
 
-    struct TaskOverlayTool;
+    struct SubSessionOverlayTool;
 
     #[async_trait]
-    impl Tool for TaskOverlayTool {
+    impl Tool for SubSessionOverlayTool {
         fn name(&self) -> &str {
-            "Task"
+            "SubSession"
         }
 
         fn description(&self) -> &str {
-            "overlay task"
+            "overlay sub session"
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
@@ -138,16 +138,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overlay_executor_routes_task_alias_to_overlay_tool() {
+    async fn overlay_executor_routes_spawn_alias_to_overlay_tool() {
         let overlay = OverlayToolExecutor::new(
             std::sync::Arc::new(BaseExecutor),
-            std::sync::Arc::new(TaskOverlayTool),
+            std::sync::Arc::new(SubSessionOverlayTool),
         );
 
         let result = overlay
             .execute(&make_call("sub_task"))
             .await
-            .expect("task alias should route to overlay");
+            .expect("spawn alias should route to overlay");
 
         assert!(result.success);
         assert_eq!(result.result, "overlay");
@@ -157,7 +157,7 @@ mod tests {
     async fn overlay_executor_keeps_non_overlay_calls_on_base_executor() {
         let overlay = OverlayToolExecutor::new(
             std::sync::Arc::new(BaseExecutor),
-            std::sync::Arc::new(TaskOverlayTool),
+            std::sync::Arc::new(SubSessionOverlayTool),
         );
 
         let err = overlay

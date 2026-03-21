@@ -45,6 +45,7 @@ pub(super) async fn handle_streaming_messages(
             openai_request.model.as_str(),
             Some(&LLMRequestOptions {
                 reasoning_effort: prepared.reasoning_effort,
+                parallel_tool_calls: None,
                 responses: None,
             }),
         )

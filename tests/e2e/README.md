@@ -14,7 +14,7 @@ tests/e2e/
 ├── execute.rs             # Tests for /api/v1/execute/{session_id}
 ├── events.rs              # Tests for /api/v1/events/{session_id}
 ├── history.rs             # Tests for /api/v1/history/{session_id}
-├── todo.rs                # Tests for /api/v1/todo/* endpoints
+├── task/                  # Tests for /api/v1/task/* endpoints
 ├── respond.rs             # Tests for /api/v1/respond/* endpoints
 ├── stop.rs                # Tests for /api/v1/stop/{session_id}
 ├── delete.rs              # Tests for /api/v1/sessions/{session_id}
@@ -56,9 +56,9 @@ The e2e tests cover the following API endpoints:
 - `POST /api/v1/stop/{session_id}` - Stop execution
 - `GET /api/v1/history/{session_id}` - Get session history
 
-### Todo Endpoints
-- `GET /api/v1/todo/{session_id}` - Get todo list
-- `GET /api/v1/todo/{session_id}/exists` - Check if todo list exists
+### Task Endpoints
+- `GET /api/v1/task/{session_id}` - Get task list
+- `GET /api/v1/task/{session_id}/exists` - Check if task list exists
 
 ### Respond Endpoints
 - `POST /api/v1/respond/{session_id}` - Submit user response

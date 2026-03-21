@@ -8,9 +8,9 @@ mod runner;
 mod stream_json;
 mod version;
 
-use tracing::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use tracing::{info, warn};
 
 use discovery::discover_system_installations;
 use version::{compare_versions, source_preference};

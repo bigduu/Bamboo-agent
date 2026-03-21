@@ -47,6 +47,7 @@ pub(super) async fn handle_streaming_complete(
             mapped_model.as_str(),
             Some(&LLMRequestOptions {
                 reasoning_effort,
+                parallel_tool_calls: None,
                 responses: None,
             }),
         )

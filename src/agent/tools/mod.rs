@@ -54,7 +54,7 @@
 //! - **Shell**: `Bash`, `BashOutput`, `KillShell`
 //! - **File Operations**: `Read`, `Write`, `Edit`, `NotebookEdit`
 //! - **Search**: `Glob`, `Grep`, `WebFetch`, `WebSearch`
-//! - **Workflow**: `Task`, `TodoWrite`, `ExitPlanMode`, `SlashCommand`
+//! - **Workflow**: `Task`, `ExitPlanMode`, `SlashCommand`
 //!
 //! # Example
 //!
@@ -99,12 +99,12 @@ pub use output_manager::{ArtifactRef, ToolOutputManager};
 // Re-export all tool implementations
 pub use tools::{
     AskUserTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, GlobTool, GrepTool,
-    KillShellTool, NotebookEditTool, ReadTool, SlashCommandTool, TaskTool, TodoWriteTool,
-    ToolRegistry, WebFetchTool, WebSearchTool, WriteTool,
+    KillShellTool, NotebookEditTool, ReadTool, SlashCommandTool, TaskTool, ToolRegistry,
+    WebFetchTool, WebSearchTool, WriteTool,
 };
 
-// Re-export todo types from agent-core for convenience
-pub use crate::agent::core::{TodoItem, TodoItemStatus, TodoList};
+// Re-export task types from agent-core for convenience
+pub use crate::agent::core::{TaskItem, TaskItemStatus, TaskList};
 
 #[cfg(test)]
 mod registry_tests;

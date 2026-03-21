@@ -292,9 +292,11 @@ impl CopilotProvider {
         let has_agent_activity = messages.iter().any(|message| {
             matches!(
                 message.role,
-                crate::agent::core::agent::Role::Assistant
-                    | crate::agent::core::agent::Role::Tool
-            ) || message.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty())
+                crate::agent::core::agent::Role::Assistant | crate::agent::core::agent::Role::Tool
+            ) || message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty())
         });
 
         if !tools.is_empty() || has_agent_activity {
@@ -469,14 +471,13 @@ impl CopilotProvider {
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
         responses_options: Option<&ResponsesRequestOptions>,
+        parallel_tool_calls: Option<bool>,
         reasoning_source: &str,
     ) -> Result<LLMStream> {
         let url = "https://api.githubcopilot.com/responses";
         let mut effective_responses_options = responses_options.cloned().unwrap_or_default();
         if effective_responses_options.store == Some(true) {
-            tracing::warn!(
-                "Copilot /responses does not support store=true; forcing store=false"
-            );
+            tracing::warn!("Copilot /responses does not support store=true; forcing store=false");
         }
         effective_responses_options.store = Some(false);
         let body = build_responses_body(
@@ -486,6 +487,7 @@ impl CopilotProvider {
             max_output_tokens,
             reasoning_effort,
             Some(&effective_responses_options),
+            parallel_tool_calls,
         );
 
         tracing::debug!("Copilot provider using Responses API model: {}", model);
@@ -552,9 +554,7 @@ impl CopilotProvider {
                                 | "access-control-allow-origin"
                         )
                     })
-                    .map(|(k, v)| {
-                        format!("{}={}", k, v.to_str().unwrap_or("<binary>"))
-                    })
+                    .map(|(k, v)| format!("{}={}", k, v.to_str().unwrap_or("<binary>")))
                     .collect::<Vec<_>>()
                     .join(", ");
                 let text = response.text().await.unwrap_or_default();
@@ -575,6 +575,7 @@ impl CopilotProvider {
                         max_output_tokens,
                         None,
                         Some(&fallback_options),
+                        parallel_tool_calls,
                     );
                     let mut fallback = self
                         .client
@@ -693,6 +694,7 @@ impl LLMProvider for CopilotProvider {
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
+        let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
         let responses_options = options.and_then(|o| o.responses.as_ref());
         let reasoning_source = if request_reasoning_effort.is_some() {
             "request"
@@ -724,6 +726,7 @@ impl LLMProvider for CopilotProvider {
                     upstream_model,
                     reasoning_effort,
                     responses_options,
+                    parallel_tool_calls,
                     reasoning_source,
                 )
                 .await;
@@ -739,6 +742,9 @@ impl LLMProvider for CopilotProvider {
         if !tools.is_empty() {
             body["tools"] = json!(tools_to_openai_compat_json(tools));
             body["tool_choice"] = json!("auto");
+        }
+        if let Some(parallel_tool_calls) = parallel_tool_calls {
+            body["parallel_tool_calls"] = json!(parallel_tool_calls);
         }
 
         if let Some(max_tokens) = max_output_tokens {
@@ -822,9 +828,7 @@ impl LLMProvider for CopilotProvider {
                                 | "access-control-allow-origin"
                         )
                     })
-                    .map(|(k, v)| {
-                        format!("{}={}", k, v.to_str().unwrap_or("<binary>"))
-                    })
+                    .map(|(k, v)| format!("{}={}", k, v.to_str().unwrap_or("<binary>")))
                     .collect::<Vec<_>>()
                     .join(", ");
                 let text = response.text().await.unwrap_or_default();
@@ -853,6 +857,9 @@ impl LLMProvider for CopilotProvider {
                     if !tools.is_empty() {
                         body_no_reasoning["tools"] = json!(tools_to_openai_compat_json(tools));
                         body_no_reasoning["tool_choice"] = json!("auto");
+                    }
+                    if let Some(parallel_tool_calls) = parallel_tool_calls {
+                        body_no_reasoning["parallel_tool_calls"] = json!(parallel_tool_calls);
                     }
                     if let Some(max_tokens) = max_output_tokens {
                         body_no_reasoning["max_tokens"] = json!(max_tokens);
@@ -918,6 +925,7 @@ impl LLMProvider for CopilotProvider {
                             upstream_model,
                             reasoning_effort,
                             responses_options,
+                            parallel_tool_calls,
                             reasoning_source,
                         )
                         .await;
@@ -1254,10 +1262,9 @@ mod tests {
         assert_eq!(headers.get("openai-intent").unwrap(), "conversation-panel");
         assert_eq!(headers.get("x-github-api-version").unwrap(), "2025-05-01");
         assert_eq!(headers.get("x-initiator").unwrap(), "user");
-        assert!(uuid::Uuid::parse_str(
-            headers.get("x-request-id").unwrap().to_str().unwrap()
-        )
-        .is_ok());
+        assert!(
+            uuid::Uuid::parse_str(headers.get("x-request-id").unwrap().to_str().unwrap()).is_ok()
+        );
     }
 
     #[test]
@@ -1272,10 +1279,7 @@ mod tests {
             CopilotProvider::infer_openai_intent(&messages, &[]),
             "conversation-agent"
         );
-        assert_eq!(
-            CopilotProvider::infer_request_initiator(&messages),
-            "agent"
-        );
+        assert_eq!(CopilotProvider::infer_request_initiator(&messages), "agent");
     }
 
     // ============================================

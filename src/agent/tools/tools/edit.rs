@@ -51,6 +51,10 @@ impl EditTool {
         Self::to_lf(value).replace('\n', "\r\n")
     }
 
+    fn has_meaningful_optional_text(value: Option<&str>) -> bool {
+        value.is_some_and(|text| !text.is_empty())
+    }
+
     fn line_starts(content: &str) -> Vec<usize> {
         let mut starts = vec![0usize];
         for (idx, byte) in content.bytes().enumerate() {
@@ -415,20 +419,20 @@ impl Tool for EditTool {
                 },
                 "old_string": {
                     "type": "string",
-                    "description": "Legacy mode: exact text to replace"
+                    "description": "Legacy mode only: exact text to replace. Do not send with patch mode."
                 },
                 "new_string": {
                     "type": "string",
-                    "description": "Legacy mode: replacement text"
+                    "description": "Legacy mode only: replacement text. Do not send with patch mode."
                 },
                 "replace_all": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Legacy mode only: replace all occurrences"
+                    "description": "Legacy mode only: replace all occurrences. Do not send with patch mode."
                 },
                 "patch": {
                     "type": "string",
-                    "description": "Patch mode: one or more blocks using <<<<<<< SEARCH / ======= / >>>>>>> REPLACE"
+                    "description": "Patch mode: one or more blocks using <<<<<<< SEARCH / ======= / >>>>>>> REPLACE. Preferred mode. Do not combine with non-empty old_string/new_string or replace_all=true."
                 },
                 "line_number": {
                     "type": "integer",
@@ -492,7 +496,10 @@ impl Tool for EditTool {
         let new_string = parsed.new_string.as_deref();
 
         let (updated, replacements, mode_label) = if let Some(patch_text) = patch {
-            if old_string.is_some() || new_string.is_some() || parsed.replace_all.is_some() {
+            if Self::has_meaningful_optional_text(old_string)
+                || Self::has_meaningful_optional_text(new_string)
+                || parsed.replace_all == Some(true)
+            {
                 return Err(ToolError::InvalidArguments(
                     "patch mode cannot be combined with old_string/new_string/replace_all"
                         .to_string(),
@@ -858,6 +865,28 @@ mod tests {
         assert!(
             matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("cannot be combined"))
         );
+    }
+
+    #[tokio::test]
+    async fn edit_patch_mode_ignores_empty_legacy_placeholders() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "hello").await.unwrap();
+
+        let tool = EditTool::new();
+        let result = tool
+            .execute(json!({
+                "file_path": file.path(),
+                "old_string": "",
+                "new_string": "",
+                "replace_all": false,
+                "patch": "<<<<<<< SEARCH\nhello\n=======\nworld\n>>>>>>> REPLACE"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let updated = tokio::fs::read_to_string(file.path()).await.unwrap();
+        assert_eq!(updated, "world");
     }
 
     #[tokio::test]

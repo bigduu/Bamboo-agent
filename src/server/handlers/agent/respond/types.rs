@@ -85,7 +85,10 @@ mod tests {
         let req: RespondRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.response, "yes");
         assert_eq!(req.model.as_deref(), Some("gpt-5-mini"));
-        assert_eq!(req.reasoning_effort, Some(crate::core::ReasoningEffort::High));
+        assert_eq!(
+            req.reasoning_effort,
+            Some(crate::core::ReasoningEffort::High)
+        );
     }
 
     #[test]

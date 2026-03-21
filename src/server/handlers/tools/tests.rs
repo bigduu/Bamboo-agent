@@ -19,7 +19,7 @@ fn canonical_tool_name_or_error_resolves_aliases() {
 
     let canonical =
         canonical_tool_name_or_error(&request.tool_name).expect("expected canonical name");
-    assert_eq!(canonical, "Task");
+    assert_eq!(canonical, "SubSession");
 }
 
 #[test]
@@ -133,6 +133,7 @@ fn build_execution_response_preserves_result_content() {
         serde_json::from_str(&response.result).expect("payload should be valid json");
 
     assert_eq!(payload["tool_name"], "list_files");
+    assert_eq!(payload["success"], true);
     assert_eq!(payload["display_preference"], "Hidden");
 
     // Result is stored as a string in the payload
@@ -157,6 +158,7 @@ fn build_execution_response_handles_failed_tool_result() {
         serde_json::from_str(&response.result).expect("payload should be valid json");
 
     assert_eq!(payload["tool_name"], "read_file");
+    assert_eq!(payload["success"], false);
     assert_eq!(payload["display_preference"], "Default");
     assert_eq!(payload["result"], "Error: File not found");
 }

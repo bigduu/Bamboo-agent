@@ -52,10 +52,10 @@
 
 use anyhow::{Context, Result};
 use dirs;
-use tracing::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use tracing::{debug, error, info};
 
 /// Represents a slash command with its metadata and content.
 ///

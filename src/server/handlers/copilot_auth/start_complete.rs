@@ -91,7 +91,9 @@ pub async fn complete_copilot_auth(
                     );
                 }
                 Err(_) => {
-                    tracing::warn!("Copilot auth succeeded but provider reload timed out (non-fatal)");
+                    tracing::warn!(
+                        "Copilot auth succeeded but provider reload timed out (non-fatal)"
+                    );
                 }
             }
 

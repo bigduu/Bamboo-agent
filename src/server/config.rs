@@ -22,9 +22,9 @@
 use actix_cors::Cors;
 use actix_web::http::header;
 use actix_web::middleware::DefaultHeaders;
+use std::collections::HashSet;
 use tracing::info;
 use tracing::warn;
-use std::collections::HashSet;
 
 // Keep the default CSP strict (no `unsafe-*`) to avoid weakening XSS protections.
 // If your UI requires inline scripts/styles or eval-like behavior, override with

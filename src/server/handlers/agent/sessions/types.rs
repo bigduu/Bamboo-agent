@@ -91,7 +91,8 @@ pub struct SessionSystemPromptResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_memory: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub todo_list: Option<String>,
+    #[serde(rename = "task_list", alias = "todo_list")]
+    pub task_list: Option<String>,
     pub effective_system_prompt: String,
 }
 
@@ -267,7 +268,7 @@ mod tests {
             skill_context: None,
             tool_guide_context: None,
             external_memory: None,
-            todo_list: None,
+            task_list: None,
             effective_system_prompt: "You are helpful".to_string(),
         };
 
@@ -287,7 +288,7 @@ mod tests {
             skill_context: Some("Skill".to_string()),
             tool_guide_context: Some("Tool guide".to_string()),
             external_memory: Some("Memory".to_string()),
-            todo_list: Some("Todo".to_string()),
+            task_list: Some("Task".to_string()),
             effective_system_prompt: "Full prompt".to_string(),
         };
 

@@ -22,6 +22,7 @@ pub(super) async fn handle_non_streaming_chat(
         internal_tools,
         max_tokens,
         reasoning_effort,
+        parallel_tool_calls,
         estimated_prompt_tokens,
         ..
     } = prepared;
@@ -43,6 +44,7 @@ pub(super) async fn handle_non_streaming_chat(
             resolved_model.as_str(),
             Some(&LLMRequestOptions {
                 reasoning_effort,
+                parallel_tool_calls,
                 responses: None,
             }),
         )

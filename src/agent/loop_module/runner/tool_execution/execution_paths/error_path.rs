@@ -32,8 +32,9 @@ pub(super) async fn handle_tool_execution_error(
     )
     .await;
 
-    session.add_message(Message::tool_result(
+    session.add_message(Message::tool_result_with_status(
         tool_call.id.clone(),
         format!("Error: {error_message}"),
+        false,
     ));
 }

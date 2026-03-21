@@ -8,8 +8,9 @@ static INIT: Once = Once::new();
 /// Initialize test environment
 pub fn init_test_env() {
     INIT.call_once(|| {
-        let _ = env_logger::builder()
-            .filter_level(log::LevelFilter::Debug)
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
             .try_init();
     });
 }

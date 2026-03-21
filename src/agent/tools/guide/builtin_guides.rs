@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 20] = [
     "ask_user",
     "Bash",
     "BashOutput",
@@ -24,7 +24,6 @@ pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
     "SetWorkspace",
     "Sleep",
     "Task",
-    "TodoWrite",
     "WebFetch",
     "WebSearch",
     "Write",
@@ -183,24 +182,12 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "Task" => Some(guide(
             "Task",
             ToolCategory::TaskManagement,
-            "Delegate a sub-session (sub task/team agent/parallel worker). Always set a clear title and a single explicit responsibility.",
-            "Do not use for trivial single-step operations, and do not omit title/responsibility.",
-            &["TodoWrite"],
-            vec![example(
-                "Delegate research",
-                json!({"title":"Search refs","responsibility":"Find parser entrypoints and summarize findings","prompt":"Scan parser modules and report key entrypoints with file paths.","subagent_type":"general-purpose"}),
-                "Use when work can be isolated and run in parallel.",
-            )],
-        )),
-        "TodoWrite" => Some(guide(
-            "TodoWrite",
-            ToolCategory::TaskManagement,
-            "Maintain a structured task checklist for complex tasks.",
+            "Create or update the shared task list for the current root session tree (root + child sessions share the same task list).",
             "Do not use for trivial one-step requests.",
-            &["Task", "ExitPlanMode"],
+            &["ExitPlanMode"],
             vec![example(
-                "Update task statuses",
-                json!({"todos":[{"content":"Run tests","status":"in_progress","activeForm":"Running tests"}]}),
+                "Update shared task statuses",
+                json!({"tasks":[{"content":"Run tests","status":"in_progress","activeForm":"Running tests"}]}),
                 "Keep exactly one item in_progress whenever possible.",
             )],
         )),
@@ -209,7 +196,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::UserInteraction,
             "Ask for confirmation before leaving plan mode.",
             "Do not use if implementation can proceed directly.",
-            &["TodoWrite"],
+            &["Task"],
             vec![example(
                 "Plan complete",
                 json!({"plan":"1. Do A\n2. Do B"}),
@@ -281,7 +268,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::TaskManagement,
             "Store durable per-session facts/decisions and retrieve them across turns.",
             "Do not store secrets/tokens or transient one-turn scratch text.",
-            &["TodoWrite"],
+            &["Task"],
             vec![example(
                 "Persist a durable decision",
                 json!({"action":"append","content":"User prefers pnpm and strict TypeScript."}),

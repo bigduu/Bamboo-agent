@@ -49,6 +49,8 @@ pub struct ToolExecutionResponse {
 pub struct ToolExecutionResultPayload {
     /// Name of the executed tool.
     pub tool_name: String,
+    /// Whether the tool reported success.
+    pub success: bool,
     /// Tool execution result (usually JSON string).
     pub result: String,
     /// Display preference hint.

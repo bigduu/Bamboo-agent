@@ -11,8 +11,10 @@ const TOOL_GUIDE_START_MARKER: &str = "<!-- BAMBOO_TOOL_GUIDE_START -->";
 const TOOL_GUIDE_END_MARKER: &str = "<!-- BAMBOO_TOOL_GUIDE_END -->";
 const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
 const EXTERNAL_MEMORY_END_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_END -->";
-const TODO_LIST_START_MARKER: &str = "<!-- BAMBOO_TODO_LIST_START -->";
-const TODO_LIST_END_MARKER: &str = "<!-- BAMBOO_TODO_LIST_END -->";
+const TASK_LIST_START_MARKER: &str = "<!-- BAMBOO_TASK_LIST_START -->";
+const TASK_LIST_END_MARKER: &str = "<!-- BAMBOO_TASK_LIST_END -->";
+const LEGACY_TODO_LIST_START_MARKER: &str = "<!-- BAMBOO_TODO_LIST_START -->";
+const LEGACY_TODO_LIST_END_MARKER: &str = "<!-- BAMBOO_TODO_LIST_END -->";
 const WORKSPACE_CONTEXT_START_MARKER: &str =
     crate::server::app_state::WORKSPACE_CONTEXT_START_MARKER;
 const WORKSPACE_CONTEXT_END_MARKER: &str = crate::server::app_state::WORKSPACE_CONTEXT_END_MARKER;
@@ -78,11 +80,18 @@ fn build_system_prompt_response(
         EXTERNAL_MEMORY_START_MARKER,
         EXTERNAL_MEMORY_END_MARKER,
     );
-    let todo_list = extract_wrapped_section(
+    let task_list = extract_wrapped_section(
         &effective_system_prompt,
-        TODO_LIST_START_MARKER,
-        TODO_LIST_END_MARKER,
-    );
+        TASK_LIST_START_MARKER,
+        TASK_LIST_END_MARKER,
+    )
+    .or_else(|| {
+        extract_wrapped_section(
+            &effective_system_prompt,
+            LEGACY_TODO_LIST_START_MARKER,
+            LEGACY_TODO_LIST_END_MARKER,
+        )
+    });
 
     let prompt_without_generated_sections = strip_generated_sections(&effective_system_prompt);
     let (prompt_without_workspace, workspace_from_prompt) =
@@ -119,7 +128,7 @@ fn build_system_prompt_response(
         skill_context,
         tool_guide_context,
         external_memory,
-        todo_list,
+        task_list,
         effective_system_prompt,
     }
 }
@@ -192,7 +201,12 @@ fn strip_generated_sections(prompt: &str) -> String {
         EXTERNAL_MEMORY_START_MARKER,
         EXTERNAL_MEMORY_END_MARKER,
     );
-    let prompt = strip_wrapped_sections(&prompt, TODO_LIST_START_MARKER, TODO_LIST_END_MARKER);
+    let prompt = strip_wrapped_sections(&prompt, TASK_LIST_START_MARKER, TASK_LIST_END_MARKER);
+    let prompt = strip_wrapped_sections(
+        &prompt,
+        LEGACY_TODO_LIST_START_MARKER,
+        LEGACY_TODO_LIST_END_MARKER,
+    );
     let prompt = strip_wrapped_sections(
         &prompt,
         SKILL_CONTEXT_START_MARKER,
@@ -293,7 +307,7 @@ mod tests {
             crate::server::app_state::build_workspace_prompt_context("/tmp/workspace")
                 .expect("workspace context");
         session.add_message(Message::system(format!(
-            "Base prompt\n\nExtra guidance\n\n{workspace_context}\n\n<!-- BAMBOO_SKILL_CONTEXT_START -->\n## Skill System\n\nSkill details\n<!-- BAMBOO_SKILL_CONTEXT_END -->\n\n<!-- BAMBOO_TOOL_GUIDE_START -->\n## Tool Usage Guidelines\n\nGuide details\n<!-- BAMBOO_TOOL_GUIDE_END -->\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\nMemory details\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->\n\n<!-- BAMBOO_TODO_LIST_START -->\n## Current Task List:\n- [ ] item\n<!-- BAMBOO_TODO_LIST_END -->"
+            "Base prompt\n\nExtra guidance\n\n{workspace_context}\n\n<!-- BAMBOO_SKILL_CONTEXT_START -->\n## Skill System\n\nSkill details\n<!-- BAMBOO_SKILL_CONTEXT_END -->\n\n<!-- BAMBOO_TOOL_GUIDE_START -->\n## Tool Usage Guidelines\n\nGuide details\n<!-- BAMBOO_TOOL_GUIDE_END -->\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\nMemory details\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->\n\n<!-- BAMBOO_TASK_LIST_START -->\n## Current Task List:\n- [ ] item\n<!-- BAMBOO_TASK_LIST_END -->"
         )));
 
         let snapshot = build_system_prompt_response("session-1", &session);
@@ -319,7 +333,7 @@ mod tests {
             .as_deref()
             .is_some_and(|value| value.contains("Memory details")));
         assert!(snapshot
-            .todo_list
+            .task_list
             .as_deref()
             .is_some_and(|value| value.contains("Current Task List")));
     }

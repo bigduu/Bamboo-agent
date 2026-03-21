@@ -18,7 +18,7 @@ use startup::{initialize_loop_state, LoopRunState};
 /// Runs the agent loop with a custom configuration.
 ///
 /// This is the primary entry point for executing an agent conversation loop.
-/// It manages LLM streaming, tool execution, todo list tracking, metrics collection,
+/// It manages LLM streaming, tool execution, task list tracking, metrics collection,
 /// and event emission throughout the conversation lifecycle.
 ///
 /// # Arguments
@@ -58,7 +58,7 @@ pub async fn run_agent_loop_with_config(
     .await?;
 
     super::session_finalize::finalize_session(
-        state.todo_context,
+        state.task_context,
         session,
         &event_tx,
         &state.session_id,

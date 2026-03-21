@@ -24,8 +24,8 @@ async fn test_all_endpoints_respond() {
     // Test a representative set of endpoints to verify routing works
     let endpoints = vec![
         format!("/api/v1/history/{}", session_id),
-        format!("/api/v1/todo/{}", session_id),
-        format!("/api/v1/todo/{}/exists", session_id),
+        format!("/api/v1/task/{}", session_id),
+        format!("/api/v1/task/{}/exists", session_id),
         format!("/api/v1/respond/{}/pending", session_id),
         "/api/v1/metrics/summary".to_string(),
         "/api/v1/metrics/by-model".to_string(),

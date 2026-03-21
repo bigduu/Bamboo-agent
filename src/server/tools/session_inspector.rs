@@ -13,7 +13,7 @@ use crate::agent::core::{Message, Role, SessionKind};
 /// - Return metadata first (index-backed) so the model can narrow scope.
 /// - Allow bounded reads (pagination; from end; truncation).
 /// - Support lightweight search across session titles and (optionally) tail messages.
-/// - Encourage delegating heavy inspection/summarization to a spawned child session.
+/// - Keep inspection local by default; use child-session delegation only if the user explicitly asks.
 pub struct SessionInspectorTool {
     session_store: Arc<SessionStoreV2>,
     storage: Arc<dyn Storage>,
@@ -199,7 +199,7 @@ impl Tool for SessionInspectorTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect sessions stored in Bamboo home dir (V2). Use list/get_meta to fetch metadata first, then read_messages with a small limit (prefer from_end). For large investigations, spawn a child session to read + summarize; child sessions can use this tool but cannot spawn more sessions."
+        "Inspect sessions stored in Bamboo home dir (V2). Use list/get_meta to fetch metadata first, then read_messages with a small limit (prefer from_end). Keep inspection local by default; only use child-session delegation if the user explicitly asks for it."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -341,7 +341,7 @@ impl Tool for SessionInspectorTool {
                         "offset": offset,
                         "limit": limit,
                         "sessions": page,
-                        "note": "Use get_meta/read_messages with a small limit. For heavy reading/summarization, spawn a child session and let it use this tool."
+                        "note": "Use get_meta/read_messages with a small limit. Keep inspection local unless the user explicitly asks for delegated sub-session work."
                     })
                     .to_string(),
                     display_preference: Some("Collapsible".to_string()),
@@ -461,7 +461,7 @@ impl Tool for SessionInspectorTool {
                         "limit": limit,
                         "slice_count": slice.len(),
                         "messages": slice,
-                        "note": "If you need to read a lot of content, spawn a child session and ask it to iteratively read_messages (from_end=true) and summarize."
+                        "note": "If you need to read a lot of content, iterate with bounded read_messages calls. Only delegate to a child session if the user explicitly asks."
                     })
                     .to_string(),
                     display_preference: Some("Collapsible".to_string()),
@@ -553,7 +553,7 @@ impl Tool for SessionInspectorTool {
                         "mode": mode,
                         "case_sensitive": case_sensitive,
                         "matches": results,
-                        "note": "Consider narrowing by session_id + read_messages. For multi-session summarization, spawn a child session to do the reading and produce a report."
+                        "note": "Consider narrowing by session_id + read_messages. Keep summarization local unless the user explicitly asks for delegated child-session work."
                     })
                     .to_string(),
                     display_preference: Some("Collapsible".to_string()),

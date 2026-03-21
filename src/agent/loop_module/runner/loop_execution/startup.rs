@@ -1,7 +1,7 @@
 use crate::agent::core::tools::ToolExecutor;
 use crate::agent::core::Session;
 use crate::agent::loop_module::config::AgentLoopConfig;
-use crate::agent::loop_module::todo_context::TodoLoopContext;
+use crate::agent::loop_module::task_context::TaskLoopContext;
 use crate::agent::metrics::MetricsCollector;
 
 use super::super::logging::DebugLogger;
@@ -11,7 +11,7 @@ pub(super) struct LoopRunState {
     pub(super) model_name: String,
     pub(super) metrics_collector: Option<MetricsCollector>,
     pub(super) debug_logger: DebugLogger,
-    pub(super) todo_context: Option<TodoLoopContext>,
+    pub(super) task_context: Option<TaskLoopContext>,
 }
 
 pub(super) async fn initialize_loop_state(
@@ -51,7 +51,7 @@ pub(super) async fn initialize_loop_state(
         }),
     );
 
-    let todo_context = super::super::session_setup::prepare_session_for_loop(
+    let task_context = super::super::session_setup::prepare_session_for_loop(
         session,
         initial_message,
         config,
@@ -66,6 +66,6 @@ pub(super) async fn initialize_loop_state(
         model_name,
         metrics_collector,
         debug_logger,
-        todo_context,
+        task_context,
     }
 }

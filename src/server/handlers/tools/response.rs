@@ -11,6 +11,7 @@ pub(super) fn build_execution_response(
         .unwrap_or_else(|| "Default".to_string());
     let payload = ToolExecutionResultPayload {
         tool_name: requested_tool_name,
+        success: result.success,
         result: result.result,
         display_preference,
     };

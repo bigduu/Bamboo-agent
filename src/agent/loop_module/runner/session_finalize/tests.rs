@@ -2,19 +2,19 @@ use chrono::Utc;
 use tokio::sync::mpsc;
 
 use super::finalize_session;
-use crate::agent::core::todo::{TodoItem, TodoItemStatus, TodoList};
 use crate::agent::core::{AgentEvent, Session};
+use crate::agent::core::{TaskItem, TaskItemStatus, TaskList};
 use crate::agent::loop_module::config::AgentLoopConfig;
-use crate::agent::loop_module::todo_context::TodoLoopContext;
+use crate::agent::loop_module::task_context::TaskLoopContext;
 
-fn completed_todo_list(session_id: &str) -> TodoList {
-    TodoList {
+fn completed_task_list(session_id: &str) -> TaskList {
+    TaskList {
         session_id: session_id.to_string(),
         title: "Done".to_string(),
-        items: vec![TodoItem {
+        items: vec![TaskItem {
             id: "done-1".to_string(),
             description: "Completed task".to_string(),
-            status: TodoItemStatus::Completed,
+            status: TaskItemStatus::Completed,
             depends_on: Vec::new(),
             notes: String::new(),
         }],
@@ -70,17 +70,17 @@ async fn finalize_session_skips_complete_when_already_sent() {
 }
 
 #[tokio::test]
-async fn finalize_session_syncs_todo_context_and_emits_todo_completed() {
+async fn finalize_session_syncs_task_context_and_emits_task_completed() {
     let mut session = Session::new("finalize-session-3", "test-model");
-    session.set_todo_list(completed_todo_list("finalize-session-3"));
-    let mut todo_context =
-        TodoLoopContext::from_session(&session).expect("todo context should exist");
-    todo_context.current_round = 3;
+    session.set_task_list(completed_task_list("finalize-session-3"));
+    let mut task_context =
+        TaskLoopContext::from_session(&session).expect("task context should exist");
+    task_context.current_round = 3;
 
     let (event_tx, mut event_rx) = mpsc::channel(8);
 
     finalize_session(
-        Some(todo_context),
+        Some(task_context),
         &mut session,
         &event_tx,
         "finalize-session-3",
@@ -93,9 +93,9 @@ async fn finalize_session_syncs_todo_context_and_emits_todo_completed() {
     let event = event_rx
         .recv()
         .await
-        .expect("todo completed event expected");
+        .expect("task completed event expected");
     match event {
-        AgentEvent::TodoListCompleted {
+        AgentEvent::TaskListCompleted {
             session_id,
             total_rounds,
             ..
@@ -106,11 +106,11 @@ async fn finalize_session_syncs_todo_context_and_emits_todo_completed() {
         other => panic!("unexpected event: {other:?}"),
     }
 
-    assert!(session.todo_list.is_some());
+    assert!(session.task_list.is_some());
     assert_eq!(
         session
             .metadata
-            .get("todo_list_version")
+            .get("task_list_version")
             .map(String::as_str),
         Some("0")
     );

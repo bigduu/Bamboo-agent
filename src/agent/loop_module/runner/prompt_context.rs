@@ -2,7 +2,7 @@
 
 mod external_memory;
 mod system_sections;
-mod todo;
+mod task;
 
 pub(super) async fn inject_external_memory_into_system_message(
     session: &mut crate::agent::core::Session,
@@ -26,12 +26,12 @@ pub(super) fn merge_system_prompt_with_contexts(
     )
 }
 
-pub(super) fn inject_todo_list_into_system_message(session: &mut crate::agent::core::Session) {
-    todo::inject_todo_list_into_system_message(session);
+pub(super) fn inject_task_list_into_system_message(session: &mut crate::agent::core::Session) {
+    task::inject_task_list_into_system_message(session);
 }
 
-pub(super) fn strip_existing_todo_list(prompt: &str) -> String {
-    todo::strip_existing_todo_list(prompt)
+pub(super) fn strip_existing_task_list(prompt: &str) -> String {
+    task::strip_existing_task_list(prompt)
 }
 
 #[cfg(test)]

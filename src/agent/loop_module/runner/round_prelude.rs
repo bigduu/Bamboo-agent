@@ -3,7 +3,7 @@
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::core::{AgentError, Session};
-use crate::agent::loop_module::todo_context::TodoLoopContext;
+use crate::agent::loop_module::task_context::TaskLoopContext;
 use crate::agent::metrics::MetricsCollector;
 
 mod cancellation;
@@ -12,11 +12,11 @@ mod round_state;
 
 use cancellation::ensure_not_cancelled;
 use prompt_updates::refresh_round_prompt_context;
-use round_state::{build_round_id, log_round_start, update_todo_round_state};
+use round_state::{build_round_id, log_round_start, update_task_round_state};
 
 pub(super) async fn prepare_round(
     session: &mut Session,
-    todo_context: &mut Option<TodoLoopContext>,
+    task_context: &mut Option<TaskLoopContext>,
     round: usize,
     max_rounds: usize,
     cancel_token: &CancellationToken,
@@ -26,7 +26,7 @@ pub(super) async fn prepare_round(
     debug_enabled: bool,
 ) -> Result<String, AgentError> {
     refresh_round_prompt_context(session).await;
-    update_todo_round_state(todo_context, round, max_rounds);
+    update_task_round_state(task_context, round, max_rounds);
 
     let round_id = build_round_id(session_id, round);
 

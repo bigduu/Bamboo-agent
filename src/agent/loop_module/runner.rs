@@ -25,7 +25,7 @@ mod round_lifecycle;
 mod round_prelude;
 mod session_finalize;
 mod session_setup;
-mod todo_lifecycle;
+mod task_lifecycle;
 mod tool_execution;
 mod workspace_context;
 

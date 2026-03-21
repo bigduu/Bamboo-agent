@@ -4,8 +4,12 @@
 //! key information from earlier context.
 
 use crate::agent::core::agent::types::{Message, Role};
+use crate::agent::llm::provider::LLMProvider;
+use crate::agent::llm::types::LLMChunk;
 use async_trait::async_trait;
+use futures::StreamExt;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Trait for summarization implementations.
 #[async_trait]
@@ -208,6 +212,217 @@ impl SummaryManager {
     /// Estimate the token count of a summary for N messages.
     pub fn estimate_summary_tokens(&self, message_count: usize) -> u32 {
         self.summarizer.estimate_summary_tokens(message_count)
+    }
+}
+
+/// LLM-based summarizer that calls the current session's model to generate
+/// a rich summary of compressed/removed messages.
+///
+/// Falls back to [`HeuristicSummarizer`] if the LLM call fails.
+pub struct LlmSummarizer {
+    llm: Arc<dyn LLMProvider>,
+    model: String,
+    /// Optional existing summary to build upon (incremental summarization).
+    existing_summary: Option<String>,
+}
+
+impl LlmSummarizer {
+    /// Create a new LLM-based summarizer.
+    ///
+    /// # Arguments
+    /// * `llm` - The LLM provider to use (same as the current session's provider)
+    /// * `model` - Model name to use for summarization
+    /// * `existing_summary` - Optional previous summary to extend
+    pub fn new(llm: Arc<dyn LLMProvider>, model: String, existing_summary: Option<String>) -> Self {
+        Self {
+            llm,
+            model,
+            existing_summary,
+        }
+    }
+
+    /// Build the summarization prompt for the LLM.
+    fn build_summarization_messages(&self, messages: &[Message]) -> Vec<Message> {
+        let mut prompt_messages = Vec::new();
+
+        let system_prompt = r#"You are a conversation summarizer. Your task is to create a concise but comprehensive summary of a conversation that was removed due to context window limits.
+
+Guidelines:
+- Preserve key decisions, facts, code changes, file paths, and important outcomes
+- Maintain the user's original intent and any constraints they specified
+- Note important tool results (files read, commands executed, errors encountered)
+- Keep technical details that would be needed to continue the work
+- Use a structured format with sections if the conversation covers multiple topics
+- Be concise but don't lose critical information
+- Write in the same language as the original conversation"#;
+
+        prompt_messages.push(Message::system(system_prompt));
+
+        // If there's an existing summary, include it for incremental updates
+        let mut user_content = String::new();
+
+        if let Some(ref existing) = self.existing_summary {
+            user_content.push_str("## Previous Summary\n\n");
+            user_content.push_str(existing);
+            user_content.push_str("\n\n---\n\n");
+            user_content.push_str(
+                "The above is the previous summary. Below are additional messages that have now been compressed. \
+                 Please produce an updated, merged summary that incorporates both the previous summary and the new messages.\n\n",
+            );
+        }
+
+        user_content.push_str("## Messages to Summarize\n\n");
+
+        for message in messages {
+            let role_label = match message.role {
+                Role::User => "User",
+                Role::Assistant => "Assistant",
+                Role::Tool => "Tool Result",
+                Role::System => continue, // Skip system messages
+            };
+
+            // Include tool call info if present
+            if let Some(ref tool_calls) = message.tool_calls {
+                if !tool_calls.is_empty() {
+                    let tool_names: Vec<&str> = tool_calls
+                        .iter()
+                        .map(|tc| tc.function.name.as_str())
+                        .collect();
+                    user_content.push_str(&format!(
+                        "**{}** [called tools: {}]:\n",
+                        role_label,
+                        tool_names.join(", ")
+                    ));
+                } else {
+                    user_content.push_str(&format!("**{}**:\n", role_label));
+                }
+            } else {
+                user_content.push_str(&format!("**{}**:\n", role_label));
+            }
+
+            // Include tool_call_id for tool results
+            if let Some(ref tool_call_id) = message.tool_call_id {
+                user_content.push_str(&format!("(tool_call_id: {})\n", tool_call_id));
+            }
+
+            // Truncate very long messages to avoid blowing up the summary request
+            let content = &message.content;
+            const MAX_CONTENT_CHARS: usize = 2000;
+            if content.chars().count() > MAX_CONTENT_CHARS {
+                let truncated: String = content.chars().take(MAX_CONTENT_CHARS).collect();
+                user_content.push_str(&truncated);
+                user_content.push_str("... [truncated]\n\n");
+            } else {
+                user_content.push_str(content);
+                user_content.push_str("\n\n");
+            }
+        }
+
+        user_content.push_str(
+            "\n---\n\nPlease summarize the above conversation. \
+             Focus on preserving actionable information, decisions made, and current state of work.",
+        );
+
+        prompt_messages.push(Message::user(user_content));
+
+        prompt_messages
+    }
+
+    /// Consume an LLM stream and collect the full text response.
+    async fn collect_stream_response(
+        &self,
+        messages: &[Message],
+    ) -> Result<String, crate::agent::core::budget::types::BudgetError> {
+        let stream = self
+            .llm
+            .chat_stream(messages, &[], None, &self.model)
+            .await
+            .map_err(|e| {
+                crate::agent::core::budget::types::BudgetError::TokenCountError(format!(
+                    "LLM summarization call failed: {}",
+                    e
+                ))
+            })?;
+
+        let mut content = String::new();
+        let mut stream = stream;
+
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok(LLMChunk::Token(text)) => content.push_str(&text),
+                Ok(LLMChunk::Done) => break,
+                Ok(_) => {} // Ignore reasoning tokens, tool calls, etc.
+                Err(e) => {
+                    tracing::warn!("LLM summarization stream error: {}", e);
+                    if !content.is_empty() {
+                        break;
+                    }
+                    return Err(
+                        crate::agent::core::budget::types::BudgetError::TokenCountError(format!(
+                            "LLM summarization stream failed: {}",
+                            e
+                        )),
+                    );
+                }
+            }
+        }
+
+        Ok(content)
+    }
+}
+
+impl std::fmt::Debug for LlmSummarizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmSummarizer")
+            .field("model", &self.model)
+            .field("has_existing_summary", &self.existing_summary.is_some())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl Summarizer for LlmSummarizer {
+    async fn summarize(
+        &self,
+        messages: &[Message],
+    ) -> Result<String, crate::agent::core::budget::types::BudgetError> {
+        if messages.is_empty() {
+            return Ok("No conversation history to summarize.".to_string());
+        }
+
+        let prompt_messages = self.build_summarization_messages(messages);
+
+        tracing::info!(
+            "LlmSummarizer: summarizing {} messages using model '{}' (existing_summary={})",
+            messages.len(),
+            self.model,
+            self.existing_summary.is_some()
+        );
+
+        match self.collect_stream_response(&prompt_messages).await {
+            Ok(summary) if !summary.trim().is_empty() => {
+                tracing::info!("LlmSummarizer: generated summary ({} chars)", summary.len());
+                Ok(summary)
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    "LlmSummarizer: LLM returned empty summary, falling back to heuristic"
+                );
+                HeuristicSummarizer::new().summarize(messages).await
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "LlmSummarizer: LLM call failed ({}), falling back to heuristic",
+                    e
+                );
+                HeuristicSummarizer::new().summarize(messages).await
+            }
+        }
+    }
+
+    fn estimate_summary_tokens(&self, message_count: usize) -> u32 {
+        // LLM summaries tend to be more detailed; estimate higher than heuristic
+        (message_count * 80).min(2000) as u32
     }
 }
 

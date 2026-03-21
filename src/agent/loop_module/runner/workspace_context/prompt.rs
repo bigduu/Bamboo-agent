@@ -1,6 +1,6 @@
 use crate::agent::core::{Message, Session};
 
-use super::super::prompt_context::{strip_existing_external_memory, strip_existing_todo_list};
+use super::super::prompt_context::{strip_existing_external_memory, strip_existing_task_list};
 
 const WORKSPACE_CONTEXT_START_MARKER: &str =
     crate::server::app_state::WORKSPACE_CONTEXT_START_MARKER;
@@ -8,13 +8,14 @@ const WORKSPACE_CONTEXT_END_MARKER: &str = crate::server::app_state::WORKSPACE_C
 const SKILL_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_SKILL_CONTEXT_START -->";
 const TOOL_GUIDE_START_MARKER: &str = "<!-- BAMBOO_TOOL_GUIDE_START -->";
 const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
-const TODO_LIST_START_MARKER: &str = "<!-- BAMBOO_TODO_LIST_START -->";
+const TASK_LIST_START_MARKER: &str = "<!-- BAMBOO_TASK_LIST_START -->";
+const LEGACY_TODO_LIST_START_MARKER: &str = "<!-- BAMBOO_TODO_LIST_START -->";
 const LEGACY_WORKSPACE_CONTEXT_MARKER: &str = "\n\nWorkspace path: ";
 const LEGACY_SKILL_CONTEXT_MARKERS: [&str; 2] =
     ["\n\n## Skill System\n", "\n\n## Available Skills\n"];
 const LEGACY_TOOL_GUIDE_MARKER: &str = "## Tool Usage Guidelines\n";
 const LEGACY_EXTERNAL_MEMORY_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n";
-const LEGACY_TODO_LIST_MARKER: &str = "\n\n## Current Task List:";
+const LEGACY_TASK_LIST_MARKER: &str = "\n\n## Current Task List:";
 
 pub(super) fn apply_workspace_path_to_session(session: &mut Session, workspace_path: &str) {
     let workspace_path = workspace_path.trim();
@@ -33,7 +34,7 @@ pub(super) fn apply_workspace_path_to_session(session: &mut Session, workspace_p
     {
         // Drop dynamic round sections first. They will be re-injected by the loop.
         let base_prompt =
-            strip_existing_todo_list(&strip_existing_external_memory(&system_message.content));
+            strip_existing_task_list(&strip_existing_external_memory(&system_message.content));
         system_message.content = upsert_workspace_context(&base_prompt, workspace_path);
     } else {
         session.messages.insert(
@@ -112,7 +113,8 @@ fn strip_legacy_workspace_context(prompt: &str) -> String {
         remainder.find(SKILL_CONTEXT_START_MARKER),
         remainder.find(TOOL_GUIDE_START_MARKER),
         remainder.find(EXTERNAL_MEMORY_START_MARKER),
-        remainder.find(TODO_LIST_START_MARKER),
+        remainder.find(TASK_LIST_START_MARKER),
+        remainder.find(LEGACY_TODO_LIST_START_MARKER),
     ]
     .into_iter()
     .flatten()
@@ -125,7 +127,7 @@ fn strip_legacy_workspace_context(prompt: &str) -> String {
             remainder.find(LEGACY_SKILL_CONTEXT_MARKERS[1]),
             remainder.find(LEGACY_TOOL_GUIDE_MARKER),
             remainder.find(LEGACY_EXTERNAL_MEMORY_MARKER),
-            remainder.find(LEGACY_TODO_LIST_MARKER),
+            remainder.find(LEGACY_TASK_LIST_MARKER),
         ]
         .into_iter()
         .flatten()

@@ -8,7 +8,7 @@ use crate::agent::core::tools::ToolExecutor;
 use crate::agent::core::{AgentError, AgentEvent, Session};
 use crate::agent::llm::LLMProvider;
 use crate::agent::loop_module::config::AgentLoopConfig;
-use crate::agent::loop_module::todo_context::TodoLoopContext;
+use crate::agent::loop_module::task_context::TaskLoopContext;
 use crate::agent::metrics::MetricsCollector;
 
 use super::round_lifecycle::RoundLlmExecutionOutput;
@@ -36,7 +36,7 @@ pub(super) async fn handle_round_post_llm(
     metrics_collector: Option<&MetricsCollector>,
     tools: &Arc<dyn ToolExecutor>,
     config: &AgentLoopConfig,
-    todo_context: &mut Option<TodoLoopContext>,
+    task_context: &mut Option<TaskLoopContext>,
     llm: Arc<dyn LLMProvider>,
 ) -> Result<RoundFlowOutcome, AgentError> {
     let stream_output = round_llm_output.stream_output;
@@ -68,7 +68,7 @@ pub(super) async fn handle_round_post_llm(
         metrics_collector,
         tools,
         config,
-        todo_context,
+        task_context,
         llm,
     )
     .await

@@ -54,7 +54,6 @@
 use crate::agent::llm::ProxyAuthRequiredError;
 use anyhow::anyhow;
 use lazy_static::lazy_static;
-use tracing::error;
 use reqwest::StatusCode;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
@@ -67,6 +66,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tokio::time::sleep;
+use tracing::error;
 
 use super::device_code::DeviceCodeResponse;
 

@@ -5,6 +5,9 @@ use super::types::TruncateRequest;
 use crate::agent::core::agent::Role;
 use crate::server::app_state::AppState;
 
+const RETRY_RESUME_PENDING_KEY: &str = "retry_resume_pending";
+const RETRY_RESUME_REASON_KEY: &str = "retry_resume_reason";
+
 /// `POST /api/v1/sessions/{session_id}/messages/truncate`
 pub async fn truncate_messages(
     state: web::Data<AppState>,
@@ -24,7 +27,7 @@ pub async fn truncate_messages(
         })));
     };
 
-    let (removed, new_len) = match req.into_inner() {
+    let (removed, new_len, should_clear_derived_state, should_persist) = match req.into_inner() {
         TruncateRequest::AfterLastUser => {
             let last_user_idx = session
                 .messages
@@ -40,15 +43,39 @@ pub async fn truncate_messages(
 
             let keep_len = idx + 1;
             let removed = session.messages.len().saturating_sub(keep_len);
-            session.messages.truncate(keep_len);
-            (removed, keep_len)
+            if removed > 0 {
+                session.messages.truncate(keep_len);
+            }
+
+            let cleared_pending_flag = session.metadata.remove(RETRY_RESUME_PENDING_KEY).is_some();
+            let cleared_reason_flag = session.metadata.remove(RETRY_RESUME_REASON_KEY).is_some();
+            let cleared_retry_flags = cleared_pending_flag || cleared_reason_flag;
+            (
+                removed,
+                session.messages.len(),
+                removed > 0,
+                removed > 0 || cleared_retry_flags,
+            )
+        }
+        TruncateRequest::ErrorRetry => {
+            session
+                .metadata
+                .insert(RETRY_RESUME_PENDING_KEY.to_string(), "true".to_string());
+            session.metadata.insert(
+                RETRY_RESUME_REASON_KEY.to_string(),
+                "error_retry".to_string(),
+            );
+            (0, session.messages.len(), false, true)
         }
     };
 
-    if removed > 0 {
+    if should_clear_derived_state {
         // Truncation invalidates derived context state.
         session.token_usage = None;
         session.conversation_summary = None;
+    }
+
+    if should_persist {
         save_and_cache_session(&state, &session_id, session).await?;
     }
 

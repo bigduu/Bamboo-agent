@@ -3,11 +3,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::agent::core::tools::{
-    parse_tool_args_best_effort, ToolCall, ToolExecutionContext, ToolExecutor,
+    parse_tool_args_best_effort, ToolCall, ToolExecutionContext, ToolExecutor, ToolResult,
 };
 use crate::agent::core::{AgentEvent, Session};
 use crate::agent::loop_module::config::AgentLoopConfig;
-use crate::agent::loop_module::todo_context::TodoLoopContext;
+use crate::agent::loop_module::task_context::TaskLoopContext;
 use crate::agent::metrics::MetricsCollector;
 
 use super::execution_paths;
@@ -38,11 +38,43 @@ pub(super) struct PerToolExecutionContext<'a> {
     pub session: &'a mut Session,
     pub tools: &'a Arc<dyn ToolExecutor>,
     pub config: &'a AgentLoopConfig,
-    pub todo_context: &'a mut Option<TodoLoopContext>,
+    pub task_context: &'a mut Option<TaskLoopContext>,
     pub state: &'a mut RoundExecutionState,
 }
 
-pub(super) async fn execute_single_tool_call(ctx: PerToolExecutionContext<'_>) -> bool {
+pub(super) struct ToolExecutionOnlyContext<'a> {
+    pub tool_call: &'a ToolCall,
+    pub event_tx: &'a mpsc::Sender<AgentEvent>,
+    pub metrics_collector: Option<&'a MetricsCollector>,
+    pub session_id: &'a str,
+    pub round_id: &'a str,
+    pub round: usize,
+    pub tools: &'a Arc<dyn ToolExecutor>,
+    pub config: &'a AgentLoopConfig,
+}
+
+pub(super) struct ToolExecutionApplyContext<'a> {
+    pub tool_call: &'a ToolCall,
+    pub event_tx: &'a mpsc::Sender<AgentEvent>,
+    pub metrics_collector: Option<&'a MetricsCollector>,
+    pub session_id: &'a str,
+    pub round_id: &'a str,
+    pub round: usize,
+    pub session: &'a mut Session,
+    pub tools: &'a Arc<dyn ToolExecutor>,
+    pub config: &'a AgentLoopConfig,
+    pub task_context: &'a mut Option<TaskLoopContext>,
+    pub state: &'a mut RoundExecutionState,
+}
+
+pub(super) struct ToolExecutionOutcome {
+    pub result: Result<ToolResult, String>,
+    pub tool_duration: std::time::Duration,
+}
+
+pub(super) async fn execute_tool_call_only(
+    ctx: ToolExecutionOnlyContext<'_>,
+) -> ToolExecutionOutcome {
     let raw_arguments = ctx.tool_call.function.arguments.trim();
     let (args, parse_warning) = parse_tool_args_best_effort(&ctx.tool_call.function.arguments);
     if let Some(warning) = parse_warning {
@@ -87,14 +119,25 @@ pub(super) async fn execute_single_tool_call(ctx: PerToolExecutionContext<'_>) -
         event_tx: Some(ctx.event_tx),
     };
 
-    match crate::agent::core::tools::executor::execute_tool_call_with_context(
+    let result = crate::agent::core::tools::executor::execute_tool_call_with_context(
         ctx.tool_call,
         ctx.tools.as_ref(),
         ctx.config.composition_executor.as_ref().map(Arc::clone),
         tool_ctx,
     )
-    .await
-    {
+    .await;
+
+    ToolExecutionOutcome {
+        result: result.map_err(|error| error.to_string()),
+        tool_duration: tool_timer.elapsed(),
+    }
+}
+
+pub(super) async fn apply_tool_execution_outcome(
+    ctx: ToolExecutionApplyContext<'_>,
+    outcome: ToolExecutionOutcome,
+) -> bool {
+    match outcome.result {
         Ok(result) => {
             execution_paths::handle_successful_tool_result(execution_paths::SuccessPathContext {
                 tool_call: ctx.tool_call,
@@ -107,16 +150,16 @@ pub(super) async fn execute_single_tool_call(ctx: PerToolExecutionContext<'_>) -
                 session: ctx.session,
                 tools: ctx.tools,
                 config: ctx.config,
-                todo_context: ctx.todo_context,
+                task_context: ctx.task_context,
                 state: ctx.state,
-                tool_timer,
+                tool_duration: outcome.tool_duration,
             })
             .await
         }
-        Err(error) => {
+        Err(error_message) => {
             execution_paths::handle_tool_execution_error(
                 ctx.tool_call,
-                &error.to_string(),
+                &error_message,
                 ctx.event_tx,
                 ctx.metrics_collector,
                 ctx.session_id,
@@ -128,4 +171,36 @@ pub(super) async fn execute_single_tool_call(ctx: PerToolExecutionContext<'_>) -
             false
         }
     }
+}
+
+pub(super) async fn execute_single_tool_call(ctx: PerToolExecutionContext<'_>) -> bool {
+    let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+        tool_call: ctx.tool_call,
+        event_tx: ctx.event_tx,
+        metrics_collector: ctx.metrics_collector,
+        session_id: ctx.session_id,
+        round_id: ctx.round_id,
+        round: ctx.round,
+        tools: ctx.tools,
+        config: ctx.config,
+    })
+    .await;
+
+    apply_tool_execution_outcome(
+        ToolExecutionApplyContext {
+            tool_call: ctx.tool_call,
+            event_tx: ctx.event_tx,
+            metrics_collector: ctx.metrics_collector,
+            session_id: ctx.session_id,
+            round_id: ctx.round_id,
+            round: ctx.round,
+            session: ctx.session,
+            tools: ctx.tools,
+            config: ctx.config,
+            task_context: ctx.task_context,
+            state: ctx.state,
+        },
+        outcome,
+    )
+    .await
 }

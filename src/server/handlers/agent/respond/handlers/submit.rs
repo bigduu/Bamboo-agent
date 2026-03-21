@@ -202,13 +202,15 @@ pub(super) fn update_or_append_tool_result_message(
     for message in &mut session.messages {
         if message.tool_call_id.as_deref() == Some(tool_call_id) {
             message.content = selected_message_content(user_response);
+            message.tool_success = Some(true);
             return true;
         }
     }
 
-    session.add_message(crate::agent::core::Message::tool_result(
+    session.add_message(crate::agent::core::Message::tool_result_with_status(
         tool_call_id,
         selected_message_content(user_response),
+        true,
     ));
     false
 }

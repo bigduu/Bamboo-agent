@@ -13,7 +13,7 @@
 //!
 //! 1. **Token** events stream generated text
 //! 2. **ToolStart/ToolComplete** track tool execution
-//! 3. **TodoListUpdated** tracks progress
+//! 3. **TaskListUpdated** tracks progress
 //! 4. **TokenBudgetUpdated** reports context management
 //! 5. **Complete** or **Error** ends the stream
 //!
@@ -35,8 +35,8 @@
 //! };
 //! ```
 
-use crate::agent::core::todo::{TodoItemStatus, TodoList};
 use crate::agent::core::tools::ToolResult;
+use crate::agent::core::{TaskItemStatus, TaskList};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -60,11 +60,11 @@ use serde::{Deserialize, Serialize};
 /// - `NeedClarification` - Agent needs user input
 ///
 /// ## Progress Tracking
-/// - `TodoListUpdated` - Todo list created or modified
-/// - `TodoListItemProgress` - Individual item progress
-/// - `TodoListCompleted` - All items completed
-/// - `TodoEvaluationStarted` - Todo evaluation began
-/// - `TodoEvaluationCompleted` - Todo evaluation finished
+/// - `TaskListUpdated` - Task list created or modified
+/// - `TaskListItemProgress` - Individual item progress
+/// - `TaskListCompleted` - All items completed
+/// - `TaskEvaluationStarted` - Task evaluation began
+/// - `TaskEvaluationCompleted` - Task evaluation finished
 ///
 /// ## Context Management
 /// - `TokenBudgetUpdated` - Context budget changed
@@ -150,28 +150,28 @@ pub enum AgentEvent {
         options: Option<Vec<String>>,
     },
 
-    /// Emitted when todo list is created or updated
-    TodoListUpdated {
-        /// Current todo list state
-        todo_list: TodoList,
+    /// Emitted when task list is created or updated.
+    TaskListUpdated {
+        /// Current task list state.
+        task_list: TaskList,
     },
 
-    /// Emitted when a todo item makes progress (delta update)
-    TodoListItemProgress {
+    /// Emitted when a task item makes progress (delta update).
+    TaskListItemProgress {
         /// Session identifier
         session_id: String,
         /// Item identifier
         item_id: String,
         /// New item status
-        status: TodoItemStatus,
+        status: TaskItemStatus,
         /// Number of tool calls made
         tool_calls_count: usize,
         /// Item version (for optimistic concurrency)
         version: u64,
     },
 
-    /// Emitted when all todo items are completed
-    TodoListCompleted {
+    /// Emitted when all task items are completed.
+    TaskListCompleted {
         /// Session identifier
         session_id: String,
         /// Completion timestamp
@@ -182,16 +182,16 @@ pub enum AgentEvent {
         total_tool_calls: usize,
     },
 
-    /// Emitted when todo evaluation starts (NEW)
-    TodoEvaluationStarted {
+    /// Emitted when task evaluation starts.
+    TaskEvaluationStarted {
         /// Session identifier
         session_id: String,
         /// Number of items to evaluate
         items_count: usize,
     },
 
-    /// Emitted when todo evaluation completes (NEW)
-    TodoEvaluationCompleted {
+    /// Emitted when task evaluation completes.
+    TaskEvaluationCompleted {
         /// Session identifier
         session_id: String,
         /// Number of items updated
@@ -337,4 +337,50 @@ pub struct TokenBudgetUsage {
     pub truncation_occurred: bool,
     /// Number of message segments removed
     pub segments_removed: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::core::{TaskItem, TaskItemStatus, TaskList};
+
+    fn sample_task_list() -> TaskList {
+        TaskList {
+            session_id: "session-1".to_string(),
+            title: "Task List".to_string(),
+            items: vec![TaskItem {
+                id: "task_1".to_string(),
+                description: "Implement event rename".to_string(),
+                status: TaskItemStatus::InProgress,
+                depends_on: Vec::new(),
+                notes: "Implementing".to_string(),
+            }],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn task_list_updated_serializes_with_task_names() {
+        let event = AgentEvent::TaskListUpdated {
+            task_list: sample_task_list(),
+        };
+
+        let value = serde_json::to_value(event).expect("event should serialize");
+        assert_eq!(value["type"], "task_list_updated");
+        assert!(value.get("task_list").is_some());
+        assert!(value.get("todo_list").is_none());
+    }
+
+    #[test]
+    fn task_evaluation_completed_serializes_with_task_type() {
+        let event = AgentEvent::TaskEvaluationCompleted {
+            session_id: "session-1".to_string(),
+            updates_count: 2,
+            reasoning: "Updated statuses".to_string(),
+        };
+
+        let value = serde_json::to_value(event).expect("event should serialize");
+        assert_eq!(value["type"], "task_evaluation_completed");
+    }
 }

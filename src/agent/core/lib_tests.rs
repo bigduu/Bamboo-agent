@@ -125,6 +125,7 @@ mod tests {
         let msg = Message::tool_result("call-1", "Sunny, 25°C");
         assert!(matches!(msg.role, Role::Tool));
         assert_eq!(msg.tool_call_id, Some("call-1".to_string()));
+        assert_eq!(msg.tool_success, Some(true));
         assert_eq!(msg.content, "Sunny, 25°C");
     }
 
@@ -139,12 +140,24 @@ mod tests {
         assert_eq!(parsed["role"], "tool");
         assert_eq!(parsed["content"], "User selected: option1");
         assert_eq!(parsed["tool_call_id"], "call_yyaeEH9yC4MEL0kc5fWJwOZv");
+        assert_eq!(parsed["tool_success"], true);
 
         // Ensure tool_call_id field exists with correct name
         assert!(
             parsed.get("tool_call_id").is_some(),
             "tool_call_id field should exist"
         );
+    }
+
+    #[test]
+    fn test_tool_error_message_serialization() {
+        let msg = Message::tool_result_with_status("call-error", "Error: boom", false);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+
+        assert_eq!(parsed["role"], "tool");
+        assert_eq!(parsed["tool_call_id"], "call-error");
+        assert_eq!(parsed["tool_success"], false);
     }
 
     #[test]

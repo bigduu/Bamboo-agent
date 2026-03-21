@@ -8,7 +8,7 @@
 //! - Conversation summaries
 
 use bamboo_agent::agent::core::agent::types::*;
-use bamboo_agent::agent::core::todo::{TodoItem, TodoItemStatus, TodoList};
+use bamboo_agent::agent::core::{TaskItem, TaskItemStatus, TaskList};
 use chrono::Utc;
 
 #[test]
@@ -142,7 +142,7 @@ fn test_session_new() {
     assert_eq!(session.root_session_id, "session-123");
     assert_eq!(session.spawn_depth, 0);
     assert!(session.messages.is_empty());
-    assert!(session.todo_list.is_none());
+    assert!(session.task_list.is_none());
     assert!(session.pending_question.is_none());
     assert!(session.token_budget.is_none());
     assert!(session.token_usage.is_none());
@@ -199,16 +199,16 @@ fn test_session_add_multiple_messages() {
 }
 
 #[test]
-fn test_session_set_todo_list() {
+fn test_session_set_task_list() {
     let mut session = Session::new("session-1", "gpt-4o-mini");
 
-    let todo_list = TodoList {
+    let task_list = TaskList {
         session_id: "session-1".to_string(),
         title: "Task List".to_string(),
-        items: vec![TodoItem {
+        items: vec![TaskItem {
             id: "item-1".to_string(),
             description: "Task 1".to_string(),
-            status: TodoItemStatus::Pending,
+            status: TaskItemStatus::Pending,
             depends_on: vec![],
             notes: String::new(),
         }],
@@ -216,70 +216,70 @@ fn test_session_set_todo_list() {
         updated_at: Utc::now(),
     };
 
-    session.set_todo_list(todo_list);
+    session.set_task_list(task_list);
 
-    assert!(session.todo_list.is_some());
-    let list = session.todo_list.unwrap();
+    assert!(session.task_list.is_some());
+    let list = session.task_list.unwrap();
     assert_eq!(list.items.len(), 1);
     assert_eq!(list.items[0].description, "Task 1");
 }
 
 #[test]
-fn test_session_update_todo_item() {
+fn test_session_update_task_item() {
     let mut session = Session::new("session-1", "gpt-4o-mini");
 
-    // Set initial todo list
-    let todo_list = TodoList {
+    // Set initial task list
+    let task_list = TaskList {
         session_id: "session-1".to_string(),
         title: "Task List".to_string(),
-        items: vec![TodoItem {
+        items: vec![TaskItem {
             id: "item-1".to_string(),
             description: "Task 1".to_string(),
-            status: TodoItemStatus::Pending,
+            status: TaskItemStatus::Pending,
             depends_on: vec![],
             notes: String::new(),
         }],
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
-    session.set_todo_list(todo_list);
+    session.set_task_list(task_list);
 
-    // Update the todo item
-    let result = session.update_todo_item("item-1", TodoItemStatus::Completed, Some("Done!"));
+    // Update the task item
+    let result = session.update_task_item("item-1", TaskItemStatus::Completed, Some("Done!"));
 
     assert!(result.is_ok());
-    let list = session.todo_list.unwrap();
-    assert_eq!(list.items[0].status, TodoItemStatus::Completed);
+    let list = session.task_list.unwrap();
+    assert_eq!(list.items[0].status, TaskItemStatus::Completed);
     assert_eq!(list.items[0].notes, "Done!");
 }
 
 #[test]
-fn test_session_update_todo_item_not_found() {
+fn test_session_update_task_item_not_found() {
     let mut session = Session::new("session-1", "gpt-4o-mini");
 
-    let todo_list = TodoList {
+    let task_list = TaskList {
         session_id: "session-1".to_string(),
         title: "Task List".to_string(),
         items: vec![],
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
-    session.set_todo_list(todo_list);
+    session.set_task_list(task_list);
 
-    let result = session.update_todo_item("nonexistent", TodoItemStatus::Completed, None);
+    let result = session.update_task_item("nonexistent", TaskItemStatus::Completed, None);
 
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("not found"));
 }
 
 #[test]
-fn test_session_update_todo_item_no_list() {
+fn test_session_update_task_item_no_list() {
     let mut session = Session::new("session-1", "gpt-4o-mini");
 
-    let result = session.update_todo_item("item-1", TodoItemStatus::Completed, None);
+    let result = session.update_task_item("item-1", TaskItemStatus::Completed, None);
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("No todo list exists"));
+    assert!(result.unwrap_err().contains("No task list exists"));
 }
 
 #[test]
@@ -405,29 +405,29 @@ fn test_tool_message_no_truncation_for_other_roles() {
 }
 
 #[test]
-fn test_session_format_todo_list_for_prompt() {
+fn test_session_format_task_list_for_prompt() {
     let mut session = Session::new("session-1", "gpt-4o-mini");
 
-    // Without todo list
-    assert!(session.format_todo_list_for_prompt().is_empty());
+    // Without task list
+    assert!(session.format_task_list_for_prompt().is_empty());
 
-    // With todo list
-    let todo_list = TodoList {
+    // With task list
+    let task_list = TaskList {
         session_id: "session-1".to_string(),
         title: "Task List".to_string(),
-        items: vec![TodoItem {
+        items: vec![TaskItem {
             id: "item-1".to_string(),
             description: "Task 1".to_string(),
-            status: TodoItemStatus::Pending,
+            status: TaskItemStatus::Pending,
             depends_on: vec![],
             notes: String::new(),
         }],
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
-    session.set_todo_list(todo_list);
+    session.set_task_list(task_list);
 
-    let formatted = session.format_todo_list_for_prompt();
+    let formatted = session.format_task_list_for_prompt();
     assert!(!formatted.is_empty());
     assert!(formatted.contains("Task 1"));
 }
@@ -483,7 +483,7 @@ fn test_empty_session() {
     let session = Session::new("session-1", "gpt-4o-mini");
 
     assert!(session.messages.is_empty());
-    assert!(session.todo_list.is_none());
+    assert!(session.task_list.is_none());
     assert!(session.pending_question.is_none());
     assert!(session.conversation_summary.is_none());
 }

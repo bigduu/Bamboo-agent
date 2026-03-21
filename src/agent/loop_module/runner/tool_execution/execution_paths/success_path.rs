@@ -3,12 +3,12 @@ use std::sync::Arc;
 use crate::agent::core::tools::{handle_tool_result_with_agentic_support, ToolHandlingOutcome};
 use crate::agent::core::AgentEvent;
 
-use super::super::{clarification, events, todo};
+use super::super::{clarification, events, task};
 use super::{workspace, SuccessPathContext};
 
 pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -> bool {
-    todo::track_todo_progress(
-        ctx.todo_context,
+    task::track_task_progress(
+        ctx.task_context,
         ctx.event_tx,
         ctx.session_id,
         ctx.tool_call,
@@ -17,14 +17,14 @@ pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -
     )
     .await;
 
-    todo::maybe_handle_todowrite(
+    task::maybe_handle_taskwrite(
         ctx.tool_call,
         ctx.result,
         ctx.session,
         ctx.session_id,
         ctx.event_tx,
         ctx.config,
-        ctx.todo_context,
+        ctx.task_context,
     )
     .await;
 
@@ -69,7 +69,7 @@ pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -
         serde_json::json!({
             "tool_name": ctx.tool_call.function.name,
             "tool_call_id": ctx.tool_call.id,
-            "duration_ms": ctx.tool_timer.elapsed().as_millis(),
+            "duration_ms": ctx.tool_duration.as_millis(),
             "success": ctx.result.success,
         })
     );

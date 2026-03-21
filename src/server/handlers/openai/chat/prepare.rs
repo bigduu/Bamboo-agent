@@ -5,7 +5,7 @@ use crate::server::{app_state::AppState, error::AppError};
 
 use super::PreparedChatRequest;
 use crate::server::handlers::openai::{
-    helpers::{convert_messages, convert_tools, parse_reasoning_effort},
+    helpers::{convert_messages, convert_tools, parse_parallel_tool_calls, parse_reasoning_effort},
     usage::estimate_prompt_tokens,
 };
 
@@ -47,6 +47,7 @@ pub(super) async fn prepare_chat_request(
         .and_then(|value| value.as_u64())
         .map(|value| value as u32);
     let reasoning_effort = parse_reasoning_effort(&request.parameters);
+    let parallel_tool_calls = parse_parallel_tool_calls(&request.parameters);
     let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
 
     Ok(PreparedChatRequest {
@@ -56,6 +57,7 @@ pub(super) async fn prepare_chat_request(
         internal_tools,
         max_tokens,
         reasoning_effort,
+        parallel_tool_calls,
         estimated_prompt_tokens,
     })
 }

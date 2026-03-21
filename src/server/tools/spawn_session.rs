@@ -148,11 +148,11 @@ impl SpawnSessionTool {
 #[async_trait]
 impl Tool for SpawnSessionTool {
     fn name(&self) -> &str {
-        "Task"
+        "SubSession"
     }
 
     fn description(&self) -> &str {
-        "Delegate a sub-session (sub task/team agent/parallel worker) to run asynchronously. Always provide a clear title and responsibility."
+        "Create and run a child session asynchronously when the user explicitly requests delegated/parallel sub-agent work. Always provide a clear title and responsibility. After creation, use sub_session_manager to inspect, retry, or send follow-up messages to the same child session."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -181,17 +181,17 @@ impl Tool for SpawnSessionTool {
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let parent_session_id = ctx.session_id.ok_or_else(|| {
-            ToolError::Execution("Task requires a session_id in tool context".to_string())
+            ToolError::Execution("SubSession requires a session_id in tool context".to_string())
         })?;
 
         let parsed: SpawnSessionArgsRaw = serde_json::from_value(args)
-            .map_err(|e| ToolError::InvalidArguments(format!("Invalid Task args: {e}")))?;
+            .map_err(|e| ToolError::InvalidArguments(format!("Invalid SubSession args: {e}")))?;
         let parsed = normalize_spawn_session_args(parsed)?;
 
         let parent = self.load_parent_session(parent_session_id).await?;
         if parent.kind != SessionKind::Root {
             return Err(ToolError::Execution(
-                "Task is not allowed inside child sessions".to_string(),
+                "SubSession is not allowed inside child sessions".to_string(),
             ));
         }
 
@@ -209,7 +209,7 @@ impl Tool for SpawnSessionTool {
             Session::new_child(child_id.clone(), parent.id.clone(), model.clone(), title);
         child
             .metadata
-            .insert("spawned_by".to_string(), "Task".to_string());
+            .insert("spawned_by".to_string(), "SubSession".to_string());
         child
             .metadata
             .insert("subagent_type".to_string(), parsed.subagent_type.clone());
@@ -231,6 +231,9 @@ impl Tool for SpawnSessionTool {
         // Keep the child prompt minimal; do NOT copy the parent's full system prompt.
         child.add_message(Message::system(CHILD_SYSTEM_PROMPT));
         child.add_message(Message::user(format_child_assignment(&parsed)));
+        if let Some(parent_task_list) = parent.task_list.clone() {
+            child.set_task_list(parent_task_list);
+        }
 
         // Persist child session + index entry.
         self.storage
@@ -278,7 +281,7 @@ impl Tool for SpawnSessionTool {
                 "child_session_id": child_id,
                 "parent_session_id": parent.id,
                 "model": model,
-                "note": "Child session runs in background. Observe via sub_session_* events."
+                "note": "Child session runs in background. Observe via sub_session_* events, then use sub_session_manager action=send_message/run/update to continue the same child session."
             })
             .to_string(),
             display_preference: Some("Collapsible".to_string()),
@@ -459,7 +462,7 @@ mod tests {
 
         match err {
             ToolError::Execution(msg) => {
-                assert!(msg.contains("Task requires a session_id in tool context"));
+                assert!(msg.contains("SubSession requires a session_id in tool context"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -530,7 +533,7 @@ mod tests {
                 },
             )
             .await
-            .expect("Task should enqueue a child session");
+            .expect("SubSession should enqueue a child session");
 
         let parsed_result: serde_json::Value =
             serde_json::from_str(&result.result).expect("tool result should be JSON");

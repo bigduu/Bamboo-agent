@@ -77,13 +77,11 @@ impl ReasoningEffort {
     }
 
     fn is_claude_model(model_lower: &str) -> bool {
-        model_lower.starts_with("claude")
-            || model_lower.contains("anthropic")
+        model_lower.starts_with("claude") || model_lower.contains("anthropic")
     }
 
     fn is_gemini_model(model_lower: &str) -> bool {
-        model_lower.starts_with("gemini")
-            || model_lower.contains("google")
+        model_lower.starts_with("gemini") || model_lower.contains("google")
     }
 }
 
@@ -303,38 +301,83 @@ mod tests {
 
     #[test]
     fn wire_format_claude_models_map_xhigh_and_max_to_max() {
-        assert_eq!(ReasoningEffort::Low.to_wire_format("claude-3.5-sonnet"), "low");
-        assert_eq!(ReasoningEffort::Medium.to_wire_format("claude-3.5-sonnet"), "medium");
-        assert_eq!(ReasoningEffort::High.to_wire_format("claude-sonnet-4"), "high");
+        assert_eq!(
+            ReasoningEffort::Low.to_wire_format("claude-3.5-sonnet"),
+            "low"
+        );
+        assert_eq!(
+            ReasoningEffort::Medium.to_wire_format("claude-3.5-sonnet"),
+            "medium"
+        );
+        assert_eq!(
+            ReasoningEffort::High.to_wire_format("claude-sonnet-4"),
+            "high"
+        );
         // Both xhigh and max → "max" for Claude
-        assert_eq!(ReasoningEffort::Xhigh.to_wire_format("claude-sonnet-4"), "max");
-        assert_eq!(ReasoningEffort::Max.to_wire_format("claude-sonnet-4"), "max");
+        assert_eq!(
+            ReasoningEffort::Xhigh.to_wire_format("claude-sonnet-4"),
+            "max"
+        );
+        assert_eq!(
+            ReasoningEffort::Max.to_wire_format("claude-sonnet-4"),
+            "max"
+        );
         assert_eq!(ReasoningEffort::Max.to_wire_format("claude-3-opus"), "max");
     }
 
     #[test]
     fn wire_format_gemini_models_cap_at_high() {
         assert_eq!(ReasoningEffort::Low.to_wire_format("gemini-2.5-pro"), "low");
-        assert_eq!(ReasoningEffort::Medium.to_wire_format("gemini-2.5-pro"), "medium");
-        assert_eq!(ReasoningEffort::High.to_wire_format("gemini-2.5-pro"), "high");
+        assert_eq!(
+            ReasoningEffort::Medium.to_wire_format("gemini-2.5-pro"),
+            "medium"
+        );
+        assert_eq!(
+            ReasoningEffort::High.to_wire_format("gemini-2.5-pro"),
+            "high"
+        );
         // Both xhigh and max → "high" for Gemini
-        assert_eq!(ReasoningEffort::Xhigh.to_wire_format("gemini-2.5-pro"), "high");
-        assert_eq!(ReasoningEffort::Max.to_wire_format("gemini-2.5-pro"), "high");
+        assert_eq!(
+            ReasoningEffort::Xhigh.to_wire_format("gemini-2.5-pro"),
+            "high"
+        );
+        assert_eq!(
+            ReasoningEffort::Max.to_wire_format("gemini-2.5-pro"),
+            "high"
+        );
     }
 
     #[test]
     fn wire_format_unknown_models_default_to_openai() {
-        assert_eq!(ReasoningEffort::Xhigh.to_wire_format("some-unknown-model"), "xhigh");
-        assert_eq!(ReasoningEffort::Max.to_wire_format("some-unknown-model"), "xhigh");
+        assert_eq!(
+            ReasoningEffort::Xhigh.to_wire_format("some-unknown-model"),
+            "xhigh"
+        );
+        assert_eq!(
+            ReasoningEffort::Max.to_wire_format("some-unknown-model"),
+            "xhigh"
+        );
         assert_eq!(ReasoningEffort::High.to_wire_format("llama-3"), "high");
     }
 
     #[test]
     fn wire_format_case_insensitive_model_matching() {
-        assert_eq!(ReasoningEffort::Xhigh.to_wire_format("Claude-3.5-Sonnet"), "max");
-        assert_eq!(ReasoningEffort::Max.to_wire_format("Claude-3.5-Sonnet"), "max");
-        assert_eq!(ReasoningEffort::Xhigh.to_wire_format("GEMINI-2.5-PRO"), "high");
-        assert_eq!(ReasoningEffort::Max.to_wire_format("GEMINI-2.5-PRO"), "high");
+        assert_eq!(
+            ReasoningEffort::Xhigh.to_wire_format("Claude-3.5-Sonnet"),
+            "max"
+        );
+        assert_eq!(
+            ReasoningEffort::Max.to_wire_format("Claude-3.5-Sonnet"),
+            "max"
+        );
+        assert_eq!(
+            ReasoningEffort::Xhigh.to_wire_format("GEMINI-2.5-PRO"),
+            "high"
+        );
+        assert_eq!(
+            ReasoningEffort::Max.to_wire_format("GEMINI-2.5-PRO"),
+            "high"
+        );
         assert_eq!(ReasoningEffort::Xhigh.to_wire_format("GPT-4o"), "xhigh");
         assert_eq!(ReasoningEffort::Max.to_wire_format("GPT-4o"), "xhigh");
     }

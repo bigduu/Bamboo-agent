@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::core::{AgentEvent, Session};
 use crate::agent::loop_module::config::AgentLoopConfig;
-use crate::agent::loop_module::todo_context::TodoLoopContext;
+use crate::agent::loop_module::task_context::TaskLoopContext;
 use crate::agent::metrics::MetricsCollector;
 
 mod completion_event;
@@ -14,7 +14,7 @@ use completion_event::send_complete_event_if_needed;
 use completion_metrics::record_session_resolution;
 
 pub(super) async fn finalize_session(
-    todo_context: Option<TodoLoopContext>,
+    task_context: Option<TaskLoopContext>,
     session: &mut Session,
     event_tx: &mpsc::Sender<AgentEvent>,
     session_id: &str,
@@ -22,8 +22,8 @@ pub(super) async fn finalize_session(
     metrics_collector: Option<&MetricsCollector>,
     sent_complete: bool,
 ) {
-    super::todo_lifecycle::finalize_todo_context(
-        todo_context,
+    super::task_lifecycle::finalize_task_context(
+        task_context,
         session,
         event_tx,
         session_id,

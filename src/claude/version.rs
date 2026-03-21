@@ -1,6 +1,6 @@
-use tracing::{debug, warn};
 use regex::Regex;
 use std::cmp::Ordering;
+use tracing::{debug, warn};
 
 use super::ClaudeInstallation;
 
