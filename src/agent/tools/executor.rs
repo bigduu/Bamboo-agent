@@ -37,7 +37,7 @@ fn preview_for_log(value: &str, max_chars: usize) -> String {
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 20] = [
+pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
     "ask_user",
     "Bash",
     "BashOutput",
@@ -54,6 +54,7 @@ pub const BUILTIN_TOOL_NAMES: [&str; 20] = [
     "Read",
     "SetWorkspace",
     "Sleep",
+    "summarize_context",
     "Task",
     "WebFetch",
     "WebSearch",
