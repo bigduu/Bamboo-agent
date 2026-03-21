@@ -366,7 +366,10 @@ impl ResponsesSseParser {
 
         let mut out = String::new();
         for part in content {
-            let part_type = part.get("type").and_then(|value| value.as_str()).unwrap_or("");
+            let part_type = part
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
             if part_type != "output_text" {
                 continue;
             }

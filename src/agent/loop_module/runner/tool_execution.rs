@@ -126,10 +126,7 @@ pub(super) async fn execute_round_tool_calls(
                 continue;
             }
 
-            let tool_names: Vec<&str> = batch
-                .iter()
-                .map(|tc| tc.function.name.as_str())
-                .collect();
+            let tool_names: Vec<&str> = batch.iter().map(|tc| tc.function.name.as_str()).collect();
             tracing::info!(
                 "[{}][round:{}] ⚡ Executing {} parallel-safe tool calls concurrently: {:?}",
                 session_id,
@@ -281,14 +278,14 @@ mod tests {
     #[test]
     fn aliases_resolve_to_parallel_safe() {
         let aliases = [
-            "read_file",     // alias for Read
-            "file_exists",   // alias for FileExists
-            "fileExists",    // alias for FileExists
-            "list_directory", // alias for Glob
-            "get_file_info", // alias for GetFileInfo
-            "getFileInfo",   // alias for GetFileInfo
+            "read_file",       // alias for Read
+            "file_exists",     // alias for FileExists
+            "fileExists",      // alias for FileExists
+            "list_directory",  // alias for Glob
+            "get_file_info",   // alias for GetFileInfo
+            "getFileInfo",     // alias for GetFileInfo
             "get_current_dir", // alias for GetCurrentDir
-            "getCurrentDir", // alias for GetCurrentDir
+            "getCurrentDir",   // alias for GetCurrentDir
         ];
         for alias in &aliases {
             assert_eq!(
