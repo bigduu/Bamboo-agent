@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 20] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
     "ask_user",
     "Bash",
     "BashOutput",
@@ -23,6 +23,7 @@ pub const BUILTIN_GUIDE_NAMES: [&str; 20] = [
     "Read",
     "SetWorkspace",
     "Sleep",
+    "summarize_context",
     "Task",
     "WebFetch",
     "WebSearch",
@@ -297,6 +298,18 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Wait before next poll",
                 json!({"seconds":2,"reason":"wait for background process output"}),
                 "Use short waits between repeated status checks.",
+            )],
+        )),
+        "summarize_context" => Some(guide(
+            "summarize_context",
+            ToolCategory::TaskManagement,
+            "Request compressed conversation context when earlier messages may have been summarized due to token limits.",
+            "Do not call routinely; use only when context continuity is needed.",
+            &["Task", "memory_note"],
+            vec![example(
+                "Ask for compressed history",
+                json!({"reason":"need prior decisions before continuing implementation"}),
+                "Use when you suspect key context is missing from current visible messages.",
             )],
         )),
         _ => None,
