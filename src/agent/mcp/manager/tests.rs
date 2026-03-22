@@ -277,6 +277,11 @@ fn test_reconnect_disabled() {
 #[test]
 fn test_proxy_fingerprint_changes_on_proxy_or_auth_change() {
     let mut cfg = Config::default();
+    // Config::default() loads from the runtime data dir, so make this test
+    // deterministic regardless of local proxy settings.
+    cfg.http_proxy.clear();
+    cfg.https_proxy.clear();
+    cfg.proxy_auth = None;
     assert_eq!(proxy_fingerprint(&cfg), None);
 
     cfg.http_proxy = "http://proxy:8080".to_string();
