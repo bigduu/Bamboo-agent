@@ -25,6 +25,9 @@ pub(in crate::server::handlers::agent::execute) struct SpawnAgentExecution {
     pub(in crate::server::handlers::agent::execute) is_child_session: bool,
     pub(in crate::server::handlers::agent::execute) provider_name: String,
     pub(in crate::server::handlers::agent::execute) model: String,
+    /// Fast/cheap model for lightweight tasks (summarization, task evaluation).
+    /// Falls back to `model` at the agent loop level when None.
+    pub(in crate::server::handlers::agent::execute) fast_model: Option<String>,
     pub(in crate::server::handlers::agent::execute) reasoning_effort: Option<ReasoningEffort>,
     pub(in crate::server::handlers::agent::execute) reasoning_effort_source: String,
     pub(in crate::server::handlers::agent::execute) disabled_tools: BTreeSet<String>,
@@ -44,6 +47,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
             is_child_session,
             provider_name,
             model,
+            fast_model,
             reasoning_effort,
             reasoning_effort_source,
             disabled_tools,
@@ -110,6 +114,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
                 attachment_reader: Some(state.session_store.clone()),
                 metrics_collector: Some(state.metrics_service.collector()),
                 model_name: Some(model),
+                fast_model_name: fast_model,
                 provider_name: Some(provider_name),
                 reasoning_effort,
                 disabled_tools,

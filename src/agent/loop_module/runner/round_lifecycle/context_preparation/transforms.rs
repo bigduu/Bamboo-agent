@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use crate::agent::core::budget::PreparedContext;
 use crate::agent::core::AgentError;
+use crate::agent::llm::LLMProvider;
 use crate::agent::loop_module::config::AgentLoopConfig;
 
 use super::super::super::image_fallback::{
@@ -9,8 +12,9 @@ use super::super::super::image_fallback::{
 pub(super) async fn apply_message_transforms(
     config: &AgentLoopConfig,
     prepared_context: &mut PreparedContext,
+    llm: &Arc<dyn LLMProvider>,
 ) -> Result<(), AgentError> {
-    apply_image_fallback(config, prepared_context).await?;
+    apply_image_fallback(config, prepared_context, llm).await?;
     resolve_attachments(config, prepared_context).await?;
     Ok(())
 }
@@ -18,14 +22,17 @@ pub(super) async fn apply_message_transforms(
 async fn apply_image_fallback(
     config: &AgentLoopConfig,
     prepared_context: &mut PreparedContext,
+    llm: &Arc<dyn LLMProvider>,
 ) -> Result<(), AgentError> {
-    // Apply image fallback (placeholder / OCR / error) to the prepared LLM context only.
-    // This must never mutate the persisted session messages (UI should still show images).
-    if let Some(fallback) = config.image_fallback {
+    // Apply image fallback (placeholder / OCR / error / vision) to the prepared
+    // LLM context only. This must never mutate the persisted session messages
+    // (UI should still show images).
+    if let Some(fallback) = config.image_fallback.clone() {
         apply_image_fallback_to_llm_messages(
             &mut prepared_context.messages,
             fallback,
             config.attachment_reader.as_deref(),
+            Some(llm),
         )
         .await?;
     }

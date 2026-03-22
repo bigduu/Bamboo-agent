@@ -164,6 +164,7 @@ pub(super) async fn apply_tool_execution_outcome(
                 ctx.metrics_collector,
                 ctx.session_id,
                 ctx.round_id,
+                ctx.round,
                 ctx.session,
                 ctx.state,
             )

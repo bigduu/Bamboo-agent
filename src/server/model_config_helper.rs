@@ -57,6 +57,32 @@ pub fn get_default_model_from_config(config: &Config) -> Result<String, LLMError
     }
 }
 
+/// Get the fast/cheap model for the current provider from config.
+///
+/// Used for lightweight tasks like title generation, mermaid fix, and summarization.
+/// Falls back to the default model when no fast_model is configured.
+pub fn get_fast_model_from_config(config: &Config) -> Result<String, LLMError> {
+    config.get_fast_model().ok_or_else(|| {
+        LLMError::Auth(format!(
+            "No model configured for provider '{}'",
+            config.provider
+        ))
+    })
+}
+
+/// Get the vision-capable model for the current provider from config.
+///
+/// Used for image understanding tasks.
+/// Falls back to the default model when no vision_model is configured.
+pub fn get_vision_model_from_config(config: &Config) -> Result<String, LLMError> {
+    config.get_vision_model().ok_or_else(|| {
+        LLMError::Auth(format!(
+            "No model configured for provider '{}'",
+            config.provider
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,6 +98,8 @@ mod tests {
                     api_key_encrypted: None,
                     base_url: None,
                     model: Some("gpt-4o".to_string()),
+                    fast_model: None,
+                    vision_model: None,
                     reasoning_effort: None,
                     responses_only_models: vec![],
                     extra: Default::default(),
@@ -96,6 +124,8 @@ mod tests {
                     api_key_encrypted: None,
                     base_url: None,
                     model: None, // No model configured
+                    fast_model: None,
+                    vision_model: None,
                     reasoning_effort: None,
                     responses_only_models: vec![],
                     extra: Default::default(),
@@ -122,6 +152,8 @@ mod tests {
                     enabled: true,
                     headless_auth: false,
                     model: Some("gpt-4o-mini".to_string()),
+                    fast_model: None,
+                    vision_model: None,
                     reasoning_effort: None,
                     responses_only_models: vec![],
                     extra: Default::default(),

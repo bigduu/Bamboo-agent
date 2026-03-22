@@ -15,9 +15,40 @@ fn other_io_error(message: impl Into<String>) -> io::Error {
 
 async fn atomic_write_json(path: &Path, bytes: Vec<u8>) -> io::Result<()> {
     let tmp = path.with_extension(format!("json.tmp.{}", Uuid::new_v4()));
-    fs::write(&tmp, bytes).await?;
+
+    // Write + fsync to ensure data is on disk before rename.
+    {
+        let mut file = fs::File::create(&tmp).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await?;
+        file.sync_all().await?;
+    }
+
     fs::rename(&tmp, path).await?;
+
+    // fsync parent directory to persist the rename metadata.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+
     Ok(())
+}
+
+/// Remove leftover `.tmp.*` files from a previous interrupted atomic write.
+async fn cleanup_stale_tmp_files(dir: &Path, prefix: &str) {
+    let mut entries = match fs::read_dir(dir).await {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Some(name) = entry.file_name().to_str() {
+            if name.starts_with(prefix) {
+                tracing::info!("Removing stale temp file: {}", entry.path().display());
+                let _ = fs::remove_file(entry.path()).await;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -98,8 +129,34 @@ impl ScheduleStore {
 
         let index = if index_path.exists() {
             let raw = fs::read_to_string(&index_path).await?;
-            serde_json::from_str(&raw)
-                .map_err(|e| other_io_error(format!("invalid schedules.json: {e}")))?
+            match serde_json::from_str::<SchedulesIndex>(&raw) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    // Corrupted file (e.g. partial write before crash).
+                    // Back up the broken file and start fresh so the app can boot.
+                    let backup_path =
+                        index_path.with_extension(format!("json.corrupted.{}", Uuid::new_v4()));
+                    tracing::error!(
+                        "schedules.json is corrupted ({}). Backing up to {} and resetting.",
+                        e,
+                        backup_path.display()
+                    );
+                    if let Err(rename_err) = fs::rename(&index_path, &backup_path).await {
+                        tracing::warn!(
+                            "Failed to back up corrupted schedules.json: {}",
+                            rename_err
+                        );
+                    }
+                    let fresh = SchedulesIndex::empty();
+                    atomic_write_json(
+                        &index_path,
+                        serde_json::to_vec_pretty(&fresh)
+                            .map_err(|e| other_io_error(e.to_string()))?,
+                    )
+                    .await?;
+                    fresh
+                }
+            }
         } else {
             let index = SchedulesIndex::empty();
             atomic_write_json(
@@ -109,6 +166,9 @@ impl ScheduleStore {
             .await?;
             index
         };
+
+        // Clean up stale temp files left behind by interrupted atomic writes.
+        cleanup_stale_tmp_files(&bamboo_home_dir, "schedules.json.tmp.").await;
 
         Ok(Self {
             index_path,
@@ -218,7 +278,21 @@ impl ScheduleStore {
     /// Claim all due schedules and advance their `next_run_at`.
     ///
     /// Returns a list of run descriptors to execute out-of-band.
+    ///
+    /// **Important**: only writes to disk when at least one schedule is actually
+    /// due.  The ticker calls this every few seconds, so avoiding unnecessary
+    /// writes is critical for disk health and crash-safety.
     pub async fn claim_due_runs(&self, now: DateTime<Utc>) -> io::Result<Vec<ClaimedScheduleRun>> {
+        // --- Phase 1: read-only check (no write lock, no disk I/O) ---
+        {
+            let index = self.index.read().await;
+            let any_due = index.schedules.values().any(|e| e.enabled && e.next_run_at <= now);
+            if !any_due {
+                return Ok(Vec::new());
+            }
+        }
+
+        // --- Phase 2: write path (only reached when ≥1 schedule is due) ---
         self.update_index(|index| {
             let mut out = Vec::new();
             for entry in index.schedules.values_mut() {

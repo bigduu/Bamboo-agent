@@ -6,6 +6,7 @@ use crate::agent::metrics::MetricsCollector;
 
 use super::super::events;
 use super::super::loop_state::RoundExecutionState;
+use super::super::tool_error_collector;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_tool_execution_error(
@@ -15,6 +16,7 @@ pub(super) async fn handle_tool_execution_error(
     metrics_collector: Option<&MetricsCollector>,
     session_id: &str,
     round_id: &str,
+    round: usize,
     session: &mut Session,
     state: &mut RoundExecutionState,
 ) {
@@ -37,4 +39,15 @@ pub(super) async fn handle_tool_execution_error(
         format!("Error: {error_message}"),
         false,
     ));
+
+    // Fire-and-forget: persist hard error for offline analysis.
+    tool_error_collector::append_tool_error(tool_error_collector::hard_error_record(
+        session_id,
+        round,
+        &tool_call.function.name,
+        &tool_call.id,
+        &tool_call.function.arguments,
+        error_message,
+    ))
+    .await;
 }

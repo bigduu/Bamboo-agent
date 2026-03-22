@@ -16,11 +16,18 @@ pub enum ImageFallbackMode {
     Placeholder,
     Error,
     Ocr,
+    /// Use a vision-capable LLM to describe the image, then replace the image
+    /// with the textual description so that text-only models can understand
+    /// the content.
+    Vision,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageFallbackConfig {
     pub mode: ImageFallbackMode,
+    /// Vision model name for `Vision` mode. Falls back to the session's main model
+    /// when `None`.
+    pub vision_model: Option<String>,
 }
 
 /// Configuration for the agent loop.
@@ -45,6 +52,9 @@ pub struct AgentLoopConfig {
     pub metrics_collector: Option<MetricsCollector>,
     /// Model name used for metrics attribution
     pub model_name: Option<String>,
+    /// Fast/cheap model name for lightweight tasks (summarization, task evaluation).
+    /// Falls back to `model_name` when not set.
+    pub fast_model_name: Option<String>,
     /// Provider name used for provider-specific request behavior.
     pub provider_name: Option<String>,
     /// Optional request-time reasoning effort override.
@@ -75,6 +85,7 @@ impl Default for AgentLoopConfig {
             attachment_reader: None,
             metrics_collector: None,
             model_name: None,
+            fast_model_name: None,
             provider_name: None,
             reasoning_effort: None,
             disabled_tools: BTreeSet::new(),

@@ -67,7 +67,7 @@ impl ScheduleManager {
             let tx = tx.clone();
             let store = ctx.schedule_store.clone();
             async move {
-                let mut ticker = tokio::time::interval(Duration::from_secs(1));
+                let mut ticker = tokio::time::interval(Duration::from_secs(15));
                 loop {
                     ticker.tick().await;
                     let now = Utc::now();

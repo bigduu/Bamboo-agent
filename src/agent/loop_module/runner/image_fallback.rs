@@ -1,7 +1,10 @@
 //! Image fallback and attachment resolution helpers for the agent loop runner.
 
+use std::sync::Arc;
+
 use crate::agent::core::storage::AttachmentReader;
 use crate::agent::core::{AgentError, Message};
+use crate::agent::llm::LLMProvider;
 use crate::agent::loop_module::config::ImageFallbackConfig;
 
 mod attachment_urls;
@@ -36,8 +39,9 @@ pub(super) async fn apply_image_fallback_to_llm_messages(
     messages: &mut [Message],
     fallback: ImageFallbackConfig,
     attachment_reader: Option<&dyn AttachmentReader>,
+    llm: Option<&Arc<dyn LLMProvider>>,
 ) -> std::result::Result<(), AgentError> {
-    rewrite::apply_image_fallback_to_llm_messages(messages, fallback, attachment_reader).await
+    rewrite::apply_image_fallback_to_llm_messages(messages, fallback, attachment_reader, llm).await
 }
 
 #[cfg(test)]

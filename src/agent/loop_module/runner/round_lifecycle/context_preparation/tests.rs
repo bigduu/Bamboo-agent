@@ -44,6 +44,7 @@ async fn prepare_round_context_applies_placeholder_fallback_only_to_prepared_con
         model_name: Some("test-model".to_string()),
         image_fallback: Some(ImageFallbackConfig {
             mode: ImageFallbackMode::Placeholder,
+            vision_model: None,
         }),
         ..Default::default()
     };

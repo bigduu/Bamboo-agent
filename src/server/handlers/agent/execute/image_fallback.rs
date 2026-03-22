@@ -21,14 +21,24 @@ pub(super) fn resolve_image_fallback(
         "placeholder" => ImageFallbackMode::Placeholder,
         "error" => ImageFallbackMode::Error,
         "ocr" => ImageFallbackMode::Ocr,
+        "vision" => ImageFallbackMode::Vision,
         other => {
             return Err(format!(
-                "Invalid config: hooks.image_fallback.mode must be 'placeholder', 'error', or 'ocr' (got '{other}')"
+                "Invalid config: hooks.image_fallback.mode must be 'placeholder', 'error', 'ocr', or 'vision' (got '{other}')"
             ));
         }
     };
 
-    Ok(Some(ImageFallbackConfig { mode }))
+    let vision_model = if mode == ImageFallbackMode::Vision {
+        config_snapshot.get_vision_model()
+    } else {
+        None
+    };
+
+    Ok(Some(ImageFallbackConfig {
+        mode,
+        vision_model,
+    }))
 }
 
 pub(super) fn validate_image_fallback_for_session(
@@ -39,7 +49,8 @@ pub(super) fn validate_image_fallback_for_session(
     if matches!(
         image_fallback,
         Some(ImageFallbackConfig {
-            mode: ImageFallbackMode::Error
+            mode: ImageFallbackMode::Error,
+            ..
         })
     ) {
         let images_seen = session

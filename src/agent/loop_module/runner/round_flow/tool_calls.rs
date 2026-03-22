@@ -65,6 +65,11 @@ pub(super) async fn handle_tool_calls_path(
 
     state.log_round_complete_if_debug(&context, session.messages.len());
 
+    // Use fast_model for task evaluation when available (lightweight task).
+    let eval_model = config
+        .fast_model_name
+        .as_deref()
+        .or(config.model_name.as_deref());
     let task_evaluation_usage = task_lifecycle::evaluate_round_task_progress(
         task_context,
         session,
@@ -72,7 +77,7 @@ pub(super) async fn handle_tool_calls_path(
         event_tx,
         context.session_id,
         context.round + 1,
-        config.model_name.as_deref(),
+        eval_model,
         config.reasoning_effort,
     )
     .await?;

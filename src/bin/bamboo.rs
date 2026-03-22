@@ -199,6 +199,8 @@ mod tests {
                 api_key_encrypted: None,
                 base_url: Some("https://api.openai.com/v1".to_string()),
                 model: Some("gpt-4o".to_string()),
+                fast_model: None,
+                vision_model: None,
                 reasoning_effort: None,
                 responses_only_models: vec![],
                 extra: BTreeMap::new(),

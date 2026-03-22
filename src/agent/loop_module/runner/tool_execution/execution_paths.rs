@@ -42,6 +42,7 @@ pub(super) async fn handle_tool_execution_error(
     metrics_collector: Option<&MetricsCollector>,
     session_id: &str,
     round_id: &str,
+    round: usize,
     session: &mut Session,
     state: &mut RoundExecutionState,
 ) {
@@ -52,6 +53,7 @@ pub(super) async fn handle_tool_execution_error(
         metrics_collector,
         session_id,
         round_id,
+        round,
         session,
         state,
     )

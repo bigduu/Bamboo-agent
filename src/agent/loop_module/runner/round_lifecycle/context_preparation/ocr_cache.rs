@@ -18,9 +18,7 @@ pub(super) async fn maybe_cache_ocr_results(
     #[cfg(windows)]
     if matches!(
         config.image_fallback,
-        Some(crate::agent::loop_module::config::ImageFallbackConfig {
-            mode: crate::agent::loop_module::config::ImageFallbackMode::Ocr
-        })
+        Some(ref cfg) if cfg.mode == crate::agent::loop_module::config::ImageFallbackMode::Ocr
     ) {
         let changed =
             ensure_session_image_ocr_cached(session, config.attachment_reader.as_deref()).await;

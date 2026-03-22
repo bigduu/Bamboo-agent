@@ -21,6 +21,8 @@ fn redacted_config_json_masks_provider_api_key_and_hides_encrypted_proxy_auth() 
         api_key_encrypted: None,
         base_url: None,
         model: None,
+        fast_model: None,
+        vision_model: None,
         reasoning_effort: None,
         responses_only_models: vec![],
         extra: BTreeMap::new(),

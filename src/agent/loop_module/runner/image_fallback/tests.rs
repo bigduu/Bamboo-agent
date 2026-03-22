@@ -51,7 +51,9 @@ async fn image_fallback_placeholder_does_not_mutate_persisted_session_messages()
         &mut llm_messages,
         ImageFallbackConfig {
             mode: ImageFallbackMode::Placeholder,
+            vision_model: None,
         },
+        None,
         None,
     )
     .await
@@ -83,7 +85,9 @@ async fn image_fallback_error_mode_rejects_messages_with_images() {
         &mut messages,
         ImageFallbackConfig {
             mode: ImageFallbackMode::Error,
+            vision_model: None,
         },
+        None,
         None,
     )
     .await;
@@ -99,7 +103,9 @@ async fn image_fallback_skips_messages_without_image_parts() {
         &mut messages,
         ImageFallbackConfig {
             mode: ImageFallbackMode::Placeholder,
+            vision_model: None,
         },
+        None,
         None,
     )
     .await

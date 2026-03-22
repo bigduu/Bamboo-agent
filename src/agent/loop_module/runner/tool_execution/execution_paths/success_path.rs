@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::agent::core::tools::{handle_tool_result_with_agentic_support, ToolHandlingOutcome};
 use crate::agent::core::AgentEvent;
 
-use super::super::{clarification, events, task};
+use super::super::{clarification, events, task, tool_error_collector};
 use super::{workspace, SuccessPathContext};
 
 pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -> bool {
@@ -61,6 +61,17 @@ pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -
     if !ctx.result.success {
         ctx.state
             .mark_unsuccessful_tool(&ctx.tool_call.function.name);
+
+        // Fire-and-forget: persist soft failure for offline analysis.
+        tool_error_collector::append_tool_error(tool_error_collector::soft_failure_record(
+            ctx.session_id,
+            ctx.round,
+            &ctx.tool_call.function.name,
+            &ctx.tool_call.id,
+            &ctx.tool_call.function.arguments,
+            &ctx.result.result,
+        ))
+        .await;
     }
 
     tracing::debug!(

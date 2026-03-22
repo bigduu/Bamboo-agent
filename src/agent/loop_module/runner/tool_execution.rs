@@ -17,6 +17,7 @@ mod execution_paths;
 mod loop_state;
 mod per_call;
 mod task;
+pub(crate) mod tool_error_collector;
 
 use loop_state::RoundExecutionState;
 

@@ -11,6 +11,8 @@ fn resolve_headless_auth_prefers_provider_specific_value() {
         enabled: true,
         headless_auth: true,
         model: None,
+        fast_model: None,
+        vision_model: None,
         reasoning_effort: None,
         responses_only_models: Vec::new(),
         extra: Default::default(),
