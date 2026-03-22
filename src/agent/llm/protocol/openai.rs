@@ -1,7 +1,7 @@
 //! OpenAI protocol conversion implementation.
 
 use crate::agent::core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
-use crate::agent::core::{Message, Role};
+use crate::agent::core::{Message, MessagePhase, Role};
 use crate::agent::llm::api::models::{
     ChatMessage as OpenAIChatMessage, Content as OpenAIContent, ContentPart as OpenAIContentPart,
     Role as OpenAIRole, Tool, ToolCall as OpenAIToolCall,
@@ -39,6 +39,11 @@ impl FromProvider<OpenAIChatMessage> for Message {
             .tool_calls
             .map(|calls| calls.into_iter().map(ToolCall::from_provider).collect())
             .transpose()?;
+        let phase = match msg.phase.as_deref() {
+            Some("commentary") => Some(MessagePhase::Commentary),
+            Some("final_answer") => Some(MessagePhase::FinalAnswer),
+            _ => None,
+        };
 
         Ok(Message {
             id: String::new(), // Will be generated if needed
@@ -47,6 +52,7 @@ impl FromProvider<OpenAIChatMessage> for Message {
             reasoning: None,
             content_parts,
             image_ocr: None,
+            phase,
             tool_calls,
             tool_call_id: msg.tool_call_id,
             tool_success: None,
@@ -105,6 +111,7 @@ impl ToProvider<OpenAIChatMessage> for Message {
         Ok(OpenAIChatMessage {
             role,
             content,
+            phase: self.phase.as_ref().map(|phase| phase.as_str().to_string()),
             tool_calls,
             tool_call_id: self.tool_call_id.clone(),
         })
@@ -204,6 +211,7 @@ mod tests {
         let openai_msg = OpenAIChatMessage {
             role: OpenAIRole::User,
             content: OpenAIContent::Text("Hello".to_string()),
+            phase: None,
             tool_calls: None,
             tool_call_id: None,
         };
@@ -231,6 +239,7 @@ mod tests {
         let openai_msg = OpenAIChatMessage {
             role: OpenAIRole::Assistant,
             content: OpenAIContent::Text(String::new()),
+            phase: None,
             tool_calls: Some(vec![OpenAIToolCall {
                 id: "call_1".to_string(),
                 tool_type: "function".to_string(),
@@ -324,6 +333,7 @@ mod tests {
         let openai_msg = OpenAIChatMessage {
             role: OpenAIRole::User,
             content: OpenAIContent::Text("Test".to_string()),
+            phase: None,
             tool_calls: None,
             tool_call_id: None,
         };

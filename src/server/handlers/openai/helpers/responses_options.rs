@@ -63,12 +63,44 @@ fn parse_truncation(parameters: &HashMap<String, Value>) -> Option<String> {
     }
 }
 
+fn parse_text_verbosity(parameters: &HashMap<String, Value>) -> Option<String> {
+    let raw = parameters
+        .get("text")
+        .and_then(|value| value.get("verbosity"))
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            parameters
+                .get("text_verbosity")
+                .and_then(|value| value.as_str())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+
+    let normalized = raw.to_ascii_lowercase();
+    match normalized.as_str() {
+        "low" | "medium" | "high" => Some(normalized),
+        _ => None,
+    }
+}
+
 pub(super) fn parse_responses_request_options(
     parameters: &HashMap<String, Value>,
 ) -> ResponsesRequestOptions {
+    let include = if parameters.contains_key("include") {
+        parse_include(parameters)
+    } else {
+        Some(vec!["reasoning.encrypted_content".to_string()])
+    };
+    let text_verbosity =
+        if parameters.contains_key("text") || parameters.contains_key("text_verbosity") {
+            parse_text_verbosity(parameters)
+        } else {
+            Some("low".to_string())
+        };
+
     ResponsesRequestOptions {
         reasoning_summary: parse_reasoning_summary(parameters),
-        include: parse_include(parameters),
+        include,
         store: parameters.get("store").and_then(|value| value.as_bool()),
         previous_response_id: parameters
             .get("previous_response_id")
@@ -77,6 +109,7 @@ pub(super) fn parse_responses_request_options(
             .filter(|value| !value.is_empty())
             .map(ToString::to_string),
         truncation: parse_truncation(parameters),
+        text_verbosity,
     }
 }
 
@@ -93,7 +126,8 @@ mod tests {
             "include": ["reasoning.encrypted_content"],
             "store": true,
             "previous_response_id": "resp_123",
-            "truncation": "auto"
+            "truncation": "auto",
+            "text": { "verbosity": "high" }
         }))
         .expect("valid params");
 
@@ -106,6 +140,7 @@ mod tests {
         assert_eq!(parsed.store, Some(true));
         assert_eq!(parsed.previous_response_id.as_deref(), Some("resp_123"));
         assert_eq!(parsed.truncation.as_deref(), Some("auto"));
+        assert_eq!(parsed.text_verbosity.as_deref(), Some("high"));
     }
 
     #[test]
@@ -294,14 +329,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_text_verbosity_from_legacy_field() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "text_verbosity": "MEDIUM"
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.text_verbosity.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn ignores_invalid_text_verbosity() {
+        let params: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "text": { "verbosity": "verbose" }
+        }))
+        .expect("valid params");
+
+        let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.text_verbosity, None);
+    }
+
+    #[test]
     fn handles_missing_all_fields() {
         let params: HashMap<String, Value> = HashMap::new();
         let parsed = parse_responses_request_options(&params);
 
         assert_eq!(parsed.reasoning_summary, None);
-        assert_eq!(parsed.include, None);
+        assert_eq!(
+            parsed.include,
+            Some(vec!["reasoning.encrypted_content".to_string()])
+        );
         assert_eq!(parsed.store, None);
         assert_eq!(parsed.truncation, None);
+        assert_eq!(parsed.text_verbosity.as_deref(), Some("low"));
     }
 
     #[test]
@@ -310,7 +371,8 @@ mod tests {
             "reasoning_summary": "",
             "include": ["file_search_call", ""],
             "store": true,
-            "truncation": "invalid"
+            "truncation": "invalid",
+            "text": { "verbosity": "invalid" }
         }))
         .expect("valid params");
 
@@ -319,5 +381,6 @@ mod tests {
         assert_eq!(parsed.include, Some(vec!["file_search_call".to_string()]));
         assert_eq!(parsed.store, Some(true));
         assert_eq!(parsed.truncation, None);
+        assert_eq!(parsed.text_verbosity, None);
     }
 }

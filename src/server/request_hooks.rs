@@ -151,6 +151,7 @@ mod tests {
                     },
                 },
             ]),
+            phase: None,
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -178,6 +179,7 @@ mod tests {
                     detail: None,
                 },
             }]),
+            phase: None,
             tool_calls: None,
             tool_call_id: None,
         }];

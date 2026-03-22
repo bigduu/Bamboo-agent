@@ -245,6 +245,7 @@ impl FromProvider<GeminiContent> for Message {
             reasoning: None,
             content_parts: has_image_parts.then_some(content_parts),
             image_ocr: None,
+            phase: None,
             tool_calls: if tool_calls.is_empty() {
                 None
             } else {

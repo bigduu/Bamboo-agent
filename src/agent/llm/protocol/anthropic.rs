@@ -32,6 +32,7 @@ impl FromProvider<AnthropicMessage> for Message {
             reasoning: None,
             content_parts: None,
             image_ocr: None,
+            phase: None,
             tool_calls: None, // Anthropic messages don't have tool_calls at this level
             tool_call_id: None,
             tool_success: None,
@@ -258,6 +259,7 @@ impl AnthropicResponseConverter {
             reasoning: None,
             content_parts: None,
             image_ocr: None,
+            phase: None,
             tool_calls,
             tool_call_id: None,
             tool_success: None,

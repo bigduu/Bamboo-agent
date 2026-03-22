@@ -23,6 +23,7 @@ pub(super) fn responses_input_to_chat_messages(
         return Ok(vec![ChatMessage {
             role: Role::User,
             content: Content::Text(text.to_string()),
+            phase: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -41,6 +42,7 @@ pub(super) fn responses_input_to_chat_messages(
             messages.push(ChatMessage {
                 role: Role::User,
                 content: Content::Text(text.to_string()),
+                phase: None,
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -77,6 +79,7 @@ pub(super) fn responses_input_to_chat_messages(
             messages.push(ChatMessage {
                 role: Role::Assistant,
                 content: Content::Text(String::new()),
+                phase: Some("commentary".to_string()),
                 tool_calls: Some(vec![ToolCall {
                     id: call_id,
                     tool_type: "function".to_string(),
@@ -102,6 +105,7 @@ pub(super) fn responses_input_to_chat_messages(
             messages.push(ChatMessage {
                 role: Role::Tool,
                 content: Content::Text(output),
+                phase: None,
                 tool_calls: None,
                 tool_call_id: Some(call_id),
             });
@@ -114,6 +118,15 @@ pub(super) fn responses_input_to_chat_messages(
             .and_then(|value| value.as_str())
             .map(role_str_to_openai_role)
             .unwrap_or(Role::User);
+        let phase = if matches!(role, Role::Assistant) {
+            obj.get("phase")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        } else {
+            None
+        };
 
         let content_value = obj
             .get("content")
@@ -172,6 +185,7 @@ pub(super) fn responses_input_to_chat_messages(
         messages.push(ChatMessage {
             role,
             content,
+            phase,
             tool_calls: None,
             tool_call_id: None,
         });

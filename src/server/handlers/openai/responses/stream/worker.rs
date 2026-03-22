@@ -78,7 +78,21 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                     break;
                 }
             }
-            Ok(LLMChunk::ReasoningToken(_)) => {}
+            // Compatibility behavior: surface reasoning deltas in the same stream channel
+            // so clients that only render output_text can still show interim narration.
+            Ok(LLMChunk::ReasoningToken(text)) => {
+                content.push_str(&text);
+                let active_response_id = response_id
+                    .clone()
+                    .unwrap_or_else(|| args.fallback_response_id.clone());
+                if !ensure_created_event(&mut args, &active_response_id, &mut created_sent).await {
+                    break;
+                }
+                let event = output_text_delta_event(&active_response_id, &args.message_id, text);
+                if args.tx.send(Ok(event_to_sse_bytes(&event))).await.is_err() {
+                    break;
+                }
+            }
             Ok(LLMChunk::ToolCalls(calls)) => {
                 let active_response_id = response_id
                     .clone()

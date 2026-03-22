@@ -56,6 +56,7 @@ fn convert_messages_response_should_map_tool_calls_to_tool_use_stop_reason() {
             message: ChatMessage {
                 role: Role::Assistant,
                 content: Content::Text("hi".to_string()),
+                phase: None,
                 tool_calls: None,
                 tool_call_id: None,
             },

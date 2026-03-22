@@ -17,6 +17,7 @@ pub(super) fn build_completion_response(
             message: ChatMessage {
                 role: Role::Assistant,
                 content: Content::Text(content),
+                phase: None,
                 tool_calls,
                 tool_call_id: None,
             },

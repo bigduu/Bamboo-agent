@@ -14,7 +14,10 @@ struct MockLlmProvider {
     chunks: Vec<LLMChunk>,
     requested_messages: Mutex<Vec<Message>>,
     requested_previous_response_id: Mutex<Option<String>>,
+    requested_reasoning_summary: Mutex<Option<String>>,
     requested_store: Mutex<Option<bool>>,
+    requested_include: Mutex<Option<Vec<String>>>,
+    requested_text_verbosity: Mutex<Option<String>>,
 }
 
 #[async_trait]
@@ -44,9 +47,24 @@ impl LLMProvider for MockLlmProvider {
             .expect("previous_response_id lock") = options
             .and_then(|value| value.responses.as_ref())
             .and_then(|value| value.previous_response_id.clone());
+        *self
+            .requested_reasoning_summary
+            .lock()
+            .expect("reasoning_summary lock") = options
+            .and_then(|value| value.responses.as_ref())
+            .and_then(|value| value.reasoning_summary.clone());
         *self.requested_store.lock().expect("store lock") = options
             .and_then(|value| value.responses.as_ref())
             .and_then(|value| value.store);
+        *self.requested_include.lock().expect("include lock") = options
+            .and_then(|value| value.responses.as_ref())
+            .and_then(|value| value.include.clone());
+        *self
+            .requested_text_verbosity
+            .lock()
+            .expect("text_verbosity lock") = options
+            .and_then(|value| value.responses.as_ref())
+            .and_then(|value| value.text_verbosity.clone());
 
         let items = self
             .chunks
@@ -76,16 +94,20 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
         compressed_message_ids: Vec::new(),
     };
 
-    let llm: Arc<dyn LLMProvider> = Arc::new(MockLlmProvider {
+    let llm = Arc::new(MockLlmProvider {
         chunks: vec![LLMChunk::Token("hi".to_string()), LLMChunk::Done],
         requested_messages: Mutex::new(Vec::new()),
         requested_previous_response_id: Mutex::new(None),
+        requested_reasoning_summary: Mutex::new(None),
         requested_store: Mutex::new(None),
+        requested_include: Mutex::new(None),
+        requested_text_verbosity: Mutex::new(None),
     });
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
     let (stream_output, _duration) = execute_llm_stream(
         &mut session,
-        &llm,
+        &llm_dyn,
         &event_tx,
         &CancellationToken::new(),
         &prepared_context,
@@ -109,6 +131,24 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
 
     let second = event_rx.recv().await.expect("token event expected");
     assert!(matches!(second, AgentEvent::Token { .. }));
+    assert_eq!(
+        llm.requested_text_verbosity
+            .lock()
+            .expect("text_verbosity lock")
+            .as_deref(),
+        Some("low")
+    );
+    assert_eq!(
+        llm.requested_include.lock().expect("include lock").clone(),
+        Some(vec!["reasoning.encrypted_content".to_string()])
+    );
+    assert_eq!(
+        llm.requested_reasoning_summary
+            .lock()
+            .expect("reasoning_summary lock")
+            .as_deref(),
+        Some("auto")
+    );
 }
 
 #[tokio::test]
@@ -147,7 +187,10 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
         ],
         requested_messages: Mutex::new(Vec::new()),
         requested_previous_response_id: Mutex::new(None),
+        requested_reasoning_summary: Mutex::new(None),
         requested_store: Mutex::new(None),
+        requested_include: Mutex::new(None),
+        requested_text_verbosity: Mutex::new(None),
     });
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
@@ -184,6 +227,24 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
     assert_eq!(
         *llm.requested_store.lock().expect("store lock"),
         Some(false)
+    );
+    assert_eq!(
+        llm.requested_text_verbosity
+            .lock()
+            .expect("text_verbosity lock")
+            .as_deref(),
+        Some("low")
+    );
+    assert_eq!(
+        llm.requested_include.lock().expect("include lock").clone(),
+        Some(vec!["reasoning.encrypted_content".to_string()])
+    );
+    assert_eq!(
+        llm.requested_reasoning_summary
+            .lock()
+            .expect("reasoning_summary lock")
+            .as_deref(),
+        Some("auto")
     );
     assert_eq!(stream_output.response_id.as_deref(), Some("resp_next"));
     assert_eq!(
@@ -231,7 +292,10 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
         ],
         requested_messages: Mutex::new(Vec::new()),
         requested_previous_response_id: Mutex::new(None),
+        requested_reasoning_summary: Mutex::new(None),
         requested_store: Mutex::new(None),
+        requested_include: Mutex::new(None),
+        requested_text_verbosity: Mutex::new(None),
     });
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
@@ -264,7 +328,28 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
             .as_deref(),
         None
     );
-    assert_eq!(*llm.requested_store.lock().expect("store lock"), None);
+    assert_eq!(
+        *llm.requested_store.lock().expect("store lock"),
+        Some(false)
+    );
+    assert_eq!(
+        llm.requested_text_verbosity
+            .lock()
+            .expect("text_verbosity lock")
+            .as_deref(),
+        Some("low")
+    );
+    assert_eq!(
+        llm.requested_include.lock().expect("include lock").clone(),
+        Some(vec!["reasoning.encrypted_content".to_string()])
+    );
+    assert_eq!(
+        llm.requested_reasoning_summary
+            .lock()
+            .expect("reasoning_summary lock")
+            .as_deref(),
+        Some("auto")
+    );
     assert!(!session
         .metadata
         .contains_key("responses.previous_response_id"));

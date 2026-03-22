@@ -70,6 +70,26 @@ pub enum Role {
     Tool,
 }
 
+/// Assistant message phase used by Responses-style models.
+///
+/// Some models distinguish between intermediate "commentary" content while
+/// planning/executing tools and the final user-facing answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessagePhase {
+    Commentary,
+    FinalAnswer,
+}
+
+impl MessagePhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Commentary => "commentary",
+            Self::FinalAnswer => "final_answer",
+        }
+    }
+}
+
 /// Message content in a conversation.
 ///
 /// Can be either plain text or a list of tool calls from the assistant.
@@ -143,6 +163,11 @@ pub struct Message {
     /// can choose whether/how to render OCR text without losing the original image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_ocr: Option<Vec<ImageOcrResult>>,
+    /// Optional assistant response phase (`commentary` / `final_answer`).
+    ///
+    /// Primarily used for Responses-style providers to preserve turn structure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<MessagePhase>,
     /// Tool calls (for Assistant messages)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -214,6 +239,7 @@ impl Message {
             reasoning: None,
             content_parts: None,
             image_ocr: None,
+            phase: None,
             tool_calls: None,
             tool_call_id: None,
             tool_success: None,
@@ -235,6 +261,7 @@ impl Message {
             reasoning: None,
             content_parts: Some(parts),
             image_ocr: None,
+            phase: None,
             tool_calls: None,
             tool_call_id: None,
             tool_success: None,
@@ -267,6 +294,11 @@ impl Message {
         tool_calls: Option<Vec<ToolCall>>,
         reasoning: Option<String>,
     ) -> Self {
+        let phase = if tool_calls.as_ref().is_some_and(|calls| !calls.is_empty()) {
+            Some(MessagePhase::Commentary)
+        } else {
+            Some(MessagePhase::FinalAnswer)
+        };
         Self {
             id: Uuid::new_v4().to_string(),
             role: Role::Assistant,
@@ -274,6 +306,7 @@ impl Message {
             reasoning,
             content_parts: None,
             image_ocr: None,
+            phase,
             tool_calls,
             tool_call_id: None,
             tool_success: None,
@@ -313,6 +346,7 @@ impl Message {
             reasoning: None,
             content_parts: None,
             image_ocr: None,
+            phase: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             tool_success: Some(success),
@@ -342,6 +376,7 @@ impl Message {
             reasoning: None,
             content_parts: None,
             image_ocr: None,
+            phase: None,
             tool_calls: None,
             tool_call_id: None,
             tool_success: None,

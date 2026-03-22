@@ -109,6 +109,7 @@ pub(super) async fn handle_non_streaming_complete(
             message: ChatMessage {
                 role: Role::Assistant,
                 content: Content::Text(content),
+                phase: None,
                 tool_calls,
                 tool_call_id: None,
             },

@@ -107,6 +107,7 @@ pub(super) async fn handle_non_streaming_messages(
             message: crate::agent::llm::api::models::ChatMessage {
                 role: crate::agent::llm::api::models::Role::Assistant,
                 content: crate::agent::llm::api::models::Content::Text(content),
+                phase: None,
                 tool_calls,
                 tool_call_id: None,
             },

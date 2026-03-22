@@ -14,4 +14,4 @@ pub mod types;
 
 pub use error::AgentError;
 pub use events::{AgentEvent, TokenUsage};
-pub use types::{Message, MessageContent, Role, Session, SessionKind};
+pub use types::{Message, MessageContent, MessagePhase, Role, Session, SessionKind};

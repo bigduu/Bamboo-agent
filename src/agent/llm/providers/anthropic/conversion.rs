@@ -58,6 +58,7 @@ pub fn convert_messages_request(
             out_messages.push(ChatMessage {
                 role: Role::System,
                 content: Content::Text(system_text),
+                phase: None,
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -76,6 +77,7 @@ pub fn convert_messages_request(
                 out_messages.push(ChatMessage {
                     role,
                     content: Content::Text(text),
+                    phase: None,
                     tool_calls: None,
                     tool_call_id: None,
                 });
@@ -103,6 +105,7 @@ pub fn convert_messages_request(
                     out_messages.push(ChatMessage {
                         role: Role::System,
                         content: Content::Text(system_text),
+                        phase: None,
                         tool_calls: None,
                         tool_call_id: None,
                     });
@@ -226,6 +229,7 @@ fn append_user_blocks(
                     out_messages.push(ChatMessage {
                         role: Role::User,
                         content: Content::Parts(text_parts),
+                        phase: None,
                         tool_calls: None,
                         tool_call_id: None,
                     });
@@ -236,6 +240,7 @@ fn append_user_blocks(
                 out_messages.push(ChatMessage {
                     role: Role::Tool,
                     content: Content::Text(result_text),
+                    phase: None,
                     tool_calls: None,
                     tool_call_id: Some(tool_use_id),
                 });
@@ -265,6 +270,7 @@ fn append_user_blocks(
         out_messages.push(ChatMessage {
             role: Role::User,
             content,
+            phase: None,
             tool_calls: None,
             tool_call_id: None,
         });
@@ -326,6 +332,7 @@ fn convert_assistant_blocks(
     Ok(ChatMessage {
         role: Role::Assistant,
         content,
+        phase: None,
         tool_calls: if tool_calls.is_empty() {
             None
         } else {
@@ -566,6 +573,7 @@ pub fn convert_complete_request(
         messages: vec![ChatMessage {
             role: Role::User,
             content: Content::Text(request.prompt),
+            phase: None,
             tool_calls: None,
             tool_call_id: None,
         }],

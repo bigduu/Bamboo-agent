@@ -60,6 +60,9 @@ pub struct ResponsesRequestOptions {
     /// Optional truncation mode for Responses API requests
     /// (e.g. "auto", "disabled").
     pub truncation: Option<String>,
+    /// Optional text verbosity for Responses API requests
+    /// (e.g. "low", "medium", "high").
+    pub text_verbosity: Option<String>,
 }
 
 /// Optional request-time controls for provider calls.

@@ -59,8 +59,8 @@ pub mod tools;
 
 pub use agent::events::{AgentEvent, TokenBudgetUsage, TokenUsage};
 pub use agent::types::{
-    ConversationSummary, ImageOcrLine, ImageOcrResult, Message, MessageContent, Role, Session,
-    SessionKind,
+    ConversationSummary, ImageOcrLine, ImageOcrResult, Message, MessageContent, MessagePhase, Role,
+    Session, SessionKind,
 };
 pub use agent::AgentError;
 pub use budget::limits::create_budget_for_model;

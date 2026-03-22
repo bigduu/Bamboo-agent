@@ -32,6 +32,7 @@ pub(super) async fn prepare_request(
         openai_messages.push(crate::agent::llm::api::models::ChatMessage {
             role: crate::agent::llm::api::models::Role::System,
             content: crate::agent::llm::api::models::Content::Text(instructions.to_string()),
+            phase: None,
             tool_calls: None,
             tool_call_id: None,
         });

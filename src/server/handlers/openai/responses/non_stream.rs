@@ -50,7 +50,8 @@ pub(super) async fn handle_non_streaming_response(
                 upstream_response_id = Some(response_id);
             }
             Ok(crate::agent::llm::types::LLMChunk::Token(text)) => content.push_str(&text),
-            Ok(crate::agent::llm::types::LLMChunk::ReasoningToken(_)) => {}
+            // Keep parity with streaming behavior: expose reasoning narration as text.
+            Ok(crate::agent::llm::types::LLMChunk::ReasoningToken(text)) => content.push_str(&text),
             Ok(crate::agent::llm::types::LLMChunk::ToolCalls(calls)) => tool_calls.extend(calls),
             Ok(crate::agent::llm::types::LLMChunk::Done) => break,
             Err(error) => {

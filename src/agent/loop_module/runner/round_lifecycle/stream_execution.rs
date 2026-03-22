@@ -66,14 +66,21 @@ pub(super) async fn execute_llm_stream(
     } else {
         prepared_context.messages.as_slice()
     };
+    let mut responses_options = ResponsesRequestOptions {
+        store: Some(false),
+        // Keep tool-planning narration visible but compact.
+        text_verbosity: Some("low".to_string()),
+        reasoning_summary: Some("auto".to_string()),
+        include: Some(vec!["reasoning.encrypted_content".to_string()]),
+        ..Default::default()
+    };
+    if let Some(response_id) = previous_response_id {
+        responses_options.previous_response_id = Some(response_id.to_string());
+    }
     let request_options = LLMRequestOptions {
         reasoning_effort,
         parallel_tool_calls: Some(true),
-        responses: previous_response_id.map(|response_id| ResponsesRequestOptions {
-            previous_response_id: Some(response_id.to_string()),
-            store: Some(false),
-            ..Default::default()
-        }),
+        responses: Some(responses_options),
     };
 
     if !supports_previous_response_id {

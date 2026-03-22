@@ -5,7 +5,7 @@
 //! events into [`LLMChunk`] so the rest of Bamboo can stay provider-agnostic.
 
 use super::tool_schema::sanitize_openai_function_parameters_schema;
-use crate::agent::core::{agent::Role, tools::ToolSchema, Message};
+use crate::agent::core::{agent::Role, tools::ToolSchema, Message, MessagePhase};
 use crate::agent::llm::models::ContentPart;
 use crate::agent::llm::provider::ResponsesRequestOptions;
 use crate::agent::llm::provider::Result;
@@ -50,11 +50,15 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
                 let has_text = !m.content.trim().is_empty();
                 if has_text || m.tool_calls.is_none() {
                     let content = build_content_value(m, has_images, None);
-                    out.push(json!({
+                    let mut message_item = json!({
                         "type": "message",
                         "role": "assistant",
                         "content": content,
-                    }));
+                    });
+                    if let Some(phase) = assistant_phase_for_responses_input(m) {
+                        message_item["phase"] = json!(phase);
+                    }
+                    out.push(message_item);
                 }
 
                 // Emit each tool call as a structured function_call item.
@@ -107,6 +111,30 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
     }
 
     out
+}
+
+fn assistant_phase_for_responses_input(message: &Message) -> Option<&'static str> {
+    if !matches!(message.role, Role::Assistant) {
+        return None;
+    }
+
+    if let Some(phase) = message.phase.as_ref() {
+        return Some(phase.as_str());
+    }
+
+    if message
+        .tool_calls
+        .as_ref()
+        .is_some_and(|calls| !calls.is_empty())
+    {
+        return Some(MessagePhase::Commentary.as_str());
+    }
+
+    if !message.content.trim().is_empty() {
+        return Some(MessagePhase::FinalAnswer.as_str());
+    }
+
+    None
 }
 
 /// Build the `content` value for a message item.
@@ -228,6 +256,14 @@ pub fn build_responses_body(
         body["truncation"] = json!(truncation);
     }
 
+    if let Some(text_verbosity) = responses_options
+        .and_then(|opts| opts.text_verbosity.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        body["text"] = json!({ "verbosity": text_verbosity });
+    }
+
     let store = responses_options
         .and_then(|opts| opts.store)
         .unwrap_or(false);
@@ -252,6 +288,8 @@ struct AccFnCall {
 ///
 /// Supported:
 /// - `response.output_text.delta` -> `LLMChunk::Token(delta)`
+/// - `response.content_part.added/done` (output_text parts) -> `LLMChunk::Token(...)`
+/// - `response.output_item.added/done` message output_text -> `LLMChunk::Token(...)`
 /// - `response.output_item.*` + `response.function_call_arguments.delta` -> `LLMChunk::ToolCalls`
 /// - `response.completed` -> `LLMChunk::Done`
 pub struct ResponsesSseParser {
@@ -263,6 +301,8 @@ pub struct ResponsesSseParser {
     // Some upstreams omit item_id on text deltas; keep a coarse flag so
     // `*.done` fallbacks can avoid obvious duplicate full-text emissions.
     saw_unkeyed_text_delta: bool,
+    // Reasoning output item IDs that have already emitted summary text.
+    streamed_reasoning_item_ids: HashSet<String>,
     provider_label: String,
     model: String,
     requested_reasoning_effort: Option<ReasoningEffort>,
@@ -289,6 +329,7 @@ impl ResponsesSseParser {
             fn_calls: HashMap::new(),
             streamed_text_item_ids: HashSet::new(),
             saw_unkeyed_text_delta: false,
+            streamed_reasoning_item_ids: HashSet::new(),
             provider_label: provider_label.to_string(),
             model: model.to_string(),
             requested_reasoning_effort,
@@ -328,9 +369,39 @@ impl ResponsesSseParser {
                 .map(|s| s.to_string());
         }
 
+        // Treat `output_item.added` arguments as a snapshot/seed (not a delta).
+        // Some upstreams also send `function_call_arguments.delta` and a full
+        // arguments snapshot at `output_item.done`; blindly appending here can
+        // duplicate JSON and break downstream tool arg parsing.
+        if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
+            if !args.is_empty() && entry.arguments.is_empty() {
+                entry.arguments = args.to_string();
+            }
+        }
+    }
+
+    fn apply_done_fn_call_item(&mut self, item_id: &str, item: &Value) {
+        let entry = self.ensure_fn_call(item_id);
+
+        if entry.call_id.is_none() {
+            entry.call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+
+        if entry.name.is_none() {
+            entry.name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+
+        // `output_item.done` is authoritative when it includes full arguments.
         if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
             if !args.is_empty() {
-                entry.arguments.push_str(args);
+                entry.arguments = args.to_string();
             }
         }
     }
@@ -379,6 +450,67 @@ impl ResponsesSseParser {
             }
         }
         out
+    }
+
+    fn content_part_output_text(v: &Value) -> String {
+        let part = v
+            .get("part")
+            .or_else(|| v.get("content_part"))
+            .unwrap_or(&Value::Null);
+        let part_type = part
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if part_type != "output_text" {
+            return String::new();
+        }
+
+        part.get("text")
+            .and_then(|value| value.as_str())
+            .or_else(|| part.get("delta").and_then(|value| value.as_str()))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn reasoning_item_summary_text(item: &Value) -> String {
+        let mut out = String::new();
+
+        if let Some(summary) = item.get("summary") {
+            if let Some(text) = summary.as_str() {
+                out.push_str(text);
+            } else if let Some(parts) = summary.as_array() {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
+                        out.push_str(text);
+                    } else if let Some(text) = part.as_str() {
+                        out.push_str(text);
+                    }
+                }
+            }
+        }
+
+        if out.is_empty() {
+            if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
+                out.push_str(text);
+            }
+        }
+
+        out
+    }
+
+    fn emit_reasoning_item_text(&mut self, item_id: Option<&str>, text: &str) -> Option<LLMChunk> {
+        if text.is_empty() {
+            return None;
+        }
+
+        if let Some(item_id) = item_id {
+            if self.streamed_reasoning_item_ids.contains(item_id) {
+                return None;
+            }
+            self.streamed_reasoning_item_ids.insert(item_id.to_string());
+        }
+
+        Some(LLMChunk::ReasoningToken(text.to_string()))
     }
 
     fn emit_done_text(&mut self, item_id: Option<&str>, text: &str) -> Option<LLMChunk> {
@@ -515,10 +647,49 @@ impl ResponsesSseParser {
                 Ok(self.emit_done_text(item_id.as_deref(), text))
             }
 
+            "response.content_part.added" => {
+                let text = Self::content_part_output_text(&v);
+                if text.is_empty() {
+                    return Ok(None);
+                }
+                if let Some(item_id) = Self::text_item_id(&v) {
+                    self.streamed_text_item_ids.insert(item_id);
+                } else {
+                    self.saw_unkeyed_text_delta = true;
+                }
+                Ok(Some(LLMChunk::Token(text)))
+            }
+
+            "response.content_part.done" => {
+                let text = Self::content_part_output_text(&v);
+                let item_id = Self::text_item_id(&v);
+                Ok(self.emit_done_text(item_id.as_deref(), text.as_str()))
+            }
+
             "response.output_item.added" => {
                 // Best-effort: pre-register function_call metadata.
                 if let Some(item) = v.get("item") {
                     let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if item_type == "reasoning" {
+                        let text = Self::reasoning_item_summary_text(item);
+                        let item_id = item
+                            .get("id")
+                            .and_then(|id| id.as_str())
+                            .or_else(|| v.get("item_id").and_then(|id| id.as_str()));
+                        return Ok(self.emit_reasoning_item_text(item_id, text.as_str()));
+                    }
+                    if item_type == "message" {
+                        let text = Self::message_item_output_text(item);
+                        if text.is_empty() {
+                            return Ok(None);
+                        }
+                        if let Some(item_id) = Self::text_item_id(&v) {
+                            self.streamed_text_item_ids.insert(item_id);
+                        } else {
+                            self.saw_unkeyed_text_delta = true;
+                        }
+                        return Ok(Some(LLMChunk::Token(text)));
+                    }
                     if item_type == "function_call" {
                         let item_id = item
                             .get("id")
@@ -550,6 +721,17 @@ impl ResponsesSseParser {
 
                 if let Some(item) = v.get("item") {
                     let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if item_type == "reasoning" {
+                        let text = Self::reasoning_item_summary_text(item);
+                        return Ok(self.emit_reasoning_item_text(
+                            if item_id.is_empty() {
+                                None
+                            } else {
+                                Some(item_id.as_str())
+                            },
+                            text.as_str(),
+                        ));
+                    }
                     if item_type == "message" {
                         let text = Self::message_item_output_text(item);
                         return Ok(self.emit_done_text(
@@ -562,7 +744,7 @@ impl ResponsesSseParser {
                         ));
                     }
                     if item_type == "function_call" && !item_id.is_empty() {
-                        self.parse_fn_call_item(&item_id, item);
+                        self.apply_done_fn_call_item(&item_id, item);
                     }
                 }
 
@@ -596,6 +778,7 @@ mod tests {
     use super::*;
     use crate::agent::core::tools::{FunctionCall, ToolCall};
     use crate::agent::core::tools::{FunctionSchema, ToolSchema};
+    use crate::agent::core::MessagePhase;
 
     #[test]
     fn build_responses_body_includes_input_and_stream() {
@@ -621,6 +804,7 @@ mod tests {
                 store: Some(true),
                 previous_response_id: Some("resp_123".to_string()),
                 truncation: Some("auto".to_string()),
+                text_verbosity: Some("high".to_string()),
             }),
             None,
         );
@@ -633,6 +817,7 @@ mod tests {
         assert_eq!(body["store"], true);
         assert_eq!(body["previous_response_id"], "resp_123");
         assert_eq!(body["truncation"], "auto");
+        assert_eq!(body["text"]["verbosity"], "high");
     }
 
     #[test]
@@ -716,6 +901,7 @@ mod tests {
         assert_eq!(out[0]["type"], "message");
         assert_eq!(out[0]["role"], "assistant");
         assert_eq!(out[0]["content"], "Calling a tool...");
+        assert_eq!(out[0]["phase"], "commentary");
 
         // Item 1: structured function_call
         assert_eq!(out[1]["type"], "function_call");
@@ -849,6 +1035,19 @@ mod tests {
         assert_eq!(out[0]["type"], "message");
         assert_eq!(out[0]["role"], "assistant");
         assert_eq!(out[0]["content"], "Just a text reply");
+        assert_eq!(out[0]["phase"], "final_answer");
+    }
+
+    #[test]
+    fn messages_to_responses_input_json_honors_explicit_assistant_phase() {
+        let mut assistant = Message::assistant("intermediate narration", None);
+        assistant.phase = Some(MessagePhase::Commentary);
+
+        let out = messages_to_responses_input_json(&[assistant]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "message");
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["phase"], "commentary");
     }
 
     #[test]
@@ -901,6 +1100,55 @@ mod tests {
     }
 
     #[test]
+    fn parser_emits_token_on_content_part_added_with_text() {
+        let mut p = ResponsesSseParser::new();
+        let out = p
+            .handle_event(
+                "response.content_part.added",
+                r#"{"type":"response.content_part.added","item_id":"msg_2","part":{"type":"output_text","text":"hello from part added"}}"#,
+            )
+            .unwrap();
+        match out {
+            Some(LLMChunk::Token(t)) => assert_eq!(t, "hello from part added"),
+            other => panic!("expected token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_emits_token_on_content_part_done_without_prior_delta() {
+        let mut p = ResponsesSseParser::new();
+        let out = p
+            .handle_event(
+                "response.content_part.done",
+                r#"{"type":"response.content_part.done","item_id":"msg_3","part":{"type":"output_text","text":"hello from part done"}}"#,
+            )
+            .unwrap();
+        match out {
+            Some(LLMChunk::Token(t)) => assert_eq!(t, "hello from part done"),
+            other => panic!("expected token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_skips_content_part_done_after_text_stream_for_same_item() {
+        let mut p = ResponsesSseParser::new();
+        let _ = p
+            .handle_event(
+                "response.output_text.delta",
+                r#"{"type":"response.output_text.delta","item_id":"msg_4","delta":"hello"}"#,
+            )
+            .unwrap();
+
+        let out = p
+            .handle_event(
+                "response.content_part.done",
+                r#"{"type":"response.content_part.done","item_id":"msg_4","part":{"type":"output_text","text":"hello"}}"#,
+            )
+            .unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
     fn parser_emits_response_id_on_created_event() {
         let mut p = ResponsesSseParser::new();
         let out = p
@@ -928,6 +1176,40 @@ mod tests {
     }
 
     #[test]
+    fn parser_emits_token_from_message_output_item_added() {
+        let mut p = ResponsesSseParser::new();
+        let out = p
+            .handle_event(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"id":"msg_added_1","type":"message","content":[{"type":"output_text","text":"thinking before tool"}]}}"#,
+            )
+            .unwrap();
+        match out {
+            Some(LLMChunk::Token(t)) => assert_eq!(t, "thinking before tool"),
+            other => panic!("expected token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_skips_message_output_item_done_when_added_already_emitted() {
+        let mut p = ResponsesSseParser::new();
+        let _ = p
+            .handle_event(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"id":"msg_added_2","type":"message","content":[{"type":"output_text","text":"thinking"}]}}"#,
+            )
+            .unwrap();
+
+        let out = p
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item":{"id":"msg_added_2","type":"message","content":[{"type":"output_text","text":"thinking"}]}}"#,
+            )
+            .unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
     fn parser_emits_reasoning_token_on_reasoning_delta() {
         let mut p = ResponsesSseParser::new();
         let out = p
@@ -940,6 +1222,39 @@ mod tests {
             Some(LLMChunk::ReasoningToken(t)) => assert_eq!(t, "think"),
             other => panic!("expected reasoning token, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parser_emits_reasoning_token_from_reasoning_output_item_done() {
+        let mut p = ResponsesSseParser::new();
+        let out = p
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"I will inspect the repo first."}]}}"#,
+            )
+            .unwrap();
+        match out {
+            Some(LLMChunk::ReasoningToken(t)) => assert_eq!(t, "I will inspect the repo first."),
+            other => panic!("expected reasoning token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_skips_duplicate_reasoning_output_item_done_after_added() {
+        let mut p = ResponsesSseParser::new();
+        let _ = p
+            .handle_event(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"id":"rs_2","type":"reasoning","summary":[{"type":"summary_text","text":"Planning now."}]}}"#,
+            )
+            .unwrap();
+        let out = p
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item":{"id":"rs_2","type":"reasoning","summary":[{"type":"summary_text","text":"Planning now."}]}}"#,
+            )
+            .unwrap();
+        assert!(out.is_none());
     }
 
     #[test]
@@ -971,6 +1286,42 @@ mod tests {
             Some(LLMChunk::ToolCalls(calls)) => {
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].id, "call_1");
+                assert_eq!(calls[0].function.name, "search");
+                assert_eq!(calls[0].function.arguments, r#"{"q":"test"}"#);
+            }
+            other => panic!("expected tool_calls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_prefers_done_arguments_snapshot_over_accumulated_partials() {
+        let mut p = ResponsesSseParser::new();
+
+        let _ = p
+            .handle_event(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"id":"item_2","type":"function_call","call_id":"call_2","name":"search","arguments":"{\"q\":\""}}"#,
+            )
+            .unwrap();
+
+        let _ = p
+            .handle_event(
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"item_2","delta":"test\"}"}"#,
+            )
+            .unwrap();
+
+        let out = p
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item":{"id":"item_2","type":"function_call","call_id":"call_2","name":"search","arguments":"{\"q\":\"test\"}"}}"#,
+            )
+            .unwrap();
+
+        match out {
+            Some(LLMChunk::ToolCalls(calls)) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "call_2");
                 assert_eq!(calls[0].function.name, "search");
                 assert_eq!(calls[0].function.arguments, r#"{"q":"test"}"#);
             }
