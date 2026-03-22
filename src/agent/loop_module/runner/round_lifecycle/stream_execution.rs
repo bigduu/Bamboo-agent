@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::error::Error as StdError;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
