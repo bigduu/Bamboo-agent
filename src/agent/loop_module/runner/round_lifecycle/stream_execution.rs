@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::error::Error as StdError;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -32,6 +33,76 @@ fn continuation_messages(messages: &[Message]) -> Option<&[Message]> {
 
 fn provider_supports_previous_response_id(provider_name: Option<&str>) -> bool {
     !matches!(provider_name.map(str::trim), Some("copilot"))
+}
+
+fn format_reqwest_transport_error(error: &reqwest::Error) -> String {
+    let mut kinds = Vec::new();
+    if error.is_timeout() {
+        kinds.push("timeout");
+    }
+    if error.is_connect() {
+        kinds.push("connect");
+    }
+    if error.is_request() {
+        kinds.push("request");
+    }
+    if error.is_body() {
+        kinds.push("body");
+    }
+    if error.is_decode() {
+        kinds.push("decode");
+    }
+    if error.is_redirect() {
+        kinds.push("redirect");
+    }
+    if error.is_builder() {
+        kinds.push("builder");
+    }
+    if error.is_status() {
+        kinds.push("status");
+    }
+
+    let kind = if kinds.is_empty() {
+        "unknown".to_string()
+    } else {
+        kinds.join("+")
+    };
+    let url = error
+        .url()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "<unknown>".to_string());
+
+    let mut causes = Vec::new();
+    let mut source = StdError::source(error);
+    while let Some(cause) = source {
+        causes.push(cause.to_string());
+        source = cause.source();
+        if causes.len() >= 4 {
+            break;
+        }
+    }
+
+    if causes.is_empty() {
+        format!(
+            "HTTP transport error [{}] for url ({}): {}",
+            kind, url, error
+        )
+    } else {
+        format!(
+            "HTTP transport error [{}] for url ({}): {} | causes: {}",
+            kind,
+            url,
+            error,
+            causes.join(" | ")
+        )
+    }
+}
+
+fn format_provider_error(error: crate::agent::llm::provider::LLMError) -> String {
+    match error {
+        crate::agent::llm::provider::LLMError::Http(http) => format_reqwest_transport_error(&http),
+        other => other.to_string(),
+    }
 }
 
 pub(super) async fn execute_llm_stream(
@@ -117,7 +188,7 @@ pub(super) async fn execute_llm_stream(
             Some(&request_options),
         )
         .await
-        .map_err(|error| AgentError::LLM(error.to_string()))?;
+        .map_err(|error| AgentError::LLM(format_provider_error(error)))?;
 
     // Send token budget update AFTER LLM call succeeds.
     // This timing gives frontend time to subscribe to /events endpoint.
