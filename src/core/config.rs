@@ -54,6 +54,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::PathBuf;
 
+use crate::agent::tools::normalize_tool_ref;
 use crate::core::keyword_masking::KeywordMaskingConfig;
 use crate::core::model_mapping::{AnthropicModelMapping, GeminiModelMapping};
 use crate::core::ReasoningEffort;
@@ -615,7 +616,7 @@ impl Config {
             .iter()
             .map(|name| name.trim())
             .filter(|name| !name.is_empty())
-            .map(ToOwned::to_owned)
+            .map(|name| normalize_tool_ref(name).unwrap_or_else(|| name.to_string()))
             .collect()
     }
 
@@ -1145,35 +1146,38 @@ mod tests {
     }
 
     #[test]
-    fn normalize_tool_settings_trims_dedupes_and_sorts() {
+    fn normalize_tool_settings_trims_dedupes_canonicalizes_and_sorts() {
         let mut config = Config::default();
         config.tools.disabled = vec![
             "  read_file  ".to_string(),
             "".to_string(),
             "read_file".to_string(),
             "bash".to_string(),
+            "default::getCurrentDir".to_string(),
         ];
 
         config.normalize_tool_settings();
 
-        assert_eq!(config.tools.disabled, vec!["bash", "read_file"]);
+        assert_eq!(config.tools.disabled, vec!["Bash", "GetCurrentDir", "Read"]);
     }
 
     #[test]
-    fn config_load_reads_disabled_tools() {
+    fn config_load_reads_disabled_tools_as_canonical_names() {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
         temp_home.set_config_json(
             r#"{
   "tools": {
-    "disabled": ["bash", " read_file ", "bash"]
+    "disabled": ["bash", " read_file ", "bash", "default::getCurrentDir"]
   }
 }"#,
         );
 
         let config = Config::from_data_dir(Some(temp_home.path.clone()));
-        assert_eq!(config.tools.disabled, vec!["bash", "read_file"]);
-        assert!(config.disabled_tool_names().contains("bash"));
+        assert_eq!(config.tools.disabled, vec!["Bash", "GetCurrentDir", "Read"]);
+        assert!(config.disabled_tool_names().contains("Bash"));
+        assert!(config.disabled_tool_names().contains("Read"));
+        assert!(config.disabled_tool_names().contains("GetCurrentDir"));
     }
 
     #[test]

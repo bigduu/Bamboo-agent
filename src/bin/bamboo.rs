@@ -2,6 +2,7 @@
 //!
 //! Standalone HTTP server for Bamboo
 
+use bamboo_agent::core::Config;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -138,32 +139,15 @@ async fn main() {
                     bamboo_agent::core::paths::config_json_path().display()
                 );
             } else {
-                let config = bamboo_agent::core::Config::new();
-                let mut config_value = match serde_json::to_value(&config) {
+                let mut config = Config::new();
+                config.normalize_tool_settings();
+                let config_value = match serialize_config_for_cli(config, show_secrets) {
                     Ok(value) => value,
                     Err(e) => {
                         eprintln!("Failed to serialize config: {}", e);
                         std::process::exit(1);
                     }
                 };
-
-                if !show_secrets {
-                    // Redact sensitive fields
-                    if let Some(providers) = config_value.get_mut("providers") {
-                        if let Some(providers_obj) = providers.as_object_mut() {
-                            for (_, provider) in providers_obj.iter_mut() {
-                                if let Some(provider_obj) = provider.as_object_mut() {
-                                    if provider_obj.contains_key("api_key") {
-                                        provider_obj.insert(
-                                            "api_key".to_string(),
-                                            serde_json::json!("***REDACTED***"),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
 
                 match serde_json::to_string_pretty(&config_value) {
                     Ok(json) => println!("{}", json),
@@ -174,5 +158,105 @@ async fn main() {
                 }
             }
         }
+    }
+}
+
+fn serialize_config_for_cli(
+    mut config: Config,
+    show_secrets: bool,
+) -> bamboo_agent::Result<serde_json::Value> {
+    config.refresh_proxy_auth_encrypted()?;
+    config.refresh_provider_api_keys_encrypted()?;
+    config.refresh_mcp_secrets_encrypted()?;
+    config.normalize_tool_settings();
+
+    let mut value = serde_json::to_value(&config)?;
+    if !show_secrets {
+        value = bamboo_agent::server::handlers::settings::redact_config_for_api(value, &config);
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serialize_config_for_cli;
+    use bamboo_agent::{
+        agent::mcp::{McpServerConfig, StdioConfig, TransportConfig},
+        core::{Config, OpenAIConfig, ProviderConfigs, ProxyAuth},
+    };
+    use serde_json::json;
+    use std::collections::{BTreeMap, HashMap};
+
+    fn configured_config() -> Config {
+        let mut config = Config::default();
+        config.proxy_auth = Some(ProxyAuth {
+            username: "alice".to_string(),
+            password: "secret".to_string(),
+        });
+        config.providers = ProviderConfigs {
+            openai: Some(OpenAIConfig {
+                api_key: "sk-cli-secret".to_string(),
+                api_key_encrypted: None,
+                base_url: Some("https://api.openai.com/v1".to_string()),
+                model: Some("gpt-4o".to_string()),
+                reasoning_effort: None,
+                responses_only_models: vec![],
+                extra: BTreeMap::new(),
+            }),
+            ..ProviderConfigs::default()
+        };
+        config.tools.disabled = vec![" bash ".to_string(), "read_file".to_string()];
+        config.mcp.servers.push(McpServerConfig {
+            id: "stdio-server".to_string(),
+            name: None,
+            enabled: true,
+            transport: TransportConfig::Stdio(StdioConfig {
+                command: "node".to_string(),
+                args: vec!["server.js".to_string()],
+                cwd: None,
+                env: HashMap::from([("TOKEN".to_string(), "super-secret".to_string())]),
+                env_encrypted: HashMap::new(),
+                startup_timeout_ms: 5_000,
+            }),
+            request_timeout_ms: 5_000,
+            healthcheck_interval_ms: 1_000,
+            reconnect: Default::default(),
+            allowed_tools: vec![],
+            denied_tools: vec![],
+        });
+        config
+    }
+
+    #[test]
+    fn serialize_config_for_cli_redacts_sensitive_fields_by_default() {
+        let value = serialize_config_for_cli(configured_config(), false)
+            .expect("CLI config should serialize");
+
+        assert_eq!(value["providers"]["openai"]["api_key"], "****...****");
+        assert!(value["providers"]["openai"]
+            .as_object()
+            .is_some_and(|obj| !obj.contains_key("api_key_encrypted")));
+        assert!(value.get("proxy_auth_encrypted").is_none());
+        assert_eq!(
+            value["mcpServers"]["stdio-server"]["env"]["TOKEN"],
+            "****...****"
+        );
+        assert_eq!(value["tools"]["disabled"], json!(["Bash", "Read"]));
+    }
+
+    #[test]
+    fn serialize_config_for_cli_can_include_secrets_when_requested() {
+        let value = serialize_config_for_cli(configured_config(), true)
+            .expect("CLI config should serialize");
+
+        assert!(value["providers"]["openai"]["api_key_encrypted"]
+            .as_str()
+            .is_some());
+        assert!(value.get("proxy_auth_encrypted").is_some());
+        assert_eq!(
+            value["mcpServers"]["stdio-server"]["env"]["TOKEN"],
+            "super-secret"
+        );
+        assert_eq!(value["tools"]["disabled"], json!(["Bash", "Read"]));
     }
 }

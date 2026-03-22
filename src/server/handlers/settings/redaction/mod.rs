@@ -8,7 +8,7 @@ mod provider;
 #[cfg(test)]
 mod tests;
 
-pub(super) fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
+pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
     let Some(root) = value.as_object_mut() else {
         return value;
     };
@@ -29,7 +29,7 @@ pub(super) fn redact_config_for_api(mut value: Value, config: &Config) -> Value 
     value
 }
 
-pub(super) fn redact_providers_for_api(mut value: Value, config: &Config) -> Value {
+pub fn redact_providers_for_api(mut value: Value, config: &Config) -> Value {
     let Some(obj) = value.as_object_mut() else {
         return value;
     };

@@ -79,13 +79,12 @@ pub fn normalize_tool_ref(value: &str) -> Option<String> {
     }
     let raw_tool_name = trimmed.split("::").last().unwrap_or(trimmed);
     let normalized = normalize_builtin_alias(raw_tool_name);
-    if BUILTIN_TOOL_NAMES.iter().any(|name| name == &normalized)
-        || SERVER_TOOL_NAMES.iter().any(|name| name == &normalized)
-    {
-        Some(normalized.to_string())
-    } else {
-        None
-    }
+
+    BUILTIN_TOOL_NAMES
+        .iter()
+        .chain(SERVER_TOOL_NAMES.iter())
+        .find(|name| name.eq_ignore_ascii_case(normalized))
+        .map(|name| (*name).to_string())
 }
 
 fn normalize_builtin_alias(name: &str) -> &str {

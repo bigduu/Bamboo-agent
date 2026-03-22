@@ -96,3 +96,25 @@ fn resolve_available_tool_schemas_excludes_disabled_tools() {
 
     assert_eq!(names, vec!["z_tool"]);
 }
+
+#[test]
+fn resolve_available_tool_schemas_excludes_canonicalized_disabled_tool_aliases() {
+    let config = crate::agent::loop_module::config::AgentLoopConfig {
+        disabled_tools: ["Bash".to_string(), "Read".to_string()]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("Bash"), schema("Read"), schema("Write")],
+    };
+
+    let session = Session::new("test", "test-model");
+    let resolved = resolve_available_tool_schemas(&config, &tools, &session);
+    let names: Vec<&str> = resolved
+        .iter()
+        .map(|item| item.function.name.as_str())
+        .collect();
+
+    assert_eq!(names, vec!["Write"]);
+}
