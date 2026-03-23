@@ -1,9 +1,11 @@
 //! Claude-style built-in tool implementations.
 
+pub mod apply_patch;
 pub mod ask_user;
 pub mod bash;
 pub mod bash_output;
 pub mod bash_runtime;
+pub mod content_diagnostics;
 pub mod edit;
 pub mod exit_plan_mode;
 pub mod file_change;
@@ -27,6 +29,7 @@ pub mod web_search;
 pub mod workspace_state;
 pub mod write;
 
+pub use apply_patch::ApplyPatchTool;
 pub use ask_user::AskUserTool;
 pub use bash::BashTool;
 pub use bash_output::BashOutputTool;

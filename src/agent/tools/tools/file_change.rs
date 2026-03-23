@@ -208,6 +208,25 @@ pub fn build_file_change_payload(
     previous_text: &str,
     updated_text: &str,
 ) -> String {
+    build_file_change_payload_value(
+        operation,
+        file_path,
+        message,
+        checkpoint,
+        previous_text,
+        updated_text,
+    )
+    .to_string()
+}
+
+pub fn build_file_change_payload_value(
+    operation: &str,
+    file_path: &Path,
+    message: String,
+    checkpoint: Value,
+    previous_text: &str,
+    updated_text: &str,
+) -> Value {
     let file_path_display = crate::core::paths::path_to_display_string(file_path);
     json!({
         "operation": operation,
@@ -217,7 +236,6 @@ pub fn build_file_change_payload(
         "checkpoint": checkpoint,
         "diff": build_unified_diff(file_path, previous_text, updated_text)
     })
-    .to_string()
 }
 
 fn build_unified_diff(file_path: &Path, previous_text: &str, updated_text: &str) -> Value {

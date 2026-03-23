@@ -9,7 +9,7 @@ pub fn check_permissions(
     args: &Value,
 ) -> Result<Option<Vec<PermissionContext>>, PermissionError> {
     match tool_name {
-        "Write" | "Edit" => {
+        "Write" | "Edit" | "apply_patch" => {
             let path = required_string_arg(args, "file_path")?;
             Ok(Some(vec![PermissionContext::new(
                 PermissionType::WriteFile,
@@ -150,6 +150,14 @@ mod tests {
     fn check_permissions_write() {
         let args = json!({"file_path": "/tmp/test.txt"});
         let contexts = check_permissions("Write", &args).unwrap().unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].permission_type, PermissionType::WriteFile);
+    }
+
+    #[test]
+    fn check_permissions_apply_patch() {
+        let args = json!({"file_path": "/tmp/test.txt", "patch": "..."});
+        let contexts = check_permissions("apply_patch", &args).unwrap().unwrap();
         assert_eq!(contexts.len(), 1);
         assert_eq!(contexts[0].permission_type, PermissionType::WriteFile);
     }

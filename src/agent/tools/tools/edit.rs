@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use super::read_tracker::ReadState;
-use super::{file_change, read_tracker};
+use super::{content_diagnostics, file_change, read_tracker};
 
 const MAX_PATCH_BYTES: usize = 256 * 1024;
 const MAX_PATCH_BLOCKS: usize = 128;
@@ -532,7 +532,7 @@ impl Tool for EditTool {
 
         file_change::atomic_write_text(path, &updated).await?;
 
-        let payload = file_change::build_file_change_payload(
+        let mut payload = file_change::build_file_change_payload_value(
             "Edit",
             path,
             format!(
@@ -543,10 +543,11 @@ impl Tool for EditTool {
             &content,
             &updated,
         );
+        content_diagnostics::attach_file_diagnostics(&mut payload, path, &updated);
 
         Ok(ToolResult {
             success: true,
-            result: payload,
+            result: payload.to_string(),
             display_preference: Some("Default".to_string()),
         })
     }
@@ -928,5 +929,47 @@ mod tests {
         assert!(
             matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("max block count"))
         );
+    }
+
+    #[tokio::test]
+    async fn edit_includes_json_diagnostics_after_change() {
+        let file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        tokio::fs::write(file.path(), r#"{"ok":true}"#)
+            .await
+            .unwrap();
+
+        let read_tool = ReadTool::new();
+        let _ = read_tool
+            .execute_with_context(
+                json!({ "file_path": file.path() }),
+                ToolExecutionContext {
+                    session_id: Some("session_edit_diag"),
+                    tool_call_id: "call_1",
+                    event_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let tool = EditTool::new();
+        let result = tool
+            .execute_with_context(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": r#"{"ok":true}"#,
+                    "new_string": "{"
+                }),
+                ToolExecutionContext {
+                    session_id: Some("session_edit_diag"),
+                    tool_call_id: "call_2",
+                    event_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(payload["diagnostics"]["format"], "json");
+        assert_eq!(payload["diagnostics"]["valid"], false);
     }
 }

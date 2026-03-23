@@ -6,7 +6,7 @@ use crate::core::process_utils::{
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -27,6 +27,8 @@ struct BashArgs {
     description: Option<String>,
     #[serde(default)]
     run_in_background: Option<bool>,
+    #[serde(default)]
+    workdir: Option<String>,
 }
 
 pub struct BashTool;
@@ -69,11 +71,53 @@ impl BashTool {
         *truncated = true;
     }
 
+    fn resolve_cwd(session_workspace: &Path, workdir: Option<&str>) -> Result<PathBuf, ToolError> {
+        let resolved = match workdir {
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(ToolError::InvalidArguments(
+                        "'workdir' cannot be empty".to_string(),
+                    ));
+                }
+                let requested = Path::new(trimmed);
+                if requested.is_absolute() {
+                    requested.to_path_buf()
+                } else {
+                    session_workspace.join(requested)
+                }
+            }
+            None => session_workspace.to_path_buf(),
+        };
+
+        let metadata = std::fs::metadata(&resolved).map_err(|error| {
+            ToolError::InvalidArguments(format!(
+                "Invalid workdir '{}': {}",
+                crate::core::paths::path_to_display_string(&resolved),
+                error
+            ))
+        })?;
+        if !metadata.is_dir() {
+            return Err(ToolError::InvalidArguments(format!(
+                "workdir must be a directory: {}",
+                crate::core::paths::path_to_display_string(&resolved)
+            )));
+        }
+
+        resolved.canonicalize().map_err(|error| {
+            ToolError::Execution(format!(
+                "Failed to canonicalize workdir '{}': {}",
+                crate::core::paths::path_to_display_string(&resolved),
+                error
+            ))
+        })
+    }
+
     async fn run_foreground(
         &self,
         command: &str,
         timeout_ms: u64,
-        cwd: Option<&Path>,
+        cwd: &Path,
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let shell = preferred_bash_shell();
@@ -90,9 +134,7 @@ impl BashTool {
 
         let mut cmd = Command::new(&shell.program);
         hide_window_for_tokio_command(&mut cmd);
-        if let Some(cwd) = cwd {
-            cmd.current_dir(cwd);
-        }
+        cmd.current_dir(cwd);
         cmd.arg(shell.arg)
             .arg(command)
             .stdin(Stdio::null())
@@ -182,11 +224,13 @@ impl BashTool {
 
         let exit_code = status.and_then(|s| s.code());
         let success = !timed_out && exit_code.unwrap_or(-1) == 0;
+        let cwd_display = crate::core::paths::path_to_display_string(cwd);
 
         Ok(ToolResult {
             success,
             result: json!({
                 "command": command,
+                "cwd": cwd_display,
                 "stdout": stdout_buf,
                 "stderr": stderr_buf,
                 "exit_code": exit_code,
@@ -235,6 +279,10 @@ impl Tool for BashTool {
                 "run_in_background": {
                     "type": "boolean",
                     "description": "Set to true to run this command in the background"
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Optional working directory. Relative paths are resolved from the session workspace."
                 }
             },
             "required": ["command"],
@@ -264,9 +312,10 @@ impl Tool for BashTool {
 
         let _ = parsed.description;
         let timeout_ms = Self::effective_timeout_ms(parsed.timeout);
-        let workspace = workspace_state::workspace_or_process_cwd(ctx.session_id);
+        let session_workspace = workspace_state::workspace_or_process_cwd(ctx.session_id);
+        let cwd = Self::resolve_cwd(&session_workspace, parsed.workdir.as_deref())?;
         if parsed.run_in_background.unwrap_or(false) {
-            let shell = bash_runtime::spawn_background(command, Some(&workspace))
+            let shell = bash_runtime::spawn_background(command, Some(&cwd))
                 .await
                 .map_err(ToolError::Execution)?;
 
@@ -287,14 +336,14 @@ impl Tool for BashTool {
                     "bash_id": shell.id,
                     "command": shell.command,
                     "status": "running",
+                    "cwd": crate::core::paths::path_to_display_string(&cwd),
                 })
                 .to_string(),
                 display_preference: Some("Collapsible".to_string()),
             });
         }
 
-        self.run_foreground(command, timeout_ms, Some(&workspace), ctx)
-            .await
+        self.run_foreground(command, timeout_ms, &cwd, ctx).await
     }
 }
 
@@ -432,5 +481,53 @@ mod tests {
             }
             sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn bash_resolves_relative_workdir_from_session_workspace() {
+        let tool = BashTool::new();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let nested = base.join("nested");
+        tokio::fs::create_dir_all(&nested).await.unwrap();
+
+        let session_id = format!("session_{}", uuid::Uuid::new_v4());
+        super::workspace_state::set_workspace(&session_id, base.canonicalize().unwrap());
+
+        let result = tool
+            .execute_with_context(
+                json!({
+                    "command": "pwd",
+                    "workdir": "nested"
+                }),
+                ToolExecutionContext {
+                    session_id: Some(&session_id),
+                    tool_call_id: "call_1",
+                    event_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let payload: Value = serde_json::from_str(&result.result).unwrap();
+        let expected = crate::core::paths::path_to_display_string(&nested.canonicalize().unwrap());
+        assert_eq!(payload["cwd"].as_str().unwrap_or_default(), expected);
+    }
+
+    #[tokio::test]
+    async fn bash_rejects_workdir_that_is_not_directory() {
+        let tool = BashTool::new();
+        let file = tempfile::NamedTempFile::new().unwrap();
+
+        let result = tool
+            .execute(json!({
+                "command": "echo hello",
+                "workdir": file.path()
+            }))
+            .await;
+
+        assert!(
+            matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("directory"))
+        );
     }
 }

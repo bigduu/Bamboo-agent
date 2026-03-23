@@ -166,6 +166,9 @@ impl Tool for LoadSkillTool {
             list_skill_resource_paths(&self.access.skill_root(skill_id)).map_err(|err| {
                 ToolError::Execution(format!("Failed to list skill resources: {err}"))
             })?;
+        let canonical_skill_root = tokio::fs::canonicalize(self.access.skill_root(skill_id))
+            .await
+            .unwrap_or_else(|_| self.access.skill_root(skill_id));
 
         Ok(ToolResult {
             success: true,
@@ -177,6 +180,7 @@ impl Tool for LoadSkillTool {
                 "compatibility": skill.compatibility,
                 "allowed_tools": skill.tool_refs,
                 "instructions": skill.prompt,
+                "skill_base_dir": crate::core::paths::path_to_display_string(&canonical_skill_root),
                 "resource_files": resources
             })
             .to_string(),
@@ -189,6 +193,10 @@ impl Tool for LoadSkillTool {
 struct ReadSkillResourceArgs {
     skill_id: String,
     resource_path: String,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 pub struct ReadSkillResourceTool {
@@ -228,6 +236,14 @@ impl Tool for ReadSkillResourceTool {
                 "resource_path": {
                     "type": "string",
                     "description": "Relative path inside the skill folder (for example: references/policies.md)."
+                },
+                "offset": {
+                    "type": "number",
+                    "description": "Optional 0-based line offset for paged text reads."
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Optional line limit for paged text reads."
                 }
             },
             "required": ["skill_id", "resource_path"]
@@ -307,11 +323,20 @@ impl Tool for ReadSkillResourceTool {
 
         let result = match String::from_utf8(bytes) {
             Ok(text) => {
-                let (excerpt, truncated) = truncate_text(&text, MAX_RESOURCE_CONTENT_CHARS);
+                let offset = parsed.offset.unwrap_or(0);
+                let (paged, start, end, total_lines) = page_text_lines(&text, offset, parsed.limit);
+                let (excerpt, truncated) = truncate_text(&paged, MAX_RESOURCE_CONTENT_CHARS);
+                let has_more = end < total_lines;
                 json!({
                     "skill_id": skill_id,
                     "resource_path": display_relative_path(&resource_path),
                     "size_bytes": size_bytes,
+                    "offset": start,
+                    "limit": parsed.limit,
+                    "returned_lines": end.saturating_sub(start),
+                    "total_lines": total_lines,
+                    "has_more": has_more,
+                    "next_offset": if has_more { Some(end) } else { None::<usize> },
                     "truncated": truncated,
                     "content": excerpt
                 })
@@ -416,6 +441,21 @@ fn truncate_text(content: &str, max_chars: usize) -> (&str, bool) {
     (content, false)
 }
 
+fn page_text_lines(
+    content: &str,
+    offset: usize,
+    limit: Option<usize>,
+) -> (String, usize, usize, usize) {
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let start = offset.min(total);
+    let end = limit
+        .map(|value| start.saturating_add(value).min(total))
+        .unwrap_or(total);
+    let paged = lines[start..end].join("\n");
+    (paged, start, end, total)
+}
+
 fn display_relative_path(path: &Path) -> String {
     path.components()
         .filter_map(|component| match component {
@@ -428,7 +468,7 @@ fn display_relative_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_relative_resource_path, truncate_text};
+    use super::{normalize_relative_resource_path, page_text_lines, truncate_text};
     use std::path::Path;
 
     #[test]
@@ -457,5 +497,14 @@ mod tests {
         let (text, truncated) = truncate_text("abc", 10);
         assert_eq!(text, "abc");
         assert!(!truncated);
+    }
+
+    #[test]
+    fn page_text_lines_respects_offset_and_limit() {
+        let (text, start, end, total) = page_text_lines("a\nb\nc\n", 1, Some(1));
+        assert_eq!(text, "b");
+        assert_eq!(start, 1);
+        assert_eq!(end, 2);
+        assert_eq!(total, 3);
     }
 }

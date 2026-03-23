@@ -5,7 +5,7 @@ use serde_json::json;
 use std::path::Path;
 
 use super::read_tracker::ReadState;
-use super::{file_change, read_tracker};
+use super::{content_diagnostics, file_change, read_tracker};
 
 #[derive(Debug, Deserialize)]
 struct WriteArgs {
@@ -103,7 +103,7 @@ impl Tool for WriteTool {
         file_change::atomic_write_text(path, &next_content).await?;
 
         let previous_text = file_change::bytes_to_lossy_text(previous_bytes.as_deref());
-        let payload = file_change::build_file_change_payload(
+        let mut payload = file_change::build_file_change_payload_value(
             "Write",
             path,
             format!("Wrote file: {}", file_path),
@@ -111,10 +111,11 @@ impl Tool for WriteTool {
             &previous_text,
             &next_content,
         );
+        content_diagnostics::attach_file_diagnostics(&mut payload, path, &next_content);
 
         Ok(ToolResult {
             success: true,
-            result: payload,
+            result: payload.to_string(),
             display_preference: Some("Default".to_string()),
         })
     }
@@ -198,5 +199,23 @@ mod tests {
             }))
             .await;
         assert!(matches!(result, Err(ToolError::Execution(msg)) if msg.contains("symlinked")));
+    }
+
+    #[tokio::test]
+    async fn write_includes_json_diagnostics_for_invalid_content() {
+        let file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        let write_tool = WriteTool::new();
+
+        let result = write_tool
+            .execute(json!({
+                "file_path": file.path(),
+                "content": "{"
+            }))
+            .await
+            .unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(payload["diagnostics"]["format"], "json");
+        assert_eq!(payload["diagnostics"]["valid"], false);
     }
 }

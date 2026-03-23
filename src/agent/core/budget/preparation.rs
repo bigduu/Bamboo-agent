@@ -262,6 +262,9 @@ fn select_segments_within_budget(
             continue;
         }
         if segments[index].is_tool_chain {
+            if segment_contains_skill_tool_chain(&segments[index]) {
+                continue;
+            }
             keep_flags[index] = false;
             current_tokens = current_tokens.saturating_sub(segments[index].token_estimate);
         }
@@ -341,6 +344,22 @@ fn segment_contains_assistant_text(segment: &MessageSegment) -> bool {
     })
 }
 
+fn segment_contains_skill_tool_chain(segment: &MessageSegment) -> bool {
+    segment.messages.iter().any(|message| {
+        if message.role != Role::Assistant {
+            return false;
+        }
+        message.tool_calls.as_ref().is_some_and(|calls| {
+            calls.iter().any(|call| {
+                matches!(
+                    call.function.name.as_str(),
+                    "load_skill" | "read_skill_resource"
+                )
+            })
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,11 +368,15 @@ mod tests {
     use crate::agent::core::tools::{FunctionCall, ToolCall};
 
     fn create_tool_call(id: &str) -> ToolCall {
+        create_named_tool_call(id, "test")
+    }
+
+    fn create_named_tool_call(id: &str, name: &str) -> ToolCall {
         ToolCall {
             id: id.to_string(),
             tool_type: "function".to_string(),
             function: FunctionCall {
-                name: "test".to_string(),
+                name: name.to_string(),
                 arguments: "{}".to_string(),
             },
         }
@@ -780,6 +803,53 @@ mod tests {
         assert!(
             tool_results_kept < 2,
             "At least one intermediate tool result should be purged"
+        );
+    }
+
+    #[test]
+    fn phase_one_preserves_skill_tool_chains_before_other_tool_chains() {
+        let mut skill_segment = MessageSegment::from_message(Message::assistant(
+            "Loading skill instructions",
+            Some(vec![create_named_tool_call("call_skill", "load_skill")]),
+        ));
+        skill_segment.messages.push(Message::tool_result(
+            "call_skill",
+            "skill instructions payload",
+        ));
+        skill_segment.token_estimate = 120;
+
+        let mut other_segment = MessageSegment::from_message(Message::assistant(
+            "Running non-skill tool",
+            Some(vec![create_named_tool_call("call_other", "Grep")]),
+        ));
+        other_segment
+            .messages
+            .push(Message::tool_result("call_other", "other output payload"));
+        other_segment.token_estimate = 120;
+
+        let selection = select_segments_within_budget(
+            vec![skill_segment, other_segment],
+            120,
+            &BudgetStrategy::Window { size: 50 },
+        );
+
+        let selected_has_skill = selection.selected.iter().any(|segment| {
+            segment
+                .messages
+                .iter()
+                .any(|message| message.tool_call_id.as_deref() == Some("call_skill"))
+        });
+        let selected_has_other = selection.selected.iter().any(|segment| {
+            segment
+                .messages
+                .iter()
+                .any(|message| message.tool_call_id.as_deref() == Some("call_other"))
+        });
+
+        assert!(selected_has_skill, "load_skill chain should be preserved");
+        assert!(
+            !selected_has_other,
+            "non-skill tool chain should be removed first in phase one"
         );
     }
 

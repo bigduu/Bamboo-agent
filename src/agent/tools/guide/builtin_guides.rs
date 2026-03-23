@@ -6,7 +6,8 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 20] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
+    "apply_patch",
     "ask_user",
     "Bash",
     "BashOutput",
@@ -35,6 +36,18 @@ pub fn builtin_tool_guide(tool_name: &str) -> Option<Arc<dyn ToolGuide>> {
 
 pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
     match tool_name {
+        "apply_patch" => Some(guide(
+            "apply_patch",
+            ToolCategory::FileWriting,
+            "Use for patch-only in-place updates using SEARCH/REPLACE blocks, aligned with Edit patch mode.",
+            "Do not use before Read on existing files; do not use for full-file rewrites; do not mix with old_string/new_string style arguments.",
+            &["Read", "Edit", "Write"],
+            vec![example(
+                "Apply a patch block",
+                json!({"file_path":"/workspace/project/src/main.rs","patch":"<<<<<<< SEARCH\nlet v = 1;\n=======\nlet v = 2;\n>>>>>>> REPLACE"}),
+                "Use when you want a dedicated patch tool call instead of Edit.",
+            )],
+        )),
         "ask_user" => Some(guide(
             "ask_user",
             ToolCategory::UserInteraction,
@@ -304,6 +317,30 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Wait before next poll",
                 json!({"seconds":2,"reason":"wait for background process output"}),
                 "Use short waits between repeated status checks.",
+            )],
+        )),
+        "load_skill" => Some(guide(
+            "load_skill",
+            ToolCategory::TaskManagement,
+            "Load a selected skill's SKILL.md instructions and metadata by skill_id.",
+            "Do not use for auxiliary resource files; use read_skill_resource for references/assets.",
+            &["read_skill_resource"],
+            vec![example(
+                "Load skill instructions",
+                json!({"skill_id":"rust-best-practices"}),
+                "Call this before following a matched skill's detailed workflow.",
+            )],
+        )),
+        "read_skill_resource" => Some(guide(
+            "read_skill_resource",
+            ToolCategory::FileReading,
+            "Read auxiliary files under a loaded skill directory with optional offset/limit paging.",
+            "Do not use for SKILL.md itself; call load_skill for primary instructions.",
+            &["load_skill"],
+            vec![example(
+                "Read a skill reference file",
+                json!({"skill_id":"rust-best-practices","resource_path":"references/chapter_01.md","offset":0,"limit":80}),
+                "Use when the loaded instructions point to additional files.",
             )],
         )),
         _ => None,

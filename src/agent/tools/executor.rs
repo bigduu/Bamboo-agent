@@ -9,10 +9,10 @@ use async_trait::async_trait;
 use crate::agent::tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
 use crate::agent::tools::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::agent::tools::tools::{
-    AskUserTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, FileExistsTool,
-    GetCurrentDirTool, GetFileInfoTool, GlobTool, GrepTool, KillShellTool, MemoryNoteTool,
-    NotebookEditTool, ReadTool, SetWorkspaceTool, SleepTool, TaskTool, ToolRegistry, WebFetchTool,
-    WebSearchTool, WriteTool,
+    ApplyPatchTool, AskUserTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool,
+    FileExistsTool, GetCurrentDirTool, GetFileInfoTool, GlobTool, GrepTool, KillShellTool,
+    MemoryNoteTool, NotebookEditTool, ReadTool, SetWorkspaceTool, SleepTool, TaskTool,
+    ToolRegistry, WebFetchTool, WebSearchTool, WriteTool,
 };
 use crate::core::Config;
 use tokio::sync::RwLock;
@@ -37,7 +37,8 @@ fn preview_for_log(value: &str, max_chars: usize) -> String {
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 20] = [
+pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
+    "apply_patch",
     "ask_user",
     "Bash",
     "BashOutput",
@@ -101,6 +102,7 @@ fn normalize_builtin_alias(name: &str) -> &str {
         "set_workspace" => "SetWorkspace",
         "setWorkspace" => "SetWorkspace",
         "sleep" => "Sleep",
+        "applyPatch" => "apply_patch",
         "spawn_session" => "SubSession",
         "spawnSession" => "SubSession",
         "sub_session" => "SubSession",
@@ -134,7 +136,7 @@ fn normalize_legacy_builtin_args(
     args: &mut serde_json::Map<String, serde_json::Value>,
 ) {
     match raw_tool_name {
-        "read_file" | "write_file" | "Read" | "Write" => {
+        "read_file" | "write_file" | "Read" | "Write" | "apply_patch" => {
             copy_legacy_arg_if_missing(args, "path", "file_path");
         }
         "execute_command" | "Bash" => {
@@ -235,6 +237,7 @@ impl BuiltinToolExecutor {
     /// Registers all built-in tools to the given registry
     fn register_builtin_tools(registry: &ToolRegistry, config: Option<Arc<RwLock<Config>>>) {
         let _ = config;
+        let _ = registry.register(ApplyPatchTool::new());
         let _ = registry.register(AskUserTool::new());
         let _ = registry.register(BashTool::new());
         let _ = registry.register(BashOutputTool::new());
@@ -404,6 +407,7 @@ impl BuiltinToolExecutorBuilder {
             "Read" => self.registry.register(ReadTool::new()),
             "Write" => self.registry.register(WriteTool::new()),
             "Edit" => self.registry.register(EditTool::new()),
+            "apply_patch" => self.registry.register(ApplyPatchTool::new()),
             "NotebookEdit" => self.registry.register(NotebookEditTool::new()),
             _ => return Err(ToolError::NotFound(format!("Unknown tool: {}", name))),
         }
@@ -684,12 +688,7 @@ mod tests {
             .map(|schema| schema.function.name)
             .collect();
 
-        for legacy in [
-            "claude_code",
-            "search_in_file",
-            "search_in_project",
-            "apply_patch",
-        ] {
+        for legacy in ["claude_code", "search_in_file", "search_in_project"] {
             assert!(!tool_names.iter().any(|name| name == legacy));
         }
     }
@@ -729,9 +728,15 @@ mod tests {
         assert_eq!(edit["properties"]["replace_all"]["type"], "boolean");
         assert!(edit.get("oneOf").is_none());
 
+        let apply_patch = get_params("apply_patch");
+        assert_eq!(apply_patch["required"], json!(["file_path", "patch"]));
+        assert_eq!(apply_patch["properties"]["patch"]["type"], "string");
+        assert_eq!(apply_patch["properties"]["line_number"]["type"], "integer");
+
         let bash = get_params("Bash");
         assert_eq!(bash["required"], json!(["command"]));
         assert_eq!(bash["properties"]["run_in_background"]["type"], "boolean");
+        assert_eq!(bash["properties"]["workdir"]["type"], "string");
 
         let bash_output = get_params("BashOutput");
         assert_eq!(bash_output["required"], json!(["bash_id"]));
@@ -908,12 +913,7 @@ mod tests {
     async fn removed_legacy_tools_return_not_found() {
         let executor = BuiltinToolExecutor::new();
 
-        for legacy in [
-            "claude_code",
-            "search_in_file",
-            "search_in_project",
-            "apply_patch",
-        ] {
+        for legacy in ["claude_code", "search_in_file", "search_in_project"] {
             let call = make_tool_call(legacy, json!({}));
             let result = executor.execute(&call).await;
             assert!(matches!(result, Err(ToolError::NotFound(_))));
