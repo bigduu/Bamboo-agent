@@ -24,7 +24,7 @@ pub(super) async fn prepare_session_for_loop(
     let skill_context = skill_context::load_skill_context(config, session_id).await;
 
     let base_prompt_for_language = prompt_setup::resolve_base_prompt_for_language(config, session);
-    let tool_schemas = resolve_available_tool_schemas(config, tools, session);
+    let tool_schemas = resolve_available_tool_schemas(config, tools);
     let tool_guide_context = prompt_setup::build_tool_guide_context(
         config,
         &tool_schemas,
@@ -62,9 +62,8 @@ pub(super) async fn prepare_session_for_loop(
 pub(super) fn resolve_available_tool_schemas(
     config: &AgentLoopConfig,
     tools: &dyn ToolExecutor,
-    session: &Session,
 ) -> Vec<ToolSchema> {
-    tool_schemas::resolve_available_tool_schemas(config, tools, session)
+    tool_schemas::resolve_available_tool_schemas(config, tools)
 }
 
 #[cfg(test)]

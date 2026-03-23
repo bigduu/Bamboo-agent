@@ -137,6 +137,16 @@ pub(super) async fn apply_tool_execution_outcome(
     ctx: ToolExecutionApplyContext<'_>,
     outcome: ToolExecutionOutcome,
 ) -> bool {
+    // ── Output compression pipeline ────────────────────────────────────
+    // Compress the tool result before it enters the session message list.
+    let outcome = super::output_compressor::maybe_compress(
+        &ctx.tool_call.function.name,
+        &ctx.tool_call.function.arguments,
+        ctx.session_id,
+        outcome,
+    )
+    .await;
+
     match outcome.result {
         Ok(result) => {
             execution_paths::handle_successful_tool_result(execution_paths::SuccessPathContext {
@@ -185,6 +195,15 @@ pub(super) async fn execute_single_tool_call(ctx: PerToolExecutionContext<'_>) -
         tools: ctx.tools,
         config: ctx.config,
     })
+    .await;
+
+    // Compress tool output before it enters the session message list
+    let outcome = super::output_compressor::maybe_compress(
+        &ctx.tool_call.function.name,
+        &ctx.tool_call.function.arguments,
+        ctx.session_id,
+        outcome,
+    )
     .await;
 
     apply_tool_execution_outcome(

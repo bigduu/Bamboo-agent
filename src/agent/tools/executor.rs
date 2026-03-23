@@ -11,8 +11,8 @@ use crate::agent::tools::permission::{check_permissions, PermissionChecker, Perm
 use crate::agent::tools::tools::{
     AskUserTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, FileExistsTool,
     GetCurrentDirTool, GetFileInfoTool, GlobTool, GrepTool, KillShellTool, MemoryNoteTool,
-    NotebookEditTool, ReadTool, SetWorkspaceTool, SleepTool, SummarizeContextTool, TaskTool,
-    ToolRegistry, WebFetchTool, WebSearchTool, WriteTool,
+    NotebookEditTool, ReadTool, SetWorkspaceTool, SleepTool, TaskTool, ToolRegistry, WebFetchTool,
+    WebSearchTool, WriteTool,
 };
 use crate::core::Config;
 use tokio::sync::RwLock;
@@ -37,7 +37,7 @@ fn preview_for_log(value: &str, max_chars: usize) -> String {
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
+pub const BUILTIN_TOOL_NAMES: [&str; 20] = [
     "ask_user",
     "Bash",
     "BashOutput",
@@ -54,7 +54,6 @@ pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
     "Read",
     "SetWorkspace",
     "Sleep",
-    "summarize_context",
     "Task",
     "WebFetch",
     "WebSearch",
@@ -252,7 +251,6 @@ impl BuiltinToolExecutor {
         let _ = registry.register(ReadTool::new());
         let _ = registry.register(SetWorkspaceTool::new());
         let _ = registry.register(SleepTool::new());
-        let _ = registry.register(SummarizeContextTool::new());
         let _ = registry.register(TaskTool::new());
         let _ = registry.register(WebFetchTool::new());
         let _ = registry.register(WebSearchTool::new());

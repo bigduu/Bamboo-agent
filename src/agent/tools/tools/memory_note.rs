@@ -1,7 +1,10 @@
 //! Persistent external memory note tool.
 //!
-//! This tool lets the model store (and later retrieve) a per-session note that
-//! is loaded into the system prompt at the start of each round.
+//! This tool lets the model store (and later retrieve) per-session notes that
+//! are loaded into the system prompt at the start of each round.
+//!
+//! Supports multiple **topics** per session so the model can track separate
+//! workstreams without clobbering each other.
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -9,7 +12,7 @@ use serde_json::json;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 
-use crate::agent::core::memory::ExternalMemory;
+use crate::agent::core::memory::{ExternalMemory, DEFAULT_TOPIC};
 use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 
 const MAX_NOTE_CHARS: usize = 12_000;
@@ -52,11 +55,15 @@ impl Tool for MemoryNoteTool {
                 "action": {
                     "type": "string",
                     "description": "Operation to perform on the note.",
-                    "enum": ["read", "append", "replace", "clear"]
+                    "enum": ["read", "append", "replace", "clear", "list_topics"]
                 },
                 "content": {
                     "type": "string",
                     "description": "Note content to append/replace (markdown). Required for append/replace."
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Optional topic name (alphanumeric/dash/underscore, max 50 chars). Defaults to 'default'. Use separate topics for unrelated workstreams."
                 }
             },
             "required": ["action"]
@@ -88,6 +95,13 @@ impl Tool for MemoryNoteTool {
             .trim()
             .to_lowercase();
 
+        let topic = args
+            .get("topic")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or(DEFAULT_TOPIC);
+
         let memory = ExternalMemory::with_defaults();
         let session_guard = session_lock(session_id);
         let _guard = session_guard.lock().await;
@@ -95,13 +109,14 @@ impl Tool for MemoryNoteTool {
         match action.as_str() {
             "read" => {
                 let content = memory
-                    .read_note(session_id)
+                    .read_topic(session_id, topic)
                     .await
                     .map_err(|e| ToolError::Execution(format!("Failed to read note: {e}")))?;
                 Ok(ToolResult {
                     success: true,
                     result: json!({
                         "session_id": session_id,
+                        "topic": topic,
                         "exists": content.is_some(),
                         "content": content.unwrap_or_default(),
                         "max_chars": MAX_NOTE_CHARS
@@ -112,14 +127,33 @@ impl Tool for MemoryNoteTool {
             }
             "clear" => {
                 let deleted = memory
-                    .delete_note(session_id)
+                    .delete_topic(session_id, topic)
                     .await
                     .map_err(|e| ToolError::Execution(format!("Failed to delete note: {e}")))?;
                 Ok(ToolResult {
                     success: true,
                     result: json!({
                         "session_id": session_id,
+                        "topic": topic,
                         "deleted": deleted
+                    })
+                    .to_string(),
+                    display_preference: Some("json".to_string()),
+                })
+            }
+            "list_topics" => {
+                let topics = memory
+                    .list_topics(session_id)
+                    .await
+                    .map_err(|e| {
+                        ToolError::Execution(format!("Failed to list topics: {e}"))
+                    })?;
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "session_id": session_id,
+                        "topics": topics,
+                        "count": topics.len()
                     })
                     .to_string(),
                     display_preference: Some("json".to_string()),
@@ -146,7 +180,7 @@ impl Tool for MemoryNoteTool {
                     }
 
                     let path = memory
-                        .save_note(session_id, content)
+                        .save_topic(session_id, topic, content)
                         .await
                         .map_err(|e| ToolError::Execution(format!("Failed to write note: {e}")))?;
 
@@ -154,6 +188,7 @@ impl Tool for MemoryNoteTool {
                         success: true,
                         result: json!({
                             "session_id": session_id,
+                            "topic": topic,
                             "action": "replace",
                             "path": path,
                             "length_chars": content.chars().count(),
@@ -164,7 +199,7 @@ impl Tool for MemoryNoteTool {
                     })
                 } else {
                     let existing = memory
-                        .read_note(session_id)
+                        .read_topic(session_id, topic)
                         .await
                         .map_err(|e| ToolError::Execution(format!("Failed to read note: {e}")))?;
 
@@ -177,13 +212,13 @@ impl Tool for MemoryNoteTool {
                     let next_len = next.chars().count();
                     if next_len > MAX_NOTE_CHARS {
                         return Err(ToolError::Execution(format!(
-                            "memory note would exceed the limit ({}>{} chars). Compress the existing note (use memory_note action=read), then call memory_note action=replace with a shorter version, then append again if needed.",
+                            "memory note would exceed the limit ({}>{} chars). Compress the existing note (use memory_note action=read topic={topic}), then call memory_note action=replace with a shorter version, then append again if needed.",
                             next_len, MAX_NOTE_CHARS
                         )));
                     }
 
                     let path = memory
-                        .save_note(session_id, &next)
+                        .save_topic(session_id, topic, &next)
                         .await
                         .map_err(|e| ToolError::Execution(format!("Failed to write note: {e}")))?;
 
@@ -191,6 +226,7 @@ impl Tool for MemoryNoteTool {
                         success: true,
                         result: json!({
                             "session_id": session_id,
+                            "topic": topic,
                             "action": "append",
                             "path": path,
                             "length_chars": next_len,
@@ -202,7 +238,7 @@ impl Tool for MemoryNoteTool {
                 }
             }
             _ => Err(ToolError::InvalidArguments(
-                "action must be one of: read, append, replace, clear".to_string(),
+                "action must be one of: read, append, replace, clear, list_topics".to_string(),
             )),
         }
     }
@@ -219,8 +255,16 @@ mod tests {
         assert_eq!(schema["required"], json!(["action"]));
         assert_eq!(
             schema["properties"]["action"]["enum"],
-            json!(["read", "append", "replace", "clear"])
+            json!(["read", "append", "replace", "clear", "list_topics"])
         );
+    }
+
+    #[test]
+    fn memory_note_schema_has_topic_field() {
+        let tool = MemoryNoteTool::new();
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["topic"].is_object());
+        assert_eq!(schema["properties"]["topic"]["type"], "string");
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ mod clarification;
 mod events;
 mod execution_paths;
 mod loop_state;
+mod output_compressor;
 mod per_call;
 mod task;
 pub(crate) mod tool_error_collector;
@@ -103,6 +104,15 @@ pub(super) async fn execute_round_tool_calls(
                     })
                     .await;
 
+                // Compress tool output before applying
+                let outcome = output_compressor::maybe_compress(
+                    &batch[0].function.name,
+                    &batch[0].function.arguments,
+                    session_id,
+                    outcome,
+                )
+                .await;
+
                 let should_break = per_call::apply_tool_execution_outcome(
                     per_call::ToolExecutionApplyContext {
                         tool_call: &batch[0],
@@ -175,6 +185,15 @@ pub(super) async fn execute_round_tool_calls(
             );
 
             for (batch_call, outcome) in batch.iter().zip(outcomes.into_iter()) {
+                // Compress tool output before applying
+                let outcome = output_compressor::maybe_compress(
+                    &batch_call.function.name,
+                    &batch_call.function.arguments,
+                    session_id,
+                    outcome,
+                )
+                .await;
+
                 let should_break = per_call::apply_tool_execution_outcome(
                     per_call::ToolExecutionApplyContext {
                         tool_call: batch_call,

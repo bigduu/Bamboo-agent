@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 20] = [
     "ask_user",
     "Bash",
     "BashOutput",
@@ -23,7 +23,6 @@ pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
     "Read",
     "SetWorkspace",
     "Sleep",
-    "summarize_context",
     "Task",
     "WebFetch",
     "WebSearch",
@@ -267,14 +266,21 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "memory_note" => Some(guide(
             "memory_note",
             ToolCategory::TaskManagement,
-            "Store durable per-session facts/decisions and retrieve them across turns.",
+            "Store durable per-session facts/decisions and retrieve them across turns. Supports multiple topics per session to keep unrelated workstreams separate.",
             "Do not store secrets/tokens or transient one-turn scratch text.",
             &["Task"],
-            vec![example(
-                "Persist a durable decision",
-                json!({"action":"append","content":"User prefers pnpm and strict TypeScript."}),
-                "Use append for new durable facts; use replace to compress long notes.",
-            )],
+            vec![
+                example(
+                    "Persist a durable decision",
+                    json!({"action":"append","content":"User prefers pnpm and strict TypeScript."}),
+                    "Use append for new durable facts; use replace to compress long notes.",
+                ),
+                example(
+                    "Store notes for a specific topic",
+                    json!({"action":"append","topic":"backend-api","content":"REST endpoints finalized: /users, /orders."}),
+                    "Use topic to keep separate workstreams isolated from each other.",
+                ),
+            ],
         )),
         "SetWorkspace" => Some(guide(
             "SetWorkspace",
@@ -298,18 +304,6 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Wait before next poll",
                 json!({"seconds":2,"reason":"wait for background process output"}),
                 "Use short waits between repeated status checks.",
-            )],
-        )),
-        "summarize_context" => Some(guide(
-            "summarize_context",
-            ToolCategory::TaskManagement,
-            "Request compressed conversation context when earlier messages may have been summarized due to token limits.",
-            "Do not call routinely; use only when context continuity is needed.",
-            &["Task", "memory_note"],
-            vec![example(
-                "Ask for compressed history",
-                json!({"reason":"need prior decisions before continuing implementation"}),
-                "Use when you suspect key context is missing from current visible messages.",
             )],
         )),
         _ => None,
