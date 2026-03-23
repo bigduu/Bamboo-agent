@@ -294,10 +294,8 @@ Use this skill when users want to create skills.
 
         let error = parse_markdown_skill(Path::new("skill-creator/SKILL.md"), content)
             .expect_err("name mismatch should be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("must match directory name 'skill-creator'")
-        );
+        assert!(error
+            .to_string()
+            .contains("must match directory name 'skill-creator'"));
     }
 }

@@ -26,7 +26,9 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
     );
 
     context.push_str("### Mandatory Skill Check\n");
-    context.push_str("1. Evaluate the user's request against ALL available skill descriptions below.\n");
+    context.push_str(
+        "1. Evaluate the user's request against ALL available skill descriptions below.\n",
+    );
     context.push_str("2. Decide whether at least one skill clearly and unambiguously applies.\n");
     context.push_str("3. Do NOT skip this check.\n\n");
 
@@ -40,14 +42,14 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
 
     context.push_str("### If No Skill Applies\n");
     context.push_str("1. Proceed normally without loading any skill.\n");
-    context.push_str("2. Do NOT call `load_skill` or `read_skill_resource` when no skill applies.\n\n");
+    context.push_str(
+        "2. Do NOT call `load_skill` or `read_skill_resource` when no skill applies.\n\n",
+    );
 
     context.push_str("### Resource Loading Rules\n");
     context.push_str("1. Do NOT preload all skills.\n");
     context.push_str("2. Call `load_skill` only after selecting one skill.\n");
-    context.push_str(
-        "3. Use `read_skill_resource` only for auxiliary files after `load_skill`.\n",
-    );
+    context.push_str("3. Use `read_skill_resource` only for auxiliary files after `load_skill`.\n");
     context.push_str(
         "4. When a resource response has `has_more=true`, continue with `next_offset` until you have enough context.\n\n",
     );

@@ -1,0 +1,282 @@
+{
+  "skill_name": "confluence",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Our Confluence Server lives at https://confluence.example.internal. Search the ENG space for pages related to VPN onboarding, identify the most relevant recent pages, and summarize the key setup steps and any open questions. If the title search is ambiguous, show candidate pages with page IDs before choosing.",
+      "expected_output": "Uses a search-first workflow, scopes results to the ENG space, returns candidate pages when ambiguous, fetches the selected pages, and produces a concise summary with page identifiers. Does not attempt a write.",
+      "files": [],
+      "expectations": [
+        "The workflow starts with search or candidate discovery rather than writing.",
+        "The response includes page IDs or other identifiers for candidate pages.",
+        "The response stays read-only and does not create or update pages."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Create a new Confluence page in the PLAT space under parent page 987654 called 'Weekly Platform Sync - 2026-03-21'. Use these notes: attendees Alice, Bob, Chen; decisions: move deploy freeze to Thursday; actions: Alice updates runbook, Bob confirms rollback drill. Show a publish plan first, then generate the page body in a clean meeting-notes format.",
+      "expected_output": "Builds a meeting-notes style draft, includes a publish plan with the target location, creates a valid page payload using body.storage, and returns the expected creation details such as page title, parent, and likely API result fields.",
+      "files": [],
+      "expectations": [
+        "The output includes a publish plan before the create action.",
+        "The draft follows a meeting-notes structure with attendees, decisions, and action items.",
+        "The create payload uses body.storage rather than raw Markdown.",
+        "The response identifies the target space and parent page or ancestor."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Update Confluence page 123456 in our Server instance with a new rollback procedure section for the payments deployment runbook. Preserve the rest of the page, including any existing macros or tables, fetch the current version first, and only replace the relevant section before preparing the update payload.",
+      "expected_output": "Fetches the current page with body.storage and version, favors a section-level edit over a full rewrite, preserves existing structure, increments version.number correctly, and prepares a safe update payload.",
+      "files": [],
+      "expectations": [
+        "The current page is fetched before any update is prepared.",
+        "The response preserves macros, tables, or other unrelated sections.",
+        "The update payload increments version.number from the fetched version.",
+        "The change is scoped to the requested rollback procedure section."
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "I don't remember the exact page title, but we have a Confluence wiki page in the OPS space about incident postmortems. Find the most likely page tree location for the latest postmortem, show me the top candidates with page IDs, and only then summarize the incident timeline.",
+      "expected_output": "Tests ambiguous parent discovery and page-tree browsing. The skill should search first, list candidate pages with IDs and spaces, avoid guessing, and then summarize the chosen page.",
+      "files": [],
+      "expectations": [
+        "The response lists multiple candidate pages before selecting one.",
+        "The candidate list includes page IDs and spaces.",
+        "The response does not guess a parent page without confirming ambiguity."
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "In our internal docs space, I need to add the label 'release-notes' to page 123456 and attach the rollout checklist PDF after the page exists. Please plan the page changes first and treat labels and attachments as follow-up steps.",
+      "expected_output": "Tests label and attachment handling. The skill should treat labels and attachments as separate follow-up operations, capture the page ID, and present a safe plan before making changes.",
+      "files": [],
+      "expectations": [
+        "Labels are handled as a separate follow-up after page creation or update.",
+        "Attachment upload is planned only after the destination page ID is known.",
+        "The response does not merge labels/attachments into the page body payload."
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "I have rough release notes in Markdown for the payments team. Convert them into Confluence storage format for a Server/Data Center page, keeping headings, bullet lists, and code blocks clean and durable.",
+      "expected_output": "Tests Markdown-to-storage conversion. The skill should translate rough notes into simple Confluence storage markup and avoid pasting raw Markdown unchanged.",
+      "files": [],
+      "expectations": [
+        "The response converts the notes into Confluence storage markup.",
+        "The response keeps the structure clean with headings and lists.",
+        "The response does not leave the body as raw Markdown."
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "We are on Confluence Cloud, not Server or Data Center. Can you update the page using the Cloud API? I know this skill is about Confluence, but I want the Cloud-specific endpoint behavior handled correctly.",
+      "expected_output": "Tests the Cloud boundary. The skill should refuse or clearly warn that it is optimized for Server/Data Center and should not bluff Cloud-specific behavior.",
+      "files": [],
+      "expectations": [
+        "The response explicitly distinguishes Server/Data Center from Cloud.",
+        "The response does not invent Cloud-specific endpoints or behaviors.",
+        "The response asks to adapt carefully or directs the user to the correct workflow."
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "Can you write a polished project update in a Confluence page and also draft the same text for Google Docs? I mostly want the writing, not the wiki publishing part.",
+      "expected_output": "Tests near-miss behavior. The skill should not over-trigger for generic writing when the task is not clearly about Confluence publishing, or it should limit itself to the Confluence-specific part only.",
+      "files": [],
+      "expectations": [
+        "The response does not treat generic writing as a full Confluence publishing task.",
+        "If it helps, the response keeps focus on the Confluence-specific portion only.",
+        "The response does not fabricate REST API calls when the user mainly wants prose drafting."
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "Could you organize our team handbook pages and move the onboarding docs into a nicer hierarchy? This is basically knowledge management, not necessarily a Confluence change, but the docs happen to live in a wiki.",
+      "expected_output": "Tests a tricky near-miss where the user talks about handbook/wiki organization without clearly asking for Confluence work. The skill should only engage if the Confluence context is real and should not overreach into generic docs advice.",
+      "files": [],
+      "expectations": [
+        "The response does not assume a Confluence operation from generic handbook wording alone.",
+        "The response asks for the actual wiki platform or scope if needed.",
+        "The response avoids inventing page moves or REST calls without a clear Confluence target."
+      ]
+    },
+    {
+      "id": 10,
+      "prompt": "We need to publish the runbook text in our release notes email and also update the wiki later. For now, just polish the prose and make it sound good for email distribution.",
+      "expected_output": "Tests a case where 'runbook' and 'wiki' keywords appear but the actual task is plain editing for an email. The skill should avoid over-triggering into Confluence actions unless the user explicitly asks for them.",
+      "files": [],
+      "expectations": [
+        "The response does not force a Confluence page workflow when the task is email prose.",
+        "The response focuses on the requested writing task.",
+        "The response avoids REST API or page-creation details unless explicitly requested."
+      ]
+    },
+    {
+      "id": 11,
+      "prompt": "I found a page in our docs portal with a table of known issues and a few attachments. I need the same content copied into Confluence, but first summarize what is already there and tell me whether it looks like a good candidate for import.",
+      "expected_output": "Tests a borderline import-and-summarize request. The skill should recognize Confluence relevance if the portal is actually Confluence; otherwise it should not pretend every docs portal is Confluence. It should summarize before writing.",
+      "files": [],
+      "expectations": [
+        "The response does not assume the source portal is Confluence without evidence.",
+        "The response summarizes the existing content before discussing import.",
+        "The response treats the write step as contingent on confirming the target system."
+      ]
+    },
+    {
+      "id": 12,
+      "prompt": "Can you create a page tree diagram for our architecture docs and explain how the documents should be grouped? I don't actually need you to edit any Confluence page yet, just help me think through the structure.",
+      "expected_output": "Tests planning-only behavior. The skill may help with Confluence-style organization, but it should not jump into page creation or API calls because no actual Confluence action is requested.",
+      "files": [],
+      "expectations": [
+        "The response stays at planning level and does not create or update pages.",
+        "The response can discuss hierarchy or organization conceptually.",
+        "The response does not fabricate a page write workflow when none was requested."
+      ]
+    },
+    {
+      "id": 13,
+      "prompt": "Search the PLAT space with CQL for pages labeled 'runbook' and modified after 2026-01-01, then show the top hits and summarize the newest one. If the query is ambiguous, explain the CQL you would use before running it.",
+      "expected_output": "Tests CQL search, which is a distinctive Confluence capability. The skill should use or explain CQL explicitly, scope by space, and summarize search results rather than jumping to page creation.",
+      "files": [],
+      "expectations": [
+        "The response uses or discusses CQL explicitly.",
+        "The response scopes the search to the requested space.",
+        "The response returns search results before summarizing the selected page."
+      ]
+    },
+    {
+      "id": 14,
+      "prompt": "Update page 456789 by showing the current labels first, then add 'ops' and 'incident-review' only if they are missing. This is on our Confluence Server instance.",
+      "expected_output": "Tests label inspection and update flow. The skill should inspect existing labels before making changes, treat the label update as a separate Confluence operation, and identify the Server/Data Center context.",
+      "files": [],
+      "expectations": [
+        "The response inspects existing labels before changing them.",
+        "The response treats label updates as a distinct operation.",
+        "The response identifies Server/Data Center context."
+      ]
+    },
+    {
+      "id": 15,
+      "prompt": "Attach the latest rollout checklist spreadsheet to the release page under page ID 123456, and tell me whether this will upload a new attachment version or create a new file entry.",
+      "expected_output": "Tests attachment upload semantics. The skill should plan an attachment upload against a known page ID and acknowledge versioning or replacement behavior if relevant.",
+      "files": [],
+      "expectations": [
+        "The response uses a known destination page ID.",
+        "The response treats attachment upload as a Confluence-specific follow-up step.",
+        "The response discusses whether an attachment is new or a new version."
+      ]
+    },
+    {
+      "id": 16,
+      "prompt": "We're moving our docs from Notion into a shared wiki, but I only want help rewriting the content cleanly. Don't assume the wiki is Confluence unless I say so.",
+      "expected_output": "Tests a very close near-miss with another doc platform. The skill should not hijack the task just because wiki-ish language appears; it should wait for explicit Confluence context.",
+      "files": [],
+      "expectations": [
+        "The response does not assume Confluence from generic wiki language.",
+        "The response focuses on rewriting content rather than page operations.",
+        "The response asks for the target platform if a Confluence workflow is required."
+      ]
+    },
+    {
+      "id": 17,
+      "prompt": "Use strict_metadata mode. Search only inside the ENG space for likely onboarding pages under parent page 456789, but do not read any page body or attachment content. Just show candidate page IDs, titles, labels, ancestor context, and the safest next step.",
+      "expected_output": "Tests metadata-only privacy mode. The skill should stay metadata-only, keep the search bounded to the requested space and parent area, and avoid fetching body.storage.",
+      "files": [],
+      "expectations": [
+        "The response explicitly stays in strict_metadata mode.",
+        "The response limits itself to metadata such as page ID, title, space, labels, ancestor context, or version.",
+        "The response does not summarize page body content or attachment content."
+      ]
+    },
+    {
+      "id": 18,
+      "prompt": "Use strict_scoped_read mode. You may read content, but only inside the OPS space under parent page 987654. Search for the latest two incident postmortem pages in that subtree, read only those two pages, and summarize the timeline plus follow-up actions.",
+      "expected_output": "Tests bounded content access. The skill should first constrain the search to the given space and parent subtree, then read only the approved pages and summarize them.",
+      "files": [],
+      "expectations": [
+        "The response explicitly treats the task as strict_scoped_read.",
+        "The response keeps the read scope bounded to the requested space and parent page context.",
+        "The response reads only the approved pages rather than broadening the scope."
+      ]
+    },
+    {
+      "id": 19,
+      "prompt": "Use command_only mode for our Confluence Server. I need the exact curl and payload commands to update page 123456 with a new rollback section, but do not execute anything and do not inspect the current page content.",
+      "expected_output": "Tests command-only privacy mode. The skill should generate commands and payload-building steps only, with no execution and no page-content inspection.",
+      "files": [],
+      "expectations": [
+        "The response stays in command_only mode.",
+        "The response generates curl, jq, python, or shell commands rather than pretending the update already happened.",
+        "The response does not inspect or summarize current page body content."
+      ]
+    },
+    {
+      "id": 20,
+      "prompt": "Search the PLAT space for release note pages related to the March rollout. If there are around 20 matches, rank them first, then read only the top 10 most relevant pages and produce a comparison table with page ID, title, last modified date, rollout scope, risks, and rollback notes.",
+      "expected_output": "Tests large result-set handling. The skill should rank matches by metadata, cap content reads to the top 10, and produce a structured comparison table instead of stuffing all page bodies into one summary.",
+      "files": [],
+      "expectations": [
+        "The response explicitly ranks or narrows the candidate set before reading content.",
+        "The response limits content reads to the top 10 pages rather than every match.",
+        "The response produces a structured table or equivalent comparison output."
+      ]
+    },
+    {
+      "id": 21,
+      "prompt": "We got a big CQL result set for runbooks in ENG. Do a two-pass summary: first create short per-page summaries for the most relevant 5 pages, then aggregate them into one final table of owners, prerequisites, rollback steps, and open questions. Mention clearly that you are not reading every matching page.",
+      "expected_output": "Tests batched summarization. The skill should do a per-page mini-summary pass first, then aggregate those summaries into a final structured output while making the truncation strategy explicit.",
+      "files": [],
+      "expectations": [
+        "The response uses a two-pass or batched summarization strategy.",
+        "The response makes the page limit explicit instead of implying that every match was read.",
+        "The final output is structured as a table or structured aggregate summary."
+      ]
+    },
+    {
+      "id": 22,
+      "prompt": "I'm on Windows PowerShell. Please show me how to search our Confluence Server using `$env:CONFLUENCE_BASE_URL` and `$env:CONFLUENCE_PAT`, and make sure the command uses `curl.exe` rather than bare `curl`.",
+      "expected_output": "Tests Windows PowerShell command generation. The skill should emit PowerShell-style environment variable usage and explicitly prefer curl.exe.",
+      "files": [],
+      "expectations": [
+        "The response uses PowerShell environment variable syntax such as `$env:CONFLUENCE_BASE_URL`.",
+        "The response prefers `curl.exe` over bare `curl`.",
+        "The response does not emit only Unix-style shell examples."
+      ]
+    },
+    {
+      "id": 23,
+      "prompt": "I'm on Windows and need to create a Confluence page with a long storage-format body. Please avoid hand-escaping JSON inline. Generate a PowerShell-friendly flow that writes a UTF-8 JSON payload file first and then posts it.",
+      "expected_output": "Tests Windows payload handling. The skill should favor a PowerShell-friendly JSON-file workflow, ideally with Python writing UTF-8 JSON before curl.exe posts it.",
+      "files": [],
+      "expectations": [
+        "The response prefers generating a JSON payload file rather than hand-escaping inline JSON.",
+        "The response mentions UTF-8 or an equivalent safe encoding approach.",
+        "The response is PowerShell-friendly and suitable for Windows."
+      ]
+    },
+    {
+      "id": 24,
+      "prompt": "Use command_only mode on Windows. Give me the PowerShell commands to upload `C:\\Users\\Alice\\Downloads\\rollout checklist.pdf` to Confluence page 123456, and call out any quoting or path caveats I should watch for.",
+      "expected_output": "Tests Windows attachment upload guidance. The skill should emit PowerShell-flavored command-only output, keep the Windows path intact, and mention path or quoting caveats.",
+      "files": [],
+      "expectations": [
+        "The response keeps the Windows attachment path explicit.",
+        "The response uses command_only behavior and PowerShell-oriented commands.",
+        "The response mentions quoting, spaces in paths, or related Windows path caveats."
+      ]
+    },
+    {
+      "id": 25,
+      "prompt": "Our team is on Windows PowerShell and wants strict_metadata mode. Search the ENG space for onboarding pages under parent page 456789, but do not read any body content. Please show the safest PowerShell-style approach for this metadata-only search.",
+      "expected_output": "Tests the combination of Windows PowerShell plus strict_metadata. The skill should keep the search metadata-only and use PowerShell-appropriate examples or guidance.",
+      "files": [],
+      "expectations": [
+        "The response stays in strict_metadata mode and avoids body reads.",
+        "The response is compatible with Windows PowerShell usage.",
+        "The response limits itself to metadata-oriented search behavior."
+      ]
+    }
+  ]
+}

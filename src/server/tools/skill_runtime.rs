@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,6 +16,38 @@ use crate::agent::skill::SkillManager;
 const SELECTED_SKILL_IDS_METADATA_KEY: &str = "selected_skill_ids";
 const SELECTED_SKILL_MODE_METADATA_KEY: &str = "skill_mode";
 const MAX_RESOURCE_CONTENT_CHARS: usize = 50_000;
+const LOADED_SKILL_IDS_METADATA_KEY: &str = "skill_runtime_loaded_skill_ids";
+const LAST_LOADED_SKILL_ID_METADATA_KEY: &str = "skill_runtime_last_loaded_skill_id";
+
+fn parse_loaded_skill_ids(raw: &str) -> HashSet<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return HashSet::new();
+    }
+
+    if let Ok(ids) = serde_json::from_str::<Vec<String>>(trimmed) {
+        return ids
+            .into_iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
+    }
+
+    trimmed
+        .split(',')
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+fn serialize_loaded_skill_ids(ids: &HashSet<String>) -> String {
+    let sorted: BTreeSet<String> = ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    serde_json::to_string(&sorted.into_iter().collect::<Vec<String>>()).unwrap_or("[]".to_string())
+}
 
 #[derive(Clone)]
 struct SkillToolAccess {
@@ -94,6 +126,103 @@ impl SkillToolAccess {
         Err(ToolError::Execution(format!(
             "Skill '{skill_id}' is not selected for this request"
         )))
+    }
+
+    async fn ensure_skill_loaded(
+        &self,
+        skill_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<(), ToolError> {
+        let Some(session_id) = session_id else {
+            return Err(ToolError::Execution(
+                "read_skill_resource requires a session_id in tool context".to_string(),
+            ));
+        };
+
+        let session = self
+            .session_for_context(Some(session_id))
+            .await
+            .ok_or_else(|| {
+                ToolError::Execution(format!(
+                    "Session '{session_id}' was not found while verifying loaded skill state"
+                ))
+            })?;
+
+        let loaded_ids = session
+            .metadata
+            .get(LOADED_SKILL_IDS_METADATA_KEY)
+            .map(|raw| parse_loaded_skill_ids(raw))
+            .unwrap_or_default();
+
+        if loaded_ids.contains(skill_id) {
+            return Ok(());
+        }
+
+        Err(ToolError::Execution(format!(
+            "Skill '{skill_id}' has not been loaded in this session. Call load_skill first."
+        )))
+    }
+
+    async fn mark_skill_loaded(
+        &self,
+        skill_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<(), ToolError> {
+        let Some(session_id) = session_id else {
+            return Err(ToolError::Execution(
+                "load_skill requires a session_id in tool context".to_string(),
+            ));
+        };
+
+        let mut session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(session_id).cloned()
+        };
+
+        if session.is_none() {
+            session = self
+                .storage
+                .load_session(session_id)
+                .await
+                .map_err(|error| {
+                    ToolError::Execution(format!(
+                    "Failed to load session '{session_id}' while persisting loaded skill: {error}"
+                ))
+                })?;
+        }
+
+        let Some(mut session) = session else {
+            return Err(ToolError::Execution(format!(
+                "Session '{session_id}' not found while persisting loaded skill state"
+            )));
+        };
+
+        let mut loaded_ids = session
+            .metadata
+            .get(LOADED_SKILL_IDS_METADATA_KEY)
+            .map(|raw| parse_loaded_skill_ids(raw))
+            .unwrap_or_default();
+        loaded_ids.insert(skill_id.to_string());
+
+        session.metadata.insert(
+            LOADED_SKILL_IDS_METADATA_KEY.to_string(),
+            serialize_loaded_skill_ids(&loaded_ids),
+        );
+        session.metadata.insert(
+            LAST_LOADED_SKILL_ID_METADATA_KEY.to_string(),
+            skill_id.to_string(),
+        );
+
+        self.storage.save_session(&session).await.map_err(|error| {
+            ToolError::Execution(format!(
+                "Failed to save session '{session_id}' after load_skill: {error}"
+            ))
+        })?;
+
+        let mut sessions = self.sessions.write().await;
+        sessions.insert(session_id.to_string(), session);
+
+        Ok(())
     }
 
     async fn skill_root(
@@ -191,13 +320,15 @@ impl Tool for LoadSkillTool {
             .access
             .skill_root(skill_id, skill_mode.as_deref())
             .await?;
-
         let resources = list_skill_resource_paths(&skill_root).map_err(|err| {
             ToolError::Execution(format!("Failed to list skill resources: {err}"))
         })?;
         let canonical_skill_root = tokio::fs::canonicalize(&skill_root)
             .await
             .unwrap_or(skill_root);
+        self.access
+            .mark_skill_loaded(skill_id, ctx.session_id)
+            .await?;
 
         Ok(ToolResult {
             success: true,
@@ -301,6 +432,9 @@ impl Tool for ReadSkillResourceTool {
 
         self.access
             .ensure_skill_allowed(skill_id, ctx.session_id)
+            .await?;
+        self.access
+            .ensure_skill_loaded(skill_id, ctx.session_id)
             .await?;
         let skill_mode = self.access.selected_skill_mode(ctx.session_id).await;
 
@@ -499,7 +633,11 @@ fn display_relative_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_relative_resource_path, page_text_lines, truncate_text};
+    use super::{
+        normalize_relative_resource_path, page_text_lines, parse_loaded_skill_ids,
+        serialize_loaded_skill_ids, truncate_text,
+    };
+    use std::collections::HashSet;
     use std::path::Path;
 
     #[test]
@@ -537,5 +675,27 @@ mod tests {
         assert_eq!(start, 1);
         assert_eq!(end, 2);
         assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn parse_loaded_skill_ids_supports_json_and_csv() {
+        let from_json = parse_loaded_skill_ids(r#"["skill-b","skill-a","skill-a"]"#);
+        assert_eq!(from_json.len(), 2);
+        assert!(from_json.contains("skill-a"));
+        assert!(from_json.contains("skill-b"));
+
+        let from_csv = parse_loaded_skill_ids("skill-c, skill-d , skill-c");
+        assert_eq!(from_csv.len(), 2);
+        assert!(from_csv.contains("skill-c"));
+        assert!(from_csv.contains("skill-d"));
+    }
+
+    #[test]
+    fn serialize_loaded_skill_ids_is_stable_and_sorted() {
+        let mut ids = HashSet::new();
+        ids.insert("skill-b".to_string());
+        ids.insert("skill-a".to_string());
+
+        assert_eq!(serialize_loaded_skill_ids(&ids), r#"["skill-a","skill-b"]"#);
     }
 }
