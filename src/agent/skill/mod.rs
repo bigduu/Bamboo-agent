@@ -45,9 +45,16 @@ impl SkillManager {
     async fn list_skills_for_selection(
         &self,
         selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
     ) -> Vec<SkillDefinition> {
         // Reload to get latest skills.
-        let skills = self.store.list_skills(None, true).await;
+        let skills = if selected_skill_mode.is_some() {
+            self.store
+                .list_skills_for_mode(None, selected_skill_mode)
+                .await
+        } else {
+            self.store.list_skills(None, true).await
+        };
         let Some(selected_skill_ids) = selected_skill_ids else {
             return skills;
         };
@@ -88,15 +95,28 @@ impl SkillManager {
         &self,
         selected_skill_ids: Option<&[String]>,
     ) -> String {
-        let skills = self.list_skills_for_selection(selected_skill_ids).await;
+        self.build_skill_context_for_selection_with_mode(selected_skill_ids, None)
+            .await
+    }
+
+    /// Build system prompt context from a selected subset of skills with mode override.
+    pub async fn build_skill_context_for_selection_with_mode(
+        &self,
+        selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
+    ) -> String {
+        let skills = self
+            .list_skills_for_selection(selected_skill_ids, selected_skill_mode)
+            .await;
         tracing::info!(
-            "Building skill context with {} skill(s), selection_mode={}",
+            "Building skill context with {} skill(s), selection_mode={}, skill_mode={}",
             skills.len(),
             if selected_skill_ids.is_some() {
                 "selected"
             } else {
                 "all"
-            }
+            },
+            selected_skill_mode.unwrap_or("default"),
         );
         context::build_skill_context(&skills)
     }
@@ -111,7 +131,19 @@ impl SkillManager {
         &self,
         selected_skill_ids: Option<&[String]>,
     ) -> Vec<String> {
-        let skills = self.list_skills_for_selection(selected_skill_ids).await;
+        self.get_allowed_tools_for_selection_with_mode(selected_skill_ids, None)
+            .await
+    }
+
+    /// Get allowed tool refs from a selected subset of skills with mode override.
+    pub async fn get_allowed_tools_for_selection_with_mode(
+        &self,
+        selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
+    ) -> Vec<String> {
+        let skills = self
+            .list_skills_for_selection(selected_skill_ids, selected_skill_mode)
+            .await;
 
         let mut tools: Vec<String> = skills
             .into_iter()

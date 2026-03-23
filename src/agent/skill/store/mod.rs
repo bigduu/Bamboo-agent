@@ -104,8 +104,8 @@ pub struct SkillStore {
 }
 
 impl SkillStore {
-    fn normalized_active_mode(&self) -> Option<String> {
-        let raw = self.config.active_mode.as_deref()?.trim();
+    fn normalize_mode(raw_mode: Option<&str>) -> Option<String> {
+        let raw = raw_mode?.trim();
         if raw.is_empty() {
             return None;
         }
@@ -124,6 +124,11 @@ impl SkillStore {
         Some(normalized)
     }
 
+    fn effective_mode(&self, mode_override: Option<&str>) -> Option<String> {
+        Self::normalize_mode(mode_override)
+            .or_else(|| Self::normalize_mode(self.config.active_mode.as_deref()))
+    }
+
     fn sibling_skills_mode_dir(base_skills_dir: &Path, mode: &str) -> PathBuf {
         let parent = base_skills_dir
             .parent()
@@ -140,9 +145,9 @@ impl SkillStore {
         project_dir.join(".bamboo").join(format!("skills-{mode}"))
     }
 
-    fn discovery_dirs(&self) -> Vec<SkillDiscoveryDir> {
+    fn discovery_dirs_for_mode(&self, mode_override: Option<&str>) -> Vec<SkillDiscoveryDir> {
         let mut dirs = Vec::new();
-        let active_mode = self.normalized_active_mode();
+        let active_mode = self.effective_mode(mode_override);
 
         dirs.push(SkillDiscoveryDir {
             dir: self.config.skills_dir.clone(),
@@ -173,6 +178,61 @@ impl SkillStore {
         }
 
         dirs
+    }
+
+    fn resolve_from_loaded_records(
+        loaded_records: Vec<crate::agent::skill::store::storage::LoadedSkillRecord>,
+    ) -> (HashMap<SkillId, SkillDefinition>, HashMap<SkillId, PathBuf>) {
+        let mut resolved_skills: HashMap<SkillId, SkillDefinition> = HashMap::new();
+        let mut resolved_roots: HashMap<SkillId, PathBuf> = HashMap::new();
+        let mut resolved_meta: HashMap<SkillId, SkillCandidateMeta> = HashMap::new();
+
+        for record in loaded_records {
+            let skill_id = record.skill.id.clone();
+            let candidate_meta = SkillCandidateMeta {
+                source: record.source,
+                mode: record.mode.clone(),
+            };
+
+            let should_replace = resolved_meta
+                .get(&skill_id)
+                .is_some_and(|existing| Self::should_override_skill(existing, &candidate_meta));
+            let should_keep_existing = resolved_meta.contains_key(&skill_id) && !should_replace;
+
+            if should_keep_existing {
+                tracing::debug!(
+                    "Keeping existing skill '{}' over candidate from {:?} (mode={})",
+                    skill_id,
+                    candidate_meta.source,
+                    candidate_meta.mode.as_deref().unwrap_or("generic")
+                );
+                continue;
+            }
+
+            if should_replace {
+                tracing::info!(
+                    "Skill '{}' overridden by {:?} (mode={})",
+                    skill_id,
+                    candidate_meta.source,
+                    candidate_meta.mode.as_deref().unwrap_or("generic")
+                );
+            }
+
+            resolved_skills.insert(skill_id.clone(), record.skill);
+            resolved_roots.insert(skill_id.clone(), record.skill_root);
+            resolved_meta.insert(skill_id, candidate_meta);
+        }
+
+        (resolved_skills, resolved_roots)
+    }
+
+    async fn resolve_skills_maps_for_mode(
+        &self,
+        mode_override: Option<&str>,
+    ) -> SkillResult<(HashMap<SkillId, SkillDefinition>, HashMap<SkillId, PathBuf>)> {
+        let loaded_records =
+            load_skills_from_discovery_dirs(&self.discovery_dirs_for_mode(mode_override)).await?;
+        Ok(Self::resolve_from_loaded_records(loaded_records))
     }
 
     fn should_override_skill(
@@ -268,48 +328,7 @@ impl SkillStore {
     ///
     /// Returns `SkillError` if the skills directory cannot be read.
     async fn load(&self) -> SkillResult<usize> {
-        let loaded_records = load_skills_from_discovery_dirs(&self.discovery_dirs()).await?;
-
-        let mut resolved_skills: HashMap<SkillId, SkillDefinition> = HashMap::new();
-        let mut resolved_roots: HashMap<SkillId, PathBuf> = HashMap::new();
-        let mut resolved_meta: HashMap<SkillId, SkillCandidateMeta> = HashMap::new();
-
-        for record in loaded_records {
-            let skill_id = record.skill.id.clone();
-            let candidate_meta = SkillCandidateMeta {
-                source: record.source,
-                mode: record.mode.clone(),
-            };
-
-            let should_replace = resolved_meta
-                .get(&skill_id)
-                .is_some_and(|existing| Self::should_override_skill(existing, &candidate_meta));
-            let should_keep_existing = resolved_meta.contains_key(&skill_id) && !should_replace;
-
-            if should_keep_existing {
-                tracing::debug!(
-                    "Keeping existing skill '{}' over candidate from {:?} (mode={})",
-                    skill_id,
-                    candidate_meta.source,
-                    candidate_meta.mode.as_deref().unwrap_or("generic")
-                );
-                continue;
-            }
-
-            if should_replace {
-                tracing::info!(
-                    "Skill '{}' overridden by {:?} (mode={})",
-                    skill_id,
-                    candidate_meta.source,
-                    candidate_meta.mode.as_deref().unwrap_or("generic")
-                );
-            }
-
-            resolved_skills.insert(skill_id.clone(), record.skill);
-            resolved_roots.insert(skill_id.clone(), record.skill_root);
-            resolved_meta.insert(skill_id, candidate_meta);
-        }
-
+        let (resolved_skills, resolved_roots) = self.resolve_skills_maps_for_mode(None).await?;
         let count = resolved_skills.len();
         let mut skills = self.skills.write().await;
         let mut roots = self.skill_roots.write().await;
@@ -431,6 +450,36 @@ impl SkillStore {
         result
     }
 
+    /// List skills with an optional mode override (without mutating in-memory cache).
+    pub async fn list_skills_for_mode(
+        &self,
+        filter: Option<SkillFilter>,
+        mode_override: Option<&str>,
+    ) -> Vec<SkillDefinition> {
+        let (skills, _) = match self.resolve_skills_maps_for_mode(mode_override).await {
+            Ok(maps) => maps,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to resolve skills for mode {:?}: {}",
+                    mode_override,
+                    error
+                );
+                return Vec::new();
+            }
+        };
+
+        let mut result: Vec<SkillDefinition> = skills
+            .values()
+            .filter(|skill| match &filter {
+                Some(active_filter) => active_filter.matches(skill),
+                None => true,
+            })
+            .cloned()
+            .collect();
+        result.sort_by(|left, right| left.name.cmp(&right.name));
+        result
+    }
+
     /// Get a single skill by its ID.
     ///
     /// Retrieves a skill from the in-memory cache by its unique identifier.
@@ -461,9 +510,43 @@ impl SkillStore {
             .ok_or_else(|| SkillError::NotFound(id.to_string()))
     }
 
+    /// Get a skill by id with an optional mode override.
+    pub async fn get_skill_for_mode(
+        &self,
+        id: &str,
+        mode_override: Option<&str>,
+    ) -> SkillResult<SkillDefinition> {
+        if mode_override.is_none() {
+            return self.get_skill(id).await;
+        }
+
+        let (skills, _) = self.resolve_skills_maps_for_mode(mode_override).await?;
+        skills
+            .get(id)
+            .cloned()
+            .ok_or_else(|| SkillError::NotFound(id.to_string()))
+    }
+
     /// Get the root directory path for a loaded skill.
     pub async fn get_skill_root(&self, id: &str) -> SkillResult<PathBuf> {
         let roots = self.skill_roots.read().await;
+        roots
+            .get(id)
+            .cloned()
+            .ok_or_else(|| SkillError::NotFound(id.to_string()))
+    }
+
+    /// Get the root directory path for a loaded skill with an optional mode override.
+    pub async fn get_skill_root_for_mode(
+        &self,
+        id: &str,
+        mode_override: Option<&str>,
+    ) -> SkillResult<PathBuf> {
+        if mode_override.is_none() {
+            return self.get_skill_root(id).await;
+        }
+
+        let (_, roots) = self.resolve_skills_maps_for_mode(mode_override).await?;
         roots
             .get(id)
             .cloned()
@@ -1001,5 +1084,59 @@ Use this skill for testing.
             .await
             .expect("mode-target-skill must exist");
         assert_eq!(skill.description, "generic version");
+    }
+
+    #[tokio::test]
+    async fn get_skill_for_mode_overrides_cached_generic_selection() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_dir = directory.path().join("data");
+        let global_skills_dir = data_dir.join("skills");
+        let global_mode_skills_dir = data_dir.join("skills-code");
+
+        fs::create_dir_all(&global_skills_dir)
+            .await
+            .expect("create global skills dir");
+        fs::create_dir_all(&global_mode_skills_dir)
+            .await
+            .expect("create global mode skills dir");
+
+        write_skill(
+            &global_skills_dir,
+            "mode-target-skill",
+            "generic version",
+            "Generic prompt",
+        )
+        .await
+        .expect("write generic skill");
+        write_skill(
+            &global_mode_skills_dir,
+            "mode-target-skill",
+            "mode version",
+            "Mode prompt",
+        )
+        .await
+        .expect("write mode skill");
+
+        let config = SkillStoreConfig {
+            skills_dir: global_skills_dir,
+            project_dir: None,
+            active_mode: None,
+        };
+        let store = SkillStore::new(config);
+        store.initialize().await.expect("initialize");
+
+        // Cached default view stays generic because no active_mode is configured.
+        let generic = store
+            .get_skill("mode-target-skill")
+            .await
+            .expect("generic skill exists");
+        assert_eq!(generic.description, "generic version");
+
+        // Per-call mode override should resolve the mode-specific variant.
+        let mode_specific = store
+            .get_skill_for_mode("mode-target-skill", Some("code"))
+            .await
+            .expect("mode-specific skill exists");
+        assert_eq!(mode_specific.description, "mode version");
     }
 }

@@ -8,7 +8,7 @@ use super::{
     session_state::{
         consume_pending_ask_user_resume, has_pending_user_message,
         initial_user_message_for_session, selected_skill_ids_for_session,
-        system_prompt_for_session,
+        selected_skill_mode_for_session, system_prompt_for_session,
     },
 };
 
@@ -89,6 +89,22 @@ fn selected_skill_ids_for_session_parses_metadata_json() {
     assert_eq!(
         selected_skill_ids_for_session(&session),
         Some(vec!["pdf".to_string(), "skill-creator".to_string()])
+    );
+}
+
+#[test]
+fn selected_skill_mode_for_session_prefers_skill_mode_key() {
+    let mut session = Session::new("session-1", "gpt-4o-mini");
+    session
+        .metadata
+        .insert("mode".to_string(), "ask".to_string());
+    session
+        .metadata
+        .insert("skill_mode".to_string(), "code".to_string());
+
+    assert_eq!(
+        selected_skill_mode_for_session(&session).as_deref(),
+        Some("code")
     );
 }
 

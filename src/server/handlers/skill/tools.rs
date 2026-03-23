@@ -27,10 +27,14 @@ pub async fn get_filtered_tools(
 ) -> Result<HttpResponse, AppError> {
     let session_id = resolve_session_identifier(&query);
     let selected_skill_ids = selected_skill_ids_for_session(state.get_ref(), session_id).await;
+    let selected_skill_mode = selected_skill_mode_for_session(state.get_ref(), session_id).await;
     let allowed_tools = state
         .skill_manager
         .as_ref()
-        .get_allowed_tools_for_selection(selected_skill_ids.as_deref())
+        .get_allowed_tools_for_selection_with_mode(
+            selected_skill_ids.as_deref(),
+            selected_skill_mode.as_deref(),
+        )
         .await;
     debug!("Skill filtered tools allowed list: {:?}", allowed_tools);
 
@@ -69,6 +73,34 @@ async fn selected_skill_ids_for_session(
         .metadata
         .get("selected_skill_ids")
         .and_then(|raw| crate::agent::skill::selection::parse_selected_skill_ids_metadata(raw))
+}
+
+async fn selected_skill_mode_for_session(
+    state: &AppState,
+    session_id: Option<&str>,
+) -> Option<String> {
+    let session_id = session_id?;
+
+    let in_memory = {
+        let sessions = state.sessions.read().await;
+        sessions.get(session_id).cloned()
+    };
+
+    let session = match in_memory {
+        Some(session) => Some(session),
+        None => state.storage.load_session(session_id).await.ok().flatten(),
+    }?;
+
+    let mode = session
+        .metadata
+        .get("skill_mode")
+        .or_else(|| session.metadata.get("mode"))?;
+    let trimmed = mode.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 pub(super) fn select_tools_by_allowlist(

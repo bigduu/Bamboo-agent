@@ -37,6 +37,11 @@ pub struct AgentLoopConfig {
     /// Optional explicit skill selection for this execution.
     /// When set, only these skill IDs are considered for skill context and allowlists.
     pub selected_skill_ids: Option<Vec<String>>,
+    /// Optional active skill mode for this execution.
+    ///
+    /// When set, skill discovery prefers `skills-<mode>` directories over generic
+    /// directories for the same skill id.
+    pub selected_skill_mode: Option<String>,
     pub additional_tool_schemas: Vec<ToolSchema>,
     pub tool_registry: Arc<ToolRegistry>,
     pub composition_executor: Option<Arc<CompositionExecutor>>,
@@ -76,6 +81,7 @@ impl Default for AgentLoopConfig {
             max_rounds: 200,
             system_prompt: None,
             selected_skill_ids: None,
+            selected_skill_mode: None,
             additional_tool_schemas: Vec::new(),
             tool_registry: Arc::new(ToolRegistry::new()),
             composition_executor: None,

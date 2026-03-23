@@ -13,6 +13,10 @@ fn agent_loop_config_model_name_defaults_to_none() {
         config.selected_skill_ids.is_none(),
         "selected_skill_ids should default to None"
     );
+    assert!(
+        config.selected_skill_mode.is_none(),
+        "selected_skill_mode should default to None"
+    );
 }
 
 #[test]

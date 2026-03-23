@@ -63,3 +63,16 @@ pub(super) fn selected_skill_ids_for_session(session: &Session) -> Option<Vec<St
         .get("selected_skill_ids")
         .and_then(|raw| crate::agent::skill::selection::parse_selected_skill_ids_metadata(raw))
 }
+
+pub(super) fn selected_skill_mode_for_session(session: &Session) -> Option<String> {
+    let value = session
+        .metadata
+        .get("skill_mode")
+        .or_else(|| session.metadata.get("mode"))?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}

@@ -73,6 +73,7 @@ fn execute_request_requires_model() {
 fn execute_request_empty_model_fails_validation() {
     let request = ExecuteRequest {
         model: "   ".to_string(),
+        skill_mode: None,
         reasoning_effort: None,
     };
 

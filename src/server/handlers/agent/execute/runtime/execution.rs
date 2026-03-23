@@ -15,7 +15,8 @@ use crate::{
 };
 
 use super::session_state::{
-    initial_user_message_for_session, selected_skill_ids_for_session, system_prompt_for_session,
+    initial_user_message_for_session, selected_skill_ids_for_session,
+    selected_skill_mode_for_session, system_prompt_for_session,
 };
 
 pub(in crate::server::handlers::agent::execute) struct SpawnAgentExecution {
@@ -59,6 +60,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
         let system_prompt = system_prompt_for_session(&session);
         let initial_message = initial_user_message_for_session(&session);
         let selected_skill_ids = selected_skill_ids_for_session(&session);
+        let selected_skill_mode = selected_skill_mode_for_session(&session);
 
         // Use child tool set for child sessions (no spawn schemas), otherwise root tools.
         let tools = if is_child_session {
@@ -108,6 +110,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
                 max_rounds: 200,
                 system_prompt,
                 selected_skill_ids,
+                selected_skill_mode,
                 skill_manager: Some(state.skill_manager.clone()),
                 skip_initial_user_message: true,
                 storage: Some(storage),

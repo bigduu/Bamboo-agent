@@ -14,6 +14,7 @@ use crate::agent::core::Session;
 use crate::agent::skill::SkillManager;
 
 const SELECTED_SKILL_IDS_METADATA_KEY: &str = "selected_skill_ids";
+const SELECTED_SKILL_MODE_METADATA_KEY: &str = "skill_mode";
 const MAX_RESOURCE_CONTENT_CHARS: usize = 50_000;
 
 #[derive(Clone)]
@@ -36,7 +37,7 @@ impl SkillToolAccess {
         }
     }
 
-    async fn selected_skill_allowlist(&self, session_id: Option<&str>) -> Option<HashSet<String>> {
+    async fn session_for_context(&self, session_id: Option<&str>) -> Option<Session> {
         let session_id = session_id?;
 
         let in_memory = {
@@ -44,10 +45,14 @@ impl SkillToolAccess {
             sessions.get(session_id).cloned()
         };
 
-        let session = match in_memory {
+        match in_memory {
             Some(session) => Some(session),
             None => self.storage.load_session(session_id).await.ok().flatten(),
-        }?;
+        }
+    }
+
+    async fn selected_skill_allowlist(&self, session_id: Option<&str>) -> Option<HashSet<String>> {
+        let session = self.session_for_context(session_id).await?;
 
         let selected = session
             .metadata
@@ -57,6 +62,20 @@ impl SkillToolAccess {
             })?;
 
         Some(selected.into_iter().collect())
+    }
+
+    async fn selected_skill_mode(&self, session_id: Option<&str>) -> Option<String> {
+        let session = self.session_for_context(session_id).await?;
+        let mode = session
+            .metadata
+            .get(SELECTED_SKILL_MODE_METADATA_KEY)
+            .or_else(|| session.metadata.get("mode"))?;
+        let trimmed = mode.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     }
 
     async fn ensure_skill_allowed(
@@ -77,10 +96,14 @@ impl SkillToolAccess {
         )))
     }
 
-    async fn skill_root(&self, skill_id: &str) -> Result<PathBuf, ToolError> {
+    async fn skill_root(
+        &self,
+        skill_id: &str,
+        skill_mode: Option<&str>,
+    ) -> Result<PathBuf, ToolError> {
         self.skill_manager
             .store()
-            .get_skill_root(skill_id)
+            .get_skill_root_for_mode(skill_id, skill_mode)
             .await
             .map_err(|err| ToolError::Execution(format!("Failed to resolve skill root: {err}")))
     }
@@ -153,17 +176,21 @@ impl Tool for LoadSkillTool {
         self.access
             .ensure_skill_allowed(skill_id, ctx.session_id)
             .await?;
+        let skill_mode = self.access.selected_skill_mode(ctx.session_id).await;
 
         let skill = self
             .access
             .skill_manager
             .store()
-            .get_skill(skill_id)
+            .get_skill_for_mode(skill_id, skill_mode.as_deref())
             .await
             .map_err(|err| {
                 ToolError::Execution(format!("Failed to load skill '{skill_id}': {err}"))
             })?;
-        let skill_root = self.access.skill_root(skill_id).await?;
+        let skill_root = self
+            .access
+            .skill_root(skill_id, skill_mode.as_deref())
+            .await?;
 
         let resources = list_skill_resource_paths(&skill_root).map_err(|err| {
             ToolError::Execution(format!("Failed to list skill resources: {err}"))
@@ -275,6 +302,7 @@ impl Tool for ReadSkillResourceTool {
         self.access
             .ensure_skill_allowed(skill_id, ctx.session_id)
             .await?;
+        let skill_mode = self.access.selected_skill_mode(ctx.session_id).await;
 
         let resource_path = normalize_relative_resource_path(&parsed.resource_path)?;
         if resource_path == Path::new("SKILL.md") {
@@ -284,7 +312,10 @@ impl Tool for ReadSkillResourceTool {
             ));
         }
 
-        let skill_root = self.access.skill_root(skill_id).await?;
+        let skill_root = self
+            .access
+            .skill_root(skill_id, skill_mode.as_deref())
+            .await?;
         let canonical_root = tokio::fs::canonicalize(&skill_root).await.map_err(|_| {
             ToolError::Execution(format!(
                 "Skill directory not found for '{skill_id}'. Load the skill list first."

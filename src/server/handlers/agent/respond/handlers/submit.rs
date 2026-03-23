@@ -141,6 +141,7 @@ async fn trigger_auto_resume_if_requested(
         web::Path::from(session_id.to_string()),
         web::Json(crate::server::handlers::agent::execute::ExecuteRequest {
             model,
+            skill_mode: None,
             reasoning_effort,
         }),
     )

@@ -86,6 +86,7 @@ pub async fn handler(
         Err(response) => return response,
     };
     let request_reasoning_effort = req.reasoning_effort;
+    let request_skill_mode = req.skill_mode.clone();
 
     tracing::debug!(
         "[{}] Execute request received with model: {}",
@@ -144,6 +145,17 @@ pub async fn handler(
     } else {
         session.metadata.remove("reasoning_effort");
         session.metadata.remove("reasoning_effort_source");
+    }
+
+    if let Some(skill_mode) = request_skill_mode {
+        let trimmed = skill_mode.trim();
+        if trimmed.is_empty() {
+            session.metadata.remove("skill_mode");
+        } else {
+            session
+                .metadata
+                .insert("skill_mode".to_string(), trimmed.to_string());
+        }
     }
 
     // Stable, long-lived session event sender (also used for background jobs).

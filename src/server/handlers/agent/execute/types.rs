@@ -41,6 +41,11 @@ pub struct ExecuteResponse {
 pub struct ExecuteRequest {
     /// Model to use for execution (required)
     pub model: String,
+    /// Optional per-execution skill mode override (for example: "code", "ask").
+    ///
+    /// When provided, skill discovery prefers `skills-<mode>` directories.
+    #[serde(default)]
+    pub skill_mode: Option<String>,
     /// Optional reasoning effort override for this execution.
     ///
     /// When omitted, the active provider default from config is used.
@@ -84,6 +89,7 @@ mod tests {
         let req: ExecuteRequest = serde_json::from_str(json).unwrap();
 
         assert_eq!(req.model, "claude-3-opus");
+        assert!(req.skill_mode.is_none());
         assert!(req.reasoning_effort.is_none());
     }
 
@@ -93,7 +99,17 @@ mod tests {
         let req: ExecuteRequest = serde_json::from_str(json).unwrap();
 
         assert_eq!(req.model, "claude-3-opus");
+        assert!(req.skill_mode.is_none());
         assert!(req.reasoning_effort.is_some());
+    }
+
+    #[test]
+    fn test_execute_request_with_skill_mode() {
+        let json = r#"{"model":"claude-3-opus","skill_mode":"code"}"#;
+        let req: ExecuteRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(req.model, "claude-3-opus");
+        assert_eq!(req.skill_mode.as_deref(), Some("code"));
     }
 
     #[test]
