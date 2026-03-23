@@ -31,14 +31,8 @@ pub(crate) fn compress(raw_result: &str) -> CompressionResult {
         }
     };
 
-    let stdout = parsed
-        .get("stdout")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let stderr = parsed
-        .get("stderr")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let stdout = parsed.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+    let stderr = parsed.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
 
     // Stage 1: Strip ANSI
     let clean_stdout = filters::strip_ansi(stdout);
@@ -85,8 +79,7 @@ pub(crate) fn compress(raw_result: &str) -> CompressionResult {
         );
     }
 
-    let compressed =
-        serde_json::to_string(&obj).unwrap_or_else(|_| raw_result.to_string());
+    let compressed = serde_json::to_string(&obj).unwrap_or_else(|_| raw_result.to_string());
 
     CompressionResult {
         compressed,

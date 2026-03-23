@@ -68,15 +68,15 @@ fn compress_grep_output(text: &str) -> String {
     for line in &lines {
         // Try to extract file path from the line
         if let Some(cap) = GREP_FILE_LINE_RE.captures(line) {
-            let file = cap.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+            let file = cap
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
 
             if Some(&file) != current_file.as_ref() {
                 // Flush hidden count for previous file
                 if hidden_count > 0 {
-                    result.push_str(&format!(
-                        "  ... ({} more matches hidden)\n",
-                        hidden_count
-                    ));
+                    result.push_str(&format!("  ... ({} more matches hidden)\n", hidden_count));
                     hidden_count = 0;
                 }
                 current_file = Some(file);
@@ -94,10 +94,7 @@ fn compress_grep_output(text: &str) -> String {
         } else {
             // Non-match lines (e.g., context separators `--`)
             if hidden_count > 0 {
-                result.push_str(&format!(
-                    "  ... ({} more matches hidden)\n",
-                    hidden_count
-                ));
+                result.push_str(&format!("  ... ({} more matches hidden)\n", hidden_count));
                 hidden_count = 0;
             }
             result.push_str(line);
@@ -107,10 +104,7 @@ fn compress_grep_output(text: &str) -> String {
 
     // Final flush
     if hidden_count > 0 {
-        result.push_str(&format!(
-            "  ... ({} more matches hidden)\n",
-            hidden_count
-        ));
+        result.push_str(&format!("  ... ({} more matches hidden)\n", hidden_count));
     }
 
     result

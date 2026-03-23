@@ -137,22 +137,13 @@ pub(crate) fn compress(raw_result: &str) -> CompressionResult {
         Err(_) => return compress_plain_package_text(raw_result),
     };
 
-    let stdout = parsed
-        .get("stdout")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let stderr = parsed
-        .get("stderr")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let stdout = parsed.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+    let stderr = parsed.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
     let exit_code = parsed
         .get("exit_code")
         .and_then(|v| v.as_i64())
         .unwrap_or(-1);
-    let command = parsed
-        .get("command")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let command = parsed.get("command").and_then(|v| v.as_str()).unwrap_or("");
 
     let clean_stdout = filters::strip_ansi(stdout);
     let clean_stderr = filters::strip_ansi(stderr);
@@ -244,17 +235,15 @@ fn compress_npm(
 
     if exit_code == 0 {
         // Extract summary info
-        let added = NPM_ADDED_RE
-            .captures(combined)
-            .map(|c| {
-                let pkgs = &c[1];
-                let time = c.get(2).map(|m| m.as_str()).unwrap_or("");
-                if time.is_empty() {
-                    format!("added {} packages", pkgs)
-                } else {
-                    format!("added {} packages in {}", pkgs, time)
-                }
-            });
+        let added = NPM_ADDED_RE.captures(combined).map(|c| {
+            let pkgs = &c[1];
+            let time = c.get(2).map(|m| m.as_str()).unwrap_or("");
+            if time.is_empty() {
+                format!("added {} packages", pkgs)
+            } else {
+                format!("added {} packages in {}", pkgs, time)
+            }
+        });
 
         let audit = NPM_AUDIT_RE
             .captures(combined)
@@ -415,10 +404,7 @@ fn extract_rust_warnings(text: &str) -> String {
 }
 
 /// For failed installs: keep error/warning lines, drop progress noise.
-fn compress_keeping_important_lines(
-    text: &str,
-    original: &serde_json::Value,
-) -> CompressionResult {
+fn compress_keeping_important_lines(text: &str, original: &serde_json::Value) -> CompressionResult {
     let mut result = String::new();
 
     for line in text.lines() {
@@ -513,14 +499,20 @@ fn compress_composer(
 
     let mut result = String::new();
     if exit_code == 0 {
-        result.push_str(&format!("✅ composer: {} packages installed", install_count));
+        result.push_str(&format!(
+            "✅ composer: {} packages installed",
+            install_count
+        ));
     } else {
         result.push_str(&format!("❌ composer failed ({} packages)", install_count));
     }
     result.push('\n');
 
     if noise_count > 0 {
-        result.push_str(&format!("[{} download/progress lines stripped]\n", noise_count));
+        result.push_str(&format!(
+            "[{} download/progress lines stripped]\n",
+            noise_count
+        ));
     }
 
     let warnings = extract_warnings(combined);
@@ -551,7 +543,10 @@ fn compress_bundler(
             deps, gems
         ));
     } else if exit_code == 0 {
-        result.push_str(&format!("✅ bundle install complete ({} fetched)\n", fetch_count));
+        result.push_str(&format!(
+            "✅ bundle install complete ({} fetched)\n",
+            fetch_count
+        ));
     } else {
         result.push_str("❌ bundle install failed\n");
     }
@@ -604,9 +599,15 @@ fn compress_dotnet_restore(
 
     let mut result = String::new();
     if exit_code == 0 {
-        result.push_str(&format!("✅ dotnet restore: {} projects restored\n", restore_count));
+        result.push_str(&format!(
+            "✅ dotnet restore: {} projects restored\n",
+            restore_count
+        ));
     } else {
-        result.push_str(&format!("❌ dotnet restore failed ({} partial)\n", restore_count));
+        result.push_str(&format!(
+            "❌ dotnet restore failed ({} partial)\n",
+            restore_count
+        ));
     }
 
     // Keep error lines
@@ -855,8 +856,12 @@ Package manifest generated successfully.
         let input = make_bash_json("composer install", stdout, "", 0);
         let result = compress(&input);
         assert!(result.was_compressed);
-        assert!(result.compressed.contains("✅ composer: 4 packages installed"));
-        assert!(result.compressed.contains("download/progress lines stripped"));
+        assert!(result
+            .compressed
+            .contains("✅ composer: 4 packages installed"));
+        assert!(result
+            .compressed
+            .contains("download/progress lines stripped"));
     }
 
     // ── Bundler tests ──
@@ -878,7 +883,9 @@ Bundle complete! 42 Gemfile dependencies, 120 gems now installed.
         let input = make_bash_json("bundle install", stdout, "", 0);
         let result = compress(&input);
         assert!(result.was_compressed);
-        assert!(result.compressed.contains("✅ bundle: 42 dependencies, 120 gems installed"));
+        assert!(result
+            .compressed
+            .contains("✅ bundle: 42 dependencies, 120 gems installed"));
     }
 
     // ── Gradle deps tests ──
@@ -914,6 +921,8 @@ Bundle complete! 42 Gemfile dependencies, 120 gems now installed.
         let input = make_bash_json("dotnet restore", stdout, "", 0);
         let result = compress(&input);
         assert!(result.was_compressed);
-        assert!(result.compressed.contains("✅ dotnet restore: 3 projects restored"));
+        assert!(result
+            .compressed
+            .contains("✅ dotnet restore: 3 projects restored"));
     }
 }

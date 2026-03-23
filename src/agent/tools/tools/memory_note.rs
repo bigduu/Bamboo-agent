@@ -145,9 +145,7 @@ impl Tool for MemoryNoteTool {
                 let topics = memory
                     .list_topics(session_id)
                     .await
-                    .map_err(|e| {
-                        ToolError::Execution(format!("Failed to list topics: {e}"))
-                    })?;
+                    .map_err(|e| ToolError::Execution(format!("Failed to list topics: {e}")))?;
                 Ok(ToolResult {
                     success: true,
                     result: json!({

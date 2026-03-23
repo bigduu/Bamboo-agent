@@ -33,14 +33,8 @@ pub(crate) fn compress(raw_result: &str) -> CompressionResult {
         }
     };
 
-    let stdout = parsed
-        .get("stdout")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let stderr = parsed
-        .get("stderr")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let stdout = parsed.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+    let stderr = parsed.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
     let exit_code = parsed
         .get("exit_code")
         .and_then(|v| v.as_i64())
@@ -66,7 +60,8 @@ pub(crate) fn compress(raw_result: &str) -> CompressionResult {
     }
 
     // Fallback: ANSI strip + line cap (for unrecognized test runners)
-    let (capped_stdout, stdout_capped) = filters::cap_lines(&clean_stdout, filters::DEFAULT_MAX_LINES);
+    let (capped_stdout, stdout_capped) =
+        filters::cap_lines(&clean_stdout, filters::DEFAULT_MAX_LINES);
     let (capped_stderr, stderr_capped) = filters::cap_lines(&clean_stderr, 50);
 
     if !stdout_capped && !stderr_capped {
@@ -208,11 +203,7 @@ fn parse_cargo_summaries(text: &str) -> Vec<CargoTestSummary> {
 
 /// Attempt to compress cargo test output. Returns `Some((new_stdout, new_stderr))`
 /// if this looks like cargo test output, `None` otherwise.
-fn try_compress_cargo_test(
-    stdout: &str,
-    stderr: &str,
-    exit_code: i64,
-) -> Option<(String, String)> {
+fn try_compress_cargo_test(stdout: &str, stderr: &str, exit_code: i64) -> Option<(String, String)> {
     // Check that this actually looks like cargo test output
     let combined = format!("{}\n{}", stdout, stderr);
     let summaries = parse_cargo_summaries(&combined);
@@ -225,10 +216,7 @@ fn try_compress_cargo_test(
     let total_ignored: u32 = summaries.iter().map(|s| s.ignored).sum();
 
     // Grab the last time string (overall time)
-    let time_str = summaries
-        .last()
-        .map(|s| s.time_str.as_str())
-        .unwrap_or("");
+    let time_str = summaries.last().map(|s| s.time_str.as_str()).unwrap_or("");
 
     if total_failed == 0 && exit_code == 0 {
         // ✅ All pass → extreme compression
@@ -323,11 +311,7 @@ fn compress_failing_test_output(stdout: &str) -> String {
 
 // ── pytest Handler ──────────────────────────────────────────────────────────
 
-fn try_compress_pytest(
-    stdout: &str,
-    stderr: &str,
-    exit_code: i64,
-) -> Option<(String, String)> {
+fn try_compress_pytest(stdout: &str, stderr: &str, exit_code: i64) -> Option<(String, String)> {
     let combined = format!("{}\n{}", stdout, stderr);
 
     // Detect pytest output by its distinctive summary line
@@ -342,7 +326,10 @@ fn try_compress_pytest(
     let mut skipped: u32 = 0;
 
     for cap in PYTEST_COUNTS_RE.captures_iter(summary_text) {
-        let count: u32 = cap.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+        let count: u32 = cap
+            .get(1)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
         match cap.get(2).map(|m| m.as_str()) {
             Some("passed") => passed = count,
             Some("failed") => failed = count,
@@ -413,11 +400,7 @@ fn try_compress_pytest(
 
 // ── Jest / Vitest Handler ───────────────────────────────────────────────────
 
-fn try_compress_jest(
-    stdout: &str,
-    stderr: &str,
-    exit_code: i64,
-) -> Option<(String, String)> {
+fn try_compress_jest(stdout: &str, stderr: &str, exit_code: i64) -> Option<(String, String)> {
     // Jest can output to either stdout or stderr depending on runner/config
     let combined = format!("{}\n{}", stdout, stderr);
 
@@ -434,7 +417,10 @@ fn try_compress_jest(
     let mut passed: u32 = 0;
     let mut failed: u32 = 0;
     for cap in JEST_COUNT_RE.captures_iter(tests_text) {
-        let count: u32 = cap.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+        let count: u32 = cap
+            .get(1)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
         match cap.get(2).map(|m| m.as_str()) {
             Some("passed") => passed = count,
             Some("failed") => failed = count,
@@ -506,11 +492,7 @@ fn try_compress_jest(
 
 // ── Go test Handler ─────────────────────────────────────────────────────────
 
-fn try_compress_go_test(
-    stdout: &str,
-    stderr: &str,
-    exit_code: i64,
-) -> Option<(String, String)> {
+fn try_compress_go_test(stdout: &str, stderr: &str, exit_code: i64) -> Option<(String, String)> {
     let combined = format!("{}\n{}", stdout, stderr);
 
     // Detect Go test by its result lines
@@ -574,7 +556,10 @@ fn try_compress_go_test(
 
         // End section on next `--- PASS/FAIL` or package result
         if in_fail_section {
-            if GO_TEST_LINE_RE.is_match(trimmed) || GO_TEST_OK_RE.is_match(trimmed) || GO_TEST_FAIL_RE.is_match(trimmed) {
+            if GO_TEST_LINE_RE.is_match(trimmed)
+                || GO_TEST_OK_RE.is_match(trimmed)
+                || GO_TEST_FAIL_RE.is_match(trimmed)
+            {
                 in_fail_section = false;
             }
         }
@@ -601,11 +586,7 @@ fn try_compress_go_test(
 
 // ── Maven Surefire Handler ──────────────────────────────────────────────────
 
-fn try_compress_surefire(
-    stdout: &str,
-    stderr: &str,
-    _exit_code: i64,
-) -> Option<(String, String)> {
+fn try_compress_surefire(stdout: &str, stderr: &str, _exit_code: i64) -> Option<(String, String)> {
     let combined = format!("{}\n{}", stdout, stderr);
 
     // Detect Surefire output by its summary line

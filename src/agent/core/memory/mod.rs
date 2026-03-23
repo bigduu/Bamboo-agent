@@ -176,11 +176,7 @@ impl ExternalMemory {
     }
 
     /// Read a note for a specific topic.
-    pub async fn read_topic(
-        &self,
-        session_id: &str,
-        topic: &str,
-    ) -> io::Result<Option<String>> {
+    pub async fn read_topic(&self, session_id: &str, topic: &str) -> io::Result<Option<String>> {
         self.maybe_migrate_legacy(session_id).await?;
         let path = self.topic_path(session_id, topic)?;
         if !path.exists() {
@@ -453,7 +449,9 @@ mod tests {
 
         // Simulate legacy: create {notes_dir}/session-1.md directly
         let legacy_path = dir.path().join("session-1.md");
-        tokio::fs::write(&legacy_path, "legacy content").await.unwrap();
+        tokio::fs::write(&legacy_path, "legacy content")
+            .await
+            .unwrap();
 
         // Reading should trigger migration
         let content = memory.read_note("session-1").await.unwrap();
@@ -526,14 +524,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let memory = ExternalMemory::new(dir.path());
 
-        memory
-            .save_topic("s1", "notes", "first")
-            .await
-            .unwrap();
-        memory
-            .append_topic("s1", "notes", "second")
-            .await
-            .unwrap();
+        memory.save_topic("s1", "notes", "first").await.unwrap();
+        memory.append_topic("s1", "notes", "second").await.unwrap();
 
         let content = memory.read_topic("s1", "notes").await.unwrap();
         assert_eq!(content, Some("first\n\nsecond".to_string()));

@@ -17,6 +17,7 @@ mod execution_paths;
 mod loop_state;
 mod output_compressor;
 mod per_call;
+mod policy;
 mod task;
 pub(crate) mod tool_error_collector;
 
@@ -60,6 +61,95 @@ pub(super) struct RoundToolExecutionResult {
     pub round_error: Option<String>,
 }
 
+struct SingleToolExecutionControl {
+    should_break: bool,
+    stop_round: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_and_apply_single_tool_call(
+    tool_call: &ToolCall,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    metrics_collector: Option<&MetricsCollector>,
+    session_id: &str,
+    round_id: &str,
+    round: usize,
+    session: &mut Session,
+    tools: &Arc<dyn ToolExecutor>,
+    config: &AgentLoopConfig,
+    task_context: &mut Option<TaskLoopContext>,
+    state: &mut RoundExecutionState,
+    policy_guard: &mut policy::ToolPolicyGuard,
+    reserved_calls: usize,
+) -> SingleToolExecutionControl {
+    let mut stop_round = false;
+    let outcome = match policy_guard.check_before_execution(tool_call, reserved_calls) {
+        Ok(()) => {
+            per_call::execute_tool_call_only(per_call::ToolExecutionOnlyContext {
+                tool_call,
+                event_tx,
+                metrics_collector,
+                session_id,
+                round_id,
+                round,
+                tools,
+                config,
+            })
+            .await
+        }
+        Err(violation) => {
+            stop_round = violation.should_stop_round();
+            let message = violation.into_message();
+            tracing::warn!(
+                "[{}][round:{}] Tool call blocked by policy before execution: tool_call_id={}, tool_name={}, error={}",
+                session_id,
+                round,
+                tool_call.id,
+                tool_call.function.name,
+                message
+            );
+            per_call::ToolExecutionOutcome {
+                result: Err(message),
+                tool_duration: std::time::Duration::ZERO,
+            }
+        }
+    };
+
+    policy_guard.observe_outcome(tool_call, &outcome.result);
+
+    // Compress tool output before applying
+    let outcome = output_compressor::maybe_compress(
+        &tool_call.function.name,
+        &tool_call.function.arguments,
+        session_id,
+        outcome,
+    )
+    .await;
+
+    let should_break = per_call::apply_tool_execution_outcome(
+        per_call::ToolExecutionApplyContext {
+            tool_call,
+            event_tx,
+            metrics_collector,
+            session_id,
+            round_id,
+            round,
+            session,
+            tools,
+            config,
+            task_context,
+            state,
+        },
+        outcome,
+    )
+    .await;
+
+    SingleToolExecutionControl {
+        should_break,
+        stop_round,
+    }
+}
+
 pub(super) async fn execute_round_tool_calls(
     tool_calls: &[ToolCall],
     event_tx: &mpsc::Sender<AgentEvent>,
@@ -73,6 +163,7 @@ pub(super) async fn execute_round_tool_calls(
     task_context: &mut Option<TaskLoopContext>,
 ) -> RoundToolExecutionResult {
     let mut state = RoundExecutionState::default();
+    let mut policy_guard = policy::ToolPolicyGuard::default();
 
     let mut next_index = 0usize;
     'tool_calls: while next_index < tool_calls.len() {
@@ -89,33 +180,15 @@ pub(super) async fn execute_round_tool_calls(
 
             let batch = &tool_calls[batch_start..next_index];
 
-            // Single parallel-safe tool: execute directly, skip join_all overhead
-            if batch.len() == 1 {
-                let outcome =
-                    per_call::execute_tool_call_only(per_call::ToolExecutionOnlyContext {
-                        tool_call: &batch[0],
-                        event_tx,
-                        metrics_collector,
-                        session_id,
-                        round_id,
-                        round,
-                        tools,
-                        config,
-                    })
-                    .await;
+            let policy_precheck_error = batch
+                .iter()
+                .enumerate()
+                .find_map(|(offset, call)| policy_guard.check_before_execution(call, offset).err());
 
-                // Compress tool output before applying
-                let outcome = output_compressor::maybe_compress(
-                    &batch[0].function.name,
-                    &batch[0].function.arguments,
-                    session_id,
-                    outcome,
-                )
-                .await;
-
-                let should_break = per_call::apply_tool_execution_outcome(
-                    per_call::ToolExecutionApplyContext {
-                        tool_call: &batch[0],
+            if policy_precheck_error.is_some() {
+                for batch_call in batch {
+                    let control = execute_and_apply_single_tool_call(
+                        batch_call,
                         event_tx,
                         metrics_collector,
                         session_id,
@@ -125,13 +198,39 @@ pub(super) async fn execute_round_tool_calls(
                         tools,
                         config,
                         task_context,
-                        state: &mut state,
-                    },
-                    outcome,
+                        &mut state,
+                        &mut policy_guard,
+                        0,
+                    )
+                    .await;
+
+                    if control.should_break || control.stop_round {
+                        break 'tool_calls;
+                    }
+                }
+                continue;
+            }
+
+            // Single parallel-safe tool: execute directly, skip join_all overhead
+            if batch.len() == 1 {
+                let control = execute_and_apply_single_tool_call(
+                    &batch[0],
+                    event_tx,
+                    metrics_collector,
+                    session_id,
+                    round_id,
+                    round,
+                    session,
+                    tools,
+                    config,
+                    task_context,
+                    &mut state,
+                    &mut policy_guard,
+                    0,
                 )
                 .await;
 
-                if should_break {
+                if control.should_break || control.stop_round {
                     break 'tool_calls;
                 }
                 continue;
@@ -184,9 +283,11 @@ pub(super) async fn execute_round_tool_calls(
                 individual_durations.join(", ")
             );
 
-            for (batch_call, outcome) in batch.iter().zip(outcomes.into_iter()) {
+            for (batch_call, mut outcome) in batch.iter().zip(outcomes.into_iter()) {
+                policy_guard.observe_outcome(batch_call, &outcome.result);
+
                 // Compress tool output before applying
-                let outcome = output_compressor::maybe_compress(
+                outcome = output_compressor::maybe_compress(
                     &batch_call.function.name,
                     &batch_call.function.arguments,
                     session_id,
@@ -220,7 +321,7 @@ pub(super) async fn execute_round_tool_calls(
             continue;
         }
 
-        let should_break = per_call::execute_single_tool_call(per_call::PerToolExecutionContext {
+        let control = execute_and_apply_single_tool_call(
             tool_call,
             event_tx,
             metrics_collector,
@@ -231,13 +332,15 @@ pub(super) async fn execute_round_tool_calls(
             tools,
             config,
             task_context,
-            state: &mut state,
-        })
+            &mut state,
+            &mut policy_guard,
+            0,
+        )
         .await;
 
         next_index += 1;
 
-        if should_break {
+        if control.should_break || control.stop_round {
             break;
         }
     }

@@ -12,6 +12,7 @@ use crate::agent::metrics::MetricsCollector;
 
 use super::execution_paths;
 use super::loop_state::RoundExecutionState;
+use super::policy;
 
 fn preview_for_log(value: &str, max_chars: usize) -> String {
     let mut iter = value.chars();
@@ -26,20 +27,6 @@ fn preview_for_log(value: &str, max_chars: usize) -> String {
         preview.push_str("...");
     }
     preview.replace('\n', "\\n").replace('\r', "\\r")
-}
-
-pub(super) struct PerToolExecutionContext<'a> {
-    pub tool_call: &'a ToolCall,
-    pub event_tx: &'a mpsc::Sender<AgentEvent>,
-    pub metrics_collector: Option<&'a MetricsCollector>,
-    pub session_id: &'a str,
-    pub round_id: &'a str,
-    pub round: usize,
-    pub session: &'a mut Session,
-    pub tools: &'a Arc<dyn ToolExecutor>,
-    pub config: &'a AgentLoopConfig,
-    pub task_context: &'a mut Option<TaskLoopContext>,
-    pub state: &'a mut RoundExecutionState,
 }
 
 pub(super) struct ToolExecutionOnlyContext<'a> {
@@ -75,6 +62,21 @@ pub(super) struct ToolExecutionOutcome {
 pub(super) async fn execute_tool_call_only(
     ctx: ToolExecutionOnlyContext<'_>,
 ) -> ToolExecutionOutcome {
+    if let Err(policy_error) = policy::validate_tool_call_arguments(ctx.tool_call) {
+        tracing::warn!(
+            "[{}][round:{}] Tool call blocked by strict argument policy before ToolStart: tool_call_id={}, tool_name={}, error={}",
+            ctx.session_id,
+            ctx.round,
+            ctx.tool_call.id,
+            ctx.tool_call.function.name,
+            policy_error
+        );
+        return ToolExecutionOutcome {
+            result: Err(policy_error),
+            tool_duration: std::time::Duration::ZERO,
+        };
+    }
+
     let raw_arguments = ctx.tool_call.function.arguments.trim();
     let (args, parse_warning) = parse_tool_args_best_effort(&ctx.tool_call.function.arguments);
     if let Some(warning) = parse_warning {
@@ -182,45 +184,4 @@ pub(super) async fn apply_tool_execution_outcome(
             false
         }
     }
-}
-
-pub(super) async fn execute_single_tool_call(ctx: PerToolExecutionContext<'_>) -> bool {
-    let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
-        tool_call: ctx.tool_call,
-        event_tx: ctx.event_tx,
-        metrics_collector: ctx.metrics_collector,
-        session_id: ctx.session_id,
-        round_id: ctx.round_id,
-        round: ctx.round,
-        tools: ctx.tools,
-        config: ctx.config,
-    })
-    .await;
-
-    // Compress tool output before it enters the session message list
-    let outcome = super::output_compressor::maybe_compress(
-        &ctx.tool_call.function.name,
-        &ctx.tool_call.function.arguments,
-        ctx.session_id,
-        outcome,
-    )
-    .await;
-
-    apply_tool_execution_outcome(
-        ToolExecutionApplyContext {
-            tool_call: ctx.tool_call,
-            event_tx: ctx.event_tx,
-            metrics_collector: ctx.metrics_collector,
-            session_id: ctx.session_id,
-            round_id: ctx.round_id,
-            round: ctx.round,
-            session: ctx.session,
-            tools: ctx.tools,
-            config: ctx.config,
-            task_context: ctx.task_context,
-            state: ctx.state,
-        },
-        outcome,
-    )
-    .await
 }

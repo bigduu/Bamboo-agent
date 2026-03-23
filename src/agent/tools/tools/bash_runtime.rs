@@ -136,6 +136,10 @@ pub async fn spawn_background(
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
+    // Inject user-managed environment variables from config.
+    for (key, value) in crate::core::Config::current_env_vars() {
+        cmd.env(&key, &value);
+    }
     cmd.arg(shell.arg)
         .arg(command)
         .stdin(Stdio::null())

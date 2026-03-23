@@ -246,7 +246,8 @@ pub(super) async fn maybe_compress(
     }
 
     // Tee-save full output when compression occurred.
-    let tee_note = tee::tee_save_if_needed(session_id, args_json, &original, &compressed.compressed).await;
+    let tee_note =
+        tee::tee_save_if_needed(session_id, args_json, &original, &compressed.compressed).await;
 
     // Replace result with compressed version (+ optional tee note).
     result.result = match tee_note {
@@ -358,7 +359,10 @@ mod tests {
 
     #[test]
     fn detect_webfetch_tool() {
-        assert_eq!(detect_scenario("WebFetch", "{}"), OutputScenario::WebFetchHtml);
+        assert_eq!(
+            detect_scenario("WebFetch", "{}"),
+            OutputScenario::WebFetchHtml
+        );
     }
 
     #[test]
@@ -366,13 +370,19 @@ mod tests {
         assert_eq!(detect_scenario("Edit", "{}"), OutputScenario::PassThrough);
         assert_eq!(detect_scenario("Write", "{}"), OutputScenario::PassThrough);
         assert_eq!(detect_scenario("Task", "{}"), OutputScenario::PassThrough);
-        assert_eq!(detect_scenario("ask_user", "{}"), OutputScenario::PassThrough);
+        assert_eq!(
+            detect_scenario("ask_user", "{}"),
+            OutputScenario::PassThrough
+        );
     }
 
     #[test]
     fn detect_invalid_args_json() {
         // Invalid JSON should fall through gracefully
-        assert_eq!(detect_scenario("Bash", "not-json"), OutputScenario::BashGeneric);
+        assert_eq!(
+            detect_scenario("Bash", "not-json"),
+            OutputScenario::BashGeneric
+        );
     }
 
     // ── Maven command detection ──

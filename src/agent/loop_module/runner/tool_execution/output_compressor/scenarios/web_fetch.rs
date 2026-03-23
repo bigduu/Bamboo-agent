@@ -242,11 +242,15 @@ mod tests {
         for i in 0..20 {
             input.push_str(&format!("Nav Item {}\n", i));
         }
-        input.push_str("\nThis is the actual important documentation content that spans a much longer line.\n");
+        input.push_str(
+            "\nThis is the actual important documentation content that spans a much longer line.\n",
+        );
         let padded = pad(&input);
         let result = compress(&padded);
         assert!(result.was_compressed);
-        assert!(result.compressed.contains("navigation/menu lines collapsed"));
+        assert!(result
+            .compressed
+            .contains("navigation/menu lines collapsed"));
         // Should keep first few nav items
         assert!(result.compressed.contains("Nav Item 0"));
     }
@@ -302,7 +306,9 @@ mod tests {
         input.push_str("# API Documentation\n\n");
         input.push_str("## Authentication\n\n");
         input.push_str("Use Bearer tokens for authentication.\n\n");
-        input.push_str("```bash\ncurl -H \"Authorization: Bearer TOKEN\" https://api.example.com\n```\n\n");
+        input.push_str(
+            "```bash\ncurl -H \"Authorization: Bearer TOKEN\" https://api.example.com\n```\n\n",
+        );
         input.push_str("## Response Format\n\n");
         input.push_str("All responses are JSON.\n");
         let padded = pad(&input);

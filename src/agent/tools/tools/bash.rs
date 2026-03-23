@@ -135,6 +135,10 @@ impl BashTool {
         let mut cmd = Command::new(&shell.program);
         hide_window_for_tokio_command(&mut cmd);
         cmd.current_dir(cwd);
+        // Inject user-managed environment variables from config.
+        for (key, value) in crate::core::Config::current_env_vars() {
+            cmd.env(&key, &value);
+        }
         cmd.arg(shell.arg)
             .arg(command)
             .stdin(Stdio::null())

@@ -78,18 +78,9 @@ pub(crate) fn compress(raw_result: &str) -> CompressionResult {
         Err(_) => return compress_plain_git_text(raw_result),
     };
 
-    let stdout = parsed
-        .get("stdout")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let stderr = parsed
-        .get("stderr")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let command = parsed
-        .get("command")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let stdout = parsed.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+    let stderr = parsed.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+    let command = parsed.get("command").and_then(|v| v.as_str()).unwrap_or("");
 
     let clean_stdout = filters::strip_ansi(stdout);
     let clean_stderr = filters::strip_ansi(stderr);
@@ -320,14 +311,8 @@ fn compress_git_log(stdout: &str, original: &serde_json::Value) -> Option<Compre
     }
 
     // Count commits
-    let commit_count = stdout
-        .lines()
-        .filter(|l| LOG_COMMIT_RE.is_match(l))
-        .count();
-    let shown = capped
-        .lines()
-        .filter(|l| LOG_COMMIT_RE.is_match(l))
-        .count();
+    let commit_count = stdout.lines().filter(|l| LOG_COMMIT_RE.is_match(l)).count();
+    let shown = capped.lines().filter(|l| LOG_COMMIT_RE.is_match(l)).count();
 
     let mut result = capped;
     if commit_count > shown {
@@ -437,10 +422,7 @@ Untracked files:
         assert!(result.was_compressed);
         assert!(result.compressed.contains("feature/foo"));
         // Should have compact counts
-        assert!(
-            result.compressed.contains("2M")
-                || result.compressed.contains("M")
-        );
+        assert!(result.compressed.contains("2M") || result.compressed.contains("M"));
     }
 
     // ── git diff ──

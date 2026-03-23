@@ -24,9 +24,7 @@ pub(crate) async fn tee_save_if_needed(
     full_output: &str,
     compressed_output: &str,
 ) -> Option<String> {
-    let savings = full_output
-        .len()
-        .saturating_sub(compressed_output.len());
+    let savings = full_output.len().saturating_sub(compressed_output.len());
     if savings < MIN_SAVINGS_BYTES {
         return None;
     }

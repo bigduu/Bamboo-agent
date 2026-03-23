@@ -85,7 +85,10 @@ pub(crate) async fn append_tool_error(record: ToolErrorRecord) {
     {
         Ok(mut file) => {
             if let Err(e) = file.write_all(line.as_bytes()).await {
-                tracing::warn!("Failed to write tool error record to {}: {e}", path.display());
+                tracing::warn!(
+                    "Failed to write tool error record to {}: {e}",
+                    path.display()
+                );
             }
         }
         Err(e) => {

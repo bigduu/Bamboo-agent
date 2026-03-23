@@ -47,7 +47,8 @@ pub(crate) fn compress(raw_result: &str) -> CompressionResult {
     let collapsed = collapse_long_comment_blocks(&cleaned);
     let (capped, was_capped) = filters::cap_lines(&collapsed, MAX_LINES);
 
-    let was_compressed = was_capped || collapsed.len() < cleaned.len() || cleaned.len() < raw_result.len();
+    let was_compressed =
+        was_capped || collapsed.len() < cleaned.len() || cleaned.len() < raw_result.len();
 
     if !was_compressed {
         return CompressionResult {

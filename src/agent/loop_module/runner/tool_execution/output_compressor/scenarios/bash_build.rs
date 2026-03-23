@@ -232,14 +232,8 @@ pub(crate) fn compress(raw_result: &str) -> CompressionResult {
         Err(_) => return compress_plain_build_text(raw_result),
     };
 
-    let stdout = parsed
-        .get("stdout")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let stderr = parsed
-        .get("stderr")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let stdout = parsed.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+    let stderr = parsed.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
     let exit_code = parsed
         .get("exit_code")
         .and_then(|v| v.as_i64())
@@ -247,10 +241,7 @@ pub(crate) fn compress(raw_result: &str) -> CompressionResult {
 
     let clean_stdout = filters::strip_ansi(stdout);
     let clean_stderr = filters::strip_ansi(stderr);
-    let command = parsed
-        .get("command")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let command = parsed.get("command").and_then(|v| v.as_str()).unwrap_or("");
 
     // Detect which build tool we're dealing with.
     // Maven must be checked before Rust because both contain "Compiling" text.
@@ -266,9 +257,7 @@ pub(crate) fn compress(raw_result: &str) -> CompressionResult {
     if let Some(result) = try_tsc_compress(&clean_stdout, &clean_stderr, exit_code, &parsed) {
         return result;
     }
-    if let Some(result) =
-        try_eslint_compress(&clean_stdout, &clean_stderr, exit_code, &parsed)
-    {
+    if let Some(result) = try_eslint_compress(&clean_stdout, &clean_stderr, exit_code, &parsed) {
         return result;
     }
     // Also try Maven for auto-detected (non-mvn command) Maven output
@@ -540,7 +529,10 @@ fn try_maven_compress(
     let combined = format!("{}\n{}", stdout, stderr);
 
     // Detect Maven output
-    if !MVN_BUILD_RESULT_RE.is_match(&combined) && !MVN_DOWNLOAD_RE.is_match(&combined) && !MVN_MODULE_RE.is_match(&combined) {
+    if !MVN_BUILD_RESULT_RE.is_match(&combined)
+        && !MVN_DOWNLOAD_RE.is_match(&combined)
+        && !MVN_MODULE_RE.is_match(&combined)
+    {
         return None;
     }
 
@@ -693,15 +685,13 @@ fn try_gradle_compress(
         .unwrap_or_default();
 
     // Extract actionable tasks summary
-    let actionable = GRADLE_ACTIONABLE_RE
-        .captures(&combined)
-        .map(|c| {
-            format!(
-                "{} actionable tasks: {}",
-                c.get(1).map(|m| m.as_str()).unwrap_or("?"),
-                c.get(2).map(|m| m.as_str()).unwrap_or("?"),
-            )
-        });
+    let actionable = GRADLE_ACTIONABLE_RE.captures(&combined).map(|c| {
+        format!(
+            "{} actionable tasks: {}",
+            c.get(1).map(|m| m.as_str()).unwrap_or("?"),
+            c.get(2).map(|m| m.as_str()).unwrap_or("?"),
+        )
+    });
 
     // Extract error lines
     let errors: Vec<String> = GRADLE_ERROR_RE
@@ -786,10 +776,7 @@ fn try_docker_compress(
         })
         .collect();
 
-    let total_steps = steps
-        .first()
-        .map(|(_, t)| t.as_str())
-        .unwrap_or("?");
+    let total_steps = steps.first().map(|(_, t)| t.as_str()).unwrap_or("?");
 
     // Count noise lines
     let cache_count = DOCKER_CACHE_RE.captures_iter(&combined).count();
@@ -860,7 +847,10 @@ fn try_docker_compress(
             result.push_str("\nError output:\n");
             for (i, e) in error_lines.iter().enumerate() {
                 if i >= 30 {
-                    result.push_str(&format!("  ... and {} more lines\n", error_lines.len() - 30));
+                    result.push_str(&format!(
+                        "  ... and {} more lines\n",
+                        error_lines.len() - 30
+                    ));
                     break;
                 }
                 result.push_str(&format!("  {}\n", e));
@@ -908,7 +898,10 @@ fn try_dotnet_compress(
     let mut warnings: u32 = 0;
     let mut errors: u32 = 0;
     for cap in DOTNET_COUNTS_RE.captures_iter(&combined) {
-        let count: u32 = cap.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+        let count: u32 = cap
+            .get(1)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
         match cap.get(2).map(|m| m.as_str()) {
             Some("Warning") => warnings += count,
             Some("Error") => errors += count,
@@ -974,9 +967,18 @@ fn try_terraform_compress(
 
     // Extract plan summary
     if let Some(cap) = TF_PLAN_SUMMARY_RE.captures(&combined) {
-        let add: u32 = cap.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
-        let change: u32 = cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
-        let destroy: u32 = cap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+        let add: u32 = cap
+            .get(1)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        let change: u32 = cap
+            .get(2)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        let destroy: u32 = cap
+            .get(3)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
 
         if add == 0 && change == 0 && destroy == 0 {
             result.push_str("✅ Terraform plan: no changes\n");
@@ -990,9 +992,18 @@ fn try_terraform_compress(
 
     // Extract apply summary
     if let Some(cap) = TF_APPLY_SUMMARY_RE.captures(&combined) {
-        let add: u32 = cap.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
-        let change: u32 = cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
-        let destroy: u32 = cap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+        let add: u32 = cap
+            .get(1)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        let change: u32 = cap
+            .get(2)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        let destroy: u32 = cap
+            .get(3)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
         result.push_str(&format!(
             "✅ Terraform apply: {} added, {} changed, {} destroyed\n",
             add, change, destroy
@@ -1341,7 +1352,9 @@ Found 3 errors in 2 files.
         let result = compress(&input);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ Maven BUILD SUCCESS"));
-        assert!(result.compressed.contains("200 dependency download lines stripped"));
+        assert!(result
+            .compressed
+            .contains("200 dependency download lines stripped"));
         // Original was ~200 lines of downloads, compressed should be much shorter
         assert!(result.compressed.len() < input.len() / 2);
     }
@@ -1434,7 +1447,9 @@ BUILD FAILED in 5s
         let result = compress(&input);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ Gradle BUILD SUCCESSFUL"));
-        assert!(result.compressed.contains("50 dependency download lines stripped"));
+        assert!(result
+            .compressed
+            .contains("50 dependency download lines stripped"));
     }
 
     // ── Docker ──
@@ -1468,14 +1483,20 @@ Successfully tagged myapp:latest
         let input = make_bash_json_cmd("docker build -t myapp:latest .", stdout, "", 0);
         let result = compress(&input);
         assert!(result.was_compressed);
-        assert!(result.compressed.contains("✅ Docker build: 8 steps completed"));
+        assert!(result
+            .compressed
+            .contains("✅ Docker build: 8 steps completed"));
         // Hash/cache noise should be stripped
-        assert!(result.compressed.contains("cache/hash/progress lines stripped"));
+        assert!(result
+            .compressed
+            .contains("cache/hash/progress lines stripped"));
         assert!(!result.compressed.contains("abc123def456"));
         // Should keep step summaries
         assert!(result.compressed.contains("npm install"));
         // Should keep success tag
-        assert!(result.compressed.contains("Successfully tagged myapp:latest"));
+        assert!(result
+            .compressed
+            .contains("Successfully tagged myapp:latest"));
     }
 
     #[test]
@@ -1580,10 +1601,16 @@ Plan: 2 to add, 1 to change, 0 to destroy.
         let input = make_bash_json_cmd("terraform plan", stdout, "", 0);
         let result = compress(&input);
         assert!(result.was_compressed);
-        assert!(result.compressed.contains("Terraform plan: +2 add, ~1 change, -0 destroy"));
+        assert!(result
+            .compressed
+            .contains("Terraform plan: +2 add, ~1 change, -0 destroy"));
         // Should list resources
-        assert!(result.compressed.contains("aws_instance.web will be created"));
-        assert!(result.compressed.contains("aws_s3_bucket.data will be created"));
+        assert!(result
+            .compressed
+            .contains("aws_instance.web will be created"));
+        assert!(result
+            .compressed
+            .contains("aws_s3_bucket.data will be created"));
         // Should strip detail lines
         assert!(result.compressed.contains("resource detail lines stripped"));
         // Should NOT contain full resource blocks
@@ -1604,7 +1631,9 @@ Apply complete! Resources: 2 added, 0 changed, 0 destroyed.
         let input = make_bash_json_cmd("terraform apply -auto-approve", stdout, "", 0);
         let result = compress(&input);
         assert!(result.was_compressed);
-        assert!(result.compressed.contains("✅ Terraform apply: 2 added, 0 changed, 0 destroyed"));
+        assert!(result
+            .compressed
+            .contains("✅ Terraform apply: 2 added, 0 changed, 0 destroyed"));
     }
 
     #[test]

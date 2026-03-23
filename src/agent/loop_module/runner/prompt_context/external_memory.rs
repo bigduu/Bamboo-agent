@@ -53,11 +53,7 @@ pub(super) async fn inject_external_memory_into_system_message(session: &mut Ses
     let topics = match memory.list_topics(session_id).await {
         Ok(t) => t,
         Err(error) => {
-            tracing::warn!(
-                "[{}] Failed to list memory topics: {}",
-                session_id,
-                error
-            );
+            tracing::warn!("[{}] Failed to list memory topics: {}", session_id, error);
             Vec::new()
         }
     };
@@ -189,8 +185,9 @@ pub(super) async fn inject_external_memory_into_system_message(session: &mut Ses
                      Older messages will soon be compressed and summarized. \
                      Save any important context (key decisions, file paths, \
                      architecture notes, progress state) to `{EXTERNAL_MEMORY_TOOL_NAME}` \
-                     now so it persists across the compression boundary.\n"
-                , pct));
+                     now so it persists across the compression boundary.\n",
+                    pct
+                ));
             }
         }
     }
