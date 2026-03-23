@@ -2,6 +2,7 @@ use super::fingerprint::proxy_fingerprint;
 use super::*;
 use crate::agent::mcp::config::{ReconnectConfig, SseConfig, StdioConfig};
 use tokio::sync::mpsc;
+use tokio::time::{sleep, Duration};
 
 fn create_test_server_config(id: &str) -> McpServerConfig {
     McpServerConfig {
@@ -348,4 +349,43 @@ async fn test_sse_transport_respects_proxy_settings_when_available() {
         }
         other => panic!("expected InvalidConfig, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn qos_circuit_opens_after_consecutive_failures() {
+    let qos = McpServerQos::new(McpQosConfig {
+        max_concurrent_calls: 2,
+        circuit_failure_threshold: 2,
+        circuit_open_ms: 60_000,
+    });
+
+    let err = McpError::Connection("boom".to_string());
+    qos.record_failure("server-a", "tool-a", &err).await;
+    assert!(qos.check_circuit("server-a", "tool-a").await.is_ok());
+
+    qos.record_failure("server-a", "tool-a", &err).await;
+    let blocked = qos.check_circuit("server-a", "tool-a").await;
+    assert!(blocked.is_err());
+    match blocked.unwrap_err() {
+        McpError::ToolExecution(message) => {
+            assert!(message.contains("circuit open"));
+        }
+        other => panic!("expected ToolExecution, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn qos_circuit_recovers_after_open_window() {
+    let qos = McpServerQos::new(McpQosConfig {
+        max_concurrent_calls: 1,
+        circuit_failure_threshold: 1,
+        circuit_open_ms: 5,
+    });
+
+    let err = McpError::Connection("boom".to_string());
+    qos.record_failure("server-b", "tool-b", &err).await;
+    assert!(qos.check_circuit("server-b", "tool-b").await.is_err());
+
+    sleep(Duration::from_millis(15)).await;
+    assert!(qos.check_circuit("server-b", "tool-b").await.is_ok());
 }

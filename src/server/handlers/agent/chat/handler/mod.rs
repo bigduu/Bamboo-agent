@@ -1,6 +1,6 @@
 use actix_web::{web, HttpResponse, Responder};
 
-use super::prompt::{build_enhanced_system_prompt, upsert_system_prompt_message};
+use super::prompt::{build_enhanced_system_prompt_with_profile, upsert_system_prompt_message};
 use super::{ChatRequest, ChatResponse};
 use crate::server::app_state::AppState;
 
@@ -71,13 +71,30 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         req.selected_skill_ids.as_deref(),
         req.message.as_str(),
     );
+    session::clear_skill_runtime_state(&mut session);
 
     // Always refresh the persisted system prompt so existing sessions don't
     // keep stale tool instructions after backend upgrades.
-    let system_prompt = build_enhanced_system_prompt(
+    let (system_prompt, prompt_profile) = build_enhanced_system_prompt_with_profile(
         base_prompt.as_str(),
         enhance_prompt.as_deref(),
         workspace_path.as_deref(),
+    );
+    session.metadata.insert(
+        "prompt_composer_version".to_string(),
+        prompt_profile.version.to_string(),
+    );
+    session.metadata.insert(
+        "prompt_fingerprint".to_string(),
+        prompt_profile.fingerprint.clone(),
+    );
+    session.metadata.insert(
+        "prompt_component_flags".to_string(),
+        prompt_profile.component_flags_value(),
+    );
+    session.metadata.insert(
+        "prompt_component_lengths".to_string(),
+        prompt_profile.component_lengths_value(),
     );
     upsert_system_prompt_message(&mut session, system_prompt);
 

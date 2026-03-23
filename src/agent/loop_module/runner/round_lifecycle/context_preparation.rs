@@ -59,10 +59,7 @@ pub(super) async fn prepare_round_context(
     // of the removed content to preserve context continuity.
     // Use fast_model for summarization when available (lightweight task).
     if !prepared_context.compressed_message_ids.is_empty() {
-        let summary_model = config
-            .fast_model_name
-            .as_deref()
-            .unwrap_or(model_name);
+        let summary_model = config.fast_model_name.as_deref().unwrap_or(model_name);
         maybe_summarize_compressed_messages(session, llm, summary_model, session_id).await;
     }
 

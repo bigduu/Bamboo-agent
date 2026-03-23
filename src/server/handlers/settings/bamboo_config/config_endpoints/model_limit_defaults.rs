@@ -51,14 +51,16 @@ fn infer_vendor(pattern: &str) -> &'static str {
 pub async fn get_model_limit_defaults() -> Result<HttpResponse, AppError> {
     let model_limits = KNOWN_MODEL_LIMITS
         .iter()
-        .map(|(model_pattern, max_context_tokens, max_output_tokens)| ModelLimitDefault {
-            vendor: infer_vendor(model_pattern).to_string(),
-            model_pattern: (*model_pattern).to_string(),
-            max_context_tokens: *max_context_tokens,
-            max_output_tokens: *max_output_tokens,
-            safety_margin: DEFAULT_SAFETY_MARGIN,
-            note: String::new(),
-        })
+        .map(
+            |(model_pattern, max_context_tokens, max_output_tokens)| ModelLimitDefault {
+                vendor: infer_vendor(model_pattern).to_string(),
+                model_pattern: (*model_pattern).to_string(),
+                max_context_tokens: *max_context_tokens,
+                max_output_tokens: *max_output_tokens,
+                safety_margin: DEFAULT_SAFETY_MARGIN,
+                note: String::new(),
+            },
+        )
         .collect::<Vec<_>>();
 
     Ok(HttpResponse::Ok().json(ModelLimitDefaultsResponse { model_limits }))
@@ -74,12 +76,10 @@ mod tests {
 
     #[actix_web::test]
     async fn get_model_limit_defaults_returns_builtin_profiles() {
-        let app = test::init_service(
-            App::new().route(
-                "/bamboo/model-limits/defaults",
-                web::get().to(get_model_limit_defaults),
-            ),
-        )
+        let app = test::init_service(App::new().route(
+            "/bamboo/model-limits/defaults",
+            web::get().to(get_model_limit_defaults),
+        ))
         .await;
 
         let request = test::TestRequest::get()

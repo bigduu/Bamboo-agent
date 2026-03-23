@@ -2,7 +2,8 @@ use crate::agent::core::Session;
 
 use super::request::{optional_non_empty, resolve_session_id, validate_and_normalize_model};
 use super::session::{
-    resolve_base_prompt, resolve_enhance_prompt, resolve_selected_skill_ids, resolve_workspace_path,
+    clear_skill_runtime_state, resolve_base_prompt, resolve_enhance_prompt,
+    resolve_selected_skill_ids, resolve_workspace_path,
 };
 
 #[test]
@@ -173,4 +174,26 @@ fn resolve_selected_skill_ids_clears_stale_metadata_when_no_selection_provided()
     let selected = resolve_selected_skill_ids(&mut session, None, "normal prompt");
     assert!(selected.is_none());
     assert!(!session.metadata.contains_key("selected_skill_ids"));
+}
+
+#[test]
+fn clear_skill_runtime_state_removes_loaded_skill_markers() {
+    let mut session = Session::new("session-1", "model");
+    session.metadata.insert(
+        "skill_runtime_loaded_skill_ids".to_string(),
+        r#"["demo"]"#.to_string(),
+    );
+    session.metadata.insert(
+        "skill_runtime_last_loaded_skill_id".to_string(),
+        "demo".to_string(),
+    );
+
+    clear_skill_runtime_state(&mut session);
+
+    assert!(!session
+        .metadata
+        .contains_key("skill_runtime_loaded_skill_ids"));
+    assert!(!session
+        .metadata
+        .contains_key("skill_runtime_last_loaded_skill_id"));
 }

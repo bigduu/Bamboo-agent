@@ -35,6 +35,7 @@ impl McpServerManager {
             tools: RwLock::new(tools.clone()),
             shutdown: AtomicBool::new(false),
             reconnecting: AtomicBool::new(false),
+            qos: McpServerQos::new(McpQosConfig::default()),
             proxy_fingerprint: runtime_proxy_fingerprint,
         });
 
@@ -132,10 +133,27 @@ impl McpServerManager {
             .get(server_id)
             .ok_or_else(|| McpError::ServerNotFound(server_id.to_string()))?;
 
+        runtime.qos.check_circuit(server_id, tool_name).await?;
+        let _permit = runtime.qos.acquire_permit().await?;
+
         let client = runtime.client.read().await;
         let timeout = runtime.config.request_timeout_ms;
+        let result = client.call_tool(tool_name, args, timeout).await;
+        drop(client);
 
-        let result = client.call_tool(tool_name, args, timeout).await?;
+        let result = match result {
+            Ok(result) => {
+                runtime.qos.record_success().await;
+                result
+            }
+            Err(error) => {
+                runtime
+                    .qos
+                    .record_failure(server_id, tool_name, &error)
+                    .await;
+                return Err(error);
+            }
+        };
 
         // Emit event
         if let Some(ref tx) = self.event_tx {

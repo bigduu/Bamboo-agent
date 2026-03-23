@@ -286,7 +286,10 @@ impl ScheduleStore {
         // --- Phase 1: read-only check (no write lock, no disk I/O) ---
         {
             let index = self.index.read().await;
-            let any_due = index.schedules.values().any(|e| e.enabled && e.next_run_at <= now);
+            let any_due = index
+                .schedules
+                .values()
+                .any(|e| e.enabled && e.next_run_at <= now);
             if !any_due {
                 return Ok(Vec::new());
             }

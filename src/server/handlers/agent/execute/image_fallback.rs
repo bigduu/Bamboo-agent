@@ -35,10 +35,7 @@ pub(super) fn resolve_image_fallback(
         None
     };
 
-    Ok(Some(ImageFallbackConfig {
-        mode,
-        vision_model,
-    }))
+    Ok(Some(ImageFallbackConfig { mode, vision_model }))
 }
 
 pub(super) fn validate_image_fallback_for_session(

@@ -2,6 +2,7 @@ use async_trait::async_trait;
 
 use super::resolve_available_tool_schemas;
 use crate::agent::core::tools::{FunctionSchema, ToolCall, ToolExecutor, ToolResult, ToolSchema};
+use crate::agent::core::{Message, Session};
 
 struct StaticToolExecutor {
     schemas: Vec<ToolSchema>,
@@ -112,4 +113,66 @@ fn resolve_available_tool_schemas_excludes_canonicalized_disabled_tool_aliases()
         .collect();
 
     assert_eq!(names, vec!["Write"]);
+}
+
+#[test]
+fn apply_system_prompt_contexts_persists_runtime_prompt_metadata() {
+    let mut session = Session::new("session-1", "model");
+    session.add_message(Message::system("Base prompt"));
+    let config = crate::agent::loop_module::config::AgentLoopConfig::default();
+
+    super::prompt_setup::apply_system_prompt_contexts(
+        &mut session,
+        &config,
+        "## Skill System\nSkill details",
+        "## Tool Usage Guidelines\nGuide details",
+    );
+
+    assert_eq!(
+        session
+            .metadata
+            .get("runtime_prompt_composer_version")
+            .map(String::as_str),
+        Some("bamboo.runtime-system-prompt.v1")
+    );
+    assert!(session.metadata.contains_key("runtime_prompt_fingerprint"));
+    assert!(session
+        .metadata
+        .contains_key("runtime_prompt_component_flags"));
+    assert!(session
+        .metadata
+        .contains_key("runtime_prompt_component_lengths"));
+}
+
+#[test]
+fn apply_system_prompt_contexts_updates_runtime_fingerprint_when_context_changes() {
+    let mut session = Session::new("session-1", "model");
+    session.add_message(Message::system("Base prompt"));
+    let config = crate::agent::loop_module::config::AgentLoopConfig::default();
+
+    super::prompt_setup::apply_system_prompt_contexts(
+        &mut session,
+        &config,
+        "## Skill System\nSkill A",
+        "## Tool Usage Guidelines\nGuide A",
+    );
+    let first = session
+        .metadata
+        .get("runtime_prompt_fingerprint")
+        .cloned()
+        .expect("first fingerprint");
+
+    super::prompt_setup::apply_system_prompt_contexts(
+        &mut session,
+        &config,
+        "## Skill System\nSkill B",
+        "## Tool Usage Guidelines\nGuide A",
+    );
+    let second = session
+        .metadata
+        .get("runtime_prompt_fingerprint")
+        .cloned()
+        .expect("second fingerprint");
+
+    assert_ne!(first, second);
 }

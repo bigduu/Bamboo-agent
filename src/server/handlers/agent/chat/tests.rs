@@ -1,4 +1,7 @@
-use super::prompt::{build_enhanced_system_prompt, upsert_system_prompt_message};
+use super::prompt::{
+    build_enhanced_system_prompt, build_enhanced_system_prompt_with_profile,
+    upsert_system_prompt_message,
+};
 use super::ChatRequest;
 use crate::agent::core::Session;
 
@@ -59,6 +62,37 @@ fn build_enhanced_system_prompt_appends_workspace_context_before_skills() {
 fn build_enhanced_system_prompt_ignores_empty_enhancement() {
     let prompt = build_enhanced_system_prompt("Base prompt", Some("   "), None);
     assert_eq!(prompt, "Base prompt");
+}
+
+#[test]
+fn prompt_profile_fingerprint_changes_when_components_change() {
+    let (_, profile_a) = build_enhanced_system_prompt_with_profile("Base prompt", None, None);
+    let (_, profile_b) =
+        build_enhanced_system_prompt_with_profile("Base prompt", Some("Extra"), None);
+    let (_, profile_c) = build_enhanced_system_prompt_with_profile(
+        "Base prompt",
+        Some("Extra"),
+        Some("/tmp/workspace"),
+    );
+
+    assert_ne!(profile_a.fingerprint, profile_b.fingerprint);
+    assert_ne!(profile_b.fingerprint, profile_c.fingerprint);
+}
+
+#[test]
+fn prompt_profile_exposes_component_flags_and_lengths() {
+    let (prompt, profile) = build_enhanced_system_prompt_with_profile(
+        "Base prompt",
+        Some("Extra guidance"),
+        Some("/tmp/workspace"),
+    );
+
+    assert!(profile.has_enhancement);
+    assert!(profile.has_workspace_context);
+    assert_eq!(profile.final_len, prompt.len());
+    assert!(profile.component_flags_value().contains("enhance=1"));
+    assert!(profile.component_lengths_value().contains("base="));
+    assert!(profile.component_lengths_value().contains("final="));
 }
 
 #[test]

@@ -857,10 +857,9 @@ impl ResponsesSseParser {
                     return Ok(None);
                 }
                 if let Some(stream_key) = Self::reasoning_event_stream_key(event_type, &v) {
-                    return Ok(self.emit_reasoning_delta_with_key(
-                        stream_key.as_str(),
-                        reasoning_chunk,
-                    ));
+                    return Ok(
+                        self.emit_reasoning_delta_with_key(stream_key.as_str(), reasoning_chunk)
+                    );
                 }
                 let item_id = Self::text_item_id(&v);
                 return Ok(self.emit_reasoning_delta_text(item_id.as_deref(), reasoning_chunk));
@@ -892,7 +891,9 @@ impl ResponsesSseParser {
                     ));
                 }
                 let item_id = Self::text_item_id(&v);
-                return Ok(self.emit_reasoning_done_text(item_id.as_deref(), reasoning_chunk.as_str()));
+                return Ok(
+                    self.emit_reasoning_done_text(item_id.as_deref(), reasoning_chunk.as_str())
+                );
             }
 
             // Some providers emit only part.done with the full summary text; treat it as
@@ -914,7 +915,9 @@ impl ResponsesSseParser {
                     ));
                 }
                 let item_id = Self::text_item_id(&v);
-                return Ok(self.emit_reasoning_done_text(item_id.as_deref(), reasoning_chunk.as_str()));
+                return Ok(
+                    self.emit_reasoning_done_text(item_id.as_deref(), reasoning_chunk.as_str())
+                );
             }
 
             // Legacy / provider-specific reasoning streams.
@@ -938,7 +941,9 @@ impl ResponsesSseParser {
                     return Ok(None);
                 }
                 let item_id = Self::text_item_id(&v);
-                return Ok(self.emit_reasoning_delta_text(item_id.as_deref(), reasoning_chunk.as_str()));
+                return Ok(
+                    self.emit_reasoning_delta_text(item_id.as_deref(), reasoning_chunk.as_str())
+                );
             }
 
             "response.reasoning.done" | "response.reasoning_text.done" => {
@@ -961,7 +966,9 @@ impl ResponsesSseParser {
                     return Ok(None);
                 }
                 let item_id = Self::text_item_id(&v);
-                return Ok(self.emit_reasoning_done_text(item_id.as_deref(), reasoning_chunk.as_str()));
+                return Ok(
+                    self.emit_reasoning_done_text(item_id.as_deref(), reasoning_chunk.as_str())
+                );
             }
 
             _ => {}

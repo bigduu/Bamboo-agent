@@ -70,10 +70,8 @@ pub(super) async fn run_rounds(
         )
         .await?;
 
-        let tool_schemas = super::super::session_setup::resolve_available_tool_schemas(
-            config,
-            tools.as_ref(),
-        );
+        let tool_schemas =
+            super::super::session_setup::resolve_available_tool_schemas(config, tools.as_ref());
 
         let mut round_flow_outcome: Option<super::super::round_flow::RoundFlowOutcome> = None;
         let mut terminal_error: Option<crate::agent::core::AgentError> = None;

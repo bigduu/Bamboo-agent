@@ -4,6 +4,8 @@ use crate::agent::core::{Role, Session};
 use crate::server::app_state::AppState;
 
 const SELECTED_SKILL_IDS_METADATA_KEY: &str = "selected_skill_ids";
+const LOADED_SKILL_IDS_METADATA_KEY: &str = "skill_runtime_loaded_skill_ids";
+const LAST_LOADED_SKILL_ID_METADATA_KEY: &str = "skill_runtime_last_loaded_skill_id";
 
 pub(super) async fn load_or_create_session(
     state: &web::Data<AppState>,
@@ -134,6 +136,11 @@ pub(super) fn resolve_selected_skill_ids(
     // or hint any selected skill, clear stale session metadata from prior turns.
     session.metadata.remove(SELECTED_SKILL_IDS_METADATA_KEY);
     None
+}
+
+pub(super) fn clear_skill_runtime_state(session: &mut Session) {
+    session.metadata.remove(LOADED_SKILL_IDS_METADATA_KEY);
+    session.metadata.remove(LAST_LOADED_SKILL_ID_METADATA_KEY);
 }
 
 fn persist_selected_skill_ids_metadata(
