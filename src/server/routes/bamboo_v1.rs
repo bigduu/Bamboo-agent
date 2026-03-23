@@ -81,6 +81,10 @@ fn bamboo_v1_scope() -> impl HttpServiceFactory {
             web::post().to(settings::set_bamboo_config),
         )
         .route(
+            "/bamboo/model-limits/defaults",
+            web::get().to(settings::get_model_limit_defaults),
+        )
+        .route(
             "/bamboo/config/validate",
             web::post().to(settings::validate_bamboo_config_patch),
         )

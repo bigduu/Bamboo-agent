@@ -11,9 +11,9 @@ mod setup;
 mod workflows;
 
 pub use bamboo_config::{
-    get_anthropic_model_mapping, get_bamboo_config, get_bamboo_tools, get_proxy_auth_status,
-    reset_bamboo_config, set_anthropic_model_mapping, set_bamboo_config, set_proxy_auth,
-    validate_bamboo_config_patch, ProxyAuthPayload,
+    get_anthropic_model_mapping, get_bamboo_config, get_bamboo_tools, get_model_limit_defaults,
+    get_proxy_auth_status, reset_bamboo_config, set_anthropic_model_mapping, set_bamboo_config,
+    set_proxy_auth, validate_bamboo_config_patch, ProxyAuthPayload,
 };
 pub use keyword_masking::{
     get_keyword_masking_config, update_keyword_masking_config, validate_keyword_entries,
@@ -50,6 +50,10 @@ pub fn config(cfg: &mut web::ServiceConfig) {
         )
         .route("/bamboo/config", web::get().to(get_bamboo_config))
         .route("/bamboo/config", web::post().to(set_bamboo_config))
+        .route(
+            "/bamboo/model-limits/defaults",
+            web::get().to(get_model_limit_defaults),
+        )
         .route(
             "/bamboo/config/validate",
             web::post().to(validate_bamboo_config_patch),

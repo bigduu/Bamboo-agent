@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::json;
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub mod auth;
 use crate::agent::core::{tools::ToolSchema, Message};
@@ -18,6 +19,9 @@ use super::common::openai_compat::{
 };
 use super::common::openai_responses::{build_responses_body, ResponsesSseParser};
 use super::common::sse::llm_stream_from_sse;
+
+const COPILOT_TRANSPORT_MAX_ATTEMPTS: usize = 2;
+const COPILOT_TRANSPORT_RETRY_BASE_DELAY_MS: u64 = 250;
 
 /// GitHub Copilot Provider with Device Code Authentication
 ///
@@ -462,6 +466,68 @@ impl CopilotProvider {
         mentions_previous_response_id && mentions_unsupported
     }
 
+    fn is_retryable_transport_message(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        let retryable_markers = [
+            "incompletemessage",
+            "error sending request",
+            "connection reset",
+            "broken pipe",
+            "connection aborted",
+            "connection closed",
+            "unexpected eof",
+            "timed out",
+            "timeout",
+        ];
+
+        retryable_markers
+            .iter()
+            .any(|marker| lower.contains(marker))
+    }
+
+    fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
+        error.is_timeout()
+            || error.is_connect()
+            || error.is_request()
+            || Self::is_retryable_transport_message(&error.to_string())
+    }
+
+    async fn send_with_transport_retry<F>(
+        &self,
+        mut build_request: F,
+        operation: &str,
+    ) -> std::result::Result<reqwest::Response, LLMError>
+    where
+        F: FnMut() -> reqwest::RequestBuilder,
+    {
+        for attempt in 1..=COPILOT_TRANSPORT_MAX_ATTEMPTS {
+            match build_request().send().await {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    if attempt >= COPILOT_TRANSPORT_MAX_ATTEMPTS
+                        || !Self::is_retryable_transport_error(&error)
+                    {
+                        return Err(LLMError::Http(error));
+                    }
+
+                    let delay_ms =
+                        COPILOT_TRANSPORT_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1));
+                    tracing::warn!(
+                        "Copilot transport error during {} (attempt {}/{}): {}. Retrying in {}ms",
+                        operation,
+                        attempt,
+                        COPILOT_TRANSPORT_MAX_ATTEMPTS,
+                        error,
+                        delay_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+
+        unreachable!("loop always returns or errors")
+    }
+
     async fn chat_stream_via_responses(
         &self,
         token: &str,
@@ -504,14 +570,18 @@ impl CopilotProvider {
                 .unwrap_or_else(|| "none".to_string())
         );
 
+        let request_headers = self.build_llm_headers(token, messages, tools)?;
         let mut response = self
-            .client
-            .post(url)
-            .headers(self.build_llm_headers(token, messages, tools)?)
-            .json(&body)
-            .send()
-            .await
-            .map_err(LLMError::Http)?;
+            .send_with_transport_retry(
+                || {
+                    self.client
+                        .post(url)
+                        .headers(request_headers.clone())
+                        .json(&body)
+                },
+                "copilot responses initial request",
+            )
+            .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -519,14 +589,19 @@ impl CopilotProvider {
             if (status == 401 || status == 403) && self.auth_handler.is_some() {
                 if let Some(handler) = &self.auth_handler {
                     if let Ok(Some(refreshed)) = handler.force_refresh_chat_token().await {
+                        let refreshed_headers =
+                            self.build_llm_headers(&refreshed, messages, tools)?;
                         response = self
-                            .client
-                            .post(url)
-                            .headers(self.build_llm_headers(&refreshed, messages, tools)?)
-                            .json(&body)
-                            .send()
-                            .await
-                            .map_err(LLMError::Http)?;
+                            .send_with_transport_retry(
+                                || {
+                                    self.client
+                                        .post(url)
+                                        .headers(refreshed_headers.clone())
+                                        .json(&body)
+                                },
+                                "copilot responses auth-refresh retry",
+                            )
+                            .await?;
                     }
                 }
             }
@@ -577,14 +652,18 @@ impl CopilotProvider {
                         Some(&fallback_options),
                         parallel_tool_calls,
                     );
+                    let fallback_headers = self.build_llm_headers(token, messages, tools)?;
                     let mut fallback = self
-                        .client
-                        .post(url)
-                        .headers(self.build_llm_headers(token, messages, tools)?)
-                        .json(&fallback_body)
-                        .send()
-                        .await
-                        .map_err(LLMError::Http)?;
+                        .send_with_transport_retry(
+                            || {
+                                self.client
+                                    .post(url)
+                                    .headers(fallback_headers.clone())
+                                    .json(&fallback_body)
+                            },
+                            "copilot responses reasoning fallback",
+                        )
+                        .await?;
 
                     if !fallback.status().is_success() {
                         let fallback_status = fallback.status();
@@ -595,16 +674,19 @@ impl CopilotProvider {
                                 if let Ok(Some(refreshed)) =
                                     handler.force_refresh_chat_token().await
                                 {
+                                    let refreshed_fallback_headers =
+                                        self.build_llm_headers(&refreshed, messages, tools)?;
                                     fallback = self
-                                        .client
-                                        .post(url)
-                                        .headers(
-                                            self.build_llm_headers(&refreshed, messages, tools)?,
+                                        .send_with_transport_retry(
+                                            || {
+                                                self.client
+                                                    .post(url)
+                                                    .headers(refreshed_fallback_headers.clone())
+                                                    .json(&fallback_body)
+                                            },
+                                            "copilot responses reasoning fallback auth-refresh retry",
                                         )
-                                        .json(&fallback_body)
-                                        .send()
-                                        .await
-                                        .map_err(LLMError::Http)?;
+                                        .await?;
                                 }
                             }
                         }
@@ -775,14 +857,18 @@ impl LLMProvider for CopilotProvider {
 
         let url = "https://api.githubcopilot.com/chat/completions";
 
+        let request_headers = self.build_llm_headers(&token, messages, tools)?;
         let mut response = self
-            .client
-            .post(url)
-            .headers(self.build_llm_headers(&token, messages, tools)?)
-            .json(&body)
-            .send()
-            .await
-            .map_err(LLMError::Http)?;
+            .send_with_transport_retry(
+                || {
+                    self.client
+                        .post(url)
+                        .headers(request_headers.clone())
+                        .json(&body)
+                },
+                "copilot chat/completions initial request",
+            )
+            .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -791,14 +877,19 @@ impl LLMProvider for CopilotProvider {
             if (status == 401 || status == 403) && self.auth_handler.is_some() {
                 if let Some(handler) = &self.auth_handler {
                     if let Ok(Some(refreshed)) = handler.force_refresh_chat_token().await {
+                        let refreshed_headers =
+                            self.build_llm_headers(&refreshed, messages, tools)?;
                         response = self
-                            .client
-                            .post(url)
-                            .headers(self.build_llm_headers(&refreshed, messages, tools)?)
-                            .json(&body)
-                            .send()
-                            .await
-                            .map_err(LLMError::Http)?;
+                            .send_with_transport_retry(
+                                || {
+                                    self.client
+                                        .post(url)
+                                        .headers(refreshed_headers.clone())
+                                        .json(&body)
+                                },
+                                "copilot chat/completions auth-refresh retry",
+                            )
+                            .await?;
                     }
                 }
             }
@@ -865,14 +956,18 @@ impl LLMProvider for CopilotProvider {
                         body_no_reasoning["max_tokens"] = json!(max_tokens);
                     }
 
+                    let retry_headers = self.build_llm_headers(&token, messages, tools)?;
                     let mut retry = self
-                        .client
-                        .post(url)
-                        .headers(self.build_llm_headers(&token, messages, tools)?)
-                        .json(&body_no_reasoning)
-                        .send()
-                        .await
-                        .map_err(LLMError::Http)?;
+                        .send_with_transport_retry(
+                            || {
+                                self.client
+                                    .post(url)
+                                    .headers(retry_headers.clone())
+                                    .json(&body_no_reasoning)
+                            },
+                            "copilot chat/completions reasoning fallback",
+                        )
+                        .await?;
 
                     if !retry.status().is_success() {
                         let retry_status = retry.status();
@@ -883,16 +978,19 @@ impl LLMProvider for CopilotProvider {
                                 if let Ok(Some(refreshed)) =
                                     handler.force_refresh_chat_token().await
                                 {
+                                    let refreshed_retry_headers =
+                                        self.build_llm_headers(&refreshed, messages, tools)?;
                                     retry = self
-                                        .client
-                                        .post(url)
-                                        .headers(
-                                            self.build_llm_headers(&refreshed, messages, tools)?,
+                                        .send_with_transport_retry(
+                                            || {
+                                                self.client
+                                                    .post(url)
+                                                    .headers(refreshed_retry_headers.clone())
+                                                    .json(&body_no_reasoning)
+                                            },
+                                            "copilot chat/completions reasoning fallback auth-refresh retry",
                                         )
-                                        .json(&body_no_reasoning)
-                                        .send()
-                                        .await
-                                        .map_err(LLMError::Http)?;
+                                        .await?;
                                 }
                             }
                         }
@@ -1021,13 +1119,13 @@ impl LLMProvider for CopilotProvider {
         let token = self.get_token_for_request().await?;
         let url = "https://api.githubcopilot.com/models";
 
+        let request_headers = Self::build_headers_with_token(&token)?;
         let mut response = self
-            .client
-            .get(url)
-            .headers(Self::build_headers_with_token(&token)?)
-            .send()
-            .await
-            .map_err(LLMError::Http)?;
+            .send_with_transport_retry(
+                || self.client.get(url).headers(request_headers.clone()),
+                "copilot models list",
+            )
+            .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1035,13 +1133,13 @@ impl LLMProvider for CopilotProvider {
             if (status == 401 || status == 403) && self.auth_handler.is_some() {
                 if let Some(handler) = &self.auth_handler {
                     if let Ok(Some(refreshed)) = handler.force_refresh_chat_token().await {
+                        let refreshed_headers = Self::build_headers_with_token(&refreshed)?;
                         response = self
-                            .client
-                            .get(url)
-                            .headers(Self::build_headers_with_token(&refreshed)?)
-                            .send()
-                            .await
-                            .map_err(LLMError::Http)?;
+                            .send_with_transport_retry(
+                                || self.client.get(url).headers(refreshed_headers.clone()),
+                                "copilot models list auth-refresh retry",
+                            )
+                            .await?;
                     }
                 }
             }
@@ -1143,6 +1241,20 @@ mod tests {
         assert!(provider.token.is_none());
         assert!(provider.token_expires_at.is_none());
         assert!(!provider.is_authenticated());
+    }
+
+    #[test]
+    fn transport_retry_message_detection_handles_incomplete_message() {
+        assert!(CopilotProvider::is_retryable_transport_message(
+            "error sending request for url: hyper::Error(IncompleteMessage)",
+        ));
+    }
+
+    #[test]
+    fn transport_retry_message_detection_ignores_validation_errors() {
+        assert!(!CopilotProvider::is_retryable_transport_message(
+            "HTTP 400: invalid request body",
+        ));
     }
 
     #[test]

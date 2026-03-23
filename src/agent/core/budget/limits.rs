@@ -13,16 +13,39 @@ use std::path::PathBuf;
 /// These are the built-in defaults used when there is no user override in
 /// `config.json:model_limits` and no legacy `model_limits.json`.
 pub const KNOWN_MODEL_LIMITS: &[(&str, u32, u32)] = &[
-    // OpenAI (GPT-5 series)
+    // GitHub Copilot model profiles (2026-03)
+    // Anthropic
+    ("claude-haiku-4.5", 160_000, 32_000),
+    ("claude-opus-4.5", 160_000, 32_000),
+    ("claude-opus-4.6", 192_000, 64_000),
+    ("claude-sonnet-4.6", 200_000, 32_000),
+    ("claude-sonnet-4-6", 200_000, 32_000), // Alternate wire format
+    ("claude-sonnet-4.5", 200_000, 32_000),
+    ("claude-sonnet-4-5", 200_000, 32_000), // Alternate wire format
+    // Google
+    ("gemini-2.5-pro", 128_000, 16_000),
+    ("gemini-3-flash-preview", 1_000_000, 8_192),
+    ("gemini-3.1-pro-preview", 2_000_000, 64_000),
+    // OpenAI
+    ("gpt-5.4", 1_050_000, 32_768),
+    ("gpt-5.3-codex", 400_000, 128_000),
+    ("gpt-5.2-codex", 400_000, 128_000),
+    ("gpt-5.2", 400_000, 128_000),
+    ("gpt-5.1", 400_000, 128_000),
+    ("gpt-5", 400_000, 128_000),
+    ("gpt-5.4-mini", 128_000, 16_384),
+    ("gpt-4.1", 128_000, 16_384),
+    ("gpt-4-o-preview", 128_000, 16_384),
+    ("gpt-4o-preview", 128_000, 16_384), // Alternate spelling
+    // xAI
+    ("grok-code-fast-1", 128_000, 10_240),
+    // GitHub specialized
+    ("oswe-vscode-prime", 264_000, 64_000),
+    // Backward-compatible aliases and non-Copilot profiles
     ("gpt-5.4-thinking", 1_000_000, 128_000),
-    ("gpt-5.3-codex", 1_000_000, 128_000),
     ("gpt-5.2-pro", 256_000, 64_000),
     ("gpt-5-mini", 400_000, 128_000),
-    // OpenAI (legacy)
-    ("gpt-4.1", 1_000_000, 32_000),
     ("gpt-4o", 128_000, 16_000),
-    // Google
-    ("gemini-2.5-pro", 1_000_000, 64_000),
     // Moonshot
     ("kimi-k2.5", 256_000, 64_000),
     ("kimi-for-coding", 256_000, 64_000),
@@ -318,32 +341,46 @@ mod tests {
 
     #[test]
     fn builtin_limits_contain_common_models() {
-        let gpt5 = KNOWN_MODEL_LIMITS
+        let gpt54 = KNOWN_MODEL_LIMITS
             .iter()
-            .find(|(k, _, _)| *k == "gpt-5.4-thinking")
-            .expect("Should have gpt-5.4-thinking");
-        assert_eq!(gpt5.1, 1_000_000);
-        assert_eq!(gpt5.2, 128_000);
+            .find(|(k, _, _)| *k == "gpt-5.4")
+            .expect("Should have gpt-5.4");
+        assert_eq!(gpt54.1, 1_050_000);
+        assert_eq!(gpt54.2, 32_768);
+
+        let gpt53_codex = KNOWN_MODEL_LIMITS
+            .iter()
+            .find(|(k, _, _)| *k == "gpt-5.3-codex")
+            .expect("Should have gpt-5.3-codex");
+        assert_eq!(gpt53_codex.1, 400_000);
+        assert_eq!(gpt53_codex.2, 128_000);
+
+        let gpt52_codex = KNOWN_MODEL_LIMITS
+            .iter()
+            .find(|(k, _, _)| *k == "gpt-5.2-codex")
+            .expect("Should have gpt-5.2-codex");
+        assert_eq!(gpt52_codex.1, 400_000);
+        assert_eq!(gpt52_codex.2, 128_000);
     }
 
     #[test]
     fn registry_finds_builtin_by_exact_match() {
         let registry = ModelLimitsRegistry::new();
         let limit = registry
-            .get("gpt-5.4-thinking")
-            .expect("Should find gpt-5.4-thinking");
-        assert_eq!(limit.max_context_tokens, 1_000_000);
+            .get("gpt-5.2-codex")
+            .expect("Should find gpt-5.2-codex");
+        assert_eq!(limit.max_context_tokens, 400_000);
         assert_eq!(limit.get_max_output_tokens(), 128_000);
     }
 
     #[test]
     fn registry_finds_builtin_by_partial_match() {
         let registry = ModelLimitsRegistry::new();
-        // "gpt-5.4-thinking-preview" contains "gpt-5.4-thinking"
+        // "gpt-5.2-codex-preview" contains "gpt-5.2-codex"
         let limit = registry
-            .get("gpt-5.4-thinking-preview")
-            .expect("Should find gpt-5.4-thinking");
-        assert_eq!(limit.max_context_tokens, 1_000_000);
+            .get("gpt-5.2-codex-preview")
+            .expect("Should find gpt-5.2-codex");
+        assert_eq!(limit.max_context_tokens, 400_000);
         assert_eq!(limit.get_max_output_tokens(), 128_000);
     }
 
@@ -357,10 +394,10 @@ mod tests {
     #[test]
     fn user_override_takes_precedence() {
         let mut registry = ModelLimitsRegistry::new();
-        registry.add_limit(ModelLimit::new("gpt-5.4-thinking", 64_000)); // Override with smaller limit
+        registry.add_limit(ModelLimit::new("gpt-5.2-codex", 64_000)); // Override with smaller limit
 
         let limit = registry
-            .get("gpt-5.4-thinking")
+            .get("gpt-5.2-codex")
             .expect("Should find overridden limit");
         assert_eq!(limit.max_context_tokens, 64_000);
     }
@@ -402,7 +439,7 @@ mod tests {
             "model_limits".to_string(),
             serde_json::json!([
                 {
-                    "model_pattern": "gpt-5.4-thinking",
+                    "model_pattern": "gpt-5.2-codex",
                     "max_context_tokens": 64000,
                     "max_output_tokens": 2048,
                     "safety_margin": 512
@@ -414,7 +451,7 @@ mod tests {
             .expect("should parse")
             .expect("should exist");
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].model_pattern, "gpt-5.4-thinking");
+        assert_eq!(loaded[0].model_pattern, "gpt-5.2-codex");
         assert_eq!(loaded[0].max_context_tokens, 64_000);
         assert_eq!(loaded[0].max_output_tokens, Some(2048));
         assert_eq!(loaded[0].safety_margin, Some(512));
