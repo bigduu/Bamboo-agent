@@ -21,17 +21,37 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
     );
 
     let mut context = String::from("\n\n## Skill System\n");
-    context.push_str("You have access to specialized skills that provide domain expertise, workflows, and tools. ");
-    context.push_str("When a user's request matches a skill's description, load the skill instructions and follow them.\n\n");
-    context.push_str("### How to Use Skills\n");
-    context.push_str("1. Analyze the user's request\n");
-    context
-        .push_str("2. Match it against the available skills below based on their descriptions\n");
     context.push_str(
-        "3. If there's a match, call `load_skill` with `skill_id` to fetch full instructions\n",
+        "Before producing any user-facing response, you MUST perform a skill applicability check.\n\n",
     );
-    context.push_str("4. If supporting files are needed, call `read_skill_resource` with `skill_id` and `resource_path`\n");
-    context.push_str("5. Follow the loaded instructions to help the user\n\n");
+
+    context.push_str("### Mandatory Skill Check\n");
+    context.push_str("1. Evaluate the user's request against ALL available skill descriptions below.\n");
+    context.push_str("2. Decide whether at least one skill clearly and unambiguously applies.\n");
+    context.push_str("3. Do NOT skip this check.\n\n");
+
+    context.push_str("### If A Skill Applies\n");
+    context.push_str("1. Select EXACTLY ONE skill (prefer the most specific match).\n");
+    context.push_str(
+        "2. Call `load_skill` with the selected `skill_id` BEFORE producing your response.\n",
+    );
+    context.push_str("3. Follow the loaded SKILL.md instructions precisely.\n");
+    context.push_str("4. Do NOT respond outside the selected skill's defined workflow unless the instructions explicitly allow it.\n\n");
+
+    context.push_str("### If No Skill Applies\n");
+    context.push_str("1. Proceed normally without loading any skill.\n");
+    context.push_str("2. Do NOT call `load_skill` or `read_skill_resource` when no skill applies.\n\n");
+
+    context.push_str("### Resource Loading Rules\n");
+    context.push_str("1. Do NOT preload all skills.\n");
+    context.push_str("2. Call `load_skill` only after selecting one skill.\n");
+    context.push_str(
+        "3. Use `read_skill_resource` only for auxiliary files after `load_skill`.\n",
+    );
+    context.push_str(
+        "4. When a resource response has `has_more=true`, continue with `next_offset` until you have enough context.\n\n",
+    );
+
     context.push_str("### Available Skills\n");
 
     for skill in skills {
@@ -43,6 +63,7 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
 
         // Only metadata - minimal token usage
         context.push_str(&format!("\n**{}** (`{}`)\n", skill.name, skill.id));
+        context.push_str(&format!("- skill_id: `{}`\n", skill.id));
         context.push_str(&format!("- Description: {}\n", skill.description));
 
         if !skill.tool_refs.is_empty() {
@@ -56,6 +77,11 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
             context.push_str("- Compatibility details are available in the loaded skill payload\n");
         }
     }
+
+    context.push_str("\n### Internal Verification\n");
+    context.push_str(
+        "Internally confirm `skill_check_completed=true` before each user-facing response.\n",
+    );
 
     tracing::info!("Skill metadata context built: {} chars", context.len());
 
@@ -88,14 +114,16 @@ mod tests {
 
         // Should contain instructions for AI
         assert!(context.contains("## Skill System"));
-        assert!(context.contains("How to Use Skills"));
-        assert!(context.contains("Match it against the available skills"));
+        assert!(context.contains("Mandatory Skill Check"));
+        assert!(context.contains("Select EXACTLY ONE skill"));
         assert!(context.contains("load_skill"));
         assert!(context.contains("read_skill_resource"));
+        assert!(context.contains("skill_check_completed=true"));
 
         // Should contain skill metadata
         assert!(context.contains("Demo Skill"));
         assert!(context.contains("demo-skill"));
+        assert!(context.contains("skill_id: `demo-skill`"));
         assert!(context.contains("A demo skill for testing"));
         assert!(context.contains("Provides tools: read_file"));
         assert!(context.contains("Compatibility details are available in the loaded skill payload"));
