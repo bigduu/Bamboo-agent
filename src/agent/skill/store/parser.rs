@@ -46,6 +46,12 @@ pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefi
         ));
     }
     validate_skill_name(name)?;
+    if name != dir_name {
+        return Err(SkillError::Validation(format!(
+            "Skill name '{}' must match directory name '{}'",
+            name, dir_name
+        )));
+    }
 
     let description = frontmatter.description.trim();
     if description.is_empty() {
@@ -205,16 +211,17 @@ pub(crate) fn is_valid_skill_id(id: &str) -> bool {
         return false;
     }
 
-    if !id
-        .chars()
-        .next()
-        .is_some_and(|character| character.is_ascii_lowercase())
-    {
+    // Kilo-compatible rule: ^[a-z0-9]+(?:-[a-z0-9]+)*$
+    // This forbids leading/trailing hyphens and consecutive hyphens.
+    if id.starts_with('-') || id.ends_with('-') || id.contains("--") {
         return false;
     }
 
-    id.chars().all(|character| {
-        character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+    id.split('-').all(|segment| {
+        !segment.is_empty()
+            && segment
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
     })
 }
 
@@ -230,15 +237,18 @@ mod tests {
         assert!(is_valid_skill_id("skill123"));
         assert!(is_valid_skill_id("a-b-c"));
         assert!(is_valid_skill_id("skill-creator"));
+        assert!(is_valid_skill_id("123-skill"));
     }
 
     #[test]
     fn invalid_skill_ids() {
         assert!(!is_valid_skill_id(""));
         assert!(!is_valid_skill_id("MySkill"));
-        assert!(!is_valid_skill_id("123-skill"));
         assert!(!is_valid_skill_id("my_skill"));
         assert!(!is_valid_skill_id("my skill"));
+        assert!(!is_valid_skill_id("-skill"));
+        assert!(!is_valid_skill_id("skill-"));
+        assert!(!is_valid_skill_id("my--skill"));
     }
 
     #[test]
@@ -271,5 +281,23 @@ Use this skill when users want to create skills.
         let error = parse_markdown_skill(Path::new("skill-creator/SKILL.md"), content)
             .expect_err("id should be rejected by strict schema");
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn parse_skill_rejects_name_directory_mismatch() {
+        let content = r#"---
+name: another-name
+description: Helps create and improve skills.
+---
+Use this skill when users want to create skills.
+"#;
+
+        let error = parse_markdown_skill(Path::new("skill-creator/SKILL.md"), content)
+            .expect_err("name mismatch should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("must match directory name 'skill-creator'")
+        );
     }
 }
