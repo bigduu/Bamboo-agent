@@ -33,6 +33,7 @@
 //! async fn main() {
 //!     let config = SkillStoreConfig {
 //!         skills_dir: PathBuf::from("./skills"),
+//!         ..Default::default()
 //!     };
 //!
 //!     let store = SkillStore::new(config);
@@ -51,7 +52,7 @@ pub mod parser;
 pub mod storage;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tokio::sync::RwLock;
 use tracing::info;
@@ -59,11 +60,18 @@ use tracing::info;
 use crate::agent::skill::store::builtin::load_builtin_skill_bundles;
 use crate::agent::skill::store::parser::render_skill_markdown;
 use crate::agent::skill::store::storage::{
-    ensure_skills_dir, load_skills_from_dir, write_skill_file,
+    ensure_skills_dir, load_skills_from_discovery_dirs, write_skill_file, SkillDirectorySource,
+    SkillDiscoveryDir,
 };
 use crate::agent::skill::types::{
     SkillDefinition, SkillError, SkillFilter, SkillId, SkillResult, SkillStoreConfig,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillCandidateMeta {
+    source: SkillDirectorySource,
+    mode: Option<String>,
+}
 
 /// Persistent storage for skills with in-memory caching.
 ///
@@ -88,12 +96,102 @@ use crate::agent::skill::types::{
 pub struct SkillStore {
     /// In-memory cache of loaded skills, keyed by skill ID.
     skills: RwLock<HashMap<SkillId, SkillDefinition>>,
+    /// Root directory of each loaded skill (keyed by skill ID).
+    skill_roots: RwLock<HashMap<SkillId, PathBuf>>,
 
     /// Configuration specifying the skills directory path.
     config: SkillStoreConfig,
 }
 
 impl SkillStore {
+    fn normalized_active_mode(&self) -> Option<String> {
+        let raw = self.config.active_mode.as_deref()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+
+        let normalized = raw.to_ascii_lowercase();
+        if !normalized.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        }) {
+            tracing::warn!(
+                "Ignoring invalid skill mode '{}' (allowed: lowercase letters, digits, hyphen)",
+                raw
+            );
+            return None;
+        }
+
+        Some(normalized)
+    }
+
+    fn sibling_skills_mode_dir(base_skills_dir: &Path, mode: &str) -> PathBuf {
+        let parent = base_skills_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        parent.join(format!("skills-{mode}"))
+    }
+
+    fn project_skills_dir(project_dir: &Path) -> PathBuf {
+        project_dir.join(".bamboo").join("skills")
+    }
+
+    fn project_skills_mode_dir(project_dir: &Path, mode: &str) -> PathBuf {
+        project_dir.join(".bamboo").join(format!("skills-{mode}"))
+    }
+
+    fn discovery_dirs(&self) -> Vec<SkillDiscoveryDir> {
+        let mut dirs = Vec::new();
+        let active_mode = self.normalized_active_mode();
+
+        dirs.push(SkillDiscoveryDir {
+            dir: self.config.skills_dir.clone(),
+            source: SkillDirectorySource::Global,
+            mode: None,
+        });
+        if let Some(mode) = active_mode.as_ref() {
+            dirs.push(SkillDiscoveryDir {
+                dir: Self::sibling_skills_mode_dir(&self.config.skills_dir, mode),
+                source: SkillDirectorySource::Global,
+                mode: Some(mode.clone()),
+            });
+        }
+
+        if let Some(project_dir) = self.config.project_dir.as_ref() {
+            dirs.push(SkillDiscoveryDir {
+                dir: Self::project_skills_dir(project_dir),
+                source: SkillDirectorySource::Project,
+                mode: None,
+            });
+            if let Some(mode) = active_mode.as_ref() {
+                dirs.push(SkillDiscoveryDir {
+                    dir: Self::project_skills_mode_dir(project_dir, mode),
+                    source: SkillDirectorySource::Project,
+                    mode: Some(mode.clone()),
+                });
+            }
+        }
+
+        dirs
+    }
+
+    fn should_override_skill(
+        existing: &SkillCandidateMeta,
+        candidate: &SkillCandidateMeta,
+    ) -> bool {
+        match (existing.source, candidate.source) {
+            (SkillDirectorySource::Global, SkillDirectorySource::Project) => return true,
+            (SkillDirectorySource::Project, SkillDirectorySource::Global) => return false,
+            _ => {}
+        }
+
+        match (existing.mode.is_some(), candidate.mode.is_some()) {
+            (false, true) => true,
+            (true, false) => false,
+            _ => false,
+        }
+    }
+
     /// Create a new skill store with the given configuration.
     ///
     /// The store is created empty and must be initialized using [`initialize`](Self::initialize)
@@ -111,12 +209,14 @@ impl SkillStore {
     ///
     /// let config = SkillStoreConfig {
     ///     skills_dir: PathBuf::from("./skills"),
+    ///     ..Default::default()
     /// };
     /// let store = SkillStore::new(config);
     /// ```
     pub fn new(config: SkillStoreConfig) -> Self {
         Self {
             skills: RwLock::new(HashMap::new()),
+            skill_roots: RwLock::new(HashMap::new()),
             config,
         }
     }
@@ -168,11 +268,53 @@ impl SkillStore {
     ///
     /// Returns `SkillError` if the skills directory cannot be read.
     async fn load(&self) -> SkillResult<usize> {
-        let loaded = load_skills_from_dir(&self.config.skills_dir).await?;
-        let count = loaded.len();
+        let loaded_records = load_skills_from_discovery_dirs(&self.discovery_dirs()).await?;
 
+        let mut resolved_skills: HashMap<SkillId, SkillDefinition> = HashMap::new();
+        let mut resolved_roots: HashMap<SkillId, PathBuf> = HashMap::new();
+        let mut resolved_meta: HashMap<SkillId, SkillCandidateMeta> = HashMap::new();
+
+        for record in loaded_records {
+            let skill_id = record.skill.id.clone();
+            let candidate_meta = SkillCandidateMeta {
+                source: record.source,
+                mode: record.mode.clone(),
+            };
+
+            let should_replace = resolved_meta
+                .get(&skill_id)
+                .is_some_and(|existing| Self::should_override_skill(existing, &candidate_meta));
+            let should_keep_existing = resolved_meta.contains_key(&skill_id) && !should_replace;
+
+            if should_keep_existing {
+                tracing::debug!(
+                    "Keeping existing skill '{}' over candidate from {:?} (mode={})",
+                    skill_id,
+                    candidate_meta.source,
+                    candidate_meta.mode.as_deref().unwrap_or("generic")
+                );
+                continue;
+            }
+
+            if should_replace {
+                tracing::info!(
+                    "Skill '{}' overridden by {:?} (mode={})",
+                    skill_id,
+                    candidate_meta.source,
+                    candidate_meta.mode.as_deref().unwrap_or("generic")
+                );
+            }
+
+            resolved_skills.insert(skill_id.clone(), record.skill);
+            resolved_roots.insert(skill_id.clone(), record.skill_root);
+            resolved_meta.insert(skill_id, candidate_meta);
+        }
+
+        let count = resolved_skills.len();
         let mut skills = self.skills.write().await;
-        *skills = loaded;
+        let mut roots = self.skill_roots.write().await;
+        *skills = resolved_skills;
+        *roots = resolved_roots;
 
         Ok(count)
     }
@@ -314,6 +456,15 @@ impl SkillStore {
     pub async fn get_skill(&self, id: &str) -> SkillResult<SkillDefinition> {
         let skills = self.skills.read().await;
         skills
+            .get(id)
+            .cloned()
+            .ok_or_else(|| SkillError::NotFound(id.to_string()))
+    }
+
+    /// Get the root directory path for a loaded skill.
+    pub async fn get_skill_root(&self, id: &str) -> SkillResult<PathBuf> {
+        let roots = self.skill_roots.read().await;
+        roots
             .get(id)
             .cloned()
             .ok_or_else(|| SkillError::NotFound(id.to_string()))
@@ -627,10 +778,31 @@ impl SkillUpdate {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use tokio::fs;
 
     use super::SkillStore;
     use crate::agent::skill::types::SkillStoreConfig;
+
+    async fn write_skill(
+        skills_root: &Path,
+        id: &str,
+        description: &str,
+        prompt: &str,
+    ) -> std::io::Result<PathBuf> {
+        let skill_dir = skills_root.join(id);
+        fs::create_dir_all(&skill_dir).await?;
+        let skill_file = skill_dir.join("SKILL.md");
+        let content = format!(
+            "---\nname: {id}\ndescription: {description}\n---\n{prompt}\n",
+            id = id,
+            description = description,
+            prompt = prompt
+        );
+        fs::write(&skill_file, content).await?;
+        Ok(skill_dir)
+    }
 
     #[tokio::test]
     async fn load_markdown_skills() {
@@ -654,7 +826,10 @@ Use this skill for testing.
         let skill_file = skill_dir.join("SKILL.md");
         fs::write(&skill_file, content).await.expect("write");
 
-        let config = SkillStoreConfig { skills_dir };
+        let config = SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        };
         let store = SkillStore::new(config);
         store.initialize().await.expect("initialize");
 
@@ -668,11 +843,163 @@ Use this skill for testing.
         let directory = tempfile::tempdir().expect("tempdir");
         let config = SkillStoreConfig {
             skills_dir: directory.path().join("skills"),
+            ..Default::default()
         };
         let store = SkillStore::new(config);
         store.initialize().await.expect("initialize");
 
         let skills = store.list_skills(None, false).await;
         assert!(skills.iter().any(|skill| skill.id == "skill-creator"));
+    }
+
+    #[tokio::test]
+    async fn project_skill_overrides_global_skill() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_dir = directory.path().join("data");
+        let workspace_dir = directory.path().join("workspace");
+        let global_skills_dir = data_dir.join("skills");
+        let project_skills_dir = workspace_dir.join(".bamboo").join("skills");
+
+        fs::create_dir_all(&global_skills_dir)
+            .await
+            .expect("create global skills dir");
+        fs::create_dir_all(&project_skills_dir)
+            .await
+            .expect("create project skills dir");
+
+        write_skill(
+            &global_skills_dir,
+            "override-skill",
+            "global version",
+            "Global prompt",
+        )
+        .await
+        .expect("write global skill");
+        let project_skill_root = write_skill(
+            &project_skills_dir,
+            "override-skill",
+            "project version",
+            "Project prompt",
+        )
+        .await
+        .expect("write project skill");
+
+        let config = SkillStoreConfig {
+            skills_dir: global_skills_dir,
+            project_dir: Some(workspace_dir),
+            active_mode: None,
+        };
+        let store = SkillStore::new(config);
+        store.initialize().await.expect("initialize");
+
+        let skill = store
+            .get_skill("override-skill")
+            .await
+            .expect("override skill must exist");
+        assert_eq!(skill.description, "project version");
+
+        let resolved_root = store
+            .get_skill_root("override-skill")
+            .await
+            .expect("skill root");
+        let resolved_root = fs::canonicalize(resolved_root)
+            .await
+            .expect("canonical resolved root");
+        let expected_root = fs::canonicalize(project_skill_root)
+            .await
+            .expect("canonical expected root");
+        assert_eq!(resolved_root, expected_root);
+    }
+
+    #[tokio::test]
+    async fn mode_specific_skill_overrides_generic_for_same_source() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_dir = directory.path().join("data");
+        let global_skills_dir = data_dir.join("skills");
+        let global_mode_skills_dir = data_dir.join("skills-code");
+
+        fs::create_dir_all(&global_skills_dir)
+            .await
+            .expect("create global skills dir");
+        fs::create_dir_all(&global_mode_skills_dir)
+            .await
+            .expect("create global mode skills dir");
+
+        write_skill(
+            &global_skills_dir,
+            "mode-target-skill",
+            "generic version",
+            "Generic prompt",
+        )
+        .await
+        .expect("write generic skill");
+        write_skill(
+            &global_mode_skills_dir,
+            "mode-target-skill",
+            "mode version",
+            "Mode prompt",
+        )
+        .await
+        .expect("write mode skill");
+
+        let config = SkillStoreConfig {
+            skills_dir: global_skills_dir,
+            project_dir: None,
+            active_mode: Some("code".to_string()),
+        };
+        let store = SkillStore::new(config);
+        store.initialize().await.expect("initialize");
+
+        let skill = store
+            .get_skill("mode-target-skill")
+            .await
+            .expect("mode-target-skill must exist");
+        assert_eq!(skill.description, "mode version");
+    }
+
+    #[tokio::test]
+    async fn mode_specific_skill_is_ignored_without_active_mode() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_dir = directory.path().join("data");
+        let global_skills_dir = data_dir.join("skills");
+        let global_mode_skills_dir = data_dir.join("skills-code");
+
+        fs::create_dir_all(&global_skills_dir)
+            .await
+            .expect("create global skills dir");
+        fs::create_dir_all(&global_mode_skills_dir)
+            .await
+            .expect("create global mode skills dir");
+
+        write_skill(
+            &global_skills_dir,
+            "mode-target-skill",
+            "generic version",
+            "Generic prompt",
+        )
+        .await
+        .expect("write generic skill");
+        write_skill(
+            &global_mode_skills_dir,
+            "mode-target-skill",
+            "mode version",
+            "Mode prompt",
+        )
+        .await
+        .expect("write mode skill");
+
+        let config = SkillStoreConfig {
+            skills_dir: global_skills_dir,
+            project_dir: None,
+            active_mode: None,
+        };
+        let store = SkillStore::new(config);
+        store.initialize().await.expect("initialize");
+
+        let skill = store
+            .get_skill("mode-target-skill")
+            .await
+            .expect("mode-target-skill must exist");
+        assert_eq!(skill.description, "generic version");
     }
 }

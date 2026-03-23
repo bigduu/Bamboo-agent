@@ -72,7 +72,22 @@ impl SkillDefinition {
 /// Configuration for skill store persistence
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillStoreConfig {
+    /// Global skills directory (for example: `${BAMBOO_DATA_DIR}/skills`).
     pub skills_dir: std::path::PathBuf,
+    /// Optional workspace root used for project-local skills discovery.
+    ///
+    /// When set, Bamboo also discovers skills from:
+    /// - `<project_dir>/.bamboo/skills`
+    /// - `<project_dir>/.bamboo/skills-<active_mode>` (when `active_mode` is set)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_dir: Option<std::path::PathBuf>,
+    /// Optional active mode slug for mode-specific skill overrides.
+    ///
+    /// When set, Bamboo also discovers:
+    /// - `${BAMBOO_DATA_DIR}/skills-<active_mode>`
+    /// - `<project_dir>/.bamboo/skills-<active_mode>` (if project_dir is set)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_mode: Option<String>,
 }
 
 impl Default for SkillStoreConfig {
@@ -81,6 +96,8 @@ impl Default for SkillStoreConfig {
             // Keep runtime path resolution consistent across the codebase:
             // use BAMBOO_DATA_DIR (or `${HOME}/.bamboo`) as the single storage root.
             skills_dir: crate::core::paths::bamboo_dir().join("skills"),
+            project_dir: None,
+            active_mode: None,
         }
     }
 }

@@ -349,9 +349,19 @@ fn build_base_tools(
 }
 
 async fn init_skill_manager(data_dir: &PathBuf) -> Arc<SkillManager> {
+    let project_dir = std::env::var_os("BAMBOO_WORKSPACE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    let active_mode = std::env::var("BAMBOO_SKILL_MODE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
     // Initialize skill manager
     let skill_manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
         skills_dir: data_dir.join("skills"),
+        project_dir,
+        active_mode,
     }));
     if let Err(error) = skill_manager.initialize().await {
         tracing::warn!("Failed to initialize skill manager: {}", error);

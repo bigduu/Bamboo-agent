@@ -21,7 +21,6 @@ struct SkillToolAccess {
     skill_manager: Arc<SkillManager>,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     storage: Arc<dyn Storage>,
-    skills_dir: PathBuf,
 }
 
 impl SkillToolAccess {
@@ -34,7 +33,6 @@ impl SkillToolAccess {
             skill_manager,
             sessions,
             storage,
-            skills_dir: crate::core::paths::bamboo_dir().join("skills"),
         }
     }
 
@@ -79,8 +77,12 @@ impl SkillToolAccess {
         )))
     }
 
-    fn skill_root(&self, skill_id: &str) -> PathBuf {
-        self.skills_dir.join(skill_id)
+    async fn skill_root(&self, skill_id: &str) -> Result<PathBuf, ToolError> {
+        self.skill_manager
+            .store()
+            .get_skill_root(skill_id)
+            .await
+            .map_err(|err| ToolError::Execution(format!("Failed to resolve skill root: {err}")))
     }
 }
 
@@ -161,14 +163,14 @@ impl Tool for LoadSkillTool {
             .map_err(|err| {
                 ToolError::Execution(format!("Failed to load skill '{skill_id}': {err}"))
             })?;
+        let skill_root = self.access.skill_root(skill_id).await?;
 
-        let resources =
-            list_skill_resource_paths(&self.access.skill_root(skill_id)).map_err(|err| {
-                ToolError::Execution(format!("Failed to list skill resources: {err}"))
-            })?;
-        let canonical_skill_root = tokio::fs::canonicalize(self.access.skill_root(skill_id))
+        let resources = list_skill_resource_paths(&skill_root).map_err(|err| {
+            ToolError::Execution(format!("Failed to list skill resources: {err}"))
+        })?;
+        let canonical_skill_root = tokio::fs::canonicalize(&skill_root)
             .await
-            .unwrap_or_else(|_| self.access.skill_root(skill_id));
+            .unwrap_or(skill_root);
 
         Ok(ToolResult {
             success: true,
@@ -282,23 +284,21 @@ impl Tool for ReadSkillResourceTool {
             ));
         }
 
-        let canonical_root = tokio::fs::canonicalize(self.access.skill_root(skill_id))
+        let skill_root = self.access.skill_root(skill_id).await?;
+        let canonical_root = tokio::fs::canonicalize(&skill_root).await.map_err(|_| {
+            ToolError::Execution(format!(
+                "Skill directory not found for '{skill_id}'. Load the skill list first."
+            ))
+        })?;
+        let canonical_resource = tokio::fs::canonicalize(skill_root.join(&resource_path))
             .await
             .map_err(|_| {
                 ToolError::Execution(format!(
-                    "Skill directory not found for '{skill_id}'. Load the skill list first."
+                    "Skill resource not found: {}/{}",
+                    skill_id,
+                    display_relative_path(&resource_path)
                 ))
             })?;
-        let canonical_resource =
-            tokio::fs::canonicalize(self.access.skill_root(skill_id).join(&resource_path))
-                .await
-                .map_err(|_| {
-                    ToolError::Execution(format!(
-                        "Skill resource not found: {}/{}",
-                        skill_id,
-                        display_relative_path(&resource_path)
-                    ))
-                })?;
 
         if !canonical_resource.starts_with(&canonical_root) {
             return Err(ToolError::InvalidArguments(

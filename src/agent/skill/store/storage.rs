@@ -1,11 +1,31 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use tokio::fs;
 use tracing::{debug, info, warn};
 
 use crate::agent::skill::store::parser::{parse_markdown_skill, render_skill_markdown};
-use crate::agent::skill::types::{SkillDefinition, SkillId, SkillResult};
+use crate::agent::skill::types::{SkillDefinition, SkillResult};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillDirectorySource {
+    Global,
+    Project,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillDiscoveryDir {
+    pub dir: PathBuf,
+    pub source: SkillDirectorySource,
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedSkillRecord {
+    pub skill: SkillDefinition,
+    pub skill_root: PathBuf,
+    pub source: SkillDirectorySource,
+    pub mode: Option<String>,
+}
 
 pub async fn ensure_skills_dir(skills_dir: &Path) -> SkillResult<()> {
     fs::create_dir_all(skills_dir).await?;
@@ -43,31 +63,65 @@ async fn find_skill_files(dir: &Path) -> SkillResult<Vec<PathBuf>> {
     Ok(skill_files)
 }
 
-pub async fn load_skills_from_dir(
-    skills_dir: &Path,
-) -> SkillResult<HashMap<SkillId, SkillDefinition>> {
-    debug!("Loading skills from {:?}", skills_dir);
+pub async fn load_skills_from_discovery_dirs(
+    discovery_dirs: &[SkillDiscoveryDir],
+) -> SkillResult<Vec<LoadedSkillRecord>> {
+    let mut loaded = Vec::new();
 
-    let skill_files = find_skill_files(skills_dir).await?;
-    let mut loaded: HashMap<SkillId, SkillDefinition> = HashMap::new();
-
-    for skill_file in skill_files {
-        match fs::read_to_string(&skill_file).await {
-            Ok(content) => match parse_markdown_skill(&skill_file, &content) {
-                Ok(skill) => {
-                    loaded.insert(skill.id.clone(), skill);
-                }
-                Err(error) => {
-                    warn!("Failed to parse skill file {:?}: {}", skill_file, error);
-                }
-            },
+    for discovery in discovery_dirs {
+        match fs::try_exists(&discovery.dir).await {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(
+                    "Skill discovery dir not found, skipping: {:?}",
+                    discovery.dir
+                );
+                continue;
+            }
             Err(error) => {
-                warn!("Failed to read skill file {:?}: {}", skill_file, error);
+                warn!(
+                    "Failed to check skill discovery dir {:?}: {}",
+                    discovery.dir, error
+                );
+                continue;
+            }
+        }
+
+        debug!(
+            "Loading skills from {:?} (source={:?}, mode={})",
+            discovery.dir,
+            discovery.source,
+            discovery.mode.as_deref().unwrap_or("generic")
+        );
+
+        let skill_files = find_skill_files(&discovery.dir).await?;
+        for skill_file in skill_files {
+            match fs::read_to_string(&skill_file).await {
+                Ok(content) => match parse_markdown_skill(&skill_file, &content) {
+                    Ok(skill) => {
+                        let skill_root = skill_file
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| discovery.dir.clone());
+                        loaded.push(LoadedSkillRecord {
+                            skill,
+                            skill_root,
+                            source: discovery.source,
+                            mode: discovery.mode.clone(),
+                        });
+                    }
+                    Err(error) => {
+                        warn!("Failed to parse skill file {:?}: {}", skill_file, error);
+                    }
+                },
+                Err(error) => {
+                    warn!("Failed to read skill file {:?}: {}", skill_file, error);
+                }
             }
         }
     }
 
-    info!("Loaded {} skills", loaded.len());
+    info!("Loaded {} skill records from discovery dirs", loaded.len());
     Ok(loaded)
 }
 
