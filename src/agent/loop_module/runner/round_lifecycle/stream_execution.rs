@@ -139,8 +139,8 @@ pub(super) async fn execute_llm_stream(
     };
     let mut responses_options = ResponsesRequestOptions {
         store: Some(false),
-        // Keep tool-planning narration visible but compact.
-        text_verbosity: Some("low".to_string()),
+        // Encourage the model to emit visible narration alongside tool calls.
+        text_verbosity: Some("high".to_string()),
         reasoning_summary: Some("auto".to_string()),
         include: Some(vec!["reasoning.encrypted_content".to_string()]),
         ..Default::default()

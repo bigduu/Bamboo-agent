@@ -301,8 +301,28 @@ pub struct ResponsesSseParser {
     // Some upstreams omit item_id on text deltas; keep a coarse flag so
     // `*.done` fallbacks can avoid obvious duplicate full-text emissions.
     saw_unkeyed_text_delta: bool,
+    // Keyed text streams that have emitted deltas (or delta-like fragments).
+    // Key format is derived from output/content indices when available.
+    text_delta_stream_keys: HashSet<String>,
+    // Keyed text streams that have already emitted terminal done snapshots.
+    text_done_stream_keys: HashSet<String>,
+    // Output indexes that already surfaced any user-visible text stream.
+    // Used to suppress redundant message snapshots in `response.output_item.done`.
+    streamed_text_output_indexes: HashSet<i64>,
     // Reasoning output item IDs that have already emitted summary text.
     streamed_reasoning_item_ids: HashSet<String>,
+    // Some upstreams omit item_id on reasoning deltas; use the same done-fallback guard
+    // strategy as text tokens.
+    saw_unkeyed_reasoning_delta: bool,
+    // Per-stream reasoning text accumulation used to normalize providers that emit
+    // cumulative snapshots on `*.delta` instead of strict token deltas.
+    reasoning_item_content: HashMap<String, String>,
+    // Keys (summary index stream or item id stream) that already emitted reasoning deltas.
+    // Used to suppress matching `*.done` snapshots.
+    streamed_reasoning_stream_keys: HashSet<String>,
+    // Whether this response already surfaced reasoning text via dedicated reasoning events.
+    // `response.output_item.done` reasoning payloads are treated as fallback only.
+    saw_reasoning_text_stream: bool,
     provider_label: String,
     model: String,
     requested_reasoning_effort: Option<ReasoningEffort>,
@@ -329,7 +349,14 @@ impl ResponsesSseParser {
             fn_calls: HashMap::new(),
             streamed_text_item_ids: HashSet::new(),
             saw_unkeyed_text_delta: false,
+            text_delta_stream_keys: HashSet::new(),
+            text_done_stream_keys: HashSet::new(),
+            streamed_text_output_indexes: HashSet::new(),
             streamed_reasoning_item_ids: HashSet::new(),
+            saw_unkeyed_reasoning_delta: false,
+            reasoning_item_content: HashMap::new(),
+            streamed_reasoning_stream_keys: HashSet::new(),
+            saw_reasoning_text_stream: false,
             provider_label: provider_label.to_string(),
             model: model.to_string(),
             requested_reasoning_effort,
@@ -452,7 +479,7 @@ impl ResponsesSseParser {
         out
     }
 
-    fn content_part_output_text(v: &Value) -> String {
+    fn content_part_output_text(v: &Value, prefer_delta: bool) -> String {
         let part = v
             .get("part")
             .or_else(|| v.get("content_part"))
@@ -465,11 +492,86 @@ impl ResponsesSseParser {
             return String::new();
         }
 
+        if prefer_delta {
+            return part
+                .get("delta")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string();
+        }
+
         part.get("text")
             .and_then(|value| value.as_str())
             .or_else(|| part.get("delta").and_then(|value| value.as_str()))
             .unwrap_or("")
             .to_string()
+    }
+
+    fn text_output_index(v: &Value) -> Option<i64> {
+        v.get("output_index").and_then(|value| value.as_i64())
+    }
+
+    fn text_stream_key(v: &Value) -> Option<String> {
+        let output_index = Self::text_output_index(v)?;
+        let content_index = v
+            .get("content_index")
+            .and_then(|value| value.as_i64())
+            .or_else(|| {
+                v.get("part")
+                    .and_then(|part| part.get("index"))
+                    .and_then(|value| value.as_i64())
+            });
+        match content_index {
+            Some(content_index) => Some(format!("text:{output_index}:{content_index}")),
+            None => Some(format!("text:{output_index}:_")),
+        }
+    }
+
+    fn emit_text_delta_with_key(&mut self, stream_key: &str, text: &str) -> Option<LLMChunk> {
+        if text.is_empty() {
+            return None;
+        }
+        self.text_delta_stream_keys.insert(stream_key.to_string());
+        Some(LLMChunk::Token(text.to_string()))
+    }
+
+    fn emit_text_done_with_key(&mut self, stream_key: &str, text: &str) -> Option<LLMChunk> {
+        if text.is_empty() {
+            return None;
+        }
+        if self.text_delta_stream_keys.contains(stream_key)
+            || self.text_done_stream_keys.contains(stream_key)
+        {
+            return None;
+        }
+
+        // Cross-channel dedupe by output_index when one channel omits content_index
+        // (for example, `content_part.done` with key `text:<output>:_`).
+        if let Some((prefix, _)) = stream_key.rsplit_once(':') {
+            let wildcard_key = format!("{prefix}:_");
+            if self.text_delta_stream_keys.contains(wildcard_key.as_str())
+                || self.text_done_stream_keys.contains(wildcard_key.as_str())
+            {
+                return None;
+            }
+            if stream_key.ends_with(":_") {
+                let output_prefix = format!("{prefix}:");
+                if self
+                    .text_delta_stream_keys
+                    .iter()
+                    .any(|key| key.starts_with(output_prefix.as_str()))
+                    || self
+                        .text_done_stream_keys
+                        .iter()
+                        .any(|key| key.starts_with(output_prefix.as_str()))
+                {
+                    return None;
+                }
+            }
+        }
+
+        self.text_done_stream_keys.insert(stream_key.to_string());
+        Some(LLMChunk::Token(text.to_string()))
     }
 
     fn reasoning_item_summary_text(item: &Value) -> String {
@@ -498,16 +600,107 @@ impl ResponsesSseParser {
         out
     }
 
-    fn emit_reasoning_item_text(&mut self, item_id: Option<&str>, text: &str) -> Option<LLMChunk> {
+    fn reasoning_summary_part_text(v: &Value) -> String {
+        let part = v
+            .get("part")
+            .or_else(|| v.get("summary_part"))
+            .unwrap_or(&Value::Null);
+        let part_type = part
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if part_type != "summary_text" {
+            return String::new();
+        }
+        part.get("text")
+            .and_then(|value| value.as_str())
+            .or_else(|| part.get("delta").and_then(|value| value.as_str()))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn reasoning_summary_stream_key(v: &Value) -> Option<String> {
+        let output_index = v.get("output_index").and_then(|value| value.as_i64());
+        let summary_index = v.get("summary_index").and_then(|value| value.as_i64());
+        match (output_index, summary_index) {
+            (Some(output_index), Some(summary_index)) => {
+                Some(format!("summary:{output_index}:{summary_index}"))
+            }
+            (Some(output_index), None) => Some(format!("summary:{output_index}:_")),
+            (None, Some(summary_index)) => Some(format!("summary:_:{}", summary_index)),
+            (None, None) => None,
+        }
+    }
+
+    fn reasoning_event_stream_key(event_type: &str, v: &Value) -> Option<String> {
+        if event_type.starts_with("response.reasoning_summary_") {
+            return Self::reasoning_summary_stream_key(v)
+                .or_else(|| Self::text_item_id(v).map(|item_id| format!("item:{item_id}")));
+        }
+        Self::text_item_id(v).map(|item_id| format!("item:{item_id}"))
+    }
+
+    fn emit_reasoning_delta_with_key(&mut self, stream_key: &str, text: &str) -> Option<LLMChunk> {
         if text.is_empty() {
             return None;
         }
+        self.saw_reasoning_text_stream = true;
+        self.streamed_reasoning_stream_keys
+            .insert(stream_key.to_string());
+        self.normalize_reasoning_item_chunk(stream_key, text)
+            .map(LLMChunk::ReasoningToken)
+    }
+
+    fn emit_reasoning_done_with_key(&mut self, stream_key: &str, text: &str) -> Option<LLMChunk> {
+        if text.is_empty() {
+            return None;
+        }
+        self.saw_reasoning_text_stream = true;
+        if self.streamed_reasoning_stream_keys.contains(stream_key) {
+            return None;
+        }
+        self.streamed_reasoning_stream_keys
+            .insert(stream_key.to_string());
+        self.normalize_reasoning_item_chunk(stream_key, text)
+            .map(LLMChunk::ReasoningToken)
+    }
+
+    fn emit_reasoning_item_text(&mut self, item_id: Option<&str>, text: &str) -> Option<LLMChunk> {
+        self.emit_reasoning_delta_text(item_id, text)
+    }
+
+    fn emit_reasoning_delta_text(&mut self, item_id: Option<&str>, text: &str) -> Option<LLMChunk> {
+        if text.is_empty() {
+            return None;
+        }
+        self.saw_reasoning_text_stream = true;
 
         if let Some(item_id) = item_id {
-            if self.streamed_reasoning_item_ids.contains(item_id) {
-                return None;
-            }
             self.streamed_reasoning_item_ids.insert(item_id.to_string());
+            return self
+                .normalize_reasoning_item_chunk(item_id, text)
+                .map(LLMChunk::ReasoningToken);
+        }
+
+        self.saw_unkeyed_reasoning_delta = true;
+        Some(LLMChunk::ReasoningToken(text.to_string()))
+    }
+
+    fn emit_reasoning_done_text(&mut self, item_id: Option<&str>, text: &str) -> Option<LLMChunk> {
+        if text.is_empty() {
+            return None;
+        }
+        self.saw_reasoning_text_stream = true;
+
+        if let Some(item_id) = item_id {
+            self.streamed_reasoning_item_ids.insert(item_id.to_string());
+            return self
+                .normalize_reasoning_item_chunk(item_id, text)
+                .map(LLMChunk::ReasoningToken);
+        }
+
+        if self.saw_unkeyed_reasoning_delta {
+            return None;
         }
 
         Some(LLMChunk::ReasoningToken(text.to_string()))
@@ -531,6 +724,41 @@ impl ResponsesSseParser {
         }
 
         Some(LLMChunk::Token(text.to_string()))
+    }
+
+    fn normalize_reasoning_item_chunk(&mut self, item_id: &str, chunk: &str) -> Option<String> {
+        let entry = self
+            .reasoning_item_content
+            .entry(item_id.to_string())
+            .or_default();
+
+        if entry.is_empty() {
+            entry.push_str(chunk);
+            return Some(chunk.to_string());
+        }
+
+        if chunk == entry.as_str() {
+            return None;
+        }
+
+        // Snapshot mode: the new payload includes the previous text as prefix.
+        if chunk.starts_with(entry.as_str()) {
+            let suffix = chunk[entry.len()..].to_string();
+            *entry = chunk.to_string();
+            if suffix.is_empty() {
+                return None;
+            }
+            return Some(suffix);
+        }
+
+        // Duplicate resend of an already emitted tail fragment.
+        if entry.ends_with(chunk) {
+            return None;
+        }
+
+        // True delta mode fallback: append fragment as-is.
+        entry.push_str(chunk);
+        Some(chunk.to_string())
     }
 
     fn log_reasoning_summary_if_needed(&mut self, usage: Option<&Value>) {
@@ -605,22 +833,138 @@ impl ResponsesSseParser {
             return Ok(Some(chunk));
         }
 
-        if event_type.contains("reasoning") {
-            self.observed_reasoning_signal = true;
-            self.reasoning_event_count = self.reasoning_event_count.saturating_add(1);
-            let reasoning_chunk = v
-                .get("delta")
-                .and_then(|value| value.as_str())
-                .or_else(|| v.get("text").and_then(|value| value.as_str()))
-                .or_else(|| v.get("summary").and_then(|value| value.as_str()))
-                .unwrap_or("");
-            self.reasoning_text_chars = self
-                .reasoning_text_chars
-                .saturating_add(reasoning_chunk.len());
-            if reasoning_chunk.is_empty() {
+        match event_type {
+            // `summary_part.added` is typically a shape/placeholder signal; text is usually empty.
+            "response.reasoning_summary_part.added" => {
+                self.observed_reasoning_signal = true;
+                self.reasoning_event_count = self.reasoning_event_count.saturating_add(1);
                 return Ok(None);
             }
-            return Ok(Some(LLMChunk::ReasoningToken(reasoning_chunk.to_string())));
+
+            "response.reasoning_summary_text.delta" => {
+                self.observed_reasoning_signal = true;
+                self.reasoning_event_count = self.reasoning_event_count.saturating_add(1);
+                let reasoning_chunk = v
+                    .get("delta")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| v.get("text").and_then(|value| value.as_str()))
+                    .or_else(|| v.get("summary").and_then(|value| value.as_str()))
+                    .unwrap_or("");
+                self.reasoning_text_chars = self
+                    .reasoning_text_chars
+                    .saturating_add(reasoning_chunk.len());
+                if reasoning_chunk.is_empty() {
+                    return Ok(None);
+                }
+                if let Some(stream_key) = Self::reasoning_event_stream_key(event_type, &v) {
+                    return Ok(self.emit_reasoning_delta_with_key(
+                        stream_key.as_str(),
+                        reasoning_chunk,
+                    ));
+                }
+                let item_id = Self::text_item_id(&v);
+                return Ok(self.emit_reasoning_delta_text(item_id.as_deref(), reasoning_chunk));
+            }
+
+            "response.reasoning_summary_text.done" => {
+                self.observed_reasoning_signal = true;
+                self.reasoning_event_count = self.reasoning_event_count.saturating_add(1);
+                let mut reasoning_chunk = v
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| v.get("delta").and_then(|value| value.as_str()))
+                    .or_else(|| v.get("summary").and_then(|value| value.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                if reasoning_chunk.is_empty() {
+                    reasoning_chunk = Self::reasoning_item_summary_text(&v);
+                }
+                self.reasoning_text_chars = self
+                    .reasoning_text_chars
+                    .saturating_add(reasoning_chunk.len());
+                if reasoning_chunk.is_empty() {
+                    return Ok(None);
+                }
+                if let Some(stream_key) = Self::reasoning_event_stream_key(event_type, &v) {
+                    return Ok(self.emit_reasoning_done_with_key(
+                        stream_key.as_str(),
+                        reasoning_chunk.as_str(),
+                    ));
+                }
+                let item_id = Self::text_item_id(&v);
+                return Ok(self.emit_reasoning_done_text(item_id.as_deref(), reasoning_chunk.as_str()));
+            }
+
+            // Some providers emit only part.done with the full summary text; treat it as
+            // a fallback channel and suppress when summary_text.* already streamed for this key.
+            "response.reasoning_summary_part.done" => {
+                self.observed_reasoning_signal = true;
+                self.reasoning_event_count = self.reasoning_event_count.saturating_add(1);
+                let reasoning_chunk = Self::reasoning_summary_part_text(&v);
+                self.reasoning_text_chars = self
+                    .reasoning_text_chars
+                    .saturating_add(reasoning_chunk.len());
+                if reasoning_chunk.is_empty() {
+                    return Ok(None);
+                }
+                if let Some(stream_key) = Self::reasoning_event_stream_key(event_type, &v) {
+                    return Ok(self.emit_reasoning_done_with_key(
+                        stream_key.as_str(),
+                        reasoning_chunk.as_str(),
+                    ));
+                }
+                let item_id = Self::text_item_id(&v);
+                return Ok(self.emit_reasoning_done_text(item_id.as_deref(), reasoning_chunk.as_str()));
+            }
+
+            // Legacy / provider-specific reasoning streams.
+            "response.reasoning.delta" | "response.reasoning_text.delta" => {
+                self.observed_reasoning_signal = true;
+                self.reasoning_event_count = self.reasoning_event_count.saturating_add(1);
+                let mut reasoning_chunk = v
+                    .get("delta")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| v.get("text").and_then(|value| value.as_str()))
+                    .or_else(|| v.get("summary").and_then(|value| value.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                if reasoning_chunk.is_empty() {
+                    reasoning_chunk = Self::reasoning_item_summary_text(&v);
+                }
+                self.reasoning_text_chars = self
+                    .reasoning_text_chars
+                    .saturating_add(reasoning_chunk.len());
+                if reasoning_chunk.is_empty() {
+                    return Ok(None);
+                }
+                let item_id = Self::text_item_id(&v);
+                return Ok(self.emit_reasoning_delta_text(item_id.as_deref(), reasoning_chunk.as_str()));
+            }
+
+            "response.reasoning.done" | "response.reasoning_text.done" => {
+                self.observed_reasoning_signal = true;
+                self.reasoning_event_count = self.reasoning_event_count.saturating_add(1);
+                let mut reasoning_chunk = v
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| v.get("delta").and_then(|value| value.as_str()))
+                    .or_else(|| v.get("summary").and_then(|value| value.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                if reasoning_chunk.is_empty() {
+                    reasoning_chunk = Self::reasoning_item_summary_text(&v);
+                }
+                self.reasoning_text_chars = self
+                    .reasoning_text_chars
+                    .saturating_add(reasoning_chunk.len());
+                if reasoning_chunk.is_empty() {
+                    return Ok(None);
+                }
+                let item_id = Self::text_item_id(&v);
+                return Ok(self.emit_reasoning_done_text(item_id.as_deref(), reasoning_chunk.as_str()));
+            }
+
+            _ => {}
         }
 
         match event_type {
@@ -628,6 +972,12 @@ impl ResponsesSseParser {
                 let delta = v.get("delta").and_then(|d| d.as_str()).unwrap_or("");
                 if delta.is_empty() {
                     return Ok(None);
+                }
+                if let Some(output_index) = Self::text_output_index(&v) {
+                    self.streamed_text_output_indexes.insert(output_index);
+                }
+                if let Some(stream_key) = Self::text_stream_key(&v) {
+                    return Ok(self.emit_text_delta_with_key(stream_key.as_str(), delta));
                 }
                 if let Some(item_id) = Self::text_item_id(&v) {
                     self.streamed_text_item_ids.insert(item_id);
@@ -643,14 +993,28 @@ impl ResponsesSseParser {
                     .and_then(|value| value.as_str())
                     .or_else(|| v.get("delta").and_then(|value| value.as_str()))
                     .unwrap_or("");
+                if let Some(output_index) = Self::text_output_index(&v) {
+                    self.streamed_text_output_indexes.insert(output_index);
+                }
+                if let Some(stream_key) = Self::text_stream_key(&v) {
+                    return Ok(self.emit_text_done_with_key(stream_key.as_str(), text));
+                }
                 let item_id = Self::text_item_id(&v);
                 Ok(self.emit_done_text(item_id.as_deref(), text))
             }
 
             "response.content_part.added" => {
-                let text = Self::content_part_output_text(&v);
+                // `content_part.added` often contains snapshot text that can overlap with
+                // `output_text.delta`; prefer delta-only here to avoid duplicate emissions.
+                let text = Self::content_part_output_text(&v, true);
                 if text.is_empty() {
                     return Ok(None);
+                }
+                if let Some(output_index) = Self::text_output_index(&v) {
+                    self.streamed_text_output_indexes.insert(output_index);
+                }
+                if let Some(stream_key) = Self::text_stream_key(&v) {
+                    return Ok(self.emit_text_delta_with_key(stream_key.as_str(), text.as_str()));
                 }
                 if let Some(item_id) = Self::text_item_id(&v) {
                     self.streamed_text_item_ids.insert(item_id);
@@ -661,7 +1025,13 @@ impl ResponsesSseParser {
             }
 
             "response.content_part.done" => {
-                let text = Self::content_part_output_text(&v);
+                let text = Self::content_part_output_text(&v, false);
+                if let Some(output_index) = Self::text_output_index(&v) {
+                    self.streamed_text_output_indexes.insert(output_index);
+                }
+                if let Some(stream_key) = Self::text_stream_key(&v) {
+                    return Ok(self.emit_text_done_with_key(stream_key.as_str(), text.as_str()));
+                }
                 let item_id = Self::text_item_id(&v);
                 Ok(self.emit_done_text(item_id.as_deref(), text.as_str()))
             }
@@ -670,26 +1040,6 @@ impl ResponsesSseParser {
                 // Best-effort: pre-register function_call metadata.
                 if let Some(item) = v.get("item") {
                     let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    if item_type == "reasoning" {
-                        let text = Self::reasoning_item_summary_text(item);
-                        let item_id = item
-                            .get("id")
-                            .and_then(|id| id.as_str())
-                            .or_else(|| v.get("item_id").and_then(|id| id.as_str()));
-                        return Ok(self.emit_reasoning_item_text(item_id, text.as_str()));
-                    }
-                    if item_type == "message" {
-                        let text = Self::message_item_output_text(item);
-                        if text.is_empty() {
-                            return Ok(None);
-                        }
-                        if let Some(item_id) = Self::text_item_id(&v) {
-                            self.streamed_text_item_ids.insert(item_id);
-                        } else {
-                            self.saw_unkeyed_text_delta = true;
-                        }
-                        return Ok(Some(LLMChunk::Token(text)));
-                    }
                     if item_type == "function_call" {
                         let item_id = item
                             .get("id")
@@ -722,6 +1072,9 @@ impl ResponsesSseParser {
                 if let Some(item) = v.get("item") {
                     let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     if item_type == "reasoning" {
+                        if self.saw_reasoning_text_stream {
+                            return Ok(None);
+                        }
                         let text = Self::reasoning_item_summary_text(item);
                         return Ok(self.emit_reasoning_item_text(
                             if item_id.is_empty() {
@@ -733,15 +1086,27 @@ impl ResponsesSseParser {
                         ));
                     }
                     if item_type == "message" {
+                        let output_index = Self::text_output_index(&v);
+                        if output_index
+                            .is_some_and(|index| self.streamed_text_output_indexes.contains(&index))
+                        {
+                            return Ok(None);
+                        }
                         let text = Self::message_item_output_text(item);
-                        return Ok(self.emit_done_text(
+                        let out = self.emit_done_text(
                             if item_id.is_empty() {
                                 None
                             } else {
                                 Some(item_id.as_str())
                             },
                             text.as_str(),
-                        ));
+                        );
+                        if out.is_some() {
+                            if let Some(output_index) = output_index {
+                                self.streamed_text_output_indexes.insert(output_index);
+                            }
+                        }
+                        return Ok(out);
                     }
                     if item_type == "function_call" && !item_id.is_empty() {
                         self.apply_done_fn_call_item(&item_id, item);
@@ -1100,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_emits_token_on_content_part_added_with_text() {
+    fn parser_ignores_snapshot_text_on_content_part_added() {
         let mut p = ResponsesSseParser::new();
         let out = p
             .handle_event(
@@ -1108,10 +1473,7 @@ mod tests {
                 r#"{"type":"response.content_part.added","item_id":"msg_2","part":{"type":"output_text","text":"hello from part added"}}"#,
             )
             .unwrap();
-        match out {
-            Some(LLMChunk::Token(t)) => assert_eq!(t, "hello from part added"),
-            other => panic!("expected token, got {other:?}"),
-        }
+        assert!(out.is_none());
     }
 
     #[test]
@@ -1176,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_emits_token_from_message_output_item_added() {
+    fn parser_ignores_message_output_item_added_snapshot() {
         let mut p = ResponsesSseParser::new();
         let out = p
             .handle_event(
@@ -1184,14 +1546,11 @@ mod tests {
                 r#"{"type":"response.output_item.added","item":{"id":"msg_added_1","type":"message","content":[{"type":"output_text","text":"thinking before tool"}]}}"#,
             )
             .unwrap();
-        match out {
-            Some(LLMChunk::Token(t)) => assert_eq!(t, "thinking before tool"),
-            other => panic!("expected token, got {other:?}"),
-        }
+        assert!(out.is_none());
     }
 
     #[test]
-    fn parser_skips_message_output_item_done_when_added_already_emitted() {
+    fn parser_emits_message_output_item_done_after_added_snapshot() {
         let mut p = ResponsesSseParser::new();
         let _ = p
             .handle_event(
@@ -1206,7 +1565,10 @@ mod tests {
                 r#"{"type":"response.output_item.done","item":{"id":"msg_added_2","type":"message","content":[{"type":"output_text","text":"thinking"}]}}"#,
             )
             .unwrap();
-        assert!(out.is_none());
+        match out {
+            Some(LLMChunk::Token(t)) => assert_eq!(t, "thinking"),
+            other => panic!("expected token, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1240,18 +1602,36 @@ mod tests {
     }
 
     #[test]
-    fn parser_skips_duplicate_reasoning_output_item_done_after_added() {
+    fn parser_skips_duplicate_reasoning_done_after_reasoning_delta_for_same_item() {
         let mut p = ResponsesSseParser::new();
         let _ = p
             .handle_event(
-                "response.output_item.added",
-                r#"{"type":"response.output_item.added","item":{"id":"rs_2","type":"reasoning","summary":[{"type":"summary_text","text":"Planning now."}]}}"#,
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_2","delta":"Planning now."}"#,
+            )
+            .unwrap();
+        let out = p
+            .handle_event(
+                "response.reasoning_summary_text.done",
+                r#"{"type":"response.reasoning_summary_text.done","item_id":"rs_2","text":"Planning now."}"#,
+            )
+            .unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn parser_skips_duplicate_reasoning_output_item_done_after_reasoning_delta() {
+        let mut p = ResponsesSseParser::new();
+        let _ = p
+            .handle_event(
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_3","delta":"Planning now."}"#,
             )
             .unwrap();
         let out = p
             .handle_event(
                 "response.output_item.done",
-                r#"{"type":"response.output_item.done","item":{"id":"rs_2","type":"reasoning","summary":[{"type":"summary_text","text":"Planning now."}]}}"#,
+                r#"{"type":"response.output_item.done","item":{"id":"rs_3","type":"reasoning","summary":[{"type":"summary_text","text":"Planning now."}]}}"#,
             )
             .unwrap();
         assert!(out.is_none());
@@ -1362,5 +1742,221 @@ mod tests {
             )
             .unwrap();
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn parser_avoids_duplicate_text_when_snapshot_and_delta_channels_overlap() {
+        let mut p = ResponsesSseParser::new();
+
+        let mut emitted = Vec::new();
+
+        let out = p
+            .handle_event(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"id":"msg_overlap","type":"message","content":[{"type":"output_text","text":"hello"}]}}"#,
+            )
+            .unwrap();
+        if let Some(chunk) = out {
+            emitted.push(chunk);
+        }
+
+        let out = p
+            .handle_event(
+                "response.content_part.added",
+                r#"{"type":"response.content_part.added","item_id":"msg_overlap","part":{"type":"output_text","text":"hello"}}"#,
+            )
+            .unwrap();
+        if let Some(chunk) = out {
+            emitted.push(chunk);
+        }
+
+        let out = p
+            .handle_event(
+                "response.output_text.delta",
+                r#"{"type":"response.output_text.delta","item_id":"msg_overlap","delta":"hello"}"#,
+            )
+            .unwrap();
+        if let Some(chunk) = out {
+            emitted.push(chunk);
+        }
+
+        let out = p
+            .handle_event(
+                "response.output_text.done",
+                r#"{"type":"response.output_text.done","item_id":"msg_overlap","text":"hello"}"#,
+            )
+            .unwrap();
+        if let Some(chunk) = out {
+            emitted.push(chunk);
+        }
+
+        let out = p
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item":{"id":"msg_overlap","type":"message","content":[{"type":"output_text","text":"hello"}]}}"#,
+            )
+            .unwrap();
+        if let Some(chunk) = out {
+            emitted.push(chunk);
+        }
+
+        let tokens: Vec<String> = emitted
+            .into_iter()
+            .filter_map(|chunk| match chunk {
+                LLMChunk::Token(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(tokens, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn parser_emits_single_token_when_done_channels_repeat_same_text_with_different_item_ids() {
+        let mut p = ResponsesSseParser::new();
+        let mut emitted = Vec::new();
+
+        let out = p
+            .handle_event(
+                "response.output_text.done",
+                r#"{"type":"response.output_text.done","item_id":"msg_a","output_index":0,"content_index":0,"text":"Hi! What can I help you with?"}"#,
+            )
+            .unwrap();
+        if let Some(chunk) = out {
+            emitted.push(chunk);
+        }
+
+        let out = p
+            .handle_event(
+                "response.content_part.done",
+                r#"{"type":"response.content_part.done","item_id":"msg_b","output_index":0,"part":{"type":"output_text","text":"Hi! What can I help you with?"}}"#,
+            )
+            .unwrap();
+        if let Some(chunk) = out {
+            emitted.push(chunk);
+        }
+
+        let out = p
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_c","type":"message","content":[{"type":"output_text","text":"Hi! What can I help you with?"}]}}"#,
+            )
+            .unwrap();
+        if let Some(chunk) = out {
+            emitted.push(chunk);
+        }
+
+        let tokens: Vec<String> = emitted
+            .into_iter()
+            .filter_map(|chunk| match chunk {
+                LLMChunk::Token(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tokens, vec!["Hi! What can I help you with?".to_string()]);
+    }
+
+    #[test]
+    fn parser_handles_cumulative_reasoning_delta_for_same_item_as_suffix() {
+        let mut p = ResponsesSseParser::new();
+        let first = p
+            .handle_event(
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_snap","delta":"Analyzing project structure"}"#,
+            )
+            .unwrap();
+        match first {
+            Some(LLMChunk::ReasoningToken(text)) => assert_eq!(text, "Analyzing project structure"),
+            other => panic!("expected reasoning token, got {other:?}"),
+        }
+
+        let second = p
+            .handle_event(
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_snap","delta":"Analyzing project structure and listing candidate files"}"#,
+            )
+            .unwrap();
+        match second {
+            Some(LLMChunk::ReasoningToken(text)) => {
+                assert_eq!(text, " and listing candidate files")
+            }
+            other => panic!("expected reasoning suffix token, got {other:?}"),
+        }
+
+        let done = p
+            .handle_event(
+                "response.reasoning_summary_text.done",
+                r#"{"type":"response.reasoning_summary_text.done","item_id":"rs_snap","text":"Analyzing project structure and listing candidate files"}"#,
+            )
+            .unwrap();
+        assert!(done.is_none());
+    }
+
+    #[test]
+    fn parser_skips_reasoning_summary_done_for_same_summary_stream_when_item_ids_differ() {
+        let mut p = ResponsesSseParser::new();
+        let _ = p
+            .handle_event(
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_a","output_index":0,"summary_index":7,"delta":"Planning now."}"#,
+            )
+            .unwrap();
+
+        let out = p
+            .handle_event(
+                "response.reasoning_summary_text.done",
+                r#"{"type":"response.reasoning_summary_text.done","item_id":"rs_b","output_index":0,"summary_index":7,"text":"Planning now."}"#,
+            )
+            .unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn parser_normalizes_cumulative_reasoning_delta_by_summary_stream_key() {
+        let mut p = ResponsesSseParser::new();
+        let first = p
+            .handle_event(
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_key_1","output_index":0,"summary_index":3,"delta":"Analyzing project"}"#,
+            )
+            .unwrap();
+        match first {
+            Some(LLMChunk::ReasoningToken(text)) => assert_eq!(text, "Analyzing project"),
+            other => panic!("expected reasoning token, got {other:?}"),
+        }
+
+        let second = p
+            .handle_event(
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_key_2","output_index":0,"summary_index":3,"delta":"Analyzing project structure"}"#,
+            )
+            .unwrap();
+        match second {
+            Some(LLMChunk::ReasoningToken(text)) => assert_eq!(text, " structure"),
+            other => panic!("expected reasoning suffix token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_skips_reasoning_summary_part_done_after_summary_text_done_for_same_stream() {
+        let mut p = ResponsesSseParser::new();
+        let first = p
+            .handle_event(
+                "response.reasoning_summary_text.done",
+                r#"{"type":"response.reasoning_summary_text.done","item_id":"sum_1","output_index":0,"summary_index":9,"text":"Final summary"}"#,
+            )
+            .unwrap();
+        match first {
+            Some(LLMChunk::ReasoningToken(text)) => assert_eq!(text, "Final summary"),
+            other => panic!("expected reasoning token, got {other:?}"),
+        }
+
+        let second = p
+            .handle_event(
+                "response.reasoning_summary_part.done",
+                r#"{"type":"response.reasoning_summary_part.done","item_id":"sum_2","output_index":0,"summary_index":9,"part":{"type":"summary_text","text":"Final summary"}}"#,
+            )
+            .unwrap();
+        assert!(second.is_none());
     }
 }

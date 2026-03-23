@@ -16,6 +16,7 @@ use crate::core::ReasoningEffort;
 
 use super::common::openai_compat::{build_openai_compat_body, parse_openai_compat_sse_data_strict};
 use super::common::openai_responses::{build_responses_body, ResponsesSseParser};
+use super::common::responses_debug::append_responses_sse_record;
 use super::common::sse::llm_stream_from_sse;
 
 /// OpenAI API provider for chat completions.
@@ -199,8 +200,11 @@ impl OpenAIProvider {
                 }
 
                 let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, None);
+                let model_for_debug = model.to_string();
                 let stream = llm_stream_from_sse(fallback, move |event, data| {
-                    parser.handle_event(event, data)
+                    let parsed = parser.handle_event(event, data);
+                    append_responses_sse_record("OpenAI", &model_for_debug, event, data, &parsed);
+                    parsed
                 });
                 return Ok(stream);
             }
@@ -209,8 +213,11 @@ impl OpenAIProvider {
         }
 
         let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort);
+        let model_for_debug = model.to_string();
         let stream = llm_stream_from_sse(response, move |event, data| {
-            parser.handle_event(event, data)
+            let parsed = parser.handle_event(event, data);
+            append_responses_sse_record("OpenAI", &model_for_debug, event, data, &parsed);
+            parsed
         });
         Ok(stream)
     }

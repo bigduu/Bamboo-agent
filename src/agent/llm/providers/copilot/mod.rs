@@ -18,6 +18,7 @@ use super::common::openai_compat::{
     tools_to_openai_compat_json,
 };
 use super::common::openai_responses::{build_responses_body, ResponsesSseParser};
+use super::common::responses_debug::append_responses_sse_record;
 use super::common::sse::llm_stream_from_sse;
 
 const COPILOT_TRANSPORT_MAX_ATTEMPTS: usize = 2;
@@ -510,8 +511,7 @@ impl CopilotProvider {
                         return Err(LLMError::Http(error));
                     }
 
-                    let delay_ms =
-                        COPILOT_TRANSPORT_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1));
+                    let delay_ms = COPILOT_TRANSPORT_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1));
                     tracing::warn!(
                         "Copilot transport error during {} (attempt {}/{}): {}. Retrying in {}ms",
                         operation,
@@ -695,8 +695,17 @@ impl CopilotProvider {
                     if fallback.status().is_success() {
                         let mut parser =
                             ResponsesSseParser::new_with_context("Copilot", model, None);
+                        let model_for_debug = model.to_string();
                         let stream = llm_stream_from_sse(fallback, move |event, data| {
-                            parser.handle_event(event, data)
+                            let parsed = parser.handle_event(event, data);
+                            append_responses_sse_record(
+                                "Copilot",
+                                &model_for_debug,
+                                event,
+                                data,
+                                &parsed,
+                            );
+                            parsed
                         });
                         return Ok(stream);
                     }
@@ -743,8 +752,11 @@ impl CopilotProvider {
         }
 
         let mut parser = ResponsesSseParser::new_with_context("Copilot", model, reasoning_effort);
+        let model_for_debug = model.to_string();
         let stream = llm_stream_from_sse(response, move |event, data| {
-            parser.handle_event(event, data)
+            let parsed = parser.handle_event(event, data);
+            append_responses_sse_record("Copilot", &model_for_debug, event, data, &parsed);
+            parsed
         });
         Ok(stream)
     }

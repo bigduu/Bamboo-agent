@@ -95,7 +95,7 @@ pub(super) fn parse_responses_request_options(
         if parameters.contains_key("text") || parameters.contains_key("text_verbosity") {
             parse_text_verbosity(parameters)
         } else {
-            Some("low".to_string())
+            Some("high".to_string())
         };
 
     ResponsesRequestOptions {
@@ -362,7 +362,7 @@ mod tests {
         );
         assert_eq!(parsed.store, None);
         assert_eq!(parsed.truncation, None);
-        assert_eq!(parsed.text_verbosity.as_deref(), Some("low"));
+        assert_eq!(parsed.text_verbosity.as_deref(), Some("high"));
     }
 
     #[test]

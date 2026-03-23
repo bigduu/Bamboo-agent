@@ -136,7 +136,7 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
             .lock()
             .expect("text_verbosity lock")
             .as_deref(),
-        Some("low")
+        Some("high")
     );
     assert_eq!(
         llm.requested_include.lock().expect("include lock").clone(),
@@ -233,7 +233,7 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
             .lock()
             .expect("text_verbosity lock")
             .as_deref(),
-        Some("low")
+        Some("high")
     );
     assert_eq!(
         llm.requested_include.lock().expect("include lock").clone(),
@@ -337,7 +337,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
             .lock()
             .expect("text_verbosity lock")
             .as_deref(),
-        Some("low")
+        Some("high")
     );
     assert_eq!(
         llm.requested_include.lock().expect("include lock").clone(),
