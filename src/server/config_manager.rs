@@ -353,6 +353,7 @@ pub fn build_merged_config(
     new_config.hydrate_proxy_auth_from_encrypted();
     new_config.hydrate_provider_api_keys_from_encrypted();
     new_config.hydrate_mcp_secrets_from_encrypted();
+    new_config.hydrate_env_vars_from_encrypted();
     new_config.normalize_tool_settings();
 
     Ok(new_config)

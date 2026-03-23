@@ -50,14 +50,38 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::RwLock;
 
 use crate::agent::tools::normalize_tool_ref;
 use crate::core::keyword_masking::KeywordMaskingConfig;
 use crate::core::model_mapping::{AnthropicModelMapping, GeminiModelMapping};
 use crate::core::ReasoningEffort;
+
+/// A user-managed environment variable that is injected into Bash tool processes.
+///
+/// Secret entries are encrypted at rest: `value` is empty on disk and populated
+/// in memory after hydration from `value_encrypted`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvVarEntry {
+    /// Variable name (must match `^[A-Za-z_][A-Za-z0-9_]*$`).
+    pub name: String,
+    /// Plaintext value – populated in memory after hydration.
+    /// For `secret=true` entries this field is empty on disk.
+    #[serde(default)]
+    pub value: String,
+    /// Whether this variable contains sensitive data (token, password, etc.).
+    #[serde(default)]
+    pub secret: bool,
+    /// Encrypted ciphertext (only present on disk for secret entries).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_encrypted: Option<String>,
+    /// Optional human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
 
 /// Main configuration structure for Bamboo agent
 ///
@@ -128,6 +152,12 @@ pub struct Config {
     /// Any tool listed in `disabled` is omitted from the tool schemas sent to the LLM.
     #[serde(default, skip_serializing_if = "ToolsConfig::is_empty")]
     pub tools: ToolsConfig,
+
+    /// User-managed environment variables injected into Bash tool processes.
+    ///
+    /// Secret entries are encrypted at rest; plaintext values are hydrated in memory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_vars: Vec<EnvVarEntry>,
 
     /// MCP server configuration.
     ///
@@ -502,6 +532,12 @@ impl Default for Config {
     }
 }
 
+/// Global cache of user-managed env vars for injection into child processes.
+///
+/// Updated whenever the config is loaded or reloaded via [`Config::publish_env_vars`].
+static ENV_VARS_CACHE: std::sync::LazyLock<RwLock<HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
 impl Config {
     /// Load configuration from file with environment variable overrides
     ///
@@ -541,6 +577,7 @@ impl Config {
                         config.hydrate_proxy_auth_from_encrypted();
                         config.hydrate_provider_api_keys_from_encrypted();
                         config.hydrate_mcp_secrets_from_encrypted();
+                        config.hydrate_env_vars_from_encrypted();
                         config.normalize_tool_settings();
                         config
                     })
@@ -561,6 +598,8 @@ impl Config {
         config.hydrate_provider_api_keys_from_encrypted();
         // Decrypt encrypted MCP secrets into in-memory plaintext form.
         config.hydrate_mcp_secrets_from_encrypted();
+        // Decrypt encrypted env vars into in-memory plaintext form.
+        config.hydrate_env_vars_from_encrypted();
         config.normalize_tool_settings();
 
         // Legacy: `data_dir` is no longer a persisted config field. The data directory is
@@ -586,6 +625,9 @@ impl Config {
         if let Ok(headless) = std::env::var("BAMBOO_HEADLESS") {
             config.headless_auth = parse_bool_env(&headless);
         }
+
+        // Publish env vars to the global cache so Bash tools can inject them.
+        config.publish_env_vars();
 
         config
     }
@@ -958,6 +1000,77 @@ impl Config {
         Ok(())
     }
 
+    // ── Env vars encryption ─────────────────────────────────────────────
+
+    /// Decrypt secret env vars into in-memory plaintext after loading config.
+    pub fn hydrate_env_vars_from_encrypted(&mut self) {
+        for entry in &mut self.env_vars {
+            if !entry.secret {
+                continue;
+            }
+            if !entry.value.trim().is_empty() {
+                // Already has plaintext (e.g. in-memory update).
+                continue;
+            }
+            let Some(encrypted) = &entry.value_encrypted else {
+                continue;
+            };
+            match crate::core::encryption::decrypt(encrypted) {
+                Ok(value) => entry.value = value,
+                Err(e) => tracing::warn!("Failed to decrypt env var '{}': {}", entry.name, e),
+            }
+        }
+    }
+
+    /// Re-encrypt secret env vars before persisting to disk.
+    pub fn refresh_env_vars_encrypted(&mut self) -> Result<()> {
+        for entry in &mut self.env_vars {
+            if entry.secret && !entry.value.trim().is_empty() {
+                entry.value_encrypted = Some(
+                    crate::core::encryption::encrypt(&entry.value)
+                        .with_context(|| format!("Failed to encrypt env var '{}'", entry.name))?,
+                );
+            } else if !entry.secret {
+                entry.value_encrypted = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear plaintext values for secrets before serialization to disk.
+    pub fn sanitize_env_vars_for_disk(&mut self) {
+        for entry in &mut self.env_vars {
+            if entry.secret {
+                entry.value = String::new();
+            }
+        }
+    }
+
+    /// Build a flat map of all env vars with non-empty values (for process injection).
+    pub fn env_vars_as_map(&self) -> HashMap<String, String> {
+        self.env_vars
+            .iter()
+            .filter(|e| !e.value.trim().is_empty())
+            .map(|e| (e.name.clone(), e.value.clone()))
+            .collect()
+    }
+
+    /// Update the global env vars cache (called on config load / reload).
+    pub fn publish_env_vars(&self) {
+        let map = self.env_vars_as_map();
+        if let Ok(mut guard) = ENV_VARS_CACHE.write() {
+            *guard = map;
+        }
+    }
+
+    /// Read the current env vars snapshot (called by Bash tool at process spawn time).
+    pub fn current_env_vars() -> HashMap<String, String> {
+        ENV_VARS_CACHE
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
     /// Create a default configuration without loading from file
     fn create_default() -> Self {
         Config {
@@ -974,6 +1087,7 @@ impl Config {
             gemini_model_mapping: GeminiModelMapping::default(),
             hooks: HooksConfig::default(),
             tools: ToolsConfig::default(),
+            env_vars: Vec::new(),
             mcp: crate::agent::mcp::McpConfig::default(),
             extra: BTreeMap::new(),
         }
@@ -1007,6 +1121,8 @@ impl Config {
         to_save.extra.remove("model");
         to_save.refresh_proxy_auth_encrypted()?;
         to_save.refresh_provider_api_keys_encrypted()?;
+        to_save.refresh_env_vars_encrypted()?;
+        to_save.sanitize_env_vars_for_disk();
         to_save.normalize_tool_settings();
         let content =
             serde_json::to_string_pretty(&to_save).context("Failed to serialize config to JSON")?;
@@ -1598,5 +1714,221 @@ mod tests {
             }
             _ => panic!("Expected SSE transport"),
         }
+    }
+
+    // ── Env vars lifecycle tests ──────────────────────────────
+
+    #[test]
+    fn env_vars_as_map_includes_only_non_empty_values() {
+        let mut config = Config::default();
+        config.env_vars = vec![
+            EnvVarEntry {
+                name: "A".to_string(),
+                value: "val_a".to_string(),
+                secret: false,
+                value_encrypted: None,
+                description: None,
+            },
+            EnvVarEntry {
+                name: "B".to_string(),
+                value: "".to_string(), // empty → should be excluded
+                secret: true,
+                value_encrypted: None,
+                description: None,
+            },
+            EnvVarEntry {
+                name: "C".to_string(),
+                value: "  ".to_string(), // whitespace-only → excluded
+                secret: false,
+                value_encrypted: None,
+                description: None,
+            },
+            EnvVarEntry {
+                name: "D".to_string(),
+                value: "val_d".to_string(),
+                secret: true,
+                value_encrypted: Some("enc".to_string()),
+                description: Some("desc".to_string()),
+            },
+        ];
+
+        let map = config.env_vars_as_map();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("A"), Some(&"val_a".to_string()));
+        assert_eq!(map.get("D"), Some(&"val_d".to_string()));
+        assert!(!map.contains_key("B"));
+        assert!(!map.contains_key("C"));
+    }
+
+    #[test]
+    fn sanitize_env_vars_for_disk_clears_secret_plaintext() {
+        let mut config = Config::default();
+        config.env_vars = vec![
+            EnvVarEntry {
+                name: "PLAIN".to_string(),
+                value: "visible".to_string(),
+                secret: false,
+                value_encrypted: None,
+                description: None,
+            },
+            EnvVarEntry {
+                name: "SECRET".to_string(),
+                value: "hidden_value".to_string(),
+                secret: true,
+                value_encrypted: Some("enc_data".to_string()),
+                description: None,
+            },
+        ];
+
+        config.sanitize_env_vars_for_disk();
+
+        assert_eq!(config.env_vars[0].value, "visible"); // plain kept
+        assert_eq!(config.env_vars[1].value, ""); // secret cleared
+    }
+
+    #[test]
+    fn sanitize_env_vars_for_disk_preserves_encrypted() {
+        let mut config = Config::default();
+        config.env_vars = vec![
+            EnvVarEntry {
+                name: "OPEN".to_string(),
+                value: "val".to_string(),
+                secret: false,
+                value_encrypted: None,
+                description: None,
+            },
+            EnvVarEntry {
+                name: "HIDDEN".to_string(),
+                value: "real_secret".to_string(),
+                secret: true,
+                value_encrypted: Some("enc".to_string()),
+                description: None,
+            },
+        ];
+
+        config.sanitize_env_vars_for_disk();
+
+        // Plain value untouched
+        assert_eq!(config.env_vars[0].value, "val");
+        // Secret plaintext cleared, but encrypted preserved
+        assert_eq!(config.env_vars[1].value, "");
+        assert_eq!(config.env_vars[1].value_encrypted.as_deref(), Some("enc"));
+    }
+
+    #[test]
+    fn refresh_env_vars_encrypted_round_trip() {
+        let mut config = Config::default();
+        config.env_vars = vec![
+            EnvVarEntry {
+                name: "TOKEN".to_string(),
+                value: "my-secret-token".to_string(),
+                secret: true,
+                value_encrypted: None,
+                description: Some("A token".to_string()),
+            },
+            EnvVarEntry {
+                name: "PLAIN_VAR".to_string(),
+                value: "hello".to_string(),
+                secret: false,
+                value_encrypted: None,
+                description: None,
+            },
+        ];
+
+        // Encrypt
+        config
+            .refresh_env_vars_encrypted()
+            .expect("encryption should succeed");
+
+        // Secret should now have encrypted value
+        assert!(config.env_vars[0].value_encrypted.is_some());
+        // Plain should have no encrypted value
+        assert!(config.env_vars[1].value_encrypted.is_none());
+
+        // Save encrypted value for later comparison
+        let encrypted = config.env_vars[0].value_encrypted.clone().unwrap();
+        assert_ne!(encrypted, "my-secret-token"); // shouldn't be plaintext
+
+        // Clear plaintext (simulating disk write)
+        config.sanitize_env_vars_for_disk();
+        assert_eq!(config.env_vars[0].value, "");
+
+        // Hydrate (simulating disk read)
+        config.hydrate_env_vars_from_encrypted();
+        assert_eq!(config.env_vars[0].value, "my-secret-token");
+        assert_eq!(config.env_vars[1].value, "hello"); // plain untouched
+    }
+
+    #[test]
+    fn publish_and_current_env_vars_round_trip() {
+        let mut config = Config::default();
+        config.env_vars = vec![EnvVarEntry {
+            name: "TEST_PUBLISH".to_string(),
+            value: "pub_value".to_string(),
+            secret: false,
+            value_encrypted: None,
+            description: None,
+        }];
+
+        config.publish_env_vars();
+        let map = Config::current_env_vars();
+        assert_eq!(map.get("TEST_PUBLISH"), Some(&"pub_value".to_string()));
+    }
+
+    #[test]
+    fn hydrate_skips_non_secret_entries() {
+        let mut config = Config::default();
+        config.env_vars = vec![EnvVarEntry {
+            name: "PLAIN".to_string(),
+            value: "original".to_string(),
+            secret: false,
+            value_encrypted: Some("should-be-ignored".to_string()),
+            description: None,
+        }];
+
+        config.hydrate_env_vars_from_encrypted();
+        // Non-secret entry should keep its original value
+        assert_eq!(config.env_vars[0].value, "original");
+    }
+
+    #[test]
+    fn default_config_has_empty_env_vars() {
+        let config = Config::default();
+        assert!(config.env_vars.is_empty());
+    }
+
+    #[test]
+    fn serde_round_trip_with_env_vars() {
+        let mut config = Config::default();
+        config.env_vars = vec![
+            EnvVarEntry {
+                name: "KEY1".to_string(),
+                value: "val1".to_string(),
+                secret: false,
+                value_encrypted: None,
+                description: Some("First key".to_string()),
+            },
+            EnvVarEntry {
+                name: "KEY2".to_string(),
+                value: "".to_string(), // on-disk secret has no plaintext
+                secret: true,
+                value_encrypted: Some("enc123".to_string()),
+                description: None,
+            },
+        ];
+
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: Config = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.env_vars.len(), 2);
+        assert_eq!(restored.env_vars[0].name, "KEY1");
+        assert_eq!(restored.env_vars[0].value, "val1");
+        assert!(!restored.env_vars[0].secret);
+        assert_eq!(restored.env_vars[1].name, "KEY2");
+        assert!(restored.env_vars[1].secret);
+        assert_eq!(
+            restored.env_vars[1].value_encrypted.as_deref(),
+            Some("enc123")
+        );
     }
 }

@@ -137,6 +137,17 @@ fn bamboo_v1_scope() -> impl HttpServiceFactory {
             web::post().to(settings::set_anthropic_model_mapping),
         )
         .route("/bamboo/tools", web::get().to(settings::get_bamboo_tools))
+        // Env vars routes
+        .route("/bamboo/env-vars", web::get().to(settings::list_env_vars))
+        .route("/bamboo/env-vars", web::post().to(settings::upsert_env_var))
+        .route(
+            "/bamboo/env-vars/replace",
+            web::post().to(settings::replace_env_vars),
+        )
+        .route(
+            "/bamboo/env-vars/{name}",
+            web::delete().to(settings::delete_env_var),
+        )
         // Skill routes
         .route("/skills", web::get().to(skill::list_skills))
         .route(

@@ -194,3 +194,106 @@ fn redact_config_redacts_legacy_mcp_and_falls_back_to_runtime_env_keys() {
     assert_eq!(sse_header["value"], "****...****");
     assert!(!sse_header.contains_key("value_encrypted"));
 }
+
+// ── Env vars redaction tests ──────────────────────────────
+
+#[test]
+fn redact_config_masks_secret_env_var_values() {
+    let config = Config::default();
+    let input = json!({
+        "env_vars": [
+            {
+                "name": "PLAIN",
+                "value": "visible-value",
+                "secret": false,
+                "value_encrypted": null,
+                "description": "A plain var"
+            },
+            {
+                "name": "TOKEN",
+                "value": "super-secret",
+                "secret": true,
+                "value_encrypted": "enc123",
+                "description": null
+            }
+        ]
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+    let env_vars = redacted["env_vars"].as_array().unwrap();
+
+    // Plain var: value visible, no encrypted field
+    assert_eq!(env_vars[0]["name"], "PLAIN");
+    assert_eq!(env_vars[0]["value"], "visible-value");
+    assert!(env_vars[0].get("value_encrypted").is_none());
+
+    // Secret var: value masked, encrypted removed
+    assert_eq!(env_vars[1]["name"], "TOKEN");
+    assert_eq!(env_vars[1]["value"], "****...****");
+    assert!(env_vars[1].get("value_encrypted").is_none());
+}
+
+#[test]
+fn redact_config_removes_value_encrypted_from_non_secret_entries() {
+    let config = Config::default();
+    let input = json!({
+        "env_vars": [
+            {
+                "name": "X",
+                "value": "hello",
+                "secret": false,
+                "value_encrypted": "should-be-removed"
+            }
+        ]
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+    let env_vars = redacted["env_vars"].as_array().unwrap();
+    assert_eq!(env_vars[0]["value"], "hello");
+    assert!(env_vars[0].get("value_encrypted").is_none());
+}
+
+#[test]
+fn redact_config_handles_missing_env_vars() {
+    let config = Config::default();
+    let input = json!({
+        "some_field": "value"
+    });
+
+    // Should not panic
+    let redacted = redact_config_for_api(input.clone(), &config);
+    assert_eq!(redacted["some_field"], "value");
+}
+
+#[test]
+fn redact_config_handles_empty_env_vars() {
+    let config = Config::default();
+    let input = json!({
+        "env_vars": []
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+    let env_vars = redacted["env_vars"].as_array().unwrap();
+    assert!(env_vars.is_empty());
+}
+
+#[test]
+fn redact_config_defaults_secret_false_when_missing() {
+    let config = Config::default();
+    // Entry without explicit "secret" field should be treated as non-secret
+    let input = json!({
+        "env_vars": [
+            {
+                "name": "MISSING_SECRET_FIELD",
+                "value": "plaintext",
+                "value_encrypted": "enc"
+            }
+        ]
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+    let env_vars = redacted["env_vars"].as_array().unwrap();
+    // Without secret=true, value stays as-is, but encrypted is still removed
+    assert_eq!(env_vars[0]["value"], "plaintext");
+    assert!(env_vars[0].get("value_encrypted").is_none());
+}

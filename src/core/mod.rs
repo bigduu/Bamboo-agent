@@ -18,7 +18,8 @@ pub mod todo;
 
 // Re-export commonly used types
 pub use config::{
-    AnthropicConfig, Config, CopilotConfig, GeminiConfig, OpenAIConfig, ProviderConfigs, ProxyAuth,
+    AnthropicConfig, Config, CopilotConfig, EnvVarEntry, GeminiConfig, OpenAIConfig,
+    ProviderConfigs, ProxyAuth,
 };
 pub use encryption::{decrypt, encrypt};
 pub use keyword_masking::{KeywordEntry, KeywordMaskingConfig, MatchType};

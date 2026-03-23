@@ -148,6 +148,7 @@ impl AppState {
         let snapshot = {
             let mut cfg = self.config.write().await;
             update(&mut cfg)?;
+            cfg.publish_env_vars();
             cfg.clone()
         };
 
@@ -168,6 +169,7 @@ impl AppState {
         {
             let mut cfg = self.config.write().await;
             *cfg = new_config.clone();
+            cfg.publish_env_vars();
         }
 
         self.persist_config_snapshot(new_config.clone())

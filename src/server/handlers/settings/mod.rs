@@ -4,6 +4,7 @@
 //! without growing a single monolithic file.
 
 mod bamboo_config;
+mod env_vars;
 mod keyword_masking;
 mod provider;
 mod redaction;
@@ -15,6 +16,7 @@ pub use bamboo_config::{
     get_proxy_auth_status, reset_bamboo_config, set_anthropic_model_mapping, set_bamboo_config,
     set_proxy_auth, validate_bamboo_config_patch, ProxyAuthPayload,
 };
+pub use env_vars::{delete_env_var, list_env_vars, replace_env_vars, upsert_env_var};
 pub use keyword_masking::{
     get_keyword_masking_config, update_keyword_masking_config, validate_keyword_entries,
 };
@@ -100,5 +102,10 @@ pub fn config(cfg: &mut web::ServiceConfig) {
             "/bamboo/anthropic-model-mapping",
             web::post().to(set_anthropic_model_mapping),
         )
-        .route("/bamboo/tools", web::get().to(get_bamboo_tools));
+        .route("/bamboo/tools", web::get().to(get_bamboo_tools))
+        // ── Env vars ──────────────────────────────────────────────
+        .route("/bamboo/env-vars", web::get().to(list_env_vars))
+        .route("/bamboo/env-vars", web::post().to(upsert_env_var))
+        .route("/bamboo/env-vars/replace", web::post().to(replace_env_vars))
+        .route("/bamboo/env-vars/{name}", web::delete().to(delete_env_var));
 }

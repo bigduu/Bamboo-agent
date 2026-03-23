@@ -26,6 +26,24 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
     }
 
     mcp::redact_mcp_for_api(root, config);
+
+    // Redact secret env var values.
+    if let Some(env_vars) = root.get_mut("env_vars").and_then(|v| v.as_array_mut()) {
+        for entry in env_vars.iter_mut() {
+            if let Some(obj) = entry.as_object_mut() {
+                let is_secret = obj.get("secret").and_then(|v| v.as_bool()).unwrap_or(false);
+                if is_secret {
+                    obj.insert(
+                        "value".to_string(),
+                        Value::String("****...****".to_string()),
+                    );
+                }
+                // Never expose encrypted material via API.
+                obj.remove("value_encrypted");
+            }
+        }
+    }
+
     value
 }
 
