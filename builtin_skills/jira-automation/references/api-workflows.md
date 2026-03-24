@@ -47,9 +47,17 @@ Use `/rest/api/3/...` if the user’s Jira Cloud instance prefers that version. 
 
 ## Authentication guidance
 
-Prefer environment variables and avoid echoing secrets.
+Prefer environment variables and avoid echoing secrets. The bundled Python scripts (`scripts/*.py`) handle auth automatically via `JIRA_BASE_URL` + `JIRA_EMAIL`/`JIRA_API_TOKEN` (or `JIRA_PAT`).
 
-### Bash pattern
+### Using bundled scripts (recommended)
+
+```bash
+# Scripts handle auth, errors, and JSON automatically
+python3 scripts/jira_get.py PROJ-123
+python3 scripts/jira_search.py --jql "project = PROJ" --max 20
+```
+
+### Fallback: raw curl (macOS/Linux one-off reads)
 
 ```bash
 curl -sS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
@@ -72,28 +80,27 @@ Use when the user wants to create a bug, story, task, epic, or subtask.
 - Description or source notes
 - Parent issue key if subtask
 
-### Bash create example
+### Using bundled scripts (recommended)
 
 ```bash
-payload=$(python3 - <<'PY'
-import json
-print(json.dumps({
-  "fields": {
-    "project": {"key": "PLAT"},
-    "issuetype": {"name": "Story"},
-    "summary": "Automate pod-level weekly Jira summary",
-    "description": "Goal\n\nCreate a reusable pod-level Jira reporting workflow.",
-    "labels": ["jira-automation", "reporting"]
-  }
-}))
-PY
-)
+python3 scripts/jira_create.py --project PLAT --type Story \
+    --summary "Automate pod-level weekly Jira summary" \
+    --labels "jira-automation,reporting" --dry-run
+```
+
+### Fallback: raw curl
+
+```bash
+payload=$(python3 -c "
+import json; print(json.dumps({'fields': {
+  'project': {'key': 'PLAT'}, 'issuetype': {'name': 'Story'},
+  'summary': 'Automate pod-level weekly Jira summary',
+  'labels': ['jira-automation', 'reporting']
+}}))")
 
 curl -sS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-  -H "Accept: application/json" \
   -H "Content-Type: application/json" \
-  -X POST "$JIRA_BASE_URL/rest/api/2/issue" \
-  -d "$payload"
+  -X POST "$JIRA_BASE_URL/rest/api/2/issue" -d "$payload"
 ```
 
 ### Create checklist
@@ -113,25 +120,28 @@ Use when the user wants to change summary, description, labels, assignee, priori
 4. Apply minimal update
 5. Return changed fields and next steps
 
-### Bash update example
+### Using bundled scripts (recommended)
 
 ```bash
-payload=$(python3 - <<'PY'
-import json
-print(json.dumps({
-  "fields": {
-    "summary": "Clarify OPS-132 scope and acceptance criteria",
-    "labels": ["ops", "clarified"]
-  }
-}))
-PY
-)
+python3 scripts/jira_get.py OPS-132                                    # Read first
+python3 scripts/jira_update.py OPS-132 --summary "Clarified scope" \
+    --add-labels "ops,clarified" --dry-run                             # Preview
+python3 scripts/jira_update.py OPS-132 --summary "Clarified scope" \
+    --add-labels "ops,clarified"                                       # Execute
+```
+
+### Fallback: raw curl
+
+```bash
+payload=$(python3 -c "
+import json; print(json.dumps({'fields': {
+  'summary': 'Clarify OPS-132 scope and acceptance criteria',
+  'labels': ['ops', 'clarified']
+}}))")
 
 curl -sS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-  -H "Accept: application/json" \
   -H "Content-Type: application/json" \
-  -X PUT "$JIRA_BASE_URL/rest/api/2/issue/OPS-132" \
-  -d "$payload"
+  -X PUT "$JIRA_BASE_URL/rest/api/2/issue/OPS-132" -d "$payload"
 ```
 
 ### When to read first
@@ -145,22 +155,22 @@ Read first when:
 
 Use when the user wants a progress note, blocker note, or stakeholder update without changing core issue fields.
 
-### Bash comment example
+### Using bundled scripts (recommended)
 
 ```bash
-payload=$(python3 - <<'PY'
-import json
-print(json.dumps({
-  "body": "Status update\n- Progress made: clarified scope and updated acceptance criteria.\n- Blockers: waiting on platform confirmation.\n- Next: move to In Progress after review."
-}))
-PY
-)
+python3 scripts/jira_comment.py OPS-132 --body "Status update: scope clarified, moving forward."
+python3 scripts/jira_comment.py OPS-132 --body-file update.md       # From file
+python3 scripts/jira_comment.py OPS-132 --list --last 5             # Read recent comments
+```
+
+### Fallback: raw curl
+
+```bash
+payload='{"body":"Status update: scope clarified."}'
 
 curl -sS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-  -H "Accept: application/json" \
   -H "Content-Type: application/json" \
-  -X POST "$JIRA_BASE_URL/rest/api/2/issue/OPS-132/comment" \
-  -d "$payload"
+  -X POST "$JIRA_BASE_URL/rest/api/2/issue/OPS-132/comment" -d "$payload"
 ```
 
 ### Comment use cases
@@ -173,24 +183,27 @@ curl -sS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
 
 Do not guess transition IDs. They are workflow-specific.
 
-### Step 1: Read available transitions
+### Using bundled scripts (recommended)
 
 ```bash
+python3 scripts/jira_transition.py OPS-132 --list                  # See available transitions
+python3 scripts/jira_transition.py OPS-132 --to "In Progress"      # By name
+python3 scripts/jira_transition.py OPS-132 --id 31 --comment "Starting work"  # By ID
+```
+
+### Fallback: raw curl
+
+```bash
+# Step 1: Read transitions
 curl -sS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
   -H "Accept: application/json" \
   "$JIRA_BASE_URL/rest/api/2/issue/OPS-132/transitions"
-```
 
-### Step 2: Apply chosen transition
-
-```bash
-payload='{"transition":{"id":"31"}}'
-
+# Step 2: Apply chosen transition
 curl -sS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-  -H "Accept: application/json" \
   -H "Content-Type: application/json" \
   -X POST "$JIRA_BASE_URL/rest/api/2/issue/OPS-132/transitions" \
-  -d "$payload"
+  -d '{"transition":{"id":"31"}}'
 ```
 
 ### Transition checklist
@@ -203,28 +216,33 @@ curl -sS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
 
 Use when the user wants the work broken down under a known parent issue.
 
-### Bash subtask example
+### Using bundled scripts (recommended)
 
 ```bash
-payload=$(python3 - <<'PY'
-import json
-print(json.dumps({
-  "fields": {
-    "project": {"key": "PLAT"},
-    "parent": {"key": "PLAT-101"},
-    "issuetype": {"name": "Sub-task"},
-    "summary": "Draft pod summary query and output structure",
-    "description": "Create the first version of the pod-level Jira reporting workflow."
-  }
-}))
-PY
-)
+# Single subtask
+python3 scripts/jira_subtask.py --parent PLAT-101 --summary "Draft pod summary query" --dry-run
+
+# Multiple subtasks at once
+python3 scripts/jira_subtask.py --parent PLAT-101 \
+    --summaries "Design schema|Implement API|Write tests"
+
+# Batch from JSON file
+python3 scripts/jira_subtask.py --parent PLAT-101 --batch subtasks.json
+```
+
+### Fallback: raw curl
+
+```bash
+payload=$(python3 -c "
+import json; print(json.dumps({'fields': {
+  'project': {'key': 'PLAT'}, 'parent': {'key': 'PLAT-101'},
+  'issuetype': {'name': 'Sub-task'},
+  'summary': 'Draft pod summary query and output structure'
+}}))")
 
 curl -sS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-  -H "Accept: application/json" \
   -H "Content-Type: application/json" \
-  -X POST "$JIRA_BASE_URL/rest/api/2/issue" \
-  -d "$payload"
+  -X POST "$JIRA_BASE_URL/rest/api/2/issue" -d "$payload"
 ```
 
 ### Subtask checklist
@@ -235,6 +253,13 @@ curl -sS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
 ## Workflow 6: Personal summary query pattern
 
 Use for one person’s standup, daily update, or weekly summary.
+
+### Using bundled scripts
+
+```bash
+python3 scripts/jira_summary.py --scope personal --time today --format table
+python3 scripts/jira_summary.py --scope personal --time week --format table
+```
 
 ### Typical JQL selectors
 - `assignee = currentUser()`
@@ -258,6 +283,12 @@ project = PROJ AND assignee = currentUser() AND updated >= startOfDay() ORDER BY
 ## Workflow 7: Pod summary query pattern
 
 Use for a bounded pod or squad.
+
+### Using bundled scripts
+
+```bash
+python3 scripts/jira_summary.py --scope pod --project PLAT --label pod-alpha --time week --format table
+```
 
 ### Common pod scoping options
 - project + label
@@ -283,6 +314,13 @@ project = PLAT AND labels = pod-alpha AND updated >= startOfWeek() ORDER BY prio
 
 Use for a broader leadership or stakeholder view.
 
+### Using bundled scripts
+
+```bash
+python3 scripts/jira_summary.py --scope team --project MOBILE --sprint open --format table
+python3 scripts/jira_analytics.py --scope team --project MOBILE --time month --group-by status
+```
+
 ### Common team scoping options
 - whole project
 - current sprint
@@ -306,12 +344,13 @@ project = MOBILE AND sprint in openSprints() ORDER BY priority DESC, updated DES
 
 ```mermaid
 flowchart TD
-    A[Need Jira API workflow] --> B{User platform}
-    B -->|macOS/Linux| C[Use Bash plus curl]
-    B -->|Windows PowerShell| D[Read windows-powershell.md]
-    C --> E[Build payloads with Python or jq]
-    D --> F[Build payloads with hashtables plus ConvertTo-Json]
-    E --> G[Execute create/update/search workflow]
+    A[Need Jira API workflow] --> B{Bundled script covers it?}
+    B -->|Yes| C[Use scripts/*.py — works on all platforms]
+    B -->|No — custom payload| D{User platform}
+    D -->|macOS/Linux| E[Use curl plus Python for JSON]
+    D -->|Windows PowerShell| F[Read windows-powershell.md]
+    C --> G[Execute create/update/search workflow]
+    E --> G
     F --> G
 ```
 

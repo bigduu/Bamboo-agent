@@ -97,6 +97,76 @@
         "The response keeps the task scoped to updating Jira issue OPS-132.",
         "The response does not force Unix-only patterns such as Bash heredocs as the primary solution."
       ]
+    },
+    {
+      "id": 8,
+      "name": "analytics-team-mermaid-report",
+      "prompt": "帮我看一下 PLAT 项目上个月的 Jira 数据分析，按 assignee 分组，给我一个可视化报告。",
+      "expected_output": "识别为 analytics 场景，使用 jira_analytics.py 按 assignee 分组查询 PLAT 项目上月数据，输出包含 Mermaid 图表的分析报告（pie 或 bar chart），并附带统计摘要和 issue 明细表。",
+      "files": [],
+      "expectations": [
+        "The response identifies this as a Jira analytics/visualization request.",
+        "The response uses or references jira_analytics.py with appropriate flags.",
+        "The response specifies --group-by assignee and a monthly time range.",
+        "The response includes or renders Mermaid diagram syntax for charts.",
+        "The response provides a statistical summary alongside the visual output."
+      ]
+    },
+    {
+      "id": 9,
+      "name": "script-execution-get-issue",
+      "prompt": "帮我用脚本拉一下 FEAT-781 这个 ticket 的详情。",
+      "expected_output": "识别为脚本执行场景，使用 jira_get.py 获取 FEAT-781 的详情，并在环境变量缺失时给出清晰的配置提示。",
+      "files": [],
+      "expectations": [
+        "The response uses or references jira_get.py to fetch the issue.",
+        "The response targets the correct issue key FEAT-781.",
+        "The response checks or mentions JIRA_BASE_URL and auth environment variables.",
+        "The response does not fall back to raw curl when a bundled script is available.",
+        "The response explains what the script output will contain."
+      ]
+    },
+    {
+      "id": 10,
+      "name": "triage-break-down-ticket",
+      "prompt": "看一下 PLAT-88 这个 ticket，它太大了需要拆分。帮我分析一下应该怎么拆成 subtasks，先给我一个建议方案，不要直接创建。",
+      "expected_output": "识别为 triage/planning 模式，先读取 PLAT-88 当前状态，然后给出拆分建议方案（subtask 列表），明确不执行写操作除非用户要求。",
+      "files": [],
+      "expectations": [
+        "The response identifies this as a triage/planning request, not a direct create.",
+        "The response reads or attempts to read the current state of PLAT-88.",
+        "The response proposes concrete subtask breakdown suggestions.",
+        "The response does not create any issues without user confirmation.",
+        "The response offers to execute the creation after user approves the plan."
+      ]
+    },
+    {
+      "id": 11,
+      "name": "multi-step-update-then-comment",
+      "prompt": "先把 OPS-55 的 priority 改成 High，然后加一条 comment 说 'Escalated due to customer impact'，最后 move 到 In Progress。",
+      "expected_output": "识别为多步工作流（update + comment + transition），按顺序规划并执行三个操作，每步使用对应的脚本。",
+      "files": [],
+      "expectations": [
+        "The response identifies all three steps: update priority, add comment, and transition status.",
+        "The response uses or references jira_update.py, jira_comment.py, and jira_transition.py.",
+        "The response targets the correct issue key OPS-55 across all steps.",
+        "The response executes steps in a logical order (update → comment → transition).",
+        "The response does not skip any of the three requested operations."
+      ]
+    },
+    {
+      "id": 12,
+      "name": "english-create-epic-with-subtasks",
+      "prompt": "I need to create an epic in the PLATFORM project about migrating our authentication service to OAuth 2.0. Break it down into 4-5 subtasks covering discovery, implementation, testing, and rollout. Just draft everything for now, don't create anything yet.",
+      "expected_output": "Identifies this as a create + triage workflow in English. Produces a well-structured epic draft with summary, description, and acceptance criteria, plus 4-5 concrete subtask proposals. Does not execute any writes since the user said 'just draft'.",
+      "files": [],
+      "expectations": [
+        "The response identifies the project key PLATFORM.",
+        "The response drafts an Epic-level issue with a clear summary and description.",
+        "The response proposes 4-5 concrete subtask summaries covering the requested phases.",
+        "The response does not attempt to create any issues since the user asked for a draft only.",
+        "The response is written in English matching the user's language."
+      ]
     }
   ]
 }

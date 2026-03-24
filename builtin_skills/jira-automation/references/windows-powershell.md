@@ -25,7 +25,6 @@ Use PowerShell syntax when showing examples:
 - `$env:JIRA_API_TOKEN`
 - `$env:JIRA_PAT`
 - `$env:JIRA_PROJECT_KEY`
-- `$env:JIRA_BOARD_ID`
 
 If these are not set, explain what is missing and ask for the minimum required info.
 
