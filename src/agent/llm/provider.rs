@@ -48,6 +48,8 @@ pub type LLMStream = Pin<Box<dyn Stream<Item = Result<LLMChunk>> + Send>>;
 /// Optional request-time controls for provider calls.
 #[derive(Debug, Clone, Default)]
 pub struct ResponsesRequestOptions {
+    /// Optional top-level instructions for Responses API requests.
+    pub instructions: Option<String>,
     /// Optional reasoning summary control for Responses API requests
     /// (e.g. "auto", "concise", "detailed").
     pub reasoning_summary: Option<String>,

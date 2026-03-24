@@ -27,7 +27,7 @@ pub(super) struct Model {
 /// We intentionally accept a subset of the spec to support common SDK usage:
 /// - `model`
 /// - `input` (string or array of message-like objects)
-/// - `instructions` (mapped to a system message)
+/// - `instructions` (forwarded as top-level Responses API instructions)
 /// - `previous_response_id` (passed via flattened parameters for stateful continuation)
 /// - `tools` (OpenAI tool schema; reuses existing OpenAI-compatible tool model)
 /// - `stream`

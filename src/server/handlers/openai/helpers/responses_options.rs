@@ -99,6 +99,7 @@ pub(super) fn parse_responses_request_options(
         };
 
     ResponsesRequestOptions {
+        instructions: None,
         reasoning_summary: parse_reasoning_summary(parameters),
         include,
         store: parameters.get("store").and_then(|value| value.as_bool()),

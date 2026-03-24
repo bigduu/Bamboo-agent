@@ -202,6 +202,14 @@ pub fn build_responses_body(
         "stream": true,
     });
 
+    if let Some(instructions) = responses_options
+        .and_then(|opts| opts.instructions.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        body["instructions"] = json!(instructions);
+    }
+
     if let Some(previous_response_id) = responses_options
         .and_then(|opts| opts.previous_response_id.as_deref())
         .map(str::trim)
@@ -1171,6 +1179,7 @@ mod tests {
             None,
             Some(ReasoningEffort::High),
             Some(&ResponsesRequestOptions {
+                instructions: Some("You are helpful".to_string()),
                 reasoning_summary: Some("detailed".to_string()),
                 include: Some(vec!["reasoning.encrypted_content".to_string()]),
                 store: Some(true),
@@ -1182,6 +1191,7 @@ mod tests {
         );
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "detailed");
+        assert_eq!(body["instructions"], "You are helpful");
         assert_eq!(
             body["include"],
             serde_json::json!(["reasoning.encrypted_content"])

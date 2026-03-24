@@ -7,7 +7,7 @@ use super::super::helpers::{
     parse_responses_request_options, responses_input_to_chat_messages,
 };
 use super::super::types::ResponsesCreateRequest;
-use super::super::usage::estimate_prompt_tokens;
+use super::super::usage::{estimate_prompt_tokens, estimate_text_tokens};
 use super::PreparedResponsesRequest;
 
 pub(super) async fn prepare_request(
@@ -22,33 +22,22 @@ pub(super) async fn prepare_request(
     }
     let resolved_model = requested_model;
 
-    let mut openai_messages = Vec::new();
-    if let Some(instructions) = request
+    let instructions = request
         .instructions
         .as_ref()
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
-    {
-        openai_messages.push(crate::agent::llm::api::models::ChatMessage {
-            role: crate::agent::llm::api::models::Role::System,
-            content: crate::agent::llm::api::models::Content::Text(instructions.to_string()),
-            phase: None,
-            tool_calls: None,
-            tool_call_id: None,
-        });
-    }
+        .map(ToString::to_string);
+    let input_messages = responses_input_to_chat_messages(request.input)?;
 
-    let mut input_messages = responses_input_to_chat_messages(request.input)?;
-    openai_messages.append(&mut input_messages);
-
-    if openai_messages.is_empty() {
+    if input_messages.is_empty() && instructions.is_none() {
         return Err(AppError::BadRequest(
             "Missing `input`: at least one message is required".to_string(),
         ));
     }
 
     // Convert to internal messages (preserving multimodal parts), then apply preflight hooks.
-    let mut internal_messages = convert_messages(openai_messages)?;
+    let mut internal_messages = convert_messages(input_messages)?;
     let config_snapshot = app_state.config.read().await.clone();
     crate::server::message_hooks::apply_message_preflight_hooks(
         Some(app_state.as_ref()),
@@ -75,9 +64,15 @@ pub(super) async fn prepare_request(
     });
     let reasoning_effort = parse_reasoning_effort(&request.parameters);
     let parallel_tool_calls = parse_parallel_tool_calls(&request.parameters);
-    let responses_options = parse_responses_request_options(&request.parameters);
+    let mut responses_options = parse_responses_request_options(&request.parameters);
+    responses_options.instructions = instructions.clone();
 
-    let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
+    let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages).saturating_add(
+        instructions
+            .as_deref()
+            .map(estimate_text_tokens)
+            .unwrap_or(0),
+    );
 
     Ok(PreparedResponsesRequest {
         resolved_model,

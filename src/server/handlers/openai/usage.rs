@@ -7,6 +7,11 @@ pub(super) fn estimate_prompt_tokens(messages: &[Message]) -> u64 {
     u64::from(counter.count_messages(messages))
 }
 
+pub(super) fn estimate_text_tokens(text: &str) -> u64 {
+    let counter = HeuristicTokenCounter::with_defaults();
+    u64::from(counter.count_text(text))
+}
+
 pub(super) fn estimate_completion_tokens(output_text: &str) -> u64 {
     let counter = HeuristicTokenCounter::with_defaults();
     u64::from(counter.count_text(output_text))
