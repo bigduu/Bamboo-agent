@@ -1,0 +1,6 @@
+# Confluence skill scripts dependencies
+# All scripts use only Python stdlib (urllib, json, argparse, re, etc.)
+# No third-party packages required.
+#
+# If your Confluence instance uses self-signed certificates, set:
+#   CONFLUENCE_VERIFY_SSL=0

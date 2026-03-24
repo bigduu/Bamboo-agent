@@ -18,10 +18,31 @@ Use this reference when the task is API-heavy and you want quick reminders inste
 
 Use CQL when title-only matching is too narrow.
 
-- `space=ENG and title~"onboarding"`
-- `space=OPS and text~"rollback"`
-- `label=runbook and space=PLAT`
+**Basic filters:**
+- `space=ENG and title~"onboarding"` — fuzzy title match in a space
+- `space=OPS and text~"rollback"` — full-text body search
+- `label=runbook and space=PLAT` — by label
+- `label in (runbook, sop) and space=ENG` — multiple labels (OR)
+- `creator=alice and space=ENG` — by author
+
+**Date filters:**
+- `space=OPS and lastmodified > "2025-01-01"` — modified after date
+- `space=ENG and created >= "2025-06-01"` — created after date
+- `space=PLAT and lastmodified > "2025-03-01" and label=postmortem` — combine date + label
+
+**Subtree scoping:**
+- `ancestor=123456 and type=page` — all pages under a parent
+- `space=ENG and ancestor=456789 and label=runbook` — scoped to subtree + label
+
+**Ordering:**
 - `space=ENG and type=page order by lastmodified desc`
+- `space=OPS and label=incident order by created desc`
+
+**Pitfalls:**
+- `text~` is fuzzy: may match comments/macros/metadata. Use `--keywords` for precise client-side filtering.
+- `title=` is exact match; `title~` is contains.
+- Dates must be `"YYYY-MM-DD"` with double quotes.
+- Labels are lowercase: `label=release-notes` not `label=Release-Notes`.
 
 If the instance version behaves differently, verify against the local REST API docs.
 

@@ -1,29 +1,13 @@
 ---
 name: confluence
-description: >
-  Full Confluence copilot for Confluence Server/Data Center via REST API. Use this
-  skill whenever the user wants to search, read, summarize, create, organize, label,
-  attach files to, or update Confluence pages in a self-hosted Confluence instance.
-  Also trigger when the user refers to a Confluence wiki, internal docs, knowledge
-  base, handbook, team docs, page tree, parent page, page ID, labels, attachments,
-  CQL, storage format, meeting notes, release notes, runbooks, SOPs, postmortems,
-  or wants to publish rough notes or Markdown into Confluence, even without saying
-  "Confluence". Also use it for privacy-aware Confluence work such as metadata-only
-  search, scoped reads within a specific space or parent page, or command-only
-  workflows. If the request is only generic writing, email prose, or abstract
-  planning, do not force a Confluence workflow unless the user explicitly wants
-  Confluence publishing. Optimize for Server/Data Center, not Cloud-specific
-  workflows.
-compatibility: >
-  Optimized for Confluence Server/Data Center REST API workflows using curl-style
-  Bash calls plus safe JSON payload construction with Python or jq. Not intended
-  for Confluence Cloud-specific API differences.
+description: "Confluence Server/Data Center copilot for safe read/search, page create/update/delete, section edits, labels, attachments, page tree traversal, version history, and Markdown-to-storage conversion using built-in scripts. Use when users mention Confluence pages, spaces, page IDs, CQL, storage format, or self-hosted wiki publishing. Supports privacy modes (`strict_metadata`, `strict_scoped_read`, `command_only`). Skip for generic writing or non-Confluence platforms."
+compatibility: Optimized for Confluence Server/Data Center REST API workflows using curl-style Bash calls plus safe JSON payload construction with Python or jq. Not intended for Confluence Cloud-specific API differences.
 allowed-tools:
-  - Bash
-  - Read
-  - Glob
-  - Grep
-  - ask_user
+- Bash
+- Read
+- Glob
+- Grep
+- ask_user
 ---
 
 # Confluence Server/Data Center Copilot
@@ -52,11 +36,16 @@ flowchart TD
 
 Use this skill for tasks such as:
 - Searching pages by title, space, label, or CQL and summarizing the results
+- Batch searching with keyword-context extraction for summarizing across many pages without blowing up context
 - Fetching specific pages by ID and extracting decisions, action items, risks, or open questions
 - Publishing meeting notes, release notes, runbooks, SOPs, incident notes, or knowledge-base articles
 - Updating existing pages in place while preserving important structure
+- Deleting (trashing) pages with dry-run preview
 - Helping the user locate the correct parent page, page ID, or page tree position before publishing
-- Applying labels or planning attachment uploads after page creation or update
+- Browsing the page tree recursively with depth control to understand space structure
+- Applying or removing labels, and planning attachment uploads after page creation or update
+- Listing all spaces when the user doesn't know the space key
+- Viewing page version history and comparing historical versions
 - Translating rough notes or Markdown-like content into Confluence storage format that is simple and durable
 - Running in privacy-aware modes such as metadata-only search, scoped read, or command-only execution
 - Handling large result sets with top-N selection, batched reading, and structured summaries or tables
@@ -76,7 +65,7 @@ Use this skill for tasks such as:
 11. If the user has not provided credentials or the target instance details, ask only for the minimum missing information.
 12. Build non-trivial JSON payloads with a serializer such as `python3 - <<'PY'` or `jq -n` instead of hand-escaping long storage markup.
 13. Treat labels and attachments as follow-up operations to page create or update unless the local instance documents a different workflow.
-14. For large search result sets, rank candidates by metadata, read only the top relevant pages, and summarize in batches instead of dumping every raw page body into context.
+14. For large search result sets, use `search_summarize.py` which fetches results with `body.storage` expanded in a **single search request**, strips HTML, and extracts keyword-context snippets. Never search first and then fetch pages one by one with `get_page.py` — that is a wasteful N+1 pattern.
 15. Never print secrets back to the user. Refer to them by variable name or redact them.
 
 ## Privacy and strict modes
@@ -118,6 +107,109 @@ Prefer environment variables when possible so the user does not have to paste cr
 
 Use whichever authentication method the instance supports. If both username/password and PAT are absent, ask the user how their Server or Data Center instance authenticates REST calls.
 
+## Helper scripts
+
+The `scripts/` directory contains ready-to-use Python CLI tools for common Confluence operations. All scripts use **only Python stdlib** (no pip install needed) and produce structured JSON output for easy parsing.
+
+The shared client module `scripts/confluence_client.py` handles authentication (PAT or basic auth), base URL resolution, SSL verification, and JSON response formatting. All other scripts import it automatically.
+
+Set `CONFLUENCE_VERIFY_SSL=0` if the instance uses self-signed certificates.
+
+### Available scripts
+
+| Script | Purpose | Example |
+| --- | --- | --- |
+| `search_pages.py` | Search by title, space, or CQL | `python3 scripts/search_pages.py --title "Runbook" --space ENG` |
+| `search_summarize.py` | Batch search with keyword-context snippets for summarization | `python3 scripts/search_summarize.py --cql 'space=OPS and label=postmortem' --keywords "root cause" --top 10` |
+| `get_page.py` | Fetch page by ID with configurable expand | `python3 scripts/get_page.py --page-id 123456` |
+| `create_page.py` | Create page with safe JSON payload | `python3 scripts/create_page.py --space ENG --title "New Page" --parent-id 987654 --body-file /tmp/body.html` |
+| `update_page.py` | Update page with auto version handling and 409 retry | `python3 scripts/update_page.py --page-id 123456 --body-file /tmp/updated.html` |
+| `delete_page.py` | Delete (trash) a page with dry-run support | `python3 scripts/delete_page.py --page-id 123456 --dry-run` |
+| `list_children.py` | List child pages (single level) with pagination | `python3 scripts/list_children.py --page-id 123456` |
+| `page_tree.py` | Recursive page tree with configurable depth | `python3 scripts/page_tree.py --page-id 123456 --depth 3 --flat` |
+| `page_history.py` | View version history, fetch historical versions | `python3 scripts/page_history.py --page-id 123456 --version 5 --expand-body` |
+| `list_spaces.py` | List all spaces with optional type/keyword filter | `python3 scripts/list_spaces.py --type global --query "platform"` |
+| `manage_labels.py` | Get, add, or remove labels | `python3 scripts/manage_labels.py --page-id 123456 --action remove --labels outdated,draft` |
+| `upload_attachment.py` | Upload file attachment | `python3 scripts/upload_attachment.py --page-id 123456 --file report.pdf` |
+| `markdown_to_storage.py` | Convert Markdown to Confluence storage format | `python3 scripts/markdown_to_storage.py --input notes.md` |
+| `section_editor.py` | Section-level page content editing | `python3 scripts/section_editor.py --page-id 123456 --heading "Rollback" --new-content "<p>Updated</p>"` |
+
+### When to use scripts vs inline curl
+
+**Prefer scripts** for:
+- Creating or updating pages with complex body content (avoids JSON escaping issues)
+- Section-level edits that require parsing the existing page body
+- Converting Markdown to storage format
+- Operations that benefit from auto version increment and 409 retry
+
+**Prefer inline curl** for:
+- Quick one-off metadata queries in `command_only` or `strict_metadata` mode
+- Simple CQL searches with short output
+- When the user explicitly requests curl commands
+
+### Combining scripts
+
+A typical create-from-markdown workflow:
+
+```bash
+# 1. Convert Markdown to Confluence storage
+python3 scripts/markdown_to_storage.py --input notes.md --output /tmp/body.html
+
+# 2. Create the page
+python3 scripts/create_page.py --space ENG --title "Release Notes v2.3" \
+  --parent-id 987654 --body-file /tmp/body.html
+
+# 3. Add labels (use the page ID from step 2 output)
+python3 scripts/manage_labels.py --page-id NEW_PAGE_ID --action add --labels release-notes
+```
+
+A section-level update workflow:
+
+```bash
+# 1. List sections to find the right heading
+python3 scripts/section_editor.py --page-id 123456 --list-sections
+
+# 2. Dry-run the section replacement
+python3 scripts/section_editor.py --page-id 123456 --heading "Rollback" \
+  --new-content "<p>Updated rollback steps</p>" --dry-run
+
+# 3. Push the update
+python3 scripts/section_editor.py --page-id 123456 --heading "Rollback" \
+  --new-content "<p>Updated rollback steps</p>"
+```
+
+A page discovery and cleanup workflow:
+
+```bash
+# 1. Don't know the space key? List all spaces first
+python3 scripts/list_spaces.py --type global --query "ops"
+
+# 2. Browse the page tree to find where things live
+python3 scripts/page_tree.py --page-id 123456 --depth 3 --flat
+
+# 3. Check version history to see who changed what
+python3 scripts/page_history.py --page-id 123456 --limit 10
+
+# 4. Remove outdated labels
+python3 scripts/manage_labels.py --page-id 123456 --action remove --labels outdated,draft
+
+# 5. Dry-run a page deletion before committing
+python3 scripts/delete_page.py --page-id 789012 --dry-run
+```
+
+A batch summarization workflow (avoids context blowup):
+
+```bash
+# Search across many pages with keyword-context extraction
+python3 scripts/search_summarize.py \
+  --cql 'space=OPS and label=postmortem and lastmodified > "2025-03-01"' \
+  --keywords "root cause" "remediation" "timeline" \
+  --top 10 --context-chars 200
+
+# The output is compact JSON with per-page keyword snippets
+# Feed directly to AI for summarization — no need to fetch each page body
+```
+
 ## REST API playbook
 
 The exact behavior can vary slightly by Confluence version, so verify against the local instance if a first attempt returns 404 or 400. Common Server and Data Center patterns are:
@@ -128,12 +220,17 @@ The exact behavior can vary slightly by Confluence version, so verify against th
 | Search with CQL | GET | `/rest/api/content/search?cql=...` |
 | Fetch page metadata only | GET | `/rest/api/content/{id}?expand=version,space,ancestors` |
 | Fetch a page with body and version | GET | `/rest/api/content/{id}?expand=body.storage,version,space,ancestors` |
+| Fetch a historical version | GET | `/rest/api/content/{id}?status=historical&version={n}&expand=body.storage,version` |
 | Create a page | POST | `/rest/api/content` |
 | Update a page | PUT | `/rest/api/content/{id}` |
+| Delete (trash) a page | DELETE | `/rest/api/content/{id}` |
 | List child pages | GET | `/rest/api/content/{id}/child/page` |
+| List version history | GET | `/rest/api/content/{id}/version` |
 | Inspect labels | GET | `/rest/api/content/{id}/label` |
 | Add labels to a page | POST | `/rest/api/content/{id}/label` |
+| Remove a label from a page | DELETE | `/rest/api/content/{id}/label/{label}` |
 | Upload an attachment to a page | POST | `/rest/api/content/{id}/child/attachment` |
+| List all spaces | GET | `/rest/api/space` |
 
 When using shell commands, prefer `curl` with JSON payloads. If the request is authenticated, use either basic auth or a bearer token depending on the instance. In `strict_metadata`, prefer metadata-only fetches and label/tree endpoints instead of `body.storage` expansions.
 
@@ -188,85 +285,132 @@ Use the same pattern for updates. This reduces malformed JSON and invalid storag
 
 ## Windows and PowerShell notes
 
-If the user is on Windows, prefer PowerShell over `cmd.exe` for Confluence work. PowerShell handles environment variables, multi-line commands, and JSON preparation more reliably.
+If the user is on Windows, read `references/windows-powershell.md` for PowerShell-specific environment setup, `curl.exe` usage, UTF-8 payload handling, and complete examples. Key rules: use `curl.exe` not bare `curl`, prefer generating a JSON payload file with Python, and use `$env:` syntax for variables.
 
-1. Set environment variables with PowerShell syntax such as `$env:CONFLUENCE_BASE_URL = "https://confluence.example.internal"`.
-2. Prefer `curl.exe` instead of bare `curl` so PowerShell does not route the call through an alias or wrapper unexpectedly.
-3. For complex JSON payloads, do not hand-escape long storage markup inline. Prefer generating a JSON file with Python and then posting that file.
-4. When the Unix examples use heredoc syntax like `python3 - <<'PY'`, translate that into a PowerShell here-string piped into Python, or write a temporary `.py` file first.
-5. Be careful with Windows attachment paths such as `C:\Users\Alice\Downloads\rollout-checklist.pdf`, especially when the path contains spaces.
-6. Write payload files as UTF-8 when possible so non-ASCII page titles and storage markup survive correctly.
-7. In `command_only` mode for Windows users, prefer emitting PowerShell examples explicitly rather than Bash.
+## Translating natural language to search parameters
 
-### PowerShell environment examples
+Users describe what they want in natural language. Your job is to translate that into concrete CQL, title, space, keywords, and time filters before calling any script. Confluence search is **not** a natural-language search engine — it needs structured parameters.
 
-```powershell
-$env:CONFLUENCE_BASE_URL = "https://confluence.example.internal"
-$env:CONFLUENCE_PAT = "your_token_here"
-$env:CONFLUENCE_SPACE_KEY = "ENG"
-$BASE_URL = $env:CONFLUENCE_BASE_URL.TrimEnd('/')
+### Two-layer filtering model
 
-curl.exe -sS `
-  -H "Authorization: Bearer $env:CONFLUENCE_PAT" `
-  "$BASE_URL/rest/api/content?limit=1"
+Confluence searching works in two layers:
+
+1. **CQL (server-side)**: coarse filter — narrows by space, label, date range, text contains. This is what the Confluence REST API processes. CQL `text~"keyword"` does full-text search but is fuzzy and may return noise.
+2. **`--keywords` in search_summarize.py (client-side)**: precise extraction — after results come back, strips HTML and finds exact keyword matches with context windows. This is what makes the output compact and relevant for AI summarization.
+
+Both layers serve different purposes. Use CQL to **reduce the result set** to a manageable size, and `--keywords` to **extract the specific information** the user cares about.
+
+### Translation examples
+
+| User says (natural language) | CQL (server-side filter) | keywords (client-side extract) |
+| --- | --- | --- |
+| "过去一年 OPS 事故大家怎么处理的" | `space=OPS and label=postmortem and lastmodified > "2025-03-24"` | `"root cause" "remediation" "timeline"` |
+| "ENG 空间里关于 rollback 的 runbook" | `space=ENG and label=runbook and text~"rollback"` | `"rollback" "rollback procedure"` |
+| "platform team 最近的 release notes 有哪些 breaking changes" | `space=PLAT and label=release-notes order by lastmodified desc` | `"breaking" "incompatible" "migration"` |
+| "who changed the VPN onboarding page recently" | Not a search task — use `page_history.py` | N/A |
+| "find all pages Alice created last month in ENG" | `space=ENG and creator=alice and created > "2025-02-24"` | (none, metadata query) |
+
+### How to decompose a natural language request
+
+1. **Identify the space**: look for team names, project names, or explicit space keys. If unknown, use `list_spaces.py` first.
+2. **Identify labels/page types**: "postmortem", "runbook", "release notes", "SOP" → these are usually Confluence labels.
+3. **Identify time range**: "past year", "last month", "since January" → translate to `lastmodified > "YYYY-MM-DD"` or `created > "YYYY-MM-DD"`.
+4. **Identify content keywords**: what specific information does the user want extracted? These become `--keywords` for client-side snippet extraction.
+5. **Identify the intent**: summarize across many pages → `search_summarize.py`; read one specific page → `get_page.py`; find where a page lives → `search_pages.py` with metadata.
+
+If you are unsure about the space key or labels, ask the user. Do not guess — a wrong space key returns zero results silently.
+
+### CQL quick reference
+
+CQL (Confluence Query Language) is the main structured search syntax. Use it with `--cql` in `search_pages.py` and `search_summarize.py`.
+
+**Operators and fields:**
+
+| Field | Operator | Example | What it does |
+| --- | --- | --- | --- |
+| `space` | `=` | `space=ENG` | Exact space key match |
+| `title` | `=` | `title="VPN Onboarding"` | Exact title match |
+| `title` | `~` | `title~"onboarding"` | Title contains (fuzzy) |
+| `text` | `~` | `text~"rollback procedure"` | Full-text body search (may be noisy) |
+| `label` | `=` | `label=postmortem` | Has this label |
+| `label` | `in` | `label in (runbook, sop)` | Has any of these labels |
+| `type` | `=` | `type=page` | Content type (page, blogpost, comment) |
+| `creator` | `=` | `creator=alice` | Created by this username |
+| `lastmodified` | `>`, `<`, `>=` | `lastmodified > "2025-01-01"` | Modified after date (YYYY-MM-DD) |
+| `created` | `>`, `<`, `>=` | `created >= "2025-06-01"` | Created after date |
+| `ancestor` | `=` | `ancestor=123456` | Descendant of this page ID |
+
+**Combining with `and` / `or`:**
+
+```
+space=OPS and label=postmortem and lastmodified > "2025-03-01"
+space=ENG and (label=runbook or label=sop)
+space=PLAT and text~"breaking change" and type=page
 ```
 
-### PowerShell payload example
+**Ordering:**
 
-```powershell
-@'
-import json
-
-payload = {
-    "type": "page",
-    "title": "Weekly Platform Sync - 2026-03-21",
-    "space": {"key": "PLAT"},
-    "ancestors": [{"id": 987654}],
-    "body": {
-        "storage": {
-            "value": "<h1>Summary</h1><p>...</p>",
-            "representation": "storage"
-        }
-    }
-}
-
-with open("confluence-create.json", "w", encoding="utf-8") as f:
-    json.dump(payload, f, ensure_ascii=False)
-'@ | python -
-
-curl.exe -sS `
-  -H "Content-Type: application/json" `
-  -H "Authorization: Bearer $env:CONFLUENCE_PAT" `
-  -d "@confluence-create.json" `
-  "$BASE_URL/rest/api/content"
 ```
+space=ENG and type=page order by lastmodified desc
+space=OPS and label=incident order by created desc
+```
+
+**Common pitfalls:**
+- `text~` does fuzzy full-text search — it may match pages where the keyword appears in comments, macros, or metadata. Use `--keywords` for precise client-side filtering on top.
+- `title=` is **exact match** (case-insensitive). Use `title~` for contains.
+- Date format must be `"YYYY-MM-DD"` with double quotes inside the CQL string.
+- `ancestor=ID` is useful to restrict search to a subtree under a known parent page.
+- `label` values are lowercase by convention. `label=Release-Notes` may fail; use `label=release-notes`.
 
 ## Search and read workflow
 
 When the user wants to find or summarize information:
 
-1. Resolve the search scope.
-   - Specific page ID if known
-   - Title and space if mostly known
-   - CQL if the user needs a broader search across labels, text, creators, or dates
-2. Choose the narrowest reliable search method in this order when possible: `page ID` -> `title + space` -> `CQL` -> parent discovery.
-3. Prefer search-first behavior when the title is ambiguous.
-4. In `strict_metadata`, keep the whole workflow metadata-only. Return page IDs, titles, spaces, URLs, labels, ancestor context, version, and other safe metadata without fetching `body.storage`.
-5. In `strict_scoped_read`, stay metadata-only until the user explicitly allows content reads and the target falls inside the approved `page ID` or `space + parent page ID` scope.
-6. In normal mode, fetch the page body with `expand=body.storage,version,space,ancestors` before summarizing.
-7. For large result sets, rank candidates first, then read only the top relevant pages instead of every match.
-8. Summarize what matters to the task rather than dumping raw storage XHTML.
-9. Return page identifiers so the user can verify the target.
+1. **Translate the natural language request** into structured parameters (space, CQL, keywords, time range) using the rules above.
+2. Resolve the search scope.
+   - Specific page ID if known → use `get_page.py` (1 API request)
+   - Title and space if mostly known → use `search_pages.py` (1 request, already expands body)
+   - CQL for broader search → use `search_pages.py --cql` or `search_summarize.py` (1 request)
+3. Choose the narrowest reliable search method in this order when possible: `page ID` -> `title + space` -> `CQL` -> parent discovery.
+4. Prefer search-first behavior when the title is ambiguous.
+5. In `strict_metadata`, keep the whole workflow metadata-only. Return page IDs, titles, spaces, URLs, labels, ancestor context, version, and other safe metadata without fetching `body.storage`.
+6. In `strict_scoped_read`, stay metadata-only until the user explicitly allows content reads and the target falls inside the approved `page ID` or `space + parent page ID` scope.
+7. **For single-page reads**: use `get_page.py --page-id ID` (1 request with body expansion).
+8. **For multi-page summarization**: use `search_summarize.py` which fetches body in the **same search request** and extracts keyword-context snippets client-side. **Do not** search first then call `get_page.py` per result — that is a N+1 anti-pattern.
+9. Summarize what matters to the task rather than dumping raw storage XHTML.
+10. Return page identifiers so the user can verify the target.
 
-### Large result set strategy
+### Large result set strategy — use search_summarize.py
 
-If the search returns many plausible pages, do not read them all at once.
+When the search scope spans multiple pages (5+), always prefer `search_summarize.py` over fetching pages individually:
 
-1. Start with metadata-only ranking: page ID, title, space, labels, modified time, and ancestor path.
-2. Unless the user asks otherwise, narrow to the top 5 most relevant pages for normal summaries, or the top 10 for comparison or table-building tasks.
-3. If pages are long, extract only the sections needed for the task, or produce per-page structured notes before a final summary.
-4. For comparison tasks, prefer a two-pass approach: per-page mini-summary first, then a final aggregate table or report.
-5. Tell the user what subset was read, especially if you truncated or limited the result set.
+1. Use `search_summarize.py --cql '...' --keywords "..." --top 10 --context-chars 200` — this performs a **single search request** with `expand=body.storage`, strips HTML client-side, and returns compact keyword-context snippets.
+2. For comparison tasks, use the snippet output for per-page mini-summaries, then aggregate into a table.
+3. Tell the user what subset was read, especially if you used `--top` to limit results.
+4. **Anti-pattern**: Do NOT search with metadata-only first, pick N page IDs, then call `get_page.py` on each one. That is N+1 requests and wastes API quota. The search API already supports expanding `body.storage` in the same call.
+
+### Batch search and summarization with search_summarize.py
+
+When the user wants to summarize findings across many pages (e.g. "how have incidents been handled over the past year"), use `scripts/search_summarize.py` instead of fetching pages one by one. This script performs a single search request with `body.storage` expanded, strips HTML from each result, and extracts keyword-context snippets (default 200 chars before/after each keyword match). This keeps the AI context compact and avoids recursive per-page fetches.
+
+```bash
+# Search with keyword context extraction — top 10 results, 200-char windows
+python3 scripts/search_summarize.py \
+  --cql 'space=OPS and label=postmortem and lastmodified > "2025-03-01"' \
+  --keywords "root cause" "remediation" "timeline" \
+  --top 10 --context-chars 200
+
+# Multiple keywords, narrower result set
+python3 scripts/search_summarize.py \
+  --title "incident" --space OPS \
+  --keywords "root cause" "remediation" --top 5
+
+# No keywords: returns first 500-char excerpt per page
+python3 scripts/search_summarize.py \
+  --cql 'space=ENG and lastmodified > "2025-01-01"' --top 10
+```
+
+The output is a single JSON blob with per-page metadata, text length, and keyword snippets (or excerpts when no keywords are given). Feed this directly to the AI for summarization rather than dumping full page bodies into context.
 
 ### Search examples
 
@@ -431,63 +575,21 @@ Keep the content clean and scannable. Confluence pages are usually read quickly 
 
 ## Response format
 
-For read-only tasks, use this structure:
+Read `references/response-templates.md` for structured response templates (read-only findings, metadata-only results, result-set handling, publish plans). Use the appropriate template to keep outputs consistent and scannable.
 
-```markdown
-## Confluence findings
-- Site: ...
-- Space: ...
-- Pages checked: ...
-- Candidate pages: ...
-- Summary: ...
-- Open questions: ...
-```
+## API call efficiency — avoid N+1 patterns
 
-For `strict_metadata` or the metadata phase of `strict_scoped_read`, use this structure:
+Every Confluence REST call has latency and quota cost. The scripts are designed to minimize API calls. Follow these rules:
 
-```markdown
-## Confluence metadata findings
-- Mode: strict_metadata or strict_scoped_read
-- Allowed scope: page ID, space, parent page ID, or none yet
-- Site: ...
-- Space: ...
-- Candidate pages: page IDs, titles, labels, ancestor path, modified time
-- Pages selected for content read: none yet or [list]
-- Open questions: ...
-```
+| Task | Correct approach | Wrong approach (N+1) |
+| --- | --- | --- |
+| Summarize 10 pages | `search_summarize.py --top 10` (1 request) | Search metadata → loop `get_page.py` ×10 (11 requests) |
+| Page tree | `page_tree.py` uses `/descendant/page` (1 + ⌈N/200⌉ requests) | Recursive `/child/page` per node (1 per node) |
+| Multi-page body read | `search_pages.py --cql '...'` expands body in search (1 request) | Search metadata-only → loop `get_page.py` (N+1 requests) |
+| Add N labels | `manage_labels.py --action add` (1 POST with array) | N individual POST calls |
+| Remove N labels | `manage_labels.py --action remove` (N DELETEs — API limitation) | Same, unavoidable |
 
-When you apply a top-N or batch limit, make it explicit:
-
-```markdown
-## Result-set handling
-- Total matches: ...
-- Ranked candidates considered: ...
-- Pages read in full or in part: ...
-- Batch strategy: top 5, top 10, per-page mini-summaries, section extraction, etc.
-```
-
-For write tasks, use this structure before or after the API call as appropriate:
-
-```markdown
-## Publish plan
-- Action: create or update
-- Site: ...
-- Space: ...
-- Parent page or page ID: ...
-- Title: ...
-- Labels: ...
-- Post-create actions: labels, attachments, none
-- Risks or assumptions: ...
-
-## Draft content
-[show the key structure or the body preview if useful]
-
-## API result
-- Status: ...
-- Page ID: ...
-- Version: ...
-- URL: ...
-```
+The search API (`/rest/api/content/search` and `/rest/api/content`) supports `expand=body.storage` directly. There is no need to search first for IDs and then fetch body in separate calls.
 
 ## Common failure modes
 
@@ -525,4 +627,3 @@ Pause and ask for confirmation when:
 This skill is tuned for Confluence Server and Data Center REST API workflows.
 If the user is clearly working with Confluence Cloud, do not bluff. Say that this skill is optimized for Server and Data Center and adapt carefully only if the user wants that.
 If the user asks for global administration changes, permission schemes, or plugin-specific macros, help draft a careful plan but do not invent unsupported endpoints or hidden capabilities.
-
