@@ -109,7 +109,7 @@ mod tests {
         assert!(start.elapsed().as_millis() >= 10);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn sleep_tool_accepts_valid_seconds() {
         let tool = SleepTool::new();
 

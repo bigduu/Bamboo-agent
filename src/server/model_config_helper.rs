@@ -102,6 +102,7 @@ mod tests {
                     vision_model: None,
                     reasoning_effort: None,
                     responses_only_models: vec![],
+                    request_overrides: None,
                     extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()
@@ -128,6 +129,7 @@ mod tests {
                     vision_model: None,
                     reasoning_effort: None,
                     responses_only_models: vec![],
+                    request_overrides: None,
                     extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()
@@ -156,6 +158,7 @@ mod tests {
                     vision_model: None,
                     reasoning_effort: None,
                     responses_only_models: vec![],
+                    request_overrides: None,
                     extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()

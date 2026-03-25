@@ -207,6 +207,121 @@ pub struct HooksConfig {
     pub image_fallback: ImageFallbackHookConfig,
 }
 
+/// Request override configuration for provider-specific HTTP behavior.
+///
+/// Overrides are merged in this order (later wins):
+/// 1. `common`
+/// 2. `endpoints[endpoint]`
+/// 3. matching `rules` (sorted by specificity)
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RequestOverridesConfig {
+    /// Overrides applied to all endpoints.
+    #[serde(default, skip_serializing_if = "RequestScopeOverride::is_empty")]
+    pub common: RequestScopeOverride,
+    /// Endpoint-specific overrides (`chat_completions`, `responses`, `messages`, etc.).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub endpoints: BTreeMap<String, RequestScopeOverride>,
+    /// Model-conditional overrides.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<ModelRequestRule>,
+}
+
+/// A conditional override rule matching a model pattern.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelRequestRule {
+    /// Model pattern (exact: `gpt-4o`, prefix wildcard: `gpt-5*`).
+    pub model_pattern: String,
+    /// Optional endpoint constraint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Overrides applied when this rule matches.
+    #[serde(default, skip_serializing_if = "RequestScopeOverride::is_empty")]
+    pub scope: RequestScopeOverride,
+}
+
+/// Request overrides applied in a specific scope.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RequestScopeOverride {
+    /// Extra or overridden HTTP headers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, TemplateExpr>,
+    /// JSON body patch operations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub body_patch: Vec<BodyPatch>,
+}
+
+impl RequestScopeOverride {
+    pub fn is_empty(&self) -> bool {
+        self.headers.is_empty() && self.body_patch.is_empty()
+    }
+}
+
+/// Body patch operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BodyPatch {
+    /// Target path (`foo.bar.0` or `/foo/bar/0`).
+    pub path: String,
+    /// Operation type.
+    #[serde(default)]
+    pub op: BodyPatchOp,
+    /// Value for `set` operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<PatchValue>,
+}
+
+/// Supported body patch operations.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BodyPatchOp {
+    #[default]
+    Set,
+    Remove,
+}
+
+/// Body patch value: either a template expression or a raw JSON value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum PatchValue {
+    Template(TemplateExpr),
+    Json(Value),
+}
+
+/// String template expression used by headers/body patch values.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum TemplateExpr {
+    /// Shorthand literal value.
+    Literal(String),
+    /// Structured template expression.
+    Structured(TemplateExprSpec),
+}
+
+/// Structured template expression.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TemplateExprSpec {
+    /// Literal string value.
+    Literal { value: String },
+    /// Reference a value from Bamboo env vars.
+    EnvRef {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fallback: Option<String>,
+    },
+    /// Generate a runtime value.
+    Generated { generator: GeneratedValue },
+    /// Format string with placeholders (`{env:NAME}`, `{uuid}`, `{unix_ms}`).
+    Format { template: String },
+}
+
+/// Supported generated value kinds.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratedValue {
+    Uuid,
+    UnixMs,
+}
+
 /// Global tool toggle configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolsConfig {
@@ -301,6 +416,9 @@ pub struct OpenAIConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub responses_only_models: Vec<String>,
+    /// Optional request overrides (headers/body patches/model rules).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_overrides: Option<RequestOverridesConfig>,
 
     /// Preserve unknown keys under `providers.openai`.
     #[serde(default, flatten)]
@@ -348,6 +466,9 @@ pub struct AnthropicConfig {
     /// Default reasoning effort for Anthropic requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Optional request overrides (headers/body patches/model rules).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_overrides: Option<RequestOverridesConfig>,
 
     /// Preserve unknown keys under `providers.anthropic`.
     #[serde(default, flatten)]
@@ -391,6 +512,9 @@ pub struct GeminiConfig {
     /// Default reasoning effort for Gemini requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Optional request overrides (headers/body patches/model rules).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_overrides: Option<RequestOverridesConfig>,
 
     /// Preserve unknown keys under `providers.gemini`.
     #[serde(default, flatten)]
@@ -441,6 +565,9 @@ pub struct CopilotConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub responses_only_models: Vec<String>,
+    /// Optional request overrides (headers/body patches/model rules).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_overrides: Option<RequestOverridesConfig>,
 
     /// Preserve unknown keys under `providers.copilot`.
     #[serde(default, flatten)]
@@ -1578,6 +1705,7 @@ mod tests {
             vision_model: None,
             reasoning_effort: None,
             responses_only_models: vec![],
+            request_overrides: None,
             extra: Default::default(),
         });
 

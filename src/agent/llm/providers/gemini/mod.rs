@@ -5,15 +5,19 @@ mod stream;
 pub use stream::{parse_gemini_sse_event, GeminiStreamState};
 
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{
+    header::{HeaderMap, HeaderValue, CONTENT_TYPE},
+    Client,
+};
 use serde_json::json;
 
 use crate::agent::core::{tools::ToolSchema, Message};
 use crate::agent::llm::protocol::gemini::GeminiRequest;
 use crate::agent::llm::protocol::ToProvider;
 use crate::agent::llm::provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, Result};
+use crate::agent::llm::providers::common::request_overrides;
 use crate::agent::llm::types::LLMChunk;
-use crate::core::ReasoningEffort;
+use crate::core::{ReasoningEffort, RequestOverridesConfig};
 
 /// Google Gemini API provider.
 pub struct GeminiProvider {
@@ -21,6 +25,7 @@ pub struct GeminiProvider {
     api_key: String,
     base_url: String,
     default_reasoning_effort: Option<ReasoningEffort>,
+    request_overrides: Option<RequestOverridesConfig>,
 }
 
 impl GeminiProvider {
@@ -31,6 +36,7 @@ impl GeminiProvider {
             api_key: api_key.into(),
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             default_reasoning_effort: None,
+            request_overrides: None,
         }
     }
 
@@ -50,6 +56,24 @@ impl GeminiProvider {
     pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
         self.default_reasoning_effort = effort;
         self
+    }
+
+    /// Configure request overrides for this provider.
+    pub fn with_request_overrides(mut self, overrides: Option<RequestOverridesConfig>) -> Self {
+        self.request_overrides = overrides;
+        self
+    }
+
+    fn build_headers(&self, endpoint: &str, model: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        request_overrides::apply_overrides_to_header_map(
+            &mut headers,
+            self.request_overrides.as_ref(),
+            endpoint,
+            model,
+        );
+        headers
     }
 
     fn thinking_budget_for_effort(effort: ReasoningEffort) -> Option<u32> {
@@ -154,6 +178,13 @@ impl LLMProvider for GeminiProvider {
         };
 
         let request = build_request(reasoning_effort)?;
+        let mut request_json = serde_json::to_value(&request).map_err(LLMError::Json)?;
+        request_overrides::apply_overrides_to_body(
+            &mut request_json,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+            Some(model),
+        );
         tracing::info!(
             "Gemini request protocol=streamGenerateContent model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_budget={} max_output_tokens={}",
             model,
@@ -171,14 +202,18 @@ impl LLMProvider for GeminiProvider {
         );
         tracing::debug!(
             "Gemini request: {}",
-            serde_json::to_string_pretty(&request).unwrap_or_default()
+            serde_json::to_string_pretty(&request_json).unwrap_or_default()
         );
 
+        let headers = self.build_headers(
+            request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+            Some(model),
+        );
         let mut response = self
             .client
             .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&request)
+            .headers(headers)
+            .json(&request_json)
             .send()
             .await
             .map_err(LLMError::Http)?;
@@ -196,6 +231,14 @@ impl LLMProvider for GeminiProvider {
                 );
 
                 let fallback_request = build_request(None)?;
+                let mut fallback_request_json =
+                    serde_json::to_value(&fallback_request).map_err(LLMError::Json)?;
+                request_overrides::apply_overrides_to_body(
+                    &mut fallback_request_json,
+                    self.request_overrides.as_ref(),
+                    request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+                    Some(model),
+                );
                 applied_reasoning_effort = None;
                 applied_thinking_budget = None;
                 tracing::info!(
@@ -206,11 +249,15 @@ impl LLMProvider for GeminiProvider {
                         .map(|tokens| tokens.to_string())
                         .unwrap_or_else(|| "none".to_string())
                 );
+                let fallback_headers = self.build_headers(
+                    request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+                    Some(model),
+                );
                 response = self
                     .client
                     .post(&url)
-                    .header("Content-Type", "application/json")
-                    .json(&fallback_request)
+                    .headers(fallback_headers)
+                    .json(&fallback_request_json)
                     .send()
                     .await
                     .map_err(LLMError::Http)?;

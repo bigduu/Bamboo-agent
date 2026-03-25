@@ -276,6 +276,7 @@ mod comprehensive_config_tests {
             vision_model: None,
             reasoning_effort: None,
             max_tokens: None,
+            request_overrides: None,
             extra: Default::default(),
         });
         original.server.port = 8888;

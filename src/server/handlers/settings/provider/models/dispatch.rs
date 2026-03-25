@@ -38,6 +38,7 @@ pub(super) async fn fetch_models_for_provider(
                 "openai",
                 &openai.api_key,
                 openai.base_url.as_deref(),
+                openai.request_overrides.as_ref(),
             )
             .await
         }
@@ -51,6 +52,7 @@ pub(super) async fn fetch_models_for_provider(
                 "anthropic",
                 &anthropic.api_key,
                 anthropic.base_url.as_deref(),
+                anthropic.request_overrides.as_ref(),
             )
             .await
         }
@@ -65,6 +67,7 @@ pub(super) async fn fetch_models_for_provider(
                 "gemini",
                 &gemini.api_key,
                 gemini.base_url.as_deref(),
+                gemini.request_overrides.as_ref(),
             )
             .await
         }

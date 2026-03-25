@@ -30,6 +30,7 @@ fn provider_validation_issue_returns_provider_path_when_openai_key_present() {
         vision_model: None,
         reasoning_effort: None,
         responses_only_models: vec![],
+        request_overrides: None,
         extra: BTreeMap::new(),
     });
 

@@ -56,6 +56,7 @@ pub async fn create_provider_with_dir(
                         .with_responses_only_models(copilot_cfg.responses_only_models.clone());
                 }
                 provider = provider.with_reasoning_effort(copilot_cfg.reasoning_effort);
+                provider = provider.with_request_overrides(copilot_cfg.request_overrides.clone());
             }
 
             // Try to authenticate (using cache if available)
@@ -104,6 +105,7 @@ pub async fn create_provider_with_dir(
             }
 
             provider = provider.with_reasoning_effort(openai_config.reasoning_effort);
+            provider = provider.with_request_overrides(openai_config.request_overrides.clone());
 
             Ok(Arc::new(MaskingProviderDecorator::new(
                 provider,
@@ -135,6 +137,7 @@ pub async fn create_provider_with_dir(
             }
 
             provider = provider.with_reasoning_effort(anthropic_config.reasoning_effort);
+            provider = provider.with_request_overrides(anthropic_config.request_overrides.clone());
 
             Ok(Arc::new(MaskingProviderDecorator::new(
                 provider,
@@ -163,6 +166,7 @@ pub async fn create_provider_with_dir(
             }
 
             provider = provider.with_reasoning_effort(gemini_config.reasoning_effort);
+            provider = provider.with_request_overrides(gemini_config.request_overrides.clone());
 
             Ok(Arc::new(MaskingProviderDecorator::new(
                 provider,
@@ -280,6 +284,7 @@ mod tests {
                     vision_model: None,
                     reasoning_effort: None,
                     responses_only_models: vec![],
+                    request_overrides: None,
                     extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()
@@ -311,6 +316,7 @@ mod tests {
                     vision_model: None,
                     reasoning_effort: None,
                     responses_only_models: vec![],
+                    request_overrides: None,
                     extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()
@@ -336,6 +342,7 @@ mod tests {
                     vision_model: None,
                     max_tokens: Some(4096),
                     reasoning_effort: None,
+                    request_overrides: None,
                     extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()
@@ -360,6 +367,7 @@ mod tests {
                     fast_model: None,
                     vision_model: None,
                     reasoning_effort: None,
+                    request_overrides: None,
                     extra: Default::default(),
                 }),
                 ..ProviderConfigs::default()

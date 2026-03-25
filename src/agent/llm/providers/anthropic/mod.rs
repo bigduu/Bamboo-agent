@@ -23,9 +23,10 @@ use serde_json::{json, Value};
 
 use crate::agent::llm::provider::LLMRequestOptions;
 use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
+use crate::agent::llm::providers::common::request_overrides;
 use crate::agent::llm::types::LLMChunk;
 use crate::agent::llm::ContentPart;
-use crate::core::ReasoningEffort;
+use crate::core::{ReasoningEffort, RequestOverridesConfig};
 
 /// Anthropic Messages API provider.
 pub struct AnthropicProvider {
@@ -34,6 +35,7 @@ pub struct AnthropicProvider {
     base_url: String,
     max_tokens: u32,
     default_reasoning_effort: Option<ReasoningEffort>,
+    request_overrides: Option<RequestOverridesConfig>,
 }
 
 impl AnthropicProvider {
@@ -44,6 +46,7 @@ impl AnthropicProvider {
             base_url: "https://api.anthropic.com/v1".to_string(),
             max_tokens: 1024,
             default_reasoning_effort: None,
+            request_overrides: None,
         }
     }
 
@@ -69,7 +72,13 @@ impl AnthropicProvider {
         self
     }
 
-    fn build_headers(&self) -> Result<HeaderMap> {
+    /// Configure request overrides for this provider.
+    pub fn with_request_overrides(mut self, overrides: Option<RequestOverridesConfig>) -> Self {
+        self.request_overrides = overrides;
+        self
+    }
+
+    fn build_headers(&self, endpoint: &str, model: Option<&str>) -> Result<HeaderMap> {
         use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 
         let mut headers = HeaderMap::new();
@@ -80,6 +89,12 @@ impl AnthropicProvider {
         );
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        request_overrides::apply_overrides_to_header_map(
+            &mut headers,
+            self.request_overrides.as_ref(),
+            endpoint,
+            model,
+        );
 
         Ok(headers)
     }
@@ -139,7 +154,7 @@ impl LLMProvider for AnthropicProvider {
 
         tracing::debug!("Anthropic provider using model: {}", model);
 
-        let body = build_anthropic_request(
+        let mut body = build_anthropic_request(
             messages,
             tools,
             model,
@@ -147,6 +162,12 @@ impl LLMProvider for AnthropicProvider {
             true,
             reasoning_effort,
             parallel_tool_calls,
+        );
+        request_overrides::apply_overrides_to_body(
+            &mut body,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_MESSAGES,
+            Some(model),
         );
         let mut applied_reasoning_effort = reasoning_effort;
         let mut thinking_enabled = body.get("thinking").is_some();
@@ -168,7 +189,7 @@ impl LLMProvider for AnthropicProvider {
                 .unwrap_or_else(|| "none".to_string()),
             max_tokens
         );
-        let headers = self.build_headers()?;
+        let headers = self.build_headers(request_overrides::ENDPOINT_MESSAGES, Some(model))?;
 
         let mut response = self
             .client
@@ -191,7 +212,7 @@ impl LLMProvider for AnthropicProvider {
                     model
                 );
 
-                let fallback_body = build_anthropic_request(
+                let mut fallback_body = build_anthropic_request(
                     messages,
                     tools,
                     model,
@@ -199,6 +220,12 @@ impl LLMProvider for AnthropicProvider {
                     true,
                     None,
                     parallel_tool_calls,
+                );
+                request_overrides::apply_overrides_to_body(
+                    &mut fallback_body,
+                    self.request_overrides.as_ref(),
+                    request_overrides::ENDPOINT_MESSAGES,
+                    Some(model),
                 );
                 applied_reasoning_effort = None;
                 thinking_enabled = false;
@@ -1415,7 +1442,9 @@ mod anthropic_provider_tests {
     #[test]
     fn test_request_headers() {
         let provider = AnthropicProvider::new("test_key");
-        let headers = provider.build_headers().unwrap();
+        let headers = provider
+            .build_headers(request_overrides::ENDPOINT_MESSAGES, Some("claude-test"))
+            .unwrap();
 
         assert!(headers.contains_key("x-api-key"));
         assert_eq!(
@@ -1440,7 +1469,7 @@ mod anthropic_provider_tests {
     fn test_headers_with_invalid_api_key() {
         // Test that headers with non-ASCII characters in API key fail
         let provider = AnthropicProvider::new("test\u{0000}key"); // null byte
-        let result = provider.build_headers();
+        let result = provider.build_headers(request_overrides::ENDPOINT_MESSAGES, None);
         assert!(result.is_err());
     }
 

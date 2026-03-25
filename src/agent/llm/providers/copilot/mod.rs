@@ -10,7 +10,7 @@ use crate::agent::llm::provider::{
     LLMError, LLMProvider, LLMRequestOptions, LLMStream, ResponsesRequestOptions, Result,
 };
 use crate::agent::llm::types::LLMChunk;
-use crate::core::ReasoningEffort;
+use crate::core::{ReasoningEffort, RequestOverridesConfig};
 use auth::{CopilotAuthHandler, DeviceCodeResponse};
 
 use super::common::openai_compat::{
@@ -18,6 +18,7 @@ use super::common::openai_compat::{
     tools_to_openai_compat_json,
 };
 use super::common::openai_responses::{build_responses_body, ResponsesSseParser};
+use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
 use super::common::sse::llm_stream_from_sse;
 
@@ -48,6 +49,7 @@ pub struct CopilotProvider {
     // Patterns (case-insensitive) for models that require Responses API upstream.
     responses_only_models: Vec<String>,
     default_reasoning_effort: Option<ReasoningEffort>,
+    request_overrides: Option<RequestOverridesConfig>,
 }
 
 impl CopilotProvider {
@@ -62,6 +64,7 @@ impl CopilotProvider {
             vscode_machine_id: Self::generate_vscode_machine_id(),
             responses_only_models: vec![],
             default_reasoning_effort: None,
+            request_overrides: None,
         }
     }
 
@@ -76,6 +79,7 @@ impl CopilotProvider {
             vscode_machine_id: Self::generate_vscode_machine_id(),
             responses_only_models: vec![],
             default_reasoning_effort: None,
+            request_overrides: None,
         }
     }
 
@@ -109,6 +113,7 @@ impl CopilotProvider {
             vscode_machine_id: Self::generate_vscode_machine_id(),
             responses_only_models: vec![],
             default_reasoning_effort: None,
+            request_overrides: None,
         }
     }
 
@@ -121,6 +126,12 @@ impl CopilotProvider {
     /// Configure default reasoning effort for requests sent through this provider.
     pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
         self.default_reasoning_effort = effort;
+        self
+    }
+
+    /// Configure request overrides for this provider.
+    pub fn with_request_overrides(mut self, overrides: Option<RequestOverridesConfig>) -> Self {
+        self.request_overrides = overrides;
         self
     }
 
@@ -316,6 +327,8 @@ impl CopilotProvider {
         token: &str,
         messages: &[Message],
         tools: &[ToolSchema],
+        endpoint: &str,
+        model: Option<&str>,
     ) -> std::result::Result<reqwest::header::HeaderMap, LLMError> {
         use reqwest::header::HeaderValue;
 
@@ -356,6 +369,12 @@ impl CopilotProvider {
             HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())
                 .map_err(|e| LLMError::Auth(format!("Invalid x-request-id: {}", e)))?,
         );
+        request_overrides::apply_overrides_to_header_map(
+            &mut headers,
+            self.request_overrides.as_ref(),
+            endpoint,
+            model,
+        );
 
         Ok(headers)
     }
@@ -367,7 +386,13 @@ impl CopilotProvider {
             .token
             .as_ref()
             .ok_or_else(|| LLMError::Auth("Not authenticated".to_string()))?;
-        self.build_llm_headers(token, &[], &[])
+        self.build_llm_headers(
+            token,
+            &[],
+            &[],
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+            None,
+        )
     }
 
     async fn get_token_for_request(&self) -> std::result::Result<String, LLMError> {
@@ -546,7 +571,7 @@ impl CopilotProvider {
             tracing::warn!("Copilot /responses does not support store=true; forcing store=false");
         }
         effective_responses_options.store = Some(false);
-        let body = build_responses_body(
+        let mut body = build_responses_body(
             model,
             messages,
             tools,
@@ -554,6 +579,12 @@ impl CopilotProvider {
             reasoning_effort,
             Some(&effective_responses_options),
             parallel_tool_calls,
+        );
+        request_overrides::apply_overrides_to_body(
+            &mut body,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_RESPONSES,
+            Some(model),
         );
 
         tracing::debug!("Copilot provider using Responses API model: {}", model);
@@ -570,7 +601,13 @@ impl CopilotProvider {
                 .unwrap_or_else(|| "none".to_string())
         );
 
-        let request_headers = self.build_llm_headers(token, messages, tools)?;
+        let request_headers = self.build_llm_headers(
+            token,
+            messages,
+            tools,
+            request_overrides::ENDPOINT_RESPONSES,
+            Some(model),
+        )?;
         let mut response = self
             .send_with_transport_retry(
                 || {
@@ -589,8 +626,13 @@ impl CopilotProvider {
             if (status == 401 || status == 403) && self.auth_handler.is_some() {
                 if let Some(handler) = &self.auth_handler {
                     if let Ok(Some(refreshed)) = handler.force_refresh_chat_token().await {
-                        let refreshed_headers =
-                            self.build_llm_headers(&refreshed, messages, tools)?;
+                        let refreshed_headers = self.build_llm_headers(
+                            &refreshed,
+                            messages,
+                            tools,
+                            request_overrides::ENDPOINT_RESPONSES,
+                            Some(model),
+                        )?;
                         response = self
                             .send_with_transport_retry(
                                 || {
@@ -643,7 +685,7 @@ impl CopilotProvider {
                     );
                     let mut fallback_options = effective_responses_options.clone();
                     fallback_options.reasoning_summary = None;
-                    let fallback_body = build_responses_body(
+                    let mut fallback_body = build_responses_body(
                         model,
                         messages,
                         tools,
@@ -652,7 +694,19 @@ impl CopilotProvider {
                         Some(&fallback_options),
                         parallel_tool_calls,
                     );
-                    let fallback_headers = self.build_llm_headers(token, messages, tools)?;
+                    request_overrides::apply_overrides_to_body(
+                        &mut fallback_body,
+                        self.request_overrides.as_ref(),
+                        request_overrides::ENDPOINT_RESPONSES,
+                        Some(model),
+                    );
+                    let fallback_headers = self.build_llm_headers(
+                        token,
+                        messages,
+                        tools,
+                        request_overrides::ENDPOINT_RESPONSES,
+                        Some(model),
+                    )?;
                     let mut fallback = self
                         .send_with_transport_retry(
                             || {
@@ -674,8 +728,13 @@ impl CopilotProvider {
                                 if let Ok(Some(refreshed)) =
                                     handler.force_refresh_chat_token().await
                                 {
-                                    let refreshed_fallback_headers =
-                                        self.build_llm_headers(&refreshed, messages, tools)?;
+                                    let refreshed_fallback_headers = self.build_llm_headers(
+                                        &refreshed,
+                                        messages,
+                                        tools,
+                                        request_overrides::ENDPOINT_RESPONSES,
+                                        Some(model),
+                                    )?;
                                     fallback = self
                                         .send_with_transport_retry(
                                             || {
@@ -848,6 +907,12 @@ impl LLMProvider for CopilotProvider {
         if let Some(reasoning_effort) = reasoning_effort {
             body["reasoning_effort"] = json!(reasoning_effort.to_wire_format(upstream_model));
         }
+        request_overrides::apply_overrides_to_body(
+            &mut body,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+            Some(upstream_model),
+        );
         tracing::info!(
             "Copilot request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
             upstream_model,
@@ -869,7 +934,13 @@ impl LLMProvider for CopilotProvider {
 
         let url = "https://api.githubcopilot.com/chat/completions";
 
-        let request_headers = self.build_llm_headers(&token, messages, tools)?;
+        let request_headers = self.build_llm_headers(
+            &token,
+            messages,
+            tools,
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+            Some(upstream_model),
+        )?;
         let mut response = self
             .send_with_transport_retry(
                 || {
@@ -889,8 +960,13 @@ impl LLMProvider for CopilotProvider {
             if (status == 401 || status == 403) && self.auth_handler.is_some() {
                 if let Some(handler) = &self.auth_handler {
                     if let Ok(Some(refreshed)) = handler.force_refresh_chat_token().await {
-                        let refreshed_headers =
-                            self.build_llm_headers(&refreshed, messages, tools)?;
+                        let refreshed_headers = self.build_llm_headers(
+                            &refreshed,
+                            messages,
+                            tools,
+                            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+                            Some(upstream_model),
+                        )?;
                         response = self
                             .send_with_transport_retry(
                                 || {
@@ -967,8 +1043,20 @@ impl LLMProvider for CopilotProvider {
                     if let Some(max_tokens) = max_output_tokens {
                         body_no_reasoning["max_tokens"] = json!(max_tokens);
                     }
+                    request_overrides::apply_overrides_to_body(
+                        &mut body_no_reasoning,
+                        self.request_overrides.as_ref(),
+                        request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+                        Some(upstream_model),
+                    );
 
-                    let retry_headers = self.build_llm_headers(&token, messages, tools)?;
+                    let retry_headers = self.build_llm_headers(
+                        &token,
+                        messages,
+                        tools,
+                        request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+                        Some(upstream_model),
+                    )?;
                     let mut retry = self
                         .send_with_transport_retry(
                             || {
@@ -990,8 +1078,13 @@ impl LLMProvider for CopilotProvider {
                                 if let Ok(Some(refreshed)) =
                                     handler.force_refresh_chat_token().await
                                 {
-                                    let refreshed_retry_headers =
-                                        self.build_llm_headers(&refreshed, messages, tools)?;
+                                    let refreshed_retry_headers = self.build_llm_headers(
+                                        &refreshed,
+                                        messages,
+                                        tools,
+                                        request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+                                        Some(upstream_model),
+                                    )?;
                                     retry = self
                                         .send_with_transport_retry(
                                             || {
@@ -1131,7 +1224,13 @@ impl LLMProvider for CopilotProvider {
         let token = self.get_token_for_request().await?;
         let url = "https://api.githubcopilot.com/models";
 
-        let request_headers = Self::build_headers_with_token(&token)?;
+        let mut request_headers = Self::build_headers_with_token(&token)?;
+        request_overrides::apply_overrides_to_header_map(
+            &mut request_headers,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_MODELS,
+            None,
+        );
         let mut response = self
             .send_with_transport_retry(
                 || self.client.get(url).headers(request_headers.clone()),
@@ -1145,7 +1244,13 @@ impl LLMProvider for CopilotProvider {
             if (status == 401 || status == 403) && self.auth_handler.is_some() {
                 if let Some(handler) = &self.auth_handler {
                     if let Ok(Some(refreshed)) = handler.force_refresh_chat_token().await {
-                        let refreshed_headers = Self::build_headers_with_token(&refreshed)?;
+                        let mut refreshed_headers = Self::build_headers_with_token(&refreshed)?;
+                        request_overrides::apply_overrides_to_header_map(
+                            &mut refreshed_headers,
+                            self.request_overrides.as_ref(),
+                            request_overrides::ENDPOINT_MODELS,
+                            None,
+                        );
                         response = self
                             .send_with_transport_retry(
                                 || self.client.get(url).headers(refreshed_headers.clone()),

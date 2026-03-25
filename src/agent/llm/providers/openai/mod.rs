@@ -4,7 +4,10 @@
 //! including support for streaming responses and function calling.
 
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{
+    header::{HeaderMap, HeaderValue, AUTHORIZATION},
+    Client,
+};
 use serde_json::Value;
 
 use crate::agent::core::{tools::ToolSchema, Message};
@@ -12,10 +15,11 @@ use crate::agent::llm::provider::{
     LLMError, LLMProvider, LLMRequestOptions, LLMStream, ResponsesRequestOptions, Result,
 };
 use crate::agent::llm::types::LLMChunk;
-use crate::core::ReasoningEffort;
+use crate::core::{ReasoningEffort, RequestOverridesConfig};
 
 use super::common::openai_compat::{build_openai_compat_body, parse_openai_compat_sse_data_strict};
 use super::common::openai_responses::{build_responses_body, ResponsesSseParser};
+use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
 use super::common::sse::llm_stream_from_sse;
 
@@ -26,6 +30,7 @@ pub struct OpenAIProvider {
     base_url: String,
     responses_only_models: Vec<String>,
     default_reasoning_effort: Option<ReasoningEffort>,
+    request_overrides: Option<RequestOverridesConfig>,
 }
 
 impl OpenAIProvider {
@@ -37,6 +42,7 @@ impl OpenAIProvider {
             base_url: "https://api.openai.com/v1".to_string(),
             responses_only_models: vec![],
             default_reasoning_effort: None,
+            request_overrides: None,
         }
     }
 
@@ -62,6 +68,28 @@ impl OpenAIProvider {
     pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
         self.default_reasoning_effort = effort;
         self
+    }
+
+    /// Configure request overrides for this provider.
+    pub fn with_request_overrides(mut self, overrides: Option<RequestOverridesConfig>) -> Self {
+        self.request_overrides = overrides;
+        self
+    }
+
+    fn build_headers(&self, endpoint: &str, model: Option<&str>) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", self.api_key))
+                .map_err(|e| LLMError::Auth(format!("Invalid API key: {}", e)))?,
+        );
+        request_overrides::apply_overrides_to_header_map(
+            &mut headers,
+            self.request_overrides.as_ref(),
+            endpoint,
+            model,
+        );
+        Ok(headers)
     }
 
     fn matches_model_pattern(pattern: &str, model: &str) -> bool {
@@ -129,7 +157,7 @@ impl OpenAIProvider {
         parallel_tool_calls: Option<bool>,
         reasoning_source: &str,
     ) -> Result<LLMStream> {
-        let body = build_responses_body(
+        let mut body = build_responses_body(
             model,
             messages,
             tools,
@@ -137,6 +165,12 @@ impl OpenAIProvider {
             reasoning_effort,
             responses_options,
             parallel_tool_calls,
+        );
+        request_overrides::apply_overrides_to_body(
+            &mut body,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_RESPONSES,
+            Some(model),
         );
         tracing::info!(
             "OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
@@ -151,10 +185,11 @@ impl OpenAIProvider {
                 .unwrap_or_else(|| "none".to_string())
         );
 
+        let headers = self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
         let response = self
             .client
             .post(format!("{}/responses", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .headers(headers)
             .json(&body)
             .send()
             .await?;
@@ -173,7 +208,7 @@ impl OpenAIProvider {
 
                 let mut fallback_options = responses_options.cloned().unwrap_or_default();
                 fallback_options.reasoning_summary = None;
-                let fallback_body = build_responses_body(
+                let mut fallback_body = build_responses_body(
                     model,
                     messages,
                     tools,
@@ -182,10 +217,18 @@ impl OpenAIProvider {
                     Some(&fallback_options),
                     parallel_tool_calls,
                 );
+                request_overrides::apply_overrides_to_body(
+                    &mut fallback_body,
+                    self.request_overrides.as_ref(),
+                    request_overrides::ENDPOINT_RESPONSES,
+                    Some(model),
+                );
+                let fallback_headers =
+                    self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
                 let fallback = self
                     .client
                     .post(format!("{}/responses", self.base_url))
-                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .headers(fallback_headers)
                     .json(&fallback_body)
                     .send()
                     .await?;
@@ -274,7 +317,7 @@ impl LLMProvider for OpenAIProvider {
                 .await;
         }
 
-        let body = build_openai_compat_body(
+        let mut body = build_openai_compat_body(
             model,
             messages,
             tools,
@@ -282,6 +325,12 @@ impl LLMProvider for OpenAIProvider {
             max_output_tokens,
             reasoning_effort,
             parallel_tool_calls,
+        );
+        request_overrides::apply_overrides_to_body(
+            &mut body,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+            Some(model),
         );
         tracing::info!(
             "OpenAI request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
@@ -296,10 +345,12 @@ impl LLMProvider for OpenAIProvider {
                 .unwrap_or_else(|| "none".to_string())
         );
 
+        let headers =
+            self.build_headers(request_overrides::ENDPOINT_CHAT_COMPLETIONS, Some(model))?;
         let response = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .headers(headers)
             .json(&body)
             .send()
             .await?;
@@ -316,7 +367,7 @@ impl LLMProvider for OpenAIProvider {
                     model
                 );
 
-                let fallback_body = build_openai_compat_body(
+                let mut fallback_body = build_openai_compat_body(
                     model,
                     messages,
                     tools,
@@ -325,10 +376,18 @@ impl LLMProvider for OpenAIProvider {
                     None,
                     parallel_tool_calls,
                 );
+                request_overrides::apply_overrides_to_body(
+                    &mut fallback_body,
+                    self.request_overrides.as_ref(),
+                    request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+                    Some(model),
+                );
+                let fallback_headers =
+                    self.build_headers(request_overrides::ENDPOINT_CHAT_COMPLETIONS, Some(model))?;
                 let fallback = self
                     .client
                     .post(format!("{}/chat/completions", self.base_url))
-                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .headers(fallback_headers)
                     .json(&fallback_body)
                     .send()
                     .await?;
@@ -439,10 +498,11 @@ impl LLMProvider for OpenAIProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
         let response = self
             .client
             .get(format!("{}/models", self.base_url.trim_end_matches('/')))
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .headers(headers)
             .send()
             .await
             .map_err(LLMError::Http)?;

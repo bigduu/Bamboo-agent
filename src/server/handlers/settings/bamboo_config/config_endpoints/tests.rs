@@ -25,6 +25,7 @@ fn redacted_config_json_masks_provider_api_key_and_hides_encrypted_proxy_auth() 
         vision_model: None,
         reasoning_effort: None,
         responses_only_models: vec![],
+        request_overrides: None,
         extra: BTreeMap::new(),
     });
     config.proxy_auth_encrypted = Some("enc:deadbeef".to_string());

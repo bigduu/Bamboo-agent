@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+use crate::agent::llm::providers::common::request_overrides;
+use crate::core::RequestOverridesConfig;
 use crate::server::error::AppError;
 
 pub(super) async fn fetch_models_from_api(
@@ -7,17 +9,43 @@ pub(super) async fn fetch_models_from_api(
     provider: &str,
     api_key: &str,
     base_url: Option<&str>,
+    request_overrides_cfg: Option<&RequestOverridesConfig>,
 ) -> Result<Vec<String>, AppError> {
     let request = build_provider_models_request(provider, api_key, base_url)?;
 
     tracing::info!("Fetching models from: {}", request.url);
 
-    let mut http_request = client.get(&request.url);
+    let mut headers = reqwest::header::HeaderMap::new();
     if let Some((header_name, header_value)) = request.auth_header {
-        http_request = http_request.header(header_name, header_value);
+        let normalized_name = header_name.to_ascii_lowercase();
+        let parsed_name = reqwest::header::HeaderName::from_bytes(normalized_name.as_bytes())
+            .map_err(|error| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "Invalid models auth header name '{}': {}",
+                    header_name,
+                    error
+                ))
+            })?;
+        let parsed_value =
+            reqwest::header::HeaderValue::from_str(&header_value).map_err(|error| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "Invalid models auth header value for '{}': {}",
+                    header_name,
+                    error
+                ))
+            })?;
+        headers.insert(parsed_name, parsed_value);
     }
+    request_overrides::apply_overrides_to_header_map(
+        &mut headers,
+        request_overrides_cfg,
+        request_overrides::ENDPOINT_MODELS,
+        None,
+    );
 
-    let response = http_request
+    let response = client
+        .get(&request.url)
+        .headers(headers)
         .send()
         .await
         .map_err(|error| AppError::InternalError(anyhow::anyhow!("Request failed: {}", error)))?;

@@ -15,6 +15,7 @@ fn resolve_headless_auth_prefers_provider_specific_value() {
         vision_model: None,
         reasoning_effort: None,
         responses_only_models: Vec::new(),
+        request_overrides: None,
         extra: Default::default(),
     });
 
