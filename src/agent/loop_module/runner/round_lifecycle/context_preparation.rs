@@ -30,7 +30,8 @@ pub(super) async fn prepare_round_context(
 ) -> Result<PreparedRoundContext, AgentError> {
     ocr_cache::maybe_cache_ocr_results(session, config, session_id).await;
 
-    let mut budget = super::token_budget::resolve_token_budget(session, config, model_name).await;
+    let mut budget =
+        super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref()).await;
 
     // Reserve budget space for tool schemas (they consume context tokens but
     // are not part of the message list). Without this, context compression

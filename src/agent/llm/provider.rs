@@ -45,6 +45,28 @@ pub type Result<T> = std::result::Result<T, LLMError>;
 /// Type alias for boxed streaming LLM responses
 pub type LLMStream = Pin<Box<dyn Stream<Item = Result<LLMChunk>> + Send>>;
 
+/// Metadata for a provider model returned by `list_model_info`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderModelInfo {
+    /// Model identifier.
+    pub id: String,
+    /// Maximum context window (input + output) in tokens when known.
+    pub max_context_tokens: Option<u32>,
+    /// Maximum output/completion tokens when known.
+    pub max_output_tokens: Option<u32>,
+}
+
+impl ProviderModelInfo {
+    /// Create metadata with only model id (no token limits).
+    pub fn from_id(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            max_context_tokens: None,
+            max_output_tokens: None,
+        }
+    }
+}
+
 /// Optional request-time controls for provider calls.
 #[derive(Debug, Clone, Default)]
 pub struct ResponsesRequestOptions {
@@ -160,6 +182,19 @@ pub trait LLMProvider: Send + Sync {
     async fn list_models(&self) -> Result<Vec<String>> {
         // Default implementation returns empty list
         Ok(vec![])
+    }
+
+    /// Lists available models with optional token limit metadata.
+    ///
+    /// Default implementation preserves backward compatibility by adapting
+    /// `list_models()` output into metadata entries without limits.
+    async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
+        Ok(self
+            .list_models()
+            .await?
+            .into_iter()
+            .map(ProviderModelInfo::from_id)
+            .collect())
     }
 }
 

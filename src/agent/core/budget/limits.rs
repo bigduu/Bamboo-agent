@@ -25,7 +25,7 @@ pub const KNOWN_MODEL_LIMITS: &[(&str, u32, u32)] = &[
     // Google
     ("gemini-2.5-pro", 128_000, 16_000),
     ("gemini-3-flash-preview", 1_000_000, 8_192),
-    ("gemini-3.1-pro-preview", 2_000_000, 64_000),
+    ("gemini-3.1-pro-preview", 128_000, 64_000),
     // OpenAI
     ("gpt-5.4", 1_050_000, 32_768),
     ("gpt-5.3-codex", 400_000, 128_000),
@@ -361,6 +361,13 @@ mod tests {
             .expect("Should have gpt-5.2-codex");
         assert_eq!(gpt52_codex.1, 400_000);
         assert_eq!(gpt52_codex.2, 128_000);
+
+        let gemini31_pro_preview = KNOWN_MODEL_LIMITS
+            .iter()
+            .find(|(k, _, _)| *k == "gemini-3.1-pro-preview")
+            .expect("Should have gemini-3.1-pro-preview");
+        assert_eq!(gemini31_pro_preview.1, 128_000);
+        assert_eq!(gemini31_pro_preview.2, 64_000);
     }
 
     #[test]

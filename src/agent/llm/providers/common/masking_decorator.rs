@@ -4,7 +4,9 @@ use crate::agent::core::{tools::ToolSchema, Message};
 use crate::agent::llm::models::ContentPart;
 use crate::core::keyword_masking::KeywordMaskingConfig;
 
-use crate::agent::llm::provider::{LLMProvider, LLMRequestOptions, LLMStream, Result};
+use crate::agent::llm::provider::{
+    LLMProvider, LLMRequestOptions, LLMStream, ProviderModelInfo, Result,
+};
 
 /// Decorates an [`LLMProvider`] by applying keyword masking to outgoing messages.
 ///
@@ -123,6 +125,10 @@ impl<P: LLMProvider> LLMProvider for MaskingProviderDecorator<P> {
 
     async fn list_models(&self) -> Result<Vec<String>> {
         self.inner.list_models().await
+    }
+
+    async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.inner.list_model_info().await
     }
 }
 

@@ -1,13 +1,16 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 pub mod auth;
 use crate::agent::core::{tools::ToolSchema, Message};
 use crate::agent::llm::provider::{
-    LLMError, LLMProvider, LLMRequestOptions, LLMStream, ResponsesRequestOptions, Result,
+    LLMError, LLMProvider, LLMRequestOptions, LLMStream, ProviderModelInfo,
+    ResponsesRequestOptions, Result,
 };
 use crate::agent::llm::types::LLMChunk;
 use crate::core::{ReasoningEffort, RequestOverridesConfig};
@@ -24,6 +27,7 @@ use super::common::sse::llm_stream_from_sse;
 
 const COPILOT_TRANSPORT_MAX_ATTEMPTS: usize = 2;
 const COPILOT_TRANSPORT_RETRY_BASE_DELAY_MS: u64 = 250;
+const COPILOT_MODELS_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// GitHub Copilot Provider with Device Code Authentication
 ///
@@ -50,6 +54,13 @@ pub struct CopilotProvider {
     responses_only_models: Vec<String>,
     default_reasoning_effort: Option<ReasoningEffort>,
     request_overrides: Option<RequestOverridesConfig>,
+    models_cache: RwLock<Option<CopilotModelsCache>>,
+}
+
+#[derive(Debug, Clone)]
+struct CopilotModelsCache {
+    fetched_at: Instant,
+    models: Vec<ProviderModelInfo>,
 }
 
 impl CopilotProvider {
@@ -65,6 +76,7 @@ impl CopilotProvider {
             responses_only_models: vec![],
             default_reasoning_effort: None,
             request_overrides: None,
+            models_cache: RwLock::new(None),
         }
     }
 
@@ -80,6 +92,7 @@ impl CopilotProvider {
             responses_only_models: vec![],
             default_reasoning_effort: None,
             request_overrides: None,
+            models_cache: RwLock::new(None),
         }
     }
 
@@ -114,6 +127,7 @@ impl CopilotProvider {
             responses_only_models: vec![],
             default_reasoning_effort: None,
             request_overrides: None,
+            models_cache: RwLock::new(None),
         }
     }
 
@@ -819,6 +833,206 @@ impl CopilotProvider {
         });
         Ok(stream)
     }
+
+    fn parse_token_limit(value: &serde_json::Value) -> Option<u32> {
+        match value {
+            serde_json::Value::Number(number) => number
+                .as_u64()
+                .and_then(|raw| u32::try_from(raw).ok())
+                .or_else(|| {
+                    number.as_f64().and_then(|raw| {
+                        if raw.is_finite() && raw >= 0.0 {
+                            let floor = raw.floor();
+                            if floor <= u32::MAX as f64 {
+                                Some(floor as u32)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                }),
+            serde_json::Value::String(raw) => raw.trim().parse::<u32>().ok(),
+            _ => None,
+        }
+    }
+
+    fn find_max_token_limit_by_keys(value: &serde_json::Value, keys: &[&str]) -> Option<u32> {
+        match value {
+            serde_json::Value::Object(object) => {
+                object.iter().fold(None, |current_max, (key, child)| {
+                    let direct = if keys.iter().any(|candidate| *candidate == key) {
+                        Self::parse_token_limit(child)
+                    } else {
+                        None
+                    };
+                    let nested = Self::find_max_token_limit_by_keys(child, keys);
+                    [current_max, direct, nested].into_iter().flatten().max()
+                })
+            }
+            serde_json::Value::Array(items) => items.iter().fold(None, |current_max, item| {
+                [current_max, Self::find_max_token_limit_by_keys(item, keys)]
+                    .into_iter()
+                    .flatten()
+                    .max()
+            }),
+            _ => None,
+        }
+    }
+
+    fn parse_model_info(payload: serde_json::Value) -> Result<Vec<ProviderModelInfo>> {
+        const CONTEXT_KEYS: &[&str] = &[
+            "max_context_tokens",
+            "max_input_tokens",
+            "max_prompt_tokens",
+            "context_window",
+            "context_window_tokens",
+            "input_token_limit",
+            "prompt_token_limit",
+            "context_length",
+        ];
+        const OUTPUT_KEYS: &[&str] = &[
+            "max_output_tokens",
+            "max_completion_tokens",
+            "output_token_limit",
+            "completion_token_limit",
+        ];
+
+        let data = payload
+            .get("data")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| {
+                LLMError::Api("Unexpected Copilot /models response format".to_string())
+            })?;
+
+        let mut dedup: BTreeMap<String, ProviderModelInfo> = BTreeMap::new();
+
+        for model in data {
+            let Some(id) = model
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+
+            let context_tokens = Self::find_max_token_limit_by_keys(model, CONTEXT_KEYS);
+            let output_tokens = Self::find_max_token_limit_by_keys(model, OUTPUT_KEYS);
+
+            dedup
+                .entry(id.to_string())
+                .and_modify(|existing| {
+                    existing.max_context_tokens = [existing.max_context_tokens, context_tokens]
+                        .into_iter()
+                        .flatten()
+                        .max();
+                    existing.max_output_tokens = [existing.max_output_tokens, output_tokens]
+                        .into_iter()
+                        .flatten()
+                        .max();
+                })
+                .or_insert(ProviderModelInfo {
+                    id: id.to_string(),
+                    max_context_tokens: context_tokens,
+                    max_output_tokens: output_tokens,
+                });
+        }
+
+        Ok(dedup.into_values().collect())
+    }
+
+    async fn fetch_model_info_from_api(&self) -> Result<Vec<ProviderModelInfo>> {
+        let token = self.get_token_for_request().await?;
+        let url = "https://api.githubcopilot.com/models";
+
+        let mut request_headers = Self::build_headers_with_token(&token)?;
+        request_overrides::apply_overrides_to_header_map(
+            &mut request_headers,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_MODELS,
+            None,
+        );
+        let mut response = self
+            .send_with_transport_retry(
+                || self.client.get(url).headers(request_headers.clone()),
+                "copilot models list",
+            )
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+
+            if (status == 401 || status == 403) && self.auth_handler.is_some() {
+                if let Some(handler) = &self.auth_handler {
+                    if let Ok(Some(refreshed)) = handler.force_refresh_chat_token().await {
+                        let mut refreshed_headers = Self::build_headers_with_token(&refreshed)?;
+                        request_overrides::apply_overrides_to_header_map(
+                            &mut refreshed_headers,
+                            self.request_overrides.as_ref(),
+                            request_overrides::ENDPOINT_MODELS,
+                            None,
+                        );
+                        response = self
+                            .send_with_transport_retry(
+                                || self.client.get(url).headers(refreshed_headers.clone()),
+                                "copilot models list auth-refresh retry",
+                            )
+                            .await?;
+                    }
+                }
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+
+                if status == 401 || status == 403 {
+                    return Err(LLMError::Auth(format!(
+                        "Authentication failed: {}. Please run authenticate() again.",
+                        text
+                    )));
+                }
+
+                tracing::error!("Copilot API error: HTTP {} - {}", status, text);
+                return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
+            }
+        }
+
+        let payload: serde_json::Value = response.json().await.map_err(LLMError::Http)?;
+        Self::parse_model_info(payload)
+    }
+
+    async fn list_model_info_cached(&self) -> Result<Vec<ProviderModelInfo>> {
+        let cached = self.models_cache.read().await.clone();
+        if let Some(cache) = &cached {
+            if cache.fetched_at.elapsed() <= COPILOT_MODELS_CACHE_TTL {
+                return Ok(cache.models.clone());
+            }
+        }
+
+        match self.fetch_model_info_from_api().await {
+            Ok(models) => {
+                let mut write_guard = self.models_cache.write().await;
+                *write_guard = Some(CopilotModelsCache {
+                    fetched_at: Instant::now(),
+                    models: models.clone(),
+                });
+                Ok(models)
+            }
+            Err(error) => {
+                if let Some(cache) = cached {
+                    tracing::warn!(
+                        "Failed to refresh Copilot model metadata; using stale cache: {}",
+                        error
+                    );
+                    return Ok(cache.models);
+                }
+                Err(error)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1221,82 +1435,16 @@ impl LLMProvider for CopilotProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {
-        let token = self.get_token_for_request().await?;
-        let url = "https://api.githubcopilot.com/models";
+        Ok(self
+            .list_model_info_cached()
+            .await?
+            .into_iter()
+            .map(|model| model.id)
+            .collect())
+    }
 
-        let mut request_headers = Self::build_headers_with_token(&token)?;
-        request_overrides::apply_overrides_to_header_map(
-            &mut request_headers,
-            self.request_overrides.as_ref(),
-            request_overrides::ENDPOINT_MODELS,
-            None,
-        );
-        let mut response = self
-            .send_with_transport_retry(
-                || self.client.get(url).headers(request_headers.clone()),
-                "copilot models list",
-            )
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-
-            if (status == 401 || status == 403) && self.auth_handler.is_some() {
-                if let Some(handler) = &self.auth_handler {
-                    if let Ok(Some(refreshed)) = handler.force_refresh_chat_token().await {
-                        let mut refreshed_headers = Self::build_headers_with_token(&refreshed)?;
-                        request_overrides::apply_overrides_to_header_map(
-                            &mut refreshed_headers,
-                            self.request_overrides.as_ref(),
-                            request_overrides::ENDPOINT_MODELS,
-                            None,
-                        );
-                        response = self
-                            .send_with_transport_retry(
-                                || self.client.get(url).headers(refreshed_headers.clone()),
-                                "copilot models list auth-refresh retry",
-                            )
-                            .await?;
-                    }
-                }
-            }
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let text = response.text().await.unwrap_or_default();
-
-                // Check for auth errors
-                if status == 401 || status == 403 {
-                    return Err(LLMError::Auth(format!(
-                        "Authentication failed: {}. Please run authenticate() again.",
-                        text
-                    )));
-                }
-
-                tracing::error!("Copilot API error: HTTP {} - {}", status, text);
-                return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
-            }
-        }
-
-        // Parse the response
-        #[derive(serde::Deserialize)]
-        struct ModelResponse {
-            data: Vec<ModelData>,
-        }
-
-        #[derive(serde::Deserialize)]
-        struct ModelData {
-            id: String,
-        }
-
-        let models: ModelResponse = response.json().await.map_err(LLMError::Http)?;
-
-        // Deduplicate model IDs to avoid duplicates in the list
-        let mut model_ids: Vec<String> = models.data.into_iter().map(|m| m.id).collect();
-        model_ids.sort();
-        model_ids.dedup();
-
-        Ok(model_ids)
+    async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.list_model_info_cached().await
     }
 }
 
