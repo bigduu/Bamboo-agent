@@ -1,5 +1,6 @@
 use futures::stream;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::core::tools::{FunctionCall, ToolCall};
@@ -77,7 +78,7 @@ async fn consume_llm_stream_silent_does_not_emit_events() {
 }
 
 #[tokio::test]
-async fn consume_llm_stream_emits_single_prefix_stream_error_message() {
+async fn consume_llm_stream_returns_single_prefix_stream_error_message() {
     let stream = build_stream(vec![Err(LLMError::Stream(
         "Transport error: error decoding response body".to_string(),
     ))]);
@@ -101,14 +102,5 @@ async fn consume_llm_stream_emits_single_prefix_stream_error_message() {
         other => panic!("expected AgentError::LLM, got {other:?}"),
     }
 
-    let error_event = event_rx.recv().await.expect("missing error event");
-    match error_event {
-        AgentEvent::Error { message } => {
-            assert_eq!(
-                message,
-                "Stream error: Transport error: error decoding response body"
-            );
-        }
-        other => panic!("expected AgentEvent::Error, got {other:?}"),
-    }
+    assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
 }

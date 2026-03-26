@@ -52,13 +52,10 @@ pub(super) async fn handle_chunk_result(
         }
         Err(error) => {
             let message = error.to_string();
-            if let Some(event_tx) = event_tx {
-                let _ = event_tx
-                    .send(AgentEvent::Error {
-                        message: message.clone(),
-                    })
-                    .await;
-            }
+            tracing::warn!("[{}] LLM stream error: {}", session_id, message);
+            // Do not emit AgentEvent::Error here.
+            // Round-level retry logic may recover from this transient stream failure.
+            let _ = event_tx;
             Err(AgentError::LLM(message))
         }
     }

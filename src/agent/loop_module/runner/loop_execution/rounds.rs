@@ -231,6 +231,13 @@ mod tests {
     }
 
     #[test]
+    fn retries_stream_decode_transport_errors() {
+        assert!(should_retry_round_error(&AgentError::LLM(
+            "Stream error: Transport error: error decoding response body".to_string(),
+        )));
+    }
+
+    #[test]
     fn retries_unknown_llm_errors_by_default() {
         // Any LLM error that doesn't match non-retryable patterns should be retried.
         assert!(should_retry_round_error(&AgentError::LLM(
