@@ -200,7 +200,10 @@ fn validate_skill_name(name: &str) -> SkillResult<()> {
 }
 
 fn matches_skill_name_directory(name: &str, dir_name: &str) -> bool {
-    name == dir_name || name.rsplit_once(':').is_some_and(|(_, suffix)| suffix == dir_name)
+    name == dir_name
+        || name
+            .rsplit_once(':')
+            .is_some_and(|(_, suffix)| suffix == dir_name)
 }
 
 fn validate_skill_description(description: &str) -> SkillResult<()> {

@@ -84,12 +84,11 @@ async fn consume_llm_stream_returns_single_prefix_stream_error_message() {
     ))]);
 
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(4);
-    let err = match consume_llm_stream(stream, &event_tx, &CancellationToken::new(), "session-3")
-        .await
-    {
-        Ok(_) => panic!("stream should fail"),
-        Err(err) => err,
-    };
+    let err =
+        match consume_llm_stream(stream, &event_tx, &CancellationToken::new(), "session-3").await {
+            Ok(_) => panic!("stream should fail"),
+            Err(err) => err,
+        };
 
     match err {
         AgentError::LLM(message) => {
