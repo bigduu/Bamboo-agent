@@ -18,6 +18,13 @@ struct SkillFrontmatter {
     #[serde(default)]
     #[serde(rename = "allowed-tools", skip_serializing_if = "Vec::is_empty")]
     allowed_tools: Vec<String>,
+    #[serde(
+        default,
+        rename = "argument-hint",
+        alias = "argument_hint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    argument_hint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     metadata: Option<serde_json::Value>,
 }
@@ -25,6 +32,15 @@ struct SkillFrontmatter {
 pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefinition> {
     let (frontmatter_raw, body) = split_frontmatter(content)?;
     let frontmatter: SkillFrontmatter = serde_yaml::from_str(&frontmatter_raw)?;
+    let SkillFrontmatter {
+        name,
+        description,
+        license,
+        compatibility,
+        allowed_tools,
+        argument_hint: _argument_hint,
+        metadata,
+    } = frontmatter;
 
     // Skill ID comes from directory name.
     let dir_name = path
@@ -39,21 +55,21 @@ pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefi
         )));
     }
 
-    let name = frontmatter.name.trim();
+    let name = name.trim();
     if name.is_empty() {
         return Err(SkillError::Validation(
             "Skill name cannot be empty".to_string(),
         ));
     }
     validate_skill_name(name)?;
-    if name != dir_name {
+    if !matches_skill_name_directory(name, dir_name) {
         return Err(SkillError::Validation(format!(
-            "Skill name '{}' must match directory name '{}'",
-            name, dir_name
+            "Skill name '{}' must match directory name '{}' or '<namespace>:{}'",
+            name, dir_name, dir_name
         )));
     }
 
-    let description = frontmatter.description.trim();
+    let description = description.trim();
     if description.is_empty() {
         return Err(SkillError::Validation(
             "Skill description cannot be empty".to_string(),
@@ -61,8 +77,7 @@ pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefi
     }
     validate_skill_description(description)?;
 
-    let compatibility = frontmatter
-        .compatibility
+    let compatibility = compatibility
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -71,15 +86,14 @@ pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefi
         validate_compatibility(value)?;
     }
 
-    let license = frontmatter
-        .license
+    let license = license
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
     let mut tool_refs = Vec::new();
-    for tool_ref in frontmatter.allowed_tools {
+    for tool_ref in allowed_tools {
         let trimmed = tool_ref.trim();
         if trimmed.is_empty() {
             continue;
@@ -103,7 +117,7 @@ pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefi
         description: description.to_string(),
         license,
         compatibility,
-        metadata: frontmatter.metadata,
+        metadata,
         prompt: body.trim().to_string(),
         tool_refs,
     })
@@ -141,28 +155,52 @@ pub fn split_frontmatter(content: &str) -> SkillResult<(String, String)> {
 }
 
 fn validate_skill_name(name: &str) -> SkillResult<()> {
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
+    if name.chars().any(char::is_whitespace) {
         return Err(SkillError::Validation(format!(
-            "Name '{}' should be kebab-case (lowercase letters, digits, and hyphens only)",
+            "Name '{}' cannot contain whitespace",
             name
         )));
     }
-    if name.starts_with('-') || name.ends_with('-') || name.contains("--") {
+    if name.len() > 128 {
         return Err(SkillError::Validation(format!(
-            "Name '{}' cannot start/end with hyphen or contain consecutive hyphens",
-            name
-        )));
-    }
-    if name.len() > 64 {
-        return Err(SkillError::Validation(format!(
-            "Name is too long ({} characters). Maximum is 64 characters.",
+            "Name is too long ({} characters). Maximum is 128 characters.",
             name.len()
         )));
     }
+
+    let mut segments = name.split(':');
+    let primary = segments.next().unwrap_or_default();
+    let secondary = segments.next();
+    let extra = segments.next();
+
+    if extra.is_some() {
+        return Err(SkillError::Validation(format!(
+            "Name '{}' supports at most one namespace separator ':'",
+            name
+        )));
+    }
+
+    if !is_valid_skill_id(primary) {
+        return Err(SkillError::Validation(format!(
+            "Name '{}' must be kebab-case or '<namespace>:kebab-case'",
+            name
+        )));
+    }
+
+    if let Some(suffix) = secondary {
+        if !is_valid_skill_id(suffix) {
+            return Err(SkillError::Validation(format!(
+                "Name '{}' must be kebab-case or '<namespace>:kebab-case'",
+                name
+            )));
+        }
+    }
+
     Ok(())
+}
+
+fn matches_skill_name_directory(name: &str, dir_name: &str) -> bool {
+    name == dir_name || name.rsplit_once(':').is_some_and(|(_, suffix)| suffix == dir_name)
 }
 
 fn validate_skill_description(description: &str) -> SkillResult<()> {
@@ -197,6 +235,7 @@ pub fn render_skill_markdown(skill: &SkillDefinition) -> SkillResult<String> {
         license: skill.license.clone(),
         compatibility: skill.compatibility.clone(),
         allowed_tools: skill.tool_refs.clone(),
+        argument_hint: None,
         metadata: skill.metadata.clone(),
     };
 
@@ -269,6 +308,23 @@ Use this skill when users want to create skills.
     }
 
     #[test]
+    fn parse_skill_accepts_namespaced_name_and_argument_hint() {
+        let content = r#"---
+name: ckm:design
+description: Design workflows.
+argument-hint: "[type]"
+---
+Use this skill when users need design support.
+"#;
+
+        let parsed = parse_markdown_skill(Path::new("design/SKILL.md"), content)
+            .expect("namespaced skill name should parse");
+        assert_eq!(parsed.id, "design");
+        assert_eq!(parsed.name, "ckm:design");
+        assert_eq!(parsed.description, "Design workflows.");
+    }
+
+    #[test]
     fn parse_skill_rejects_unexpected_id_field() {
         let content = r#"---
 id: skill-creator
@@ -286,7 +342,7 @@ Use this skill when users want to create skills.
     #[test]
     fn parse_skill_rejects_name_directory_mismatch() {
         let content = r#"---
-name: another-name
+name: ckm:another-name
 description: Helps create and improve skills.
 ---
 Use this skill when users want to create skills.
