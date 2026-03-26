@@ -8,6 +8,9 @@ use crate::agent::core::{Role, Session};
 const MAX_TOOL_CALLS_PER_ROUND: usize = 80;
 const MAX_CONSECUTIVE_FAILURES_PER_TOOL: usize = 3;
 const RESET_POLICY_TOOL_NAME: &str = "ask_user";
+const COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY: &str = "copilot_ask_user_enhancement_enabled";
+const CONCLUSION_TOOL_NAME: &str = "conclusion";
+const MERMAID_TOOL_NAME: &str = "mermaid";
 
 const STRICT_ARGUMENT_TOOL_NAMES: [&str; 10] = [
     "Write",
@@ -25,6 +28,44 @@ const STRICT_ARGUMENT_TOOL_NAMES: [&str; 10] = [
 fn normalize_tool_for_policy(raw_tool_name: &str) -> String {
     crate::agent::tools::normalize_tool_ref(raw_tool_name)
         .unwrap_or_else(|| normalize_tool_name(raw_tool_name).trim().to_string())
+}
+
+fn is_copilot_ask_user_enhancement_enabled(session: &Session) -> bool {
+    session
+        .metadata
+        .get(COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+}
+
+fn find_assistant_message_for_tool_call<'a>(
+    session: &'a Session,
+    tool_call_id: &str,
+) -> Option<&'a crate::agent::core::Message> {
+    session.messages.iter().rev().find(|message| {
+        matches!(message.role, Role::Assistant)
+            && message
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls.iter().any(|call| call.id == tool_call_id))
+                .unwrap_or(false)
+    })
+}
+
+fn assistant_message_has_tool(message: &crate::agent::core::Message, tool_name: &str) -> bool {
+    message
+        .tool_calls
+        .as_ref()
+        .map(|calls| {
+            calls.iter().any(|call| {
+                normalize_tool_for_policy(&call.function.name).eq_ignore_ascii_case(tool_name)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn assistant_message_has_conclusion_or_mermaid(message: &crate::agent::core::Message) -> bool {
+    assistant_message_has_tool(message, CONCLUSION_TOOL_NAME)
+        || assistant_message_has_tool(message, MERMAID_TOOL_NAME)
 }
 
 pub(super) fn validate_tool_call_arguments(tool_call: &ToolCall) -> Result<(), String> {
@@ -66,32 +107,47 @@ pub(super) fn validate_tool_call_context(
     session: &Session,
 ) -> Result<(), String> {
     let normalized_tool_name = normalize_tool_for_policy(&tool_call.function.name);
-    if !normalized_tool_name.eq_ignore_ascii_case("ask_user") {
+    let assistant_message = find_assistant_message_for_tool_call(session, &tool_call.id);
+    let enhancement_enabled = is_copilot_ask_user_enhancement_enabled(session);
+
+    if normalized_tool_name.eq_ignore_ascii_case("ask_user") {
+        let has_narration = assistant_message
+            .map(|message| !message.content.trim().is_empty())
+            .unwrap_or(false);
+
+        if !has_narration {
+            return Err(
+                "Tool policy blocked 'ask_user': add a brief assistant text summary before calling ask_user so the user can understand the conclusion.".to_string()
+            );
+        }
+
+        if enhancement_enabled
+            && !assistant_message
+                .map(assistant_message_has_conclusion_or_mermaid)
+                .unwrap_or(false)
+        {
+            return Err(
+                "Tool policy blocked 'ask_user': when copilot ask-user enhancement is enabled, include a `conclusion` or `mermaid` tool call in the same assistant response before final confirmation."
+                    .to_string(),
+            );
+        }
+
         return Ok(());
     }
 
-    let has_narration = session
-        .messages
-        .iter()
-        .rev()
-        .find(|message| {
-            matches!(message.role, Role::Assistant)
-                && message
-                    .tool_calls
-                    .as_ref()
-                    .map(|calls| calls.iter().any(|call| call.id == tool_call.id))
-                    .unwrap_or(false)
-        })
-        .map(|message| !message.content.trim().is_empty())
-        .unwrap_or(false);
-
-    if has_narration {
-        return Ok(());
+    if normalized_tool_name.eq_ignore_ascii_case(CONCLUSION_TOOL_NAME)
+        && enhancement_enabled
+        && !assistant_message
+            .map(|message| assistant_message_has_tool(message, "ask_user"))
+            .unwrap_or(false)
+    {
+        return Err(
+            "Tool policy blocked 'conclusion': when copilot ask-user enhancement is enabled, pair conclusion with an `ask_user` tool call in the same assistant response."
+                .to_string(),
+        );
     }
 
-    Err(
-        "Tool policy blocked 'ask_user': add a brief assistant text summary before calling ask_user so the user can understand the conclusion.".to_string()
-    )
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,8 +277,12 @@ mod tests {
     use crate::agent::core::{Message, Session};
 
     fn tool_call(name: &str, arguments: &str) -> ToolCall {
+        tool_call_with_id("call-1", name, arguments)
+    }
+
+    fn tool_call_with_id(id: &str, name: &str, arguments: &str) -> ToolCall {
         ToolCall {
-            id: "call-1".to_string(),
+            id: id.to_string(),
             tool_type: "function".to_string(),
             function: FunctionCall {
                 name: name.to_string(),
@@ -281,6 +341,76 @@ mod tests {
         let call = tool_call("Read", "{}");
         let session = Session::new("session-1", "model");
         assert!(validate_tool_call_context(&call, &session).is_ok());
+    }
+
+    #[test]
+    fn conclusion_requires_ask_user_when_enhancement_enabled() {
+        let conclusion_call = tool_call_with_id("call-conclusion", "conclusion", "{}");
+        let mut session = Session::new("session-1", "model");
+        session.metadata.insert(
+            COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        session.add_message(Message::assistant(
+            "Wrap-up summary.",
+            Some(vec![conclusion_call.clone()]),
+        ));
+
+        let err = validate_tool_call_context(&conclusion_call, &session)
+            .expect_err("expected policy rejection");
+        assert!(err.contains("pair conclusion with an `ask_user`"));
+    }
+
+    #[test]
+    fn conclusion_with_ask_user_passes_when_enhancement_enabled() {
+        let conclusion_call = tool_call_with_id("call-conclusion", "conclusion", "{}");
+        let ask_user_call = tool_call_with_id("call-ask-user", "ask_user", "{}");
+        let mut session = Session::new("session-1", "model");
+        session.metadata.insert(
+            COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        session.add_message(Message::assistant(
+            "Wrap-up summary.",
+            Some(vec![conclusion_call.clone(), ask_user_call]),
+        ));
+
+        assert!(validate_tool_call_context(&conclusion_call, &session).is_ok());
+    }
+
+    #[test]
+    fn ask_user_requires_summary_tool_when_enhancement_enabled() {
+        let ask_user_call = tool_call_with_id("call-ask-user", "ask_user", "{}");
+        let mut session = Session::new("session-1", "model");
+        session.metadata.insert(
+            COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        session.add_message(Message::assistant(
+            "Final confirmation request.",
+            Some(vec![ask_user_call.clone()]),
+        ));
+
+        let err = validate_tool_call_context(&ask_user_call, &session)
+            .expect_err("expected policy rejection");
+        assert!(err.contains("include a `conclusion` or `mermaid`"));
+    }
+
+    #[test]
+    fn ask_user_with_summary_tool_passes_when_enhancement_enabled() {
+        let ask_user_call = tool_call_with_id("call-ask-user", "ask_user", "{}");
+        let conclusion_call = tool_call_with_id("call-conclusion", "conclusion", "{}");
+        let mut session = Session::new("session-1", "model");
+        session.metadata.insert(
+            COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        session.add_message(Message::assistant(
+            "Final summary and confirmation.",
+            Some(vec![conclusion_call, ask_user_call.clone()]),
+        ));
+
+        assert!(validate_tool_call_context(&ask_user_call, &session).is_ok());
     }
 
     #[test]
