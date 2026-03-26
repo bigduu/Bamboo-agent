@@ -6,11 +6,12 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 23] = [
     "apply_patch",
     "ask_user",
     "Bash",
     "BashOutput",
+    "conclusion",
     "Edit",
     "ExitPlanMode",
     "FileExists",
@@ -20,6 +21,7 @@ pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
     "Grep",
     "KillShell",
     "memory_note",
+    "mermaid",
     "NotebookEdit",
     "Read",
     "SetWorkspace",
@@ -51,13 +53,13 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "ask_user" => Some(guide(
             "ask_user",
             ToolCategory::UserInteraction,
-            "Ask the user for confirmation or missing input with selectable options.",
-            "Do not use when the task can safely proceed without user confirmation.",
+            "Ask the user for confirmation or missing input with selectable options. Always use this tool for final completion confirmation before ending a task.",
+            "Do not use repeatedly for routine status updates during active execution; reserve it for true clarification points and required final confirmation.",
             &["ExitPlanMode"],
             vec![example(
                 "Confirm before finishing",
-                json!({"question":"Any other requests before I finish?","options":["OK","Need changes"],"allow_custom":true}),
-                "Use when user intent is required before finalizing.",
+                json!({"question":"Any other requests before I finish?"}),
+                "Use when user intent is required before finalizing. Defaults to options [\"OK\", \"Need changes\"] when options are omitted.",
             )],
         )),
         "Read" => Some(guide(
@@ -154,6 +156,18 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Poll output",
                 json!({"bash_id":"abc"}),
                 "Use repeatedly until shell completes.",
+            )],
+        )),
+        "conclusion" => Some(guide(
+            "conclusion",
+            ToolCategory::UserInteraction,
+            "Render a structured conclusion card with a final takeaway and optional supporting bullets.",
+            "Do not use for intermediate status updates or raw execution logs.",
+            &["ask_user", "mermaid"],
+            vec![example(
+                "Present final conclusion",
+                json!({"title":"Conclusion","conclusion":"Core validation is complete and release is ready.","key_points":["All targeted tests passed","No blocking regressions"],"next_steps":["Proceed with release train"],"confidence":"high"}),
+                "Use at wrap-up to communicate a clear final decision.",
             )],
         )),
         "KillShell" => Some(guide(
@@ -294,6 +308,18 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                     "Use topic to keep separate workstreams isolated from each other.",
                 ),
             ],
+        )),
+        "mermaid" => Some(guide(
+            "mermaid",
+            ToolCategory::UserInteraction,
+            "Render a Mermaid diagram card with optional title and summary for visual explanations.",
+            "Do not use when plain text is sufficient and no visual structure is needed.",
+            &["conclusion", "ask_user"],
+            vec![example(
+                "Show system flow",
+                json!({"title":"Request Flow","summary":"High-level request path","chart":"flowchart TD\nA[User] --> B[API]\nB --> C[Service]\nC --> D[DB]"}),
+                "Use when a diagram helps users understand relationships faster than prose.",
+            )],
         )),
         "SetWorkspace" => Some(guide(
             "SetWorkspace",

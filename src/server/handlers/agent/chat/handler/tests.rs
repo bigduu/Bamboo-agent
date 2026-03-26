@@ -2,8 +2,8 @@ use crate::agent::core::Session;
 
 use super::request::{optional_non_empty, resolve_session_id, validate_and_normalize_model};
 use super::session::{
-    clear_skill_runtime_state, resolve_base_prompt, resolve_enhance_prompt,
-    resolve_selected_skill_ids, resolve_workspace_path,
+    clear_skill_runtime_state, resolve_base_prompt, resolve_copilot_ask_user_enhancement_enabled,
+    resolve_enhance_prompt, resolve_selected_skill_ids, resolve_workspace_path,
 };
 
 #[test]
@@ -115,6 +115,37 @@ fn resolve_enhance_prompt_stores_and_clears_metadata() {
     let from_empty_request = resolve_enhance_prompt(&mut session, None);
     assert_eq!(from_empty_request, None);
     assert!(!session.metadata.contains_key("enhance_prompt"));
+}
+
+#[test]
+fn resolve_copilot_ask_user_enhancement_enabled_stores_and_clears_metadata() {
+    let mut session = Session::new("session-1", "model");
+
+    let from_request = resolve_copilot_ask_user_enhancement_enabled(&mut session, Some(true));
+    assert_eq!(from_request, Some(true));
+    assert_eq!(
+        session
+            .metadata
+            .get("copilot_ask_user_enhancement_enabled")
+            .map(String::as_str),
+        Some("true")
+    );
+
+    let from_request = resolve_copilot_ask_user_enhancement_enabled(&mut session, Some(false));
+    assert_eq!(from_request, Some(false));
+    assert_eq!(
+        session
+            .metadata
+            .get("copilot_ask_user_enhancement_enabled")
+            .map(String::as_str),
+        Some("false")
+    );
+
+    let from_empty_request = resolve_copilot_ask_user_enhancement_enabled(&mut session, None);
+    assert_eq!(from_empty_request, None);
+    assert!(!session
+        .metadata
+        .contains_key("copilot_ask_user_enhancement_enabled"));
 }
 
 #[test]

@@ -98,9 +98,9 @@ pub use output_manager::{ArtifactRef, ToolOutputManager};
 
 // Re-export all tool implementations
 pub use tools::{
-    AskUserTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, GlobTool, GrepTool,
-    KillShellTool, NotebookEditTool, ReadTool, SlashCommandTool, TaskTool, ToolRegistry,
-    WebFetchTool, WebSearchTool, WriteTool,
+    AskUserTool, BashOutputTool, BashTool, ConclusionTool, EditTool, ExitPlanModeTool, GlobTool,
+    GrepTool, KillShellTool, MermaidTool, NotebookEditTool, ReadTool, SlashCommandTool, TaskTool,
+    ToolRegistry, WebFetchTool, WebSearchTool, WriteTool,
 };
 
 // Re-export task types from agent-core for convenience

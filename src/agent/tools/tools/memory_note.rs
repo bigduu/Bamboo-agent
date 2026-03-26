@@ -111,7 +111,11 @@ impl Tool for MemoryNoteTool {
                 let content = memory
                     .read_topic(session_id, topic)
                     .await
-                    .map_err(|e| ToolError::Execution(format!("Failed to read note: {e}")))?;
+                    .map_err(|e| {
+                        ToolError::Execution(format!(
+                            "Failed to read note: {e}. Rewrite and retry memory_note with valid JSON, e.g. {{\"action\":\"read\",\"topic\":\"{topic}\"}}."
+                        ))
+                    })?;
                 Ok(ToolResult {
                     success: true,
                     result: json!({
@@ -129,7 +133,11 @@ impl Tool for MemoryNoteTool {
                 let deleted = memory
                     .delete_topic(session_id, topic)
                     .await
-                    .map_err(|e| ToolError::Execution(format!("Failed to delete note: {e}")))?;
+                    .map_err(|e| {
+                        ToolError::Execution(format!(
+                            "Failed to delete note: {e}. Rewrite and retry memory_note with valid JSON, e.g. {{\"action\":\"clear\",\"topic\":\"{topic}\"}}."
+                        ))
+                    })?;
                 Ok(ToolResult {
                     success: true,
                     result: json!({
@@ -145,7 +153,11 @@ impl Tool for MemoryNoteTool {
                 let topics = memory
                     .list_topics(session_id)
                     .await
-                    .map_err(|e| ToolError::Execution(format!("Failed to list topics: {e}")))?;
+                    .map_err(|e| {
+                        ToolError::Execution(format!(
+                            "Failed to list topics: {e}. Rewrite and retry memory_note with valid JSON, e.g. {{\"action\":\"list_topics\"}}."
+                        ))
+                    })?;
                 Ok(ToolResult {
                     success: true,
                     result: json!({
@@ -165,7 +177,8 @@ impl Tool for MemoryNoteTool {
                     .filter(|v| !v.is_empty())
                     .ok_or_else(|| {
                         ToolError::InvalidArguments(
-                            "content is required for action=append|replace".to_string(),
+                            "content is required for action=append|replace. Rewrite the memory_note call with valid JSON and include non-empty content."
+                                .to_string(),
                         )
                     })?;
 
@@ -180,7 +193,11 @@ impl Tool for MemoryNoteTool {
                     let path = memory
                         .save_topic(session_id, topic, content)
                         .await
-                        .map_err(|e| ToolError::Execution(format!("Failed to write note: {e}")))?;
+                        .map_err(|e| {
+                            ToolError::Execution(format!(
+                                "Failed to write note: {e}. Rewrite and retry memory_note with valid JSON, e.g. {{\"action\":\"replace\",\"topic\":\"{topic}\",\"content\":\"...\"}}."
+                            ))
+                        })?;
 
                     Ok(ToolResult {
                         success: true,
@@ -199,7 +216,11 @@ impl Tool for MemoryNoteTool {
                     let existing = memory
                         .read_topic(session_id, topic)
                         .await
-                        .map_err(|e| ToolError::Execution(format!("Failed to read note: {e}")))?;
+                        .map_err(|e| {
+                            ToolError::Execution(format!(
+                                "Failed to read note: {e}. Rewrite and retry memory_note with valid JSON, e.g. {{\"action\":\"append\",\"topic\":\"{topic}\",\"content\":\"...\"}}."
+                            ))
+                        })?;
 
                     let mut next = existing.unwrap_or_default();
                     if !next.is_empty() {
@@ -218,7 +239,11 @@ impl Tool for MemoryNoteTool {
                     let path = memory
                         .save_topic(session_id, topic, &next)
                         .await
-                        .map_err(|e| ToolError::Execution(format!("Failed to write note: {e}")))?;
+                        .map_err(|e| {
+                            ToolError::Execution(format!(
+                                "Failed to write note: {e}. Rewrite and retry memory_note with valid JSON, e.g. {{\"action\":\"append\",\"topic\":\"{topic}\",\"content\":\"...\"}}."
+                            ))
+                        })?;
 
                     Ok(ToolResult {
                         success: true,
@@ -236,7 +261,8 @@ impl Tool for MemoryNoteTool {
                 }
             }
             _ => Err(ToolError::InvalidArguments(
-                "action must be one of: read, append, replace, clear, list_topics".to_string(),
+                "action must be one of: read, append, replace, clear, list_topics. Rewrite the memory_note call with valid JSON."
+                    .to_string(),
             )),
         }
     }

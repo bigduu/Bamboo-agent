@@ -64,7 +64,7 @@ pub(super) async fn prepare_round_context(
         maybe_summarize_compressed_messages(session, llm, summary_model, session_id).await;
     }
 
-    transforms::apply_message_transforms(config, &mut prepared_context, llm).await?;
+    transforms::apply_message_transforms(config, &mut prepared_context, llm, session_id).await?;
     logging::log_context_truncation(session_id, &prepared_context);
 
     Ok(PreparedRoundContext {

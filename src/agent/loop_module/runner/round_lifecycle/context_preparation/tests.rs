@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use super::prepare_round_context;
 use crate::agent::core::budget::{BudgetStrategy, TokenBudget};
+use crate::agent::core::tools::{FunctionCall, ToolCall};
 use crate::agent::core::{Message, Role, Session};
 use crate::agent::llm::models::{ContentPart, ImageUrl};
 use crate::agent::llm::provider::{LLMProvider, LLMStream};
@@ -128,5 +129,125 @@ async fn prepare_round_context_records_compression_events_and_marks_messages() {
             .filter(|m| m.compressed)
             .all(|m| m.compressed_by_event_id.is_some()),
         "Archived messages should reference a compression event"
+    );
+}
+
+#[tokio::test]
+async fn prepare_round_context_drops_orphan_tool_results_only_from_prepared_context() {
+    let mut session = Session::new("session-cp-3", "test-model");
+    session.messages.push(Message::user("Run tool"));
+    session.messages.push(Message::assistant(
+        "Calling tool",
+        Some(vec![ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "memory_note".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+    ));
+    session
+        .messages
+        .push(Message::tool_result("call_1", "ok result"));
+    session
+        .messages
+        .push(Message::tool_result("call_orphan", "orphan result"));
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+
+    let llm = noop_llm();
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "session-cp-3",
+        &[],
+        &llm,
+    )
+    .await
+    .expect("prepare round context");
+
+    let orphan_in_prepared =
+        prepared.prepared_context.messages.iter().any(|m| {
+            matches!(m.role, Role::Tool) && m.tool_call_id.as_deref() == Some("call_orphan")
+        });
+    assert!(
+        !orphan_in_prepared,
+        "orphan tool result should be removed from LLM context"
+    );
+
+    let orphan_in_persisted = session
+        .messages
+        .iter()
+        .any(|m| matches!(m.role, Role::Tool) && m.tool_call_id.as_deref() == Some("call_orphan"));
+    assert!(
+        orphan_in_persisted,
+        "persisted session history must remain unchanged"
+    );
+}
+
+#[tokio::test]
+async fn prepare_round_context_prunes_unresolved_tool_calls_from_prepared_context() {
+    let mut session = Session::new("session-cp-4", "test-model");
+    session.messages.push(Message::user("Run tool"));
+    session.messages.push(Message::assistant(
+        "This text should stay",
+        Some(vec![ToolCall {
+            id: "call_missing".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "memory_note".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+    ));
+    session.messages.push(Message::user("continue"));
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+
+    let llm = noop_llm();
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "session-cp-4",
+        &[],
+        &llm,
+    )
+    .await
+    .expect("prepare round context");
+
+    let unresolved_tool_call_in_prepared = prepared.prepared_context.messages.iter().any(|m| {
+        m.tool_calls
+            .as_ref()
+            .is_some_and(|calls| calls.iter().any(|call| call.id == "call_missing"))
+    });
+    assert!(
+        !unresolved_tool_call_in_prepared,
+        "unresolved tool call should be pruned from prepared LLM context"
+    );
+
+    let assistant_text_kept = prepared
+        .prepared_context
+        .messages
+        .iter()
+        .any(|m| matches!(m.role, Role::Assistant) && m.content == "This text should stay");
+    assert!(assistant_text_kept, "assistant text should be preserved");
+
+    let unresolved_tool_call_in_persisted = session.messages.iter().any(|m| {
+        m.tool_calls
+            .as_ref()
+            .is_some_and(|calls| calls.iter().any(|call| call.id == "call_missing"))
+    });
+    assert!(
+        unresolved_tool_call_in_persisted,
+        "persisted history must remain unchanged"
     );
 }

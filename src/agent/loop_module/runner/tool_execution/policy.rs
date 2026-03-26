@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use crate::agent::core::tools::{normalize_tool_name, parse_tool_args, ToolCall, ToolResult};
+use crate::agent::core::tools::{
+    normalize_tool_name, parse_tool_args, parse_tool_args_best_effort, ToolCall, ToolResult,
+};
+use crate::agent::core::{Role, Session};
 
 const MAX_TOOL_CALLS_PER_ROUND: usize = 80;
 const MAX_CONSECUTIVE_FAILURES_PER_TOOL: usize = 3;
@@ -33,6 +36,21 @@ pub(super) fn validate_tool_call_arguments(tool_call: &ToolCall) -> Result<(), S
         return Ok(());
     }
 
+    if normalized_tool_name.eq_ignore_ascii_case("memory_note") {
+        let (parsed, parse_warning) = parse_tool_args_best_effort(&tool_call.function.arguments);
+        if parse_warning.is_some()
+            && parsed
+                .as_object()
+                .map(|map| map.is_empty())
+                .unwrap_or(false)
+        {
+            return Err(
+                "Tool policy blocked 'memory_note' due to invalid JSON arguments: unable to recover arguments. Rewrite the memory_note call with a valid JSON object, for example {\"action\":\"read\",\"topic\":\"default\"}.".to_string()
+            );
+        }
+        return Ok(());
+    }
+
     parse_tool_args(&tool_call.function.arguments).map_err(|error| {
         format!(
             "Tool policy blocked '{}' due to invalid JSON arguments: {}",
@@ -41,6 +59,39 @@ pub(super) fn validate_tool_call_arguments(tool_call: &ToolCall) -> Result<(), S
     })?;
 
     Ok(())
+}
+
+pub(super) fn validate_tool_call_context(
+    tool_call: &ToolCall,
+    session: &Session,
+) -> Result<(), String> {
+    let normalized_tool_name = normalize_tool_for_policy(&tool_call.function.name);
+    if !normalized_tool_name.eq_ignore_ascii_case("ask_user") {
+        return Ok(());
+    }
+
+    let has_narration = session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| {
+            matches!(message.role, Role::Assistant)
+                && message
+                    .tool_calls
+                    .as_ref()
+                    .map(|calls| calls.iter().any(|call| call.id == tool_call.id))
+                    .unwrap_or(false)
+        })
+        .map(|message| !message.content.trim().is_empty())
+        .unwrap_or(false);
+
+    if has_narration {
+        return Ok(());
+    }
+
+    Err(
+        "Tool policy blocked 'ask_user': add a brief assistant text summary before calling ask_user so the user can understand the conclusion.".to_string()
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +218,7 @@ impl Default for ToolPolicyGuard {
 mod tests {
     use super::*;
     use crate::agent::core::tools::FunctionCall;
+    use crate::agent::core::{Message, Session};
 
     fn tool_call(name: &str, arguments: &str) -> ToolCall {
         ToolCall {
@@ -190,6 +242,58 @@ mod tests {
     fn non_strict_tools_allow_invalid_json_for_best_effort_path() {
         let call = tool_call("Read", "{invalid");
         assert!(validate_tool_call_arguments(&call).is_ok());
+    }
+
+    #[test]
+    fn ask_user_context_validation_requires_matching_assistant_narration() {
+        let call = tool_call("ask_user", "{}");
+        let session = Session::new("session-1", "model");
+        let err =
+            validate_tool_call_context(&call, &session).expect_err("expected context rejection");
+        assert!(err.contains("before calling ask_user"));
+    }
+
+    #[test]
+    fn ask_user_context_validation_rejects_empty_assistant_narration() {
+        let call = tool_call("ask_user", "{}");
+        let mut session = Session::new("session-1", "model");
+        session.add_message(Message::assistant("   ", Some(vec![call.clone()])));
+
+        let err =
+            validate_tool_call_context(&call, &session).expect_err("expected context rejection");
+        assert!(err.contains("before calling ask_user"));
+    }
+
+    #[test]
+    fn ask_user_context_validation_accepts_non_empty_assistant_narration() {
+        let call = tool_call("ask_user", "{}");
+        let mut session = Session::new("session-1", "model");
+        session.add_message(Message::assistant(
+            "Summary: completed requested changes and ready for your confirmation.",
+            Some(vec![call.clone()]),
+        ));
+
+        assert!(validate_tool_call_context(&call, &session).is_ok());
+    }
+
+    #[test]
+    fn non_ask_user_context_validation_is_noop() {
+        let call = tool_call("Read", "{}");
+        let session = Session::new("session-1", "model");
+        assert!(validate_tool_call_context(&call, &session).is_ok());
+    }
+
+    #[test]
+    fn memory_note_accepts_repairable_json_arguments() {
+        let call = tool_call("memory_note", r#"{"action":"read""#);
+        assert!(validate_tool_call_arguments(&call).is_ok());
+    }
+
+    #[test]
+    fn memory_note_rejects_unrecoverable_json_with_retry_guidance() {
+        let call = tool_call("memory_note", "not-json");
+        let err = validate_tool_call_arguments(&call).expect_err("expected strict rejection");
+        assert!(err.contains("Rewrite the memory_note call with a valid JSON object"));
     }
 
     #[test]

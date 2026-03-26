@@ -85,17 +85,32 @@ async fn execute_and_apply_single_tool_call(
     let mut stop_round = false;
     let outcome = match policy_guard.check_before_execution(tool_call, reserved_calls) {
         Ok(()) => {
-            per_call::execute_tool_call_only(per_call::ToolExecutionOnlyContext {
-                tool_call,
-                event_tx,
-                metrics_collector,
-                session_id,
-                round_id,
-                round,
-                tools,
-                config,
-            })
-            .await
+            if let Err(policy_error) = policy::validate_tool_call_context(tool_call, session) {
+                tracing::warn!(
+                    "[{}][round:{}] Tool call blocked by context policy before ToolStart: tool_call_id={}, tool_name={}, error={}",
+                    session_id,
+                    round,
+                    tool_call.id,
+                    tool_call.function.name,
+                    policy_error
+                );
+                per_call::ToolExecutionOutcome {
+                    result: Err(policy_error),
+                    tool_duration: std::time::Duration::ZERO,
+                }
+            } else {
+                per_call::execute_tool_call_only(per_call::ToolExecutionOnlyContext {
+                    tool_call,
+                    event_tx,
+                    metrics_collector,
+                    session_id,
+                    round_id,
+                    round,
+                    tools,
+                    config,
+                })
+                .await
+            }
         }
         Err(violation) => {
             stop_round = violation.should_stop_round();

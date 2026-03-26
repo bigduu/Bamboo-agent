@@ -2,6 +2,12 @@ use crate::agent::core::tools::{Tool, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 
+const DEFAULT_OPTIONS: [&str; 2] = ["OK", "Need changes"];
+
+fn default_options() -> Vec<String> {
+    DEFAULT_OPTIONS.iter().map(|s| (*s).to_string()).collect()
+}
+
 /// Tool for asking user a question with multiple choice options
 pub struct AskUserTool;
 
@@ -41,12 +47,10 @@ impl Tool for AskUserTool {
                 },
                 "options": {
                     "type": "array",
-                    "description": "Candidate answer options, recommended to provide 2-5 options",
+                    "description": "Candidate answer options (optional). If omitted or invalid, defaults to [\"OK\", \"Need changes\"].",
                     "items": {
                         "type": "string"
-                    },
-                    "minItems": 2,
-                    "maxItems": 6
+                    }
                 },
                 "allow_custom": {
                     "type": "boolean",
@@ -54,7 +58,7 @@ impl Tool for AskUserTool {
                     "default": true
                 }
             },
-            "required": ["question", "options"]
+            "required": ["question"]
         })
     }
 
@@ -63,26 +67,24 @@ impl Tool for AskUserTool {
             ToolError::InvalidArguments("Missing 'question' parameter".to_string())
         })?;
 
-        let options_array = args["options"].as_array().ok_or_else(|| {
-            ToolError::InvalidArguments("Missing 'options' parameter".to_string())
-        })?;
-
-        if options_array.len() < 2 || options_array.len() > 6 {
-            return Err(ToolError::InvalidArguments(format!(
-                "'options' must contain 2 to 6 items, got {}",
-                options_array.len()
-            )));
-        }
-
-        let options: Vec<String> = options_array
-            .iter()
-            .enumerate()
-            .map(|(idx, opt)| {
-                opt.as_str().map(String::from).ok_or_else(|| {
-                    ToolError::InvalidArguments(format!("Option at index {} is not a string", idx))
-                })
+        let mut options: Vec<String> = args["options"]
+            .as_array()
+            .map(|options_array| {
+                options_array
+                    .iter()
+                    .filter_map(|opt| opt.as_str())
+                    .map(str::trim)
+                    .filter(|opt| !opt.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>()
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .unwrap_or_default();
+
+        if options.len() < 2 {
+            options = default_options();
+        } else if options.len() > 6 {
+            options.truncate(6);
+        }
 
         let allow_custom = args["allow_custom"].as_bool().unwrap_or(true);
 
@@ -148,7 +150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_rejects_too_few_options() {
+    async fn test_execute_with_too_few_options_uses_defaults() {
         let tool = AskUserTool::new();
 
         let result = tool
@@ -156,9 +158,42 @@ mod tests {
                 "question": "Please select?",
                 "options": ["Only one option"]
             }))
-            .await;
+            .await
+            .expect("tool should execute with fallback defaults");
 
-        assert!(result.is_err());
+        let parsed: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(parsed["options"], json!(["OK", "Need changes"]));
+    }
+
+    #[tokio::test]
+    async fn test_execute_without_options_uses_defaults() {
+        let tool = AskUserTool::new();
+
+        let result = tool
+            .execute(json!({
+                "question": "Any other requests before I finish?"
+            }))
+            .await
+            .expect("tool should execute without options");
+
+        let parsed: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(parsed["options"], json!(["OK", "Need changes"]));
+    }
+
+    #[tokio::test]
+    async fn test_execute_truncates_options_to_six_items() {
+        let tool = AskUserTool::new();
+
+        let result = tool
+            .execute(json!({
+                "question": "Please pick one",
+                "options": ["1", "2", "3", "4", "5", "6", "7"]
+            }))
+            .await
+            .expect("tool should execute and truncate options");
+
+        let parsed: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(parsed["options"], json!(["1", "2", "3", "4", "5", "6"]));
     }
 
     #[tokio::test]

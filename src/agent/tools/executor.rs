@@ -9,10 +9,10 @@ use async_trait::async_trait;
 use crate::agent::tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
 use crate::agent::tools::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::agent::tools::tools::{
-    ApplyPatchTool, AskUserTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool,
-    FileExistsTool, GetCurrentDirTool, GetFileInfoTool, GlobTool, GrepTool, KillShellTool,
-    MemoryNoteTool, NotebookEditTool, ReadTool, SetWorkspaceTool, SleepTool, TaskTool,
-    ToolRegistry, WebFetchTool, WebSearchTool, WriteTool,
+    ApplyPatchTool, AskUserTool, BashOutputTool, BashTool, ConclusionTool, EditTool,
+    ExitPlanModeTool, FileExistsTool, GetCurrentDirTool, GetFileInfoTool, GlobTool, GrepTool,
+    KillShellTool, MemoryNoteTool, MermaidTool, NotebookEditTool, ReadTool, SetWorkspaceTool,
+    SleepTool, TaskTool, ToolRegistry, WebFetchTool, WebSearchTool, WriteTool,
 };
 use crate::core::Config;
 use tokio::sync::RwLock;
@@ -37,11 +37,12 @@ fn preview_for_log(value: &str, max_chars: usize) -> String {
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
+pub const BUILTIN_TOOL_NAMES: [&str; 23] = [
     "apply_patch",
     "ask_user",
     "Bash",
     "BashOutput",
+    "conclusion",
     "Edit",
     "ExitPlanMode",
     "FileExists",
@@ -51,6 +52,7 @@ pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
     "Grep",
     "KillShell",
     "memory_note",
+    "mermaid",
     "NotebookEdit",
     "Read",
     "SetWorkspace",
@@ -241,6 +243,7 @@ impl BuiltinToolExecutor {
         let _ = registry.register(AskUserTool::new());
         let _ = registry.register(BashTool::new());
         let _ = registry.register(BashOutputTool::new());
+        let _ = registry.register(ConclusionTool::new());
         let _ = registry.register(EditTool::new());
         let _ = registry.register(ExitPlanModeTool::new());
         let _ = registry.register(FileExistsTool::new());
@@ -250,6 +253,7 @@ impl BuiltinToolExecutor {
         let _ = registry.register(GrepTool::new());
         let _ = registry.register(KillShellTool::new());
         let _ = registry.register(MemoryNoteTool::new());
+        let _ = registry.register(MermaidTool::new());
         let _ = registry.register(NotebookEditTool::new());
         let _ = registry.register(ReadTool::new());
         let _ = registry.register(SetWorkspaceTool::new());

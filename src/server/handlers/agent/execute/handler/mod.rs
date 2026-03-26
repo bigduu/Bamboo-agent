@@ -8,7 +8,7 @@ use super::runtime::{
 };
 use super::session::load_session;
 use super::ExecuteRequest;
-use crate::agent::core::SessionKind;
+use crate::agent::core::{Session, SessionKind};
 use crate::server::app_state::AppState;
 
 use self::response::{
@@ -21,6 +21,38 @@ mod response;
 #[cfg(test)]
 mod tests;
 mod validation;
+
+const COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY: &str = "copilot_ask_user_enhancement_enabled";
+const COPILOT_ASK_USER_ENHANCEMENT_TOOLS: [&str; 2] = ["conclusion", "mermaid"];
+
+fn is_copilot_ask_user_enhancement_enabled_for_session(
+    session: &Session,
+    provider_name: &str,
+) -> bool {
+    if !provider_name.trim().eq_ignore_ascii_case("copilot") {
+        return false;
+    }
+
+    session
+        .metadata
+        .get(COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY)
+        .map(|value| value.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn apply_copilot_ask_user_enhancement_tool_filter(
+    disabled_tools: &mut std::collections::BTreeSet<String>,
+    session: &Session,
+    provider_name: &str,
+) {
+    if is_copilot_ask_user_enhancement_enabled_for_session(session, provider_name) {
+        return;
+    }
+
+    for tool_name in COPILOT_ASK_USER_ENHANCEMENT_TOOLS {
+        disabled_tools.insert(tool_name.to_string());
+    }
+}
 
 /// Execute the AI agent on a chat session.
 ///
@@ -108,7 +140,12 @@ pub async fn handler(
     let config_snapshot = state.config.read().await.clone();
     let default_reasoning_effort = config_snapshot.get_reasoning_effort();
     let effective_reasoning_effort = request_reasoning_effort.or(default_reasoning_effort);
-    let disabled_tools = config_snapshot.disabled_tool_names();
+    let mut disabled_tools = config_snapshot.disabled_tool_names();
+    apply_copilot_ask_user_enhancement_tool_filter(
+        &mut disabled_tools,
+        &session,
+        &config_snapshot.provider,
+    );
     let reasoning_effort_source = if request_reasoning_effort.is_some() {
         "request"
     } else if default_reasoning_effort.is_some() {

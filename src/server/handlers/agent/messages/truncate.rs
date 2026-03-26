@@ -32,6 +32,86 @@ fn unresolved_tool_call_ids(messages: &[Message]) -> HashSet<String> {
     pending_ids
 }
 
+fn sanitize_malformed_tool_chains(session: &mut Session) -> usize {
+    let resolved_tool_result_ids: HashSet<String> = session
+        .messages
+        .iter()
+        .filter(|message| matches!(message.role, Role::Tool))
+        .filter_map(|message| {
+            message
+                .tool_call_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
+        .collect();
+
+    let mut removed_assistant_calls = 0usize;
+    for message in session.messages.iter_mut() {
+        if !matches!(message.role, Role::Assistant) {
+            continue;
+        }
+        let Some(tool_calls) = message.tool_calls.take() else {
+            continue;
+        };
+        let original_len = tool_calls.len();
+        let kept_calls = tool_calls
+            .into_iter()
+            .filter(|call| {
+                let id = call.id.trim();
+                !id.is_empty() && resolved_tool_result_ids.contains(id)
+            })
+            .collect::<Vec<_>>();
+        removed_assistant_calls += original_len.saturating_sub(kept_calls.len());
+        message.tool_calls = if kept_calls.is_empty() {
+            None
+        } else {
+            Some(kept_calls)
+        };
+    }
+
+    let valid_tool_call_ids: HashSet<String> = session
+        .messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .filter_map(|call| {
+            let id = call.id.trim();
+            if id.is_empty() {
+                None
+            } else {
+                Some(id.to_string())
+            }
+        })
+        .collect();
+
+    let before_tool_results = session
+        .messages
+        .iter()
+        .filter(|message| matches!(message.role, Role::Tool))
+        .count();
+    session.messages.retain(|message| {
+        if !matches!(message.role, Role::Tool) {
+            return true;
+        }
+        message
+            .tool_call_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .is_some_and(|id| valid_tool_call_ids.contains(id))
+    });
+    let after_tool_results = session
+        .messages
+        .iter()
+        .filter(|message| matches!(message.role, Role::Tool))
+        .count();
+    let removed_tool_results = before_tool_results.saturating_sub(after_tool_results);
+
+    removed_assistant_calls + removed_tool_results
+}
+
 fn truncate_after_last_user(session: &mut Session) -> Option<usize> {
     let last_user_idx = session
         .messages
@@ -110,7 +190,8 @@ pub async fn truncate_messages(
             )
         }
         TruncateRequest::ErrorRetry => {
-            if unresolved_tool_call_ids(&session.messages).is_empty() {
+            let unresolved_before = unresolved_tool_call_ids(&session.messages);
+            if unresolved_before.is_empty() {
                 session
                     .metadata
                     .insert(RETRY_RESUME_PENDING_KEY.to_string(), "true".to_string());
@@ -120,29 +201,55 @@ pub async fn truncate_messages(
                 );
                 (0, session.messages.len(), false, true)
             } else {
-                tracing::warn!(
-                    "[{}] error_retry requested with unresolved tool calls; falling back to truncation",
-                    session_id
-                );
-                let Some(removed) = truncate_for_unresolved_tool_calls(&mut session) else {
-                    return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-                        "error": "Found unresolved tool calls but no prior user message to retry from",
-                        "session_id": session_id
-                    })));
-                };
+                let removed_via_sanitization = sanitize_malformed_tool_chains(&mut session);
+                let unresolved_after_sanitization = unresolved_tool_call_ids(&session.messages);
+                if unresolved_after_sanitization.is_empty() {
+                    tracing::warn!(
+                        "[{}] error_retry recovered by sanitizing malformed tool chain data: unresolved_before={}, removed_entries={}",
+                        session_id,
+                        unresolved_before.len(),
+                        removed_via_sanitization
+                    );
+                    session
+                        .metadata
+                        .insert(RETRY_RESUME_PENDING_KEY.to_string(), "true".to_string());
+                    session.metadata.insert(
+                        RETRY_RESUME_REASON_KEY.to_string(),
+                        "error_retry".to_string(),
+                    );
+                    (
+                        removed_via_sanitization,
+                        session.messages.len(),
+                        removed_via_sanitization > 0,
+                        true,
+                    )
+                } else {
+                    tracing::warn!(
+                        "[{}] error_retry unresolved tool calls remain after sanitization (before={}, after={}); falling back to truncation",
+                        session_id,
+                        unresolved_before.len(),
+                        unresolved_after_sanitization.len()
+                    );
+                    let Some(removed) = truncate_for_unresolved_tool_calls(&mut session) else {
+                        return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+                            "error": "Found unresolved tool calls but no prior user message to retry from",
+                            "session_id": session_id
+                        })));
+                    };
 
-                let cleared_pending_flag =
-                    session.metadata.remove(RETRY_RESUME_PENDING_KEY).is_some();
-                let cleared_reason_flag =
-                    session.metadata.remove(RETRY_RESUME_REASON_KEY).is_some();
-                let cleared_retry_flags = cleared_pending_flag || cleared_reason_flag;
+                    let cleared_pending_flag =
+                        session.metadata.remove(RETRY_RESUME_PENDING_KEY).is_some();
+                    let cleared_reason_flag =
+                        session.metadata.remove(RETRY_RESUME_REASON_KEY).is_some();
+                    let cleared_retry_flags = cleared_pending_flag || cleared_reason_flag;
 
-                (
-                    removed,
-                    session.messages.len(),
-                    removed > 0,
-                    removed > 0 || cleared_retry_flags,
-                )
+                    (
+                        removed,
+                        session.messages.len(),
+                        removed > 0,
+                        removed > 0 || cleared_retry_flags,
+                    )
+                }
             }
         }
     };
@@ -168,7 +275,8 @@ pub async fn truncate_messages(
 #[cfg(test)]
 mod tests {
     use super::{
-        truncate_after_last_user, truncate_for_unresolved_tool_calls, unresolved_tool_call_ids,
+        sanitize_malformed_tool_chains, truncate_after_last_user,
+        truncate_for_unresolved_tool_calls, unresolved_tool_call_ids,
     };
     use crate::agent::core::tools::{FunctionCall, ToolCall};
     use crate::agent::core::{Message, Session};
@@ -243,5 +351,30 @@ mod tests {
         let removed = truncate_after_last_user(&mut session).expect("user anchor exists");
         assert_eq!(removed, 1);
         assert_eq!(session.messages.len(), 2);
+    }
+
+    #[test]
+    fn sanitize_malformed_tool_chains_prunes_orphan_results_and_unresolved_calls() {
+        let mut session = Session::new("session-1", "gpt-5");
+        session.add_message(Message::user("task-1"));
+        session.add_message(Message::assistant(
+            "tool call without result",
+            Some(vec![make_tool_call("call_missing")]),
+        ));
+        session.add_message(Message::tool_result("call_orphan", "error"));
+        session.add_message(Message::user("continue"));
+
+        let removed = sanitize_malformed_tool_chains(&mut session);
+        assert_eq!(removed, 2);
+        assert!(unresolved_tool_call_ids(&session.messages).is_empty());
+        assert!(session
+            .messages
+            .iter()
+            .all(|message| !matches!(message.role, crate::agent::core::agent::Role::Tool)));
+        assert!(session.messages.iter().any(|message| {
+            matches!(message.role, crate::agent::core::agent::Role::Assistant)
+                && message.content == "tool call without result"
+                && message.tool_calls.is_none()
+        }));
     }
 }
