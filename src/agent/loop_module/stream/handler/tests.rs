@@ -3,7 +3,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::core::tools::{FunctionCall, ToolCall};
-use crate::agent::core::AgentEvent;
+use crate::agent::core::{AgentError, AgentEvent};
+use crate::agent::llm::provider::LLMError;
 use crate::agent::llm::{LLMChunk, LLMStream};
 
 use super::{consume_llm_stream, consume_llm_stream_silent};
@@ -73,4 +74,41 @@ async fn consume_llm_stream_silent_does_not_emit_events() {
     assert!(output.reasoning_content.is_empty());
     assert_eq!(output.token_count, 5);
     assert!(output.tool_calls.is_empty());
+}
+
+#[tokio::test]
+async fn consume_llm_stream_emits_single_prefix_stream_error_message() {
+    let stream = build_stream(vec![Err(LLMError::Stream(
+        "Transport error: error decoding response body".to_string(),
+    ))]);
+
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(4);
+    let err = match consume_llm_stream(stream, &event_tx, &CancellationToken::new(), "session-3")
+        .await
+    {
+        Ok(_) => panic!("stream should fail"),
+        Err(err) => err,
+    };
+
+    match err {
+        AgentError::LLM(message) => {
+            assert_eq!(
+                message,
+                "Stream error: Transport error: error decoding response body"
+            );
+            assert!(!message.starts_with("Stream error: Stream error:"));
+        }
+        other => panic!("expected AgentError::LLM, got {other:?}"),
+    }
+
+    let error_event = event_rx.recv().await.expect("missing error event");
+    match error_event {
+        AgentEvent::Error { message } => {
+            assert_eq!(
+                message,
+                "Stream error: Transport error: error decoding response body"
+            );
+        }
+        other => panic!("expected AgentEvent::Error, got {other:?}"),
+    }
 }

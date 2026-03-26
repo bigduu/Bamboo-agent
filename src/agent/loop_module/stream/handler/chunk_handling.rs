@@ -51,15 +51,15 @@ pub(super) async fn handle_chunk_result(
             Ok(())
         }
         Err(error) => {
+            let message = error.to_string();
             if let Some(event_tx) = event_tx {
-                let message = format!("Stream error: {error}");
                 let _ = event_tx
                     .send(AgentEvent::Error {
                         message: message.clone(),
                     })
                     .await;
             }
-            Err(AgentError::LLM(error.to_string()))
+            Err(AgentError::LLM(message))
         }
     }
 }

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// * `session_id` - Optional session ID. If not provided, a new UUID will be generated
 /// * `system_prompt` - Optional custom system prompt. If empty, uses the default
 /// * `enhance_prompt` - Optional additional prompt instructions appended to the system prompt
-/// * `copilot_ask_user_enhancement_enabled` - Optional flag for enabling copilot ask-user conclusion/mermaid flow
+/// * `copilot_ask_user_enhancement_enabled` - Optional flag for enabling copilot ask-user conclusion flow
 /// * `workspace_path` - Optional workspace path to include in the system prompt
 /// * `selected_skill_ids` - Optional explicit skill IDs selected for this request
 /// * `model` - Required model identifier (e.g., "gpt-4o-mini", "claude-3-opus")

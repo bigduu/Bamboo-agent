@@ -59,7 +59,7 @@ pub fn get_default_model_from_config(config: &Config) -> Result<String, LLMError
 
 /// Get the fast/cheap model for the current provider from config.
 ///
-/// Used for lightweight tasks like title generation, mermaid fix, and summarization.
+/// Used for lightweight tasks like title generation and summarization.
 /// Falls back to the default model when no fast_model is configured.
 pub fn get_fast_model_from_config(config: &Config) -> Result<String, LLMError> {
     config.get_fast_model().ok_or_else(|| {

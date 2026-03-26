@@ -1,5 +1,3 @@
-//! Claude-style built-in tool implementations.
-
 pub mod apply_patch;
 pub mod ask_user;
 pub mod bash;
@@ -17,7 +15,6 @@ pub mod glob;
 pub mod grep;
 pub mod kill_shell;
 pub mod memory_note;
-pub mod mermaid;
 pub mod notebook_edit;
 pub mod read;
 pub mod read_tracker;
@@ -45,7 +42,6 @@ pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use kill_shell::KillShellTool;
 pub use memory_note::MemoryNoteTool;
-pub use mermaid::MermaidTool;
 pub use notebook_edit::NotebookEditTool;
 pub use read::ReadTool;
 pub use registry::ToolRegistry;

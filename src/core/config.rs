@@ -396,7 +396,7 @@ pub struct OpenAIConfig {
     /// Default model to use (e.g., "gpt-4", "gpt-3.5-turbo")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Fast/cheap model for lightweight tasks (title generation, mermaid fix, summarization).
+    /// Fast/cheap model for lightweight tasks (title generation and summarization).
     /// Falls back to `model` when not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast_model: Option<String>,
@@ -785,7 +785,7 @@ impl Config {
 
     /// Get the fast/cheap model for the currently active provider.
     ///
-    /// Used for lightweight tasks like title generation, mermaid fix, and summarization.
+    /// Used for lightweight tasks like title generation and summarization.
     /// Falls back to `get_model()` when no fast_model is configured.
     pub fn get_fast_model(&self) -> Option<String> {
         let fast = match self.provider.as_str() {

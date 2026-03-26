@@ -23,7 +23,7 @@ mod tests;
 mod validation;
 
 const COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY: &str = "copilot_ask_user_enhancement_enabled";
-const COPILOT_ASK_USER_ENHANCEMENT_TOOLS: [&str; 2] = ["conclusion", "mermaid"];
+const COPILOT_ASK_USER_ENHANCEMENT_TOOLS: [&str; 1] = ["conclusion"];
 
 fn is_copilot_ask_user_enhancement_enabled_for_session(
     session: &Session,

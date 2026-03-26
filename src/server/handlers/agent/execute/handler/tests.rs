@@ -65,17 +65,16 @@ fn copilot_ask_user_enhancement_flag_requires_copilot_provider_and_true_metadata
 }
 
 #[test]
-fn tool_filter_disables_conclusion_and_mermaid_when_enhancement_not_enabled() {
+fn tool_filter_disables_conclusion_when_enhancement_not_enabled() {
     let mut disabled_tools = BTreeSet::new();
     let session = Session::new("session-1", "model");
     apply_copilot_ask_user_enhancement_tool_filter(&mut disabled_tools, &session, "copilot");
 
     assert!(disabled_tools.contains("conclusion"));
-    assert!(disabled_tools.contains("mermaid"));
 }
 
 #[test]
-fn tool_filter_keeps_conclusion_and_mermaid_available_when_enhancement_enabled() {
+fn tool_filter_keeps_conclusion_available_when_enhancement_enabled() {
     let mut disabled_tools = BTreeSet::new();
     let mut session = Session::new("session-1", "model");
     session.metadata.insert(
@@ -86,5 +85,4 @@ fn tool_filter_keeps_conclusion_and_mermaid_available_when_enhancement_enabled()
     apply_copilot_ask_user_enhancement_tool_filter(&mut disabled_tools, &session, "copilot");
 
     assert!(!disabled_tools.contains("conclusion"));
-    assert!(!disabled_tools.contains("mermaid"));
 }

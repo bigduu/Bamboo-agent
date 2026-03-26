@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 23] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 22] = [
     "apply_patch",
     "ask_user",
     "Bash",
@@ -21,7 +21,6 @@ pub const BUILTIN_GUIDE_NAMES: [&str; 23] = [
     "Grep",
     "KillShell",
     "memory_note",
-    "mermaid",
     "NotebookEdit",
     "Read",
     "SetWorkspace",
@@ -163,7 +162,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::UserInteraction,
             "Render a structured conclusion card with a final takeaway and optional supporting bullets.",
             "Do not use for intermediate status updates or raw execution logs.",
-            &["ask_user", "mermaid"],
+            &["ask_user"],
             vec![example(
                 "Present final conclusion",
                 json!({"title":"Conclusion","conclusion":"Core validation is complete and release is ready.","key_points":["All targeted tests passed","No blocking regressions"],"next_steps":["Proceed with release train"],"confidence":"high"}),
@@ -309,18 +308,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 ),
             ],
         )),
-        "mermaid" => Some(guide(
-            "mermaid",
-            ToolCategory::UserInteraction,
-            "Render a Mermaid diagram card with optional title and summary for visual explanations.",
-            "Do not use when plain text is sufficient and no visual structure is needed.",
-            &["conclusion", "ask_user"],
-            vec![example(
-                "Show system flow",
-                json!({"title":"Request Flow","summary":"High-level request path","chart":"flowchart TD\nA[User] --> B[API]\nB --> C[Service]\nC --> D[DB]"}),
-                "Use when a diagram helps users understand relationships faster than prose.",
-            )],
-        )),
+
         "SetWorkspace" => Some(guide(
             "SetWorkspace",
             ToolCategory::CommandExecution,

@@ -10,7 +10,6 @@ const MAX_CONSECUTIVE_FAILURES_PER_TOOL: usize = 3;
 const RESET_POLICY_TOOL_NAME: &str = "ask_user";
 const COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY: &str = "copilot_ask_user_enhancement_enabled";
 const CONCLUSION_TOOL_NAME: &str = "conclusion";
-const MERMAID_TOOL_NAME: &str = "mermaid";
 
 const STRICT_ARGUMENT_TOOL_NAMES: [&str; 10] = [
     "Write",
@@ -63,9 +62,8 @@ fn assistant_message_has_tool(message: &crate::agent::core::Message, tool_name: 
         .unwrap_or(false)
 }
 
-fn assistant_message_has_conclusion_or_mermaid(message: &crate::agent::core::Message) -> bool {
+fn assistant_message_has_conclusion(message: &crate::agent::core::Message) -> bool {
     assistant_message_has_tool(message, CONCLUSION_TOOL_NAME)
-        || assistant_message_has_tool(message, MERMAID_TOOL_NAME)
 }
 
 pub(super) fn validate_tool_call_arguments(tool_call: &ToolCall) -> Result<(), String> {
@@ -123,11 +121,11 @@ pub(super) fn validate_tool_call_context(
 
         if enhancement_enabled
             && !assistant_message
-                .map(assistant_message_has_conclusion_or_mermaid)
+                .map(assistant_message_has_conclusion)
                 .unwrap_or(false)
         {
             return Err(
-                "Tool policy blocked 'ask_user': when copilot ask-user enhancement is enabled, include a `conclusion` or `mermaid` tool call in the same assistant response before final confirmation."
+                "Tool policy blocked 'ask_user': when copilot ask-user enhancement is enabled, include a `conclusion` tool call in the same assistant response before final confirmation."
                     .to_string(),
             );
         }
@@ -379,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn ask_user_requires_summary_tool_when_enhancement_enabled() {
+    fn ask_user_requires_conclusion_when_enhancement_enabled() {
         let ask_user_call = tool_call_with_id("call-ask-user", "ask_user", "{}");
         let mut session = Session::new("session-1", "model");
         session.metadata.insert(
@@ -393,7 +391,7 @@ mod tests {
 
         let err = validate_tool_call_context(&ask_user_call, &session)
             .expect_err("expected policy rejection");
-        assert!(err.contains("include a `conclusion` or `mermaid`"));
+        assert!(err.contains("include a `conclusion` tool call"));
     }
 
     #[test]
