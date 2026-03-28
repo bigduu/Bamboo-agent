@@ -23,6 +23,13 @@ fn canonical_tool_name_or_error_resolves_aliases() {
 }
 
 #[test]
+fn canonical_tool_name_or_error_accepts_compress_context() {
+    let canonical = canonical_tool_name_or_error("compress_context")
+        .expect("compress_context should resolve");
+    assert_eq!(canonical, "compress_context");
+}
+
+#[test]
 fn parse_arguments_parses_json_and_plain_strings() {
     let args = parse_arguments(vec![
         ToolParameter {
@@ -59,6 +66,20 @@ fn validate_session_context_requirement_rejects_missing_session_for_edit() {
         AppError::BadRequest(message) => {
             assert!(message.contains("requires session_id"));
             assert!(message.contains("Edit"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn validate_session_context_requirement_rejects_missing_session_for_compress_context() {
+    let error = validate_session_context_requirement("compress_context", None)
+        .expect_err("expected missing-session validation error");
+
+    match error {
+        AppError::BadRequest(message) => {
+            assert!(message.contains("requires session_id"));
+            assert!(message.contains("compress_context"));
         }
         other => panic!("unexpected error: {other}"),
     }
