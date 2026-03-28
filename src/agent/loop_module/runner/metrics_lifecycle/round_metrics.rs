@@ -29,6 +29,7 @@ pub(in crate::agent::loop_module::runner) fn record_round_completed(
     message_count: u32,
     round_status: MetricsRoundStatus,
     round_usage: MetricsTokenUsage,
+    prompt_cached_tool_outputs: u32,
     round_error: Option<String>,
 ) {
     let Some(metrics) = metrics_collector else {
@@ -39,6 +40,7 @@ pub(in crate::agent::loop_module::runner) fn record_round_completed(
         Utc::now(),
         round_status,
         round_usage,
+        prompt_cached_tool_outputs,
         round_error,
     );
     metrics.session_message_count(session_id.to_string(), message_count, Utc::now());
@@ -62,6 +64,7 @@ pub(in crate::agent::loop_module::runner) fn record_round_and_session_error(
         Utc::now(),
         round_status,
         MetricsTokenUsage::default(),
+        0,
         round_error,
     );
     metrics.session_message_count(session_id.to_string(), message_count, Utc::now());

@@ -213,6 +213,8 @@ pub struct CombinedSummary {
     pub total_errors: u64,
     /// Success rate percentage
     pub success_rate: f64,
+    /// Total number of prompt-side cached tool outputs in chat sessions.
+    pub prompt_cached_tool_outputs: u64,
 }
 
 /// Unified timeline point combining chat and forward metrics
@@ -230,4 +232,6 @@ pub struct UnifiedTimelinePoint {
     pub forward_requests: u32,
     /// Total tokens (chat + forward)
     pub total_tokens: u64,
+    /// Prompt-side cached tool outputs observed in chat sessions on this date.
+    pub prompt_cached_tool_outputs: u64,
 }

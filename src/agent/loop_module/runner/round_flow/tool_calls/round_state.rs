@@ -72,6 +72,12 @@ impl ToolCallsRoundState {
             session.messages.len() as u32,
             self.round_status,
             round_usage,
+            session
+                .token_usage
+                .as_ref()
+                .map(|usage| usage.prompt_cached_tool_outputs)
+                .unwrap_or(0)
+                .min(u32::MAX as usize) as u32,
             self.round_error.clone(),
         );
     }

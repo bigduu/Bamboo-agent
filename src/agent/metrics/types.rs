@@ -149,6 +149,9 @@ pub struct RoundMetrics {
     pub error: Option<String>,
     /// Round duration in milliseconds
     pub duration_ms: Option<u64>,
+    /// Number of tool outputs compacted into prompt-side cache summaries in this round.
+    #[serde(default)]
+    pub prompt_cached_tool_outputs: u32,
 }
 
 /// Metrics for an entire session
@@ -176,6 +179,9 @@ pub struct SessionMetrics {
     pub message_count: u32,
     /// Session duration in milliseconds
     pub duration_ms: Option<u64>,
+    /// Total number of prompt-side cached tool outputs observed across rounds.
+    #[serde(default)]
+    pub prompt_cached_tool_outputs: u64,
 }
 
 /// Detailed session metrics with round information
@@ -204,6 +210,9 @@ pub struct DailyMetrics {
     pub model_breakdown: HashMap<String, TokenUsage>,
     /// Tool call breakdown by tool name
     pub tool_breakdown: HashMap<String, u32>,
+    /// Total number of prompt-side cached tool outputs observed on this day.
+    #[serde(default)]
+    pub prompt_cached_tool_outputs: u64,
 }
 
 /// Overall metrics summary
@@ -217,6 +226,9 @@ pub struct MetricsSummary {
     pub total_tool_calls: u64,
     /// Number of currently active sessions
     pub active_sessions: u64,
+    /// Total number of prompt-side cached tool outputs.
+    #[serde(default)]
+    pub prompt_cached_tool_outputs: u64,
 }
 
 /// Metrics aggregated by model
@@ -232,6 +244,9 @@ pub struct ModelMetrics {
     pub tokens: TokenUsage,
     /// Number of tool calls using this model
     pub tool_calls: u64,
+    /// Number of prompt-side cached tool outputs for this model.
+    #[serde(default)]
+    pub prompt_cached_tool_outputs: u64,
 }
 
 /// Date filter for metrics queries
@@ -483,6 +498,7 @@ mod tests {
             status: RoundStatus::Running,
             error: None,
             duration_ms: None,
+            prompt_cached_tool_outputs: 0,
         };
 
         let json = serde_json::to_string(&metrics).unwrap();
@@ -504,6 +520,7 @@ mod tests {
             status: SessionStatus::Running,
             message_count: 15,
             duration_ms: None,
+            prompt_cached_tool_outputs: 0,
         };
 
         let json = serde_json::to_string(&metrics).unwrap();
@@ -519,6 +536,7 @@ mod tests {
             total_rounds: 50,
             total_token_usage: TokenUsage::default(),
             total_tool_calls: 100,
+            prompt_cached_tool_outputs: 0,
             model_breakdown: HashMap::new(),
             tool_breakdown: HashMap::new(),
         };
@@ -535,6 +553,7 @@ mod tests {
             total_tokens: TokenUsage::default(),
             total_tool_calls: 500,
             active_sessions: 5,
+            prompt_cached_tool_outputs: 0,
         };
 
         let json = serde_json::to_string(&summary).unwrap();
@@ -550,6 +569,7 @@ mod tests {
             rounds: 200,
             tokens: TokenUsage::default(),
             tool_calls: 100,
+            prompt_cached_tool_outputs: 0,
         };
 
         let json = serde_json::to_string(&metrics).unwrap();

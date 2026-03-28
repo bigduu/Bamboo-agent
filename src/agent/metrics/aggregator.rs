@@ -14,6 +14,7 @@ pub struct PeriodMetrics {
     pub total_rounds: u32,
     pub total_token_usage: TokenUsage,
     pub total_tool_calls: u32,
+    pub prompt_cached_tool_outputs: u64,
     pub model_breakdown: HashMap<String, TokenUsage>,
     pub tool_breakdown: HashMap<String, u32>,
 }
@@ -48,6 +49,7 @@ where
                 total_rounds: 0,
                 total_token_usage: TokenUsage::default(),
                 total_tool_calls: 0,
+                prompt_cached_tool_outputs: 0,
                 model_breakdown: HashMap::new(),
                 tool_breakdown: HashMap::new(),
             });
@@ -60,6 +62,7 @@ where
         entry.total_rounds += day.total_rounds;
         entry.total_token_usage.add_assign(day.total_token_usage);
         entry.total_tool_calls += day.total_tool_calls;
+        entry.prompt_cached_tool_outputs += day.prompt_cached_tool_outputs;
 
         for (model, usage) in &day.model_breakdown {
             let model_entry = entry.model_breakdown.entry(model.clone()).or_default();
@@ -125,6 +128,7 @@ mod tests {
                     total_tokens: 30,
                 },
                 total_tool_calls: 4,
+                prompt_cached_tool_outputs: 3,
                 model_breakdown: HashMap::new(),
                 tool_breakdown: HashMap::new(),
             },
@@ -138,6 +142,7 @@ mod tests {
                     total_tokens: 10,
                 },
                 total_tool_calls: 1,
+                prompt_cached_tool_outputs: 2,
                 model_breakdown: HashMap::new(),
                 tool_breakdown: HashMap::new(),
             },
@@ -149,6 +154,7 @@ mod tests {
         assert_eq!(result[0].total_rounds, 5);
         assert_eq!(result[0].total_token_usage.total_tokens, 40);
         assert_eq!(result[0].total_tool_calls, 5);
+        assert_eq!(result[0].prompt_cached_tool_outputs, 5);
     }
 
     #[test]
@@ -164,6 +170,7 @@ mod tests {
                     total_tokens: 2,
                 },
                 total_tool_calls: 1,
+                prompt_cached_tool_outputs: 0,
                 model_breakdown: HashMap::new(),
                 tool_breakdown: HashMap::new(),
             },
@@ -177,6 +184,7 @@ mod tests {
                     total_tokens: 5,
                 },
                 total_tool_calls: 3,
+                prompt_cached_tool_outputs: 1,
                 model_breakdown: HashMap::new(),
                 tool_breakdown: HashMap::new(),
             },

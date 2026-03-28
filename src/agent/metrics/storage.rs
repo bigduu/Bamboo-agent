@@ -332,6 +332,7 @@ pub trait MetricsStorage: Send + Sync {
         completed_at: DateTime<Utc>,
         status: RoundStatus,
         usage: TokenUsage,
+        prompt_cached_tool_outputs: u32,
         error: Option<String>,
     ) -> MetricsResult<()>;
 
@@ -851,6 +852,7 @@ impl MetricsStorage for SqliteMetricsStorage {
                     prompt_tokens INTEGER NOT NULL DEFAULT 0,
                     completion_tokens INTEGER NOT NULL DEFAULT 0,
                     total_tokens INTEGER NOT NULL DEFAULT 0,
+                    prompt_cached_tool_outputs INTEGER NOT NULL DEFAULT 0,
                     tool_call_count INTEGER NOT NULL DEFAULT 0,
                     message_count INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
@@ -866,6 +868,7 @@ impl MetricsStorage for SqliteMetricsStorage {
                     prompt_tokens INTEGER NOT NULL DEFAULT 0,
                     completion_tokens INTEGER NOT NULL DEFAULT 0,
                     total_tokens INTEGER NOT NULL DEFAULT 0,
+                    prompt_cached_tool_outputs INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
                     FOREIGN KEY(session_id) REFERENCES session_metrics(session_id) ON DELETE CASCADE
                 );
@@ -911,6 +914,13 @@ impl MetricsStorage for SqliteMetricsStorage {
                 CREATE INDEX IF NOT EXISTS idx_forward_model ON forward_request_metrics(model);
                 "#,
             )?;
+            ensure_integer_column(
+                connection,
+                "session_metrics",
+                "prompt_cached_tool_outputs",
+                0,
+            )?;
+            ensure_integer_column(connection, "round_metrics", "prompt_cached_tool_outputs", 0)?;
             Ok(())
         })
         .await
@@ -1022,6 +1032,7 @@ impl MetricsStorage for SqliteMetricsStorage {
         completed_at: DateTime<Utc>,
         status: RoundStatus,
         usage: TokenUsage,
+        prompt_cached_tool_outputs: u32,
         error: Option<String>,
     ) -> MetricsResult<()> {
         let round_id = round_id.to_string();
@@ -1042,8 +1053,9 @@ impl MetricsStorage for SqliteMetricsStorage {
                     prompt_tokens = ?3,
                     completion_tokens = ?4,
                     total_tokens = ?5,
-                    error = ?6
-                WHERE round_id = ?7
+                    prompt_cached_tool_outputs = ?6,
+                    error = ?7
+                WHERE round_id = ?8
                 "#,
                 params![
                     completed_at_str,
@@ -1051,6 +1063,7 @@ impl MetricsStorage for SqliteMetricsStorage {
                     usage.prompt_tokens as i64,
                     usage.completion_tokens as i64,
                     usage.total_tokens as i64,
+                    i64::from(prompt_cached_tool_outputs),
                     error,
                     round_id,
                 ],
@@ -1421,6 +1434,7 @@ impl MetricsStorage for SqliteMetricsStorage {
                         total_tokens: row.get::<_, i64>(4)? as u64,
                     },
                     total_tool_calls: 0,
+                    prompt_cached_tool_outputs: 0,
                     model_breakdown: HashMap::new(),
                     tool_breakdown: HashMap::new(),
                 });
@@ -1442,7 +1456,7 @@ impl MetricsStorage for SqliteMetricsStorage {
             );
 
             let summary_sql = format!(
-                "SELECT COUNT(*), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(tool_call_count), 0) FROM session_metrics {}",
+                "SELECT COUNT(*), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(tool_call_count), 0), COALESCE(SUM(prompt_cached_tool_outputs), 0) FROM session_metrics {}",
                 where_clause
             );
 
@@ -1456,6 +1470,7 @@ impl MetricsStorage for SqliteMetricsStorage {
                         total_tokens: row.get::<_, i64>(3)? as u64,
                     },
                     total_tool_calls: row.get::<_, i64>(4)? as u64,
+                    prompt_cached_tool_outputs: row.get::<_, i64>(5)? as u64,
                     active_sessions: 0,
                 })
             })?;
@@ -1495,7 +1510,7 @@ impl MetricsStorage for SqliteMetricsStorage {
             );
 
             let sql = format!(
-                "SELECT model, COUNT(*), COALESCE(SUM(total_rounds), 0), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(tool_call_count), 0) FROM session_metrics {} GROUP BY model ORDER BY SUM(total_tokens) DESC",
+                "SELECT model, COUNT(*), COALESCE(SUM(total_rounds), 0), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(tool_call_count), 0), COALESCE(SUM(prompt_cached_tool_outputs), 0) FROM session_metrics {} GROUP BY model ORDER BY SUM(total_tokens) DESC",
                 where_clause
             );
 
@@ -1514,6 +1529,7 @@ impl MetricsStorage for SqliteMetricsStorage {
                         total_tokens: row.get::<_, i64>(5)? as u64,
                     },
                     tool_calls: row.get::<_, i64>(6)? as u64,
+                    prompt_cached_tool_outputs: row.get::<_, i64>(7)? as u64,
                 });
             }
 
@@ -1549,7 +1565,7 @@ impl MetricsStorage for SqliteMetricsStorage {
 
             let limit = i64::from(filter.limit.unwrap_or(100).min(1_000));
             let sql = format!(
-                "SELECT session_id, model, started_at, completed_at, total_rounds, prompt_tokens, completion_tokens, total_tokens, tool_call_count, status, message_count FROM session_metrics {} ORDER BY started_at DESC LIMIT {}",
+                "SELECT session_id, model, started_at, completed_at, total_rounds, prompt_tokens, completion_tokens, total_tokens, tool_call_count, prompt_cached_tool_outputs, status, message_count FROM session_metrics {} ORDER BY started_at DESC LIMIT {}",
                 where_sql, limit
             );
 
@@ -1561,7 +1577,7 @@ impl MetricsStorage for SqliteMetricsStorage {
                 let session_id: String = row.get(0)?;
                 let started_at = parse_timestamp(row.get::<_, String>(2)?)?;
                 let completed_at = parse_optional_timestamp(row.get::<_, Option<String>>(3)?)?;
-                let status_raw: String = row.get(9)?;
+                let status_raw: String = row.get(10)?;
                 let status = SessionStatus::from_db(&status_raw).ok_or_else(|| {
                     MetricsError::InvalidData(format!("unknown session status: {}", status_raw))
                 })?;
@@ -1579,9 +1595,10 @@ impl MetricsStorage for SqliteMetricsStorage {
                         total_tokens: row.get::<_, i64>(7)? as u64,
                     },
                     tool_call_count: row.get::<_, i64>(8)? as u32,
+                    prompt_cached_tool_outputs: row.get::<_, i64>(9)? as u64,
                     tool_breakdown,
                     status,
-                    message_count: row.get::<_, i64>(10)? as u32,
+                    message_count: row.get::<_, i64>(11)? as u32,
                     duration_ms: compute_duration_ms(started_at, completed_at),
                 });
             }
@@ -1594,7 +1611,7 @@ impl MetricsStorage for SqliteMetricsStorage {
     async fn session_detail(&self, session_id: &str) -> MetricsResult<Option<SessionDetail>> {
         let session_id = session_id.to_string();
         self.with_connection(move |connection| {
-            let session_sql = "SELECT session_id, model, started_at, completed_at, total_rounds, prompt_tokens, completion_tokens, total_tokens, tool_call_count, status, message_count FROM session_metrics WHERE session_id = ?1";
+            let session_sql = "SELECT session_id, model, started_at, completed_at, total_rounds, prompt_tokens, completion_tokens, total_tokens, tool_call_count, prompt_cached_tool_outputs, status, message_count FROM session_metrics WHERE session_id = ?1";
             let session_row = connection
                 .query_row(session_sql, params![session_id], |row| {
                     Ok((
@@ -1607,8 +1624,9 @@ impl MetricsStorage for SqliteMetricsStorage {
                         row.get::<_, i64>(6)?,
                         row.get::<_, i64>(7)?,
                         row.get::<_, i64>(8)?,
-                        row.get::<_, String>(9)?,
-                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, i64>(11)?,
                     ))
                 })
                 .optional()?;
@@ -1623,6 +1641,7 @@ impl MetricsStorage for SqliteMetricsStorage {
                 completion_tokens,
                 total_tokens,
                 tool_call_count,
+                prompt_cached_tool_outputs,
                 status_raw,
                 message_count,
             )) = session_row
@@ -1649,6 +1668,7 @@ impl MetricsStorage for SqliteMetricsStorage {
                     total_tokens: total_tokens as u64,
                 },
                 tool_call_count: tool_call_count as u32,
+                prompt_cached_tool_outputs: prompt_cached_tool_outputs as u64,
                 tool_breakdown,
                 status,
                 message_count: message_count as u32,
@@ -1680,7 +1700,8 @@ impl MetricsStorage for SqliteMetricsStorage {
                     COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
                     COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
                     COALESCE(SUM(total_tokens), 0) AS total_tokens,
-                    COALESCE(SUM(tool_call_count), 0) AS total_tool_calls
+                    COALESCE(SUM(tool_call_count), 0) AS total_tool_calls,
+                    COALESCE(SUM(prompt_cached_tool_outputs), 0) AS prompt_cached_tool_outputs
                 FROM session_metrics
                 WHERE date(started_at) BETWEEN date(?1) AND date(?2)
                 GROUP BY date_key
@@ -1706,6 +1727,7 @@ impl MetricsStorage for SqliteMetricsStorage {
                         total_tokens: row.get::<_, i64>(5)? as u64,
                     },
                     total_tool_calls: row.get::<_, i64>(6)? as u32,
+                    prompt_cached_tool_outputs: row.get::<_, i64>(7)? as u64,
                     model_breakdown,
                     tool_breakdown,
                 });
@@ -1934,6 +1956,28 @@ fn build_forward_where_clause(
     }
 }
 
+fn ensure_integer_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    default_value: i64,
+) -> MetricsResult<()> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = connection.prepare(&pragma)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(());
+        }
+    }
+
+    let alter =
+        format!("ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT {default_value}");
+    connection.execute(&alter, [])?;
+    Ok(())
+}
+
 /// Refreshes aggregated metrics for a session by recalculating from child entities.
 ///
 /// This function updates the session's aggregate columns by summing values
@@ -1946,6 +1990,7 @@ fn build_forward_where_clause(
 /// - `prompt_tokens`: Sum of prompt tokens from all rounds
 /// - `completion_tokens`: Sum of completion tokens from all rounds
 /// - `total_tokens`: Sum of total tokens from all rounds
+/// - `prompt_cached_tool_outputs`: Sum of prompt-side cached tool outputs from all rounds
 /// - `tool_call_count`: Count of tool calls in the session
 /// - `updated_at`: Timestamp of this update
 ///
@@ -1972,6 +2017,7 @@ fn refresh_session_aggregates(
             prompt_tokens = COALESCE((SELECT SUM(prompt_tokens) FROM round_metrics WHERE session_id = ?1), 0),
             completion_tokens = COALESCE((SELECT SUM(completion_tokens) FROM round_metrics WHERE session_id = ?1), 0),
             total_tokens = COALESCE((SELECT SUM(total_tokens) FROM round_metrics WHERE session_id = ?1), 0),
+            prompt_cached_tool_outputs = COALESCE((SELECT SUM(prompt_cached_tool_outputs) FROM round_metrics WHERE session_id = ?1), 0),
             tool_call_count = COALESCE((SELECT COUNT(*) FROM tool_call_metrics WHERE session_id = ?1), 0),
             updated_at = ?2
         WHERE session_id = ?1
@@ -2042,7 +2088,7 @@ fn load_tool_breakdown(
 /// - Status values are invalid
 fn load_rounds(connection: &Connection, session_id: &str) -> MetricsResult<Vec<RoundMetrics>> {
     let mut stmt = connection.prepare(
-        "SELECT round_id, session_id, model, started_at, completed_at, status, prompt_tokens, completion_tokens, total_tokens, error FROM round_metrics WHERE session_id = ?1 ORDER BY started_at ASC",
+        "SELECT round_id, session_id, model, started_at, completed_at, status, prompt_tokens, completion_tokens, total_tokens, prompt_cached_tool_outputs, error FROM round_metrics WHERE session_id = ?1 ORDER BY started_at ASC",
     )?;
     let mut rows = stmt.query(params![session_id])?;
     let mut rounds = Vec::new();
@@ -2069,7 +2115,8 @@ fn load_rounds(connection: &Connection, session_id: &str) -> MetricsResult<Vec<R
             },
             tool_calls: load_tool_calls(connection, &round_id)?,
             status,
-            error: row.get(9)?,
+            prompt_cached_tool_outputs: row.get::<_, i64>(9)? as u32,
+            error: row.get(10)?,
             duration_ms: compute_duration_ms(started_at, completed_at),
         });
     }
@@ -2273,6 +2320,7 @@ mod tests {
                     completion_tokens: 15,
                     total_tokens: 25,
                 },
+                3,
                 None,
             )
             .await
@@ -2290,6 +2338,16 @@ mod tests {
         assert_eq!(summary.total_sessions, 1);
         assert_eq!(summary.total_tokens.total_tokens, 25);
         assert_eq!(summary.total_tool_calls, 1);
+        assert_eq!(summary.prompt_cached_tool_outputs, 3);
+
+        let detail = storage
+            .session_detail("session-a")
+            .await
+            .expect("session detail query")
+            .expect("session detail should exist");
+        assert_eq!(detail.session.prompt_cached_tool_outputs, 3);
+        assert_eq!(detail.rounds.len(), 1);
+        assert_eq!(detail.rounds[0].prompt_cached_tool_outputs, 3);
     }
 
     #[tokio::test]
@@ -2341,6 +2399,7 @@ mod tests {
                     completion_tokens: 1,
                     total_tokens: 2,
                 },
+                0,
                 None,
             )
             .await
@@ -2410,6 +2469,7 @@ mod tests {
                     completion_tokens: 7,
                     total_tokens: 10,
                 },
+                0,
                 None,
             )
             .await

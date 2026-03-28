@@ -35,6 +35,7 @@ enum CollectorCommand {
         completed_at: DateTime<Utc>,
         status: RoundStatus,
         usage: TokenUsage,
+        prompt_cached_tool_outputs: u32,
         error: Option<String>,
     },
     ToolStarted {
@@ -126,10 +127,18 @@ impl MetricsCollector {
                         completed_at,
                         status,
                         usage,
+                        prompt_cached_tool_outputs,
                         error,
                     } => {
                         storage
-                            .complete_round(&round_id, completed_at, status, usage, error)
+                            .complete_round(
+                                &round_id,
+                                completed_at,
+                                status,
+                                usage,
+                                prompt_cached_tool_outputs,
+                                error,
+                            )
                             .await
                     }
                     CollectorCommand::ToolStarted {
@@ -265,6 +274,7 @@ impl MetricsCollector {
         completed_at: DateTime<Utc>,
         status: RoundStatus,
         usage: TokenUsage,
+        prompt_cached_tool_outputs: u32,
         error: Option<String>,
     ) {
         let _ = self.tx.send(CollectorCommand::RoundCompleted {
@@ -272,6 +282,7 @@ impl MetricsCollector {
             completed_at,
             status,
             usage,
+            prompt_cached_tool_outputs,
             error,
         });
     }

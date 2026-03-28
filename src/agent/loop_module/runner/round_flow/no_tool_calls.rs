@@ -35,6 +35,12 @@ pub(super) async fn handle_no_tool_calls(
         session.messages.len() as u32,
         MetricsRoundStatus::Success,
         round_usage,
+        session
+            .token_usage
+            .as_ref()
+            .map(|usage| usage.prompt_cached_tool_outputs)
+            .unwrap_or(0)
+            .min(u32::MAX as usize) as u32,
         None,
     );
 

@@ -147,7 +147,14 @@ impl MetricsWorker {
                 ..
             } => {
                 storage
-                    .complete_round(round_id, meta.occurred_at, *status, *usage, error.clone())
+                    .complete_round(
+                        round_id,
+                        meta.occurred_at,
+                        *status,
+                        *usage,
+                        0,
+                        error.clone(),
+                    )
                     .await?;
                 info!(
                     "Chat: RoundCompleted - {} ({:?}) - {} tokens",
