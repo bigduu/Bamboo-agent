@@ -58,6 +58,7 @@ pub(super) async fn execute_llm_round(
         event_tx,
         cancel_token,
         &prepared.prepared_context,
+        prepared.budget.max_context_tokens,
         tool_schemas,
         prepared.budget.max_output_tokens,
         model,

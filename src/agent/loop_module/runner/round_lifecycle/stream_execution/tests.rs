@@ -111,6 +111,7 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
         &event_tx,
         &CancellationToken::new(),
         &prepared_context,
+        400_000,
         &[],
         128,
         "test-model",
@@ -125,6 +126,10 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
     assert_eq!(stream_output.content, "hi");
     assert!(stream_output.reasoning_content.is_empty());
     assert!(session.token_usage.is_some());
+    assert_eq!(
+        session.token_usage.as_ref().map(|usage| usage.max_context_tokens),
+        Some(400_000)
+    );
 
     let first = event_rx.recv().await.expect("budget event expected");
     assert!(matches!(first, AgentEvent::TokenBudgetUpdated { .. }));
@@ -200,6 +205,7 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
         &event_tx,
         &CancellationToken::new(),
         &prepared_context,
+        400_000,
         &[],
         128,
         "test-model",
@@ -257,6 +263,89 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
 }
 
 #[tokio::test]
+async fn execute_llm_stream_disables_previous_response_id_when_local_summary_or_compression_is_active(
+) {
+    let mut session = Session::new("session-stream-2b", "test-model");
+    session.metadata.insert(
+        "responses.previous_response_id".to_string(),
+        "resp_prev".to_string(),
+    );
+    session.conversation_summary =
+        Some(crate::agent::core::agent::types::ConversationSummary::new(
+            "Older work has been summarized locally.",
+            6,
+            42,
+        ));
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("system"),
+            Message::user("previous work was compressed"),
+            Message::assistant("here is the local summary context", None),
+            Message::user("continue from the compressed state"),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: TokenUsageBreakdown {
+            system_tokens: 10,
+            summary_tokens: 18,
+            window_tokens: 12,
+            total_tokens: 40,
+            budget_limit: 100,
+        },
+        truncation_occurred: false,
+        segments_removed: 1,
+        compressed_message_ids: vec!["msg_old_1".to_string(), "msg_old_2".to_string()],
+    };
+
+    let llm = Arc::new(MockLlmProvider {
+        chunks: vec![
+            LLMChunk::ResponseId("resp_next".to_string()),
+            LLMChunk::Token("done".to_string()),
+            LLMChunk::Done,
+        ],
+        requested_messages: Mutex::new(Vec::new()),
+        requested_previous_response_id: Mutex::new(None),
+        requested_reasoning_summary: Mutex::new(None),
+        requested_store: Mutex::new(None),
+        requested_include: Mutex::new(None),
+        requested_text_verbosity: Mutex::new(None),
+    });
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+
+    let (_stream_output, _duration) = execute_llm_stream(
+        &mut session,
+        &llm_dyn,
+        &event_tx,
+        &CancellationToken::new(),
+        &prepared_context,
+        400_000,
+        &[],
+        128,
+        "test-model",
+        Some("openai"),
+        None,
+        "session-stream-2b",
+    )
+    .await
+    .expect("execute llm stream");
+
+    let requested_messages = llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .clone();
+    assert_eq!(requested_messages.len(), prepared_context.messages.len());
+    assert_eq!(
+        llm.requested_previous_response_id
+            .lock()
+            .expect("previous_response_id lock")
+            .as_deref(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
     let mut session = Session::new("session-stream-3", "test-model");
     session.metadata.insert(
@@ -305,6 +394,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
         &event_tx,
         &CancellationToken::new(),
         &prepared_context,
+        400_000,
         &[],
         128,
         "test-model",

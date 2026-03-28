@@ -20,6 +20,7 @@ async fn session_index_persists_token_usage() {
         summary_tokens: 20,
         window_tokens: 30,
         total_tokens: 60,
+        max_context_tokens: 4000,
         budget_limit: 1000,
         truncation_occurred: true,
         segments_removed: 3,

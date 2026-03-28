@@ -13,6 +13,7 @@
 //! - [`preparation`]: Context preparation with budget enforcement
 //! - [`summarizer`]: Conversation summarization for context preservation
 
+pub mod compression_tooling;
 pub mod counter;
 pub mod limits;
 pub mod preparation;
@@ -20,6 +21,12 @@ pub mod segmenter;
 pub mod summarizer;
 pub mod types;
 
+pub use compression_tooling::{
+    active_messages_for_budget, apply_compression_plan, build_compression_plan_with_summary,
+    build_forced_compression_plan_with_summary, build_summary_prompt, compression_summary_message,
+    estimate_context_compression_exposure, summary_source_messages, CompressionPlan,
+    ContextCompressionExposure,
+};
 pub use counter::{HeuristicTokenCounter, TokenCounter};
 pub use limits::{create_budget_for_model, ModelLimitsRegistry};
 pub use preparation::prepare_hybrid_context;

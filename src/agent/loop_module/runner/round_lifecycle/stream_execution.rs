@@ -31,6 +31,16 @@ fn continuation_messages(messages: &[Message]) -> Option<&[Message]> {
     (!continuation.is_empty()).then_some(continuation)
 }
 
+fn should_disable_previous_response_id(
+    session: &Session,
+    prepared_context: &PreparedContext,
+) -> bool {
+    session.conversation_summary.is_some()
+        || !prepared_context.compressed_message_ids.is_empty()
+        || prepared_context.token_usage.summary_tokens > 0
+        || prepared_context.truncation_occurred
+}
+
 fn provider_supports_previous_response_id(provider_name: Option<&str>) -> bool {
     !matches!(provider_name.map(str::trim), Some("copilot"))
 }
@@ -111,6 +121,7 @@ pub(super) async fn execute_llm_stream(
     event_tx: &mpsc::Sender<AgentEvent>,
     cancel_token: &CancellationToken,
     prepared_context: &PreparedContext,
+    max_context_tokens: u32,
     tool_schemas: &[ToolSchema],
     max_output_tokens: u32,
     model: &str,
@@ -126,7 +137,9 @@ pub(super) async fn execute_llm_stream(
 > {
     let llm_started_at = std::time::Instant::now();
     let supports_previous_response_id = provider_supports_previous_response_id(provider_name);
-    let previous_response_id = if supports_previous_response_id {
+    let disable_previous_response_id =
+        should_disable_previous_response_id(session, prepared_context);
+    let previous_response_id = if supports_previous_response_id && !disable_previous_response_id {
         session_previous_response_id(session)
     } else {
         None
@@ -159,6 +172,11 @@ pub(super) async fn execute_llm_stream(
             "[{}] Responses API previous_response_id disabled for provider={}",
             session_id,
             provider_name.unwrap_or("unknown")
+        );
+    } else if disable_previous_response_id {
+        tracing::debug!(
+            "[{}] Responses API previous_response_id disabled because local context compression/summary state is active",
+            session_id
         );
     } else if let Some(response_id) = previous_response_id {
         tracing::debug!(
@@ -197,6 +215,7 @@ pub(super) async fn execute_llm_stream(
         summary_tokens: prepared_context.token_usage.summary_tokens,
         window_tokens: prepared_context.token_usage.window_tokens,
         total_tokens: prepared_context.token_usage.total_tokens,
+        max_context_tokens,
         budget_limit: prepared_context.token_usage.budget_limit,
         truncation_occurred: prepared_context.truncation_occurred,
         segments_removed: prepared_context.segments_removed,

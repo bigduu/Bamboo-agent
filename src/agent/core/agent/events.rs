@@ -304,6 +304,7 @@ pub struct TokenUsage {
 /// * `summary_tokens` - Tokens in conversation summary
 /// * `window_tokens` - Tokens in recent message window
 /// * `total_tokens` - Total tokens in prepared context
+/// * `max_context_tokens` - Model context window size before output/safety reservations
 /// * `budget_limit` - Maximum allowed input tokens
 /// * `truncation_occurred` - Whether old messages were removed
 /// * `segments_removed` - Number of message segments truncated
@@ -316,6 +317,7 @@ pub struct TokenUsage {
 ///     summary_tokens: 200,
 ///     window_tokens: 3000,
 ///     total_tokens: 3700,
+///     max_context_tokens: 8000,
 ///     budget_limit: 4000,
 ///     truncation_occurred: true,
 ///     segments_removed: 5,
@@ -331,6 +333,9 @@ pub struct TokenBudgetUsage {
     pub window_tokens: u32,
     /// Total tokens in prepared context
     pub total_tokens: u32,
+    /// Model context window size (input + output before reservations)
+    #[serde(default)]
+    pub max_context_tokens: u32,
     /// Budget limit for input tokens
     pub budget_limit: u32,
     /// Whether truncation occurred

@@ -29,6 +29,7 @@ async fn test_patch_message_persists_and_clears_derived_context() {
         summary_tokens: 5,
         window_tokens: 15,
         total_tokens: 30,
+        max_context_tokens: 4000,
         budget_limit: 100,
         truncation_occurred: false,
         segments_removed: 0,
