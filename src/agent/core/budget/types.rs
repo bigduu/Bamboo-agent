@@ -17,6 +17,16 @@ const DEFAULT_COMPRESSION_TARGET_PERCENT: u8 = 50;
 const MIN_COMPRESSION_TARGET_PERCENT: u32 = 20;
 /// Maximum allowed compression target percent.
 const MAX_COMPRESSION_TARGET_PERCENT: u32 = 50;
+/// Default minimum tool output length (chars) before prompt-side cache compaction is considered.
+const DEFAULT_PROMPT_CACHE_MIN_TOOL_OUTPUT_CHARS: u32 = 1_200;
+/// Default number of leading characters preserved in cached tool output summaries.
+const DEFAULT_PROMPT_CACHE_HEAD_CHARS: u32 = 280;
+/// Default number of trailing characters preserved in cached tool output summaries.
+const DEFAULT_PROMPT_CACHE_TAIL_CHARS: u32 = 180;
+/// Default number of latest user turns protected from prompt-side cache compaction.
+const DEFAULT_PROMPT_CACHE_RECENT_USER_TURNS: u8 = 2;
+/// Default number of latest tool call chains protected from prompt-side cache compaction.
+const DEFAULT_PROMPT_CACHE_RECENT_TOOL_CHAINS: u8 = 2;
 
 /// Token budget configuration for a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +53,21 @@ pub struct TokenBudget {
     /// to the supported range `[20, 50]`.
     #[serde(default = "default_compression_target_percent")]
     pub compression_target_percent: u8,
+    /// Minimum tool output character length required before prompt-side cache compaction.
+    #[serde(default = "default_prompt_cache_min_tool_output_chars")]
+    pub prompt_cache_min_tool_output_chars: u32,
+    /// Leading excerpt length (chars) kept in cached tool output summaries.
+    #[serde(default = "default_prompt_cache_head_chars")]
+    pub prompt_cache_head_chars: u32,
+    /// Trailing excerpt length (chars) kept in cached tool output summaries.
+    #[serde(default = "default_prompt_cache_tail_chars")]
+    pub prompt_cache_tail_chars: u32,
+    /// Number of latest user turns protected from prompt-side cache compaction.
+    #[serde(default = "default_prompt_cache_recent_user_turns")]
+    pub prompt_cache_recent_user_turns: u8,
+    /// Number of latest tool call chains protected from prompt-side cache compaction.
+    #[serde(default = "default_prompt_cache_recent_tool_chains")]
+    pub prompt_cache_recent_tool_chains: u8,
 }
 
 fn default_safety_margin() -> u32 {
@@ -58,6 +83,26 @@ fn default_compression_target_percent() -> u8 {
     DEFAULT_COMPRESSION_TARGET_PERCENT
 }
 
+fn default_prompt_cache_min_tool_output_chars() -> u32 {
+    DEFAULT_PROMPT_CACHE_MIN_TOOL_OUTPUT_CHARS
+}
+
+fn default_prompt_cache_head_chars() -> u32 {
+    DEFAULT_PROMPT_CACHE_HEAD_CHARS
+}
+
+fn default_prompt_cache_tail_chars() -> u32 {
+    DEFAULT_PROMPT_CACHE_TAIL_CHARS
+}
+
+fn default_prompt_cache_recent_user_turns() -> u8 {
+    DEFAULT_PROMPT_CACHE_RECENT_USER_TURNS
+}
+
+fn default_prompt_cache_recent_tool_chains() -> u8 {
+    DEFAULT_PROMPT_CACHE_RECENT_TOOL_CHAINS
+}
+
 impl TokenBudget {
     /// Create a new token budget with the specified parameters.
     pub fn new(max_context_tokens: u32, max_output_tokens: u32, strategy: BudgetStrategy) -> Self {
@@ -69,6 +114,11 @@ impl TokenBudget {
             safety_margin,
             compression_trigger_percent: default_compression_trigger_percent(),
             compression_target_percent: default_compression_target_percent(),
+            prompt_cache_min_tool_output_chars: default_prompt_cache_min_tool_output_chars(),
+            prompt_cache_head_chars: default_prompt_cache_head_chars(),
+            prompt_cache_tail_chars: default_prompt_cache_tail_chars(),
+            prompt_cache_recent_user_turns: default_prompt_cache_recent_user_turns(),
+            prompt_cache_recent_tool_chains: default_prompt_cache_recent_tool_chains(),
         }
     }
 
@@ -86,6 +136,11 @@ impl TokenBudget {
             safety_margin,
             compression_trigger_percent: default_compression_trigger_percent(),
             compression_target_percent: default_compression_target_percent(),
+            prompt_cache_min_tool_output_chars: default_prompt_cache_min_tool_output_chars(),
+            prompt_cache_head_chars: default_prompt_cache_head_chars(),
+            prompt_cache_tail_chars: default_prompt_cache_tail_chars(),
+            prompt_cache_recent_user_turns: default_prompt_cache_recent_user_turns(),
+            prompt_cache_recent_tool_chains: default_prompt_cache_recent_tool_chains(),
         }
     }
 
@@ -298,6 +353,16 @@ mod tests {
     fn compression_target_defaults_to_fifty_percent() {
         let budget = TokenBudget::for_model(128_000);
         assert_eq!(budget.compression_target_percent, 50);
+    }
+
+    #[test]
+    fn prompt_cache_defaults_match_current_compaction_policy() {
+        let budget = TokenBudget::for_model(128_000);
+        assert_eq!(budget.prompt_cache_min_tool_output_chars, 1_200);
+        assert_eq!(budget.prompt_cache_head_chars, 280);
+        assert_eq!(budget.prompt_cache_tail_chars, 180);
+        assert_eq!(budget.prompt_cache_recent_user_turns, 2);
+        assert_eq!(budget.prompt_cache_recent_tool_chains, 2);
     }
 
     #[test]

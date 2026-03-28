@@ -412,6 +412,11 @@ mod tests {
             safety_margin: 0,
             compression_trigger_percent: 50,
             compression_target_percent: 20,
+            prompt_cache_min_tool_output_chars: 1_200,
+            prompt_cache_head_chars: 280,
+            prompt_cache_tail_chars: 180,
+            prompt_cache_recent_user_turns: 2,
+            prompt_cache_recent_tool_chains: 2,
         }
     }
 
@@ -581,6 +586,11 @@ mod tests {
             safety_margin: 0,
             compression_trigger_percent: 80,
             compression_target_percent: 50,
+            prompt_cache_min_tool_output_chars: 1_200,
+            prompt_cache_head_chars: 280,
+            prompt_cache_tail_chars: 180,
+            prompt_cache_recent_user_turns: 2,
+            prompt_cache_recent_tool_chains: 2,
         });
         session.add_message(Message::system("system"));
         session.add_message(Message::user("short"));

@@ -11,11 +11,10 @@ use crate::agent::core::budget::types::{
 };
 use std::collections::{HashMap, HashSet};
 
-const PROMPT_CACHE_MIN_TOOL_OUTPUT_CHARS: usize = 1_200;
-const PROMPT_CACHE_HEAD_CHARS: usize = 280;
-const PROMPT_CACHE_TAIL_CHARS: usize = 180;
-const PROMPT_CACHE_RECENT_USER_TURNS: usize = 2;
-const PROMPT_CACHE_RECENT_TOOL_CHAINS: usize = 2;
+const PROMPT_CACHE_MAX_MIN_TOOL_OUTPUT_CHARS: usize = 200_000;
+const PROMPT_CACHE_MAX_EXCERPT_CHARS: usize = 20_000;
+const PROMPT_CACHE_MAX_RECENT_USER_TURNS: usize = 64;
+const PROMPT_CACHE_MAX_RECENT_TOOL_CHAINS: usize = 64;
 const PROMPT_CACHE_MARKER: &str = "[cached_tool_output]";
 
 /// Prepare context for LLM call with budget enforcement.
@@ -327,6 +326,15 @@ struct PromptCacheCompactionResult {
     compacted_tool_outputs: usize,
 }
 
+#[derive(Clone, Copy)]
+struct PromptCachePolicy {
+    min_tool_output_chars: usize,
+    head_chars: usize,
+    tail_chars: usize,
+    recent_user_turns: usize,
+    recent_tool_chains: usize,
+}
+
 struct PromptCacheCandidate {
     index: usize,
     cached_summary: String,
@@ -348,6 +356,7 @@ fn maybe_compact_old_tool_outputs_for_prompt(
             compacted_tool_outputs: 0,
         };
     }
+    let policy = prompt_cache_policy_from_budget(budget);
 
     let available = budget.available_input_tokens();
     if available == 0 {
@@ -357,11 +366,12 @@ fn maybe_compact_old_tool_outputs_for_prompt(
         };
     }
 
-    // Require at least two user turns before compacting old tool traces.
-    // ask_user tool calls do not create Role::User messages, so they are
-    // naturally excluded from this turn boundary.
+    // Keep the configured number of latest user turns unmodified when
+    // compacting older tool traces. ask_user tool calls do not create
+    // Role::User messages, so they are naturally excluded from this
+    // turn boundary.
     let Some(protected_turn_start) =
-        recent_user_turn_start_index(&active_messages, PROMPT_CACHE_RECENT_USER_TURNS)
+        recent_user_turn_start_index(&active_messages, policy.recent_user_turns)
     else {
         return PromptCacheCompactionResult {
             messages: active_messages,
@@ -384,12 +394,13 @@ fn maybe_compact_old_tool_outputs_for_prompt(
     let usage_before = (total_tokens as f64 / available as f64) * 100.0;
     let tool_call_names = tool_call_name_index(&active_messages);
     let protected_recent_calls =
-        collect_recent_tool_call_ids(&active_messages, PROMPT_CACHE_RECENT_TOOL_CHAINS);
+        collect_recent_tool_call_ids(&active_messages, policy.recent_tool_chains);
     let mut candidates = build_prompt_cache_candidates(
         &active_messages,
         protected_turn_start,
         &protected_recent_calls,
         &tool_call_names,
+        policy,
         counter,
     );
 
@@ -449,6 +460,7 @@ fn build_prompt_cache_candidates(
     protected_turn_start: usize,
     protected_recent_calls: &HashSet<String>,
     tool_call_names: &HashMap<String, String>,
+    policy: PromptCachePolicy,
     counter: &dyn TokenCounter,
 ) -> Vec<PromptCacheCandidate> {
     let mut candidates = Vec::new();
@@ -473,12 +485,17 @@ fn build_prompt_cache_candidates(
         }
 
         let original_char_count = message.content.chars().count();
-        if original_char_count < PROMPT_CACHE_MIN_TOOL_OUTPUT_CHARS {
+        if original_char_count < policy.min_tool_output_chars {
             continue;
         }
 
-        let cached_summary =
-            build_cached_tool_output_summary(tool_name, tool_call_id, &message.content);
+        let cached_summary = build_cached_tool_output_summary(
+            tool_name,
+            tool_call_id,
+            &message.content,
+            policy.head_chars,
+            policy.tail_chars,
+        );
         if cached_summary.chars().count() >= original_char_count {
             continue;
         }
@@ -580,9 +597,34 @@ fn is_cacheable_tool_name(tool_name: &str) -> bool {
     )
 }
 
-fn build_cached_tool_output_summary(tool_name: &str, tool_call_id: &str, content: &str) -> String {
-    let head = take_first_chars(content, PROMPT_CACHE_HEAD_CHARS);
-    let tail = take_last_chars(content, PROMPT_CACHE_TAIL_CHARS);
+fn prompt_cache_policy_from_budget(budget: &TokenBudget) -> PromptCachePolicy {
+    let min_tool_output_chars = (budget.prompt_cache_min_tool_output_chars as usize)
+        .min(PROMPT_CACHE_MAX_MIN_TOOL_OUTPUT_CHARS);
+    let head_chars = (budget.prompt_cache_head_chars as usize).min(PROMPT_CACHE_MAX_EXCERPT_CHARS);
+    let tail_chars = (budget.prompt_cache_tail_chars as usize).min(PROMPT_CACHE_MAX_EXCERPT_CHARS);
+    let recent_user_turns =
+        (budget.prompt_cache_recent_user_turns as usize).min(PROMPT_CACHE_MAX_RECENT_USER_TURNS);
+    let recent_tool_chains =
+        (budget.prompt_cache_recent_tool_chains as usize).min(PROMPT_CACHE_MAX_RECENT_TOOL_CHAINS);
+
+    PromptCachePolicy {
+        min_tool_output_chars,
+        head_chars,
+        tail_chars,
+        recent_user_turns,
+        recent_tool_chains,
+    }
+}
+
+fn build_cached_tool_output_summary(
+    tool_name: &str,
+    tool_call_id: &str,
+    content: &str,
+    head_chars: usize,
+    tail_chars: usize,
+) -> String {
+    let head = take_first_chars(content, head_chars);
+    let tail = take_last_chars(content, tail_chars);
     let line_count = content.lines().count();
     let char_count = content.chars().count();
 
@@ -1509,6 +1551,64 @@ mod tests {
             prepared.prompt_cached_tool_outputs, 1,
             "only one compaction should be required when highest-savings candidate is selected first"
         );
+    }
+
+    #[test]
+    fn prompt_cache_respects_budget_min_tool_output_chars_setting() {
+        let old_tool_output = "old-read-output ".repeat(120);
+        let recent_tool_output = "recent-read-output ".repeat(120);
+
+        let counter = DeterministicCounter::new(6)
+            .with_message_token("System", 20)
+            .with_message_token("User turn 1", 15)
+            .with_message_token("Reading old files", 10)
+            .with_message_token(old_tool_output.clone(), 220)
+            .with_message_token("Old analysis", 10)
+            .with_message_token("User turn 2", 15)
+            .with_message_token("Reading recent files", 10)
+            .with_message_token(recent_tool_output.clone(), 220)
+            .with_message_token("Recent analysis", 10)
+            .with_message_token("User turn 3", 15)
+            .with_message_token("Current conclusion", 10);
+
+        let mut budget =
+            TokenBudget::with_safety_margin(700, 100, BudgetStrategy::Window { size: 60 }, 0);
+        budget.compression_trigger_percent = 80;
+        budget.prompt_cache_min_tool_output_chars = 10_000;
+
+        let messages = vec![
+            Message::system("System"),
+            Message::user("User turn 1"),
+            Message::assistant(
+                "Reading old files",
+                Some(vec![create_named_tool_call("call_old", "Read")]),
+            ),
+            Message::tool_result("call_old", old_tool_output.clone()),
+            Message::assistant("Old analysis", None),
+            Message::user("User turn 2"),
+            Message::assistant(
+                "Reading recent files",
+                Some(vec![create_named_tool_call("call_recent", "Read")]),
+            ),
+            Message::tool_result("call_recent", recent_tool_output.clone()),
+            Message::assistant("Recent analysis", None),
+            Message::user("User turn 3"),
+            Message::assistant("Current conclusion", None),
+        ];
+
+        let session = make_session_with_messages(messages);
+        let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
+
+        let old_tool = prepared
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call_old"))
+            .expect("old tool output should stay in prepared context");
+        assert!(
+            old_tool.content.contains("old-read-output"),
+            "raising min_tool_output_chars should suppress prompt-side cache compaction"
+        );
+        assert_eq!(prepared.prompt_cached_tool_outputs, 0);
     }
 
     #[test]
