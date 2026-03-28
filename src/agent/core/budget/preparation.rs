@@ -327,6 +327,14 @@ struct PromptCacheCompactionResult {
     compacted_tool_outputs: usize,
 }
 
+struct PromptCacheCandidate {
+    index: usize,
+    cached_summary: String,
+    old_tokens: u32,
+    new_tokens: u32,
+    saved_tokens: u32,
+}
+
 fn maybe_compact_old_tool_outputs_for_prompt(
     session: &Session,
     mut active_messages: Vec<crate::agent::core::Message>,
@@ -377,13 +385,75 @@ fn maybe_compact_old_tool_outputs_for_prompt(
     let tool_call_names = tool_call_name_index(&active_messages);
     let protected_recent_calls =
         collect_recent_tool_call_ids(&active_messages, PROMPT_CACHE_RECENT_TOOL_CHAINS);
+    let mut candidates = build_prompt_cache_candidates(
+        &active_messages,
+        protected_turn_start,
+        &protected_recent_calls,
+        &tool_call_names,
+        counter,
+    );
+
+    if candidates.is_empty() {
+        return PromptCacheCompactionResult {
+            messages: active_messages,
+            compacted_tool_outputs: 0,
+        };
+    }
+
+    // Compact highest-yield candidates first so we minimize how many messages
+    // are rewritten while still getting below the trigger threshold.
+    candidates.sort_by(|a, b| {
+        b.saved_tokens
+            .cmp(&a.saved_tokens)
+            .then_with(|| a.index.cmp(&b.index))
+    });
 
     let mut compacted_count = 0usize;
+    let mut saved_tokens_total = 0u32;
 
-    for (index, message) in active_messages.iter_mut().enumerate() {
+    for candidate in candidates {
         if total_tokens <= trigger_limit {
             break;
         }
+        let message = &mut active_messages[candidate.index];
+        message.content = candidate.cached_summary;
+
+        compacted_count += 1;
+        saved_tokens_total = saved_tokens_total.saturating_add(candidate.saved_tokens);
+        total_tokens = total_tokens
+            .saturating_sub(candidate.old_tokens)
+            .saturating_add(candidate.new_tokens);
+    }
+
+    if compacted_count > 0 {
+        let usage_after = (total_tokens as f64 / available as f64) * 100.0;
+        tracing::info!(
+            "[{}] Prompt-side tool output cache applied: compacted_messages={}, saved_tokens={}, usage_before={:.1}%, usage_after={:.1}%, trigger={}%",
+            session.id,
+            compacted_count,
+            saved_tokens_total,
+            usage_before,
+            usage_after,
+            budget.compression_trigger_percent
+        );
+    }
+
+    PromptCacheCompactionResult {
+        messages: active_messages,
+        compacted_tool_outputs: compacted_count,
+    }
+}
+
+fn build_prompt_cache_candidates(
+    messages: &[crate::agent::core::Message],
+    protected_turn_start: usize,
+    protected_recent_calls: &HashSet<String>,
+    tool_call_names: &HashMap<String, String>,
+    counter: &dyn TokenCounter,
+) -> Vec<PromptCacheCandidate> {
+    let mut candidates = Vec::new();
+
+    for (index, message) in messages.iter().enumerate() {
         if index >= protected_turn_start || message.role != Role::Tool {
             continue;
         }
@@ -413,38 +483,28 @@ fn maybe_compact_old_tool_outputs_for_prompt(
             continue;
         }
 
-        let original_content = message.content.clone();
         let old_tokens = counter.count_message(message);
-        message.content = cached_summary;
-        let new_tokens = counter.count_message(message);
-
-        if new_tokens >= old_tokens {
-            message.content = original_content;
+        if old_tokens == 0 {
             continue;
         }
 
-        compacted_count += 1;
-        total_tokens = total_tokens
-            .saturating_sub(old_tokens)
-            .saturating_add(new_tokens);
+        let mut preview_message = message.clone();
+        preview_message.content = cached_summary.clone();
+        let new_tokens = counter.count_message(&preview_message);
+        if new_tokens >= old_tokens {
+            continue;
+        }
+
+        candidates.push(PromptCacheCandidate {
+            index,
+            cached_summary,
+            old_tokens,
+            new_tokens,
+            saved_tokens: old_tokens.saturating_sub(new_tokens),
+        });
     }
 
-    if compacted_count > 0 {
-        let usage_after = (total_tokens as f64 / available as f64) * 100.0;
-        tracing::info!(
-            "[{}] Prompt-side tool output cache applied: compacted_messages={}, usage_before={:.1}%, usage_after={:.1}%, trigger={}%",
-            session.id,
-            compacted_count,
-            usage_before,
-            usage_after,
-            budget.compression_trigger_percent
-        );
-    }
-
-    PromptCacheCompactionResult {
-        messages: active_messages,
-        compacted_tool_outputs: compacted_count,
-    }
+    candidates
 }
 
 fn recent_user_turn_start_index(
@@ -1363,6 +1423,91 @@ mod tests {
         assert!(
             turn_two_tool.content.contains("turn-two-output"),
             "latest user turn should stay untouched; ask_user chain must not count as a separate user turn"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_prioritizes_highest_token_savings_first() {
+        let small_tool_output = "small-output ".repeat(120);
+        let large_tool_output = "large-output ".repeat(240);
+
+        let counter = DeterministicCounter::new(6)
+            .with_message_token("System", 20)
+            .with_message_token("Turn one", 15)
+            .with_message_token("Read smaller file", 10)
+            .with_message_token(small_tool_output.clone(), 120)
+            .with_message_token("Read larger file", 10)
+            .with_message_token(large_tool_output.clone(), 280)
+            .with_message_token("Early analysis", 10)
+            .with_message_token("Turn two", 15)
+            .with_message_token("Read recent files 1", 10)
+            .with_message_token("recent-output-1", 8)
+            .with_message_token("Second turn analysis", 10)
+            .with_message_token("Turn three", 15)
+            .with_message_token("Read recent files 2", 10)
+            .with_message_token("recent-output-2", 8)
+            .with_message_token("Current conclusion", 10);
+
+        let mut budget =
+            TokenBudget::with_safety_margin(700, 100, BudgetStrategy::Window { size: 60 }, 0);
+        budget.compression_trigger_percent = 80;
+
+        let messages = vec![
+            Message::system("System"),
+            Message::user("Turn one"),
+            Message::assistant(
+                "Read smaller file",
+                Some(vec![create_named_tool_call("call_small", "Read")]),
+            ),
+            Message::tool_result("call_small", small_tool_output.clone()),
+            Message::assistant(
+                "Read larger file",
+                Some(vec![create_named_tool_call("call_large", "Read")]),
+            ),
+            Message::tool_result("call_large", large_tool_output.clone()),
+            Message::assistant("Early analysis", None),
+            Message::user("Turn two"),
+            Message::assistant(
+                "Read recent files 1",
+                Some(vec![create_named_tool_call("call_recent_one", "Read")]),
+            ),
+            Message::tool_result("call_recent_one", "recent-output-1"),
+            Message::assistant("Second turn analysis", None),
+            Message::user("Turn three"),
+            Message::assistant(
+                "Read recent files 2",
+                Some(vec![create_named_tool_call("call_recent_two", "Read")]),
+            ),
+            Message::tool_result("call_recent_two", "recent-output-2"),
+            Message::assistant("Current conclusion", None),
+        ];
+
+        let session = make_session_with_messages(messages);
+        let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
+
+        let small_tool = prepared
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call_small"))
+            .expect("small tool output should stay in prepared context");
+        assert!(
+            small_tool.content.contains("small-output"),
+            "smaller candidate should remain untouched when larger candidate can satisfy trigger"
+        );
+
+        let large_tool = prepared
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call_large"))
+            .expect("large tool output should stay in prepared context");
+        assert!(
+            large_tool.content.contains(PROMPT_CACHE_MARKER),
+            "largest savings candidate should be compacted first"
+        );
+
+        assert_eq!(
+            prepared.prompt_cached_tool_outputs, 1,
+            "only one compaction should be required when highest-savings candidate is selected first"
         );
     }
 
