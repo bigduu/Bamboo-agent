@@ -9,6 +9,14 @@ use crate::agent::core::budget::segmenter::{MessageSegment, MessageSegmenter};
 use crate::agent::core::budget::types::{
     BudgetError, BudgetStrategy, PreparedContext, TokenBudget, TokenUsageBreakdown,
 };
+use std::collections::{HashMap, HashSet};
+
+const PROMPT_CACHE_MIN_TOOL_OUTPUT_CHARS: usize = 1_200;
+const PROMPT_CACHE_HEAD_CHARS: usize = 280;
+const PROMPT_CACHE_TAIL_CHARS: usize = 180;
+const PROMPT_CACHE_RECENT_USER_TURNS: usize = 2;
+const PROMPT_CACHE_RECENT_TOOL_CHAINS: usize = 2;
+const PROMPT_CACHE_MARKER: &str = "[cached_tool_output]";
 
 /// Prepare context for LLM call with budget enforcement.
 ///
@@ -48,12 +56,28 @@ pub fn prepare_hybrid_context(
     counter: &dyn TokenCounter,
 ) -> Result<PreparedContext, BudgetError> {
     let segmenter = MessageSegmenter::new();
+    let summary_message = session.conversation_summary.as_ref().map(|summary| {
+        crate::agent::core::budget::compression_tooling::compression_summary_message(
+            &summary.content,
+        )
+    });
+    let summary_tokens = summary_message
+        .as_ref()
+        .map(|message| counter.count_messages(std::slice::from_ref(message)))
+        .unwrap_or(0);
     let active_messages: Vec<_> = session
         .messages
         .iter()
         .filter(|message| !message.compressed)
         .cloned()
         .collect();
+    let active_messages = maybe_compact_old_tool_outputs_for_prompt(
+        session,
+        active_messages,
+        budget,
+        counter,
+        summary_tokens,
+    );
 
     // 1. Extract system messages (always included) - takes ownership, no clone needed
     let (system_messages, mut segments) = segmenter.segment_with_system(active_messages);
@@ -70,11 +94,13 @@ pub fn prepare_hybrid_context(
         });
     }
 
-    // 4. Calculate remaining budget after system messages.
-    // Use proactive threshold so compression can occur before the hard limit.
-    let proactive_limit = budget.compression_trigger_input_tokens();
-    let target_limit = budget.compression_target_input_tokens();
-    let proactive_remaining_budget = proactive_limit.saturating_sub(system_tokens);
+    // 4. Calculate remaining budget after system messages and any existing
+    // summary. Automatic trimming here is hard-limit safety fitting only.
+    // Proactive trigger/target thresholds are reserved for exposing and using
+    // the explicit compress_context tool.
+    let hard_remaining_budget = hard_available
+        .saturating_sub(system_tokens)
+        .saturating_sub(summary_tokens);
 
     // 5. Count tokens for each segment
     for segment in &mut segments {
@@ -84,37 +110,24 @@ pub fn prepare_hybrid_context(
     let pre_window_tokens: u32 = segments.iter().fold(0u32, |acc, segment| {
         acc.saturating_add(segment.token_estimate)
     });
-    let compression_needed = pre_window_tokens > proactive_remaining_budget;
-    let remaining_budget = if compression_needed {
-        target_limit.saturating_sub(system_tokens)
-    } else {
-        proactive_remaining_budget
-    };
-    if compression_needed {
-        let pre_total_tokens = system_tokens.saturating_add(pre_window_tokens);
+    let hard_fit_needed = pre_window_tokens > hard_remaining_budget;
+    let remaining_budget = hard_remaining_budget;
+    if hard_fit_needed {
+        let pre_total_tokens = system_tokens
+            .saturating_add(summary_tokens)
+            .saturating_add(pre_window_tokens);
         let pre_usage_pct = if hard_available == 0 {
             0.0
         } else {
             (pre_total_tokens as f64 / hard_available as f64) * 100.0
         };
-        let target_effective_pct = if hard_available == 0 {
-            0
-        } else {
-            target_limit
-                .saturating_mul(100)
-                .saturating_div(hard_available)
-        };
         tracing::info!(
-            "[{}] Context compression needed: pre_total={} (system={}, window={}), proactive_limit={} (trigger={}%), target_limit={} (target_config={}%, target_effective={}%), hard_limit={}, usage={:.1}%",
+            "[{}] Context hard-limit fit needed: pre_total={} (system={}, summary={}, window={}), hard_limit={}, usage={:.1}%",
             session.id,
             pre_total_tokens,
             system_tokens,
+            summary_tokens,
             pre_window_tokens,
-            proactive_limit,
-            budget.compression_trigger_percent,
-            target_limit,
-            budget.compression_target_percent,
-            target_effective_pct,
             hard_available,
             pre_usage_pct
         );
@@ -145,22 +158,9 @@ pub fn prepare_hybrid_context(
 
     // Inject conversation summary between system messages and the window.
     // This preserves context from earlier (compressed) parts of the conversation.
-    let summary_tokens = if let Some(ref summary) = session.conversation_summary {
-        let summary_message = crate::agent::core::agent::types::Message::user(format!(
-            "<!-- CONVERSATION_SUMMARY_START -->\n\
-             ## Previous Conversation Summary\n\
-             The following is a summary of earlier conversation that was removed \
-             due to context window limits. Use it to maintain continuity.\n\n\
-             {}\n\
-             <!-- CONVERSATION_SUMMARY_END -->",
-            summary.content
-        ));
-        let tokens = counter.count_messages(&[summary_message.clone()]);
+    if let Some(summary_message) = summary_message {
         prepared_messages.push(summary_message);
-        tokens
-    } else {
-        0
-    };
+    }
 
     // Add selected segments - use take to avoid cloning
     for segment in &mut selected_segments {
@@ -187,13 +187,8 @@ pub fn prepare_hybrid_context(
 
     let truncation_occurred = removed_count > 0;
     if truncation_occurred {
-        let applied_limit = if compression_needed {
-            target_limit
-        } else {
-            proactive_limit
-        };
         tracing::info!(
-            "[{}] Context compression result: removed_segments={}, removed_messages={}, removed_tool_segments={}, removed_tokens={}, kept_segments={}, kept_messages={}, final_total={} / {} ({:.1}%), applied_limit={}",
+            "[{}] Context hard-limit fit result: removed_segments={}, removed_messages={}, removed_tool_segments={}, removed_tokens={}, kept_segments={}, kept_messages={}, final_total={} / {} ({:.1}%)",
             session.id,
             removed_count,
             removed_messages_count,
@@ -203,8 +198,7 @@ pub fn prepare_hybrid_context(
             kept_messages_count,
             total_tokens,
             hard_available,
-            token_usage.usage_percentage(),
-            applied_limit
+            token_usage.usage_percentage()
         );
     }
 
@@ -326,6 +320,214 @@ struct SegmentSelectionResult {
     removed: Vec<MessageSegment>,
 }
 
+fn maybe_compact_old_tool_outputs_for_prompt(
+    session: &Session,
+    mut active_messages: Vec<crate::agent::core::Message>,
+    budget: &TokenBudget,
+    counter: &dyn TokenCounter,
+    summary_tokens: u32,
+) -> Vec<crate::agent::core::Message> {
+    if active_messages.is_empty() {
+        return active_messages;
+    }
+
+    let available = budget.available_input_tokens();
+    if available == 0 {
+        return active_messages;
+    }
+
+    // Require at least two user turns before compacting old tool traces.
+    // ask_user tool calls do not create Role::User messages, so they are
+    // naturally excluded from this turn boundary.
+    let Some(protected_turn_start) =
+        recent_user_turn_start_index(&active_messages, PROMPT_CACHE_RECENT_USER_TURNS)
+    else {
+        return active_messages;
+    };
+
+    let trigger_limit = budget.compression_trigger_input_tokens();
+    let mut total_tokens = counter
+        .count_messages(&active_messages)
+        .saturating_add(summary_tokens);
+
+    if total_tokens <= trigger_limit {
+        return active_messages;
+    }
+
+    let usage_before = (total_tokens as f64 / available as f64) * 100.0;
+    let tool_call_names = tool_call_name_index(&active_messages);
+    let protected_recent_calls =
+        collect_recent_tool_call_ids(&active_messages, PROMPT_CACHE_RECENT_TOOL_CHAINS);
+
+    let mut compacted_count = 0usize;
+
+    for (index, message) in active_messages.iter_mut().enumerate() {
+        if total_tokens <= trigger_limit {
+            break;
+        }
+        if index >= protected_turn_start || message.role != Role::Tool {
+            continue;
+        }
+
+        let Some(tool_call_id) = message.tool_call_id.as_deref() else {
+            continue;
+        };
+        if protected_recent_calls.contains(tool_call_id) {
+            continue;
+        }
+
+        let Some(tool_name) = tool_call_names.get(tool_call_id) else {
+            continue;
+        };
+        if !is_cacheable_tool_name(tool_name) {
+            continue;
+        }
+
+        let original_char_count = message.content.chars().count();
+        if original_char_count < PROMPT_CACHE_MIN_TOOL_OUTPUT_CHARS {
+            continue;
+        }
+
+        let cached_summary =
+            build_cached_tool_output_summary(tool_name, tool_call_id, &message.content);
+        if cached_summary.chars().count() >= original_char_count {
+            continue;
+        }
+
+        let original_content = message.content.clone();
+        let old_tokens = counter.count_message(message);
+        message.content = cached_summary;
+        let new_tokens = counter.count_message(message);
+
+        if new_tokens >= old_tokens {
+            message.content = original_content;
+            continue;
+        }
+
+        compacted_count += 1;
+        total_tokens = total_tokens
+            .saturating_sub(old_tokens)
+            .saturating_add(new_tokens);
+    }
+
+    if compacted_count > 0 {
+        let usage_after = (total_tokens as f64 / available as f64) * 100.0;
+        tracing::info!(
+            "[{}] Prompt-side tool output cache applied: compacted_messages={}, usage_before={:.1}%, usage_after={:.1}%, trigger={}%",
+            session.id,
+            compacted_count,
+            usage_before,
+            usage_after,
+            budget.compression_trigger_percent
+        );
+    }
+
+    active_messages
+}
+
+fn recent_user_turn_start_index(
+    messages: &[crate::agent::core::Message],
+    keep_recent_turns: usize,
+) -> Option<usize> {
+    if keep_recent_turns == 0 {
+        return Some(0);
+    }
+    let user_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| (message.role == Role::User).then_some(index))
+        .collect();
+    if user_indices.len() < keep_recent_turns {
+        return None;
+    }
+    Some(user_indices[user_indices.len() - keep_recent_turns])
+}
+
+fn tool_call_name_index(messages: &[crate::agent::core::Message]) -> HashMap<String, String> {
+    let mut index = HashMap::new();
+    for message in messages {
+        if message.role != Role::Assistant {
+            continue;
+        }
+        let Some(tool_calls) = message.tool_calls.as_ref() else {
+            continue;
+        };
+        for call in tool_calls {
+            if call.id.trim().is_empty() {
+                continue;
+            }
+            index.insert(call.id.clone(), call.function.name.clone());
+        }
+    }
+    index
+}
+
+fn collect_recent_tool_call_ids(
+    messages: &[crate::agent::core::Message],
+    keep_recent_calls: usize,
+) -> HashSet<String> {
+    let mut result = HashSet::new();
+    if keep_recent_calls == 0 {
+        return result;
+    }
+
+    for message in messages.iter().rev() {
+        if message.role != Role::Assistant {
+            continue;
+        }
+        let Some(tool_calls) = message.tool_calls.as_ref() else {
+            continue;
+        };
+        for call in tool_calls.iter().rev() {
+            if !call.id.trim().is_empty() {
+                result.insert(call.id.clone());
+            }
+            if result.len() >= keep_recent_calls {
+                return result;
+            }
+        }
+    }
+
+    result
+}
+
+fn is_cacheable_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "Read" | "Grep" | "Bash" | "BashOutput" | "WebFetch"
+    )
+}
+
+fn build_cached_tool_output_summary(tool_name: &str, tool_call_id: &str, content: &str) -> String {
+    let head = take_first_chars(content, PROMPT_CACHE_HEAD_CHARS);
+    let tail = take_last_chars(content, PROMPT_CACHE_TAIL_CHARS);
+    let line_count = content.lines().count();
+    let char_count = content.chars().count();
+
+    format!(
+        "{PROMPT_CACHE_MARKER}\n\
+tool: {tool_name}\n\
+tool_call_id: {tool_call_id}\n\
+original_chars: {char_count}\n\
+original_lines: {line_count}\n\
+head_excerpt:\n\
+{head}\n\
+tail_excerpt:\n\
+{tail}\n\
+note: Full output remains in session history and UI; this compact summary is used for context efficiency."
+    )
+}
+
+fn take_first_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn take_last_chars(value: &str, max_chars: usize) -> String {
+    let mut tail: Vec<char> = value.chars().rev().take(max_chars).collect();
+    tail.reverse();
+    tail.into_iter().collect()
+}
+
 fn segment_contains_user(segment: &MessageSegment) -> bool {
     segment
         .messages
@@ -363,9 +565,46 @@ fn segment_contains_skill_tool_chain(segment: &MessageSegment) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::core::agent::types::{Message, Role};
+    use crate::agent::core::agent::types::{ConversationSummary, Message, Role};
+    use crate::agent::core::budget::compression_summary_message;
     use crate::agent::core::budget::counter::HeuristicTokenCounter;
+    use crate::agent::core::budget::counter::TokenCounter;
     use crate::agent::core::tools::{FunctionCall, ToolCall};
+    use std::collections::HashMap;
+
+    struct DeterministicCounter {
+        message_tokens: HashMap<String, u32>,
+        text_tokens: HashMap<String, u32>,
+        default_message_tokens: u32,
+    }
+
+    impl DeterministicCounter {
+        fn new(default_message_tokens: u32) -> Self {
+            Self {
+                message_tokens: HashMap::new(),
+                text_tokens: HashMap::new(),
+                default_message_tokens,
+            }
+        }
+
+        fn with_message_token(mut self, content: impl Into<String>, tokens: u32) -> Self {
+            self.message_tokens.insert(content.into(), tokens);
+            self
+        }
+    }
+
+    impl TokenCounter for DeterministicCounter {
+        fn count_message(&self, message: &Message) -> u32 {
+            self.message_tokens
+                .get(&message.content)
+                .copied()
+                .unwrap_or(self.default_message_tokens)
+        }
+
+        fn count_text(&self, text: &str) -> u32 {
+            self.text_tokens.get(text).copied().unwrap_or(0)
+        }
+    }
 
     fn create_tool_call(id: &str) -> ToolCall {
         create_named_tool_call(id, "test")
@@ -560,6 +799,68 @@ mod tests {
 
         assert_eq!(prepared.token_usage.total_tokens, expected_total);
         assert!(prepared.token_usage.total_tokens <= prepared.token_usage.budget_limit);
+    }
+
+    #[test]
+    fn summary_tokens_contribute_to_hard_limit_fitting() {
+        let summary_text = "summary-budget-test";
+        let summary_message = compression_summary_message(summary_text);
+        let counter = DeterministicCounter::new(1)
+            .with_message_token("System", 10)
+            .with_message_token("Older user", 20)
+            .with_message_token("Older assistant", 20)
+            .with_message_token("Recent user", 20)
+            .with_message_token("Recent assistant", 20)
+            .with_message_token("Latest user", 20)
+            .with_message_token(summary_message.content.clone(), 30);
+
+        let mut budget = TokenBudget::with_safety_margin(
+            180,
+            50,
+            BudgetStrategy::Hybrid {
+                window_size: 20,
+                enable_summarization: true,
+            },
+            0,
+        );
+        budget.compression_trigger_percent = 80;
+        budget.compression_target_percent = 50;
+
+        let mut session = make_session_with_messages(vec![
+            Message::system("System"),
+            Message::user("Older user"),
+            Message::assistant("Older assistant", None),
+            Message::user("Recent user"),
+            Message::assistant("Recent assistant", None),
+            Message::user("Latest user"),
+        ]);
+        session.conversation_summary = Some(ConversationSummary::new(summary_text, 2, 30));
+
+        let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
+        let hard_limit = budget.available_input_tokens();
+
+        assert!(
+            prepared.truncation_occurred,
+            "summary reserve should contribute to hard-limit fitting when it pushes total context over the model input budget"
+        );
+        assert_eq!(prepared.token_usage.summary_tokens, 30);
+        assert!(
+            prepared.token_usage.total_tokens <= hard_limit,
+            "total tokens {} should stay within hard input budget {} when summary is included",
+            prepared.token_usage.total_tokens,
+            hard_limit
+        );
+        assert!(
+            10 + 30 + 100 > hard_limit,
+            "test setup should exceed the hard limit only when summary tokens are counted"
+        );
+        assert!(
+            prepared
+                .messages
+                .iter()
+                .any(|message| message.content.contains(summary_text)),
+            "prepared context should include the conversation summary"
+        );
     }
 
     #[test]
@@ -854,14 +1155,14 @@ mod tests {
     }
 
     #[test]
-    fn proactive_trigger_compresses_before_hard_limit() {
+    fn trigger_percent_does_not_force_auto_truncation_before_hard_limit() {
         let counter = HeuristicTokenCounter::default();
-        let mut proactive_budget =
+        let mut trigger_fifty_budget =
             TokenBudget::with_safety_margin(400, 100, BudgetStrategy::Window { size: 50 }, 100);
-        proactive_budget.compression_trigger_percent = 50;
+        trigger_fifty_budget.compression_trigger_percent = 50;
 
-        let mut hard_only_budget = proactive_budget.clone();
-        hard_only_budget.compression_trigger_percent = 100;
+        let mut trigger_hundred_budget = trigger_fifty_budget.clone();
+        trigger_hundred_budget.compression_trigger_percent = 100;
 
         let messages = vec![
             Message::system("System"),
@@ -883,21 +1184,168 @@ mod tests {
         ];
         let session = make_session_with_messages(messages);
 
-        let proactive = prepare_hybrid_context(&session, &proactive_budget, &counter).unwrap();
-        let hard_only = prepare_hybrid_context(&session, &hard_only_budget, &counter).unwrap();
+        let trigger_fifty =
+            prepare_hybrid_context(&session, &trigger_fifty_budget, &counter).unwrap();
+        let trigger_hundred =
+            prepare_hybrid_context(&session, &trigger_hundred_budget, &counter).unwrap();
 
         assert!(
-            proactive.truncation_occurred,
-            "Proactive trigger should truncate before hard budget is exceeded"
+            !trigger_fifty.truncation_occurred,
+            "Crossing the configured tool exposure trigger should not auto-truncate context before the hard limit"
         );
         assert!(
-            !hard_only.truncation_occurred,
-            "Hard-limit-only budget should keep this context"
+            !trigger_hundred.truncation_occurred,
+            "Hard-limit-only budget should also keep this context"
+        );
+        assert_eq!(trigger_fifty.messages.len(), trigger_hundred.messages.len());
+        assert_eq!(
+            trigger_fifty.token_usage.total_tokens,
+            trigger_hundred.token_usage.total_tokens
         );
     }
 
     #[test]
-    fn compression_reduces_context_to_target_threshold() {
+    fn prompt_cache_compacts_old_tool_output_after_trigger_and_preserves_recent_turns() {
+        let old_tool_output = "old-read-output ".repeat(120);
+        let recent_tool_output = "recent-read-output ".repeat(120);
+
+        let counter = DeterministicCounter::new(6)
+            .with_message_token("System", 20)
+            .with_message_token("User turn 1", 15)
+            .with_message_token("Reading old files", 10)
+            .with_message_token(old_tool_output.clone(), 220)
+            .with_message_token("Old analysis", 10)
+            .with_message_token("Need confirmation", 10)
+            .with_message_token("User selected: OK", 8)
+            .with_message_token("User turn 2", 15)
+            .with_message_token("Reading recent files", 10)
+            .with_message_token(recent_tool_output.clone(), 220)
+            .with_message_token("Recent analysis", 10)
+            .with_message_token("User turn 3", 15)
+            .with_message_token("Current conclusion", 10);
+
+        let mut budget =
+            TokenBudget::with_safety_margin(700, 100, BudgetStrategy::Window { size: 60 }, 0);
+        budget.compression_trigger_percent = 80;
+
+        let messages = vec![
+            Message::system("System"),
+            Message::user("User turn 1"),
+            Message::assistant(
+                "Reading old files",
+                Some(vec![create_named_tool_call("call_old", "Read")]),
+            ),
+            Message::tool_result("call_old", old_tool_output.clone()),
+            Message::assistant("Old analysis", None),
+            Message::assistant(
+                "Need confirmation",
+                Some(vec![create_named_tool_call("call_ask", "ask_user")]),
+            ),
+            Message::tool_result("call_ask", "User selected: OK"),
+            Message::user("User turn 2"),
+            Message::assistant(
+                "Reading recent files",
+                Some(vec![create_named_tool_call("call_recent", "Read")]),
+            ),
+            Message::tool_result("call_recent", recent_tool_output.clone()),
+            Message::assistant("Recent analysis", None),
+            Message::user("User turn 3"),
+            Message::assistant("Current conclusion", None),
+        ];
+        let session = make_session_with_messages(messages);
+        let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
+
+        let old_tool = prepared
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call_old"))
+            .expect("old tool output should stay in prepared context");
+        assert!(
+            old_tool.content.contains(PROMPT_CACHE_MARKER),
+            "older tool output should be replaced with cached summary once trigger is exceeded"
+        );
+
+        let recent_tool = prepared
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call_recent"))
+            .expect("recent tool output should stay in prepared context");
+        assert!(
+            recent_tool.content.contains("recent-read-output"),
+            "recent-turn tool output should remain unmodified"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_turn_boundary_is_based_on_user_messages_not_ask_user_calls() {
+        let turn_one_tool_output = "turn-one-output ".repeat(120);
+        let turn_two_tool_output = "turn-two-output ".repeat(120);
+
+        let counter = DeterministicCounter::new(6)
+            .with_message_token("System", 20)
+            .with_message_token("First request", 15)
+            .with_message_token("Turn one read", 10)
+            .with_message_token(turn_one_tool_output.clone(), 220)
+            .with_message_token("Need confirmation", 10)
+            .with_message_token("User selected: Need changes", 8)
+            .with_message_token("Second request", 15)
+            .with_message_token("Turn two read", 10)
+            .with_message_token(turn_two_tool_output.clone(), 220)
+            .with_message_token("Third request", 15)
+            .with_message_token("Done", 10);
+
+        let mut budget =
+            TokenBudget::with_safety_margin(700, 100, BudgetStrategy::Window { size: 60 }, 0);
+        budget.compression_trigger_percent = 80;
+
+        let messages = vec![
+            Message::system("System"),
+            Message::user("First request"),
+            Message::assistant(
+                "Turn one read",
+                Some(vec![create_named_tool_call("call_turn_one", "Read")]),
+            ),
+            Message::tool_result("call_turn_one", turn_one_tool_output.clone()),
+            Message::assistant(
+                "Need confirmation",
+                Some(vec![create_named_tool_call("call_ask", "ask_user")]),
+            ),
+            Message::tool_result("call_ask", "User selected: Need changes"),
+            Message::user("Second request"),
+            Message::assistant(
+                "Turn two read",
+                Some(vec![create_named_tool_call("call_turn_two", "Read")]),
+            ),
+            Message::tool_result("call_turn_two", turn_two_tool_output.clone()),
+            Message::user("Third request"),
+            Message::assistant("Done", None),
+        ];
+        let session = make_session_with_messages(messages);
+        let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
+
+        let turn_one_tool = prepared
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call_turn_one"))
+            .expect("turn one tool output should stay in prepared context");
+        assert!(
+            turn_one_tool.content.contains(PROMPT_CACHE_MARKER),
+            "older turn should be cache-compacted when trigger is exceeded"
+        );
+
+        let turn_two_tool = prepared
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call_turn_two"))
+            .expect("turn two tool output should stay in prepared context");
+        assert!(
+            turn_two_tool.content.contains("turn-two-output"),
+            "latest user turn should stay untouched; ask_user chain must not count as a separate user turn"
+        );
+    }
+
+    #[test]
+    fn hard_limit_fit_stays_within_budget_limit_and_keeps_latest_goal() {
         let counter = HeuristicTokenCounter::default();
         let mut budget =
             TokenBudget::with_safety_margin(900, 200, BudgetStrategy::Window { size: 80 }, 100);
@@ -928,12 +1376,12 @@ mod tests {
 
         assert!(prepared.truncation_occurred);
         assert!(
-            prepared.token_usage.total_tokens <= budget.compression_target_input_tokens(),
-            "Post-compression context should be at or below target threshold"
+            prepared.token_usage.total_tokens <= prepared.token_usage.budget_limit,
+            "Hard-limit fitting should keep total tokens within the model input budget"
         );
         assert!(
             keeps_latest_goal,
-            "Latest user goal/request should survive compression"
+            "Latest user goal/request should survive hard-limit fitting"
         );
     }
 }
