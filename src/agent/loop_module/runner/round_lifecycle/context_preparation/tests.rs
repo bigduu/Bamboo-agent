@@ -293,6 +293,7 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
         budget_limit: 1100,
         truncation_occurred: true,
         segments_removed: 8,
+        prompt_cached_tool_outputs: 0,
     });
 
     let config = AgentLoopConfig {

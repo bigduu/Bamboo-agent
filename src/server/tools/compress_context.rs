@@ -138,12 +138,9 @@ impl CompressContextTool {
             existing_summary,
             task_list_prompt,
         );
-        summarizer
-            .summarize(messages)
-            .await
-            .map_err(|error| {
-                ToolError::Execution(format!("compress_context summary call failed: {error}"))
-            })
+        summarizer.summarize(messages).await.map_err(|error| {
+            ToolError::Execution(format!("compress_context summary call failed: {error}"))
+        })
     }
 
     fn section_count(summary: &str) -> usize {
@@ -287,12 +284,7 @@ impl CompressContextTool {
         );
 
         let repaired_summary = self
-            .summarize_messages(
-                session,
-                model_name,
-                messages,
-                Some(refinement_seed),
-            )
+            .summarize_messages(session, model_name, messages, Some(refinement_seed))
             .await?;
         let repaired_assessment = Self::assess_summary_quality(&repaired_summary);
 
@@ -318,6 +310,7 @@ impl CompressContextTool {
             budget_limit: prepared.token_usage.budget_limit,
             truncation_occurred: prepared.truncation_occurred,
             segments_removed: prepared.segments_removed,
+            prompt_cached_tool_outputs: prepared.prompt_cached_tool_outputs,
         })
     }
 }
@@ -437,7 +430,9 @@ impl Tool for CompressContextTool {
         self.persist_live_session(&session).await?;
 
         if let (Some(event_tx), Some(usage)) = (ctx.cloned_sender(), usage_snapshot.clone()) {
-            let _ = event_tx.send(AgentEvent::TokenBudgetUpdated { usage }).await;
+            let _ = event_tx
+                .send(AgentEvent::TokenBudgetUpdated { usage })
+                .await;
         }
 
         let reason = parsed
@@ -733,7 +728,12 @@ mod tests {
         assert!(!payload["summary_model"].as_str().unwrap_or("").is_empty());
         assert!(payload["summary_chars"].as_u64().unwrap_or(0) > 0);
         assert!(payload["summary_quality"]["score"].as_u64().unwrap_or(0) > 0);
-        assert!(payload["summary_quality"]["max_score"].as_u64().unwrap_or(0) >= 6);
+        assert!(
+            payload["summary_quality"]["max_score"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 6
+        );
 
         let persisted = storage
             .load_session("compress-success")
@@ -788,7 +788,9 @@ mod tests {
         let sparse = "Quick note only.";
         let sparse_assessment = CompressContextTool::assess_summary_quality(sparse);
         assert!(!sparse_assessment.is_acceptable());
-        assert!(sparse_assessment.missing_checks.contains(&"structured_sections"));
+        assert!(sparse_assessment
+            .missing_checks
+            .contains(&"structured_sections"));
         assert!(sparse_assessment.missing_checks.contains(&"next_step"));
 
         let structured = r#"

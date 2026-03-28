@@ -33,6 +33,7 @@ async fn test_patch_message_persists_and_clears_derived_context() {
         budget_limit: 100,
         truncation_occurred: false,
         segments_removed: 0,
+        prompt_cached_tool_outputs: 0,
     });
     session.conversation_summary = Some(ConversationSummary::new("summary", 2, 5));
 

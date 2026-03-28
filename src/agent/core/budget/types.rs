@@ -229,6 +229,8 @@ pub struct PreparedContext {
     pub segments_removed: usize,
     /// Message IDs newly archived by this preparation pass.
     pub compressed_message_ids: Vec<String>,
+    /// Number of long tool outputs replaced with prompt-side cached summaries.
+    pub prompt_cached_tool_outputs: usize,
 }
 
 /// Detailed token usage breakdown.

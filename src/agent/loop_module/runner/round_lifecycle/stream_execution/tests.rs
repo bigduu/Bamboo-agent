@@ -92,6 +92,7 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
         truncation_occurred: false,
         segments_removed: 0,
         compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
     };
 
     let llm = Arc::new(MockLlmProvider {
@@ -127,7 +128,10 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
     assert!(stream_output.reasoning_content.is_empty());
     assert!(session.token_usage.is_some());
     assert_eq!(
-        session.token_usage.as_ref().map(|usage| usage.max_context_tokens),
+        session
+            .token_usage
+            .as_ref()
+            .map(|usage| usage.max_context_tokens),
         Some(400_000)
     );
 
@@ -182,6 +186,7 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
         truncation_occurred: false,
         segments_removed: 0,
         compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
     };
 
     let llm = Arc::new(MockLlmProvider {
@@ -296,6 +301,7 @@ async fn execute_llm_stream_disables_previous_response_id_when_local_summary_or_
         truncation_occurred: false,
         segments_removed: 1,
         compressed_message_ids: vec!["msg_old_1".to_string(), "msg_old_2".to_string()],
+        prompt_cached_tool_outputs: 0,
     };
 
     let llm = Arc::new(MockLlmProvider {
@@ -371,6 +377,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
         truncation_occurred: false,
         segments_removed: 0,
         compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
     };
 
     let llm = Arc::new(MockLlmProvider {

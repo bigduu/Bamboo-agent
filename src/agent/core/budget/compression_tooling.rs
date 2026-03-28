@@ -505,6 +505,7 @@ mod tests {
             budget_limit: 10_000,
             truncation_occurred: true,
             segments_removed: 8,
+            prompt_cached_tool_outputs: 0,
         });
 
         let exposure = estimate_context_compression_exposure(
@@ -593,6 +594,7 @@ mod tests {
             budget_limit: 10_000,
             truncation_occurred: true,
             segments_removed: 12,
+            prompt_cached_tool_outputs: 0,
         });
 
         let exposure = estimate_context_compression_exposure(

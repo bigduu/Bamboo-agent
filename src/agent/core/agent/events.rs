@@ -308,6 +308,7 @@ pub struct TokenUsage {
 /// * `budget_limit` - Maximum allowed input tokens
 /// * `truncation_occurred` - Whether old messages were removed
 /// * `segments_removed` - Number of message segments truncated
+/// * `prompt_cached_tool_outputs` - Number of tool outputs compacted into cached summaries for prompt context
 ///
 /// # Example
 ///
@@ -321,6 +322,7 @@ pub struct TokenUsage {
 ///     budget_limit: 4000,
 ///     truncation_occurred: true,
 ///     segments_removed: 5,
+///     prompt_cached_tool_outputs: 3,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +344,9 @@ pub struct TokenBudgetUsage {
     pub truncation_occurred: bool,
     /// Number of message segments removed
     pub segments_removed: usize,
+    /// Number of tool outputs replaced with compact cached summaries in prepared context.
+    #[serde(default)]
+    pub prompt_cached_tool_outputs: usize,
 }
 
 #[cfg(test)]

@@ -71,13 +71,14 @@ pub fn prepare_hybrid_context(
         .filter(|message| !message.compressed)
         .cloned()
         .collect();
-    let active_messages = maybe_compact_old_tool_outputs_for_prompt(
+    let prompt_cache_result = maybe_compact_old_tool_outputs_for_prompt(
         session,
         active_messages,
         budget,
         counter,
         summary_tokens,
     );
+    let active_messages = prompt_cache_result.messages;
 
     // 1. Extract system messages (always included) - takes ownership, no clone needed
     let (system_messages, mut segments) = segmenter.segment_with_system(active_messages);
@@ -208,6 +209,7 @@ pub fn prepare_hybrid_context(
         truncation_occurred,
         segments_removed: removed_count,
         compressed_message_ids,
+        prompt_cached_tool_outputs: prompt_cache_result.compacted_tool_outputs,
     })
 }
 
@@ -320,20 +322,31 @@ struct SegmentSelectionResult {
     removed: Vec<MessageSegment>,
 }
 
+struct PromptCacheCompactionResult {
+    messages: Vec<crate::agent::core::Message>,
+    compacted_tool_outputs: usize,
+}
+
 fn maybe_compact_old_tool_outputs_for_prompt(
     session: &Session,
     mut active_messages: Vec<crate::agent::core::Message>,
     budget: &TokenBudget,
     counter: &dyn TokenCounter,
     summary_tokens: u32,
-) -> Vec<crate::agent::core::Message> {
+) -> PromptCacheCompactionResult {
     if active_messages.is_empty() {
-        return active_messages;
+        return PromptCacheCompactionResult {
+            messages: active_messages,
+            compacted_tool_outputs: 0,
+        };
     }
 
     let available = budget.available_input_tokens();
     if available == 0 {
-        return active_messages;
+        return PromptCacheCompactionResult {
+            messages: active_messages,
+            compacted_tool_outputs: 0,
+        };
     }
 
     // Require at least two user turns before compacting old tool traces.
@@ -342,7 +355,10 @@ fn maybe_compact_old_tool_outputs_for_prompt(
     let Some(protected_turn_start) =
         recent_user_turn_start_index(&active_messages, PROMPT_CACHE_RECENT_USER_TURNS)
     else {
-        return active_messages;
+        return PromptCacheCompactionResult {
+            messages: active_messages,
+            compacted_tool_outputs: 0,
+        };
     };
 
     let trigger_limit = budget.compression_trigger_input_tokens();
@@ -351,7 +367,10 @@ fn maybe_compact_old_tool_outputs_for_prompt(
         .saturating_add(summary_tokens);
 
     if total_tokens <= trigger_limit {
-        return active_messages;
+        return PromptCacheCompactionResult {
+            messages: active_messages,
+            compacted_tool_outputs: 0,
+        };
     }
 
     let usage_before = (total_tokens as f64 / available as f64) * 100.0;
@@ -422,7 +441,10 @@ fn maybe_compact_old_tool_outputs_for_prompt(
         );
     }
 
-    active_messages
+    PromptCacheCompactionResult {
+        messages: active_messages,
+        compacted_tool_outputs: compacted_count,
+    }
 }
 
 fn recent_user_turn_start_index(
