@@ -89,7 +89,7 @@ JSONL 存储实现
 #### 16. agent/tools/tools/*.rs (19 files, 19 items)
 每个工具的 `new()` 函数
 - [ ] `apply_patch.rs`
-- [ ] `ask_user.rs`
+- [ ] `conclusion_with_options.rs`
 - [ ] `create_todo_list.rs`
 - [ ] `execute_command.rs`
 - [ ] `file_exists.rs`

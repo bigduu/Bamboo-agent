@@ -590,11 +590,20 @@ impl ResponsesSseParser {
                 out.push_str(text);
             } else if let Some(parts) = summary.as_array() {
                 for part in parts {
-                    if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
-                        out.push_str(text);
-                    } else if let Some(text) = part.as_str() {
-                        out.push_str(text);
+                    let maybe_text = part
+                        .get("text")
+                        .and_then(|value| value.as_str())
+                        .or_else(|| part.as_str());
+                    let Some(text) = maybe_text else {
+                        continue;
+                    };
+                    if text.is_empty() {
+                        continue;
                     }
+                    if !out.is_empty() {
+                        out.push_str("\n\n");
+                    }
+                    out.push_str(text);
                 }
             }
         }
@@ -1614,6 +1623,23 @@ mod tests {
             .unwrap();
         match out {
             Some(LLMChunk::ReasoningToken(t)) => assert_eq!(t, "I will inspect the repo first."),
+            other => panic!("expected reasoning token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_joins_multiple_reasoning_summary_parts_with_blank_line() {
+        let mut p = ResponsesSseParser::new();
+        let out = p
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item":{"id":"rs_multi_1","type":"reasoning","summary":[{"type":"summary_text","text":"Evaluating local changes"},{"type":"summary_text","text":"Committing release version"}]}}"#,
+            )
+            .unwrap();
+        match out {
+            Some(LLMChunk::ReasoningToken(t)) => {
+                assert_eq!(t, "Evaluating local changes\n\nCommitting release version")
+            }
             other => panic!("expected reasoning token, got {other:?}"),
         }
     }

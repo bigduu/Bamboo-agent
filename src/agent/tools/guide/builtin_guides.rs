@@ -6,28 +6,27 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 22] = [
-    "apply_patch",
-    "ask_user",
+pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
+    "conclusion_with_options",
     "Bash",
     "BashOutput",
-    "conclusion",
     "Edit",
     "ExitPlanMode",
-    "FileExists",
-    "Glob",
-    "GetCurrentDir",
     "GetFileInfo",
+    "Glob",
     "Grep",
+    "js_repl",
     "KillShell",
     "memory_note",
     "NotebookEdit",
     "Read",
-    "SetWorkspace",
+    "request_permissions",
     "Sleep",
     "Task",
+    "tool_search",
     "WebFetch",
     "WebSearch",
+    "Workspace",
     "Write",
 ];
 
@@ -37,6 +36,8 @@ pub fn builtin_tool_guide(tool_name: &str) -> Option<Arc<dyn ToolGuide>> {
 
 pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
     match tool_name {
+        // apply_patch is now an alias for Edit; return the Edit guide with
+        // the alias name so existing callers still see relevant documentation.
         "apply_patch" => Some(guide(
             "apply_patch",
             ToolCategory::FileWriting,
@@ -49,15 +50,25 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Use when you want a dedicated patch tool call instead of Edit.",
             )],
         )),
-        "ask_user" => Some(guide(
-            "ask_user",
+        "conclusion_with_options" => Some(guide(
+            "conclusion_with_options",
             ToolCategory::UserInteraction,
-            "Ask the user for confirmation or missing input with selectable options. Always use this tool for final completion confirmation before ending a task.",
-            "Do not use repeatedly for routine status updates during active execution; reserve it for true clarification points and required final confirmation.",
+            "Ask the user for confirmation or missing input with selectable options. Include a structured `conclusion` object (summary + Mermaid graph) in the same call when you need a wrapped-up confirmation flow.",
+            "Do not use repeatedly for routine status updates during active execution; reserve it for true clarification points, explicit user decisions, or a final confirmation flow when required by the active prompt/policy.",
             &["ExitPlanMode"],
             vec![example(
                 "Confirm before finishing",
-                json!({"question":"Any other requests before I finish?"}),
+                json!({
+                    "question":"Any other requests before I finish?",
+                    "conclusion":{
+                        "title":"Conclusion",
+                        "summary":"Core validation is complete and release is ready.",
+                        "key_points":["All targeted tests passed","No blocking regressions"],
+                        "next_steps":["Proceed with release train"],
+                        "confidence":"high",
+                        "mermaid":{"graph":"graph TD\nA[Validation]-->B[Ready to release]"}
+                    }
+                }),
                 "Use when user intent is required before finalizing. Defaults to options [\"OK\", \"Need changes\"] when options are omitted.",
             )],
         )),
@@ -157,18 +168,6 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Use repeatedly until shell completes.",
             )],
         )),
-        "conclusion" => Some(guide(
-            "conclusion",
-            ToolCategory::UserInteraction,
-            "Render a structured conclusion card with a final takeaway and optional supporting bullets.",
-            "Do not use for intermediate status updates or raw execution logs.",
-            &["ask_user"],
-            vec![example(
-                "Present final conclusion",
-                json!({"title":"Conclusion","conclusion":"Core validation is complete and release is ready.","key_points":["All targeted tests passed","No blocking regressions"],"next_steps":["Proceed with release train"],"confidence":"high"}),
-                "Use at wrap-up to communicate a clear final decision.",
-            )],
-        )),
         "KillShell" => Some(guide(
             "KillShell",
             ToolCategory::CommandExecution,
@@ -229,18 +228,19 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Use after producing a concrete implementation plan.",
             )],
         )),
-        "FileExists" => Some(guide(
-            "FileExists",
-            ToolCategory::FileReading,
-            "Check quickly whether a path exists before reading, editing, or writing conditionally.",
-            "Do not use to inspect file content or metadata details.",
-            &["GetFileInfo", "Read", "Write"],
+        "tool_search" => Some(guide(
+            "tool_search",
+            ToolCategory::TaskManagement,
+            "Search for available tools by keyword query. Returns the most relevant tools ranked by BM25 relevance.",
+            "Do not use when you already know the exact tool name. Use for discovery only.",
+            &["load_skill"],
             vec![example(
-                "Guard before write",
-                json!({"path":"/workspace/project/.env"}),
-                "Use as a fast existence probe before deciding create vs update.",
+                "Find file editing tools",
+                json!({"query":"edit file content"}),
+                "Use when unsure which tool handles a task.",
             )],
         )),
+        // FileExists guide moved next to GetFileInfo (see below).
         "WebFetch" => Some(guide(
             "WebFetch",
             ToolCategory::CommandExecution,
@@ -265,12 +265,13 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Use before WebFetch when URL is unknown.",
             )],
         )),
+        // GetCurrentDir is now an alias for Workspace (get mode)
         "GetCurrentDir" => Some(guide(
             "GetCurrentDir",
             ToolCategory::CommandExecution,
-            "Retrieve the session's current workspace directory before running relative-path operations.",
+            "Retrieve the session's current workspace directory. (Alias for Workspace with no path argument.)",
             "Do not use when absolute paths are already known.",
-            &["SetWorkspace", "Bash", "Read"],
+            &["Workspace", "Bash", "Read"],
             vec![example(
                 "Inspect working directory",
                 json!({}),
@@ -280,13 +281,26 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "GetFileInfo" => Some(guide(
             "GetFileInfo",
             ToolCategory::FileReading,
-            "Read metadata (file/dir, size, modified time) without loading file content.",
+            "Check if a file/dir exists and read metadata (type, size, modified time) without loading content. Returns {exists: false} for missing paths, so this also covers existence checks.",
             "Do not use when you need actual content; use Read instead.",
-            &["FileExists", "Read"],
+            &["Read"],
             vec![example(
                 "Check metadata before processing",
                 json!({"path":"/workspace/project/logs/app.log"}),
                 "Use to branch behavior based on file type/size.",
+            )],
+        )),
+        // FileExists is now an alias for GetFileInfo
+        "FileExists" => Some(guide(
+            "FileExists",
+            ToolCategory::FileReading,
+            "Check quickly whether a path exists before reading, editing, or writing conditionally. (Alias for GetFileInfo)",
+            "Do not use to inspect file content or metadata details.",
+            &["GetFileInfo", "Read", "Write"],
+            vec![example(
+                "Guard before write",
+                json!({"path":"/workspace/project/.env"}),
+                "Use as a fast existence probe before deciding create vs update.",
             )],
         )),
         "memory_note" => Some(guide(
@@ -309,16 +323,61 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ],
         )),
 
+        // SetWorkspace is now an alias for Workspace (set mode)
         "SetWorkspace" => Some(guide(
             "SetWorkspace",
             ToolCategory::CommandExecution,
-            "Change the current session workspace so relative paths and shell commands run in the intended project.",
+            "Change the current session workspace. (Alias for Workspace with path argument.)",
             "Do not use with non-directory or missing paths.",
-            &["GetCurrentDir", "Bash", "Read"],
+            &["Workspace", "Bash", "Read"],
             vec![example(
                 "Switch session workspace",
                 json!({"path":"/workspace/project"}),
                 "Use before running commands or edits in another repo root.",
+            )],
+        )),
+        // Workspace is the unified tool replacing GetCurrentDir + SetWorkspace
+        "Workspace" => Some(guide(
+            "Workspace",
+            ToolCategory::CommandExecution,
+            "Get or set the current session workspace directory. Call without 'path' to read the current workspace; call with 'path' to change it.",
+            "Do not set workspace to a non-directory or missing path.",
+            &["Bash", "Read"],
+            vec![
+                example(
+                    "Get current workspace",
+                    json!({}),
+                    "Useful before commands or file ops that rely on relative paths.",
+                ),
+                example(
+                    "Set workspace",
+                    json!({"path":"/workspace/project"}),
+                    "Use before running commands or edits in another repo root.",
+                ),
+            ],
+        )),
+        "js_repl" => Some(guide(
+            "js_repl",
+            ToolCategory::CommandExecution,
+            "Execute JavaScript code using Node.js with top-level await support. Each invocation runs in a fresh process.",
+            "Do not use for tasks better handled by Bash. Requires Node.js installed on the host.",
+            &["Bash"],
+            vec![example(
+                "Evaluate a JS expression",
+                json!({"code":"console.log(2 + 2)"}),
+                "Use for quick calculations, JSON manipulation, or any JS-specific task.",
+            )],
+        )),
+        "request_permissions" => Some(guide(
+            "request_permissions",
+            ToolCategory::UserInteraction,
+            "Request elevated permissions from the user when a needed operation would be blocked. The agent loop pauses until the user approves or denies.",
+            "Do not use pre-emptively for every operation; only request when you know the current permission set is insufficient.",
+            &["conclusion_with_options"],
+            vec![example(
+                "Request file write permission",
+                json!({"reason":"Need to write deployment config to /etc/nginx","permissions":[{"type":"write_file","resource":"/etc/nginx/conf.d/*"}]}),
+                "Use when a Write/Edit would be denied due to path restrictions.",
             )],
         )),
         "Sleep" => Some(guide(

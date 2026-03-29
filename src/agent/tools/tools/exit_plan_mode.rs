@@ -62,7 +62,7 @@ impl Tool for ExitPlanModeTool {
         Ok(ToolResult {
             success: true,
             result: payload.to_string(),
-            display_preference: Some("ask_user".to_string()),
+            display_preference: Some("conclusion_with_options".to_string()),
         })
     }
 }
@@ -143,7 +143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exit_plan_mode_sets_display_preference_to_ask_user() {
+    async fn exit_plan_mode_sets_display_preference_to_conclusion_with_options() {
         let tool = ExitPlanModeTool::new();
         let result = tool
             .execute(json!({
@@ -152,7 +152,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.display_preference, Some("ask_user".to_string()));
+        assert_eq!(result.display_preference, Some("conclusion_with_options".to_string()));
     }
 
     #[tokio::test]

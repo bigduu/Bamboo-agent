@@ -10,9 +10,9 @@ const MIN_SAFETY_MARGIN: u32 = 100;
 /// Maximum safety margin in tokens.
 const MAX_SAFETY_MARGIN: u32 = 2000;
 /// Default percentage of context window where proactive compression starts.
-const DEFAULT_COMPRESSION_TRIGGER_PERCENT: u8 = 80;
+const DEFAULT_COMPRESSION_TRIGGER_PERCENT: u8 = 85;
 /// Default percentage of context window to target after compression.
-const DEFAULT_COMPRESSION_TARGET_PERCENT: u8 = 50;
+const DEFAULT_COMPRESSION_TARGET_PERCENT: u8 = 40;
 /// Minimum allowed compression target percent.
 const MIN_COMPRESSION_TARGET_PERCENT: u32 = 20;
 /// Maximum allowed compression target percent.
@@ -42,7 +42,7 @@ pub struct TokenBudget {
     pub safety_margin: u32,
     /// Proactive compression trigger threshold as a percentage of context window tokens.
     ///
-    /// Example: `80` means start compressing once context reaches 80% of context window,
+    /// Example: `85` means start compressing once context reaches 85% of context window,
     /// rather than waiting until the hard limit is exceeded.
     #[serde(default = "default_compression_trigger_percent")]
     pub compression_trigger_percent: u8,
@@ -337,15 +337,15 @@ mod tests {
     use super::{BudgetStrategy, TokenBudget};
 
     #[test]
-    fn compression_trigger_defaults_to_eighty_percent() {
+    fn compression_trigger_defaults_to_eighty_five_percent() {
         let budget = TokenBudget::for_model(128_000);
-        assert_eq!(budget.compression_trigger_percent, 80);
+        assert_eq!(budget.compression_trigger_percent, 85);
     }
 
     #[test]
-    fn compression_target_defaults_to_fifty_percent() {
+    fn compression_target_defaults_to_forty_percent() {
         let budget = TokenBudget::for_model(128_000);
-        assert_eq!(budget.compression_target_percent, 50);
+        assert_eq!(budget.compression_target_percent, 40);
     }
 
     #[test]

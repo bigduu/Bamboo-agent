@@ -11,7 +11,7 @@ async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events(
         id: "ask-1".to_string(),
         tool_type: "function".to_string(),
         function: FunctionCall {
-            name: "ask_user".to_string(),
+            name: "conclusion_with_options".to_string(),
             arguments: "{}".to_string(),
         },
     };
@@ -23,7 +23,7 @@ async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events(
             "allow_custom": false
         })
         .to_string(),
-        display_preference: Some("ask_user".to_string()),
+        display_preference: Some("conclusion_with_options".to_string()),
     };
 
     let (tx, mut rx) = mpsc::channel(8);
@@ -75,6 +75,80 @@ async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events(
         AgentEvent::NeedClarification { question, options } => {
             assert_eq!(question, "Continue?");
             assert_eq!(options, Some(vec!["Yes".to_string(), "No".to_string()]));
+        }
+        other => panic!("unexpected second event: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn maybe_handle_user_question_tool_handles_request_permissions() {
+    let tool_call = ToolCall {
+        id: "perm-1".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "request_permissions".to_string(),
+            arguments: "{}".to_string(),
+        },
+    };
+    let result = ToolResult {
+        success: true,
+        result: serde_json::json!({
+            "status": "awaiting_permission_approval",
+            "question": "**Permission Request**\n\nNeed write access\n\n**Requested permissions:**\n- write_file `/tmp/deploy`\n",
+            "reason": "Need write access",
+            "permissions": [{"type": "write_file", "resource": "/tmp/deploy", "risk_level": "Medium Risk"}],
+            "options": ["Approve", "Deny"],
+            "allow_custom": false
+        })
+        .to_string(),
+        display_preference: Some("request_permissions".to_string()),
+    };
+
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut session = Session::new("session-perm", "model");
+
+    let handled = maybe_handle_user_question_tool(
+        &tool_call,
+        &result,
+        &mut session,
+        &tx,
+        None,
+        "session-perm",
+        "round-1",
+        &AgentLoopConfig::default(),
+    )
+    .await;
+
+    assert!(
+        handled,
+        "request_permissions should be handled as a pause-tool"
+    );
+    assert_eq!(session.messages.len(), 1);
+    assert!(matches!(session.messages[0].role, Role::Tool));
+
+    let pending = session
+        .pending_question
+        .as_ref()
+        .expect("pending question should be set for request_permissions");
+    assert_eq!(pending.tool_call_id, "perm-1");
+    assert!(pending.question.contains("Permission Request"));
+    assert_eq!(
+        pending.options,
+        vec!["Approve".to_string(), "Deny".to_string()]
+    );
+    assert!(!pending.allow_custom);
+
+    let first_event = rx.recv().await.expect("first event");
+    assert!(matches!(first_event, AgentEvent::ToolComplete { .. }));
+
+    let second_event = rx.recv().await.expect("second event");
+    match second_event {
+        AgentEvent::NeedClarification { question, options } => {
+            assert!(question.contains("Permission Request"));
+            assert_eq!(
+                options,
+                Some(vec!["Approve".to_string(), "Deny".to_string()])
+            );
         }
         other => panic!("unexpected second event: {other:?}"),
     }

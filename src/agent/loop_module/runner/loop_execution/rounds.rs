@@ -76,6 +76,7 @@ pub(super) async fn run_rounds(
             super::super::session_setup::tool_schemas::resolve_available_tool_schemas_for_session(
                 config,
                 tools.as_ref(),
+                session,
             );
 
         let mut round_flow_outcome: Option<super::super::round_flow::RoundFlowOutcome> = None;

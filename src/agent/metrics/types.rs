@@ -229,6 +229,12 @@ pub struct MetricsSummary {
     /// Total number of prompt-side cached tool outputs.
     #[serde(default)]
     pub prompt_cached_tool_outputs: u64,
+    /// Total number of execute sync mismatches observed for the filtered period.
+    #[serde(default)]
+    pub total_sync_mismatches: u64,
+    /// Breakdown of execute sync mismatches by stable reason label.
+    #[serde(default)]
+    pub sync_mismatch_breakdown: HashMap<String, u64>,
 }
 
 /// Metrics aggregated by model
@@ -554,6 +560,8 @@ mod tests {
             total_tool_calls: 500,
             active_sessions: 5,
             prompt_cached_tool_outputs: 0,
+            total_sync_mismatches: 0,
+            sync_mismatch_breakdown: HashMap::new(),
         };
 
         let json = serde_json::to_string(&summary).unwrap();

@@ -6,8 +6,8 @@ use crate::server::app_state::AppState;
 const SELECTED_SKILL_IDS_METADATA_KEY: &str = "selected_skill_ids";
 const LOADED_SKILL_IDS_METADATA_KEY: &str = "skill_runtime_loaded_skill_ids";
 const LAST_LOADED_SKILL_ID_METADATA_KEY: &str = "skill_runtime_last_loaded_skill_id";
-const COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY: &str = "copilot_ask_user_enhancement_enabled";
-
+const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str =
+    "copilot_conclusion_with_options_enhancement_enabled";
 pub(super) async fn load_or_create_session(
     state: &web::Data<AppState>,
     session_id: &str,
@@ -112,19 +112,19 @@ pub(super) fn resolve_enhance_prompt(
     enhance_prompt_from_request.map(ToString::to_string)
 }
 
-pub(super) fn resolve_copilot_ask_user_enhancement_enabled(
+pub(super) fn resolve_copilot_conclusion_with_options_enhancement_enabled(
     session: &mut Session,
     enabled_from_request: Option<bool>,
 ) -> Option<bool> {
     if let Some(enabled) = enabled_from_request {
         session.metadata.insert(
-            COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY.to_string(),
+            COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY.to_string(),
             enabled.to_string(),
         );
     } else {
         session
             .metadata
-            .remove(COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY);
+            .remove(COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY);
     }
 
     enabled_from_request

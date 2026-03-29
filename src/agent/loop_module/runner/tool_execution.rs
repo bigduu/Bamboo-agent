@@ -5,8 +5,9 @@ use std::sync::Arc;
 use futures::future::join_all;
 use tokio::sync::mpsc;
 
-use crate::agent::core::tools::{ToolCall, ToolExecutor};
-use crate::agent::core::{AgentEvent, Session};
+use crate::agent::core::tools::{ToolCall, ToolExecutor, ToolSchema};
+use crate::agent::core::{AgentError, AgentEvent, Session};
+use crate::agent::llm::LLMProvider;
 use crate::agent::loop_module::config::AgentLoopConfig;
 use crate::agent::loop_module::task_context::TaskLoopContext;
 use crate::agent::metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
@@ -29,26 +30,19 @@ enum ToolSchedulingMode {
     Sequential,
 }
 
-fn is_parallel_safe_tool_name(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "FileExists"
-            | "Glob"
-            | "GetCurrentDir"
-            | "GetFileInfo"
-            | "Grep"
-            | "Read"
-            | "WebFetch"
-            | "WebSearch"
-            | "session_inspector"
-    )
-}
-
 fn scheduling_mode_for_tool_call(tool_call: &ToolCall) -> ToolSchedulingMode {
     let normalized = crate::agent::tools::normalize_tool_ref(&tool_call.function.name)
         .unwrap_or_else(|| tool_call.function.name.trim().to_string());
 
-    if is_parallel_safe_tool_name(normalized.as_str()) {
+    // Resolve aliases to canonical names (e.g. FileExists → GetFileInfo)
+    // so the classifier sees the canonical tool name.
+    let canonical = crate::agent::tools::resolve_alias(&normalized)
+        .map(|s| s.to_string())
+        .unwrap_or(normalized);
+
+    // Delegate to the centralized classification in orchestrator.rs
+    // which also powers ToolCallRuntime's concurrency control.
+    if crate::agent::tools::parallel::ToolCallRuntime::supports_parallel(&canonical) {
         ToolSchedulingMode::ParallelSafe
     } else {
         ToolSchedulingMode::Sequential
@@ -165,6 +159,39 @@ async fn execute_and_apply_single_tool_call(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn maybe_apply_mid_turn_context_compression_after_tool(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    llm: &Arc<dyn LLMProvider>,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    session_id: &str,
+    model_name: Option<&str>,
+    tool_schemas: &[ToolSchema],
+) -> Result<(), AgentError> {
+    let Some(model_name) = model_name else {
+        return Ok(());
+    };
+
+    if super::round_lifecycle::maybe_apply_mid_turn_context_compression(
+        session,
+        config,
+        llm,
+        event_tx,
+        session_id,
+        model_name,
+        tool_schemas,
+    )
+    .await?
+    {
+        tracing::debug!(
+            "[{}] Applied mid-turn host context compression after single tool result",
+            session_id
+        );
+    }
+    Ok(())
+}
+
 pub(super) async fn execute_round_tool_calls(
     tool_calls: &[ToolCall],
     event_tx: &mpsc::Sender<AgentEvent>,
@@ -176,7 +203,10 @@ pub(super) async fn execute_round_tool_calls(
     tools: &Arc<dyn ToolExecutor>,
     config: &AgentLoopConfig,
     task_context: &mut Option<TaskLoopContext>,
-) -> RoundToolExecutionResult {
+    llm: &Arc<dyn LLMProvider>,
+    compression_model_name: Option<&str>,
+    tool_schemas: &[ToolSchema],
+) -> Result<RoundToolExecutionResult, AgentError> {
     let mut state = RoundExecutionState::default();
     let mut policy_guard = policy::ToolPolicyGuard::default();
 
@@ -219,6 +249,17 @@ pub(super) async fn execute_round_tool_calls(
                     )
                     .await;
 
+                    maybe_apply_mid_turn_context_compression_after_tool(
+                        session,
+                        config,
+                        llm,
+                        event_tx,
+                        session_id,
+                        compression_model_name,
+                        tool_schemas,
+                    )
+                    .await?;
+
                     if control.should_break || control.stop_round {
                         break 'tool_calls;
                     }
@@ -244,6 +285,17 @@ pub(super) async fn execute_round_tool_calls(
                     0,
                 )
                 .await;
+
+                maybe_apply_mid_turn_context_compression_after_tool(
+                    session,
+                    config,
+                    llm,
+                    event_tx,
+                    session_id,
+                    compression_model_name,
+                    tool_schemas,
+                )
+                .await?;
 
                 if control.should_break || control.stop_round {
                     break 'tool_calls;
@@ -328,6 +380,17 @@ pub(super) async fn execute_round_tool_calls(
                 )
                 .await;
 
+                maybe_apply_mid_turn_context_compression_after_tool(
+                    session,
+                    config,
+                    llm,
+                    event_tx,
+                    session_id,
+                    compression_model_name,
+                    tool_schemas,
+                )
+                .await?;
+
                 if should_break {
                     break 'tool_calls;
                 }
@@ -355,12 +418,23 @@ pub(super) async fn execute_round_tool_calls(
 
         next_index += 1;
 
+        maybe_apply_mid_turn_context_compression_after_tool(
+            session,
+            config,
+            llm,
+            event_tx,
+            session_id,
+            compression_model_name,
+            tool_schemas,
+        )
+        .await?;
+
         if control.should_break || control.stop_round {
             break;
         }
     }
 
-    state.into_result()
+    Ok(state.into_result())
 }
 
 #[cfg(test)]
@@ -393,16 +467,20 @@ mod tests {
 
     #[test]
     fn all_parallel_safe_tools_are_classified_correctly() {
+        // Canonical read-only tools (from orchestrator::READ_ONLY_TOOLS)
         let parallel_tools = [
-            "FileExists",
-            "Glob",
-            "GetCurrentDir",
             "GetFileInfo",
+            "Glob",
             "Grep",
             "Read",
             "WebFetch",
             "WebSearch",
+            "Workspace",
+            "BashOutput",
+            "tool_search",
+            "memory_note",
             "session_inspector",
+            "Sleep",
         ];
         for name in &parallel_tools {
             assert_eq!(
@@ -417,13 +495,13 @@ mod tests {
     fn aliases_resolve_to_parallel_safe() {
         let aliases = [
             "read_file",       // alias for Read
-            "file_exists",     // alias for FileExists
-            "fileExists",      // alias for FileExists
+            "file_exists",     // alias → FileExists → GetFileInfo
+            "fileExists",      // alias → FileExists → GetFileInfo
             "list_directory",  // alias for Glob
             "get_file_info",   // alias for GetFileInfo
             "getFileInfo",     // alias for GetFileInfo
-            "get_current_dir", // alias for GetCurrentDir
-            "getCurrentDir",   // alias for GetCurrentDir
+            "get_current_dir", // alias → GetCurrentDir → Workspace
+            "getCurrentDir",   // alias → GetCurrentDir → Workspace
         ];
         for alias in &aliases {
             assert_eq!(
@@ -440,13 +518,10 @@ mod tests {
             "Write",
             "Edit",
             "Bash",
-            "ask_user",
-            "SetWorkspace",
-            "Sleep",
+            "conclusion_with_options",
             "Task",
             "NotebookEdit",
             "KillShell",
-            "memory_note",
             "schedule_tasks",
             "SubSession",
         ];

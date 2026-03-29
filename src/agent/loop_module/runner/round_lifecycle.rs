@@ -43,6 +43,7 @@ pub(super) async fn execute_llm_round(
         session_id,
         tool_schemas,
         llm,
+        Some(event_tx),
     )
     .await?;
 
@@ -104,6 +105,7 @@ pub(super) async fn maybe_apply_mid_turn_context_compression(
     session: &mut Session,
     config: &AgentLoopConfig,
     llm: &Arc<dyn LLMProvider>,
+    event_tx: &mpsc::Sender<AgentEvent>,
     session_id: &str,
     model_name: &str,
     tool_schemas: &[ToolSchema],
@@ -115,6 +117,7 @@ pub(super) async fn maybe_apply_mid_turn_context_compression(
         session_id,
         tool_schemas,
         llm,
+        Some(event_tx),
         "mid-turn",
     )
     .await

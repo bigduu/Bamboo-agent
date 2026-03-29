@@ -5,10 +5,11 @@ use crate::agent::core::budget::{
     TokenBudget,
 };
 use crate::agent::core::tools::ToolSchema;
-use crate::agent::core::{AgentError, Session};
+use crate::agent::core::{AgentError, AgentEvent, Session};
 use crate::agent::llm::LLMProvider;
 use crate::agent::loop_module::config::AgentLoopConfig;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 mod logging;
 mod ocr_cache;
@@ -21,6 +22,22 @@ pub(super) struct PreparedRoundContext {
     pub budget: TokenBudget,
 }
 
+async fn emit_context_compression_status(
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
+    phase_label: &str,
+    status: &str,
+) {
+    let Some(tx) = event_tx else {
+        return;
+    };
+    let _ = tx
+        .send(AgentEvent::ContextCompressionStatus {
+            phase: phase_label.to_string(),
+            status: status.to_string(),
+        })
+        .await;
+}
+
 async fn maybe_apply_host_context_compression_with_budget(
     session: &mut Session,
     config: &AgentLoopConfig,
@@ -28,6 +45,7 @@ async fn maybe_apply_host_context_compression_with_budget(
     session_id: &str,
     llm: &Arc<dyn LLMProvider>,
     budget: &TokenBudget,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
     phase_label: &str,
 ) -> Result<bool, AgentError> {
     let exposure = estimate_context_compression_exposure(session, model_name, Some(budget));
@@ -75,10 +93,14 @@ async fn maybe_apply_host_context_compression_with_budget(
         existing_summary,
         task_list_prompt,
     );
-    let summary = summarizer
-        .summarize(&messages)
-        .await
-        .map_err(|error| AgentError::Budget(error.to_string()))?;
+    emit_context_compression_status(event_tx, phase_label, "started").await;
+    let summary = match summarizer.summarize(&messages).await {
+        Ok(summary) => summary,
+        Err(error) => {
+            emit_context_compression_status(event_tx, phase_label, "failed").await;
+            return Err(AgentError::Budget(error.to_string()));
+        }
+    };
 
     let plan = match build_forced_compression_plan_with_summary(
         session,
@@ -95,6 +117,7 @@ async fn maybe_apply_host_context_compression_with_budget(
                 usage_percent,
                 reason
             );
+            emit_context_compression_status(event_tx, phase_label, "failed").await;
             return Ok(false);
         }
     };
@@ -107,6 +130,7 @@ async fn maybe_apply_host_context_compression_with_budget(
             phase_label,
             usage_percent
         );
+        emit_context_compression_status(event_tx, phase_label, "skipped").await;
         return Ok(false);
     }
 
@@ -130,6 +154,7 @@ async fn maybe_apply_host_context_compression_with_budget(
         compressed_count,
         plan.active_usage_after_percent
     );
+    emit_context_compression_status(event_tx, phase_label, "completed").await;
     Ok(true)
 }
 
@@ -140,6 +165,7 @@ pub(super) async fn maybe_apply_host_context_compression(
     session_id: &str,
     _tool_schemas: &[ToolSchema],
     llm: &Arc<dyn LLMProvider>,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
     phase_label: &str,
 ) -> Result<bool, AgentError> {
     let budget =
@@ -151,6 +177,7 @@ pub(super) async fn maybe_apply_host_context_compression(
         session_id,
         llm,
         &budget,
+        event_tx,
         phase_label,
     )
     .await
@@ -163,6 +190,7 @@ pub(super) async fn prepare_round_context(
     session_id: &str,
     _tool_schemas: &[ToolSchema],
     llm: &Arc<dyn LLMProvider>,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<PreparedRoundContext, AgentError> {
     ocr_cache::maybe_cache_ocr_results(session, config, session_id).await;
 
@@ -172,7 +200,7 @@ pub(super) async fn prepare_round_context(
     let counter = HeuristicTokenCounter::default();
 
     if maybe_apply_host_context_compression_with_budget(
-        session, config, model_name, session_id, llm, &budget, "pre-turn",
+        session, config, model_name, session_id, llm, &budget, event_tx, "pre-turn",
     )
     .await?
     {

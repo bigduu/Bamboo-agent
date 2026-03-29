@@ -108,7 +108,7 @@ async fn test_submit_response_updates_tool_result_and_clears_pending_question() 
     assert_eq!(
         loaded
             .metadata
-            .get("ask_user_resume_pending")
+            .get("conclusion_with_options_resume_pending")
             .map(String::as_str),
         Some("true")
     );

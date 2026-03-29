@@ -491,7 +491,7 @@ pub fn build_summary_prompt(
         "You are compressing conversation history for continued work. Produce a compact but reliable working-memory summary.\n\n",
     );
     content.push_str(
-        "Critical requirements:\n- Distinguish clearly between ACTIVE work, COMPLETED work, and OBSOLETE or superseded work\n- Do not restate old tasks as active unless they are still unresolved\n- The current task list is the source of truth for what is actively being worked on\n- Preserve constraints, decisions, file paths, code changes, errors, tool findings, blockers, and the next step\n- If earlier plans conflict with the current task list or newer messages, treat the earlier plans as obsolete or completed\n- Explicitly evaluate each clear user requirement (e.g. requirement 1, requirement 2) with a status and evidence\n- Return only summary text in the same language as the conversation\n\n",
+        "Critical requirements:\n- First capture the in-flight work right before compression (what was being done, where, and with which tool/file)\n- Distinguish clearly between ACTIVE work, COMPLETED work, and OBSOLETE or superseded work\n- Do not restate old tasks as active unless they are still unresolved\n- The current task list is the source of truth for what is actively being worked on\n- Preserve constraints, decisions, file paths, code changes, errors, tool findings, blockers, and the next step\n- If earlier plans conflict with the current task list or newer messages, treat the earlier plans as obsolete or completed\n- Explicitly evaluate each clear user requirement (e.g. requirement 1, requirement 2) with a status and evidence\n- Return only summary text in the same language as the conversation\n\n",
     );
 
     if let Some(existing) = existing_summary.map(str::trim).filter(|s| !s.is_empty()) {
@@ -508,7 +508,7 @@ pub fn build_summary_prompt(
     }
 
     content.push_str(
-        "## Required Output Sections\n1. Current active objective\n2. Requirement checklist (Requirement | Status: completed/in_progress/pending/blocked/obsolete | Evidence)\n3. Active tasks\n4. Completed tasks\n5. Obsolete or superseded tasks\n6. Important context and constraints\n7. Files, code, and tool findings\n8. Open issues and next step\n\n",
+        "## Required Output Sections\n1. Pre-compression in-flight work (what was being done immediately before compression)\n2. Current active objective\n3. Requirement checklist (Requirement | Status: completed/in_progress/pending/blocked/obsolete | Evidence)\n4. Active tasks\n5. Completed tasks\n6. Obsolete or superseded tasks\n7. Important context and constraints\n8. Files, code, and tool findings\n9. Open issues and next step\n\n",
     );
 
     content.push_str("## Messages To Compress\n\n");

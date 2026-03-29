@@ -1,4 +1,4 @@
-use super::*;
+use super::{AppState, DEFAULT_BASE_PROMPT};
 use crate::agent::core::tools::{FunctionCall, ToolCall, ToolError};
 use crate::agent::tools::permission::config::{PermissionConfig, PermissionRule, PermissionType};
 use crate::agent::tools::permission::storage::PermissionStorage;
@@ -13,6 +13,13 @@ fn make_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
             arguments: args.to_string(),
         },
     }
+}
+
+#[test]
+fn default_base_prompt_does_not_unconditionally_require_conclusion_with_options() {
+    let normalized = DEFAULT_BASE_PROMPT.to_ascii_lowercase();
+    assert!(!normalized.contains("before ending a task, always call conclusion_with_options"));
+    assert!(!normalized.contains("do not ask final confirmation in plain assistant text"));
 }
 #[tokio::test]
 async fn test_app_state_creation() {

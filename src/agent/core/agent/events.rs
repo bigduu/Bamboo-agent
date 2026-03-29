@@ -68,6 +68,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// ## Context Management
 /// - `TokenBudgetUpdated` - Context budget changed
+/// - `ContextCompressionStatus` - Context compression lifecycle progress
 /// - `ContextSummarized` - Old messages summarized
 ///
 /// ## Sub-sessions (Async Spawn)
@@ -142,6 +143,33 @@ pub enum AgentEvent {
         error: String,
     },
 
+    /// Structured lifecycle event for tool execution tracking.
+    ///
+    /// These events complement `ToolStart`/`ToolComplete`/`ToolError` with
+    /// richer metadata (mutability, auto-approval, wall-clock timing) and
+    /// are emitted by [`crate::agent::tools::events::ToolEmitter`].
+    ToolLifecycle {
+        /// Tool call identifier
+        tool_call_id: String,
+        /// Canonical tool name
+        tool_name: String,
+        /// Lifecycle phase: "begin", "finished", "error", "cancelled"
+        phase: String,
+        /// Wall-clock milliseconds since the call began (None for begin)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<u64>,
+        /// Whether the tool mutates state (writes files, runs commands)
+        is_mutating: bool,
+        /// Whether execution was auto-approved (no user prompt needed)
+        auto_approved: bool,
+        /// Human-readable summary
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        /// Error message (if phase == "error")
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
     /// Agent needs clarification from the user.
     NeedClarification {
         /// Question to ask the user
@@ -204,6 +232,14 @@ pub enum AgentEvent {
     TokenBudgetUpdated {
         /// Token budget details
         usage: TokenBudgetUsage,
+    },
+
+    /// Emitted when host-side context compression lifecycle changes.
+    ContextCompressionStatus {
+        /// Compression phase label (for example: pre-turn, mid-turn).
+        phase: String,
+        /// Compression status: started | completed | failed | skipped
+        status: String,
     },
 
     /// Emitted when conversation context is summarized
@@ -392,5 +428,18 @@ mod tests {
 
         let value = serde_json::to_value(event).expect("event should serialize");
         assert_eq!(value["type"], "task_evaluation_completed");
+    }
+
+    #[test]
+    fn context_compression_status_serializes_with_phase_and_status() {
+        let event = AgentEvent::ContextCompressionStatus {
+            phase: "mid-turn".to_string(),
+            status: "started".to_string(),
+        };
+
+        let value = serde_json::to_value(event).expect("event should serialize");
+        assert_eq!(value["type"], "context_compression_status");
+        assert_eq!(value["phase"], "mid-turn");
+        assert_eq!(value["status"], "started");
     }
 }

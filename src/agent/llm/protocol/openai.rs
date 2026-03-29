@@ -59,6 +59,7 @@ impl FromProvider<OpenAIChatMessage> for Message {
             compressed: false,
             compressed_by_event_id: None,
             created_at: chrono::Utc::now(),
+            metadata: None,
         })
     }
 }

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// * `session_id` - Optional session ID. If not provided, a new UUID will be generated
 /// * `system_prompt` - Optional custom system prompt. If empty, uses the default
 /// * `enhance_prompt` - Optional additional prompt instructions appended to the system prompt
-/// * `copilot_ask_user_enhancement_enabled` - Optional flag for enabling copilot ask-user conclusion flow
+/// * `copilot_conclusion_with_options_enhancement_enabled` - Optional flag for enabling copilot conclusion-with-options conclusion flow
 /// * `workspace_path` - Optional workspace path to include in the system prompt
 /// * `selected_skill_ids` - Optional explicit skill IDs selected for this request
 /// * `model` - Required model identifier (e.g., "gpt-4o-mini", "claude-3-opus")
@@ -21,7 +21,7 @@ pub struct ChatRequest {
     #[serde(default)]
     pub enhance_prompt: Option<String>,
     #[serde(default)]
-    pub copilot_ask_user_enhancement_enabled: Option<bool>,
+    pub copilot_conclusion_with_options_enhancement_enabled: Option<bool>,
     #[serde(default)]
     pub workspace_path: Option<String>,
     #[serde(default)]
@@ -72,7 +72,7 @@ mod tests {
         assert_eq!(req.model, "gpt-4");
         assert!(req.session_id.is_none());
         assert!(req.system_prompt.is_none());
-        assert!(req.copilot_ask_user_enhancement_enabled.is_none());
+        assert!(req.copilot_conclusion_with_options_enhancement_enabled.is_none());
         assert!(req.images.is_none());
     }
 
@@ -83,7 +83,7 @@ mod tests {
             "session_id":"sess-123",
             "system_prompt":"Be helpful",
             "enhance_prompt":"Be concise",
-            "copilot_ask_user_enhancement_enabled":true,
+            "copilot_conclusion_with_options_enhancement_enabled":true,
             "workspace_path":"/home/user",
             "selected_skill_ids":["pdf","skill-creator"],
             "model":"claude-3"
@@ -93,7 +93,7 @@ mod tests {
         assert_eq!(req.session_id, Some("sess-123".to_string()));
         assert_eq!(req.system_prompt, Some("Be helpful".to_string()));
         assert_eq!(req.enhance_prompt, Some("Be concise".to_string()));
-        assert_eq!(req.copilot_ask_user_enhancement_enabled, Some(true));
+        assert_eq!(req.copilot_conclusion_with_options_enhancement_enabled, Some(true));
         assert_eq!(req.workspace_path, Some("/home/user".to_string()));
         assert_eq!(
             req.selected_skill_ids,
@@ -136,7 +136,7 @@ mod tests {
             session_id: None,
             system_prompt: None,
             enhance_prompt: None,
-            copilot_ask_user_enhancement_enabled: None,
+            copilot_conclusion_with_options_enhancement_enabled: None,
             workspace_path: None,
             selected_skill_ids: None,
             images: None,

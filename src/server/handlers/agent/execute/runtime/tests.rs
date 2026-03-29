@@ -6,7 +6,7 @@ use crate::{
 use super::{
     execution::{status_from_execution_result, terminal_error_event_for_result},
     session_state::{
-        consume_pending_ask_user_resume, has_pending_user_message,
+        consume_pending_conclusion_with_options_resume, has_pending_user_message,
         initial_user_message_for_session, selected_skill_ids_for_session,
         selected_skill_mode_for_session, system_prompt_for_session,
     },
@@ -24,7 +24,7 @@ fn has_pending_user_message_only_when_last_message_is_user() {
 }
 
 #[test]
-fn has_pending_user_message_when_ask_user_resume_is_marked() {
+fn has_pending_user_message_when_conclusion_with_options_resume_is_marked() {
     let mut session = Session::new("session-1", "gpt-4o-mini");
     session.add_message(Message::assistant("tool question", None));
     session.add_message(Message::tool_result("ask-1", "User selected: A"));
@@ -32,10 +32,10 @@ fn has_pending_user_message_when_ask_user_resume_is_marked() {
 
     session
         .metadata
-        .insert("ask_user_resume_pending".to_string(), "true".to_string());
+        .insert("conclusion_with_options_resume_pending".to_string(), "true".to_string());
     assert!(has_pending_user_message(&session));
 
-    consume_pending_ask_user_resume(&mut session);
+    consume_pending_conclusion_with_options_resume(&mut session);
     assert!(!has_pending_user_message(&session));
 }
 
@@ -54,7 +54,7 @@ fn has_pending_user_message_when_error_retry_resume_is_marked() {
         .insert("retry_resume_reason".to_string(), "error_retry".to_string());
     assert!(has_pending_user_message(&session));
 
-    consume_pending_ask_user_resume(&mut session);
+    consume_pending_conclusion_with_options_resume(&mut session);
     assert!(!has_pending_user_message(&session));
     assert!(!session.metadata.contains_key("retry_resume_pending"));
     assert!(!session.metadata.contains_key("retry_resume_reason"));

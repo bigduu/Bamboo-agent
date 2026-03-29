@@ -45,7 +45,7 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> imp
     // When an agent runner is active the in-memory session cache (`state.sessions`)
     // may lag behind disk because the loop works with a local `&mut Session` and only
     // writes back to the cache after `run_agent_loop` returns.  The agent *does* persist
-    // to disk after significant changes (ask_user, compaction, finalize), so reading
+    // to disk after significant changes (conclusion_with_options, compaction, finalize), so reading
     // from disk gives the frontend the freshest snapshot during execution.
     let runner_active = {
         let runners = state.agent_runners.read().await;

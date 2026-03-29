@@ -7,9 +7,9 @@ use crate::agent::core::{Role, Session};
 
 const MAX_TOOL_CALLS_PER_ROUND: usize = 80;
 const MAX_CONSECUTIVE_FAILURES_PER_TOOL: usize = 3;
-const RESET_POLICY_TOOL_NAME: &str = "ask_user";
-const COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY: &str = "copilot_ask_user_enhancement_enabled";
-const CONCLUSION_TOOL_NAME: &str = "conclusion";
+const RESET_POLICY_TOOL_NAME: &str = "conclusion_with_options";
+const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str =
+    "copilot_conclusion_with_options_enhancement_enabled";
 
 const STRICT_ARGUMENT_TOOL_NAMES: [&str; 10] = [
     "Write",
@@ -29,10 +29,10 @@ fn normalize_tool_for_policy(raw_tool_name: &str) -> String {
         .unwrap_or_else(|| normalize_tool_name(raw_tool_name).trim().to_string())
 }
 
-fn is_copilot_ask_user_enhancement_enabled(session: &Session) -> bool {
+fn is_copilot_conclusion_with_options_enhancement_enabled(session: &Session) -> bool {
     session
         .metadata
-        .get(COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY)
+        .get(COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY)
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
 }
 
@@ -50,20 +50,27 @@ fn find_assistant_message_for_tool_call<'a>(
     })
 }
 
-fn assistant_message_has_tool(message: &crate::agent::core::Message, tool_name: &str) -> bool {
-    message
-        .tool_calls
-        .as_ref()
-        .map(|calls| {
-            calls.iter().any(|call| {
-                normalize_tool_for_policy(&call.function.name).eq_ignore_ascii_case(tool_name)
-            })
-        })
-        .unwrap_or(false)
-}
+fn conclusion_with_options_arguments_include_conclusion(tool_call: &ToolCall) -> bool {
+    let (parsed, _) = parse_tool_args_best_effort(&tool_call.function.arguments);
+    let Some(args) = parsed.as_object() else {
+        return false;
+    };
 
-fn assistant_message_has_conclusion(message: &crate::agent::core::Message) -> bool {
-    assistant_message_has_tool(message, CONCLUSION_TOOL_NAME)
+    let Some(conclusion) = args.get("conclusion").and_then(|value| value.as_object()) else {
+        return false;
+    };
+    let has_summary = conclusion
+        .get("summary")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_mermaid_graph = conclusion
+        .get("mermaid")
+        .and_then(|value| value.as_object())
+        .and_then(|value| value.get("graph"))
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty());
+
+    has_summary && has_mermaid_graph
 }
 
 pub(super) fn validate_tool_call_arguments(tool_call: &ToolCall) -> Result<(), String> {
@@ -106,43 +113,27 @@ pub(super) fn validate_tool_call_context(
 ) -> Result<(), String> {
     let normalized_tool_name = normalize_tool_for_policy(&tool_call.function.name);
     let assistant_message = find_assistant_message_for_tool_call(session, &tool_call.id);
-    let enhancement_enabled = is_copilot_ask_user_enhancement_enabled(session);
+    let enhancement_enabled = is_copilot_conclusion_with_options_enhancement_enabled(session);
 
-    if normalized_tool_name.eq_ignore_ascii_case("ask_user") {
+    if normalized_tool_name.eq_ignore_ascii_case("conclusion_with_options") {
         let has_narration = assistant_message
             .map(|message| !message.content.trim().is_empty())
             .unwrap_or(false);
 
         if !has_narration {
             return Err(
-                "Tool policy blocked 'ask_user': add a brief assistant text summary before calling ask_user so the user can understand the conclusion.".to_string()
+                "Tool policy blocked 'conclusion_with_options': add a brief assistant text summary before calling conclusion_with_options so the user can understand the conclusion.".to_string()
             );
         }
 
-        if enhancement_enabled
-            && !assistant_message
-                .map(assistant_message_has_conclusion)
-                .unwrap_or(false)
-        {
+        if enhancement_enabled && !conclusion_with_options_arguments_include_conclusion(tool_call) {
             return Err(
-                "Tool policy blocked 'ask_user': when copilot ask-user enhancement is enabled, include a `conclusion` tool call in the same assistant response before final confirmation."
+                "Tool policy blocked 'conclusion_with_options': when copilot conclusion-with-options enhancement is enabled, include `conclusion.summary` and `conclusion.mermaid.graph` in the conclusion_with_options arguments."
                     .to_string(),
             );
         }
 
         return Ok(());
-    }
-
-    if normalized_tool_name.eq_ignore_ascii_case(CONCLUSION_TOOL_NAME)
-        && enhancement_enabled
-        && !assistant_message
-            .map(|message| assistant_message_has_tool(message, "ask_user"))
-            .unwrap_or(false)
-    {
-        return Err(
-            "Tool policy blocked 'conclusion': when copilot ask-user enhancement is enabled, pair conclusion with an `ask_user` tool call in the same assistant response."
-                .to_string(),
-        );
     }
 
     Ok(())
@@ -303,28 +294,28 @@ mod tests {
     }
 
     #[test]
-    fn ask_user_context_validation_requires_matching_assistant_narration() {
-        let call = tool_call("ask_user", "{}");
+    fn conclusion_with_options_context_validation_requires_matching_assistant_narration() {
+        let call = tool_call("conclusion_with_options", "{}");
         let session = Session::new("session-1", "model");
         let err =
             validate_tool_call_context(&call, &session).expect_err("expected context rejection");
-        assert!(err.contains("before calling ask_user"));
+        assert!(err.contains("before calling conclusion_with_options"));
     }
 
     #[test]
-    fn ask_user_context_validation_rejects_empty_assistant_narration() {
-        let call = tool_call("ask_user", "{}");
+    fn conclusion_with_options_context_validation_rejects_empty_assistant_narration() {
+        let call = tool_call("conclusion_with_options", "{}");
         let mut session = Session::new("session-1", "model");
         session.add_message(Message::assistant("   ", Some(vec![call.clone()])));
 
         let err =
             validate_tool_call_context(&call, &session).expect_err("expected context rejection");
-        assert!(err.contains("before calling ask_user"));
+        assert!(err.contains("before calling conclusion_with_options"));
     }
 
     #[test]
-    fn ask_user_context_validation_accepts_non_empty_assistant_narration() {
-        let call = tool_call("ask_user", "{}");
+    fn conclusion_with_options_context_validation_accepts_non_empty_assistant_narration() {
+        let call = tool_call("conclusion_with_options", "{}");
         let mut session = Session::new("session-1", "model");
         session.add_message(Message::assistant(
             "Summary: completed requested changes and ready for your confirmation.",
@@ -335,80 +326,50 @@ mod tests {
     }
 
     #[test]
-    fn non_ask_user_context_validation_is_noop() {
+    fn non_conclusion_with_options_context_validation_is_noop() {
         let call = tool_call("Read", "{}");
         let session = Session::new("session-1", "model");
         assert!(validate_tool_call_context(&call, &session).is_ok());
     }
 
     #[test]
-    fn conclusion_requires_ask_user_when_enhancement_enabled() {
-        let conclusion_call = tool_call_with_id("call-conclusion", "conclusion", "{}");
+    fn conclusion_with_options_requires_conclusion_fields_when_enhancement_enabled() {
+        let conclusion_with_options_call =
+            tool_call_with_id("call-conclusion-with-options", "conclusion_with_options", r#"{"question":"Continue?"}"#);
         let mut session = Session::new("session-1", "model");
         session.metadata.insert(
-            COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY.to_string(),
-            "true".to_string(),
-        );
-        session.add_message(Message::assistant(
-            "Wrap-up summary.",
-            Some(vec![conclusion_call.clone()]),
-        ));
-
-        let err = validate_tool_call_context(&conclusion_call, &session)
-            .expect_err("expected policy rejection");
-        assert!(err.contains("pair conclusion with an `ask_user`"));
-    }
-
-    #[test]
-    fn conclusion_with_ask_user_passes_when_enhancement_enabled() {
-        let conclusion_call = tool_call_with_id("call-conclusion", "conclusion", "{}");
-        let ask_user_call = tool_call_with_id("call-ask-user", "ask_user", "{}");
-        let mut session = Session::new("session-1", "model");
-        session.metadata.insert(
-            COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY.to_string(),
-            "true".to_string(),
-        );
-        session.add_message(Message::assistant(
-            "Wrap-up summary.",
-            Some(vec![conclusion_call.clone(), ask_user_call]),
-        ));
-
-        assert!(validate_tool_call_context(&conclusion_call, &session).is_ok());
-    }
-
-    #[test]
-    fn ask_user_requires_conclusion_when_enhancement_enabled() {
-        let ask_user_call = tool_call_with_id("call-ask-user", "ask_user", "{}");
-        let mut session = Session::new("session-1", "model");
-        session.metadata.insert(
-            COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY.to_string(),
+            COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY.to_string(),
             "true".to_string(),
         );
         session.add_message(Message::assistant(
             "Final confirmation request.",
-            Some(vec![ask_user_call.clone()]),
+            Some(vec![conclusion_with_options_call.clone()]),
         ));
 
-        let err = validate_tool_call_context(&ask_user_call, &session)
+        let err = validate_tool_call_context(&conclusion_with_options_call, &session)
             .expect_err("expected policy rejection");
-        assert!(err.contains("include a `conclusion` tool call"));
+        assert!(err.contains("conclusion.summary"));
+        assert!(err.contains("conclusion.mermaid.graph"));
     }
 
     #[test]
-    fn ask_user_with_summary_tool_passes_when_enhancement_enabled() {
-        let ask_user_call = tool_call_with_id("call-ask-user", "ask_user", "{}");
-        let conclusion_call = tool_call_with_id("call-conclusion", "conclusion", "{}");
+    fn conclusion_with_options_with_conclusion_fields_passes_when_enhancement_enabled() {
+        let conclusion_with_options_call = tool_call_with_id(
+            "call-conclusion-with-options",
+            "conclusion_with_options",
+            r#"{"question":"Continue?","conclusion":{"summary":"All done.","mermaid":{"graph":"graph TD\nA-->B"}}}"#,
+        );
         let mut session = Session::new("session-1", "model");
         session.metadata.insert(
-            COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY.to_string(),
+            COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY.to_string(),
             "true".to_string(),
         );
         session.add_message(Message::assistant(
             "Final summary and confirmation.",
-            Some(vec![conclusion_call, ask_user_call.clone()]),
+            Some(vec![conclusion_with_options_call.clone()]),
         ));
 
-        assert!(validate_tool_call_context(&ask_user_call, &session).is_ok());
+        assert!(validate_tool_call_context(&conclusion_with_options_call, &session).is_ok());
     }
 
     #[test]
@@ -486,10 +447,10 @@ mod tests {
     }
 
     #[test]
-    fn ask_user_resets_round_limit_counters() {
+    fn conclusion_with_options_resets_round_limit_counters() {
         let mut guard = ToolPolicyGuard::default();
         let read_call = tool_call("Read", "{}");
-        let ask_user_call = tool_call("ask_user", "{}");
+        let conclusion_with_options_call = tool_call("conclusion_with_options", "{}");
 
         for _ in 0..MAX_TOOL_CALLS_PER_ROUND {
             guard.observe_outcome(
@@ -505,7 +466,7 @@ mod tests {
         assert!(guard.check_before_execution(&read_call, 0).is_err());
 
         guard.observe_outcome(
-            &ask_user_call,
+            &conclusion_with_options_call,
             &Ok(ToolResult {
                 success: true,
                 result: "ask".to_string(),
@@ -517,10 +478,10 @@ mod tests {
     }
 
     #[test]
-    fn ask_user_resets_failure_circuit() {
+    fn conclusion_with_options_resets_failure_circuit() {
         let mut guard = ToolPolicyGuard::default();
         let bash_call = tool_call("Bash", "{}");
-        let ask_user_call = tool_call("ask_user", "{}");
+        let conclusion_with_options_call = tool_call("conclusion_with_options", "{}");
 
         for _ in 0..MAX_CONSECUTIVE_FAILURES_PER_TOOL {
             guard.observe_outcome(&bash_call, &Err("boom".to_string()));
@@ -528,7 +489,7 @@ mod tests {
         assert!(guard.check_before_execution(&bash_call, 0).is_err());
 
         guard.observe_outcome(
-            &ask_user_call,
+            &conclusion_with_options_call,
             &Ok(ToolResult {
                 success: true,
                 result: "ask".to_string(),

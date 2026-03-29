@@ -49,6 +49,10 @@ enum CollectorCommand {
         tool_call_id: String,
         completion: ToolCallCompletion,
     },
+    ExecuteSyncMismatch {
+        reason: String,
+        occurred_at: DateTime<Utc>,
+    },
     ForwardStarted {
         forward_id: String,
         endpoint: String,
@@ -162,6 +166,11 @@ impl MetricsCollector {
                         tool_call_id,
                         completion,
                     } => storage.complete_tool_call(&tool_call_id, completion).await,
+                    CollectorCommand::ExecuteSyncMismatch { reason, occurred_at } => {
+                        storage
+                            .increment_execute_sync_mismatch(&reason, occurred_at)
+                            .await
+                    }
                     CollectorCommand::ForwardStarted {
                         forward_id,
                         endpoint,
@@ -369,6 +378,13 @@ impl MetricsCollector {
             status,
             usage,
             error,
+        });
+    }
+
+    pub fn execute_sync_mismatch(&self, reason: impl Into<String>, occurred_at: DateTime<Utc>) {
+        let _ = self.tx.send(CollectorCommand::ExecuteSyncMismatch {
+            reason: reason.into(),
+            occurred_at,
         });
     }
 

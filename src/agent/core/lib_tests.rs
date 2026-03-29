@@ -166,7 +166,7 @@ mod tests {
             id: "call_yyaeEH9yC4MEL0kc5fWJwOZv".to_string(),
             tool_type: "function".to_string(),
             function: FunctionCall {
-                name: "ask_user".to_string(),
+                name: "conclusion_with_options".to_string(),
                 arguments: r#"{"question": "test"}"#.to_string(),
             },
         }];

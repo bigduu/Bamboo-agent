@@ -10,7 +10,9 @@ mod session;
 mod types;
 
 pub use handler::handler;
-pub use types::{ExecuteRequest, ExecuteResponse};
+pub use types::{
+    ExecuteClientSync, ExecuteRequest, ExecuteResponse, ExecuteSyncInfo, ExecuteSyncReason,
+};
 
 #[cfg(test)]
 mod tests;

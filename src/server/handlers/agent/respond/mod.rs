@@ -1,7 +1,7 @@
 //! User response API handler for interactive agent questions.
 //!
 //! This module provides HTTP endpoints for submitting user responses
-//! when the agent asks questions via the `ask_user` tool.
+//! when the agent asks questions via the `conclusion_with_options` tool.
 
 mod handlers;
 mod session;

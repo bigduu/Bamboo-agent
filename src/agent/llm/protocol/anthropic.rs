@@ -39,6 +39,7 @@ impl FromProvider<AnthropicMessage> for Message {
             compressed: false,
             compressed_by_event_id: None,
             created_at: chrono::Utc::now(),
+            metadata: None,
         })
     }
 }
@@ -266,6 +267,7 @@ impl AnthropicResponseConverter {
             compressed: false,
             compressed_by_event_id: None,
             created_at: chrono::Utc::now(),
+            metadata: None,
         })
     }
 }

@@ -96,6 +96,19 @@ pub fn check_permissions(
                 format!("Web search query: {}", query),
             )]))
         }
+        "js_repl" => {
+            let code = required_string_arg(args, "code")?;
+            let preview = if code.len() > 80 {
+                format!("{}...", &code[..80])
+            } else {
+                code.to_string()
+            };
+            Ok(Some(vec![PermissionContext::new(
+                PermissionType::ExecuteCommand,
+                "node",
+                format!("Execute JavaScript: {}", preview),
+            )]))
+        }
         _ => Ok(None),
     }
 }
@@ -207,5 +220,34 @@ mod tests {
         assert_eq!(contexts.len(), 1);
         assert_eq!(contexts[0].permission_type, PermissionType::TerminalSession);
         assert_eq!(contexts[0].resource, "abc-123");
+    }
+
+    #[test]
+    fn check_permissions_js_repl() {
+        let args = json!({"code": "console.log('hello')"});
+        let contexts = check_permissions("js_repl", &args).unwrap().unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].permission_type, PermissionType::ExecuteCommand);
+        assert_eq!(contexts[0].resource, "node");
+        assert!(contexts[0]
+            .operation_description
+            .contains("console.log('hello')"));
+    }
+
+    #[test]
+    fn check_permissions_js_repl_long_code_truncated() {
+        let long_code = "x".repeat(200);
+        let args = json!({"code": long_code});
+        let contexts = check_permissions("js_repl", &args).unwrap().unwrap();
+        assert!(contexts[0].operation_description.contains("..."));
+        assert!(contexts[0].operation_description.len() < 200);
+    }
+
+    #[test]
+    fn check_permissions_web_search() {
+        let args = json!({"query": "rust async trait"});
+        let contexts = check_permissions("WebSearch", &args).unwrap().unwrap();
+        assert_eq!(contexts[0].permission_type, PermissionType::HttpRequest);
+        assert_eq!(contexts[0].resource, "duckduckgo.com");
     }
 }

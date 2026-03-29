@@ -75,6 +75,7 @@ fn execute_request_empty_model_fails_validation() {
         model: "   ".to_string(),
         skill_mode: None,
         reasoning_effort: None,
+        client_sync: None,
     };
 
     // Handler validation: trim and check if empty.

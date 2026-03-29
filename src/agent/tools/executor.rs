@@ -9,10 +9,10 @@ use async_trait::async_trait;
 use crate::agent::tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
 use crate::agent::tools::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::agent::tools::tools::{
-    ApplyPatchTool, AskUserTool, BashOutputTool, BashTool, ConclusionTool, EditTool,
-    ExitPlanModeTool, FileExistsTool, GetCurrentDirTool, GetFileInfoTool, GlobTool, GrepTool,
-    KillShellTool, MemoryNoteTool, NotebookEditTool, ReadTool, SetWorkspaceTool, SleepTool,
-    TaskTool, ToolRegistry, WebFetchTool, WebSearchTool, WriteTool,
+    ConclusionWithOptionsTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, GetFileInfoTool, GlobTool,
+    GrepTool, JsReplTool, KillShellTool, MemoryNoteTool, NotebookEditTool, ReadTool,
+    RequestPermissionsTool, SleepTool, TaskTool, ToolRegistry, ToolSearchTool, WebFetchTool,
+    WebSearchTool, WorkspaceTool, WriteTool,
 };
 use crate::core::Config;
 use tokio::sync::RwLock;
@@ -37,29 +37,41 @@ fn preview_for_log(value: &str, max_chars: usize) -> String {
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 22] = [
-    "apply_patch",
-    "ask_user",
+pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
+    "conclusion_with_options",
     "Bash",
     "BashOutput",
-    "conclusion",
     "Edit",
     "ExitPlanMode",
-    "FileExists",
-    "Glob",
-    "GetCurrentDir",
     "GetFileInfo",
+    "Glob",
     "Grep",
+    "js_repl",
     "KillShell",
     "memory_note",
     "NotebookEdit",
     "Read",
-    "SetWorkspace",
+    "request_permissions",
     "Sleep",
     "Task",
+    "tool_search",
     "WebFetch",
     "WebSearch",
+    "Workspace",
     "Write",
+];
+
+/// Tool names that are accepted as aliases for built-in tools but are not
+/// independently listed in `BUILTIN_TOOL_NAMES`.  Calls to these names are
+/// transparently routed to their canonical counterpart.
+pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 4] = [
+    // apply_patch is a patch-only alias for Edit
+    ("apply_patch", "Edit"),
+    // FileExists is subsumed by GetFileInfo (returns {exists: false} for missing paths)
+    ("FileExists", "GetFileInfo"),
+    // GetCurrentDir + SetWorkspace are subsumed by Workspace
+    ("GetCurrentDir", "Workspace"),
+    ("SetWorkspace", "Workspace"),
 ];
 
 pub const SERVER_TOOL_NAMES: [&str; 6] = [
@@ -83,16 +95,36 @@ pub fn normalize_tool_ref(value: &str) -> Option<String> {
     let raw_tool_name = trimmed.split("::").last().unwrap_or(trimmed);
     let normalized = normalize_builtin_alias(raw_tool_name);
 
-    BUILTIN_TOOL_NAMES
+    // Check canonical tool names first
+    if let Some(name) = BUILTIN_TOOL_NAMES
         .iter()
         .chain(SERVER_TOOL_NAMES.iter())
         .find(|name| name.eq_ignore_ascii_case(normalized))
-        .map(|name| (*name).to_string())
+    {
+        return Some((*name).to_string());
+    }
+
+    // Check aliases – return the *alias* name so callers see what was typed,
+    // while the executor routes it to the canonical tool.
+    BUILTIN_TOOL_ALIASES
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(normalized))
+        .map(|(alias, _)| (*alias).to_string())
+}
+
+/// Returns the canonical tool name for an alias, or `None` if the name is
+/// not an alias.
+pub fn resolve_alias(name: &str) -> Option<&'static str> {
+    BUILTIN_TOOL_ALIASES
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(name))
+        .map(|(_, canonical)| *canonical)
 }
 
 fn normalize_builtin_alias(name: &str) -> &str {
     match name {
         // Backward compatibility for earlier camelCase and snake_case names.
+        "conclusionWithOptions" => "conclusion_with_options",
         "execute_command" => "Bash",
         "file_exists" => "FileExists",
         "fileExists" => "FileExists",
@@ -240,27 +272,29 @@ impl BuiltinToolExecutor {
     /// Registers all built-in tools to the given registry
     fn register_builtin_tools(registry: &ToolRegistry, config: Option<Arc<RwLock<Config>>>) {
         let _ = config;
-        let _ = registry.register(ApplyPatchTool::new());
-        let _ = registry.register(AskUserTool::new());
+        // NOTE: apply_patch is now an alias for Edit – no separate registration.
+        let _ = registry.register(ConclusionWithOptionsTool::new());
         let _ = registry.register(BashTool::new());
         let _ = registry.register(BashOutputTool::new());
-        let _ = registry.register(ConclusionTool::new());
         let _ = registry.register(EditTool::new());
         let _ = registry.register(ExitPlanModeTool::new());
-        let _ = registry.register(FileExistsTool::new());
-        let _ = registry.register(GlobTool::new());
-        let _ = registry.register(GetCurrentDirTool::new());
+        // NOTE: FileExists is now an alias for GetFileInfo – no separate registration.
         let _ = registry.register(GetFileInfoTool::new());
+        let _ = registry.register(GlobTool::new());
         let _ = registry.register(GrepTool::new());
+        let _ = registry.register(JsReplTool::new());
         let _ = registry.register(KillShellTool::new());
         let _ = registry.register(MemoryNoteTool::new());
         let _ = registry.register(NotebookEditTool::new());
         let _ = registry.register(ReadTool::new());
-        let _ = registry.register(SetWorkspaceTool::new());
+        let _ = registry.register(RequestPermissionsTool::new());
         let _ = registry.register(SleepTool::new());
         let _ = registry.register(TaskTool::new());
+        let _ = registry.register(ToolSearchTool::new());
         let _ = registry.register(WebFetchTool::new());
         let _ = registry.register(WebSearchTool::new());
+        // NOTE: GetCurrentDir + SetWorkspace are now aliases for Workspace.
+        let _ = registry.register(WorkspaceTool::new());
         let _ = registry.register(WriteTool::new());
     }
 
@@ -347,7 +381,14 @@ impl ToolExecutor for BuiltinToolExecutor {
         let tool_name = if self.registry.get(raw_tool_name).is_some() {
             raw_tool_name
         } else {
-            normalize_builtin_alias(raw_tool_name)
+            let aliased = normalize_builtin_alias(raw_tool_name);
+            // If the aliased name isn't in the registry either, try resolving
+            // through the BUILTIN_TOOL_ALIASES table (e.g. apply_patch → Edit).
+            if self.registry.get(aliased).is_some() {
+                aliased
+            } else {
+                resolve_alias(aliased).unwrap_or(aliased)
+            }
         };
 
         // Look up the tool in the registry
@@ -410,8 +451,8 @@ impl BuiltinToolExecutorBuilder {
         match name {
             "Read" => self.registry.register(ReadTool::new()),
             "Write" => self.registry.register(WriteTool::new()),
-            "Edit" => self.registry.register(EditTool::new()),
-            "apply_patch" => self.registry.register(ApplyPatchTool::new()),
+            // apply_patch is now an alias for Edit
+            "Edit" | "apply_patch" => self.registry.register(EditTool::new()),
             "NotebookEdit" => self.registry.register(NotebookEditTool::new()),
             _ => return Err(ToolError::NotFound(format!("Unknown tool: {}", name))),
         }
@@ -741,10 +782,10 @@ mod tests {
         assert_eq!(edit["properties"]["replace_all"]["type"], "boolean");
         assert!(edit.get("oneOf").is_none());
 
-        let apply_patch = get_params("apply_patch");
-        assert_eq!(apply_patch["required"], json!(["file_path", "patch"]));
-        assert_eq!(apply_patch["properties"]["patch"]["type"], "string");
-        assert_eq!(apply_patch["properties"]["line_number"]["type"], "integer");
+        // apply_patch is now an alias for Edit – its schema is the Edit
+        // schema, so we just verify that Edit includes the patch property.
+        assert_eq!(edit["properties"]["patch"]["type"], "string");
+        assert_eq!(edit["properties"]["line_number"]["type"], "integer");
 
         let bash = get_params("Bash");
         assert_eq!(bash["required"], json!(["command"]));

@@ -62,9 +62,9 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         &mut session,
         request::optional_non_empty(req.enhance_prompt.as_deref()),
     );
-    session::resolve_copilot_ask_user_enhancement_enabled(
+    session::resolve_copilot_conclusion_with_options_enhancement_enabled(
         &mut session,
-        req.copilot_ask_user_enhancement_enabled,
+        req.copilot_conclusion_with_options_enhancement_enabled,
     );
     let workspace_path = session::resolve_workspace_path(
         &mut session,

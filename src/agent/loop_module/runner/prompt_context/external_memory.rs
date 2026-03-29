@@ -11,7 +11,7 @@ const EXTERNAL_MEMORY_PROMPT_MAX_TOTAL_CHARS: usize = 6_000;
 const EXTERNAL_MEMORY_TOOL_NAME: &str = "memory_note";
 
 /// Context usage percentage at which we warn the LLM to save memory.
-/// This should be below the budget system's compression trigger (~80%).
+/// This should be below the budget system's compression trigger (~90%).
 const CONTEXT_PRESSURE_WARNING_THRESHOLD: f64 = 70.0;
 
 pub(super) fn strip_existing_external_memory(prompt: &str) -> String {

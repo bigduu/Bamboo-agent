@@ -3,12 +3,14 @@ use tokio::sync::mpsc;
 
 use super::image_fallback::{resolve_image_fallback, validate_image_fallback_for_session};
 use super::runtime::{
-    consume_pending_ask_user_resume, has_pending_user_message, reserve_runner,
+    consume_pending_conclusion_with_options_resume, has_pending_user_message, reserve_runner,
     spawn_agent_execution, spawn_event_forwarder, RunnerReservation, SpawnAgentExecution,
 };
 use super::session::load_session;
-use super::ExecuteRequest;
-use crate::agent::core::{Session, SessionKind};
+use super::{
+    ExecuteClientSync, ExecuteRequest, ExecuteSyncInfo, ExecuteSyncReason,
+};
+use crate::agent::core::SessionKind;
 use crate::server::app_state::AppState;
 
 use self::response::{
@@ -22,36 +24,93 @@ mod response;
 mod tests;
 mod validation;
 
-const COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY: &str = "copilot_ask_user_enhancement_enabled";
-const COPILOT_ASK_USER_ENHANCEMENT_TOOLS: [&str; 1] = ["conclusion"];
-
-fn is_copilot_ask_user_enhancement_enabled_for_session(
-    session: &Session,
-    provider_name: &str,
-) -> bool {
-    if !provider_name.trim().eq_ignore_ascii_case("copilot") {
-        return false;
-    }
-
-    session
-        .metadata
-        .get(COPILOT_ASK_USER_ENHANCEMENT_METADATA_KEY)
-        .map(|value| value.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerExecuteSnapshot {
+    message_count: usize,
+    last_message_id: Option<String>,
+    has_pending_question: bool,
+    pending_question_tool_call_id: Option<String>,
+    has_pending_user_message: bool,
 }
 
-fn apply_copilot_ask_user_enhancement_tool_filter(
-    disabled_tools: &mut std::collections::BTreeSet<String>,
-    session: &Session,
-    provider_name: &str,
-) {
-    if is_copilot_ask_user_enhancement_enabled_for_session(session, provider_name) {
-        return;
+impl ServerExecuteSnapshot {
+    fn from_session(session: &crate::agent::core::Session) -> Self {
+        Self {
+            message_count: session.messages.len(),
+            last_message_id: session.messages.last().map(|message| message.id.clone()),
+            has_pending_question: session.pending_question.is_some(),
+            pending_question_tool_call_id: session
+                .pending_question
+                .as_ref()
+                .map(|pending| pending.tool_call_id.clone()),
+            has_pending_user_message: has_pending_user_message(session),
+        }
     }
 
-    for tool_name in COPILOT_ASK_USER_ENHANCEMENT_TOOLS {
-        disabled_tools.insert(tool_name.to_string());
+    fn to_sync_info(&self, reason: Option<ExecuteSyncReason>) -> ExecuteSyncInfo {
+        ExecuteSyncInfo {
+            need_sync: reason.is_some(),
+            reason,
+            server_message_count: self.message_count,
+            server_last_message_id: self.last_message_id.clone(),
+            has_pending_question: self.has_pending_question,
+            pending_question_tool_call_id: self.pending_question_tool_call_id.clone(),
+            has_pending_user_message: self.has_pending_user_message,
+        }
     }
+}
+
+fn evaluate_client_sync(
+    client_sync: Option<&ExecuteClientSync>,
+    server_snapshot: &ServerExecuteSnapshot,
+) -> Option<ExecuteSyncReason> {
+    let client_sync = client_sync?;
+
+    let client_pending_question_tool_call_id = client_sync
+        .client_pending_question_tool_call_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let server_pending_question_tool_call_id = server_snapshot
+        .pending_question_tool_call_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if client_sync.client_has_pending_question != server_snapshot.has_pending_question {
+        return Some(ExecuteSyncReason::PendingQuestionMismatch);
+    }
+
+    // Tool call id is optional on the client cursor. If the client knows the id,
+    // require an exact match. If it does not, avoid forcing a sync just because
+    // the server has a populated id.
+    if client_sync.client_has_pending_question
+        && client_pending_question_tool_call_id.is_some()
+        && client_pending_question_tool_call_id != server_pending_question_tool_call_id
+    {
+        return Some(ExecuteSyncReason::PendingQuestionMismatch);
+    }
+
+    if client_sync.client_message_count != server_snapshot.message_count {
+        return Some(ExecuteSyncReason::MessageCountMismatch);
+    }
+
+    let client_last_message_id = client_sync
+        .client_last_message_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let server_last_message_id = server_snapshot
+        .last_message_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if client_last_message_id != server_last_message_id {
+        return Some(ExecuteSyncReason::LastMessageIdMismatch);
+    }
+
+    None
 }
 
 /// Execute the AI agent on a chat session.
@@ -119,6 +178,7 @@ pub async fn handler(
     };
     let request_reasoning_effort = req.reasoning_effort;
     let request_skill_mode = req.skill_mode.clone();
+    let request_client_sync = req.client_sync.clone();
 
     tracing::debug!(
         "[{}] Execute request received with model: {}",
@@ -131,6 +191,19 @@ pub async fn handler(
         Err(response) => return response,
     };
     let is_child_session = session.kind == SessionKind::Child;
+    let server_snapshot = ServerExecuteSnapshot::from_session(&session);
+    if let Some(reason) = evaluate_client_sync(request_client_sync.as_ref(), &server_snapshot) {
+        tracing::info!(
+            "[{}] Execute sync mismatch detected before start: {}",
+            session_id,
+            reason.as_str()
+        );
+        state
+            .metrics_service
+            .collector()
+            .execute_sync_mismatch(reason.as_str(), chrono::Utc::now());
+        return completed_response(&session_id, server_snapshot.to_sync_info(Some(reason)));
+    }
 
     // Snapshot server config for this execution.
     //
@@ -140,12 +213,7 @@ pub async fn handler(
     let config_snapshot = state.config.read().await.clone();
     let default_reasoning_effort = config_snapshot.get_reasoning_effort();
     let effective_reasoning_effort = request_reasoning_effort.or(default_reasoning_effort);
-    let mut disabled_tools = config_snapshot.disabled_tool_names();
-    apply_copilot_ask_user_enhancement_tool_filter(
-        &mut disabled_tools,
-        &session,
-        &config_snapshot.provider,
-    );
+    let disabled_tools = config_snapshot.disabled_tool_names();
     let reasoning_effort_source = if request_reasoning_effort.is_some() {
         "request"
     } else if default_reasoning_effort.is_some() {
@@ -162,12 +230,12 @@ pub async fn handler(
         return bad_request_error_response(error);
     }
 
-    if !has_pending_user_message(&session) {
+    if !server_snapshot.has_pending_user_message {
         tracing::debug!(
             "[{}] No pending user message, returning completed status",
             session_id
         );
-        return completed_response(&session_id);
+        return completed_response(&session_id, server_snapshot.to_sync_info(None));
     }
 
     if let Some(reasoning_effort) = effective_reasoning_effort {
@@ -200,10 +268,12 @@ pub async fn handler(
 
     let cancel_token = match reserve_runner(state.get_ref(), &session_id, &session_tx).await {
         RunnerReservation::Started(token) => token,
-        RunnerReservation::AlreadyRunning => return already_running_response(&session_id),
+        RunnerReservation::AlreadyRunning => {
+            return already_running_response(&session_id, server_snapshot.to_sync_info(None));
+        }
     };
 
-    consume_pending_ask_user_resume(&mut session);
+    consume_pending_conclusion_with_options_resume(&mut session);
 
     tracing::info!("[{}] Starting agent execution", session_id);
 
@@ -232,5 +302,5 @@ pub async fn handler(
         image_fallback,
     });
 
-    started_response(&session_id)
+    started_response(&session_id, server_snapshot.to_sync_info(None))
 }

@@ -371,7 +371,7 @@ mod tests {
         assert_eq!(detect_scenario("Write", "{}"), OutputScenario::PassThrough);
         assert_eq!(detect_scenario("Task", "{}"), OutputScenario::PassThrough);
         assert_eq!(
-            detect_scenario("ask_user", "{}"),
+            detect_scenario("conclusion_with_options", "{}"),
             OutputScenario::PassThrough
         );
     }

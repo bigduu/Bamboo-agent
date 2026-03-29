@@ -29,12 +29,14 @@
 //! config.grant_session_permission(PermissionType::WriteFile, "/tmp/*");
 //! ```
 
+pub mod approval_store;
 pub mod checker;
 pub mod config;
 pub mod storage;
 pub mod tool_permissions;
 
 // Re-export commonly used types
+pub use approval_store::{with_cached_approval, ApprovalDecision, ApprovalStore};
 pub use checker::{
     AllowAllPermissionChecker, ConfigPermissionChecker, DenyDangerousPermissionChecker,
     LoggingPermissionChecker, PermissionChecker, PermissionCheckerExt, PermissionContext,

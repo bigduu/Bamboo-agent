@@ -1,13 +1,13 @@
 use crate::agent::core::{agent::Role, Session};
 
-const ASK_USER_RESUME_PENDING_KEY: &str = "ask_user_resume_pending";
+const CONCLUSION_WITH_OPTIONS_RESUME_PENDING_KEY: &str = "conclusion_with_options_resume_pending";
 const RETRY_RESUME_PENDING_KEY: &str = "retry_resume_pending";
 const RETRY_RESUME_REASON_KEY: &str = "retry_resume_reason";
 
 pub(in crate::server::handlers::agent::execute) fn has_pending_user_message(
     session: &Session,
 ) -> bool {
-    if has_pending_ask_user_resume(session) || has_pending_retry_resume(session) {
+    if has_pending_conclusion_with_options_resume(session) || has_pending_retry_resume(session) {
         return true;
     }
 
@@ -18,18 +18,20 @@ pub(in crate::server::handlers::agent::execute) fn has_pending_user_message(
         .unwrap_or(false)
 }
 
-pub(in crate::server::handlers::agent::execute) fn consume_pending_ask_user_resume(
+pub(in crate::server::handlers::agent::execute) fn consume_pending_conclusion_with_options_resume(
     session: &mut Session,
 ) {
-    session.metadata.remove(ASK_USER_RESUME_PENDING_KEY);
+    session
+        .metadata
+        .remove(CONCLUSION_WITH_OPTIONS_RESUME_PENDING_KEY);
     session.metadata.remove(RETRY_RESUME_PENDING_KEY);
     session.metadata.remove(RETRY_RESUME_REASON_KEY);
 }
 
-fn has_pending_ask_user_resume(session: &Session) -> bool {
+fn has_pending_conclusion_with_options_resume(session: &Session) -> bool {
     session
         .metadata
-        .get(ASK_USER_RESUME_PENDING_KEY)
+        .get(CONCLUSION_WITH_OPTIONS_RESUME_PENDING_KEY)
         .is_some_and(|value| value == "true")
 }
 

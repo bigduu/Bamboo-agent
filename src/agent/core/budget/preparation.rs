@@ -367,7 +367,7 @@ fn maybe_compact_old_tool_outputs_for_prompt(
     }
 
     // Keep the configured number of latest user turns unmodified when
-    // compacting older tool traces. ask_user tool calls do not create
+    // compacting older tool traces. conclusion_with_options tool calls do not create
     // Role::User messages, so they are naturally excluded from this
     // turn boundary.
     let Some(protected_turn_start) =
@@ -1363,7 +1363,7 @@ mod tests {
             Message::assistant("Old analysis", None),
             Message::assistant(
                 "Need confirmation",
-                Some(vec![create_named_tool_call("call_ask", "ask_user")]),
+                Some(vec![create_named_tool_call("call_ask", "conclusion_with_options")]),
             ),
             Message::tool_result("call_ask", "User selected: OK"),
             Message::user("User turn 2"),
@@ -1401,7 +1401,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_cache_turn_boundary_is_based_on_user_messages_not_ask_user_calls() {
+    fn prompt_cache_turn_boundary_is_based_on_user_messages_not_conclusion_with_options_calls() {
         let turn_one_tool_output = "turn-one-output ".repeat(120);
         let turn_two_tool_output = "turn-two-output ".repeat(120);
 
@@ -1432,7 +1432,7 @@ mod tests {
             Message::tool_result("call_turn_one", turn_one_tool_output.clone()),
             Message::assistant(
                 "Need confirmation",
-                Some(vec![create_named_tool_call("call_ask", "ask_user")]),
+                Some(vec![create_named_tool_call("call_ask", "conclusion_with_options")]),
             ),
             Message::tool_result("call_ask", "User selected: Need changes"),
             Message::user("Second request"),
@@ -1464,7 +1464,7 @@ mod tests {
             .expect("turn two tool output should stay in prepared context");
         assert!(
             turn_two_tool.content.contains("turn-two-output"),
-            "latest user turn should stay untouched; ask_user chain must not count as a separate user turn"
+            "latest user turn should stay untouched; conclusion_with_options chain must not count as a separate user turn"
         );
     }
 

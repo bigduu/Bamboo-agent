@@ -186,6 +186,18 @@ pub struct Message {
     /// Message creation timestamp
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
+    /// Optional metadata for tool lifecycle tracking and other extensions.
+    ///
+    /// This is persisted to `session.json` for UI replay/debugging but is
+    /// **stripped** when building LLM context to avoid polluting the prompt.
+    ///
+    /// Typical fields for tool result messages:
+    /// - `elapsed_ms`: Wall-clock execution time in milliseconds
+    /// - `is_mutating`: Whether the tool writes files / runs commands
+    /// - `auto_approved`: Whether execution was auto-approved
+    /// - `tool_name`: Canonical tool name
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// OCR line with bounding box (pixels relative to the image).
@@ -246,6 +258,7 @@ impl Message {
             compressed: false,
             compressed_by_event_id: None,
             created_at: Utc::now(),
+            metadata: None,
         }
     }
 
@@ -268,6 +281,7 @@ impl Message {
             compressed: false,
             compressed_by_event_id: None,
             created_at: Utc::now(),
+            metadata: None,
         }
     }
 
@@ -313,6 +327,7 @@ impl Message {
             compressed: false,
             compressed_by_event_id: None,
             created_at: Utc::now(),
+            metadata: None,
         }
     }
 
@@ -353,6 +368,7 @@ impl Message {
             compressed: false,
             compressed_by_event_id: None,
             created_at: Utc::now(),
+            metadata: None,
         }
     }
 
@@ -383,13 +399,14 @@ impl Message {
             compressed: false,
             compressed_by_event_id: None,
             created_at: Utc::now(),
+            metadata: None,
         }
     }
 }
 
 /// A pending question waiting for user response.
 ///
-/// When the agent calls the `ask_user` tool, it creates a pending question
+/// When the agent calls the `conclusion_with_options` tool, it creates a pending question
 /// that blocks execution until the user responds via the API.
 ///
 /// # Fields
@@ -629,7 +646,7 @@ pub struct Session {
         skip_serializing_if = "Option::is_none"
     )]
     pub task_list: Option<TaskList>,
-    /// Pending question when waiting for user response via ask_user tool
+    /// Pending question when waiting for user response via conclusion_with_options tool
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_question: Option<PendingQuestion>,
     /// Model name for this session (e.g., "gpt-4o", "gpt-4o-mini")
@@ -840,7 +857,7 @@ impl Session {
     /// Set a pending question when waiting for user response
     /// Set a pending question when waiting for user response.
     ///
-    /// Called when the agent uses the `ask_user` tool to request
+    /// Called when the agent uses the `conclusion_with_options` tool to request
     /// user input before continuing execution.
     ///
     /// # Arguments
@@ -933,4 +950,233 @@ fn truncate_tool_message_content(content: &str) -> Option<String> {
     compacted.push_str(&marker);
     compacted.push_str(tail);
     Some(compacted)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::core::tools::FunctionCall;
+    use serde_json::json;
+
+    // ── Metadata serialization / deserialization ────────────────────────
+
+    #[test]
+    fn message_without_metadata_serializes_without_metadata_key() {
+        let msg = Message::user("hello");
+        let serialized = serde_json::to_string(&msg).unwrap();
+        assert!(
+            !serialized.contains("\"metadata\""),
+            "metadata key should be absent when None"
+        );
+    }
+
+    #[test]
+    fn message_with_metadata_serializes_and_deserializes() {
+        let mut msg = Message::tool_result("call-1", "result");
+        let meta = json!({
+            "elapsed_ms": 150u64,
+            "is_mutating": false,
+            "auto_approved": true,
+            "tool_name": "Read",
+            "success": true,
+        });
+        msg.metadata = Some(meta.clone());
+
+        let serialized = serde_json::to_string(&msg).unwrap();
+        assert!(
+            serialized.contains("\"metadata\""),
+            "serialized JSON should contain the metadata key"
+        );
+        assert!(
+            serialized.contains("\"elapsed_ms\":150"),
+            "serialized JSON should contain elapsed_ms value"
+        );
+
+        let deserialized: Message = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.metadata, Some(meta));
+        assert_eq!(deserialized.content, "result");
+        assert_eq!(deserialized.tool_call_id, Some("call-1".to_string()));
+    }
+
+    #[test]
+    fn old_json_without_metadata_field_deserializes_as_none() {
+        // Simulates loading a session.json from before the metadata feature.
+        let json = r#"{
+            "id": "msg-1",
+            "role": "tool",
+            "content": "ok",
+            "tool_call_id": "call-1",
+            "created_at": "2025-01-01T00:00:00Z"
+        }"#;
+        let msg: Message = serde_json::from_str(json).unwrap();
+        assert!(
+            msg.metadata.is_none(),
+            "metadata should default to None for old JSON without the field"
+        );
+    }
+
+    #[test]
+    fn metadata_with_null_value_deserializes_as_none() {
+        let json = r#"{
+            "id": "msg-2",
+            "role": "tool",
+            "content": "ok",
+            "tool_call_id": "call-2",
+            "metadata": null,
+            "created_at": "2025-01-01T00:00:00Z"
+        }"#;
+        let msg: Message = serde_json::from_str(json).unwrap();
+        assert!(
+            msg.metadata.is_none(),
+            "metadata should be None when JSON value is null"
+        );
+    }
+
+    // ── Constructor helpers produce metadata: None ──────────────────────
+
+    #[test]
+    fn all_constructors_have_metadata_none() {
+        let user_msg = Message::user("hi");
+        assert!(user_msg.metadata.is_none());
+
+        let system_msg = Message::system("sys");
+        assert!(system_msg.metadata.is_none());
+
+        let assistant_msg = Message::assistant("resp", None);
+        assert!(assistant_msg.metadata.is_none());
+
+        let tool_result_msg = Message::tool_result("call-1", "result");
+        assert!(tool_result_msg.metadata.is_none());
+
+        let tool_result_status_msg = Message::tool_result_with_status("call-2", "result", true);
+        assert!(tool_result_status_msg.metadata.is_none());
+    }
+
+    // ── Metadata does not leak into to_provider outputs ────────────────
+
+    #[test]
+    fn tool_result_metadata_not_leaked_to_openai_provider() {
+        use crate::agent::llm::api::models::ChatMessage as OpenAIChatMessage;
+        use crate::agent::llm::protocol::ToProvider;
+
+        let mut msg = Message::tool_result("call-1", "tool output");
+        msg.metadata = Some(json!({
+            "elapsed_ms": 200,
+            "is_mutating": true,
+        }));
+
+        let openai_msg: OpenAIChatMessage = msg.to_provider().unwrap();
+        // OpenAIChatMessage has no metadata field — verify it serializes clean.
+        let serialized = serde_json::to_string(&openai_msg).unwrap();
+        assert!(
+            !serialized.contains("elapsed_ms"),
+            "OpenAI provider message should not contain tool lifecycle metadata"
+        );
+        assert!(
+            !serialized.contains("is_mutating"),
+            "OpenAI provider message should not contain is_mutating"
+        );
+    }
+
+    #[test]
+    fn tool_result_metadata_not_leaked_to_provider_batch() {
+        use crate::agent::llm::api::models::ChatMessage as OpenAIChatMessage;
+        use crate::agent::llm::protocol::ToProviderBatch;
+
+        let mut tool_msg = Message::tool_result("call-1", "tool output");
+        tool_msg.metadata = Some(json!({
+            "elapsed_ms": 300,
+            "is_mutating": false,
+            "auto_approved": true,
+        }));
+
+        let tc = crate::agent::core::tools::ToolCall {
+            id: "call-1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Read".to_string(),
+                arguments: r#"{"file_path":"test.rs"}"#.to_string(),
+            },
+        };
+        let mut assistant_msg = Message::assistant("reading file", Some(vec![tc]));
+        assistant_msg.metadata = Some(json!({"extra": "should vanish"}));
+
+        let messages = vec![Message::user("show me the file"), assistant_msg, tool_msg];
+
+        let provider_msgs: Vec<OpenAIChatMessage> = messages.to_provider_batch().unwrap();
+        for pm in &provider_msgs {
+            let serialized = serde_json::to_string(pm).unwrap();
+            assert!(
+                !serialized.contains("elapsed_ms"),
+                "Provider batch output should not contain elapsed_ms"
+            );
+            assert!(
+                !serialized.contains("is_mutating"),
+                "Provider batch output should not contain is_mutating"
+            );
+            assert!(
+                !serialized.contains("should vanish"),
+                "Provider batch output should not contain stray metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_with_tool_calls_metadata_not_leaked_to_openai_provider() {
+        use crate::agent::llm::api::models::ChatMessage as OpenAIChatMessage;
+        use crate::agent::llm::protocol::ToProvider;
+
+        let tc = crate::agent::core::tools::ToolCall {
+            id: "call-1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Bash".to_string(),
+                arguments: r#"{"command":"ls"}"#.to_string(),
+            },
+        };
+        let mut msg = Message::assistant("Let me check.", Some(vec![tc]));
+        msg.metadata = Some(json!({"extra": "should not appear"}));
+
+        let openai_msg: OpenAIChatMessage = msg.to_provider().unwrap();
+        let serialized = serde_json::to_string(&openai_msg).unwrap();
+        assert!(
+            !serialized.contains("should not appear"),
+            "Assistant metadata should not leak to OpenAI provider format"
+        );
+    }
+
+    // ── Metadata roundtrip through clone ────────────────────────────────
+
+    #[test]
+    fn message_clone_preserves_metadata() {
+        let mut msg = Message::tool_result("call-1", "data");
+        msg.metadata = Some(json!({"elapsed_ms": 42}));
+
+        let cloned = msg.clone();
+        assert_eq!(cloned.metadata, msg.metadata);
+    }
+
+    // ── Metadata survives Session add_message ──────────────────────────
+
+    #[test]
+    fn session_add_message_preserves_metadata() {
+        let mut session = Session::new("test-session", "test-model");
+        let mut msg = Message::tool_result("call-1", "short result");
+        msg.metadata = Some(json!({
+            "elapsed_ms": 100,
+            "is_mutating": false,
+        }));
+
+        session.add_message(msg);
+
+        let stored = session.messages.last().unwrap();
+        assert!(stored.metadata.is_some());
+        let meta = stored.metadata.as_ref().unwrap();
+        assert_eq!(meta["elapsed_ms"], 100);
+        assert_eq!(meta["is_mutating"], false);
+    }
 }

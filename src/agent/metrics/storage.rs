@@ -638,6 +638,13 @@ pub trait MetricsStorage: Send + Sync {
     /// ```
     async fn session_detail(&self, session_id: &str) -> MetricsResult<Option<SessionDetail>>;
 
+    /// Increments the execute sync mismatch counter for a specific stable reason label.
+    async fn increment_execute_sync_mismatch(
+        &self,
+        reason: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> MetricsResult<()>;
+
     /// Retrieves daily aggregated metrics for chat sessions.
     ///
     /// Returns per-day statistics including session counts, token usage,
@@ -909,9 +916,19 @@ impl MetricsStorage for SqliteMetricsStorage {
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS execute_sync_mismatch_metrics (
+                    reason TEXT NOT NULL,
+                    mismatch_date TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (reason, mismatch_date)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_forward_started_at ON forward_request_metrics(started_at);
                 CREATE INDEX IF NOT EXISTS idx_forward_endpoint ON forward_request_metrics(endpoint);
                 CREATE INDEX IF NOT EXISTS idx_forward_model ON forward_request_metrics(model);
+                CREATE INDEX IF NOT EXISTS idx_execute_sync_mismatch_date ON execute_sync_mismatch_metrics(mismatch_date);
+                CREATE INDEX IF NOT EXISTS idx_execute_sync_mismatch_reason ON execute_sync_mismatch_metrics(reason);
                 "#,
             )?;
             ensure_integer_column(
@@ -1461,7 +1478,7 @@ impl MetricsStorage for SqliteMetricsStorage {
             );
 
             let mut stmt = connection.prepare(&summary_sql)?;
-            let summary = stmt.query_row(params_from_iter(params_vec.iter()), |row| {
+            let mut summary = stmt.query_row(params_from_iter(params_vec.iter()), |row| {
                 Ok(MetricsSummary {
                     total_sessions: row.get::<_, i64>(0)? as u64,
                     total_tokens: TokenUsage {
@@ -1471,10 +1488,32 @@ impl MetricsStorage for SqliteMetricsStorage {
                     },
                     total_tool_calls: row.get::<_, i64>(4)? as u64,
                     prompt_cached_tool_outputs: row.get::<_, i64>(5)? as u64,
+                    total_sync_mismatches: 0,
+                    sync_mismatch_breakdown: HashMap::new(),
                     active_sessions: 0,
                 })
             })?;
 
+            let mut mismatch_params = Vec::new();
+            let mismatch_clause = build_execute_sync_mismatch_where_clause(
+                filter.start_date,
+                filter.end_date,
+                None,
+                &mut mismatch_params,
+            );
+            let mismatch_sql = format!(
+                "SELECT COALESCE(SUM(count), 0) FROM execute_sync_mismatch_metrics {}",
+                mismatch_clause
+            );
+            let mut mismatch_stmt = connection.prepare(&mismatch_sql)?;
+            summary.total_sync_mismatches = mismatch_stmt
+                .query_row(params_from_iter(mismatch_params.iter()), |row| row.get::<_, i64>(0))?
+                as u64;
+            summary.sync_mismatch_breakdown = load_execute_sync_mismatch_breakdown(
+                connection,
+                filter.start_date,
+                filter.end_date,
+            )?;
             let mut active_params = Vec::new();
             let active_clause = build_session_where_clause(
                 filter.start_date,
@@ -1677,6 +1716,31 @@ impl MetricsStorage for SqliteMetricsStorage {
 
             let rounds = load_rounds(connection, &session_id)?;
             Ok(Some(SessionDetail { session, rounds }))
+        })
+        .await
+    }
+
+    async fn increment_execute_sync_mismatch(
+        &self,
+        reason: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> MetricsResult<()> {
+        let reason = reason.to_string();
+        let mismatch_date = occurred_at.date_naive().to_string();
+        let updated_at = format_timestamp(occurred_at);
+
+        self.with_connection(move |connection| {
+            connection.execute(
+                r#"
+                INSERT INTO execute_sync_mismatch_metrics (reason, mismatch_date, count, updated_at)
+                VALUES (?1, ?2, 1, ?3)
+                ON CONFLICT(reason, mismatch_date) DO UPDATE SET
+                    count = count + 1,
+                    updated_at = excluded.updated_at
+                "#,
+                params![reason, mismatch_date, updated_at],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -1947,6 +2011,36 @@ fn build_forward_where_clause(
     if let Some(m) = model {
         conditions.push("model = ?".to_string());
         params_vec.push(m.to_string());
+    }
+
+    if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    }
+}
+
+fn build_execute_sync_mismatch_where_clause(
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+    reason: Option<&str>,
+    params_vec: &mut Vec<String>,
+) -> String {
+    let mut conditions = Vec::new();
+
+    if let Some(start) = start_date {
+        conditions.push("date(mismatch_date) >= date(?)".to_string());
+        params_vec.push(start.to_string());
+    }
+
+    if let Some(end) = end_date {
+        conditions.push("date(mismatch_date) <= date(?)".to_string());
+        params_vec.push(end.to_string());
+    }
+
+    if let Some(reason) = reason {
+        conditions.push("reason = ?".to_string());
+        params_vec.push(reason.to_string());
     }
 
     if conditions.is_empty() {
@@ -2259,6 +2353,29 @@ fn load_daily_tool_breakdown(
     Ok(breakdown)
 }
 
+fn load_execute_sync_mismatch_breakdown(
+    connection: &Connection,
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+) -> MetricsResult<HashMap<String, u64>> {
+    let mut params_vec = Vec::new();
+    let where_clause =
+        build_execute_sync_mismatch_where_clause(start_date, end_date, None, &mut params_vec);
+    let sql = format!(
+        "SELECT reason, COALESCE(SUM(count), 0) FROM execute_sync_mismatch_metrics {} GROUP BY reason ORDER BY reason ASC",
+        where_clause
+    );
+    let mut stmt = connection.prepare(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params_vec.iter()))?;
+    let mut breakdown = HashMap::new();
+
+    while let Some(row) = rows.next()? {
+        breakdown.insert(row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64);
+    }
+
+    Ok(breakdown)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -2497,6 +2614,67 @@ mod tests {
         assert_eq!(
             row.tool_breakdown,
             HashMap::from([(String::from("write_file"), 1)])
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_summarizes_execute_sync_mismatches_by_reason() {
+        let dir = tempdir().expect("temp dir");
+        let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
+
+        storage.init().await.expect("init storage");
+
+        let day_a = Utc
+            .with_ymd_and_hms(2026, 2, 10, 10, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let day_b = Utc
+            .with_ymd_and_hms(2026, 2, 11, 10, 0, 0)
+            .single()
+            .expect("valid datetime");
+
+        storage
+            .increment_execute_sync_mismatch("message_count", day_a)
+            .await
+            .expect("message_count mismatch one");
+        storage
+            .increment_execute_sync_mismatch("message_count", day_a)
+            .await
+            .expect("message_count mismatch two");
+        storage
+            .increment_execute_sync_mismatch("pending_question", day_a)
+            .await
+            .expect("pending question mismatch");
+        storage
+            .increment_execute_sync_mismatch("last_message_id", day_b)
+            .await
+            .expect("last_message_id mismatch");
+
+        let day_a_summary = storage
+            .summary(MetricsDateFilter {
+                start_date: Some(NaiveDate::from_ymd_opt(2026, 2, 10).expect("valid date")),
+                end_date: Some(NaiveDate::from_ymd_opt(2026, 2, 10).expect("valid date")),
+            })
+            .await
+            .expect("day a summary");
+
+        assert_eq!(day_a_summary.total_sync_mismatches, 3);
+        assert_eq!(
+            day_a_summary.sync_mismatch_breakdown,
+            HashMap::from([
+                (String::from("message_count"), 2_u64),
+                (String::from("pending_question"), 1_u64),
+            ])
+        );
+
+        let full_summary = storage
+            .summary(MetricsDateFilter::default())
+            .await
+            .expect("full summary");
+        assert_eq!(full_summary.total_sync_mismatches, 4);
+        assert_eq!(
+            full_summary.sync_mismatch_breakdown.get("last_message_id"),
+            Some(&1_u64)
         );
     }
 }

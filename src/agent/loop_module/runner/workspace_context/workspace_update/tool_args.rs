@@ -8,6 +8,7 @@ pub(super) fn is_workspace_update_tool(tool_call: &ToolCall) -> Option<bool> {
     let normalized_tool_name = normalized_tool_name(tool_call)?;
     Some(
         normalized_tool_name == "SetWorkspace"
+            || normalized_tool_name == "Workspace"
             || normalized_tool_name == "Write"
             || normalized_tool_name == "Edit"
             || normalized_tool_name == "NotebookEdit",

@@ -99,6 +99,25 @@ enum AgentEvent {
         question: String,
         options: Option<Vec<String>>,
     },
+    ToolLifecycle {
+        #[allow(dead_code)]
+        tool_call_id: String,
+        tool_name: String,
+        phase: String,
+        #[allow(dead_code)]
+        elapsed_ms: Option<u64>,
+        is_mutating: bool,
+        #[allow(dead_code)]
+        auto_approved: bool,
+        #[allow(dead_code)]
+        summary: Option<String>,
+        #[allow(dead_code)]
+        error: Option<String>,
+    },
+    ContextCompressionStatus {
+        phase: String,
+        status: String,
+    },
     Complete {
         usage: TokenUsage,
     },
@@ -369,6 +388,36 @@ async fn stream_message(
                                     format!("   Options: {}", options.join(" | ")).dimmed()
                                 );
                             }
+                        }
+                        AgentEvent::ToolLifecycle {
+                            tool_name,
+                            phase,
+                            is_mutating,
+                            ..
+                        } => {
+                            let mutating_label = if *is_mutating { "⚡" } else { "📖" };
+                            let msg = format!(
+                                "{} Tool lifecycle: {} {} [{}]",
+                                mutating_label,
+                                tool_name,
+                                phase,
+                                if *is_mutating {
+                                    "mutating"
+                                } else {
+                                    "read-only"
+                                }
+                            );
+                            if phase == "error" || phase == "cancelled" {
+                                println!("{}", msg.yellow());
+                            } else {
+                                println!("{}", msg.dimmed());
+                            }
+                        }
+                        AgentEvent::ContextCompressionStatus { phase, status } => {
+                            println!(
+                                "{}",
+                                format!("🗜️ Context compression {status} ({phase})").dimmed()
+                            );
                         }
                         AgentEvent::Complete { usage } => {
                             println!();

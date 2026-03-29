@@ -114,6 +114,17 @@ pub(super) async fn execute_tool_call_only(
     )
     .await;
 
+    // ── ToolEmitter: track lifecycle events ─────────────────────────────
+    let tool_name = ctx.tool_call.function.name.trim();
+    let is_mutating = crate::agent::tools::orchestrator::classify_tool(tool_name)
+        == crate::agent::tools::orchestrator::ToolMutability::Mutating;
+    let mut emitter =
+        crate::agent::tools::events::ToolEmitter::new(&ctx.tool_call.id, tool_name, is_mutating);
+    emitter.set_auto_approved(!is_mutating);
+    let begin_event = emitter.begin().clone();
+    // Push lifecycle "begin" through the AgentEvent channel for UI visibility
+    let _ = ctx.event_tx.send(begin_event.into_agent_event()).await;
+
     let tool_timer = std::time::Instant::now();
     let tool_ctx = ToolExecutionContext {
         session_id: Some(ctx.session_id),
@@ -129,9 +140,29 @@ pub(super) async fn execute_tool_call_only(
     )
     .await;
 
+    let tool_duration = tool_timer.elapsed();
+
+    // Emit lifecycle event based on result and push through AgentEvent channel
+    let end_event = match &result {
+        Ok(_) => emitter
+            .finish(Some(format!("completed in {:?}", tool_duration)))
+            .clone(),
+        Err(err) => emitter.error(format!("{}", err)).clone(),
+    };
+    let _ = ctx.event_tx.send(end_event.into_agent_event()).await;
+
+    tracing::trace!(
+        "[{}][round:{}] ToolEmitter: call_id={}, tool={}, events={}",
+        ctx.session_id,
+        ctx.round,
+        ctx.tool_call.id,
+        tool_name,
+        emitter.events().len()
+    );
+
     ToolExecutionOutcome {
         result: result.map_err(|error| error.to_string()),
-        tool_duration: tool_timer.elapsed(),
+        tool_duration,
     }
 }
 
@@ -149,24 +180,36 @@ pub(super) async fn apply_tool_execution_outcome(
     )
     .await;
 
-    match outcome.result {
+    // Capture tool lifecycle metadata before the borrow-splitting match.
+    let tool_name_for_meta = ctx.tool_call.function.name.clone();
+    let tool_call_id_for_meta = ctx.tool_call.id.clone();
+    let tool_duration_ms = outcome.tool_duration.as_millis() as u64;
+    let is_success = outcome.result.is_ok();
+
+    let is_mutating = crate::agent::tools::orchestrator::classify_tool(&tool_name_for_meta)
+        == crate::agent::tools::orchestrator::ToolMutability::Mutating;
+
+    let result = match outcome.result {
         Ok(result) => {
-            execution_paths::handle_successful_tool_result(execution_paths::SuccessPathContext {
-                tool_call: ctx.tool_call,
-                result: &result,
-                event_tx: ctx.event_tx,
-                metrics_collector: ctx.metrics_collector,
-                session_id: ctx.session_id,
-                round_id: ctx.round_id,
-                round: ctx.round,
-                session: ctx.session,
-                tools: ctx.tools,
-                config: ctx.config,
-                task_context: ctx.task_context,
-                state: ctx.state,
-                tool_duration: outcome.tool_duration,
-            })
-            .await
+            let r = execution_paths::handle_successful_tool_result(
+                execution_paths::SuccessPathContext {
+                    tool_call: ctx.tool_call,
+                    result: &result,
+                    event_tx: ctx.event_tx,
+                    metrics_collector: ctx.metrics_collector,
+                    session_id: ctx.session_id,
+                    round_id: ctx.round_id,
+                    round: ctx.round,
+                    session: ctx.session,
+                    tools: ctx.tools,
+                    config: ctx.config,
+                    task_context: ctx.task_context,
+                    state: ctx.state,
+                    tool_duration: outcome.tool_duration,
+                },
+            )
+            .await;
+            r
         }
         Err(error_message) => {
             execution_paths::handle_tool_execution_error(
@@ -183,5 +226,28 @@ pub(super) async fn apply_tool_execution_outcome(
             .await;
             false
         }
+    };
+
+    // ── Persist lifecycle metadata on the tool result message ──────────
+    // Find the last tool-result message matching this tool_call_id and
+    // attach execution metadata so it is persisted in session.json and
+    // available when the frontend reloads the session later.
+    let metadata_value = serde_json::json!({
+        "elapsed_ms": tool_duration_ms,
+        "is_mutating": is_mutating,
+        "auto_approved": !is_mutating,
+        "tool_name": tool_name_for_meta,
+        "success": is_success,
+    });
+    if let Some(msg) = ctx
+        .session
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.tool_call_id.as_deref() == Some(&tool_call_id_for_meta))
+    {
+        msg.metadata = Some(metadata_value);
     }
+
+    result
 }

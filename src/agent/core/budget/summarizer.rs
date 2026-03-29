@@ -258,6 +258,7 @@ impl LlmSummarizer {
         let system_prompt = r#"You are a conversation summarizer. Your task is to create a concise but reliable working-memory summary for a conversation that was removed due to context window limits.
 
 Guidelines:
+- First capture the in-flight work right before compression (what was being done, where, and with which tool/file)
 - Distinguish clearly between CURRENT ACTIVE work, COMPLETED work, and OBSOLETE or superseded work
 - Do not restate old tasks as active unless they are still unresolved
 - The provided current task list is the source of truth for active work
@@ -290,7 +291,7 @@ Guidelines:
         }
 
         user_content.push_str(
-            "## Required Output Sections\n1. Current active objective\n2. Requirement checklist (Requirement | Status: completed/in_progress/pending/blocked/obsolete | Evidence)\n3. Active tasks\n4. Completed tasks\n5. Obsolete or superseded tasks\n6. Important context and constraints\n7. Files, code, and tool findings\n8. Open issues and next step\n\n",
+            "## Required Output Sections\n1. Pre-compression in-flight work (what was being done immediately before compression)\n2. Current active objective\n3. Requirement checklist (Requirement | Status: completed/in_progress/pending/blocked/obsolete | Evidence)\n4. Active tasks\n5. Completed tasks\n6. Obsolete or superseded tasks\n7. Important context and constraints\n8. Files, code, and tool findings\n9. Open issues and next step\n\n",
         );
 
         user_content.push_str("## Messages to Summarize\n\n");

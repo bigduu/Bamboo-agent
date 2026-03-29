@@ -7,7 +7,7 @@ allowed-tools:
 - Read
 - Glob
 - Grep
-- ask_user
+- conclusion_with_options
 ---
 
 # Jira Work Copilot

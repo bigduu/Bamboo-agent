@@ -167,7 +167,7 @@ fn chat_request_empty_model_fails_validation() {
         session_id: None,
         system_prompt: None,
         enhance_prompt: None,
-        copilot_ask_user_enhancement_enabled: None,
+        copilot_conclusion_with_options_enhancement_enabled: None,
         workspace_path: None,
         selected_skill_ids: None,
         images: None,

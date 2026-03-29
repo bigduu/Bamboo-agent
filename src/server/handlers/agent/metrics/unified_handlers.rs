@@ -33,6 +33,7 @@ pub async fn v2_unified_summary(
     match (chat_result, forward_result) {
         (Ok(chat), Ok(forward)) => {
             let prompt_cached_tool_outputs = chat.prompt_cached_tool_outputs;
+            let total_sync_mismatches = chat.total_sync_mismatches;
             let total_requests = chat.total_sessions + forward.total_requests;
             let total_tokens = chat.total_tokens.total_tokens + forward.total_tokens.total_tokens;
             let total_success =
@@ -54,6 +55,7 @@ pub async fn v2_unified_summary(
                     total_errors,
                     success_rate,
                     prompt_cached_tool_outputs,
+                    total_sync_mismatches,
                 },
             };
 

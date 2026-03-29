@@ -125,6 +125,7 @@ async fn maybe_apply_host_context_compression_uses_fast_model_for_summary_reques
         "session-cp-fast-model",
         &[],
         &llm,
+        None,
         "pre-turn",
     )
     .await
@@ -168,6 +169,7 @@ async fn prepare_round_context_applies_placeholder_fallback_only_to_prepared_con
         "session-cp-1",
         &[],
         &llm,
+        None,
     )
     .await
     .expect("prepare round context");
@@ -222,6 +224,7 @@ async fn prepare_round_context_auto_compresses_when_hard_limit_truncation_pressu
         "session-cp-2",
         &[],
         &llm,
+        None,
     )
     .await
     .expect("prepare round context");
@@ -283,6 +286,7 @@ async fn prepare_round_context_drops_orphan_tool_results_only_from_prepared_cont
         "session-cp-3",
         &[],
         &llm,
+        None,
     )
     .await
     .expect("prepare round context");
@@ -336,6 +340,7 @@ async fn prepare_round_context_prunes_unresolved_tool_calls_from_prepared_contex
         "session-cp-4",
         &[],
         &llm,
+        None,
     )
     .await
     .expect("prepare round context");
@@ -428,6 +433,7 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
         "session-cp-force",
         &[],
         &llm,
+        None,
     )
     .await
     .expect("prepare round context");
@@ -506,6 +512,7 @@ async fn maybe_apply_host_context_compression_supports_mid_turn_phase() {
         "session-cp-mid-turn",
         &[],
         &llm,
+        None,
         "mid-turn",
     )
     .await
@@ -583,6 +590,7 @@ async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses
         "session-cp-force-context-only",
         &[],
         &llm,
+        None,
     )
     .await
     .expect("prepare round context");
@@ -653,6 +661,7 @@ async fn prepare_round_context_skips_host_auto_compression_below_trigger() {
         "session-cp-force-context-low",
         &[],
         &llm,
+        None,
     )
     .await
     .expect("prepare round context");

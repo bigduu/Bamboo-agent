@@ -59,6 +59,7 @@ pub(super) fn requires_session_context(tool_name: &str) -> bool {
         "Write"
             | "Edit"
             | "SetWorkspace"
+            | "Workspace"
             | "Task"
             | "SubSession"
             | "memory_note"

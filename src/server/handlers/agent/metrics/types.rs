@@ -215,6 +215,8 @@ pub struct CombinedSummary {
     pub success_rate: f64,
     /// Total number of prompt-side cached tool outputs in chat sessions.
     pub prompt_cached_tool_outputs: u64,
+    /// Total number of execute sync mismatches observed in the selected range.
+    pub total_sync_mismatches: u64,
 }
 
 /// Unified timeline point combining chat and forward metrics

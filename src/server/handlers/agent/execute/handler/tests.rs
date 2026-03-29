@@ -1,11 +1,7 @@
 use super::response::execute_response_payload;
 use super::validation::validate_and_normalize_model;
-use super::{
-    apply_copilot_ask_user_enhancement_tool_filter,
-    is_copilot_ask_user_enhancement_enabled_for_session,
-};
-use crate::agent::core::Session;
-use std::collections::BTreeSet;
+use super::{evaluate_client_sync, ServerExecuteSnapshot};
+use crate::server::handlers::agent::execute::{ExecuteClientSync, ExecuteSyncReason};
 
 #[test]
 fn validate_and_normalize_model_rejects_empty_value() {
@@ -20,69 +16,124 @@ fn validate_and_normalize_model_trims_whitespace() {
 
 #[test]
 fn execute_response_payload_formats_status_and_events_url() {
-    let payload = execute_response_payload("session-123", "started");
+    let payload = execute_response_payload(
+        "session-123",
+        "started",
+        Some(ServerExecuteSnapshot {
+            message_count: 2,
+            last_message_id: Some("msg-2".to_string()),
+            has_pending_question: false,
+            pending_question_tool_call_id: None,
+            has_pending_user_message: true,
+        }
+        .to_sync_info(None)),
+    );
     assert_eq!(payload.session_id, "session-123");
     assert_eq!(payload.status, "started");
     assert_eq!(payload.events_url, "/api/v1/events/session-123");
+    assert!(payload.sync.is_some());
 }
 
 #[test]
-fn copilot_ask_user_enhancement_flag_requires_copilot_provider_and_true_metadata() {
-    let mut enabled_session = Session::new("session-1", "model");
-    enabled_session.metadata.insert(
-        "copilot_ask_user_enhancement_enabled".to_string(),
-        "true".to_string(),
-    );
-    assert!(is_copilot_ask_user_enhancement_enabled_for_session(
-        &enabled_session,
-        "copilot"
-    ));
-    assert!(is_copilot_ask_user_enhancement_enabled_for_session(
-        &enabled_session,
-        " COPILOT "
-    ));
+fn evaluate_client_sync_accepts_matching_snapshot() {
+    let server_snapshot = ServerExecuteSnapshot {
+        message_count: 3,
+        last_message_id: Some("msg-3".to_string()),
+        has_pending_question: true,
+        pending_question_tool_call_id: Some("tool-1".to_string()),
+        has_pending_user_message: false,
+    };
+    let client_sync = ExecuteClientSync {
+        client_message_count: 3,
+        client_last_message_id: Some("msg-3".to_string()),
+        client_has_pending_question: true,
+        client_pending_question_tool_call_id: Some("tool-1".to_string()),
+    };
 
-    let mut disabled_session = Session::new("session-2", "model");
-    disabled_session.metadata.insert(
-        "copilot_ask_user_enhancement_enabled".to_string(),
-        "false".to_string(),
-    );
-    assert!(!is_copilot_ask_user_enhancement_enabled_for_session(
-        &disabled_session,
-        "copilot"
-    ));
-
-    let no_metadata_session = Session::new("session-3", "model");
-    assert!(!is_copilot_ask_user_enhancement_enabled_for_session(
-        &no_metadata_session,
-        "copilot"
-    ));
-
-    assert!(!is_copilot_ask_user_enhancement_enabled_for_session(
-        &enabled_session,
-        "openai"
-    ));
+    assert_eq!(evaluate_client_sync(Some(&client_sync), &server_snapshot), None);
 }
 
 #[test]
-fn tool_filter_disables_conclusion_when_enhancement_not_enabled() {
-    let mut disabled_tools = BTreeSet::new();
-    let session = Session::new("session-1", "model");
-    apply_copilot_ask_user_enhancement_tool_filter(&mut disabled_tools, &session, "copilot");
+fn evaluate_client_sync_detects_message_count_mismatch() {
+    let server_snapshot = ServerExecuteSnapshot {
+        message_count: 4,
+        last_message_id: Some("msg-4".to_string()),
+        has_pending_question: false,
+        pending_question_tool_call_id: None,
+        has_pending_user_message: true,
+    };
+    let client_sync = ExecuteClientSync {
+        client_message_count: 3,
+        client_last_message_id: Some("msg-4".to_string()),
+        client_has_pending_question: false,
+        client_pending_question_tool_call_id: None,
+    };
 
-    assert!(disabled_tools.contains("conclusion"));
+    assert_eq!(
+        evaluate_client_sync(Some(&client_sync), &server_snapshot),
+        Some(ExecuteSyncReason::MessageCountMismatch)
+    );
 }
 
 #[test]
-fn tool_filter_keeps_conclusion_available_when_enhancement_enabled() {
-    let mut disabled_tools = BTreeSet::new();
-    let mut session = Session::new("session-1", "model");
-    session.metadata.insert(
-        "copilot_ask_user_enhancement_enabled".to_string(),
-        "true".to_string(),
+fn evaluate_client_sync_detects_last_message_id_mismatch() {
+    let server_snapshot = ServerExecuteSnapshot {
+        message_count: 4,
+        last_message_id: Some("msg-4".to_string()),
+        has_pending_question: false,
+        pending_question_tool_call_id: None,
+        has_pending_user_message: true,
+    };
+    let client_sync = ExecuteClientSync {
+        client_message_count: 4,
+        client_last_message_id: Some("msg-3".to_string()),
+        client_has_pending_question: false,
+        client_pending_question_tool_call_id: None,
+    };
+
+    assert_eq!(
+        evaluate_client_sync(Some(&client_sync), &server_snapshot),
+        Some(ExecuteSyncReason::LastMessageIdMismatch)
     );
+}
 
-    apply_copilot_ask_user_enhancement_tool_filter(&mut disabled_tools, &session, "copilot");
+#[test]
+fn evaluate_client_sync_detects_pending_question_mismatch() {
+    let server_snapshot = ServerExecuteSnapshot {
+        message_count: 4,
+        last_message_id: Some("msg-4".to_string()),
+        has_pending_question: true,
+        pending_question_tool_call_id: Some("tool-2".to_string()),
+        has_pending_user_message: false,
+    };
+    let client_sync = ExecuteClientSync {
+        client_message_count: 4,
+        client_last_message_id: Some("msg-4".to_string()),
+        client_has_pending_question: true,
+        client_pending_question_tool_call_id: Some("tool-1".to_string()),
+    };
 
-    assert!(!disabled_tools.contains("conclusion"));
+    assert_eq!(
+        evaluate_client_sync(Some(&client_sync), &server_snapshot),
+        Some(ExecuteSyncReason::PendingQuestionMismatch)
+    );
+}
+
+#[test]
+fn evaluate_client_sync_allows_missing_pending_question_tool_call_id() {
+    let server_snapshot = ServerExecuteSnapshot {
+        message_count: 4,
+        last_message_id: Some("msg-4".to_string()),
+        has_pending_question: true,
+        pending_question_tool_call_id: Some("tool-2".to_string()),
+        has_pending_user_message: false,
+    };
+    let client_sync = ExecuteClientSync {
+        client_message_count: 4,
+        client_last_message_id: Some("msg-4".to_string()),
+        client_has_pending_question: true,
+        client_pending_question_tool_call_id: None,
+    };
+
+    assert_eq!(evaluate_client_sync(Some(&client_sync), &server_snapshot), None);
 }

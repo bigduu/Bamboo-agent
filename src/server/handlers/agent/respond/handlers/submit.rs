@@ -7,11 +7,11 @@ use crate::server::app_state::AppState;
 use super::super::session::load_session_from_memory_or_storage;
 use super::super::types::RespondRequest;
 
-const ASK_USER_RESUME_PENDING_KEY: &str = "ask_user_resume_pending";
+const CONCLUSION_WITH_OPTIONS_RESUME_PENDING_KEY: &str = "conclusion_with_options_resume_pending";
 
-/// Submit a user response to a pending question from the `ask_user` tool.
+/// Submit a user response to a pending question from the `conclusion_with_options` tool.
 ///
-/// When the agent calls the `ask_user` tool, it pauses execution and waits
+/// When the agent calls the `conclusion_with_options` tool, it pauses execution and waits
 /// for user input. This endpoint submits the user's response, allowing
 /// the agent to resume execution.
 ///
@@ -77,9 +77,10 @@ pub async fn submit_response(
     }
 
     session.clear_pending_question();
-    session
-        .metadata
-        .insert(ASK_USER_RESUME_PENDING_KEY.to_string(), "true".to_string());
+    session.metadata.insert(
+        CONCLUSION_WITH_OPTIONS_RESUME_PENDING_KEY.to_string(),
+        "true".to_string(),
+    );
 
     // Resolve reasoning_effort: request → session metadata fallback.
     // Read from session *before* it is moved into the sessions map.
@@ -143,6 +144,7 @@ async fn trigger_auto_resume_if_requested(
             model,
             skill_mode: None,
             reasoning_effort,
+            client_sync: None,
         }),
     )
     .await;

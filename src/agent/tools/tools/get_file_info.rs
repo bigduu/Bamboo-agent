@@ -57,6 +57,19 @@ impl Tool for GetFileInfoTool {
         let metadata = match fs::metadata(path).await {
             Ok(metadata) => metadata,
             Err(error) => {
+                // When the path simply does not exist, return a structured
+                // `exists: false` response so this tool subsumes FileExists.
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(ToolResult {
+                        success: true,
+                        result: json!({
+                            "path": path,
+                            "exists": false
+                        })
+                        .to_string(),
+                        display_preference: Some("json".to_string()),
+                    });
+                }
                 return Ok(ToolResult {
                     success: false,
                     result: format!("Failed to read metadata for '{path}': {error}"),
@@ -75,6 +88,7 @@ impl Tool for GetFileInfoTool {
             success: true,
             result: json!({
                 "path": path,
+                "exists": true,
                 "is_file": metadata.is_file(),
                 "is_dir": metadata.is_dir(),
                 "size_bytes": metadata.len(),
@@ -104,5 +118,19 @@ mod tests {
 
         assert!(result.success);
         assert!(result.result.contains("\"is_file\":true"));
+        assert!(result.result.contains("\"exists\":true"));
+    }
+
+    #[tokio::test]
+    async fn get_file_info_returns_exists_false_for_missing_path() {
+        let tool = GetFileInfoTool::new();
+        let result = tool
+            .execute(json!({"path": "/tmp/bamboo-file-info-missing-xyz-98765"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(payload["exists"], false);
     }
 }

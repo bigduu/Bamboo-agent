@@ -4,6 +4,10 @@ use super::tool_schemas::resolve_available_tool_schemas_for_session;
 use crate::agent::core::tools::{FunctionSchema, ToolCall, ToolExecutor, ToolResult, ToolSchema};
 use crate::agent::core::{Message, Session};
 
+const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str = "copilot_conclusion_with_options_enhancement_enabled";
+const ASK_USER_ENHANCED_DESCRIPTION_FRAGMENT: &str =
+    "If you are about to end or hand off a task turn, you must call this tool instead of ending with plain assistant text.";
+
 struct StaticToolExecutor {
     schemas: Vec<ToolSchema>,
 }
@@ -43,8 +47,9 @@ fn resolve_available_tool_schemas_uses_executor_when_registry_empty() {
     let tools = StaticToolExecutor {
         schemas: vec![schema("z_tool"), schema("a_tool")],
     };
+    let session = Session::new("session-1", "model");
 
-    let resolved = resolve_available_tool_schemas_for_session(&config, &tools);
+    let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
     let names: Vec<&str> = resolved
         .iter()
         .map(|item| item.function.name.as_str())
@@ -62,8 +67,9 @@ fn resolve_available_tool_schemas_dedupes_and_merges_additional_entries() {
     let tools = StaticToolExecutor {
         schemas: vec![schema("a_tool"), schema("z_tool")],
     };
+    let session = Session::new("session-1", "model");
 
-    let resolved = resolve_available_tool_schemas_for_session(&config, &tools);
+    let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
     let names: Vec<&str> = resolved
         .iter()
         .map(|item| item.function.name.as_str())
@@ -84,8 +90,9 @@ fn resolve_available_tool_schemas_excludes_disabled_tools() {
     let tools = StaticToolExecutor {
         schemas: vec![schema("a_tool"), schema("z_tool")],
     };
+    let session = Session::new("session-1", "model");
 
-    let resolved = resolve_available_tool_schemas_for_session(&config, &tools);
+    let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
     let names: Vec<&str> = resolved
         .iter()
         .map(|item| item.function.name.as_str())
@@ -105,8 +112,9 @@ fn resolve_available_tool_schemas_excludes_canonicalized_disabled_tool_aliases()
     let tools = StaticToolExecutor {
         schemas: vec![schema("Bash"), schema("Read"), schema("Write")],
     };
+    let session = Session::new("session-1", "model");
 
-    let resolved = resolve_available_tool_schemas_for_session(&config, &tools);
+    let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
     let names: Vec<&str> = resolved
         .iter()
         .map(|item| item.function.name.as_str())
@@ -127,7 +135,11 @@ fn resolve_available_tool_schemas_does_not_mutate_session_metadata() {
         .metadata
         .insert("existing".to_string(), "value".to_string());
 
-    let resolved = super::tool_schemas::resolve_available_tool_schemas_for_session(&config, &tools);
+    let resolved = super::tool_schemas::resolve_available_tool_schemas_for_session(
+        &config,
+        &tools,
+        &session,
+    );
     let names: Vec<&str> = resolved
         .iter()
         .map(|item| item.function.name.as_str())
@@ -139,6 +151,53 @@ fn resolve_available_tool_schemas_does_not_mutate_session_metadata() {
         Some("value")
     );
     assert_eq!(session.metadata.len(), 1);
+}
+
+#[test]
+fn resolve_available_tool_schemas_keeps_conclusion_with_options_description_neutral_when_flag_disabled() {
+    let config = crate::agent::loop_module::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("conclusion_with_options")],
+    };
+    let session = Session::new("session-1", "model");
+
+    let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
+    let conclusion_with_options_schema = resolved
+        .iter()
+        .find(|schema| schema.function.name == "conclusion_with_options")
+        .expect("conclusion_with_options schema should exist");
+
+    assert_eq!(conclusion_with_options_schema.function.description, "conclusion_with_options tool");
+    assert!(!conclusion_with_options_schema
+        .function
+        .description
+        .contains(ASK_USER_ENHANCED_DESCRIPTION_FRAGMENT));
+}
+
+#[test]
+fn resolve_available_tool_schemas_strengthens_conclusion_with_options_description_when_flag_enabled() {
+    let config = crate::agent::loop_module::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("conclusion_with_options")],
+    };
+    let mut session = Session::new("session-1", "model");
+    session.metadata.insert(
+        COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+
+    let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
+    let conclusion_with_options_schema = resolved
+        .iter()
+        .find(|schema| schema.function.name == "conclusion_with_options")
+        .expect("conclusion_with_options schema should exist");
+
+    assert!(conclusion_with_options_schema
+        .function
+        .description
+        .contains(ASK_USER_ENHANCED_DESCRIPTION_FRAGMENT));
+    assert!(conclusion_with_options_schema.function.description.contains("conclusion"));
+    assert!(conclusion_with_options_schema.function.description.contains("OK"));
 }
 
 #[test]

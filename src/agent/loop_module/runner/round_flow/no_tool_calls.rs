@@ -58,6 +58,14 @@ mod tests {
     use crate::agent::core::{AgentEvent, Role, Session};
     use crate::agent::metrics::TokenUsage as MetricsTokenUsage;
 
+    fn token_usage() -> MetricsTokenUsage {
+        MetricsTokenUsage {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            total_tokens: 18,
+        }
+    }
+
     #[tokio::test]
     async fn handle_no_tool_calls_emits_complete_and_appends_assistant_message() {
         let mut session = Session::new("session-1", "model");
@@ -68,11 +76,7 @@ mod tests {
             Some("reasoning trace".to_string()),
             11,
             7,
-            MetricsTokenUsage {
-                prompt_tokens: 11,
-                completion_tokens: 7,
-                total_tokens: 18,
-            },
+            token_usage(),
             &mut session,
             &tx,
             None,

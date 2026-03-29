@@ -24,7 +24,7 @@ pub(super) async fn prepare_session_for_loop(
     let skill_context =
         skill_context::load_skill_context(config, session_id, initial_message).await;
 
-    let tool_schemas = tool_schemas::resolve_available_tool_schemas_for_session(config, tools);
+    let tool_schemas = tool_schemas::resolve_available_tool_schemas_for_session(config, tools, session);
     let base_prompt_for_language =
         prompt_setup::resolve_base_prompt_for_language(config, session).to_string();
     let tool_guide_context = prompt_setup::build_tool_guide_context(

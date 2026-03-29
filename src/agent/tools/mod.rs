@@ -74,17 +74,20 @@
 //! - [`ToolRegistry`] for dynamic tool registration
 //! - [`ToolGuide`] for documentation generation
 
+pub mod events;
 mod executor;
 pub mod guide;
+pub mod orchestrator;
 pub mod output_manager;
+pub mod parallel;
 pub mod permission;
 #[allow(clippy::module_inception)]
 pub mod tools;
 
 // Re-export executor types
 pub use executor::{
-    is_builtin_tool, normalize_tool_ref, BuiltinToolExecutor, BuiltinToolExecutorBuilder,
-    BUILTIN_TOOL_NAMES,
+    is_builtin_tool, normalize_tool_ref, resolve_alias, BuiltinToolExecutor,
+    BuiltinToolExecutorBuilder, BUILTIN_TOOL_NAMES,
 };
 
 // Re-export guide system types
@@ -93,13 +96,20 @@ pub use guide::{
     EnhancedPromptBuilder, ToolCategory, ToolExample, ToolGuide, ToolGuideSpec,
 };
 
+// Re-export orchestration types
+pub use events::{ToolEmitter, ToolEvent, ToolEventPhase};
+pub use orchestrator::{
+    classify_tool, OrchestratorConfig, OrchestratorResult, ToolMutability, ToolOrchestrator,
+};
+pub use parallel::{ToolCallResult, ToolCallRuntime};
+
 // Re-export output manager types
 pub use output_manager::{ArtifactRef, ToolOutputManager};
 
 // Re-export all tool implementations
 pub use tools::{
-    AskUserTool, BashOutputTool, BashTool, ConclusionTool, EditTool, ExitPlanModeTool, GlobTool,
-    GrepTool, KillShellTool, NotebookEditTool, ReadTool, SlashCommandTool, TaskTool, ToolRegistry,
+    ConclusionWithOptionsTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, GlobTool, GrepTool,
+    KillShellTool, NotebookEditTool, ReadTool, SlashCommandTool, TaskTool, ToolRegistry,
     WebFetchTool, WebSearchTool, WriteTool,
 };
 
