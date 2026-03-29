@@ -255,7 +255,10 @@ mod tests {
             .expect("tool should execute successfully");
 
         assert!(result.success);
-        assert_eq!(result.display_preference, Some("conclusion_with_options".to_string()));
+        assert_eq!(
+            result.display_preference,
+            Some("conclusion_with_options".to_string())
+        );
 
         let parsed: serde_json::Value = serde_json::from_str(&result.result).unwrap();
         assert_eq!(parsed["status"], "awaiting_user_input");

@@ -18,10 +18,12 @@ fn apply_session_tool_schema_overrides(session: &Session, tool_schemas: &mut [To
         return;
     }
 
-    if let Some(schema) = tool_schemas
-        .iter_mut()
-        .find(|schema| schema.function.name.eq_ignore_ascii_case("conclusion_with_options"))
-    {
+    if let Some(schema) = tool_schemas.iter_mut().find(|schema| {
+        schema
+            .function
+            .name
+            .eq_ignore_ascii_case("conclusion_with_options")
+    }) {
         schema.function.description = CONCLUSION_WITH_OPTIONS_ENHANCED_DESCRIPTION.to_string();
     }
 }

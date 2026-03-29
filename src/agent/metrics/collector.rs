@@ -166,7 +166,10 @@ impl MetricsCollector {
                         tool_call_id,
                         completion,
                     } => storage.complete_tool_call(&tool_call_id, completion).await,
-                    CollectorCommand::ExecuteSyncMismatch { reason, occurred_at } => {
+                    CollectorCommand::ExecuteSyncMismatch {
+                        reason,
+                        occurred_at,
+                    } => {
                         storage
                             .increment_execute_sync_mismatch(&reason, occurred_at)
                             .await

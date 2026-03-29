@@ -334,8 +334,11 @@ mod tests {
 
     #[test]
     fn conclusion_with_options_requires_conclusion_fields_when_enhancement_enabled() {
-        let conclusion_with_options_call =
-            tool_call_with_id("call-conclusion-with-options", "conclusion_with_options", r#"{"question":"Continue?"}"#);
+        let conclusion_with_options_call = tool_call_with_id(
+            "call-conclusion-with-options",
+            "conclusion_with_options",
+            r#"{"question":"Continue?"}"#,
+        );
         let mut session = Session::new("session-1", "model");
         session.metadata.insert(
             COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY.to_string(),

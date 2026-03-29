@@ -203,7 +203,10 @@ mod tests {
 
         let client_sync = req.client_sync.expect("client sync should deserialize");
         assert_eq!(client_sync.client_message_count, 12);
-        assert_eq!(client_sync.client_last_message_id.as_deref(), Some("msg-12"));
+        assert_eq!(
+            client_sync.client_last_message_id.as_deref(),
+            Some("msg-12")
+        );
         assert!(client_sync.client_has_pending_question);
         assert_eq!(
             client_sync.client_pending_question_tool_call_id.as_deref(),

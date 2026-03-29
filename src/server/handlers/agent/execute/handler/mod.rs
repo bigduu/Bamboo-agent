@@ -7,9 +7,7 @@ use super::runtime::{
     spawn_agent_execution, spawn_event_forwarder, RunnerReservation, SpawnAgentExecution,
 };
 use super::session::load_session;
-use super::{
-    ExecuteClientSync, ExecuteRequest, ExecuteSyncInfo, ExecuteSyncReason,
-};
+use super::{ExecuteClientSync, ExecuteRequest, ExecuteSyncInfo, ExecuteSyncReason};
 use crate::agent::core::SessionKind;
 use crate::server::app_state::AppState;
 

@@ -19,14 +19,16 @@ fn execute_response_payload_formats_status_and_events_url() {
     let payload = execute_response_payload(
         "session-123",
         "started",
-        Some(ServerExecuteSnapshot {
-            message_count: 2,
-            last_message_id: Some("msg-2".to_string()),
-            has_pending_question: false,
-            pending_question_tool_call_id: None,
-            has_pending_user_message: true,
-        }
-        .to_sync_info(None)),
+        Some(
+            ServerExecuteSnapshot {
+                message_count: 2,
+                last_message_id: Some("msg-2".to_string()),
+                has_pending_question: false,
+                pending_question_tool_call_id: None,
+                has_pending_user_message: true,
+            }
+            .to_sync_info(None),
+        ),
     );
     assert_eq!(payload.session_id, "session-123");
     assert_eq!(payload.status, "started");
@@ -50,7 +52,10 @@ fn evaluate_client_sync_accepts_matching_snapshot() {
         client_pending_question_tool_call_id: Some("tool-1".to_string()),
     };
 
-    assert_eq!(evaluate_client_sync(Some(&client_sync), &server_snapshot), None);
+    assert_eq!(
+        evaluate_client_sync(Some(&client_sync), &server_snapshot),
+        None
+    );
 }
 
 #[test]
@@ -135,5 +140,8 @@ fn evaluate_client_sync_allows_missing_pending_question_tool_call_id() {
         client_pending_question_tool_call_id: None,
     };
 
-    assert_eq!(evaluate_client_sync(Some(&client_sync), &server_snapshot), None);
+    assert_eq!(
+        evaluate_client_sync(Some(&client_sync), &server_snapshot),
+        None
+    );
 }

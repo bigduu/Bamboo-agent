@@ -1,7 +1,11 @@
 use crate::agent::core::tools::{ToolCall, ToolResult};
 
 /// Names of tools that pause the agent loop to wait for user input/approval.
-const PAUSE_TOOLS: [&str; 3] = ["ExitPlanMode", "conclusion_with_options", "request_permissions"];
+const PAUSE_TOOLS: [&str; 3] = [
+    "ExitPlanMode",
+    "conclusion_with_options",
+    "request_permissions",
+];
 
 #[derive(Debug, Clone)]
 pub(super) struct UserQuestionPayload {

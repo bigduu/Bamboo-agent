@@ -1,9 +1,9 @@
 // NOTE: apply_patch, file_exists, get_current_dir, set_workspace have been
 // removed.  They are now aliases routed via BUILTIN_TOOL_ALIASES in executor.rs.
-pub mod conclusion_with_options;
 pub mod bash;
 pub mod bash_output;
 pub mod bash_runtime;
+pub mod conclusion_with_options;
 pub mod content_diagnostics;
 pub mod edit;
 pub mod exit_plan_mode;
@@ -29,9 +29,9 @@ pub mod workspace;
 pub mod workspace_state;
 pub mod write;
 
-pub use conclusion_with_options::ConclusionWithOptionsTool;
 pub use bash::BashTool;
 pub use bash_output::BashOutputTool;
+pub use conclusion_with_options::ConclusionWithOptionsTool;
 pub use edit::EditTool;
 pub use exit_plan_mode::ExitPlanModeTool;
 pub use get_file_info::GetFileInfoTool;

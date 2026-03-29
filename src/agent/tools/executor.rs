@@ -9,10 +9,10 @@ use async_trait::async_trait;
 use crate::agent::tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
 use crate::agent::tools::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::agent::tools::tools::{
-    ConclusionWithOptionsTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, GetFileInfoTool, GlobTool,
-    GrepTool, JsReplTool, KillShellTool, MemoryNoteTool, NotebookEditTool, ReadTool,
-    RequestPermissionsTool, SleepTool, TaskTool, ToolRegistry, ToolSearchTool, WebFetchTool,
-    WebSearchTool, WorkspaceTool, WriteTool,
+    BashOutputTool, BashTool, ConclusionWithOptionsTool, EditTool, ExitPlanModeTool,
+    GetFileInfoTool, GlobTool, GrepTool, JsReplTool, KillShellTool, MemoryNoteTool,
+    NotebookEditTool, ReadTool, RequestPermissionsTool, SleepTool, TaskTool, ToolRegistry,
+    ToolSearchTool, WebFetchTool, WebSearchTool, WorkspaceTool, WriteTool,
 };
 use crate::core::Config;
 use tokio::sync::RwLock;

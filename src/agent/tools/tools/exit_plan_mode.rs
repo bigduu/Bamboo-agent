@@ -152,7 +152,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.display_preference, Some("conclusion_with_options".to_string()));
+        assert_eq!(
+            result.display_preference,
+            Some("conclusion_with_options".to_string())
+        );
     }
 
     #[tokio::test]

@@ -72,7 +72,9 @@ mod tests {
         assert_eq!(req.model, "gpt-4");
         assert!(req.session_id.is_none());
         assert!(req.system_prompt.is_none());
-        assert!(req.copilot_conclusion_with_options_enhancement_enabled.is_none());
+        assert!(req
+            .copilot_conclusion_with_options_enhancement_enabled
+            .is_none());
         assert!(req.images.is_none());
     }
 
@@ -93,7 +95,10 @@ mod tests {
         assert_eq!(req.session_id, Some("sess-123".to_string()));
         assert_eq!(req.system_prompt, Some("Be helpful".to_string()));
         assert_eq!(req.enhance_prompt, Some("Be concise".to_string()));
-        assert_eq!(req.copilot_conclusion_with_options_enhancement_enabled, Some(true));
+        assert_eq!(
+            req.copilot_conclusion_with_options_enhancement_enabled,
+            Some(true)
+        );
         assert_eq!(req.workspace_path, Some("/home/user".to_string()));
         assert_eq!(
             req.selected_skill_ids,

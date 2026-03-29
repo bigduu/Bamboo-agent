@@ -1363,7 +1363,10 @@ mod tests {
             Message::assistant("Old analysis", None),
             Message::assistant(
                 "Need confirmation",
-                Some(vec![create_named_tool_call("call_ask", "conclusion_with_options")]),
+                Some(vec![create_named_tool_call(
+                    "call_ask",
+                    "conclusion_with_options",
+                )]),
             ),
             Message::tool_result("call_ask", "User selected: OK"),
             Message::user("User turn 2"),
@@ -1432,7 +1435,10 @@ mod tests {
             Message::tool_result("call_turn_one", turn_one_tool_output.clone()),
             Message::assistant(
                 "Need confirmation",
-                Some(vec![create_named_tool_call("call_ask", "conclusion_with_options")]),
+                Some(vec![create_named_tool_call(
+                    "call_ask",
+                    "conclusion_with_options",
+                )]),
             ),
             Message::tool_result("call_ask", "User selected: Need changes"),
             Message::user("Second request"),

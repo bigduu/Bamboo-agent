@@ -15,7 +15,11 @@ pub(super) fn internal_server_error_response(message: impl Into<String>) -> Http
 }
 
 pub(super) fn completed_response(session_id: &str, sync: ExecuteSyncInfo) -> HttpResponse {
-    HttpResponse::Ok().json(execute_response_payload(session_id, "completed", Some(sync)))
+    HttpResponse::Ok().json(execute_response_payload(
+        session_id,
+        "completed",
+        Some(sync),
+    ))
 }
 
 pub(super) fn already_running_response(session_id: &str, sync: ExecuteSyncInfo) -> HttpResponse {

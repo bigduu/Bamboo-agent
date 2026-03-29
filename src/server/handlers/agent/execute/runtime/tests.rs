@@ -30,9 +30,10 @@ fn has_pending_user_message_when_conclusion_with_options_resume_is_marked() {
     session.add_message(Message::tool_result("ask-1", "User selected: A"));
     assert!(!has_pending_user_message(&session));
 
-    session
-        .metadata
-        .insert("conclusion_with_options_resume_pending".to_string(), "true".to_string());
+    session.metadata.insert(
+        "conclusion_with_options_resume_pending".to_string(),
+        "true".to_string(),
+    );
     assert!(has_pending_user_message(&session));
 
     consume_pending_conclusion_with_options_resume(&mut session);
