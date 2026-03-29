@@ -3,10 +3,12 @@ use std::sync::{Arc, Mutex};
 use crate::agent::core::tools::ToolSchema;
 use crate::agent::core::{AgentEvent, Message, TaskItemStatus};
 use crate::agent::core::{TaskItem, TaskList};
-use crate::agent::llm::{LLMError, LLMProvider, LLMStream};
+use crate::agent::llm::{LLMChunk, LLMError, LLMProvider, LLMRequestOptions, LLMStream};
 use crate::agent::loop_module::task_context::{TaskLoopContext, TaskLoopItem, ToolCallRecord};
+use crate::core::ReasoningEffort;
 use async_trait::async_trait;
 use chrono::Utc;
+use futures::stream;
 use tokio::sync::mpsc;
 
 use super::message_builder::format_recent_tools;
@@ -154,4 +156,77 @@ async fn task_evaluation_uses_explicit_model_parameter_for_provider_request() {
     assert!(result.updates.is_empty());
     assert!(result.reasoning.contains("Evaluation failed:"));
     assert!(result.reasoning.contains("intentional provider failure"));
+}
+
+#[derive(Clone, Default)]
+struct RecordingRequestOptionsProvider {
+    requested_reasoning: Arc<Mutex<Vec<Option<ReasoningEffort>>>>,
+}
+
+impl RecordingRequestOptionsProvider {
+    fn last_requested_reasoning(&self) -> Option<Option<ReasoningEffort>> {
+        self.requested_reasoning
+            .lock()
+            .ok()
+            .and_then(|values| values.last().copied())
+    }
+}
+
+#[async_trait]
+impl LLMProvider for RecordingRequestOptionsProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> crate::agent::llm::provider::Result<LLMStream> {
+        Ok(Box::pin(stream::iter(vec![
+            Ok::<LLMChunk, LLMError>(LLMChunk::Token(
+                "{\"item_id\":\"1\",\"status\":\"completed\"}".to_string(),
+            )),
+            Ok::<LLMChunk, LLMError>(LLMChunk::Done),
+        ])))
+    }
+
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> crate::agent::llm::provider::Result<LLMStream> {
+        if let Ok(mut values) = self.requested_reasoning.lock() {
+            values.push(options.and_then(|o| o.reasoning_effort));
+        }
+        self.chat_stream(messages, tools, max_output_tokens, model)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn task_evaluation_caps_reasoning_effort_to_high_for_lightweight_request() {
+    let context = create_test_context();
+    let session = crate::agent::core::Session::new("test-session", "session-model");
+    let provider = Arc::new(RecordingRequestOptionsProvider::default());
+    let llm: Arc<dyn LLMProvider> = provider.clone();
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(4);
+
+    let _ = evaluate_task_progress(
+        &context,
+        &session,
+        llm,
+        &event_tx,
+        "test-session",
+        "gpt-5-mini",
+        Some(ReasoningEffort::Xhigh),
+    )
+    .await
+    .expect("evaluation request should succeed");
+
+    assert_eq!(
+        provider.last_requested_reasoning(),
+        Some(Some(ReasoningEffort::High))
+    );
 }

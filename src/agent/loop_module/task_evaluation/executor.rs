@@ -28,6 +28,15 @@ fn skipped_evaluation(reasoning: &str) -> TaskEvaluationResult {
     }
 }
 
+fn normalize_lightweight_reasoning_effort(
+    reasoning_effort: Option<ReasoningEffort>,
+) -> Option<ReasoningEffort> {
+    reasoning_effort.map(|effort| match effort {
+        ReasoningEffort::Xhigh | ReasoningEffort::Max => ReasoningEffort::High,
+        other => other,
+    })
+}
+
 /// 执行 TaskList 评估
 pub async fn evaluate_task_progress(
     ctx: &TaskLoopContext,
@@ -76,9 +85,19 @@ pub async fn evaluate_task_progress(
     // Use model from parameter (passed from config), not from session.
     tracing::debug!("[{}] Task evaluation using model: {}", session_id, model);
 
+    let request_reasoning_effort = normalize_lightweight_reasoning_effort(reasoning_effort);
+    if request_reasoning_effort != reasoning_effort {
+        tracing::debug!(
+            "[{}] Task evaluation downgraded reasoning effort from {:?} to {:?} for lightweight request",
+            session_id,
+            reasoning_effort,
+            request_reasoning_effort
+        );
+    }
+
     let request_options = LLMRequestOptions {
         session_id: Some(session_id.to_string()),
-        reasoning_effort,
+        reasoning_effort: request_reasoning_effort,
         parallel_tool_calls: None,
         responses: None,
     };

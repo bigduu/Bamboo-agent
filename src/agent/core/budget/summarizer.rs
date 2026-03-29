@@ -4,8 +4,9 @@
 //! key information from earlier context.
 
 use crate::agent::core::agent::types::{Message, Role};
-use crate::agent::llm::provider::LLMProvider;
+use crate::agent::llm::provider::{LLMProvider, LLMRequestOptions};
 use crate::agent::llm::types::LLMChunk;
+use crate::core::ReasoningEffort;
 use async_trait::async_trait;
 use futures::StreamExt;
 use std::collections::HashSet;
@@ -350,9 +351,17 @@ Guidelines:
         &self,
         messages: &[Message],
     ) -> Result<String, crate::agent::core::budget::types::BudgetError> {
+        // Summarization is a lightweight auxiliary request; cap reasoning effort at `high`
+        // to stay compatible with fast models (e.g. gpt-5-mini).
+        let options = LLMRequestOptions {
+            session_id: None,
+            reasoning_effort: Some(ReasoningEffort::High),
+            parallel_tool_calls: None,
+            responses: None,
+        };
         let stream = self
             .llm
-            .chat_stream(messages, &[], None, &self.model)
+            .chat_stream_with_options(messages, &[], None, &self.model, Some(&options))
             .await
             .map_err(|e| {
                 crate::agent::core::budget::types::BudgetError::TokenCountError(format!(
@@ -446,9 +455,11 @@ impl Summarizer for LlmSummarizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::llm::{LLMChunk, LLMError, LLMStream};
+    use crate::agent::llm::{LLMChunk, LLMError, LLMRequestOptions, LLMStream};
+    use crate::core::ReasoningEffort;
     use async_trait::async_trait;
     use futures::stream;
+    use std::sync::Mutex;
 
     struct DummyProvider;
 
@@ -676,5 +687,69 @@ mod tests {
             .content
             .contains("Obsolete or superseded tasks"));
         assert!(prompt_messages[1].content.contains("Earlier summary"));
+    }
+
+    #[derive(Default)]
+    struct ReasoningCaptureProvider {
+        captured_reasoning: Mutex<Vec<Option<ReasoningEffort>>>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for ReasoningCaptureProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[crate::agent::core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Ok(Box::pin(stream::iter(vec![
+                Ok::<LLMChunk, LLMError>(LLMChunk::Token("captured summary".to_string())),
+                Ok::<LLMChunk, LLMError>(LLMChunk::Done),
+            ])))
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            messages: &[Message],
+            tools: &[crate::agent::core::tools::ToolSchema],
+            max_output_tokens: Option<u32>,
+            model: &str,
+            options: Option<&LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            self.captured_reasoning
+                .lock()
+                .expect("captured reasoning lock should not be poisoned")
+                .push(options.and_then(|o| o.reasoning_effort));
+            self.chat_stream(messages, tools, max_output_tokens, model)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_summarizer_requests_high_reasoning_effort_for_summary_calls() {
+        let provider = Arc::new(ReasoningCaptureProvider::default());
+        let summarizer = LlmSummarizer::new(
+            provider.clone(),
+            "gpt-5-mini".to_string(),
+            None,
+            Some("task list".to_string()),
+        );
+        let messages = vec![
+            Message::user("请总结最近三轮"),
+            Message::assistant("已完成第一步并准备第二步", None),
+        ];
+
+        let summary = summarizer
+            .summarize(&messages)
+            .await
+            .expect("summary generation should succeed");
+        assert_eq!(summary, "captured summary");
+
+        let captured = provider
+            .captured_reasoning
+            .lock()
+            .expect("captured reasoning lock should not be poisoned");
+        assert_eq!(captured.as_slice(), [Some(ReasoningEffort::High)]);
     }
 }
