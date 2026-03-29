@@ -53,7 +53,12 @@ async fn maybe_apply_host_context_compression_with_budget(
         return Ok(false);
     }
 
-    let summary_model = model_name;
+    let summary_model = config
+        .fast_model_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(model_name);
     let existing_summary = session
         .conversation_summary
         .as_ref()

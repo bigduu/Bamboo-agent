@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::{maybe_apply_host_context_compression, prepare_round_context};
 use crate::agent::core::budget::{BudgetStrategy, TokenBudget};
@@ -7,7 +7,9 @@ use crate::agent::core::TokenBudgetUsage;
 use crate::agent::core::{Message, Role, Session};
 use crate::agent::llm::models::{ContentPart, ImageUrl};
 use crate::agent::llm::provider::{LLMProvider, LLMStream};
+use crate::agent::llm::{LLMChunk, LLMError};
 use crate::agent::loop_module::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
+use futures::stream;
 
 /// A no-op LLM provider for tests that returns an empty stream.
 struct NoopLlmProvider;
@@ -27,6 +29,113 @@ impl LLMProvider for NoopLlmProvider {
 
 fn noop_llm() -> Arc<dyn LLMProvider> {
     Arc::new(NoopLlmProvider)
+}
+
+struct RecordingLlmProvider {
+    models: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for RecordingLlmProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[crate::agent::core::tools::ToolSchema],
+        _max_output_tokens: Option<u32>,
+        model: &str,
+    ) -> crate::agent::llm::provider::Result<LLMStream> {
+        self.models
+            .lock()
+            .expect("recorded model list lock should not be poisoned")
+            .push(model.to_string());
+
+        Ok(Box::pin(stream::iter(vec![
+            Ok::<LLMChunk, LLMError>(LLMChunk::Token("summary".to_string())),
+            Ok::<LLMChunk, LLMError>(LLMChunk::Done),
+        ])))
+    }
+}
+
+fn recording_llm() -> (Arc<dyn LLMProvider>, Arc<Mutex<Vec<String>>>) {
+    let models = Arc::new(Mutex::new(Vec::new()));
+    let llm: Arc<dyn LLMProvider> = Arc::new(RecordingLlmProvider {
+        models: Arc::clone(&models),
+    });
+    (llm, models)
+}
+
+#[tokio::test]
+async fn maybe_apply_host_context_compression_uses_fast_model_for_summary_request() {
+    let mut session = Session::new("session-cp-fast-model", "main-model");
+    session.token_budget = Some(TokenBudget {
+        max_context_tokens: 1200,
+        max_output_tokens: 200,
+        strategy: BudgetStrategy::Hybrid {
+            window_size: 20,
+            enable_summarization: true,
+        },
+        safety_margin: 0,
+        compression_trigger_percent: 80,
+        compression_target_percent: 50,
+        prompt_cache_min_tool_output_chars: 1_200,
+        prompt_cache_head_chars: 280,
+        prompt_cache_tail_chars: 180,
+        prompt_cache_recent_user_turns: 2,
+        prompt_cache_recent_tool_chains: 2,
+    });
+    session.messages.push(Message::system("System prompt"));
+    for index in 0..12 {
+        session.messages.push(Message::user(format!(
+            "User message {} {}",
+            index,
+            "alpha beta gamma delta epsilon zeta ".repeat(8)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "Assistant response {} {}",
+                index,
+                "analysis plan files checks and next steps ".repeat(8)
+            ),
+            None,
+        ));
+    }
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: 100,
+        summary_tokens: 0,
+        window_tokens: 900,
+        total_tokens: 1000,
+        max_context_tokens: 1200,
+        budget_limit: 1200,
+        truncation_occurred: true,
+        segments_removed: 8,
+        prompt_cached_tool_outputs: 0,
+    });
+
+    let config = AgentLoopConfig {
+        model_name: Some("main-model".to_string()),
+        fast_model_name: Some("fast-model".to_string()),
+        ..Default::default()
+    };
+    let (llm, models) = recording_llm();
+
+    let applied = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "main-model",
+        "session-cp-fast-model",
+        &[],
+        &llm,
+        "pre-turn",
+    )
+    .await
+    .expect("host compression should run with fast model");
+
+    assert!(applied, "expected pre-turn compression to be applied");
+
+    let models = models
+        .lock()
+        .expect("recorded model list lock should not be poisoned");
+    assert_eq!(models.as_slice(), ["fast-model"]);
 }
 
 #[tokio::test]
