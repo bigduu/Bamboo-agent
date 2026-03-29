@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::agent::core::tools::ToolExecutor;
 use crate::agent::core::{AgentEvent, Session};
@@ -43,30 +44,35 @@ pub async fn run_agent_loop_with_config(
     cancel_token: CancellationToken,
     config: AgentLoopConfig,
 ) -> super::Result<()> {
-    let mut state: LoopRunState =
-        initialize_loop_state(session, initial_message.as_str(), &config, tools.as_ref()).await;
+    let session_span = tracing::info_span!("agent_loop", session_id = %session.id);
+    async {
+        let mut state: LoopRunState =
+            initialize_loop_state(session, initial_message.as_str(), &config, tools.as_ref()).await;
 
-    let sent_complete = run_rounds(
-        session,
-        &event_tx,
-        llm,
-        tools,
-        &cancel_token,
-        &config,
-        &mut state,
-    )
-    .await?;
+        let sent_complete = run_rounds(
+            session,
+            &event_tx,
+            llm,
+            tools,
+            &cancel_token,
+            &config,
+            &mut state,
+        )
+        .await?;
 
-    super::session_finalize::finalize_session(
-        state.task_context,
-        session,
-        &event_tx,
-        &state.session_id,
-        &config,
-        state.metrics_collector.as_ref(),
-        sent_complete,
-    )
-    .await;
+        super::session_finalize::finalize_session(
+            state.task_context,
+            session,
+            &event_tx,
+            &state.session_id,
+            &config,
+            state.metrics_collector.as_ref(),
+            sent_complete,
+        )
+        .await;
 
-    Ok(())
+        Ok(())
+    }
+    .instrument(session_span)
+    .await
 }

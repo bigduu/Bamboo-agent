@@ -536,10 +536,12 @@ impl CopilotProvider {
         &self,
         mut build_request: F,
         operation: &str,
+        session_id: Option<&str>,
     ) -> std::result::Result<reqwest::Response, LLMError>
     where
         F: FnMut() -> reqwest::RequestBuilder,
     {
+        let session_log_id = session_id.unwrap_or("unknown-session");
         for attempt in 1..=COPILOT_TRANSPORT_MAX_ATTEMPTS {
             match build_request().send().await {
                 Ok(response) => return Ok(response),
@@ -552,7 +554,8 @@ impl CopilotProvider {
 
                     let delay_ms = COPILOT_TRANSPORT_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1));
                     tracing::warn!(
-                        "Copilot transport error during {} (attempt {}/{}): {}. Retrying in {}ms",
+                        "[{}] Copilot transport error during {} (attempt {}/{}): {}. Retrying in {}ms",
+                        session_log_id,
                         operation,
                         attempt,
                         COPILOT_TRANSPORT_MAX_ATTEMPTS,
@@ -578,11 +581,15 @@ impl CopilotProvider {
         responses_options: Option<&ResponsesRequestOptions>,
         parallel_tool_calls: Option<bool>,
         reasoning_source: &str,
+        session_log_id: &str,
     ) -> Result<LLMStream> {
         let url = "https://api.githubcopilot.com/responses";
         let mut effective_responses_options = responses_options.cloned().unwrap_or_default();
         if effective_responses_options.store == Some(true) {
-            tracing::warn!("Copilot /responses does not support store=true; forcing store=false");
+            tracing::warn!(
+                "[{}] Copilot /responses does not support store=true; forcing store=false",
+                session_log_id
+            );
         }
         effective_responses_options.store = Some(false);
         let mut body = build_responses_body(
@@ -601,9 +608,14 @@ impl CopilotProvider {
             Some(model),
         );
 
-        tracing::debug!("Copilot provider using Responses API model: {}", model);
+        tracing::debug!(
+            "[{}] Copilot provider using Responses API model: {}",
+            session_log_id,
+            model
+        );
         tracing::info!(
-            "Copilot request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
+            "[{}] Copilot request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
+            session_log_id,
             model,
             reasoning_effort
                 .map(ReasoningEffort::as_str)
@@ -631,6 +643,7 @@ impl CopilotProvider {
                         .json(&body)
                 },
                 "copilot responses initial request",
+                Some(session_log_id),
             )
             .await?;
 
@@ -656,6 +669,7 @@ impl CopilotProvider {
                                         .json(&body)
                                 },
                                 "copilot responses auth-refresh retry",
+                                Some(session_log_id),
                             )
                             .await?;
                     }
@@ -694,7 +708,8 @@ impl CopilotProvider {
                     && Self::looks_like_reasoning_unsupported_error(status, &text)
                 {
                     tracing::warn!(
-                        "Copilot /responses rejected reasoning for model '{}'; retrying without reasoning_effort",
+                        "[{}] Copilot /responses rejected reasoning for model '{}'; retrying without reasoning_effort",
+                        session_log_id,
                         model
                     );
                     let mut fallback_options = effective_responses_options.clone();
@@ -730,6 +745,7 @@ impl CopilotProvider {
                                     .json(&fallback_body)
                             },
                             "copilot responses reasoning fallback",
+                            Some(session_log_id),
                         )
                         .await?;
 
@@ -758,6 +774,7 @@ impl CopilotProvider {
                                                     .json(&fallback_body)
                                             },
                                             "copilot responses reasoning fallback auth-refresh retry",
+                                            Some(session_log_id),
                                         )
                                         .await?;
                                 }
@@ -802,7 +819,8 @@ impl CopilotProvider {
 
                 let request_body_bytes = serde_json::to_vec(&body).map(|v| v.len()).unwrap_or(0);
                 tracing::error!(
-                    "Copilot Responses API error: HTTP {} - {} (request_id={}, model='{}', messages={}, tools={}, request_body_bytes={}, max_output_tokens={:?}, reasoning_effort={:?})",
+                    "[{}] Copilot Responses API error: HTTP {} - {} (request_id={}, model='{}', messages={}, tools={}, request_body_bytes={}, max_output_tokens={:?}, reasoning_effort={:?})",
+                    session_log_id,
                     status,
                     text,
                     request_id,
@@ -814,7 +832,8 @@ impl CopilotProvider {
                     reasoning_effort
                 );
                 tracing::debug!(
-                    "Copilot Responses API error response headers: [{}]",
+                    "[{}] Copilot Responses API error response headers: [{}]",
+                    session_log_id,
                     response_headers_debug
                 );
                 return Err(LLMError::Api(format!(
@@ -958,6 +977,7 @@ impl CopilotProvider {
             .send_with_transport_retry(
                 || self.client.get(url).headers(request_headers.clone()),
                 "copilot models list",
+                None,
             )
             .await?;
 
@@ -978,6 +998,7 @@ impl CopilotProvider {
                             .send_with_transport_retry(
                                 || self.client.get(url).headers(refreshed_headers.clone()),
                                 "copilot models list auth-refresh retry",
+                                None,
                             )
                             .await?;
                     }
@@ -1056,6 +1077,9 @@ impl LLMProvider for CopilotProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
+        let session_log_id = options
+            .and_then(|value| value.session_id.as_deref())
+            .unwrap_or("unknown-session");
         let token = self.get_token_for_request().await?;
         let reasoning_effort = options
             .and_then(|o| o.reasoning_effort)
@@ -1080,7 +1104,11 @@ impl LLMProvider for CopilotProvider {
             ));
         }
 
-        tracing::debug!("Copilot provider using upstream model: {}", upstream_model);
+        tracing::debug!(
+            "[{}] Copilot provider using upstream model: {}",
+            session_log_id,
+            upstream_model
+        );
 
         // Some models only support Responses API.
         if self.uses_responses_api(upstream_model) {
@@ -1095,6 +1123,7 @@ impl LLMProvider for CopilotProvider {
                     responses_options,
                     parallel_tool_calls,
                     reasoning_source,
+                    session_log_id,
                 )
                 .await;
         }
@@ -1128,7 +1157,8 @@ impl LLMProvider for CopilotProvider {
             Some(upstream_model),
         );
         tracing::info!(
-            "Copilot request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
+            "[{}] Copilot request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
+            session_log_id,
             upstream_model,
             reasoning_effort
                 .map(ReasoningEffort::as_str)
@@ -1141,7 +1171,8 @@ impl LLMProvider for CopilotProvider {
         );
 
         tracing::debug!(
-            "Sending request to Copilot API with {} messages and {} tools",
+            "[{}] Sending request to Copilot API with {} messages and {} tools",
+            session_log_id,
             messages.len(),
             tools.len()
         );
@@ -1164,6 +1195,7 @@ impl LLMProvider for CopilotProvider {
                         .json(&body)
                 },
                 "copilot chat/completions initial request",
+                Some(session_log_id),
             )
             .await?;
 
@@ -1190,6 +1222,7 @@ impl LLMProvider for CopilotProvider {
                                         .json(&body)
                                 },
                                 "copilot chat/completions auth-refresh retry",
+                                Some(session_log_id),
                             )
                             .await?;
                     }
@@ -1238,7 +1271,8 @@ impl LLMProvider for CopilotProvider {
                     && Self::looks_like_reasoning_unsupported_error(status, &text)
                 {
                     tracing::warn!(
-                        "Copilot /chat/completions rejected reasoning for model '{}'; retrying without reasoning_effort",
+                        "[{}] Copilot /chat/completions rejected reasoning for model '{}'; retrying without reasoning_effort",
+                        session_log_id,
                         upstream_model
                     );
 
@@ -1280,6 +1314,7 @@ impl LLMProvider for CopilotProvider {
                                     .json(&body_no_reasoning)
                             },
                             "copilot chat/completions reasoning fallback",
+                            Some(session_log_id),
                         )
                         .await?;
 
@@ -1308,6 +1343,7 @@ impl LLMProvider for CopilotProvider {
                                                     .json(&body_no_reasoning)
                                             },
                                             "copilot chat/completions reasoning fallback auth-refresh retry",
+                                            Some(session_log_id),
                                         )
                                         .await?;
                                 }
@@ -1330,7 +1366,8 @@ impl LLMProvider for CopilotProvider {
                 // If this model only supports Responses API, retry with /responses.
                 if Self::looks_like_responses_only_error(status, &text) {
                     tracing::info!(
-                        "Copilot chat/completions rejected model '{}'; retrying via /responses",
+                        "[{}] Copilot chat/completions rejected model '{}'; retrying via /responses",
+                        session_log_id,
                         upstream_model
                     );
                     return self
@@ -1344,13 +1381,15 @@ impl LLMProvider for CopilotProvider {
                             responses_options,
                             parallel_tool_calls,
                             reasoning_source,
+                            session_log_id,
                         )
                         .await;
                 }
 
                 let request_body_bytes = serde_json::to_vec(&body).map(|v| v.len()).unwrap_or(0);
                 tracing::error!(
-                    "Copilot API error: HTTP {} - {} (request_id={}, model='{}', messages={}, tools={}, request_body_bytes={}, max_output_tokens={:?}, reasoning_effort={:?})",
+                    "[{}] Copilot API error: HTTP {} - {} (request_id={}, model='{}', messages={}, tools={}, request_body_bytes={}, max_output_tokens={:?}, reasoning_effort={:?})",
+                    session_log_id,
                     status,
                     text,
                     request_id,
@@ -1362,7 +1401,8 @@ impl LLMProvider for CopilotProvider {
                     reasoning_effort
                 );
                 tracing::debug!(
-                    "Copilot API error response headers: [{}]",
+                    "[{}] Copilot API error response headers: [{}]",
+                    session_log_id,
                     response_headers_debug
                 );
                 return Err(LLMError::Api(format!(
@@ -1374,6 +1414,7 @@ impl LLMProvider for CopilotProvider {
 
         let model_for_log = upstream_model.to_string();
         let requested_reasoning = reasoning_effort;
+        let session_for_log = session_log_id.to_string();
         let mut observed_reasoning_signal = false;
         let mut reasoning_chars = 0usize;
         let mut logged_summary = false;
@@ -1415,7 +1456,8 @@ impl LLMProvider for CopilotProvider {
                         && (requested_reasoning.is_some() || observed_reasoning_signal)
                     {
                         tracing::info!(
-                            "Copilot chat_completions reasoning summary: model='{}' requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
+                            "[{}] Copilot chat_completions reasoning summary: model='{}' requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
+                            session_for_log,
                             model_for_log,
                             requested_reasoning
                                 .map(ReasoningEffort::as_str)

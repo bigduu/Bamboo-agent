@@ -46,6 +46,7 @@ pub(super) async fn handle_streaming_complete(
             max_tokens,
             mapped_model.as_str(),
             Some(&LLMRequestOptions {
+                session_id: None,
                 reasoning_effort,
                 parallel_tool_calls: None,
                 responses: None,

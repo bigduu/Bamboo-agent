@@ -77,6 +77,7 @@ pub async fn evaluate_task_progress(
     tracing::debug!("[{}] Task evaluation using model: {}", session_id, model);
 
     let request_options = LLMRequestOptions {
+        session_id: Some(session_id.to_string()),
         reasoning_effort,
         parallel_tool_calls: None,
         responses: None,

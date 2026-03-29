@@ -6,6 +6,7 @@ use crate::agent::core::tools::ToolExecutor;
 use crate::agent::core::{AgentError, AgentEvent, Message, Session};
 use crate::agent::llm::LLMProvider;
 use crate::agent::loop_module::config::AgentLoopConfig;
+use crate::agent::loop_module::runner::session_setup::tool_schemas::resolve_available_tool_schemas_for_session;
 use crate::agent::loop_module::stream::handler::StreamHandlingOutput;
 use crate::agent::loop_module::task_context::TaskLoopContext;
 use crate::agent::metrics::{MetricsCollector, TokenUsage};
@@ -64,6 +65,34 @@ pub(super) async fn handle_tool_calls_path(
     }
 
     state.log_round_complete_if_debug(&context, session.messages.len());
+
+    let compression_model = config
+        .model_name
+        .clone()
+        .or_else(|| (!session.model.trim().is_empty()).then_some(session.model.trim().to_string()));
+    if let Some(model_name) = compression_model.as_deref() {
+        let tool_schemas = resolve_available_tool_schemas_for_session(config, tools.as_ref());
+        if super::super::round_lifecycle::maybe_apply_mid_turn_context_compression(
+            session,
+            config,
+            &llm,
+            context.session_id,
+            model_name,
+            &tool_schemas,
+        )
+        .await?
+        {
+            tracing::debug!(
+                "[{}] Applied mid-turn host context compression after tool execution",
+                context.session_id
+            );
+        }
+    } else {
+        tracing::warn!(
+            "[{}] Skipping mid-turn context compression: missing model name",
+            context.session_id
+        );
+    }
 
     // Use fast_model for task evaluation when available (lightweight task).
     let eval_model = config

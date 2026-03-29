@@ -99,3 +99,23 @@ pub(super) async fn execute_llm_round(
         round_usage,
     })
 }
+
+pub(super) async fn maybe_apply_mid_turn_context_compression(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    llm: &Arc<dyn LLMProvider>,
+    session_id: &str,
+    model_name: &str,
+    tool_schemas: &[ToolSchema],
+) -> Result<bool, AgentError> {
+    context_preparation::maybe_apply_host_context_compression(
+        session,
+        config,
+        model_name,
+        session_id,
+        tool_schemas,
+        llm,
+        "mid-turn",
+    )
+    .await
+}

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use super::resolve_available_tool_schemas;
+use super::tool_schemas::resolve_available_tool_schemas_for_session;
 use crate::agent::core::tools::{FunctionSchema, ToolCall, ToolExecutor, ToolResult, ToolSchema};
 use crate::agent::core::{Message, Session};
 
@@ -44,7 +44,7 @@ fn resolve_available_tool_schemas_uses_executor_when_registry_empty() {
         schemas: vec![schema("z_tool"), schema("a_tool")],
     };
 
-    let resolved = resolve_available_tool_schemas(&config, &tools);
+    let resolved = resolve_available_tool_schemas_for_session(&config, &tools);
     let names: Vec<&str> = resolved
         .iter()
         .map(|item| item.function.name.as_str())
@@ -63,7 +63,7 @@ fn resolve_available_tool_schemas_dedupes_and_merges_additional_entries() {
         schemas: vec![schema("a_tool"), schema("z_tool")],
     };
 
-    let resolved = resolve_available_tool_schemas(&config, &tools);
+    let resolved = resolve_available_tool_schemas_for_session(&config, &tools);
     let names: Vec<&str> = resolved
         .iter()
         .map(|item| item.function.name.as_str())
@@ -85,7 +85,7 @@ fn resolve_available_tool_schemas_excludes_disabled_tools() {
         schemas: vec![schema("a_tool"), schema("z_tool")],
     };
 
-    let resolved = resolve_available_tool_schemas(&config, &tools);
+    let resolved = resolve_available_tool_schemas_for_session(&config, &tools);
     let names: Vec<&str> = resolved
         .iter()
         .map(|item| item.function.name.as_str())
@@ -106,13 +106,39 @@ fn resolve_available_tool_schemas_excludes_canonicalized_disabled_tool_aliases()
         schemas: vec![schema("Bash"), schema("Read"), schema("Write")],
     };
 
-    let resolved = resolve_available_tool_schemas(&config, &tools);
+    let resolved = resolve_available_tool_schemas_for_session(&config, &tools);
     let names: Vec<&str> = resolved
         .iter()
         .map(|item| item.function.name.as_str())
         .collect();
 
     assert_eq!(names, vec!["Write"]);
+}
+
+#[test]
+fn resolve_available_tool_schemas_does_not_mutate_session_metadata() {
+    let config = crate::agent::loop_module::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("Write"), schema("session_inspector")],
+    };
+    let mut session = Session::new("session-1", "gpt-4o-mini");
+    session.add_message(Message::system("sys"));
+    session
+        .metadata
+        .insert("existing".to_string(), "value".to_string());
+
+    let resolved = super::tool_schemas::resolve_available_tool_schemas_for_session(&config, &tools);
+    let names: Vec<&str> = resolved
+        .iter()
+        .map(|item| item.function.name.as_str())
+        .collect();
+
+    assert_eq!(names, vec!["Write", "session_inspector"]);
+    assert_eq!(
+        session.metadata.get("existing").map(String::as_str),
+        Some("value")
+    );
+    assert_eq!(session.metadata.len(), 1);
 }
 
 #[test]

@@ -224,6 +224,9 @@ pub struct LlmSummarizer {
     model: String,
     /// Optional existing summary to build upon (incremental summarization).
     existing_summary: Option<String>,
+    /// Optional current task list prompt so summary generation can distinguish
+    /// active vs completed/obsolete work using the session's source of truth.
+    task_list_prompt: Option<String>,
 }
 
 impl LlmSummarizer {
@@ -233,11 +236,17 @@ impl LlmSummarizer {
     /// * `llm` - The LLM provider to use (same as the current session's provider)
     /// * `model` - Model name to use for summarization
     /// * `existing_summary` - Optional previous summary to extend
-    pub fn new(llm: Arc<dyn LLMProvider>, model: String, existing_summary: Option<String>) -> Self {
+    pub fn new(
+        llm: Arc<dyn LLMProvider>,
+        model: String,
+        existing_summary: Option<String>,
+        task_list_prompt: Option<String>,
+    ) -> Self {
         Self {
             llm,
             model,
             existing_summary,
+            task_list_prompt,
         }
     }
 
@@ -245,31 +254,43 @@ impl LlmSummarizer {
     fn build_summarization_messages(&self, messages: &[Message]) -> Vec<Message> {
         let mut prompt_messages = Vec::new();
 
-        let system_prompt = r#"You are a conversation summarizer. Your task is to create a concise but comprehensive summary of a conversation that was removed due to context window limits.
+        let system_prompt = r#"You are a conversation summarizer. Your task is to create a concise but reliable working-memory summary for a conversation that was removed due to context window limits.
 
 Guidelines:
-- Preserve key decisions, facts, code changes, file paths, and important outcomes
-- Maintain the user's original intent and any constraints they specified
-- Note important tool results (files read, commands executed, errors encountered)
-- Keep technical details that would be needed to continue the work
-- Use a structured format with sections if the conversation covers multiple topics
-- Be concise but don't lose critical information
+- Distinguish clearly between CURRENT ACTIVE work, COMPLETED work, and OBSOLETE or superseded work
+- Do not restate old tasks as active unless they are still unresolved
+- The provided current task list is the source of truth for active work
+- Preserve key decisions, constraints, file paths, code changes, tool findings, blockers, and important outcomes
+- If earlier plans conflict with newer messages or the current task list, mark them as obsolete or completed
+- Explicitly evaluate each clear user requirement (e.g. requirement 1, requirement 2) with a status and evidence
+- Keep the next step specific and aligned with the active work only
+- Use structured sections
 - Write in the same language as the original conversation"#;
 
         prompt_messages.push(Message::system(system_prompt));
 
-        // If there's an existing summary, include it for incremental updates
         let mut user_content = String::new();
 
         if let Some(ref existing) = self.existing_summary {
             user_content.push_str("## Previous Summary\n\n");
             user_content.push_str(existing);
             user_content.push_str("\n\n---\n\n");
-            user_content.push_str(
-                "The above is the previous summary. Below are additional messages that have now been compressed. \
-                 Please produce an updated, merged summary that incorporates both the previous summary and the new messages.\n\n",
-            );
         }
+
+        if let Some(task_list_prompt) = self
+            .task_list_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            user_content.push_str("## Current Task List\n\n");
+            user_content.push_str(task_list_prompt);
+            user_content.push_str("\n\n---\n\n");
+        }
+
+        user_content.push_str(
+            "## Required Output Sections\n1. Current active objective\n2. Requirement checklist (Requirement | Status: completed/in_progress/pending/blocked/obsolete | Evidence)\n3. Active tasks\n4. Completed tasks\n5. Obsolete or superseded tasks\n6. Important context and constraints\n7. Files, code, and tool findings\n8. Open issues and next step\n\n",
+        );
 
         user_content.push_str("## Messages to Summarize\n\n");
 
@@ -278,10 +299,9 @@ Guidelines:
                 Role::User => "User",
                 Role::Assistant => "Assistant",
                 Role::Tool => "Tool Result",
-                Role::System => continue, // Skip system messages
+                Role::System => continue,
             };
 
-            // Include tool call info if present
             if let Some(ref tool_calls) = message.tool_calls {
                 if !tool_calls.is_empty() {
                     let tool_names: Vec<&str> = tool_calls
@@ -300,12 +320,10 @@ Guidelines:
                 user_content.push_str(&format!("**{}**:\n", role_label));
             }
 
-            // Include tool_call_id for tool results
             if let Some(ref tool_call_id) = message.tool_call_id {
                 user_content.push_str(&format!("(tool_call_id: {})\n", tool_call_id));
             }
 
-            // Truncate very long messages to avoid blowing up the summary request
             let content = &message.content;
             const MAX_CONTENT_CHARS: usize = 2000;
             if content.chars().count() > MAX_CONTENT_CHARS {
@@ -319,8 +337,7 @@ Guidelines:
         }
 
         user_content.push_str(
-            "\n---\n\nPlease summarize the above conversation. \
-             Focus on preserving actionable information, decisions made, and current state of work.",
+            "\n---\n\nReturn only the summary text. Be explicit about what is active now versus what is already completed or no longer relevant.",
         );
 
         prompt_messages.push(Message::user(user_content));
@@ -429,6 +446,27 @@ impl Summarizer for LlmSummarizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::llm::{LLMChunk, LLMError, LLMStream};
+    use async_trait::async_trait;
+    use futures::stream;
+
+    struct DummyProvider;
+
+    #[async_trait]
+    impl LLMProvider for DummyProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[crate::agent::core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Ok(Box::pin(stream::iter(vec![
+                Ok::<LLMChunk, LLMError>(LLMChunk::Token("dummy summary".to_string())),
+                Ok::<LLMChunk, LLMError>(LLMChunk::Done),
+            ])))
+        }
+    }
 
     #[test]
     fn heuristic_summarizer_extracts_user_questions() {
@@ -606,5 +644,37 @@ mod tests {
 
         // Should return unchanged
         assert_eq!(truncated, text);
+    }
+
+    #[test]
+    fn llm_summarizer_prompt_includes_task_list_and_state_sections() {
+        let summarizer = LlmSummarizer::new(
+            Arc::new(DummyProvider),
+            "gpt-4o-mini".to_string(),
+            Some("Earlier summary".to_string()),
+            Some(
+                "## Current Task List\n[/] task_1: Fix compression bounce\n[x] task_0: Analyze bug"
+                    .to_string(),
+            ),
+        );
+        let messages = vec![
+            Message::user("继续做压缩修复"),
+            Message::assistant("我先检查 trigger 与 target", None),
+        ];
+
+        let prompt_messages = summarizer.build_summarization_messages(&messages);
+        assert_eq!(prompt_messages.len(), 2);
+        assert_eq!(prompt_messages[0].role, Role::System);
+        assert!(prompt_messages[1].content.contains("## Current Task List"));
+        assert!(prompt_messages[1]
+            .content
+            .contains("Current active objective"));
+        assert!(prompt_messages[1].content.contains("Requirement checklist"));
+        assert!(prompt_messages[1].content.contains("Active tasks"));
+        assert!(prompt_messages[1].content.contains("Completed tasks"));
+        assert!(prompt_messages[1]
+            .content
+            .contains("Obsolete or superseded tasks"));
+        assert!(prompt_messages[1].content.contains("Earlier summary"));
     }
 }

@@ -6,14 +6,56 @@ use crate::agent::core::MessagePhase;
 use chrono::Utc;
 use std::collections::HashSet;
 
-const CONTEXT_COMPRESSION_LAST_APPLIED_AT_KEY: &str = "context_compression_last_applied_at";
-const CONTEXT_COMPRESSION_LAST_APPLIED_USAGE_PCT_KEY: &str =
-    "context_compression_last_applied_usage_pct";
-const CONTEXT_COMPRESSION_REEXPOSE_MIN_DELTA_PCT: f64 = 5.0;
-const CONTEXT_COMPRESSION_CRITICAL_EXPOSE_PERCENT: f64 = 95.0;
+/// Structured reason why a compression plan could not be built.
+#[derive(Debug, Clone)]
+pub enum CompressionPlanError {
+    /// The exposure gate (threshold not reached) prevented building.
+    ExposureGateNotMet {
+        usage_percent: f64,
+        trigger_percent: u8,
+    },
+    /// No active messages in the session.
+    NoActiveMessages,
+    /// Not enough non-system messages to compress (need >=3).
+    NotEnoughMessages { non_system_count: usize },
+    /// Nothing to compress after anchor/keep splitting.
+    NothingToCompress {
+        anchor_index: usize,
+        non_system_count: usize,
+    },
+}
 
-/// Metadata about current context pressure, used to decide when to expose
-/// the `compress_context` tool to the model.
+impl std::fmt::Display for CompressionPlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExposureGateNotMet {
+                usage_percent,
+                trigger_percent,
+            } => write!(
+                f,
+                "compression threshold not reached (usage={:.1}%, trigger={}%)",
+                usage_percent, trigger_percent
+            ),
+            Self::NoActiveMessages => write!(f, "no active messages to compress"),
+            Self::NotEnoughMessages { non_system_count } => write!(
+                f,
+                "not enough non-system messages to compress ({}, need >=3)",
+                non_system_count
+            ),
+            Self::NothingToCompress {
+                anchor_index,
+                non_system_count,
+            } => write!(
+                f,
+                "nothing to compress after anchor/keep splitting (anchor_index={}, non_system={})",
+                anchor_index, non_system_count
+            ),
+        }
+    }
+}
+
+/// Metadata about current context pressure, used to decide when compression
+/// should be requested by host-side control flow.
 #[derive(Debug, Clone)]
 pub struct ContextCompressionExposure {
     pub budget: TokenBudget,
@@ -38,8 +80,23 @@ pub struct CompressionPlan {
     pub segments_removed: usize,
 }
 
+pub fn context_window_usage_percent(total_tokens: u32, context_window_tokens: u32) -> f64 {
+    if context_window_tokens == 0 {
+        return 0.0;
+    }
+    (total_tokens as f64 / context_window_tokens as f64) * 100.0
+}
+
+pub fn normalized_trigger_percent(trigger_percent: u8) -> f64 {
+    match trigger_percent {
+        0 => 100.0,
+        1..=100 => trigger_percent as f64,
+        _ => 100.0,
+    }
+}
+
 /// Estimate whether context pressure has crossed the configured threshold for
-/// manual tool exposure.
+/// compression eligibility.
 pub fn estimate_context_compression_exposure(
     session: &Session,
     model_name: &str,
@@ -57,43 +114,44 @@ pub fn estimate_context_compression_exposure(
         .map(|summary| counter.count_messages(&[compression_summary_message(&summary.content)]))
         .unwrap_or(0);
     let active_tokens = active_message_tokens.saturating_add(summary_tokens);
-    let available = budget.available_input_tokens();
-    let estimated_usage = if available == 0 {
-        0.0
-    } else {
-        (active_tokens as f64 / available as f64) * 100.0
-    };
+    // Use context window as the denominator for a single, provider-aligned
+    // pressure scale across backend and frontend.
+    let context_window = budget.max_context_tokens;
+    let estimated_usage = context_window_usage_percent(active_tokens, context_window);
     let usage = session
         .token_usage
         .as_ref()
         .and_then(|token_usage| {
-            (token_usage.budget_limit > 0).then_some(
-                (token_usage.total_tokens as f64 / token_usage.budget_limit as f64) * 100.0,
-            )
+            let denominator = if token_usage.max_context_tokens > 0 {
+                token_usage.max_context_tokens
+            } else if token_usage.budget_limit > 0 {
+                // Legacy payload compatibility.
+                token_usage.budget_limit
+            } else {
+                context_window
+            };
+            (denominator > 0).then_some(context_window_usage_percent(
+                token_usage.total_tokens,
+                denominator,
+            ))
         })
         .map(|persisted_usage| persisted_usage.max(estimated_usage))
         .unwrap_or(estimated_usage);
 
     let rounded = usage.clamp(0.0, 100.0).round() as u8;
-    let trigger = f64::from(budget.compression_trigger_percent);
-    let reexpose_delta = session
-        .metadata
-        .get(CONTEXT_COMPRESSION_LAST_APPLIED_USAGE_PCT_KEY)
-        .and_then(|value| value.parse::<f64>().ok())
-        .map(|previous| usage - previous)
-        .unwrap_or(f64::INFINITY);
-    let recently_compressed = session
-        .metadata
-        .contains_key(CONTEXT_COMPRESSION_LAST_APPLIED_AT_KEY);
+    let trigger = normalized_trigger_percent(budget.compression_trigger_percent);
+    let threshold_reached = usage >= trigger;
 
-    let critical_usage = usage >= CONTEXT_COMPRESSION_CRITICAL_EXPOSE_PERCENT;
-    let threshold_reached = usage >= trigger || critical_usage;
+    // Check non-system message count to stay consistent with the plan
+    // building requirement of >=3 non-system messages.  Using
+    // active_messages.len() would include system messages and expose the
+    // tool even when plan building would immediately fail.
+    let non_system_count = active_messages
+        .iter()
+        .filter(|m| !matches!(m.role, crate::agent::core::Role::System))
+        .count();
 
-    let should_expose_tool = threshold_reached
-        && active_messages.len() > 2
-        && (critical_usage
-            || !recently_compressed
-            || reexpose_delta >= CONTEXT_COMPRESSION_REEXPOSE_MIN_DELTA_PCT);
+    let should_expose_tool = threshold_reached && non_system_count >= 3;
 
     ContextCompressionExposure {
         budget,
@@ -111,7 +169,7 @@ pub fn build_compression_plan_with_summary(
     model_name: &str,
     configured_budget: Option<&TokenBudget>,
     summary_content: String,
-) -> Option<CompressionPlan> {
+) -> Result<CompressionPlan, CompressionPlanError> {
     build_compression_plan_with_summary_internal(
         session,
         model_name,
@@ -124,14 +182,14 @@ pub fn build_compression_plan_with_summary(
 /// Build a compression plan while bypassing "tool exposure" gating.
 ///
 /// This is intended for host-enforced fallback paths when context pressure is
-/// critically high and compression must be attempted even if hysteresis would
-/// normally suppress re-exposure.
+/// critically high and compression must be attempted regardless of the normal
+/// trigger gate.
 pub fn build_forced_compression_plan_with_summary(
     session: &Session,
     model_name: &str,
     configured_budget: Option<&TokenBudget>,
     summary_content: String,
-) -> Option<CompressionPlan> {
+) -> Result<CompressionPlan, CompressionPlanError> {
     build_compression_plan_with_summary_internal(
         session,
         model_name,
@@ -147,10 +205,13 @@ fn build_compression_plan_with_summary_internal(
     configured_budget: Option<&TokenBudget>,
     summary_content: String,
     require_exposure_gate: bool,
-) -> Option<CompressionPlan> {
+) -> Result<CompressionPlan, CompressionPlanError> {
     let exposure = estimate_context_compression_exposure(session, model_name, configured_budget);
     if require_exposure_gate && !exposure.should_expose_tool {
-        return None;
+        return Err(CompressionPlanError::ExposureGateNotMet {
+            usage_percent: exposure.active_usage_percent,
+            trigger_percent: exposure.budget.compression_trigger_percent,
+        });
     }
 
     let budget = &exposure.budget;
@@ -158,12 +219,13 @@ fn build_compression_plan_with_summary_internal(
     let summary_message = compression_summary_message(&summary_content);
     let summary_tokens = counter.count_messages(&[summary_message]);
 
-    let available = budget.available_input_tokens();
-    let target_limit = budget.compression_target_input_tokens();
+    let context_window = budget.max_context_tokens;
+    let target_limit = budget.compression_target_context_tokens();
 
     let mut active_messages = active_messages_for_budget(session);
     if active_messages.is_empty() {
-        return None;
+        tracing::debug!("compression plan: no active messages, cannot build plan");
+        return Err(CompressionPlanError::NoActiveMessages);
     }
 
     let system_messages: Vec<Message> = active_messages
@@ -181,32 +243,79 @@ fn build_compression_plan_with_summary_internal(
         .collect();
 
     if non_system.len() < 3 {
-        return None;
+        tracing::debug!(
+            "compression plan: not enough non-system messages ({}), need at least 3",
+            non_system.len()
+        );
+        return Err(CompressionPlanError::NotEnoughMessages {
+            non_system_count: non_system.len(),
+        });
     }
 
-    let anchor_index = non_system
+    let user_indexes = non_system
         .iter()
-        .rposition(|m| matches!(m.role, crate::agent::core::Role::User))
-        .unwrap_or(non_system.len().saturating_sub(1));
+        .enumerate()
+        .filter_map(|(index, message)| {
+            matches!(message.role, crate::agent::core::Role::User).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let keep_user_count = user_indexes.len().min(3);
+    let anchor_index = if keep_user_count > 0 {
+        user_indexes[user_indexes.len() - keep_user_count]
+    } else {
+        non_system
+            .iter()
+            .rposition(|m| matches!(m.role, crate::agent::core::Role::User))
+            .unwrap_or(non_system.len().saturating_sub(1))
+    };
+    let protected_user_ids: HashSet<String> = if keep_user_count > 0 {
+        user_indexes[user_indexes.len() - keep_user_count..]
+            .iter()
+            .filter_map(|idx| non_system.get(*idx))
+            .map(|message| message.id.clone())
+            .collect()
+    } else {
+        HashSet::new()
+    };
 
-    if anchor_index == 0 {
-        return None;
-    }
+    tracing::debug!(
+        "compression plan: context_window={}, target_limit={}, system_tokens={}, summary_tokens={}, window_limit={}, non_system_messages={}, keep_user_count={}, keep_from_index={}",
+        context_window, target_limit, system_tokens, summary_tokens, window_limit, non_system.len(), keep_user_count, anchor_index
+    );
 
+    // Keep the newest 3 user turns (or fewer if there are not enough user
+    // turns) as active context and summarize older history before that
+    // boundary. If budget is still too high, continue moving the oldest
+    // non-protected messages into the summarize set.
     let mut messages_to_summarize = non_system[..anchor_index].to_vec();
+    let non_system_count = non_system.len();
     let mut messages_to_keep = non_system[anchor_index..].to_vec();
 
-    while messages_to_keep.len() > 1 {
+    while !messages_to_keep.is_empty() {
         let keep_tokens = counter.count_messages(&messages_to_keep);
         if keep_tokens <= window_limit {
             break;
         }
-        let moved = messages_to_keep.remove(0);
+
+        let Some(remove_index) = messages_to_keep
+            .iter()
+            .position(|message| !protected_user_ids.contains(message.id.as_str()))
+        else {
+            // Remaining messages are all protected user turns; stop shrinking.
+            break;
+        };
+        let moved = messages_to_keep.remove(remove_index);
         messages_to_summarize.push(moved);
     }
 
     if messages_to_summarize.is_empty() {
-        return None;
+        tracing::debug!(
+            "compression plan: messages_to_summarize is empty after anchor/keep splitting"
+        );
+        return Err(CompressionPlanError::NothingToCompress {
+            anchor_index,
+            non_system_count,
+        });
     }
 
     let compressed_message_ids = messages_to_summarize
@@ -216,14 +325,21 @@ fn build_compression_plan_with_summary_internal(
 
     let keep_tokens = counter.count_messages(&messages_to_keep);
     let active_before = exposure.active_usage_percent;
-    let active_after = if available == 0 {
+    // Use context_window as denominator, consistent with
+    // estimate_context_compression_exposure().
+    let active_after = if context_window == 0 {
         0.0
     } else {
         let after_total = reserved_non_window_tokens.saturating_add(keep_tokens);
-        (after_total as f64 / available as f64) * 100.0
+        (after_total as f64 / context_window as f64) * 100.0
     };
 
-    Some(CompressionPlan {
+    // Count actual segments being compressed using the same segmenter that
+    // prepare_hybrid_context uses, so the segment count is accurate.
+    let segmenter = crate::agent::core::budget::segmenter::MessageSegmenter::new();
+    let segments_removed = segmenter.segment(messages_to_summarize.clone()).len();
+
+    Ok(CompressionPlan {
         compressed_message_ids,
         messages_to_summarize,
         summary_tokens,
@@ -232,7 +348,7 @@ fn build_compression_plan_with_summary_internal(
         active_usage_after_percent: active_after,
         trigger_percent: budget.compression_trigger_percent,
         target_percent: budget.compression_target_percent,
-        segments_removed: 1,
+        segments_removed,
     })
 }
 
@@ -257,7 +373,13 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
         return 0;
     }
 
-    let event = CompressionEvent::new(changed_indexes.len(), plan.segments_removed);
+    let event = CompressionEvent::new(
+        changed_indexes.len(),
+        plan.segments_removed,
+        plan.active_usage_before_percent,
+        plan.active_usage_after_percent,
+        plan.summary_tokens,
+    );
     let event_id = event.id.clone();
     for index in changed_indexes {
         session.messages[index].compressed_by_event_id = Some(event_id.clone());
@@ -268,16 +390,62 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
         plan.compressed_message_ids.len(),
         plan.summary_tokens,
     ));
-    session.metadata.remove("responses.previous_response_id");
-    session.metadata.insert(
-        CONTEXT_COMPRESSION_LAST_APPLIED_AT_KEY.to_string(),
-        Utc::now().to_rfc3339(),
-    );
-    session.metadata.insert(
-        CONTEXT_COMPRESSION_LAST_APPLIED_USAGE_PCT_KEY.to_string(),
-        format!("{:.2}", plan.active_usage_after_percent),
-    );
-    session.token_usage = None;
+
+    // Instead of clearing token_usage entirely (which forces the next round
+    // to rely on heuristic estimates that don't account for tool schema
+    // tokens), recompute an approximate post-compression snapshot.  We
+    // preserve the context-window denominator from the previous usage snapshot
+    // so percentages stay consistent across rounds.
+    let counter = HeuristicTokenCounter::default();
+    let remaining_active: Vec<_> = session
+        .messages
+        .iter()
+        .filter(|m| !m.compressed)
+        .cloned()
+        .collect();
+    let system_msgs: Vec<_> = remaining_active
+        .iter()
+        .filter(|m| matches!(m.role, crate::agent::core::Role::System))
+        .cloned()
+        .collect();
+    let window_msgs: Vec<_> = remaining_active
+        .iter()
+        .filter(|m| !matches!(m.role, crate::agent::core::Role::System))
+        .cloned()
+        .collect();
+    let system_tokens = counter.count_messages(&system_msgs);
+    let new_summary_tokens = plan.summary_tokens;
+    let window_tokens = counter.count_messages(&window_msgs);
+    let total_tokens = system_tokens
+        .saturating_add(new_summary_tokens)
+        .saturating_add(window_tokens);
+    let previous_usage = session.token_usage.take();
+    let budget_limit = previous_usage
+        .as_ref()
+        .map(|u| {
+            if u.max_context_tokens > 0 {
+                u.max_context_tokens
+            } else {
+                u.budget_limit
+            }
+        })
+        .unwrap_or(0);
+    let max_context_tokens = previous_usage
+        .as_ref()
+        .map(|u| u.max_context_tokens)
+        .unwrap_or(0);
+    session.token_usage = Some(crate::agent::core::TokenBudgetUsage {
+        system_tokens,
+        summary_tokens: new_summary_tokens,
+        window_tokens,
+        total_tokens,
+        max_context_tokens,
+        budget_limit,
+        truncation_occurred: false,
+        segments_removed: 0,
+        prompt_cached_tool_outputs: 0,
+    });
+
     session.updated_at = Utc::now();
     plan.compressed_message_ids.len()
 }
@@ -323,7 +491,7 @@ pub fn build_summary_prompt(
         "You are compressing conversation history for continued work. Produce a compact but reliable working-memory summary.\n\n",
     );
     content.push_str(
-        "Critical requirements:\n- Distinguish clearly between ACTIVE work, COMPLETED work, and OBSOLETE or superseded work\n- Do not restate old tasks as active unless they are still unresolved\n- The current task list is the source of truth for what is actively being worked on\n- Preserve constraints, decisions, file paths, code changes, errors, tool findings, blockers, and the next step\n- If earlier plans conflict with the current task list or newer messages, treat the earlier plans as obsolete or completed\n- Return only summary text in the same language as the conversation\n\n",
+        "Critical requirements:\n- Distinguish clearly between ACTIVE work, COMPLETED work, and OBSOLETE or superseded work\n- Do not restate old tasks as active unless they are still unresolved\n- The current task list is the source of truth for what is actively being worked on\n- Preserve constraints, decisions, file paths, code changes, errors, tool findings, blockers, and the next step\n- If earlier plans conflict with the current task list or newer messages, treat the earlier plans as obsolete or completed\n- Explicitly evaluate each clear user requirement (e.g. requirement 1, requirement 2) with a status and evidence\n- Return only summary text in the same language as the conversation\n\n",
     );
 
     if let Some(existing) = existing_summary.map(str::trim).filter(|s| !s.is_empty()) {
@@ -340,7 +508,7 @@ pub fn build_summary_prompt(
     }
 
     content.push_str(
-        "## Required Output Sections\n1. Current active objective\n2. Active tasks\n3. Completed tasks\n4. Obsolete or superseded tasks\n5. Important context and constraints\n6. Files, code, and tool findings\n7. Open issues and next step\n\n",
+        "## Required Output Sections\n1. Current active objective\n2. Requirement checklist (Requirement | Status: completed/in_progress/pending/blocked/obsolete | Evidence)\n3. Active tasks\n4. Completed tasks\n5. Obsolete or superseded tasks\n6. Important context and constraints\n7. Files, code, and tool findings\n8. Open issues and next step\n\n",
     );
 
     content.push_str("## Messages To Compress\n\n");
@@ -441,93 +609,41 @@ mod tests {
     }
 
     #[test]
-    fn estimate_context_compression_exposure_has_reexpose_hysteresis_after_recent_compression() {
-        let mut session = make_session_with_pressure();
-        let baseline = estimate_context_compression_exposure(
-            &session,
-            "gpt-4o-mini",
-            session.token_budget.as_ref(),
-        );
-        let usage_now = baseline.active_usage_percent.max(1.0);
-        let trigger = usage_now.floor().clamp(1.0, 100.0) as u8;
-        if let Some(budget) = session.token_budget.as_mut() {
-            budget.compression_trigger_percent = trigger;
-        }
-        session.metadata.insert(
-            CONTEXT_COMPRESSION_LAST_APPLIED_AT_KEY.to_string(),
-            Utc::now().to_rfc3339(),
-        );
-        session.metadata.insert(
-            CONTEXT_COMPRESSION_LAST_APPLIED_USAGE_PCT_KEY.to_string(),
-            format!("{:.2}", usage_now - 1.0),
-        );
+    fn context_window_usage_percent_uses_context_window_denominator() {
+        assert_eq!(context_window_usage_percent(0, 0), 0.0);
+        assert_eq!(context_window_usage_percent(500, 1000), 50.0);
+    }
 
+    #[test]
+    fn estimate_context_compression_exposure_crosses_trigger_when_usage_is_high_enough() {
+        let mut session = make_session_with_pressure();
+        if let Some(budget) = session.token_budget.as_mut() {
+            budget.compression_trigger_percent = 10;
+        }
         let exposure = estimate_context_compression_exposure(
             &session,
             "gpt-4o-mini",
             session.token_budget.as_ref(),
         );
-
-        assert!(
-            exposure.active_usage_percent >= f64::from(trigger),
-            "setup should still be above trigger (usage={}, trigger={})",
-            exposure.active_usage_percent,
-            trigger
-        );
-        assert!(
-            !exposure.should_expose_tool,
-            "session should not re-expose compression immediately when usage only rose by about 1% after the last compression"
-        );
+        assert!(exposure.active_usage_percent >= 10.0);
+        assert!(exposure.should_expose_tool);
     }
 
     #[test]
-    fn estimate_context_compression_exposure_reexposes_tool_in_critical_usage_band() {
+    fn estimate_context_compression_exposure_stays_below_trigger_when_usage_is_low() {
         let mut session = make_session_with_pressure();
         if let Some(budget) = session.token_budget.as_mut() {
             budget.compression_trigger_percent = 99;
         }
 
-        let baseline = estimate_context_compression_exposure(
-            &session,
-            "gpt-4o-mini",
-            session.token_budget.as_ref(),
-        );
-        let usage_now = baseline.active_usage_percent.max(95.0);
-        session.metadata.insert(
-            CONTEXT_COMPRESSION_LAST_APPLIED_AT_KEY.to_string(),
-            Utc::now().to_rfc3339(),
-        );
-        session.metadata.insert(
-            CONTEXT_COMPRESSION_LAST_APPLIED_USAGE_PCT_KEY.to_string(),
-            format!("{:.2}", usage_now - 1.0),
-        );
-        session.token_usage = Some(TokenBudgetUsage {
-            system_tokens: 120,
-            summary_tokens: 0,
-            window_tokens: 9_540,
-            total_tokens: 9_660,
-            max_context_tokens: 10_000,
-            budget_limit: 10_000,
-            truncation_occurred: true,
-            segments_removed: 8,
-            prompt_cached_tool_outputs: 0,
-        });
-
         let exposure = estimate_context_compression_exposure(
             &session,
             "gpt-4o-mini",
             session.token_budget.as_ref(),
         );
 
-        assert!(
-            exposure.active_usage_percent >= CONTEXT_COMPRESSION_CRITICAL_EXPOSE_PERCENT,
-            "setup should be in critical usage band, got {}",
-            exposure.active_usage_percent
-        );
-        assert!(
-            exposure.should_expose_tool,
-            "critical usage should bypass hysteresis and re-expose compress_context"
-        );
+        assert!(exposure.active_usage_percent < 99.0);
+        assert!(!exposure.should_expose_tool);
     }
 
     #[test]
@@ -566,11 +682,82 @@ mod tests {
 
         assert!(prompt.contains("## Current Task List"));
         assert!(prompt.contains("Current active objective"));
+        assert!(prompt.contains("Requirement checklist"));
         assert!(prompt.contains("Active tasks"));
         assert!(prompt.contains("Completed tasks"));
         assert!(prompt.contains("Obsolete or superseded tasks"));
         assert!(prompt.contains("检查 51% 又回落到 50% 的触发逻辑"));
         assert!(prompt.contains("old summary"));
+    }
+
+    #[test]
+    fn forced_plan_keeps_last_three_user_messages_active() {
+        let budget = TokenBudget {
+            max_context_tokens: 1200,
+            max_output_tokens: 100,
+            strategy: BudgetStrategy::Hybrid {
+                window_size: 20,
+                enable_summarization: true,
+            },
+            safety_margin: 0,
+            compression_trigger_percent: 80,
+            compression_target_percent: 20,
+            prompt_cache_min_tool_output_chars: 1_200,
+            prompt_cache_head_chars: 280,
+            prompt_cache_tail_chars: 180,
+            prompt_cache_recent_user_turns: 2,
+            prompt_cache_recent_tool_chains: 2,
+        };
+        let mut session = Session::new("keep-last-three-user-turns", "gpt-4o-mini");
+        session.token_budget = Some(budget.clone());
+        session.add_message(Message::system("system"));
+        for i in 0..6 {
+            session.add_message(Message::user(format!(
+                "U{i}: {}",
+                "alpha beta gamma ".repeat(8)
+            )));
+            session.add_message(Message::assistant(
+                format!("A{i}: {}", "analysis plan steps ".repeat(8)),
+                None,
+            ));
+        }
+
+        let plan = build_forced_compression_plan_with_summary(
+            &session,
+            "gpt-4o-mini",
+            Some(&budget),
+            "summary".to_string(),
+        )
+        .expect("forced plan should build");
+
+        let compressed_ids = plan
+            .compressed_message_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let kept_user_contents = session
+            .messages
+            .iter()
+            .filter(|message| !matches!(message.role, crate::agent::core::Role::System))
+            .filter(|message| !compressed_ids.contains(message.id.as_str()))
+            .filter(|message| matches!(message.role, crate::agent::core::Role::User))
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>();
+
+        assert!(
+            kept_user_contents.len() >= 3,
+            "expected to keep at least 3 user messages, got {}",
+            kept_user_contents.len()
+        );
+        assert!(kept_user_contents
+            .iter()
+            .any(|content| content.starts_with("U3:")));
+        assert!(kept_user_contents
+            .iter()
+            .any(|content| content.starts_with("U4:")));
+        assert!(kept_user_contents
+            .iter()
+            .any(|content| content.starts_with("U5:")));
     }
 
     #[test]
@@ -595,11 +782,13 @@ mod tests {
         session.add_message(Message::system("system"));
         session.add_message(Message::user("short"));
         session.add_message(Message::assistant("short", None));
+        session.add_message(Message::user("follow-up"));
+        session.add_message(Message::assistant("reply", None));
         session.token_usage = Some(TokenBudgetUsage {
             system_tokens: 100,
             summary_tokens: 0,
-            window_tokens: 9_500,
-            total_tokens: 9_600,
+            window_tokens: 95_900,
+            total_tokens: 96_000,
             max_context_tokens: 100_000,
             budget_limit: 10_000,
             truncation_occurred: true,
@@ -615,7 +804,7 @@ mod tests {
 
         assert!(
             exposure.active_usage_percent >= 96.0,
-            "expected persisted budget usage to drive exposure, got {}",
+            "expected persisted context-window usage to drive exposure, got {}",
             exposure.active_usage_percent
         );
         assert!(exposure.should_expose_tool);

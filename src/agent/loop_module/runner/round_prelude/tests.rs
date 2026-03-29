@@ -4,7 +4,9 @@ use tokio_util::sync::CancellationToken;
 use super::prepare_round;
 use crate::agent::core::{AgentError, Role, Session};
 use crate::agent::core::{TaskItem, TaskItemStatus, TaskList};
+use crate::agent::loop_module::config::AgentLoopConfig;
 use crate::agent::loop_module::task_context::TaskLoopContext;
+use crate::agent::tools::BuiltinToolExecutor;
 
 fn sample_task_list(session_id: &str, status: TaskItemStatus) -> TaskList {
     TaskList {
@@ -27,6 +29,8 @@ async fn prepare_round_updates_task_context_and_returns_round_id() {
     let mut session = Session::new("session-prelude", "test-model");
     session.set_task_list(sample_task_list("session-prelude", TaskItemStatus::Pending));
     let mut task_context = TaskLoopContext::from_session(&session);
+    let config = AgentLoopConfig::default();
+    let tools = BuiltinToolExecutor::new();
 
     let round_id = prepare_round(
         &mut session,
@@ -38,6 +42,8 @@ async fn prepare_round_updates_task_context_and_returns_round_id() {
         "session-prelude",
         "test-model",
         false,
+        &config,
+        &tools,
     )
     .await
     .expect("round should prepare");
@@ -57,6 +63,8 @@ async fn prepare_round_returns_cancelled_error_when_token_cancelled() {
     let mut session = Session::new("session-cancelled", "test-model");
     let mut task_context = None;
     let cancel_token = CancellationToken::new();
+    let config = AgentLoopConfig::default();
+    let tools = BuiltinToolExecutor::new();
     cancel_token.cancel();
 
     let result = prepare_round(
@@ -69,6 +77,8 @@ async fn prepare_round_returns_cancelled_error_when_token_cancelled() {
         "session-cancelled",
         "test-model",
         false,
+        &config,
+        &tools,
     )
     .await;
 

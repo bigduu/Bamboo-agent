@@ -363,11 +363,14 @@ fn test_conversation_summary_update() {
 
 #[test]
 fn test_compression_event_new() {
-    let event = CompressionEvent::new(15, 3);
+    let event = CompressionEvent::new(15, 3, 96.2, 61.4, 128);
 
     assert!(!event.id.is_empty());
     assert_eq!(event.messages_compressed, 15);
     assert_eq!(event.segments_removed, 3);
+    assert!((event.usage_before_percent - 96.2).abs() < f64::EPSILON);
+    assert!((event.usage_after_percent - 61.4).abs() < f64::EPSILON);
+    assert_eq!(event.summary_tokens, 128);
 }
 
 #[test]

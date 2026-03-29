@@ -32,6 +32,17 @@ pub(super) async fn load_session_or_404(
         .map_err(|e| ErrorInternalServerError(format!("Failed to load session: {e}")))
 }
 
+pub(super) fn clear_derived_context_state(session: &mut Session) {
+    session.token_usage = None;
+    session.conversation_summary = None;
+    session.compression_events.clear();
+    session.metadata.remove("responses.previous_response_id");
+    for message in &mut session.messages {
+        message.compressed = false;
+        message.compressed_by_event_id = None;
+    }
+}
+
 pub(super) async fn save_and_cache_session(
     state: &web::Data<AppState>,
     session_id: &str,

@@ -1,6 +1,9 @@
 use actix_web::{web, HttpResponse, Result};
 
-use super::shared::{ensure_session_not_running, load_session_or_404, save_and_cache_session};
+use super::shared::{
+    clear_derived_context_state, ensure_session_not_running, load_session_or_404,
+    save_and_cache_session,
+};
 use super::types::PatchMessageRequest;
 use crate::agent::core::Role;
 use crate::server::app_state::AppState;
@@ -62,8 +65,7 @@ pub async fn patch_message(
     message.content = content;
 
     // Editing history invalidates derived context state.
-    session.token_usage = None;
-    session.conversation_summary = None;
+    clear_derived_context_state(&mut session);
     let message_count = session.messages.len();
     save_and_cache_session(&state, &session_id, session).await?;
 

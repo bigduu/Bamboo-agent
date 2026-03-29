@@ -1,7 +1,10 @@
 use actix_web::{web, HttpResponse, Result};
 use std::collections::HashSet;
 
-use super::shared::{ensure_session_not_running, load_session_or_404, save_and_cache_session};
+use super::shared::{
+    clear_derived_context_state, ensure_session_not_running, load_session_or_404,
+    save_and_cache_session,
+};
 use super::types::TruncateRequest;
 use crate::agent::core::agent::Role;
 use crate::agent::core::{Message, Session};
@@ -256,8 +259,7 @@ pub async fn truncate_messages(
 
     if should_clear_derived_state {
         // Truncation invalidates derived context state.
-        session.token_usage = None;
-        session.conversation_summary = None;
+        clear_derived_context_state(&mut session);
     }
 
     if should_persist {

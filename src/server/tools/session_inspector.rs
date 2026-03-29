@@ -98,6 +98,19 @@ enum SessionInspectorArgs {
         include_image_urls: Option<bool>,
     },
 
+    /// Read compressed historical context from local SQLite index cache.
+    ReadCompressedCache {
+        session_id: String,
+        #[serde(default)]
+        offset: Option<usize>,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        truncate_chars: Option<usize>,
+        #[serde(default)]
+        include_summary: Option<bool>,
+    },
+
     /// Search session titles and (optionally) tail messages.
     Search {
         query: String,
@@ -199,7 +212,7 @@ impl Tool for SessionInspectorTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect sessions stored in Bamboo home dir (V2). Use list/get_meta to fetch metadata first, then read_messages with a small limit (prefer from_end). Keep inspection local by default; only use child-session delegation if the user explicitly asks for it."
+        "Inspect sessions stored in Bamboo home dir (V2). Use list/get_meta to fetch metadata first, then read_messages or read_compressed_cache with bounded limits. Keep inspection local by default; only use child-session delegation if the user explicitly asks for it."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -209,7 +222,7 @@ impl Tool for SessionInspectorTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "get_meta", "read_messages", "search"],
+                    "enum": ["list", "get_meta", "read_messages", "read_compressed_cache", "search"],
                     "description": "Which inspection action to perform."
                 },
                 "query": { "type": "string", "description": "Search string (list/search)." },
@@ -227,6 +240,7 @@ impl Tool for SessionInspectorTool {
                 "include_tool": { "type": "boolean" },
                 "include_tool_calls": { "type": "boolean" },
                 "include_image_urls": { "type": "boolean" },
+                "include_summary": { "type": "boolean", "description": "Include cached conversation summary when available (read_compressed_cache)." },
                 "mode": { "type": "string", "enum": ["title", "tail_messages"] },
                 "max_sessions": { "type": "number" },
                 "tail_messages": { "type": "number" },
@@ -468,6 +482,109 @@ impl Tool for SessionInspectorTool {
                 })
             }
 
+            SessionInspectorArgs::ReadCompressedCache {
+                session_id,
+                offset,
+                limit,
+                truncate_chars,
+                include_summary,
+            } => {
+                let session_id = session_id.trim().to_string();
+                if session_id.is_empty() {
+                    return Err(ToolError::InvalidArguments(
+                        "session_id must be a non-empty string".to_string(),
+                    ));
+                }
+
+                let offset = offset.unwrap_or(0).min(1_000_000);
+                let limit = limit.unwrap_or(40).min(200);
+                let truncate_chars = truncate_chars.unwrap_or(1200).min(20_000);
+                let include_summary = include_summary.unwrap_or(true);
+
+                let sqlite_snapshot = self
+                    .session_store
+                    .search_index()
+                    .read_compressed_cache(&session_id, offset, limit, truncate_chars)
+                    .await;
+
+                let (source, summary, total_compressed, messages) = match sqlite_snapshot {
+                    Ok(snapshot) if snapshot.total_compressed_messages > 0 => (
+                        "sqlite_fts",
+                        if include_summary {
+                            snapshot.summary
+                        } else {
+                            None
+                        },
+                        snapshot.total_compressed_messages,
+                        snapshot
+                            .messages
+                            .into_iter()
+                            .map(|row| {
+                                json!({
+                                    "id": row.message_id,
+                                    "index": row.message_index,
+                                    "role": row.role,
+                                    "created_at": row.created_at,
+                                    "content_len": row.content_len,
+                                    "content": row.content,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    Ok(_) | Err(_) => {
+                        let session = self.load_session(&session_id).await?;
+                        let summary = if include_summary {
+                            session
+                                .conversation_summary
+                                .as_ref()
+                                .map(|value| value.content.clone())
+                        } else {
+                            None
+                        };
+                        let compressed_messages = session
+                            .messages
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, message)| message.compressed)
+                            .collect::<Vec<_>>();
+                        let total = compressed_messages.len();
+                        let slice = compressed_messages
+                            .into_iter()
+                            .skip(offset)
+                            .take(limit)
+                            .map(|(index, message)| {
+                                json!({
+                                    "id": message.id,
+                                    "index": index,
+                                    "role": role_to_str(&message.role),
+                                    "created_at": message.created_at,
+                                    "content_len": message.content.chars().count(),
+                                    "content": truncate_string(&message.content, truncate_chars),
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        ("session_json_fallback", summary, total, slice)
+                    }
+                };
+
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "session_id": session_id,
+                        "source": source,
+                        "offset": offset,
+                        "limit": limit,
+                        "slice_count": messages.len(),
+                        "total_compressed_messages": total_compressed,
+                        "summary": summary,
+                        "messages": messages,
+                        "note": "Use this for bounded recall from compressed history. Prioritize current task list and recent turns when conflicts appear."
+                    })
+                    .to_string(),
+                    display_preference: Some("Collapsible".to_string()),
+                })
+            }
+
             SessionInspectorArgs::Search {
                 query,
                 mode,
@@ -490,6 +607,60 @@ impl Tool for SessionInspectorTool {
                     .unwrap_or("title")
                     .to_ascii_lowercase();
                 let max_matches = max_matches.unwrap_or(50).min(200);
+
+                if !case_sensitive {
+                    match self
+                        .session_store
+                        .search_index()
+                        .search(q, max_matches)
+                        .await
+                    {
+                        Ok(fts_matches) if !fts_matches.is_empty() => {
+                            let matches = fts_matches
+                                .into_iter()
+                                .map(|m| {
+                                    json!({
+                                        "type": if m.match_type == "session" { "title_match" } else { "message_match" },
+                                        "session_id": m.session_id,
+                                        "session_title": m.session_title,
+                                        "session_kind": m.session_kind,
+                                        "root_session_id": m.root_session_id,
+                                        "parent_session_id": m.parent_session_id,
+                                        "pinned": m.pinned,
+                                        "updated_at": m.updated_at,
+                                        "rank": m.rank,
+                                        "message_id": m.message_id,
+                                        "message_index": m.message_index,
+                                        "role": m.role,
+                                        "content_preview": m.content_preview,
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+
+                            return Ok(ToolResult {
+                                success: true,
+                                result: json!({
+                                    "query": q,
+                                    "mode": mode,
+                                    "case_sensitive": case_sensitive,
+                                    "search_backend": "sqlite_fts",
+                                    "matches": matches,
+                                    "note": "Results came from the local SQLite FTS session search index. Use read_messages for bounded inspection of matched sessions."
+                                })
+                                .to_string(),
+                                display_preference: Some("Collapsible".to_string()),
+                            });
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                "session_inspector FTS search failed for query '{}': {}. Falling back to in-memory scan.",
+                                q,
+                                error
+                            );
+                        }
+                    }
+                }
 
                 let entries = self.session_store.list_index_entries().await;
                 let mut results = Vec::new();

@@ -1,6 +1,9 @@
 use actix_web::{web, HttpResponse, Result};
 
-use super::shared::{ensure_session_not_running, load_session_or_404, save_and_cache_session};
+use super::shared::{
+    clear_derived_context_state, ensure_session_not_running, load_session_or_404,
+    save_and_cache_session,
+};
 use super::types::RestoreSessionRequest;
 use crate::server::app_state::AppState;
 
@@ -75,8 +78,7 @@ pub async fn restore_session_state(
     } = restore_outcome;
 
     session.messages.truncate(target_index + 1);
-    session.token_usage = None;
-    session.conversation_summary = None;
+    clear_derived_context_state(&mut session);
     save_and_cache_session(&state, &session_id, session).await?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({

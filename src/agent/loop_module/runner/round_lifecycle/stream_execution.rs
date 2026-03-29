@@ -31,16 +31,6 @@ fn continuation_messages(messages: &[Message]) -> Option<&[Message]> {
     (!continuation.is_empty()).then_some(continuation)
 }
 
-fn should_disable_previous_response_id(
-    session: &Session,
-    prepared_context: &PreparedContext,
-) -> bool {
-    session.conversation_summary.is_some()
-        || !prepared_context.compressed_message_ids.is_empty()
-        || prepared_context.token_usage.summary_tokens > 0
-        || prepared_context.truncation_occurred
-}
-
 fn provider_supports_previous_response_id(provider_name: Option<&str>) -> bool {
     !matches!(provider_name.map(str::trim), Some("copilot"))
 }
@@ -137,9 +127,7 @@ pub(super) async fn execute_llm_stream(
 > {
     let llm_started_at = std::time::Instant::now();
     let supports_previous_response_id = provider_supports_previous_response_id(provider_name);
-    let disable_previous_response_id =
-        should_disable_previous_response_id(session, prepared_context);
-    let previous_response_id = if supports_previous_response_id && !disable_previous_response_id {
+    let previous_response_id = if supports_previous_response_id {
         session_previous_response_id(session)
     } else {
         None
@@ -162,6 +150,7 @@ pub(super) async fn execute_llm_stream(
         responses_options.previous_response_id = Some(response_id.to_string());
     }
     let request_options = LLMRequestOptions {
+        session_id: Some(session_id.to_string()),
         reasoning_effort,
         parallel_tool_calls: Some(true),
         responses: Some(responses_options),
@@ -172,11 +161,6 @@ pub(super) async fn execute_llm_stream(
             "[{}] Responses API previous_response_id disabled for provider={}",
             session_id,
             provider_name.unwrap_or("unknown")
-        );
-    } else if disable_previous_response_id {
-        tracing::debug!(
-            "[{}] Responses API previous_response_id disabled because local context compression/summary state is active",
-            session_id
         );
     } else if let Some(response_id) = previous_response_id {
         tracing::debug!(

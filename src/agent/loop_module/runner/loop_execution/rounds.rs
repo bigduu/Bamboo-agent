@@ -67,11 +67,16 @@ pub(super) async fn run_rounds(
             &state.session_id,
             &state.model_name,
             state.debug_logger.enabled,
+            config,
+            tools.as_ref(),
         )
         .await?;
 
         let tool_schemas =
-            super::super::session_setup::resolve_available_tool_schemas(config, tools.as_ref());
+            super::super::session_setup::tool_schemas::resolve_available_tool_schemas_for_session(
+                config,
+                tools.as_ref(),
+            );
 
         let mut round_flow_outcome: Option<super::super::round_flow::RoundFlowOutcome> = None;
         let mut terminal_error: Option<crate::agent::core::AgentError> = None;

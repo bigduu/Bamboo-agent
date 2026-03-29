@@ -92,6 +92,8 @@ pub struct ResponsesRequestOptions {
 /// Optional request-time controls for provider calls.
 #[derive(Debug, Clone, Default)]
 pub struct LLMRequestOptions {
+    /// Session identifier used for request-scoped logging correlation.
+    pub session_id: Option<String>,
     /// Override reasoning effort for this request.
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Request provider-side parallel tool call planning when supported.

@@ -177,8 +177,13 @@ pub(super) async fn inject_external_memory_into_system_message(session: &mut Ses
     // save important state to memory_note before the budget system begins
     // purging older messages.
     if let Some(ref usage) = session.token_usage {
-        if usage.budget_limit > 0 {
-            let pct = (usage.total_tokens as f64 / usage.budget_limit as f64) * 100.0;
+        let denominator = if usage.max_context_tokens > 0 {
+            usage.max_context_tokens
+        } else {
+            usage.budget_limit
+        };
+        if denominator > 0 {
+            let pct = (usage.total_tokens as f64 / denominator as f64) * 100.0;
             if pct >= CONTEXT_PRESSURE_WARNING_THRESHOLD {
                 section.push_str(&format!(
                     "\n> ⚠️ **Context window filling up (~{:.0}% used).** \

@@ -522,15 +522,33 @@ pub struct CompressionEvent {
     pub messages_compressed: usize,
     /// Number of segments removed in budget preparation for this event.
     pub segments_removed: usize,
+    /// Context usage percentage before compression.
+    #[serde(default)]
+    pub usage_before_percent: f64,
+    /// Context usage percentage after compression.
+    #[serde(default)]
+    pub usage_after_percent: f64,
+    /// Number of summary tokens in the compression plan.
+    #[serde(default)]
+    pub summary_tokens: u32,
 }
 
 impl CompressionEvent {
-    pub fn new(messages_compressed: usize, segments_removed: usize) -> Self {
+    pub fn new(
+        messages_compressed: usize,
+        segments_removed: usize,
+        usage_before_percent: f64,
+        usage_after_percent: f64,
+        summary_tokens: u32,
+    ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             created_at: Utc::now(),
             messages_compressed,
             segments_removed,
+            usage_before_percent,
+            usage_after_percent,
+            summary_tokens,
         }
     }
 }

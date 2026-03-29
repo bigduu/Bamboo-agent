@@ -1,7 +1,7 @@
 use crate::agent::core::tools::{ToolExecutor, ToolSchema};
 use crate::agent::loop_module::config::AgentLoopConfig;
 
-pub(super) fn resolve_available_tool_schemas(
+pub(crate) fn resolve_available_tool_schemas_for_session(
     config: &AgentLoopConfig,
     tools: &dyn ToolExecutor,
 ) -> Vec<ToolSchema> {

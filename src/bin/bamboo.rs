@@ -55,8 +55,14 @@ enum Commands {
 async fn main() {
     let cli = Cli::parse();
 
-    // Initialize logging
-    tracing_subscriber::fmt::init();
+    // Initialize logging.
+    tracing_subscriber::fmt()
+        .with_target(true)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     match cli.command {
         Commands::Serve {

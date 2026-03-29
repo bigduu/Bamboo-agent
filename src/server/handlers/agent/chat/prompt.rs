@@ -56,6 +56,7 @@ fn build_prompt_fingerprint(
     format!("{:x}", hasher.finalize())
 }
 
+#[cfg(test)]
 pub(super) fn build_enhanced_system_prompt(
     base_prompt: &str,
     enhance_prompt: Option<&str>,

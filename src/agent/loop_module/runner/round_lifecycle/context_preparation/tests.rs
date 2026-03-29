@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::prepare_round_context;
+use super::{maybe_apply_host_context_compression, prepare_round_context};
 use crate::agent::core::budget::{BudgetStrategy, TokenBudget};
 use crate::agent::core::tools::{FunctionCall, ToolCall};
 use crate::agent::core::TokenBudgetUsage;
@@ -82,7 +82,7 @@ async fn prepare_round_context_applies_placeholder_fallback_only_to_prepared_con
 }
 
 #[tokio::test]
-async fn prepare_round_context_truncates_prepared_context_without_persisting_compression_state() {
+async fn prepare_round_context_auto_compresses_when_hard_limit_truncation_pressure_is_high() {
     let mut session = Session::new("session-cp-2", "test-model");
     session.token_budget = Some(TokenBudget::new(
         360,
@@ -117,20 +117,25 @@ async fn prepare_round_context_truncates_prepared_context_without_persisting_com
     .await
     .expect("prepare round context");
 
-    assert!(prepared.prepared_context.truncation_occurred);
-    assert!(prepared.prepared_context.segments_removed > 0);
     assert!(
-        !prepared.prepared_context.compressed_message_ids.is_empty(),
-        "Prepared context should identify messages that were truncated from this request"
+        !session.compression_events.is_empty(),
+        "high pressure hard-limit truncation should trigger host auto-compression persistence"
     );
     assert!(
-        session.compression_events.is_empty(),
-        "Persistent compression state should only be created by the explicit compress_context tool"
+        session.messages.iter().any(|m| m.compressed),
+        "host auto-compression should mark historical messages compressed"
     );
-    assert_eq!(
-        session.messages.iter().filter(|m| m.compressed).count(),
-        0,
-        "prepare_round_context should not automatically mark persisted messages compressed"
+    assert!(
+        prepared.prepared_context.token_usage.summary_tokens > 0,
+        "prepared context should reserve summary tokens after host auto-compression"
+    );
+    assert!(
+        prepared
+            .prepared_context
+            .messages
+            .iter()
+            .any(|m| m.content.contains("CONVERSATION_SUMMARY_START")),
+        "prepared context should include the persisted compression summary"
     );
 }
 
@@ -259,6 +264,84 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
     let mut session = Session::new("session-cp-force", "test-model");
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 1200,
+        max_output_tokens: 0,
+        strategy: BudgetStrategy::Hybrid {
+            window_size: 20,
+            enable_summarization: true,
+        },
+        safety_margin: 0,
+        compression_trigger_percent: 80,
+        compression_target_percent: 50,
+        prompt_cache_min_tool_output_chars: 1_200,
+        prompt_cache_head_chars: 280,
+        prompt_cache_tail_chars: 180,
+        prompt_cache_recent_user_turns: 2,
+        prompt_cache_recent_tool_chains: 2,
+    });
+    session.messages.push(Message::system("System prompt"));
+    for index in 0..12 {
+        session.messages.push(Message::user(format!(
+            "User message {} {}",
+            index,
+            "alpha beta gamma delta epsilon zeta ".repeat(8)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "Assistant response {} {}",
+                index,
+                "analysis plan files checks and next steps ".repeat(8)
+            ),
+            None,
+        ));
+    }
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: 100,
+        summary_tokens: 0,
+        window_tokens: 1078,
+        total_tokens: 1178,
+        max_context_tokens: 1200,
+        budget_limit: 1200,
+        truncation_occurred: true,
+        segments_removed: 8,
+        prompt_cached_tool_outputs: 0,
+    });
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+
+    let llm = noop_llm();
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "session-cp-force",
+        &[],
+        &llm,
+    )
+    .await
+    .expect("prepare round context");
+
+    assert!(
+        !session.compression_events.is_empty(),
+        "forced fallback should persist a compression event when usage is >= 98%"
+    );
+    assert!(
+        session.messages.iter().any(|m| m.compressed),
+        "forced fallback should mark older messages compressed"
+    );
+    assert!(
+        prepared.prepared_context.token_usage.usage_percentage() < 98.0,
+        "prepared context should be recomputed after forced compression"
+    );
+}
+
+#[tokio::test]
+async fn maybe_apply_host_context_compression_supports_mid_turn_phase() {
+    let mut session = Session::new("session-cp-mid-turn", "test-model");
+    session.token_budget = Some(TokenBudget {
+        max_context_tokens: 1200,
         max_output_tokens: 200,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
@@ -292,10 +375,87 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
     session.token_usage = Some(TokenBudgetUsage {
         system_tokens: 100,
         summary_tokens: 0,
-        window_tokens: 970,
-        total_tokens: 1078,
+        window_tokens: 850,
+        total_tokens: 950,
         max_context_tokens: 1200,
-        budget_limit: 1100,
+        budget_limit: 1000,
+        truncation_occurred: true,
+        segments_removed: 8,
+        prompt_cached_tool_outputs: 0,
+    });
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+    let llm = noop_llm();
+
+    let applied = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "session-cp-mid-turn",
+        &[],
+        &llm,
+        "mid-turn",
+    )
+    .await
+    .expect("mid-turn host compression should run");
+
+    assert!(applied, "expected mid-turn compression to be applied");
+    assert!(
+        !session.compression_events.is_empty(),
+        "mid-turn compression should persist a compression event"
+    );
+}
+
+#[tokio::test]
+async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses_trigger() {
+    // Host auto-compression now uses a single rule:
+    // usage(context_window) >= compression_trigger_percent.
+    // Here total_tokens/context_window = 1000/1200 = 83.3% with trigger=80, so it should run.
+    let mut session = Session::new("session-cp-force-context-only", "test-model");
+    session.token_budget = Some(TokenBudget {
+        max_context_tokens: 1200,
+        max_output_tokens: 200,
+        strategy: BudgetStrategy::Hybrid {
+            window_size: 20,
+            enable_summarization: true,
+        },
+        safety_margin: 0,
+        compression_trigger_percent: 80,
+        compression_target_percent: 50,
+        prompt_cache_min_tool_output_chars: 1_200,
+        prompt_cache_head_chars: 280,
+        prompt_cache_tail_chars: 180,
+        prompt_cache_recent_user_turns: 2,
+        prompt_cache_recent_tool_chains: 2,
+    });
+    session.messages.push(Message::system("System prompt"));
+    for index in 0..12 {
+        session.messages.push(Message::user(format!(
+            "User message {} {}",
+            index,
+            "alpha beta gamma delta epsilon zeta ".repeat(8)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "Assistant response {} {}",
+                index,
+                "analysis plan files checks and next steps ".repeat(8)
+            ),
+            None,
+        ));
+    }
+    // context_window = 1200
+    // total_tokens/context_window = 1000/1200 = 83.3% >= 80%
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: 100,
+        summary_tokens: 0,
+        window_tokens: 900,
+        total_tokens: 1000,
+        max_context_tokens: 1200,
+        budget_limit: 1200,
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
@@ -307,11 +467,11 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
     };
 
     let llm = noop_llm();
-    let prepared = prepare_round_context(
+    let _prepared = prepare_round_context(
         &mut session,
         &config,
         "test-model",
-        "session-cp-force",
+        "session-cp-force-context-only",
         &[],
         &llm,
     )
@@ -320,21 +480,241 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
 
     assert!(
         !session.compression_events.is_empty(),
-        "forced fallback should persist a compression event when usage is >= 98%"
+        "host auto compression should run when context-window usage (83.3%) crosses trigger (80%)"
     );
     assert!(
         session.messages.iter().any(|m| m.compressed),
-        "forced fallback should mark older messages compressed"
+        "messages should be compressed when host auto compression runs"
     );
-    assert_eq!(
+}
+
+#[tokio::test]
+async fn prepare_round_context_skips_host_auto_compression_below_trigger() {
+    let mut session = Session::new("session-cp-force-context-low", "test-model");
+    session.token_budget = Some(TokenBudget {
+        max_context_tokens: 1200,
+        max_output_tokens: 200,
+        strategy: BudgetStrategy::Hybrid {
+            window_size: 20,
+            enable_summarization: true,
+        },
+        safety_margin: 0,
+        compression_trigger_percent: 80,
+        compression_target_percent: 50,
+        prompt_cache_min_tool_output_chars: 1_200,
+        prompt_cache_head_chars: 280,
+        prompt_cache_tail_chars: 180,
+        prompt_cache_recent_user_turns: 2,
+        prompt_cache_recent_tool_chains: 2,
+    });
+    session.messages.push(Message::system("System prompt"));
+    for index in 0..4 {
         session
-            .metadata
-            .get("context_compression_tool_enabled")
-            .map(String::as_str),
-        Some("false")
+            .messages
+            .push(Message::user(format!("User message {} short text", index)));
+        session.messages.push(Message::assistant(
+            format!("Assistant response {} short text", index),
+            None,
+        ));
+    }
+    // context_window = 1200, usage = 62.5%; history content is also intentionally
+    // kept short so estimated usage stays below trigger (80%).
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: 100,
+        summary_tokens: 0,
+        window_tokens: 650,
+        total_tokens: 750,
+        max_context_tokens: 1200,
+        budget_limit: 1200,
+        truncation_occurred: true,
+        segments_removed: 4,
+        prompt_cached_tool_outputs: 0,
+    });
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+
+    let llm = noop_llm();
+    let _prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "session-cp-force-context-low",
+        &[],
+        &llm,
+    )
+    .await
+    .expect("prepare round context");
+
+    assert!(
+        session.compression_events.is_empty(),
+        "host auto compression should stay off below trigger (80%)"
     );
     assert!(
-        prepared.prepared_context.token_usage.usage_percentage() < 98.0,
-        "prepared context should be recomputed after forced compression"
+        !session.messages.iter().any(|m| m.compressed),
+        "messages should stay uncompressed below host auto-compression trigger"
+    );
+}
+
+/// Integration test: multi-round compress → build pressure → re-expose → compress again.
+///
+/// This verifies the full cycle including the anchor_index==0 fix and
+/// token_usage preservation after compression.
+#[tokio::test]
+async fn multi_round_compression_cycle() {
+    use crate::agent::core::budget::{
+        apply_compression_plan, build_forced_compression_plan_with_summary,
+        estimate_context_compression_exposure,
+    };
+
+    let budget = TokenBudget {
+        max_context_tokens: 2000,
+        max_output_tokens: 200,
+        strategy: BudgetStrategy::Hybrid {
+            window_size: 50,
+            enable_summarization: true,
+        },
+        safety_margin: 0,
+        compression_trigger_percent: 80,
+        compression_target_percent: 50,
+        prompt_cache_min_tool_output_chars: 1_200,
+        prompt_cache_head_chars: 280,
+        prompt_cache_tail_chars: 180,
+        prompt_cache_recent_user_turns: 2,
+        prompt_cache_recent_tool_chains: 2,
+    };
+    let mut session = Session::new("multi-round-compress", "test-model");
+    session.token_budget = Some(budget.clone());
+    session.add_message(Message::system("You are a helpful assistant"));
+
+    // ---- Round 1: build pressure ----
+    for idx in 0..8 {
+        session.add_message(Message::user(format!(
+            "User question {idx} {}",
+            "alpha beta gamma delta ".repeat(10)
+        )));
+        session.add_message(Message::assistant(
+            format!(
+                "Assistant response {idx} {}",
+                "analyzing files checks plans ".repeat(10)
+            ),
+            None,
+        ));
+    }
+
+    // Simulate persisted usage from prepare_hybrid_context
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: 50,
+        summary_tokens: 0,
+        window_tokens: 1700,
+        total_tokens: 1750,
+        max_context_tokens: 2000,
+        budget_limit: 2000, // context_window
+        truncation_occurred: true,
+        segments_removed: 3,
+        prompt_cached_tool_outputs: 0,
+    });
+
+    let exposure1 = estimate_context_compression_exposure(
+        &session,
+        "test-model",
+        session.token_budget.as_ref(),
+    );
+    assert!(
+        exposure1.should_expose_tool,
+        "should expose tool on first pressure: usage={:.1}%",
+        exposure1.active_usage_percent
+    );
+
+    // ---- Compress round 1 ----
+    let plan1 = build_forced_compression_plan_with_summary(
+        &session,
+        "test-model",
+        session.token_budget.as_ref(),
+        "Summary of rounds 0-7: user asked many questions, assistant analyzed files.".to_string(),
+    )
+    .expect("first compression plan should succeed");
+
+    let compressed1 = apply_compression_plan(&mut session, plan1);
+    assert!(compressed1 > 0, "first compression should archive messages");
+
+    // token_usage should NOT be None after compression
+    assert!(
+        session.token_usage.is_some(),
+        "token_usage should be preserved (re-estimated) after compression"
+    );
+    let usage_after_1 = session.token_usage.as_ref().unwrap();
+    assert!(
+        usage_after_1.budget_limit > 0,
+        "budget_limit should be preserved after compression"
+    );
+
+    // ---- Round 2: build more pressure after first compression ----
+    // Only one User message remains (anchor_index == 0 scenario)
+    let user_count_after_1 = session
+        .messages
+        .iter()
+        .filter(|m| !m.compressed && matches!(m.role, Role::User))
+        .count();
+    // Could be 1 or more depending on anchor — just verify compression happened
+    assert!(
+        session.messages.iter().any(|m| m.compressed),
+        "some messages should be compressed after round 1"
+    );
+
+    // Add more messages to build pressure again
+    for idx in 0..6 {
+        session.add_message(Message::user(format!(
+            "Follow-up {idx} {}",
+            "more content to fill budget ".repeat(12)
+        )));
+        session.add_message(Message::assistant(
+            format!(
+                "Reply {idx} {}",
+                "detailed analysis and next steps ".repeat(12)
+            ),
+            None,
+        ));
+    }
+
+    // Simulate updated persisted usage
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: 50,
+        summary_tokens: 100,
+        window_tokens: 1650,
+        total_tokens: 1800,
+        max_context_tokens: 2000,
+        budget_limit: 2000,
+        truncation_occurred: true,
+        segments_removed: 2,
+        prompt_cached_tool_outputs: 0,
+    });
+
+    // ---- Compress round 2 (anchor_index == 0 or small) ----
+    let plan2 = build_forced_compression_plan_with_summary(
+        &session,
+        "test-model",
+        session.token_budget.as_ref(),
+        format!(
+            "Updated summary: rounds 0-7 summarized earlier (user_count_after_first={}). Follow-up rounds 8-13 added.",
+            user_count_after_1
+        ),
+    )
+    .expect("second compression plan should succeed (anchor_index fix)");
+
+    let compressed2 = apply_compression_plan(&mut session, plan2);
+    assert!(
+        compressed2 > 0,
+        "second compression should archive more messages"
+    );
+    assert!(
+        session.compression_events.len() >= 2,
+        "should have at least 2 compression events"
+    );
+    assert!(
+        session.token_usage.is_some(),
+        "token_usage should be preserved after second compression"
     );
 }

@@ -85,20 +85,20 @@ pub fn prepare_hybrid_context(
     // 2. Count system tokens
     let system_tokens = counter.count_messages(&system_messages);
 
-    // 3. Check if system prompt alone exceeds budget
-    let hard_available = budget.available_input_tokens();
-    if system_tokens > hard_available {
+    // 3. Check if system prompt alone exceeds context window
+    let hard_limit = budget.max_context_tokens;
+    if system_tokens > hard_limit {
         return Err(BudgetError::SystemPromptTooLarge {
             system_tokens,
-            available_tokens: hard_available,
+            available_tokens: hard_limit,
         });
     }
 
     // 4. Calculate remaining budget after system messages and any existing
     // summary. Automatic trimming here is hard-limit safety fitting only.
-    // Proactive trigger/target thresholds are reserved for exposing and using
-    // the explicit compress_context tool.
-    let hard_remaining_budget = hard_available
+    // Proactive trigger/target thresholds are handled by the host-side
+    // compression pipeline before this stage.
+    let hard_remaining_budget = hard_limit
         .saturating_sub(system_tokens)
         .saturating_sub(summary_tokens);
 
@@ -116,10 +116,10 @@ pub fn prepare_hybrid_context(
         let pre_total_tokens = system_tokens
             .saturating_add(summary_tokens)
             .saturating_add(pre_window_tokens);
-        let pre_usage_pct = if hard_available == 0 {
+        let pre_usage_pct = if hard_limit == 0 {
             0.0
         } else {
-            (pre_total_tokens as f64 / hard_available as f64) * 100.0
+            (pre_total_tokens as f64 / hard_limit as f64) * 100.0
         };
         tracing::info!(
             "[{}] Context hard-limit fit needed: pre_total={} (system={}, summary={}, window={}), hard_limit={}, usage={:.1}%",
@@ -128,7 +128,7 @@ pub fn prepare_hybrid_context(
             system_tokens,
             summary_tokens,
             pre_window_tokens,
-            hard_available,
+            hard_limit,
             pre_usage_pct
         );
     }
@@ -182,7 +182,7 @@ pub fn prepare_hybrid_context(
         summary_tokens,
         window_tokens,
         total_tokens,
-        budget_limit: hard_available,
+        budget_limit: hard_limit,
     };
 
     let truncation_occurred = removed_count > 0;
@@ -197,7 +197,7 @@ pub fn prepare_hybrid_context(
             selected_segments.len(),
             kept_messages_count,
             total_tokens,
-            hard_available,
+            hard_limit,
             token_usage.usage_percentage()
         );
     }
@@ -358,8 +358,8 @@ fn maybe_compact_old_tool_outputs_for_prompt(
     }
     let policy = prompt_cache_policy_from_budget(budget);
 
-    let available = budget.available_input_tokens();
-    if available == 0 {
+    let context_window = budget.max_context_tokens;
+    if context_window == 0 {
         return PromptCacheCompactionResult {
             messages: active_messages,
             compacted_tool_outputs: 0,
@@ -379,7 +379,7 @@ fn maybe_compact_old_tool_outputs_for_prompt(
         };
     };
 
-    let trigger_limit = budget.compression_trigger_input_tokens();
+    let trigger_limit = budget.compression_trigger_context_tokens();
     let mut total_tokens = counter
         .count_messages(&active_messages)
         .saturating_add(summary_tokens);
@@ -391,7 +391,7 @@ fn maybe_compact_old_tool_outputs_for_prompt(
         };
     }
 
-    let usage_before = (total_tokens as f64 / available as f64) * 100.0;
+    let usage_before = (total_tokens as f64 / context_window as f64) * 100.0;
     let tool_call_names = tool_call_name_index(&active_messages);
     let protected_recent_calls =
         collect_recent_tool_call_ids(&active_messages, policy.recent_tool_chains);
@@ -437,7 +437,7 @@ fn maybe_compact_old_tool_outputs_for_prompt(
     }
 
     if compacted_count > 0 {
-        let usage_after = (total_tokens as f64 / available as f64) * 100.0;
+        let usage_after = (total_tokens as f64 / context_window as f64) * 100.0;
         tracing::info!(
             "[{}] Prompt-side tool output cache applied: compacted_messages={}, saved_tokens={}, usage_before={:.1}%, usage_after={:.1}%, trigger={}%",
             session.id,
@@ -939,7 +939,7 @@ mod tests {
             .with_message_token(summary_message.content.clone(), 30);
 
         let mut budget = TokenBudget::with_safety_margin(
-            180,
+            130,
             50,
             BudgetStrategy::Hybrid {
                 window_size: 20,
@@ -961,16 +961,16 @@ mod tests {
         session.conversation_summary = Some(ConversationSummary::new(summary_text, 2, 30));
 
         let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
-        let hard_limit = budget.available_input_tokens();
+        let hard_limit = budget.max_context_tokens;
 
         assert!(
             prepared.truncation_occurred,
-            "summary reserve should contribute to hard-limit fitting when it pushes total context over the model input budget"
+            "summary reserve should contribute to hard-limit fitting when it pushes total context over the model context window"
         );
         assert_eq!(prepared.token_usage.summary_tokens, 30);
         assert!(
             prepared.token_usage.total_tokens <= hard_limit,
-            "total tokens {} should stay within hard input budget {} when summary is included",
+            "total tokens {} should stay within context window {} when summary is included",
             prepared.token_usage.total_tokens,
             hard_limit
         );
@@ -1048,7 +1048,7 @@ mod tests {
         // Test that segments exceeding remaining budget are skipped
         let counter = HeuristicTokenCounter::default();
         // Tight budget: large message should not fit, but small message should.
-        let budget = TokenBudget::new(400, 100, BudgetStrategy::Window { size: 50 });
+        let budget = TokenBudget::new(200, 100, BudgetStrategy::Window { size: 50 });
 
         let messages = vec![
             Message::system("System"),
@@ -1076,10 +1076,9 @@ mod tests {
 
     #[test]
     fn handles_zero_remaining_budget() {
-        // Test behavior when remaining budget is 0 (system fills entire budget)
+        // Test behavior when system prompt alone exceeds a tiny context window.
         let counter = HeuristicTokenCounter::default();
-        // Budget that only fits system message - small safety margin leaves 0 for window
-        let budget = TokenBudget::new(100, 50, BudgetStrategy::Window { size: 50 });
+        let budget = TokenBudget::new(10, 50, BudgetStrategy::Window { size: 50 });
 
         let messages = vec![
             Message::system("System prompt that uses most of the budget"),
@@ -1087,7 +1086,8 @@ mod tests {
         ];
         let session = make_session_with_messages(messages);
 
-        // Should fail with SystemPromptTooLarge since 22 tokens > 0 available
+        // Should fail with SystemPromptTooLarge since system prompt exceeds
+        // context window.
         let result = prepare_hybrid_context(&session, &budget, &counter);
         assert!(matches!(
             result,
@@ -1349,7 +1349,7 @@ mod tests {
             .with_message_token("Current conclusion", 10);
 
         let mut budget =
-            TokenBudget::with_safety_margin(700, 100, BudgetStrategy::Window { size: 60 }, 0);
+            TokenBudget::with_safety_margin(650, 100, BudgetStrategy::Window { size: 60 }, 0);
         budget.compression_trigger_percent = 80;
 
         let messages = vec![
@@ -1419,7 +1419,7 @@ mod tests {
             .with_message_token("Done", 10);
 
         let mut budget =
-            TokenBudget::with_safety_margin(700, 100, BudgetStrategy::Window { size: 60 }, 0);
+            TokenBudget::with_safety_margin(680, 100, BudgetStrategy::Window { size: 60 }, 0);
         budget.compression_trigger_percent = 80;
 
         let messages = vec![
@@ -1491,7 +1491,7 @@ mod tests {
             .with_message_token("Current conclusion", 10);
 
         let mut budget =
-            TokenBudget::with_safety_margin(700, 100, BudgetStrategy::Window { size: 60 }, 0);
+            TokenBudget::with_safety_margin(650, 100, BudgetStrategy::Window { size: 60 }, 0);
         budget.compression_trigger_percent = 80;
 
         let messages = vec![
@@ -1644,7 +1644,7 @@ mod tests {
         assert!(prepared.truncation_occurred);
         assert!(
             prepared.token_usage.total_tokens <= prepared.token_usage.budget_limit,
-            "Hard-limit fitting should keep total tokens within the model input budget"
+            "Hard-limit fitting should keep total tokens within the model context window"
         );
         assert!(
             keeps_latest_goal,

@@ -13,6 +13,7 @@ use crate::agent::llm::{LLMChunk, LLMProvider, LLMRequestOptions, LLMStream};
 struct MockLlmProvider {
     chunks: Vec<LLMChunk>,
     requested_messages: Mutex<Vec<Message>>,
+    requested_session_id: Mutex<Option<String>>,
     requested_previous_response_id: Mutex<Option<String>>,
     requested_reasoning_summary: Mutex<Option<String>>,
     requested_store: Mutex<Option<bool>>,
@@ -41,6 +42,8 @@ impl LLMProvider for MockLlmProvider {
         options: Option<&LLMRequestOptions>,
     ) -> crate::agent::llm::provider::Result<LLMStream> {
         *self.requested_messages.lock().expect("messages lock") = messages.to_vec();
+        *self.requested_session_id.lock().expect("session_id lock") =
+            options.and_then(|value| value.session_id.clone());
         *self
             .requested_previous_response_id
             .lock()
@@ -98,6 +101,7 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
     let llm = Arc::new(MockLlmProvider {
         chunks: vec![LLMChunk::Token("hi".to_string()), LLMChunk::Done],
         requested_messages: Mutex::new(Vec::new()),
+        requested_session_id: Mutex::new(None),
         requested_previous_response_id: Mutex::new(None),
         requested_reasoning_summary: Mutex::new(None),
         requested_store: Mutex::new(None),
@@ -158,6 +162,13 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
             .as_deref(),
         Some("auto")
     );
+    assert_eq!(
+        llm.requested_session_id
+            .lock()
+            .expect("session_id lock")
+            .as_deref(),
+        Some("session-stream-1")
+    );
 }
 
 #[tokio::test]
@@ -196,6 +207,7 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
             LLMChunk::Done,
         ],
         requested_messages: Mutex::new(Vec::new()),
+        requested_session_id: Mutex::new(None),
         requested_previous_response_id: Mutex::new(None),
         requested_reasoning_summary: Mutex::new(None),
         requested_store: Mutex::new(None),
@@ -257,6 +269,13 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
             .as_deref(),
         Some("auto")
     );
+    assert_eq!(
+        llm.requested_session_id
+            .lock()
+            .expect("session_id lock")
+            .as_deref(),
+        Some("session-stream-2")
+    );
     assert_eq!(stream_output.response_id.as_deref(), Some("resp_next"));
     assert_eq!(
         session
@@ -268,8 +287,8 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
 }
 
 #[tokio::test]
-async fn execute_llm_stream_disables_previous_response_id_when_local_summary_or_compression_is_active(
-) {
+async fn execute_llm_stream_keeps_previous_response_id_when_local_summary_or_compression_is_active()
+{
     let mut session = Session::new("session-stream-2b", "test-model");
     session.metadata.insert(
         "responses.previous_response_id".to_string(),
@@ -311,6 +330,7 @@ async fn execute_llm_stream_disables_previous_response_id_when_local_summary_or_
             LLMChunk::Done,
         ],
         requested_messages: Mutex::new(Vec::new()),
+        requested_session_id: Mutex::new(None),
         requested_previous_response_id: Mutex::new(None),
         requested_reasoning_summary: Mutex::new(None),
         requested_store: Mutex::new(None),
@@ -341,13 +361,22 @@ async fn execute_llm_stream_disables_previous_response_id_when_local_summary_or_
         .lock()
         .expect("messages lock")
         .clone();
-    assert_eq!(requested_messages.len(), prepared_context.messages.len());
+    assert_eq!(requested_messages.len(), 2);
+    assert!(matches!(requested_messages[0].role, Role::User));
+    assert!(matches!(requested_messages[1].role, Role::Tool));
     assert_eq!(
         llm.requested_previous_response_id
             .lock()
             .expect("previous_response_id lock")
             .as_deref(),
-        None
+        Some("resp_prev")
+    );
+    assert_eq!(
+        llm.requested_session_id
+            .lock()
+            .expect("session_id lock")
+            .as_deref(),
+        Some("session-stream-2b")
     );
 }
 
@@ -387,6 +416,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
             LLMChunk::Done,
         ],
         requested_messages: Mutex::new(Vec::new()),
+        requested_session_id: Mutex::new(None),
         requested_previous_response_id: Mutex::new(None),
         requested_reasoning_summary: Mutex::new(None),
         requested_store: Mutex::new(None),
@@ -446,6 +476,13 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
             .expect("reasoning_summary lock")
             .as_deref(),
         Some("auto")
+    );
+    assert_eq!(
+        llm.requested_session_id
+            .lock()
+            .expect("session_id lock")
+            .as_deref(),
+        Some("session-stream-3")
     );
     assert!(!session
         .metadata

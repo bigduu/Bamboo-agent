@@ -24,6 +24,19 @@ impl<P: LLMProvider> MaskingProviderDecorator<P> {
             masking_config,
         }
     }
+
+    fn log_masking_applied(session_id: Option<&str>, message_count: usize) {
+        if let Some(session_id) = session_id {
+            tracing::debug!(
+                "[{}] Applied keyword masking to {} messages",
+                session_id,
+                message_count
+            );
+            return;
+        }
+
+        tracing::debug!("Applied keyword masking to {} messages", message_count);
+    }
 }
 
 #[async_trait]
@@ -65,10 +78,7 @@ impl<P: LLMProvider> LLMProvider for MaskingProviderDecorator<P> {
             })
             .collect();
 
-        tracing::debug!(
-            "Applied keyword masking to {} messages",
-            masked_messages.len()
-        );
+        Self::log_masking_applied(None, masked_messages.len());
 
         self.inner
             .chat_stream(&masked_messages, tools, max_output_tokens, model)
@@ -113,10 +123,8 @@ impl<P: LLMProvider> LLMProvider for MaskingProviderDecorator<P> {
             })
             .collect();
 
-        tracing::debug!(
-            "Applied keyword masking to {} messages",
-            masked_messages.len()
-        );
+        let session_id = options.and_then(|value| value.session_id.as_deref());
+        Self::log_masking_applied(session_id, masked_messages.len());
 
         self.inner
             .chat_stream_with_options(&masked_messages, tools, max_output_tokens, model, options)

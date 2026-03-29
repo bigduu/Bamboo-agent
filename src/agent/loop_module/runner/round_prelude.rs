@@ -2,7 +2,9 @@
 
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::core::tools::ToolExecutor;
 use crate::agent::core::{AgentError, Session};
+use crate::agent::loop_module::config::AgentLoopConfig;
 use crate::agent::loop_module::task_context::TaskLoopContext;
 use crate::agent::metrics::MetricsCollector;
 
@@ -24,7 +26,10 @@ pub(super) async fn prepare_round(
     session_id: &str,
     model_name: &str,
     debug_enabled: bool,
+    config: &AgentLoopConfig,
+    _tools: &dyn ToolExecutor,
 ) -> Result<String, AgentError> {
+    let _ = (config, session_id);
     refresh_round_prompt_context(session).await;
     update_task_round_state(task_context, round, max_rounds);
 

@@ -109,14 +109,6 @@ impl AppState {
         let mcp_manager = init_mcp_manager(config.clone());
 
         let skill_manager = init_skill_manager(&data_dir).await;
-        let base_tools = build_base_tools(
-            config.clone(),
-            permission_checker,
-            mcp_manager.clone(),
-            skill_manager.clone(),
-            storage.clone(),
-            sessions.clone(),
-        );
         let metrics_service = init_metrics_service(&data_dir).await?;
 
         let agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>> =
@@ -131,6 +123,15 @@ impl AppState {
         let process_registry = Arc::new(ProcessRegistry::new());
 
         let (provider_lock, provider_handle) = build_provider_handles(provider);
+
+        let base_tools = build_base_tools(
+            config.clone(),
+            permission_checker,
+            mcp_manager.clone(),
+            skill_manager.clone(),
+            storage.clone(),
+            sessions.clone(),
+        );
 
         // Long-lived session event senders map (UI subscriptions + background tasks).
         let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
@@ -232,6 +233,39 @@ async fn init_storage_components(
                 AppError::StorageError(error)
             })?,
     );
+    let session_store_for_rebuild = session_store.clone();
+    tokio::spawn(async move {
+        let purged_rows = match session_store_for_rebuild
+            .search_index()
+            .prune_stale_sessions()
+            .await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!("Background session search index prune failed: {}", error);
+                0
+            }
+        };
+
+        if let Err(error) = session_store_for_rebuild.rebuild_search_index().await {
+            tracing::warn!("Background session search index rebuild failed: {}", error);
+        } else {
+            tracing::info!("Background session search index rebuild completed");
+        }
+
+        match session_store_for_rebuild
+            .search_index()
+            .maybe_vacuum_if_needed(purged_rows)
+            .await
+        {
+            Ok(true) => tracing::info!("Background session search index vacuum completed"),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!("Background session search index vacuum failed: {}", error)
+            }
+        }
+    });
+
     let storage: Arc<dyn Storage> = session_store.clone();
     tracing::info!(
         "Session store V2 initialized (index: {:?}, sessions: {:?})",
@@ -311,7 +345,7 @@ fn build_base_tools(
     // compatibility and opt-in behavior.
     let builtin_executor = Arc::new(
         crate::agent::tools::BuiltinToolExecutor::new_with_config_and_permissions(
-            config,
+            config.clone(),
             permission_checker,
         ),
     );

@@ -135,3 +135,57 @@ async fn session_inspector_search_tail_messages_finds_match() {
         out.result
     );
 }
+
+#[tokio::test]
+async fn session_inspector_read_compressed_cache_reads_sqlite_cached_rows() {
+    common::init_test_env();
+    let dir = common::create_temp_dir();
+    let store = Arc::new(SessionStoreV2::new(dir.path().to_path_buf()).await.unwrap());
+
+    let mut caller = Session::new("caller", "test-model");
+    caller.add_message(Message::user("hi".to_string()));
+    store.save_session(&caller).await.unwrap();
+
+    let mut s = Session::new("compressed-1", "test-model");
+    s.title = "Compressed Session".to_string();
+    s.add_message(Message::system("system".to_string()));
+    s.add_message(Message::user("old-user-context".to_string()));
+    s.add_message(Message::assistant(
+        "old-assistant-context".to_string(),
+        None,
+    ));
+    s.add_message(Message::user("latest user".to_string()));
+    s.add_message(Message::assistant("latest assistant".to_string(), None));
+    s.conversation_summary = Some(bamboo_agent::agent::core::ConversationSummary::new(
+        "compressed summary snapshot",
+        2,
+        20,
+    ));
+    s.messages[1].compressed = true;
+    s.messages[2].compressed = true;
+    store.save_session(&s).await.unwrap();
+
+    let tool = SessionInspectorTool::new(store.clone(), store.clone());
+    let out = tool
+        .execute_with_context(
+            serde_json::json!({
+                "action": "read_compressed_cache",
+                "session_id": "compressed-1",
+                "limit": 10
+            }),
+            ctx_for_session("caller"),
+        )
+        .await
+        .unwrap();
+
+    let v: serde_json::Value = serde_json::from_str(&out.result).unwrap();
+    assert_eq!(v["source"].as_str(), Some("sqlite_fts"));
+    assert_eq!(v["total_compressed_messages"].as_u64(), Some(2));
+    assert_eq!(v["slice_count"].as_u64(), Some(2));
+    assert_eq!(v["summary"].as_str(), Some("compressed summary snapshot"));
+    assert!(v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["content"].as_str() == Some("old-user-context")));
+}

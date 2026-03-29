@@ -7,6 +7,8 @@ use super::super::{clarification, events, task, tool_error_collector};
 use super::{workspace, SuccessPathContext};
 
 pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -> bool {
+    let ctx = ctx;
+
     task::track_task_progress(
         ctx.task_context,
         ctx.event_tx,

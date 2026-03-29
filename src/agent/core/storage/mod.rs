@@ -18,9 +18,11 @@
 //! ```
 
 pub mod jsonl;
+pub mod search_index;
 pub mod v2;
 
 pub use jsonl::{JsonlStorage, Storage};
+pub use search_index::{SessionSearchIndex, SessionSearchMatch};
 pub use v2::{CleanupMode, CleanupResult, SessionIndexEntry, SessionStoreV2, SessionsIndex};
 
 /// Attachment reader for `bamboo-attachment://<session_id>/<attachment_id>` references.

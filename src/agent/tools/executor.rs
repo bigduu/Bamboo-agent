@@ -62,14 +62,13 @@ pub const BUILTIN_TOOL_NAMES: [&str; 22] = [
     "Write",
 ];
 
-pub const SERVER_TOOL_NAMES: [&str; 7] = [
+pub const SERVER_TOOL_NAMES: [&str; 6] = [
     "SubSession",
     "schedule_tasks",
     "sub_session_manager",
     "session_inspector",
     "load_skill",
     "read_skill_resource",
-    "compress_context",
 ];
 
 /// Normalizes a tool reference to a standard tool name
@@ -595,10 +594,7 @@ mod tests {
 
     #[test]
     fn test_normalize_tool_ref_accepts_server_overlay_tools() {
-        assert_eq!(
-            normalize_tool_ref("compress_context"),
-            Some("compress_context".to_string())
-        );
+        assert_eq!(normalize_tool_ref("compress_context"), None);
         assert_eq!(
             normalize_tool_ref("default::read_skill_resource"),
             Some("read_skill_resource".to_string())

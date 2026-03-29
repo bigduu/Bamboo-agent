@@ -4,6 +4,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::{
     agent::{
@@ -40,124 +41,130 @@ pub(in crate::server::handlers::agent::execute) struct SpawnAgentExecution {
 pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
     args: SpawnAgentExecution,
 ) {
-    tokio::spawn(async move {
-        let SpawnAgentExecution {
-            state,
-            session_id,
-            mut session,
-            is_child_session,
-            provider_name,
-            model,
-            fast_model,
-            reasoning_effort,
-            reasoning_effort_source,
-            disabled_tools,
-            cancel_token,
-            mpsc_tx,
-            image_fallback,
-        } = args;
+    let span_session_id = args.session_id.clone();
+    let session_span = tracing::info_span!("agent_execution", session_id = %span_session_id);
 
-        let system_prompt = system_prompt_for_session(&session);
-        let initial_message = initial_user_message_for_session(&session);
-        let selected_skill_ids = selected_skill_ids_for_session(&session);
-        let selected_skill_mode = selected_skill_mode_for_session(&session);
-
-        // Use child tool set for child sessions (no spawn schemas), otherwise root tools.
-        let tools = if is_child_session {
-            state.child_tools.clone()
-        } else {
-            state.tools.clone()
-        };
-
-        // Use model from request (not from session - session.model is just for recording/debugging).
-        tracing::info!(
-            "[{}] Using model from request: {}, reasoning_effort={}, reasoning_source={}",
-            session_id,
-            model,
-            reasoning_effort
-                .map(crate::core::ReasoningEffort::as_str)
-                .unwrap_or("none"),
-            reasoning_effort_source
-        );
-
-        // Update session.model for debugging/recording purposes.
-        session.model = model.clone();
-
-        if let Some(prompt) = system_prompt.as_ref() {
-            tracing::info!("[{}] ========== SYSTEM PROMPT ==========", session_id);
-            tracing::info!(
-                "[{}] Final prompt length: {} chars",
+    tokio::spawn(
+        async move {
+            let SpawnAgentExecution {
+                state,
                 session_id,
-                prompt.len()
-            );
-            tracing::info!("[{}] -----------------------------------", session_id);
-            tracing::info!("[{}] {}", session_id, prompt);
-            tracing::info!("[{}] ========== END SYSTEM PROMPT ==========", session_id);
-        }
-
-        // Run agent loop.
-        let storage: Arc<dyn crate::agent::core::storage::Storage> = state.storage.clone();
-        let result = run_agent_loop_with_config(
-            &mut session,
-            initial_message,
-            mpsc_tx.clone(),
-            // Use the reloadable provider handle so config/provider switches take effect
-            // without requiring a server restart.
-            state.get_provider().await,
-            tools,
-            cancel_token,
-            AgentLoopConfig {
-                max_rounds: 200,
-                system_prompt,
-                selected_skill_ids,
-                selected_skill_mode,
-                skill_manager: Some(state.skill_manager.clone()),
-                skip_initial_user_message: true,
-                storage: Some(storage),
-                attachment_reader: Some(state.session_store.clone()),
-                metrics_collector: Some(state.metrics_service.collector()),
-                model_name: Some(model),
-                fast_model_name: fast_model,
-                provider_name: Some(provider_name),
+                mut session,
+                is_child_session,
+                provider_name,
+                model,
+                fast_model,
                 reasoning_effort,
+                reasoning_effort_source,
                 disabled_tools,
+                cancel_token,
+                mpsc_tx,
                 image_fallback,
-                ..Default::default()
-            },
-        )
-        .await;
+            } = args;
 
-        // Send terminal event for all error cases (including cancellation).
-        if let Some(error_event) = terminal_error_event_for_result(&result) {
-            let _ = mpsc_tx.send(error_event).await;
-        }
+            let system_prompt = system_prompt_for_session(&session);
+            let initial_message = initial_user_message_for_session(&session);
+            let selected_skill_ids = selected_skill_ids_for_session(&session);
+            let selected_skill_mode = selected_skill_mode_for_session(&session);
 
-        // Update runner status.
-        {
-            let mut runners = state.agent_runners.write().await;
-            if let Some(runner) = runners.get_mut(&session_id) {
-                runner.status = status_from_execution_result(&result);
-                runner.completed_at = Some(Utc::now());
+            // Use child tool set for child sessions (no spawn schemas), otherwise root tools.
+            let tools = if is_child_session {
+                state.child_tools.clone()
+            } else {
+                state.tools.clone()
+            };
+
+            // Use model from request (not from session - session.model is just for recording/debugging).
+            tracing::info!(
+                "[{}] Using model from request: {}, reasoning_effort={}, reasoning_source={}",
+                session_id,
+                model,
+                reasoning_effort
+                    .map(crate::core::ReasoningEffort::as_str)
+                    .unwrap_or("none"),
+                reasoning_effort_source
+            );
+
+            // Update session.model for debugging/recording purposes.
+            session.model = model.clone();
+
+            if let Some(prompt) = system_prompt.as_ref() {
+                tracing::info!("[{}] ========== SYSTEM PROMPT ==========", session_id);
+                tracing::info!(
+                    "[{}] Final prompt length: {} chars",
+                    session_id,
+                    prompt.len()
+                );
+                tracing::info!("[{}] -----------------------------------", session_id);
+                tracing::info!("[{}] {}", session_id, prompt);
+                tracing::info!("[{}] ========== END SYSTEM PROMPT ==========", session_id);
             }
+
+            // Run agent loop.
+            let storage: Arc<dyn crate::agent::core::storage::Storage> = state.storage.clone();
+            let result = run_agent_loop_with_config(
+                &mut session,
+                initial_message,
+                mpsc_tx.clone(),
+                // Use the reloadable provider handle so config/provider switches take effect
+                // without requiring a server restart.
+                state.get_provider().await,
+                tools,
+                cancel_token,
+                AgentLoopConfig {
+                    max_rounds: 200,
+                    system_prompt,
+                    selected_skill_ids,
+                    selected_skill_mode,
+                    skill_manager: Some(state.skill_manager.clone()),
+                    skip_initial_user_message: true,
+                    storage: Some(storage),
+                    attachment_reader: Some(state.session_store.clone()),
+                    metrics_collector: Some(state.metrics_service.collector()),
+                    model_name: Some(model),
+                    fast_model_name: fast_model,
+                    provider_name: Some(provider_name),
+                    reasoning_effort,
+                    disabled_tools,
+                    image_fallback,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+            // Send terminal event for all error cases (including cancellation).
+            if let Some(error_event) = terminal_error_event_for_result(&result) {
+                let _ = mpsc_tx.send(error_event).await;
+            }
+
+            // Update runner status.
+            {
+                let mut runners = state.agent_runners.write().await;
+                if let Some(runner) = runners.get_mut(&session_id) {
+                    runner.status = status_from_execution_result(&result);
+                    runner.completed_at = Some(Utc::now());
+                }
+            }
+
+            // Save session.
+            state.save_session(&session).await;
+
+            // Update memory.
+            {
+                let mut sessions = state.sessions.write().await;
+                sessions.insert(session_id.clone(), session);
+            }
+
+            // Remove cancellation token (legacy).
+            {
+                let mut tokens = state.cancel_tokens.write().await;
+                tokens.remove(&session_id);
+            }
+
+            tracing::info!("[{}] Agent execution completed", session_id);
         }
-
-        // Save session.
-        state.save_session(&session).await;
-
-        // Update memory.
-        {
-            let mut sessions = state.sessions.write().await;
-            sessions.insert(session_id.clone(), session);
-        }
-
-        // Remove cancellation token (legacy).
-        {
-            let mut tokens = state.cancel_tokens.write().await;
-            tokens.remove(&session_id);
-        }
-
-        tracing::info!("[{}] Agent execution completed", session_id);
-    });
+        .instrument(session_span),
+    );
 }
 
 pub(super) fn terminal_error_event_for_result<E>(result: &Result<(), E>) -> Option<AgentEvent>

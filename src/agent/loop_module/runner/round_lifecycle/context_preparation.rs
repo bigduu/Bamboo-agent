@@ -1,7 +1,8 @@
 use crate::agent::core::budget::{
     apply_compression_plan, build_forced_compression_plan_with_summary,
-    estimate_context_compression_exposure, prepare_hybrid_context, summary_source_messages,
-    HeuristicTokenCounter, LlmSummarizer, PreparedContext, Summarizer, TokenBudget,
+    estimate_context_compression_exposure, normalized_trigger_percent, prepare_hybrid_context,
+    summary_source_messages, HeuristicTokenCounter, LlmSummarizer, PreparedContext, Summarizer,
+    TokenBudget,
 };
 use crate::agent::core::tools::ToolSchema;
 use crate::agent::core::{AgentError, Session};
@@ -14,54 +15,45 @@ mod ocr_cache;
 mod transforms;
 
 const FORCE_CONTEXT_COMPRESSION_PERCENT: f64 = 98.0;
-const CONTEXT_COMPRESSION_ENABLED_KEY: &str = "context_compression_tool_enabled";
-const CONTEXT_COMPRESSION_TRIGGER_PCT_KEY: &str = "context_compression_tool_trigger_pct";
-const CONTEXT_COMPRESSION_USAGE_PCT_KEY: &str = "context_compression_tool_usage_pct";
 
 pub(super) struct PreparedRoundContext {
     pub prepared_context: PreparedContext,
     pub budget: TokenBudget,
 }
 
-async fn maybe_force_context_compression(
+async fn maybe_apply_host_context_compression_with_budget(
     session: &mut Session,
     config: &AgentLoopConfig,
     model_name: &str,
     session_id: &str,
     llm: &Arc<dyn LLMProvider>,
     budget: &TokenBudget,
+    phase_label: &str,
 ) -> Result<bool, AgentError> {
-    let persisted_usage = session
-        .token_usage
-        .as_ref()
-        .and_then(|usage| {
-            (usage.budget_limit > 0)
-                .then_some((usage.total_tokens as f64 / usage.budget_limit as f64) * 100.0)
-        })
-        .unwrap_or(0.0);
-    if persisted_usage < FORCE_CONTEXT_COMPRESSION_PERCENT {
+    let exposure = estimate_context_compression_exposure(session, model_name, Some(budget));
+    let usage_percent = exposure.active_usage_percent;
+    let auto_threshold = normalized_trigger_percent(exposure.budget.compression_trigger_percent);
+    let host_auto_requested = usage_percent >= auto_threshold;
+    let critical_fallback_requested = usage_percent >= FORCE_CONTEXT_COMPRESSION_PERCENT;
+    if !host_auto_requested && !critical_fallback_requested {
         return Ok(false);
     }
-
-    let exposure = estimate_context_compression_exposure(session, model_name, Some(budget));
 
     let messages = summary_source_messages(session);
     if messages.len() < 3 {
         tracing::warn!(
-            "[{}] Context usage {:.1}% >= {}% but forced compression skipped: not enough active messages ({})",
+            "[{}] {} context compression skipped: usage={:.1}%, auto_threshold={:.1}%, critical_threshold={}%, not enough active messages ({})",
             session_id,
-            exposure.active_usage_percent,
+            phase_label,
+            usage_percent,
+            auto_threshold,
             FORCE_CONTEXT_COMPRESSION_PERCENT,
             messages.len()
         );
         return Ok(false);
     }
 
-    let summary_model = config
-        .fast_model_name
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(model_name);
+    let summary_model = model_name;
     let existing_summary = session
         .conversation_summary
         .as_ref()
@@ -83,41 +75,35 @@ async fn maybe_force_context_compression(
         .await
         .map_err(|error| AgentError::Budget(error.to_string()))?;
 
-    let Some(plan) =
-        build_forced_compression_plan_with_summary(session, model_name, Some(budget), summary)
-    else {
-        tracing::warn!(
-            "[{}] Context usage {:.1}% >= {}% but forced compression produced no safe plan",
-            session_id,
-            exposure.active_usage_percent,
-            FORCE_CONTEXT_COMPRESSION_PERCENT
-        );
-        return Ok(false);
+    let plan = match build_forced_compression_plan_with_summary(
+        session,
+        model_name,
+        Some(budget),
+        summary,
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            tracing::warn!(
+                "[{}] {} context compression attempted (usage={:.1}%) but plan build failed: {}",
+                session_id,
+                phase_label,
+                usage_percent,
+                reason
+            );
+            return Ok(false);
+        }
     };
 
     let compressed_count = apply_compression_plan(session, plan.clone());
     if compressed_count == 0 {
         tracing::warn!(
-            "[{}] Context usage {:.1}% >= {}% but forced compression did not archive messages",
+            "[{}] {} context compression attempted (usage={:.1}%) but did not archive messages",
             session_id,
-            exposure.active_usage_percent,
-            FORCE_CONTEXT_COMPRESSION_PERCENT
+            phase_label,
+            usage_percent
         );
         return Ok(false);
     }
-
-    session.metadata.insert(
-        CONTEXT_COMPRESSION_ENABLED_KEY.to_string(),
-        "false".to_string(),
-    );
-    session.metadata.insert(
-        CONTEXT_COMPRESSION_TRIGGER_PCT_KEY.to_string(),
-        plan.trigger_percent.to_string(),
-    );
-    session.metadata.insert(
-        CONTEXT_COMPRESSION_USAGE_PCT_KEY.to_string(),
-        format!("{:.1}", plan.active_usage_after_percent.clamp(0.0, 100.0)),
-    );
 
     if let Some(storage) = config.storage.as_ref() {
         if let Err(error) = storage.save_session(session).await {
@@ -130,9 +116,11 @@ async fn maybe_force_context_compression(
     }
 
     tracing::info!(
-        "[{}] Forced context compression applied at {:.1}% usage (threshold {}%): compressed_messages={}, usage_after={:.1}%",
+        "[{}] {} context compression applied: usage={:.1}%, auto_threshold={:.1}%, critical_threshold={}%, compressed_messages={}, usage_after_context_window={:.1}%",
         session_id,
-        exposure.active_usage_percent,
+        phase_label,
+        usage_percent,
+        auto_threshold,
         FORCE_CONTEXT_COMPRESSION_PERCENT,
         compressed_count,
         plan.active_usage_after_percent
@@ -140,40 +128,48 @@ async fn maybe_force_context_compression(
     Ok(true)
 }
 
+pub(super) async fn maybe_apply_host_context_compression(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    model_name: &str,
+    session_id: &str,
+    _tool_schemas: &[ToolSchema],
+    llm: &Arc<dyn LLMProvider>,
+    phase_label: &str,
+) -> Result<bool, AgentError> {
+    let budget =
+        super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref()).await;
+    maybe_apply_host_context_compression_with_budget(
+        session,
+        config,
+        model_name,
+        session_id,
+        llm,
+        &budget,
+        phase_label,
+    )
+    .await
+}
+
 pub(super) async fn prepare_round_context(
     session: &mut Session,
     config: &AgentLoopConfig,
     model_name: &str,
     session_id: &str,
-    tool_schemas: &[ToolSchema],
+    _tool_schemas: &[ToolSchema],
     llm: &Arc<dyn LLMProvider>,
 ) -> Result<PreparedRoundContext, AgentError> {
     ocr_cache::maybe_cache_ocr_results(session, config, session_id).await;
 
-    let mut budget =
+    let budget =
         super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref()).await;
-
-    // Reserve budget space for tool schemas (they consume context tokens but
-    // are not part of the message list). Without this, context compression
-    // underestimates actual token usage, which can cause the LLM to receive
-    // more tokens than its context window supports — resulting in empty
-    // responses.
-    let tool_tokens = super::token_estimation::estimate_tool_schemas_tokens(tool_schemas);
-    if tool_tokens > 0 {
-        budget.safety_margin = budget.safety_margin.saturating_add(tool_tokens);
-        tracing::debug!(
-            "[{}] Reserved {} tokens for {} tool schemas (effective safety_margin={})",
-            session_id,
-            tool_tokens,
-            tool_schemas.len(),
-            budget.safety_margin
-        );
-    }
 
     let counter = HeuristicTokenCounter::default();
 
-    if maybe_force_context_compression(session, config, model_name, session_id, llm, &budget)
-        .await?
+    if maybe_apply_host_context_compression_with_budget(
+        session, config, model_name, session_id, llm, &budget, "pre-turn",
+    )
+    .await?
     {
         tracing::debug!(
             "[{}] Recomputing prepared context after forced compression fallback",

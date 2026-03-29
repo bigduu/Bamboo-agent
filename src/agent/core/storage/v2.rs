@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::agent::core::agent::{AgentEvent, Session, SessionKind};
 
+use super::search_index::{should_index_session, SessionSearchIndex};
 use super::AttachmentReader;
 use super::Storage;
 
@@ -98,6 +99,7 @@ pub struct SessionStoreV2 {
     bamboo_home_dir: PathBuf,
     sessions_dir: PathBuf,
     index_path: PathBuf,
+    search_index: SessionSearchIndex,
     index: RwLock<SessionsIndex>,
     /// Serializes on-disk index writes (and any multi-step operations that must be atomic-ish).
     write_lock: Mutex<()>,
@@ -107,8 +109,10 @@ impl SessionStoreV2 {
     pub async fn new(bamboo_home_dir: PathBuf) -> io::Result<Self> {
         let sessions_dir = bamboo_home_dir.join("sessions");
         let index_path = bamboo_home_dir.join("sessions.json");
+        let search_index = SessionSearchIndex::new(bamboo_home_dir.join("session_search.db"));
 
         fs::create_dir_all(&sessions_dir).await?;
+        search_index.init().await?;
 
         let index = if index_path.exists() {
             let raw = fs::read_to_string(&index_path).await?;
@@ -127,17 +131,46 @@ impl SessionStoreV2 {
             index
         };
 
-        Ok(Self {
+        let storage = Self {
             bamboo_home_dir,
             sessions_dir,
             index_path,
+            search_index,
             index: RwLock::new(index),
             write_lock: Mutex::new(()),
-        })
+        };
+
+        Ok(storage)
+    }
+
+    pub fn search_index(&self) -> &SessionSearchIndex {
+        &self.search_index
     }
 
     pub fn index_path(&self) -> &Path {
         &self.index_path
+    }
+
+    pub async fn rebuild_search_index(&self) -> io::Result<()> {
+        let session_ids = {
+            let index = self.index.read().await;
+            index.sessions.keys().cloned().collect::<Vec<_>>()
+        };
+        for session_id in session_ids {
+            if let Some(session) = self.load_session(&session_id).await? {
+                if !should_index_session(session.updated_at) {
+                    continue;
+                }
+                if let Err(error) = self.search_index.upsert_session(&session).await {
+                    tracing::warn!(
+                        "failed to rebuild search index entry for {}: {}",
+                        session_id,
+                        error
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn sessions_root_dir(&self) -> &Path {
@@ -571,6 +604,13 @@ impl SessionStoreV2 {
                     Ok(())
                 })
                 .await?;
+                if let Err(error) = self.search_index.delete_session(session_id).await {
+                    tracing::warn!(
+                        "failed to delete session search index row for {}: {}",
+                        session_id,
+                        error
+                    );
+                }
                 Ok(true)
             }
             SessionKind::Root => {
@@ -578,19 +618,33 @@ impl SessionStoreV2 {
                 let abs_dir = self.abs_path_from_rel(&entry.rel_path);
                 let _ = fs::remove_dir_all(&abs_dir).await;
 
-                self.update_index(|index| {
-                    let to_remove: Vec<String> = index
+                let to_remove_ids = {
+                    let index = self.index.read().await;
+                    index
                         .sessions
                         .values()
                         .filter(|e| e.root_session_id == root_id)
                         .map(|e| e.id.clone())
-                        .collect();
-                    for id in to_remove {
-                        index.sessions.remove(&id);
+                        .collect::<Vec<_>>()
+                };
+
+                self.update_index(|index| {
+                    for id in &to_remove_ids {
+                        index.sessions.remove(id);
                     }
                     Ok(())
                 })
                 .await?;
+
+                for id in to_remove_ids {
+                    if let Err(error) = self.search_index.delete_session(&id).await {
+                        tracing::warn!(
+                            "failed to delete session search index row for {}: {}",
+                            id,
+                            error
+                        );
+                    }
+                }
                 Ok(true)
             }
         }
@@ -679,6 +733,13 @@ impl Storage for SessionStoreV2 {
         atomic_rename(&tmp, &path).await?;
 
         self.upsert_index_from_session(session, rel_path).await?;
+        if let Err(error) = self.search_index.upsert_session(session).await {
+            tracing::warn!(
+                "failed to update session search index for {}: {}",
+                session.id,
+                error
+            );
+        }
         Ok(())
     }
 

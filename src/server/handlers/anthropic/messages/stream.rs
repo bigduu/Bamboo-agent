@@ -44,6 +44,7 @@ pub(super) async fn handle_streaming_messages(
             prepared.max_tokens,
             openai_request.model.as_str(),
             Some(&LLMRequestOptions {
+                session_id: None,
                 reasoning_effort: prepared.reasoning_effort,
                 parallel_tool_calls: None,
                 responses: None,
