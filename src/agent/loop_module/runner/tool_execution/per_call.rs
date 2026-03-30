@@ -126,10 +126,12 @@ pub(super) async fn execute_tool_call_only(
     let _ = ctx.event_tx.send(begin_event.into_agent_event()).await;
 
     let tool_timer = std::time::Instant::now();
+    let available_tool_schemas = ctx.tools.list_tools();
     let tool_ctx = ToolExecutionContext {
         session_id: Some(ctx.session_id),
         tool_call_id: &ctx.tool_call.id,
         event_tx: Some(ctx.event_tx),
+        available_tool_schemas: Some(available_tool_schemas.as_slice()),
     };
 
     let result = crate::agent::core::tools::executor::execute_tool_call_with_context(

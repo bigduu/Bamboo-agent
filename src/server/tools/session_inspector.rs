@@ -208,11 +208,11 @@ fn role_to_str(role: &Role) -> &'static str {
 #[async_trait]
 impl Tool for SessionInspectorTool {
     fn name(&self) -> &str {
-        "session_inspector"
+        "recall"
     }
 
     fn description(&self) -> &str {
-        "Inspect sessions stored in Bamboo home dir (V2). Use list/get_meta to fetch metadata first, then read_messages or read_compressed_cache with bounded limits. Keep inspection local by default; only use child-session delegation if the user explicitly asks for it."
+        "Recall prior Bamboo context from local storage. Use this to list sessions, inspect metadata, read bounded message slices, read compressed recall, and search prior conversation history before asking the user to repeat information. Keep recall local by default; only use child-session delegation if the user explicitly asks for it."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -262,14 +262,11 @@ impl Tool for SessionInspectorTool {
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let _caller_session_id = ctx.session_id.ok_or_else(|| {
-            ToolError::Execution(
-                "session_inspector requires a session_id in tool context".to_string(),
-            )
+            ToolError::Execution("recall requires a session_id in tool context".to_string())
         })?;
 
-        let parsed: SessionInspectorArgs = serde_json::from_value(args).map_err(|e| {
-            ToolError::InvalidArguments(format!("Invalid session_inspector args: {e}"))
-        })?;
+        let parsed: SessionInspectorArgs = serde_json::from_value(args)
+            .map_err(|e| ToolError::InvalidArguments(format!("Invalid recall args: {e}")))?;
 
         match parsed {
             SessionInspectorArgs::List {
@@ -654,7 +651,7 @@ impl Tool for SessionInspectorTool {
                         Ok(_) => {}
                         Err(error) => {
                             tracing::warn!(
-                                "session_inspector FTS search failed for query '{}': {}. Falling back to in-memory scan.",
+                                "recall FTS search failed for query '{}': {}. Falling back to in-memory scan.",
                                 q,
                                 error
                             );

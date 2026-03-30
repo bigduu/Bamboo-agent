@@ -1,10 +1,11 @@
 use crate::agent::core::tools::{ToolExecutor, ToolSchema};
 use crate::agent::core::Session;
 use crate::agent::loop_module::config::AgentLoopConfig;
+use crate::agent::tools::exposure::{activated_discoverable_tools, canonical_tool_name, is_core_tool};
 
 const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str =
     "copilot_conclusion_with_options_enhancement_enabled";
-const CONCLUSION_WITH_OPTIONS_ENHANCED_DESCRIPTION: &str = "Ask the user a question with options and wait for the user to select or enter a custom answer. If you are about to end or hand off a task turn, you must call this tool instead of ending with plain assistant text. For completion confirmation, include a `conclusion` object with both `summary` and `mermaid.graph`, and include `OK` as one of the options.";
+const CONCLUSION_WITH_OPTIONS_ENHANCED_DESCRIPTION: &str = "Ask the user a question with options and wait for the user to select or enter a custom answer. If you are wrapping up a task turn, asking the user to choose next steps, or handing off execution, you must call this tool instead of ending with plain assistant text. For completion confirmation, include a `conclusion` object with both `summary` and `mermaid.graph`, and include `OK` as one of the options.";
 
 fn is_copilot_conclusion_with_options_enhancement_enabled(session: &Session) -> bool {
     session
@@ -44,6 +45,12 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
     if !config.disabled_tools.is_empty() {
         tool_schemas.retain(|schema| !config.disabled_tools.contains(&schema.function.name));
     }
+
+    let activated = activated_discoverable_tools(session);
+    tool_schemas.retain(|schema| {
+        let canonical = canonical_tool_name(&schema.function.name);
+        is_core_tool(&canonical) || activated.contains(&canonical)
+    });
 
     apply_session_tool_schema_overrides(session, &mut tool_schemas);
 

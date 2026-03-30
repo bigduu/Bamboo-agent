@@ -7,7 +7,7 @@ use crate::agent::core::{Message, Session};
 const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str =
     "copilot_conclusion_with_options_enhancement_enabled";
 const ASK_USER_ENHANCED_DESCRIPTION_FRAGMENT: &str =
-    "If you are about to end or hand off a task turn, you must call this tool instead of ending with plain assistant text.";
+    "If you are wrapping up a task turn, asking the user to choose next steps, or handing off execution, you must call this tool instead of ending with plain assistant text.";
 
 struct StaticToolExecutor {
     schemas: Vec<ToolSchema>,
@@ -125,10 +125,42 @@ fn resolve_available_tool_schemas_excludes_canonicalized_disabled_tool_aliases()
 }
 
 #[test]
+fn resolve_available_tool_schemas_hides_discoverable_tools_by_default() {
+    let config = crate::agent::loop_module::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("Read"), schema("Sleep"), schema("scheduler")],
+    };
+    let session = Session::new("session-1", "model");
+
+    let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
+    let names: Vec<&str> = resolved.iter().map(|item| item.function.name.as_str()).collect();
+
+    assert_eq!(names, vec!["Read"]);
+}
+
+#[test]
+fn resolve_available_tool_schemas_includes_activated_discoverable_tools() {
+    let config = crate::agent::loop_module::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("Read"), schema("Sleep"), schema("scheduler")],
+    };
+    let mut session = Session::new("session-1", "model");
+    crate::agent::tools::exposure::activate_discoverable_tools(
+        &mut session,
+        ["Sleep", "scheduler"],
+    );
+
+    let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
+    let names: Vec<&str> = resolved.iter().map(|item| item.function.name.as_str()).collect();
+
+    assert_eq!(names, vec!["Read", "Sleep", "scheduler"]);
+}
+
+#[test]
 fn resolve_available_tool_schemas_does_not_mutate_session_metadata() {
     let config = crate::agent::loop_module::config::AgentLoopConfig::default();
     let tools = StaticToolExecutor {
-        schemas: vec![schema("Write"), schema("session_inspector")],
+        schemas: vec![schema("Write"), schema("recall")],
     };
     let mut session = Session::new("session-1", "gpt-4o-mini");
     session.add_message(Message::system("sys"));
@@ -143,7 +175,7 @@ fn resolve_available_tool_schemas_does_not_mutate_session_metadata() {
         .map(|item| item.function.name.as_str())
         .collect();
 
-    assert_eq!(names, vec!["Write", "session_inspector"]);
+    assert_eq!(names, vec!["Write"]);
     assert_eq!(
         session.metadata.get("existing").map(String::as_str),
         Some("value")

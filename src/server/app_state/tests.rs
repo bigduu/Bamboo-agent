@@ -46,16 +46,48 @@ async fn root_tools_include_server_overlays_and_memory_note() {
 
     assert!(names.contains("Task"));
     assert!(names.contains("SubSession"));
-    assert!(names.contains("schedule_tasks"));
+    assert!(names.contains("scheduler"));
     assert!(names.contains("sub_session_manager"));
-    assert!(names.contains("session_inspector"));
+    assert!(names.contains("recall"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
     assert!(names.contains("memory_note"));
 }
 
 #[tokio::test]
-async fn child_tools_exclude_schedule_and_session_inspector() {
+async fn default_first_round_tool_surface_is_smaller_than_full_root_tool_catalog() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+
+    let full = state.get_all_tool_schemas();
+    let visible: Vec<_> = full
+        .iter()
+        .filter(|schema| crate::agent::tools::exposure::is_core_tool(&schema.function.name))
+        .collect();
+    let visible_names: std::collections::HashSet<&str> =
+        visible.iter().map(|schema| schema.function.name.as_str()).collect();
+    eprintln!(
+        "tool_surface_metrics: full={}, visible={}, hidden={}",
+        full.len(),
+        visible.len(),
+        full.len().saturating_sub(visible.len())
+    );
+
+    assert!(
+        visible.len() < full.len(),
+        "expected reduced first-round surface: visible={}, full={}",
+        visible.len(),
+        full.len()
+    );
+    assert!(!visible_names.contains("scheduler"));
+    assert!(!visible_names.contains("sub_session_manager"));
+    assert!(!visible_names.contains("recall"));
+}
+
+#[tokio::test]
+async fn child_tools_exclude_scheduler_and_recall() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
@@ -67,9 +99,9 @@ async fn child_tools_exclude_schedule_and_session_inspector() {
         .map(|schema| schema.function.name)
         .collect();
 
-    assert!(!names.contains("schedule_tasks"));
+    assert!(!names.contains("scheduler"));
     assert!(!names.contains("sub_session_manager"));
-    assert!(!names.contains("session_inspector"));
+    assert!(!names.contains("recall"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
     assert!(names.contains("memory_note"));
@@ -84,10 +116,7 @@ async fn overlay_tools_require_session_context() {
 
     let schedule_result = state
         .tools
-        .execute(&make_tool_call(
-            "schedule_tasks",
-            json!({ "action": "list" }),
-        ))
+        .execute(&make_tool_call("scheduler", json!({ "action": "list" })))
         .await;
     assert!(matches!(
         schedule_result,
@@ -96,10 +125,7 @@ async fn overlay_tools_require_session_context() {
 
     let inspector_result = state
         .tools
-        .execute(&make_tool_call(
-            "session_inspector",
-            json!({ "action": "list" }),
-        ))
+        .execute(&make_tool_call("recall", json!({ "action": "list" })))
         .await;
     assert!(matches!(
         inspector_result,

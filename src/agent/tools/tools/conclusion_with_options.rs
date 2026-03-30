@@ -93,7 +93,7 @@ impl Tool for ConclusionWithOptionsTool {
     }
 
     fn description(&self) -> &str {
-        "Ask the user a question with options and wait for the user to select or enter a custom answer. The `conclusion` object is required and must include both a summary and a Mermaid graph."
+        "Ask the user a question with options and wait for the user to select or enter a custom answer. Use this as the final interaction step when wrapping up a task turn or when the user must choose next steps. The `conclusion` object is required and must include both a summary and a Mermaid graph."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

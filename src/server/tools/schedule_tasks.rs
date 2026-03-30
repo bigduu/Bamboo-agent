@@ -86,11 +86,11 @@ enum ScheduleTasksArgs {
 #[async_trait]
 impl Tool for ScheduleTasksTool {
     fn name(&self) -> &str {
-        "schedule_tasks"
+        "scheduler"
     }
 
     fn description(&self) -> &str {
-        "Manage scheduler tasks (list/create/patch/delete/run_now/list_sessions). Server-only tool that calls internal schedule store (not HTTP). Child sessions cannot use this."
+        "Manage Bamboo scheduled automation jobs (list/create/patch/delete/run_now/list_sessions). Server-only tool that calls the internal scheduler directly instead of HTTP. Child sessions cannot use this."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -139,19 +139,18 @@ impl Tool for ScheduleTasksTool {
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let caller_session_id = ctx.session_id.ok_or_else(|| {
-            ToolError::Execution("schedule_tasks requires a session_id in tool context".to_string())
+            ToolError::Execution("scheduler requires a session_id in tool context".to_string())
         })?;
 
         let caller = self.load_caller_session(caller_session_id).await?;
         if caller.kind != SessionKind::Root {
             return Err(ToolError::Execution(
-                "schedule_tasks is not allowed inside child sessions".to_string(),
+                "scheduler is not allowed inside child sessions".to_string(),
             ));
         }
 
-        let parsed: ScheduleTasksArgs = serde_json::from_value(args).map_err(|e| {
-            ToolError::InvalidArguments(format!("Invalid schedule_tasks args: {e}"))
-        })?;
+        let parsed: ScheduleTasksArgs = serde_json::from_value(args)
+            .map_err(|e| ToolError::InvalidArguments(format!("Invalid scheduler args: {e}")))?;
 
         match parsed {
             ScheduleTasksArgs::List {} => {

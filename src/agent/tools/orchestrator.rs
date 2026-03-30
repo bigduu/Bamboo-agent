@@ -67,6 +67,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "BashOutput",
     "tool_search",
     "memory_note",
+    "recall",
     "session_inspector",
     "Sleep",
 ];

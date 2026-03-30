@@ -19,7 +19,7 @@ const STRICT_ARGUMENT_TOOL_NAMES: [&str; 10] = [
     "Bash",
     "Task",
     "SubSession",
-    "schedule_tasks",
+    "scheduler",
     "sub_session_manager",
     "memory_note",
 ];
@@ -122,13 +122,14 @@ pub(super) fn validate_tool_call_context(
 
         if !has_narration {
             return Err(
-                "Tool policy blocked 'conclusion_with_options': add a brief assistant text summary before calling conclusion_with_options so the user can understand the conclusion.".to_string()
+                "Tool policy blocked 'conclusion_with_options': add a brief assistant text summary before calling conclusion_with_options so the user can understand the conclusion. Then retry conclusion_with_options instead of repeating the same blocked call. For example, first send a short plain-text wrap-up sentence, then call conclusion_with_options in the next assistant action."
+                    .to_string(),
             );
         }
 
         if enhancement_enabled && !conclusion_with_options_arguments_include_conclusion(tool_call) {
             return Err(
-                "Tool policy blocked 'conclusion_with_options': when copilot conclusion-with-options enhancement is enabled, include `conclusion.summary` and `conclusion.mermaid.graph` in the conclusion_with_options arguments."
+                "Tool policy blocked 'conclusion_with_options': when copilot conclusion-with-options enhancement is enabled, include `conclusion.summary` and `conclusion.mermaid.graph` in the conclusion_with_options arguments. Rewrite the tool arguments to include those required fields, then retry conclusion_with_options."
                     .to_string(),
             );
         }
@@ -300,6 +301,8 @@ mod tests {
         let err =
             validate_tool_call_context(&call, &session).expect_err("expected context rejection");
         assert!(err.contains("before calling conclusion_with_options"));
+        assert!(err.contains("Then retry conclusion_with_options"));
+        assert!(err.contains("short plain-text wrap-up sentence"));
     }
 
     #[test]
@@ -311,6 +314,7 @@ mod tests {
         let err =
             validate_tool_call_context(&call, &session).expect_err("expected context rejection");
         assert!(err.contains("before calling conclusion_with_options"));
+        assert!(err.contains("Then retry conclusion_with_options"));
     }
 
     #[test]
@@ -353,6 +357,7 @@ mod tests {
             .expect_err("expected policy rejection");
         assert!(err.contains("conclusion.summary"));
         assert!(err.contains("conclusion.mermaid.graph"));
+        assert!(err.contains("then retry conclusion_with_options"));
     }
 
     #[test]

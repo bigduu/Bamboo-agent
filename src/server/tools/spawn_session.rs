@@ -530,6 +530,7 @@ mod tests {
                     session_id: Some(parent_session_id.as_str()),
                     tool_call_id: "tool_call_1",
                     event_tx: None,
+                    available_tool_schemas: None,
                 },
             )
             .await

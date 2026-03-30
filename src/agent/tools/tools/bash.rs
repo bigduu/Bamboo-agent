@@ -398,6 +398,7 @@ mod tests {
                     session_id: Some("session_1"),
                     tool_call_id: "call_1",
                     event_tx: Some(&tx),
+                    available_tool_schemas: None,
                 },
             )
             .await
@@ -508,6 +509,7 @@ mod tests {
                     session_id: Some(&session_id),
                     tool_call_id: "call_1",
                     event_tx: None,
+                    available_tool_schemas: None,
                 },
             )
             .await

@@ -259,6 +259,7 @@ pub async fn execute_sub_actions(
 ) -> ToolHandlingOutcome {
     let mut pending: VecDeque<ToolCall> = actions.iter().cloned().collect();
     let mut processed = 0usize;
+    let available_tools = tools.list_tools();
 
     while let Some(action) = pending.pop_front() {
         if processed >= MAX_SUB_ACTIONS {
@@ -294,6 +295,7 @@ pub async fn execute_sub_actions(
             session_id: Some(&session.id),
             tool_call_id: &action.id,
             event_tx: Some(event_tx),
+            available_tool_schemas: Some(available_tools.as_slice()),
         };
 
         match execute_tool_call_with_context(&action, tools, composition_executor.clone(), tool_ctx)

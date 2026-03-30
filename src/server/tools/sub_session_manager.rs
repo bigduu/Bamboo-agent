@@ -969,6 +969,7 @@ mod tests {
                     session_id: Some(harness.parent_session_id.as_str()),
                     tool_call_id: "tool_call_send_message",
                     event_tx: None,
+                    available_tool_schemas: None,
                 },
             )
             .await
@@ -1019,6 +1020,7 @@ mod tests {
                     session_id: Some(harness.parent_session_id.as_str()),
                     tool_call_id: "tool_call_running",
                     event_tx: None,
+                    available_tool_schemas: None,
                 },
             )
             .await
@@ -1065,6 +1067,7 @@ mod tests {
                     session_id: Some(harness.parent_session_id.as_str()),
                     tool_call_id: "tool_call_interrupt_running",
                     event_tx: None,
+                    available_tool_schemas: None,
                 },
             )
             .await
@@ -1113,6 +1116,7 @@ mod tests {
                     session_id: Some(harness.parent_session_id.as_str()),
                     tool_call_id: "tool_call_queue",
                     event_tx: None,
+                    available_tool_schemas: None,
                 },
             )
             .await

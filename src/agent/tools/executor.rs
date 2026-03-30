@@ -61,10 +61,10 @@ pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
     "Write",
 ];
 
-/// Tool names that are accepted as aliases for built-in tools but are not
-/// independently listed in `BUILTIN_TOOL_NAMES`.  Calls to these names are
+/// Tool names that are accepted as aliases for built-in/server tools but are not
+/// independently listed in `BUILTIN_TOOL_NAMES`/`SERVER_TOOL_NAMES`. Calls to these names are
 /// transparently routed to their canonical counterpart.
-pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 4] = [
+pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 6] = [
     // apply_patch is a patch-only alias for Edit
     ("apply_patch", "Edit"),
     // FileExists is subsumed by GetFileInfo (returns {exists: false} for missing paths)
@@ -72,13 +72,16 @@ pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 4] = [
     // GetCurrentDir + SetWorkspace are subsumed by Workspace
     ("GetCurrentDir", "Workspace"),
     ("SetWorkspace", "Workspace"),
+    // Server tool renames
+    ("session_inspector", "recall"),
+    ("schedule_tasks", "scheduler"),
 ];
 
 pub const SERVER_TOOL_NAMES: [&str; 6] = [
     "SubSession",
-    "schedule_tasks",
+    "scheduler",
     "sub_session_manager",
-    "session_inspector",
+    "recall",
     "load_skill",
     "read_skill_resource",
 ];
@@ -149,6 +152,8 @@ fn normalize_builtin_alias(name: &str) -> &str {
         "child_session" => "SubSession",
         "childSession" => "SubSession",
         "write_file" => "Write",
+        "sessionInspector" => "session_inspector",
+        "scheduleTasks" => "schedule_tasks",
         _ => name,
     }
 }
@@ -949,6 +954,7 @@ mod tests {
                     session_id: Some("s1"),
                     tool_call_id: &call.id,
                     event_tx: Some(&tx),
+                    available_tool_schemas: None,
                 },
             )
             .await

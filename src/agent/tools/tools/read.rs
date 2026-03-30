@@ -239,6 +239,7 @@ mod tests {
             session_id: Some("session_binary_read"),
             tool_call_id: "call_1",
             event_tx: None,
+                    available_tool_schemas: None,
         };
 
         let read_tool = ReadTool::new();

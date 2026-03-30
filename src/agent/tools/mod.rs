@@ -76,6 +76,7 @@
 
 pub mod events;
 mod executor;
+pub mod exposure;
 pub mod guide;
 pub mod orchestrator;
 pub mod output_manager;

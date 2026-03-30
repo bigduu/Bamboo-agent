@@ -53,24 +53,52 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "conclusion_with_options" => Some(guide(
             "conclusion_with_options",
             ToolCategory::UserInteraction,
-            "Ask the user for confirmation or missing input with selectable options. Include a structured `conclusion` object (summary + Mermaid graph) in the same call when you need a wrapped-up confirmation flow.",
-            "Do not use repeatedly for routine status updates during active execution; reserve it for true clarification points, explicit user decisions, or a final confirmation flow when required by the active prompt/policy.",
+            "Ask the user for confirmation or missing input with selectable options. Use this as the final interaction step when wrapping up a task turn, handing off execution, or asking the user to choose next steps.",
+            "Do not use repeatedly for routine status updates during active execution; reserve it for true clarification points, explicit user decisions, or the required final confirmation flow.",
             &["ExitPlanMode"],
-            vec![example(
-                "Confirm before finishing",
-                json!({
-                    "question":"Any other requests before I finish?",
-                    "conclusion":{
-                        "title":"Conclusion",
-                        "summary":"Core validation is complete and release is ready.",
-                        "key_points":["All targeted tests passed","No blocking regressions"],
-                        "next_steps":["Proceed with release train"],
-                        "confidence":"high",
-                        "mermaid":{"graph":"graph TD\nA[Validation]-->B[Ready to release]"}
-                    }
-                }),
-                "Use when user intent is required before finalizing. Defaults to options [\"OK\", \"Need changes\"] when options are omitted.",
-            )],
+            vec![
+                example(
+                    "Confirm before finishing",
+                    json!({
+                        "question":"Any other requests before I finish?",
+                        "conclusion":{
+                            "title":"Conclusion",
+                            "summary":"Core validation is complete and release is ready.",
+                            "key_points":["All targeted tests passed","No blocking regressions"],
+                            "next_steps":["Proceed with release train"],
+                            "confidence":"high",
+                            "mermaid":{"graph":"graph TD\nA[Validation]-->B[Ready to release]"}
+                        }
+                    }),
+                    "Use when user intent is required before finalizing. Defaults to options [\"OK\", \"Need changes\"] when options are omitted.",
+                ),
+                example(
+                    "Ask the user to choose the next step",
+                    json!({
+                        "question":"Which next step should I take?",
+                        "options":["Implement it","Refine the plan","Stop here","OK"],
+                        "conclusion":{
+                            "summary":"I finished the review and identified two viable implementation paths.",
+                            "key_points":["Minimal change path is lower risk","Broader refactor will simplify future maintenance"],
+                            "mermaid":{"graph":"graph TD\nA[Review done]-->B[Choose next step]"}
+                        }
+                    }),
+                    "Use when the user must choose among concrete next actions instead of receiving plain prose.",
+                ),
+                example(
+                    "Wrap up a review turn",
+                    json!({
+                        "question":"Want me to proceed with the recommended fix?",
+                        "options":["Proceed","Need changes","OK"],
+                        "conclusion":{
+                            "summary":"The review is complete and I found one blocking issue plus two minor cleanups.",
+                            "key_points":["Blocking issue identified","Fix scope is localized"],
+                            "mermaid":{"graph":"graph TD\nA[Review complete]-->B[Decision needed]"}
+                        }
+                    }),
+                    "Use at the end of review/explanation turns instead of a plain final paragraph.",
+                )
+            ],
         )),
         "Read" => Some(guide(
             "Read",
@@ -306,14 +334,14 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "memory_note" => Some(guide(
             "memory_note",
             ToolCategory::TaskManagement,
-            "Store durable per-session facts/decisions and retrieve them across turns. Supports multiple topics per session to keep unrelated workstreams separate.",
-            "Do not store secrets/tokens or transient one-turn scratch text.",
-            &["Task"],
+            "Store durable session-scoped notes and retrieve them across turns. Use it for local context, user preferences, constraints, and compression-resistant reminders within the current workstream.",
+            "Do not store secrets/tokens, one-turn scratch text, or use it as the primary long-term knowledge base.",
+            &["Task", "recall"],
             vec![
                 example(
-                    "Persist a durable decision",
+                    "Persist a durable session constraint",
                     json!({"action":"append","content":"User prefers pnpm and strict TypeScript."}),
-                    "Use append for new durable facts; use replace to compress long notes.",
+                    "Use append for stable session/workstream facts; use replace to compress long notes.",
                 ),
                 example(
                     "Store notes for a specific topic",
@@ -415,6 +443,82 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 json!({"skill_id":"rust-best-practices","resource_path":"references/chapter_01.md","offset":0,"limit":80}),
                 "Use when the loaded instructions point to additional files.",
             )],
+        )),
+        "recall" | "session_inspector" => Some(guide(
+            if tool_name == "session_inspector" { "session_inspector" } else { "recall" },
+            ToolCategory::FileReading,
+            "Inspect prior Bamboo context from local session storage. Use list/get_meta before deep reads when possible, then read bounded message slices, compressed recall, or search results to recover previous discussion context.",
+            "Do not use as a broad substitute for local code search, and do not delegate child-session inspection unless the user explicitly asks for delegated work.",
+            &["memory_note", "Read", "Task"],
+            vec![
+                example(
+                    "Search prior discussion history",
+                    json!({"action":"search","query":"release checklist","mode":"tail_messages","max_sessions":10,"tail_messages":6}),
+                    "Use when you need to recover what was discussed previously before asking the user to repeat it.",
+                ),
+                example(
+                    "Inspect a specific session with bounded reads",
+                    json!({"action":"read_messages","session_id":"session-123","from_end":true,"limit":20,"include_system":false,"truncate_chars":200}),
+                    "Prefer bounded slices rather than dumping an entire session at once.",
+                ),
+            ],
+        )),
+        "scheduler" | "schedule_tasks" => Some(guide(
+            if tool_name == "schedule_tasks" { "schedule_tasks" } else { "scheduler" },
+            ToolCategory::TaskManagement,
+            "Manage Bamboo scheduled automation jobs for recurring or delayed work. Use it to create, inspect, modify, run, or delete schedules without going through HTTP.",
+            "Do not use for normal one-shot task planning inside the current conversation; use Task for active execution tracking instead.",
+            &["Task", "Workspace"],
+            vec![
+                example(
+                    "Create a recurring schedule",
+                    json!({"action":"create","name":"daily-review","interval_seconds":86400,"enabled":true,"run_config":{"auto_execute":true,"task_message":"Review new tickets","workspace_path":"/workspace/project"}}),
+                    "Use when work should recur automatically over time.",
+                ),
+                example(
+                    "Inspect schedule sessions",
+                    json!({"action":"list_sessions","schedule_id":"sch_123"}),
+                    "Use to see the sessions a schedule created or ran.",
+                ),
+            ],
+        )),
+        "SubSession" => Some(guide(
+            "SubSession",
+            ToolCategory::TaskManagement,
+            "Create and run a child session asynchronously when the user explicitly requests delegated, parallel, or sub-agent work.",
+            "Do not use proactively just to speed things up or split work on your own; only use it when the user clearly asked for delegation/sub-agents/parallel agent work.",
+            &["sub_session_manager", "Task"],
+            vec![
+                example(
+                    "Start delegated review work explicitly requested by the user",
+                    json!({"title":"Backend API audit","responsibility":"Review backend API integration points","subagent_type":"general-purpose","prompt":"Analyze the backend API surface and report coupling risks."}),
+                    "Use only after the user explicitly asked for delegation or parallel agent help.",
+                ),
+                example(
+                    "Create a focused child session",
+                    json!({"title":"Docs verification","responsibility":"Verify docs against implementation","subagent_type":"researcher","prompt":"Compare current docs with implementation details and list mismatches."}),
+                    "Keep the child session responsibility single-purpose and explicit.",
+                ),
+            ],
+        )),
+        "sub_session_manager" => Some(guide(
+            "sub_session_manager",
+            ToolCategory::TaskManagement,
+            "Manage existing child sessions under the current root session. Use it to inspect, retry, update, rerun, or message child sessions after they already exist.",
+            "Do not use it to create new child sessions from scratch; use SubSession for creation, and do not use it inside child sessions.",
+            &["SubSession", "Task"],
+            vec![
+                example(
+                    "List existing child sessions",
+                    json!({"action":"list"}),
+                    "Use before following up on an existing child session when you need to inspect what already exists.",
+                ),
+                example(
+                    "Send follow-up instructions to an existing child",
+                    json!({"action":"send_message","child_session_id":"child_123","message":"Continue and focus on test failures.","auto_run":true}),
+                    "Use after a child session exists and you want it to continue with updated instructions.",
+                ),
+            ],
         )),
         _ => None,
     }

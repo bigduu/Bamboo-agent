@@ -479,7 +479,7 @@ mod tests {
             "BashOutput",
             "tool_search",
             "memory_note",
-            "session_inspector",
+            "recall",
             "Sleep",
         ];
         for name in &parallel_tools {
@@ -522,7 +522,7 @@ mod tests {
             "Task",
             "NotebookEdit",
             "KillShell",
-            "schedule_tasks",
+            "scheduler",
             "SubSession",
         ];
         for name in &sequential_tools {

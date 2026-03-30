@@ -1,4 +1,4 @@
-//! Integration tests for the server-only `session_inspector` tool.
+//! Integration tests for the server-only `recall` tool (legacy alias: `session_inspector`).
 
 use std::sync::Arc;
 
@@ -14,6 +14,7 @@ fn ctx_for_session<'a>(session_id: &'a str) -> ToolExecutionContext<'a> {
         session_id: Some(session_id),
         tool_call_id: "tool_call",
         event_tx: None,
+        available_tool_schemas: None,
     }
 }
 

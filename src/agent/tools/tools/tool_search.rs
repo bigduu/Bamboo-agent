@@ -1,4 +1,7 @@
-use crate::agent::core::tools::{Tool, ToolError, ToolResult};
+use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult, ToolSchema};
+use crate::agent::tools::exposure::canonical_tool_name;
+use crate::agent::tools::guide::builtin_guides::builtin_guide_spec;
+use crate::agent::tools::guide::ToolGuideSpec;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
@@ -34,6 +37,18 @@ impl Default for ToolSearchTool {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ToolSearchResponseItem {
+    name: String,
+    description: String,
+    score: f64,
+    category: Option<String>,
+    source: String,
+    when_to_use: Option<String>,
+    related_tools: Vec<String>,
+    parameters: Vec<String>,
 }
 
 #[async_trait]
@@ -77,19 +92,6 @@ impl Tool for ToolSearchTool {
 
         let limit = parsed.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
-        // NOTE: ToolSearchTool returns results from the registry attached to
-        // ToolExecutionContext.  However, the Tool trait's `execute` method
-        // does not currently receive the context.  As a pragmatic workaround,
-        // we use the `execute_with_context` method (from ToolExecutionContext)
-        // if available.  The default `execute` below serves as a fallback that
-        // returns a helpful message about calling through the context.
-        //
-        // In practice, the BuiltinToolExecutor routes calls through the
-        // ToolRegistry which passes the execution context.
-
-        // Fallback: return a helpful message. Real implementation is in
-        // `execute_with_context` on the executor side which has access to
-        // the full ToolRegistry.
         Ok(ToolResult {
             success: true,
             result: json!({
@@ -102,9 +104,88 @@ impl Tool for ToolSearchTool {
             display_preference: None,
         })
     }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let parsed: ToolSearchArgs = serde_json::from_value(args)
+            .map_err(|e| ToolError::InvalidArguments(format!("Invalid tool_search args: {}", e)))?;
+
+        let query = parsed.query.trim().to_string();
+        if query.is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "'query' must not be empty".to_string(),
+            ));
+        }
+
+        let limit = parsed.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+        let Some(schemas) = ctx.available_tool_schemas else {
+            return self.execute(json!({"query": query, "limit": limit})).await;
+        };
+
+        let docs = build_tool_docs(schemas);
+        let engine = ToolSearchEngine::new(
+            docs.iter()
+                .map(|doc| {
+                    (
+                        doc.name.clone(),
+                        doc.search_text.clone(),
+                        doc.parameters.clone(),
+                    )
+                })
+                .collect(),
+        );
+        let results = engine.search(&query, limit);
+        let mut by_name = std::collections::HashMap::new();
+        for doc in docs {
+            by_name.insert(doc.name.clone(), doc);
+        }
+
+        let items: Vec<ToolSearchResponseItem> = results
+            .into_iter()
+            .filter_map(|result| {
+                let doc = by_name.get(&result.name)?;
+                Some(ToolSearchResponseItem {
+                    name: result.name,
+                    description: doc.description.clone(),
+                    score: (result.score * 100.0).round() / 100.0,
+                    category: doc.category.clone(),
+                    source: doc.source.clone(),
+                    when_to_use: doc.when_to_use.clone(),
+                    related_tools: doc.related_tools.clone(),
+                    parameters: doc.parameters.clone(),
+                })
+            })
+            .collect();
+
+        Ok(ToolResult {
+            success: true,
+            result: json!({
+                "query": query,
+                "limit": limit,
+                "results": items,
+            })
+            .to_string(),
+            display_preference: Some("json".to_string()),
+        })
+    }
 }
 
 // ─── BM25-lite search engine (no external crate) ───────────────────────────
+
+#[derive(Debug, Clone)]
+struct ToolSearchDocument {
+    name: String,
+    description: String,
+    search_text: String,
+    parameters: Vec<String>,
+    category: Option<String>,
+    source: String,
+    when_to_use: Option<String>,
+    related_tools: Vec<String>,
+}
 
 /// A scored search result.
 #[derive(Debug, Clone)]
@@ -212,6 +293,84 @@ impl ToolSearchEngine {
                 }
             })
             .collect()
+    }
+}
+
+fn build_tool_docs(schemas: &[ToolSchema]) -> Vec<ToolSearchDocument> {
+    let mut deduped: std::collections::BTreeMap<String, ToolSearchDocument> =
+        std::collections::BTreeMap::new();
+
+    for schema in schemas {
+        let canonical = canonical_tool_name(&schema.function.name);
+        let guide = builtin_guide_spec(&schema.function.name).or_else(|| builtin_guide_spec(&canonical));
+        let parameters = parameter_names(schema);
+        let category = guide.as_ref().map(|guide| format!("{:?}", guide.category));
+        let when_to_use = guide.as_ref().map(|guide| guide.when_to_use.clone());
+        let related_tools = guide
+            .as_ref()
+            .map(|guide| guide.related_tools.clone())
+            .unwrap_or_default();
+        let source = source_for_tool_name(&schema.function.name);
+        let search_text = build_search_text(schema, guide.as_ref(), &parameters, &source, &canonical);
+
+        deduped.entry(canonical.clone()).or_insert_with(|| ToolSearchDocument {
+            name: canonical,
+            description: schema.function.description.clone(),
+            search_text,
+            parameters,
+            category,
+            source,
+            when_to_use,
+            related_tools,
+        });
+    }
+
+    deduped.into_values().collect()
+}
+
+fn parameter_names(schema: &ToolSchema) -> Vec<String> {
+    schema
+        .function
+        .parameters
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .map(|properties| properties.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn build_search_text(
+    schema: &ToolSchema,
+    guide: Option<&ToolGuideSpec>,
+    parameters: &[String],
+    source: &str,
+    canonical: &str,
+) -> String {
+    let mut parts = vec![
+        schema.function.name.clone(),
+        canonical.to_string(),
+        schema.function.description.clone(),
+        source.to_string(),
+    ];
+    parts.extend(parameters.iter().cloned());
+
+    if let Some(guide) = guide {
+        parts.push(guide.when_to_use.clone());
+        parts.push(guide.when_not_to_use.clone());
+        parts.extend(guide.related_tools.iter().cloned());
+        for example in &guide.examples {
+            parts.push(example.scenario.clone());
+            parts.push(example.explanation.clone());
+        }
+    }
+
+    parts.join(" ")
+}
+
+fn source_for_tool_name(tool_name: &str) -> String {
+    match canonical_tool_name(tool_name).as_str() {
+        "scheduler" | "SubSession" | "sub_session_manager" | "recall" | "load_skill"
+        | "read_skill_resource" => "server".to_string(),
+        _ => "builtin".to_string(),
     }
 }
 
@@ -339,5 +498,53 @@ mod tests {
         let results = engine.search("search web", 3);
         assert!(!results.is_empty());
         assert_eq!(results[0].name, "WebSearch");
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_context_returns_real_ranked_results() {
+        let tool = ToolSearchTool::new();
+        let schemas = vec![
+            ToolSchema {
+                schema_type: "function".to_string(),
+                function: crate::agent::core::tools::FunctionSchema {
+                    name: "Read".to_string(),
+                    description: "Read file contents from disk".to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}}
+                    }),
+                },
+            },
+            ToolSchema {
+                schema_type: "function".to_string(),
+                function: crate::agent::core::tools::FunctionSchema {
+                    name: "scheduler".to_string(),
+                    description: "Manage recurring automation schedules".to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {"action": {"type": "string"}}
+                    }),
+                },
+            },
+        ];
+
+        let result = tool
+            .execute_with_context(
+                json!({"query": "read file", "limit": 2}),
+                ToolExecutionContext {
+                    session_id: Some("session-1"),
+                    tool_call_id: "call-1",
+                    event_tx: None,
+                    available_tool_schemas: Some(schemas.as_slice()),
+                },
+            )
+            .await
+            .expect("tool_search with context should succeed");
+
+        assert!(result.success);
+        let value: serde_json::Value = serde_json::from_str(&result.result).expect("json result");
+        let results = value["results"].as_array().expect("results array");
+        assert!(!results.is_empty());
+        assert_eq!(results[0]["name"], "Read");
     }
 }

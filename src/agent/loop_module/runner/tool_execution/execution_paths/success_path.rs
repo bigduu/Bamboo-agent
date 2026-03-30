@@ -2,9 +2,32 @@ use std::sync::Arc;
 
 use crate::agent::core::tools::{handle_tool_result_with_agentic_support, ToolHandlingOutcome};
 use crate::agent::core::AgentEvent;
+use crate::agent::tools::exposure::activate_discoverable_tools;
 
 use super::super::{clarification, events, task, tool_error_collector};
 use super::{workspace, SuccessPathContext};
+
+fn maybe_activate_discoverable_tools_from_tool_search(
+    session: &mut crate::agent::core::Session,
+    tool_name: &str,
+    result: &crate::agent::core::tools::ToolResult,
+) {
+    if !result.success || !tool_name.eq_ignore_ascii_case("tool_search") {
+        return;
+    }
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&result.result) else {
+        return;
+    };
+    let Some(results) = value.get("results").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+
+    let tool_names = results
+        .iter()
+        .filter_map(|item| item.get("name").and_then(serde_json::Value::as_str));
+    activate_discoverable_tools(session, tool_names);
+}
 
 pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -> bool {
     let ctx = ctx;
@@ -85,6 +108,12 @@ pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -
             "duration_ms": ctx.tool_duration.as_millis(),
             "success": ctx.result.success,
         })
+    );
+
+    maybe_activate_discoverable_tools_from_tool_search(
+        ctx.session,
+        &ctx.tool_call.function.name,
+        ctx.result,
     );
 
     let outcome = handle_tool_result_with_agentic_support(

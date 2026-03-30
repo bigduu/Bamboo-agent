@@ -170,6 +170,7 @@ mod tests {
                     session_id: Some(&session),
                     tool_call_id: "call_1",
                     event_tx: None,
+                    available_tool_schemas: None,
                 },
             )
             .await
@@ -196,6 +197,7 @@ mod tests {
                     session_id: Some(&session),
                     tool_call_id: "call_1",
                     event_tx: None,
+                    available_tool_schemas: None,
                 },
             )
             .await
@@ -210,6 +212,7 @@ mod tests {
                     session_id: Some(&session),
                     tool_call_id: "call_2",
                     event_tx: None,
+                    available_tool_schemas: None,
                 },
             )
             .await
@@ -232,6 +235,7 @@ mod tests {
                     session_id: Some("session_1"),
                     tool_call_id: "call_1",
                     event_tx: None,
+                    available_tool_schemas: None,
                 },
             )
             .await

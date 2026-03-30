@@ -29,6 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::agent::core::tools::ToolSchema;
+use crate::agent::tools::exposure::{canonical_tool_name, is_core_tool};
 use serde::{Deserialize, Serialize};
 
 pub mod builtin_guides;
@@ -396,67 +397,78 @@ impl EnhancedPromptBuilder {
     ) -> String {
         let guides = Self::collect_guides(registry, tool_names);
 
-        if guides.is_empty() {
-            return Self::render_schema_only_section(fallback_schemas, context, true);
-        }
+        let (core_guides, discoverable_guides): (Vec<ToolGuideSpec>, Vec<ToolGuideSpec>) = guides
+            .into_iter()
+            .partition(|guide| is_core_tool(&canonical_tool_name(&guide.tool_name)));
 
         let mut output = String::from("## Tool Usage Guidelines\n");
-        let mut grouped: BTreeMap<ToolCategory, Vec<&ToolGuideSpec>> = BTreeMap::new();
+        let mut rendered_any = false;
 
-        for guide in &guides {
-            grouped.entry(guide.category).or_default().push(guide);
-        }
+        if !core_guides.is_empty() {
+            rendered_any = true;
+            let mut grouped: BTreeMap<ToolCategory, Vec<&ToolGuideSpec>> = BTreeMap::new();
+            for guide in &core_guides {
+                grouped.entry(guide.category).or_default().push(guide);
+            }
 
-        for guides in grouped.values_mut() {
-            guides.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
-        }
+            for guides in grouped.values_mut() {
+                guides.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+            }
 
-        for category in ToolCategory::ordered() {
-            let Some(category_guides) = grouped.get(category) else {
-                continue;
-            };
+            for category in ToolCategory::ordered() {
+                let Some(category_guides) = grouped.get(category) else {
+                    continue;
+                };
 
-            output.push_str(&format!("\n### {}\n", category.title(context.language)));
-            output.push_str(category.description(context.language));
-            output.push('\n');
+                output.push_str(&format!("\n### {}\n", category.title(context.language)));
+                output.push_str(category.description(context.language));
+                output.push('\n');
 
-            for guide in category_guides {
-                output.push_str(&format!("\n**{}**\n", guide.tool_name));
-                output.push_str(&format!(
-                    "- {}: {}\n",
-                    when_to_use_label(context.language),
-                    guide.when_to_use
-                ));
-                output.push_str(&format!(
-                    "- {}: {}\n",
-                    when_not_to_use_label(context.language),
-                    guide.when_not_to_use
-                ));
-
-                for example in guide.examples.iter().take(context.max_examples_per_tool) {
-                    let params = serde_json::to_string(&example.parameters)
-                        .unwrap_or_else(|_| "{}".to_string());
-                    output.push_str(&format!(
-                        "- {}: {}\n  -> {}\n",
-                        example_label(context.language),
-                        params,
-                        example.explanation
-                    ));
-                }
-
-                if !guide.related_tools.is_empty() {
+                for guide in category_guides {
+                    output.push_str(&format!("\n**{}**\n", guide.tool_name));
                     output.push_str(&format!(
                         "- {}: {}\n",
-                        related_tools_label(context.language),
-                        guide.related_tools.join(", ")
+                        when_to_use_label(context.language),
+                        guide.when_to_use
                     ));
+                    output.push_str(&format!(
+                        "- {}: {}\n",
+                        when_not_to_use_label(context.language),
+                        guide.when_not_to_use
+                    ));
+
+                    for example in guide.examples.iter().take(context.max_examples_per_tool) {
+                        let params = serde_json::to_string(&example.parameters)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        output.push_str(&format!(
+                            "- {}: {}\n  -> {}\n",
+                            example_label(context.language),
+                            params,
+                            example.explanation
+                        ));
+                    }
+
+                    if !guide.related_tools.is_empty() {
+                        output.push_str(&format!(
+                            "- {}: {}\n",
+                            related_tools_label(context.language),
+                            guide.related_tools.join(", ")
+                        ));
+                    }
                 }
             }
         }
 
-        let guided_names: BTreeSet<&str> = guides
+        if !discoverable_guides.is_empty() {
+            rendered_any = true;
+            output.push('\n');
+            output.push_str(&Self::render_discoverable_section(&discoverable_guides, context));
+        }
+
+        let guided_names: BTreeSet<String> = core_guides
             .iter()
-            .map(|guide| guide.tool_name.as_str())
+            .chain(discoverable_guides.iter())
+            .map(|guide| guide.tool_name.clone())
             .collect();
         let unguided_schemas: Vec<ToolSchema> = fallback_schemas
             .iter()
@@ -465,12 +477,17 @@ impl EnhancedPromptBuilder {
             .collect();
 
         if !unguided_schemas.is_empty() {
+            rendered_any = true;
             output.push('\n');
             output.push_str(&Self::render_schema_only_section(
                 &unguided_schemas,
                 context,
                 false,
             ));
+        }
+
+        if !rendered_any {
+            return Self::render_schema_only_section(fallback_schemas, context, true);
         }
 
         if context.include_best_practices {
@@ -511,6 +528,32 @@ impl EnhancedPromptBuilder {
 
         guides.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
         guides
+    }
+
+    /// Renders a compact summary for discoverable tools.
+    fn render_discoverable_section(
+        guides: &[ToolGuideSpec],
+        context: &GuideBuildContext,
+    ) -> String {
+        if guides.is_empty() {
+            return String::new();
+        }
+
+        let mut sorted = guides.to_vec();
+        sorted.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+
+        let mut output = String::new();
+        output.push_str(&format!("### {}\n", discoverable_tools_title(context.language)));
+        output.push_str(discoverable_tools_description(context.language));
+        output.push('\n');
+        for guide in sorted {
+            output.push_str(&format!("- `{}`: {}\n", guide.tool_name, guide.when_to_use));
+        }
+        output.push_str(&format!(
+            "Use `tool_search` {}\n",
+            discoverable_tools_call_to_action(context.language)
+        ));
+        output
     }
 
     /// Renders a section listing tools by schema only (no detailed guides)
@@ -588,6 +631,34 @@ fn best_practices_title(language: GuideLanguage) -> &'static str {
     }
 }
 
+/// Returns the discoverable-tools section title in the appropriate language
+fn discoverable_tools_title(language: GuideLanguage) -> &'static str {
+    match language {
+        GuideLanguage::Chinese => "Discoverable Tools",
+        GuideLanguage::English => "Discoverable Tools",
+    }
+}
+
+/// Returns the discoverable-tools section description in the appropriate language
+fn discoverable_tools_description(language: GuideLanguage) -> &'static str {
+    match language {
+        GuideLanguage::Chinese => {
+            "These lower-frequency tools are available but not fully expanded by default to save context."
+        }
+        GuideLanguage::English => {
+            "These lower-frequency tools are available but not fully expanded by default to save context."
+        }
+    }
+}
+
+/// Returns the discoverable-tools call to action in the appropriate language
+fn discoverable_tools_call_to_action(language: GuideLanguage) -> &'static str {
+    match language {
+        GuideLanguage::Chinese => "to discover and choose the right one when needed.",
+        GuideLanguage::English => "to discover and choose the right one when needed.",
+    }
+}
+
 /// Returns the "Additional Tools (Schema Only)" title in the appropriate language
 fn schema_only_title(language: GuideLanguage) -> &'static str {
     match language {
@@ -606,13 +677,108 @@ fn schema_only_description(language: GuideLanguage) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use serde_json::json;
 
-    use crate::agent::core::tools::{FunctionSchema, ToolSchema};
+    use crate::agent::core::tools::{FunctionSchema, ToolExecutor, ToolSchema};
+    use crate::agent::tools::{BuiltinToolExecutor, tools::{ReadTool, ToolRegistry}};
 
-    use crate::agent::tools::tools::{ReadTool, ToolRegistry};
+    use super::{
+        context::GuideBuildContext,
+        context::GuideLanguage,
+        EnhancedPromptBuilder,
+        ToolCategory,
+        ToolGuideSpec,
+    };
 
-    use super::{context::GuideBuildContext, context::GuideLanguage, EnhancedPromptBuilder};
+    fn render_legacy_full_prompt(schemas: &[ToolSchema], context: &GuideBuildContext) -> String {
+        let tool_names: Vec<String> = schemas.iter().map(|schema| schema.function.name.clone()).collect();
+        let guides = EnhancedPromptBuilder::collect_guides(None, &tool_names);
+
+        if guides.is_empty() {
+            return EnhancedPromptBuilder::render_schema_only_section(schemas, context, true);
+        }
+
+        let mut output = String::from("## Tool Usage Guidelines\n");
+        let mut grouped: BTreeMap<ToolCategory, Vec<&ToolGuideSpec>> = BTreeMap::new();
+
+        for guide in &guides {
+            grouped.entry(guide.category).or_default().push(guide);
+        }
+
+        for guides in grouped.values_mut() {
+            guides.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+        }
+
+        for category in ToolCategory::ordered() {
+            let Some(category_guides) = grouped.get(category) else {
+                continue;
+            };
+
+            output.push_str(&format!("\n### {}\n", category.title(context.language)));
+            output.push_str(category.description(context.language));
+            output.push('\n');
+
+            for guide in category_guides {
+                output.push_str(&format!("\n**{}**\n", guide.tool_name));
+                output.push_str(&format!(
+                    "- {}: {}\n",
+                    super::when_to_use_label(context.language),
+                    guide.when_to_use
+                ));
+                output.push_str(&format!(
+                    "- {}: {}\n",
+                    super::when_not_to_use_label(context.language),
+                    guide.when_not_to_use
+                ));
+
+                for example in guide.examples.iter().take(context.max_examples_per_tool) {
+                    let params = serde_json::to_string(&example.parameters)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    output.push_str(&format!(
+                        "- {}: {}\n  -> {}\n",
+                        super::example_label(context.language),
+                        params,
+                        example.explanation
+                    ));
+                }
+
+                if !guide.related_tools.is_empty() {
+                    output.push_str(&format!(
+                        "- {}: {}\n",
+                        super::related_tools_label(context.language),
+                        guide.related_tools.join(", ")
+                    ));
+                }
+            }
+        }
+
+        let guided_names: BTreeSet<&str> = guides.iter().map(|guide| guide.tool_name.as_str()).collect();
+        let unguided_schemas: Vec<ToolSchema> = schemas
+            .iter()
+            .filter(|schema| !guided_names.contains(schema.function.name.as_str()))
+            .cloned()
+            .collect();
+
+        if !unguided_schemas.is_empty() {
+            output.push('\n');
+            output.push_str(&EnhancedPromptBuilder::render_schema_only_section(
+                &unguided_schemas,
+                context,
+                false,
+            ));
+        }
+
+        if context.include_best_practices {
+            output.push_str(&format!("\n### {}\n", super::best_practices_title(context.language)));
+            for (index, rule) in context.best_practices().iter().enumerate() {
+                output.push_str(&format!("{}. {}\n", index + 1, rule));
+            }
+        }
+
+        output
+    }
 
     #[test]
     fn build_renders_builtin_guides() {
@@ -646,5 +812,45 @@ mod tests {
 
         assert!(prompt.contains("Additional Tools (Schema Only)"));
         assert!(prompt.contains("dynamic_tool"));
+    }
+
+    #[test]
+    fn build_summarizes_discoverable_tools() {
+        let registry = ToolRegistry::new();
+        registry.register(ReadTool::new()).unwrap();
+        registry
+            .register(crate::agent::tools::tools::SleepTool::new())
+            .unwrap();
+
+        let schemas = registry.list_tools();
+        let prompt =
+            EnhancedPromptBuilder::build(Some(&registry), &schemas, &GuideBuildContext::default());
+
+        assert!(prompt.contains("### Discoverable Tools"));
+        assert!(prompt.contains("`Sleep`"));
+        assert!(prompt.contains("Use `tool_search`"));
+        assert!(!prompt.contains("**Sleep**"));
+    }
+
+    #[test]
+    fn build_reduces_prompt_length_vs_legacy_full_guides_for_builtin_surface() {
+        let executor = BuiltinToolExecutor::new();
+        let schemas = executor.list_tools();
+        let context = GuideBuildContext::default();
+
+        let legacy = render_legacy_full_prompt(&schemas, &context);
+        let current = EnhancedPromptBuilder::build(None, &schemas, &context);
+
+        assert!(current.len() < legacy.len());
+        let saved = legacy.len() - current.len();
+        let saved_ratio = saved as f64 / legacy.len() as f64;
+        eprintln!(
+            "guide_length_metrics: legacy={}, current={}, saved={}, saved_ratio={:.3}",
+            legacy.len(),
+            current.len(),
+            saved,
+            saved_ratio,
+        );
+        assert!(saved > 0, "expected prompt savings for summarized discoverable tools");
     }
 }

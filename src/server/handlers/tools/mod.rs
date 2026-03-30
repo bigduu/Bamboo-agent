@@ -111,6 +111,7 @@ pub async fn execute_tool(
     let args = request::parse_arguments(parameters);
     let call = request::build_tool_call(canonical_tool_name, args)?;
 
+    let available_tool_schemas = app_state.tools.list_tools();
     let result = app_state
         .tools
         .execute_with_context(
@@ -119,6 +120,7 @@ pub async fn execute_tool(
                 session_id,
                 tool_call_id: &call.id,
                 event_tx: None,
+                available_tool_schemas: Some(available_tool_schemas.as_slice()),
             },
         )
         .await

@@ -45,7 +45,7 @@ impl Tool for MemoryNoteTool {
     }
 
     fn description(&self) -> &str {
-        "Read or update the persistent per-session memory note (markdown). Use this to store durable facts/preferences/decisions across turns. Hard limit: 12000 characters; compress before append/replace if needed."
+        "Read or update the persistent session-scoped note (markdown). Use this for durable local context, user preferences, constraints, and compression-resistant reminders within the current session/workstream. Do not use it as the primary long-term knowledge base. Hard limit: 12000 characters; compress before append/replace if needed."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -314,6 +314,7 @@ mod tests {
             session_id: Some("session-1"),
             tool_call_id: "tool_call",
             event_tx: None,
+                    available_tool_schemas: None,
         };
 
         let unknown = tool

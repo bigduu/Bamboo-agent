@@ -63,8 +63,10 @@ pub(super) fn requires_session_context(tool_name: &str) -> bool {
             | "Task"
             | "SubSession"
             | "memory_note"
+            | "scheduler"
             | "schedule_tasks"
             | "sub_session_manager"
+            | "recall"
             | "session_inspector"
     )
 }
