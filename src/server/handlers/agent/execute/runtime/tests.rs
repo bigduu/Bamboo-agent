@@ -4,7 +4,10 @@ use crate::{
 };
 
 use super::{
-    execution::{status_from_execution_result, terminal_error_event_for_result},
+    execution::{
+        preserve_concurrent_session_overrides, status_from_execution_result,
+        terminal_error_event_for_result,
+    },
     session_state::{
         consume_pending_conclusion_with_options_resume, has_pending_user_message,
         initial_user_message_for_session, selected_skill_ids_for_session,
@@ -148,4 +151,47 @@ fn terminal_error_event_mapping_matches_execution_result() {
         Some(AgentEvent::Error { message }) => assert!(message.contains("network failed")),
         other => panic!("unexpected event: {other:?}"),
     }
+}
+
+#[test]
+fn preserve_concurrent_session_overrides_applies_latest_title_and_pin_when_unchanged_in_execution()
+{
+    let mut running_snapshot = Session::new("session-1", "gpt-4o-mini");
+    running_snapshot.title = "New Session".to_string();
+    running_snapshot.pinned = false;
+
+    let mut latest_persisted = running_snapshot.clone();
+    latest_persisted.title = "Debug websocket reconnect issue".to_string();
+    latest_persisted.pinned = true;
+
+    preserve_concurrent_session_overrides(
+        &mut running_snapshot,
+        &latest_persisted,
+        "New Session",
+        false,
+    );
+
+    assert_eq!(running_snapshot.title, latest_persisted.title);
+    assert!(running_snapshot.pinned);
+}
+
+#[test]
+fn preserve_concurrent_session_overrides_keeps_execution_changes() {
+    let mut running_snapshot = Session::new("session-1", "gpt-4o-mini");
+    running_snapshot.title = "Execution-assigned title".to_string();
+    running_snapshot.pinned = true;
+
+    let mut latest_persisted = running_snapshot.clone();
+    latest_persisted.title = "User edited title".to_string();
+    latest_persisted.pinned = false;
+
+    preserve_concurrent_session_overrides(
+        &mut running_snapshot,
+        &latest_persisted,
+        "New Session",
+        false,
+    );
+
+    assert_eq!(running_snapshot.title, "Execution-assigned title");
+    assert!(running_snapshot.pinned);
 }

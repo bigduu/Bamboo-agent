@@ -164,3 +164,34 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     assert_eq!(cfg["https_proxy"], "http://proxy:8080");
     assert!(cfg.get("setup").is_some(), "expected setup to still exist");
 }
+
+#[actix_web::test]
+async fn test_bamboo_config_persists_disabled_skills() {
+    let state = crate::e2e::common::create_test_app().await;
+    let data_dir = state.app_data_dir.clone();
+    let config_path = data_dir.join("config.json");
+
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    let req = test::TestRequest::post()
+        .uri("/v1/bamboo/config")
+        .set_json(&json!({
+            "skills": {
+                "disabled": [" pdf ", "skill-creator", "pdf"]
+            }
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert!(resp.status().is_success());
+
+    let cfg = read_config_json(&config_path);
+    assert_eq!(
+        cfg["skills"]["disabled"],
+        json!(["pdf", "skill-creator"])
+    );
+}

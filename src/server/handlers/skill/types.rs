@@ -12,6 +12,7 @@ pub(super) struct SkillListResponse {
 pub struct ListSkillsQuery {
     pub(super) search: Option<String>,
     pub(super) refresh: Option<bool>,
+    pub(super) include_disabled: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -81,6 +82,17 @@ mod tests {
 
         assert_eq!(query.search, Some("workflow".to_string()));
         assert_eq!(query.refresh, Some(true));
+        assert_eq!(query.include_disabled, None);
+    }
+
+    #[test]
+    fn test_list_skills_query_with_include_disabled() {
+        let json = r#"{"search":"workflow","refresh":true,"include_disabled":true}"#;
+        let query: ListSkillsQuery = serde_json::from_str(json).unwrap();
+
+        assert_eq!(query.search, Some("workflow".to_string()));
+        assert_eq!(query.refresh, Some(true));
+        assert_eq!(query.include_disabled, Some(true));
     }
 
     #[test]

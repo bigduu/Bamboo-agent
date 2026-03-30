@@ -8,6 +8,7 @@ pub(super) async fn load_skill_context(
     if let Some(skill_manager) = config.skill_manager.as_ref() {
         let context = skill_manager
             .build_skill_context_for_request_with_mode(
+                &config.disabled_skill_ids,
                 config.selected_skill_ids.as_deref(),
                 config.selected_skill_mode.as_deref(),
                 Some(request_hint),

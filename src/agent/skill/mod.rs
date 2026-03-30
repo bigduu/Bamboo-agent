@@ -8,7 +8,7 @@ pub mod types;
 pub use store::{SkillStore, SkillUpdate};
 pub use types::*;
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 const MAX_UNSELECTED_SKILLS_IN_CONTEXT: usize = 24;
@@ -123,6 +123,20 @@ fn shortlist_skills_for_context(
     selected
 }
 
+fn filter_disabled_skills(
+    skills: Vec<SkillDefinition>,
+    disabled_skill_ids: &BTreeSet<String>,
+) -> Vec<SkillDefinition> {
+    if disabled_skill_ids.is_empty() {
+        return skills;
+    }
+
+    skills
+        .into_iter()
+        .filter(|skill| !disabled_skill_ids.contains(&skill.id))
+        .collect()
+}
+
 /// Skill manager instance (convenience wrapper around SkillStore).
 #[derive(Clone)]
 pub struct SkillManager {
@@ -156,6 +170,7 @@ impl SkillManager {
 
     async fn list_skills_for_selection(
         &self,
+        disabled_skill_ids: &BTreeSet<String>,
         selected_skill_ids: Option<&[String]>,
         selected_skill_mode: Option<&str>,
     ) -> Vec<SkillDefinition> {
@@ -167,6 +182,7 @@ impl SkillManager {
         } else {
             self.store.list_skills(None, true).await
         };
+        let skills = filter_disabled_skills(skills, disabled_skill_ids);
         let Some(selected_skill_ids) = selected_skill_ids else {
             return skills;
         };
@@ -205,19 +221,22 @@ impl SkillManager {
     /// Build system prompt context from a selected subset of skills.
     pub async fn build_skill_context_for_selection(
         &self,
+        disabled_skill_ids: &BTreeSet<String>,
         selected_skill_ids: Option<&[String]>,
     ) -> String {
-        self.build_skill_context_for_request_with_mode(selected_skill_ids, None, None)
+        self.build_skill_context_for_request_with_mode(disabled_skill_ids, selected_skill_ids, None, None)
             .await
     }
 
     /// Build system prompt context from a selected subset of skills with mode override.
     pub async fn build_skill_context_for_selection_with_mode(
         &self,
+        disabled_skill_ids: &BTreeSet<String>,
         selected_skill_ids: Option<&[String]>,
         selected_skill_mode: Option<&str>,
     ) -> String {
         self.build_skill_context_for_request_with_mode(
+            disabled_skill_ids,
             selected_skill_ids,
             selected_skill_mode,
             None,
@@ -228,12 +247,13 @@ impl SkillManager {
     /// Build system prompt context from a selected subset of skills with mode and user request hint.
     pub async fn build_skill_context_for_request_with_mode(
         &self,
+        disabled_skill_ids: &BTreeSet<String>,
         selected_skill_ids: Option<&[String]>,
         selected_skill_mode: Option<&str>,
         request_hint: Option<&str>,
     ) -> String {
         let mut skills = self
-            .list_skills_for_selection(selected_skill_ids, selected_skill_mode)
+            .list_skills_for_selection(disabled_skill_ids, selected_skill_ids, selected_skill_mode)
             .await;
 
         if selected_skill_ids.is_none() {
@@ -265,27 +285,33 @@ impl SkillManager {
     }
 
     /// Build system prompt context from all skills.
-    pub async fn build_skill_context(&self, _chat_id: Option<&str>) -> String {
-        self.build_skill_context_for_selection(None).await
+    pub async fn build_skill_context(
+        &self,
+        disabled_skill_ids: &BTreeSet<String>,
+        _chat_id: Option<&str>,
+    ) -> String {
+        self.build_skill_context_for_selection(disabled_skill_ids, None).await
     }
 
     /// Get allowed tool refs from a selected subset of skills.
     pub async fn get_allowed_tools_for_selection(
         &self,
+        disabled_skill_ids: &BTreeSet<String>,
         selected_skill_ids: Option<&[String]>,
     ) -> Vec<String> {
-        self.get_allowed_tools_for_selection_with_mode(selected_skill_ids, None)
+        self.get_allowed_tools_for_selection_with_mode(disabled_skill_ids, selected_skill_ids, None)
             .await
     }
 
     /// Get allowed tool refs from a selected subset of skills with mode override.
     pub async fn get_allowed_tools_for_selection_with_mode(
         &self,
+        disabled_skill_ids: &BTreeSet<String>,
         selected_skill_ids: Option<&[String]>,
         selected_skill_mode: Option<&str>,
     ) -> Vec<String> {
         let skills = self
-            .list_skills_for_selection(selected_skill_ids, selected_skill_mode)
+            .list_skills_for_selection(disabled_skill_ids, selected_skill_ids, selected_skill_mode)
             .await;
 
         let mut tools: Vec<String> = skills
@@ -300,8 +326,12 @@ impl SkillManager {
     }
 
     /// Get allowed tool refs from all skills.
-    pub async fn get_allowed_tools(&self, _chat_id: Option<&str>) -> Vec<String> {
-        self.get_allowed_tools_for_selection(None).await
+    pub async fn get_allowed_tools(
+        &self,
+        disabled_skill_ids: &BTreeSet<String>,
+        _chat_id: Option<&str>,
+    ) -> Vec<String> {
+        self.get_allowed_tools_for_selection(disabled_skill_ids, None).await
     }
 }
 
@@ -313,7 +343,11 @@ impl Default for SkillManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{shortlist_skills_for_context, tokenize_request_hint, SkillDefinition};
+    use std::collections::BTreeSet;
+
+    use super::{
+        filter_disabled_skills, shortlist_skills_for_context, tokenize_request_hint, SkillDefinition,
+    };
 
     fn demo_skill(id: &str, description: &str) -> SkillDefinition {
         SkillDefinition::new(id, id, description, "prompt")
@@ -347,5 +381,16 @@ mod tests {
         assert!(shortlisted
             .iter()
             .any(|skill| skill.id == "react-optimizer"));
+    }
+
+    #[test]
+    fn filter_disabled_skills_removes_matching_skill_ids() {
+        let skills = vec![demo_skill("pdf", "pdf helper"), demo_skill("pptx", "ppt helper")];
+        let disabled: BTreeSet<String> = ["pdf".to_string()].into_iter().collect();
+
+        let filtered = filter_disabled_skills(skills, &disabled);
+        let ids: Vec<&str> = filtered.iter().map(|skill| skill.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["pptx"]);
     }
 }

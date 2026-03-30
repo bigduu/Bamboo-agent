@@ -59,6 +59,39 @@ fn build_enhanced_system_prompt_appends_workspace_context_before_skills() {
 }
 
 #[test]
+fn build_workspace_context_includes_prompt_safe_env_metadata_without_secret_values() {
+    let config = crate::core::Config {
+        env_vars: vec![
+            crate::core::EnvVarEntry {
+                name: "OPENAI_API_KEY".to_string(),
+                value: "super-secret-value".to_string(),
+                secret: true,
+                value_encrypted: None,
+                description: Some("OpenAI credential".to_string()),
+            },
+            crate::core::EnvVarEntry {
+                name: "INTERNAL_API_BASE".to_string(),
+                value: "https://internal.example".to_string(),
+                secret: false,
+                value_encrypted: None,
+                description: Some("Internal API endpoint".to_string()),
+            },
+        ],
+        ..crate::core::Config::default()
+    };
+    config.publish_env_vars();
+
+    let prompt = build_enhanced_system_prompt("Base prompt", None, Some("/tmp/workspace"));
+    assert!(prompt.contains("OPENAI_API_KEY"));
+    assert!(prompt.contains("INTERNAL_API_BASE"));
+    assert!(prompt.contains("OpenAI credential"));
+    assert!(prompt.contains("Internal API endpoint"));
+    assert!(prompt.contains("secret"));
+    assert!(!prompt.contains("super-secret-value"));
+    assert!(!prompt.contains("https://internal.example"));
+}
+
+#[test]
 fn build_enhanced_system_prompt_ignores_empty_enhancement() {
     let prompt = build_enhanced_system_prompt("Base prompt", Some("   "), None);
     assert_eq!(prompt, "Base prompt");

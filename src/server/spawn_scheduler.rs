@@ -278,6 +278,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
 
         let config_snapshot = ctx.config.read().await.clone();
         let disabled_tools = config_snapshot.disabled_tool_names();
+        let disabled_skill_ids = config_snapshot.disabled_skill_ids();
         let provider_name = config_snapshot.provider.clone();
 
         session.model = model.clone();
@@ -301,6 +302,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
                 model_name: Some(model),
                 provider_name: Some(provider_name),
                 disabled_tools,
+                disabled_skill_ids,
                 ..Default::default()
             },
         )

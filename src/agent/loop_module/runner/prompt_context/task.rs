@@ -30,7 +30,7 @@ pub(super) fn inject_task_list_into_system_message(session: &mut Session) {
                     task_context.trim(),
                 );
             }
-            tracing::info!(
+            tracing::debug!(
                 "Injected task list into system message ({} chars)",
                 task_context.len()
             );
@@ -46,7 +46,7 @@ pub(super) fn inject_task_list_into_system_message(session: &mut Session) {
                 task_context.trim()
             )),
         );
-        tracing::info!(
+        tracing::debug!(
             "Created system message with task list ({} chars)",
             task_context.len()
         );

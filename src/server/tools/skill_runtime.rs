@@ -12,6 +12,7 @@ use crate::agent::core::storage::Storage;
 use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use crate::agent::core::Session;
 use crate::agent::skill::SkillManager;
+use crate::core::Config;
 
 const SELECTED_SKILL_IDS_METADATA_KEY: &str = "selected_skill_ids";
 const SELECTED_SKILL_MODE_METADATA_KEY: &str = "skill_mode";
@@ -52,6 +53,7 @@ fn serialize_loaded_skill_ids(ids: &HashSet<String>) -> String {
 #[derive(Clone)]
 struct SkillToolAccess {
     skill_manager: Arc<SkillManager>,
+    config: Arc<RwLock<Config>>,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     storage: Arc<dyn Storage>,
 }
@@ -59,11 +61,13 @@ struct SkillToolAccess {
 impl SkillToolAccess {
     fn new(
         skill_manager: Arc<SkillManager>,
+        config: Arc<RwLock<Config>>,
         sessions: Arc<RwLock<HashMap<String, Session>>>,
         storage: Arc<dyn Storage>,
     ) -> Self {
         Self {
             skill_manager,
+            config,
             sessions,
             storage,
         }
@@ -115,6 +119,16 @@ impl SkillToolAccess {
         skill_id: &str,
         session_id: Option<&str>,
     ) -> Result<(), ToolError> {
+        let disabled_skill_ids = {
+            let config = self.config.read().await;
+            config.disabled_skill_ids()
+        };
+        if disabled_skill_ids.contains(skill_id) {
+            return Err(ToolError::Execution(format!(
+                "Skill '{skill_id}' is globally disabled in Bamboo settings"
+            )));
+        }
+
         let Some(allowlist) = self.selected_skill_allowlist(session_id).await else {
             return Ok(());
         };
@@ -250,11 +264,12 @@ pub struct LoadSkillTool {
 impl LoadSkillTool {
     pub fn new(
         skill_manager: Arc<SkillManager>,
+        config: Arc<RwLock<Config>>,
         sessions: Arc<RwLock<HashMap<String, Session>>>,
         storage: Arc<dyn Storage>,
     ) -> Self {
         Self {
-            access: SkillToolAccess::new(skill_manager, sessions, storage),
+            access: SkillToolAccess::new(skill_manager, config, sessions, storage),
         }
     }
 }
@@ -366,11 +381,12 @@ pub struct ReadSkillResourceTool {
 impl ReadSkillResourceTool {
     pub fn new(
         skill_manager: Arc<SkillManager>,
+        config: Arc<RwLock<Config>>,
         sessions: Arc<RwLock<HashMap<String, Session>>>,
         storage: Arc<dyn Storage>,
     ) -> Self {
         Self {
-            access: SkillToolAccess::new(skill_manager, sessions, storage),
+            access: SkillToolAccess::new(skill_manager, config, sessions, storage),
         }
     }
 }
@@ -635,10 +651,19 @@ fn display_relative_path(path: &Path) -> String {
 mod tests {
     use super::{
         normalize_relative_resource_path, page_text_lines, parse_loaded_skill_ids,
-        serialize_loaded_skill_ids, truncate_text,
+        serialize_loaded_skill_ids, truncate_text, LoadSkillTool,
     };
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::path::Path;
+    use std::sync::Arc;
+
+    use tokio::sync::RwLock;
+
+    use crate::agent::core::storage::Storage;
+    use crate::agent::core::tools::{Tool, ToolExecutionContext};
+    use crate::agent::core::{AgentEvent, Session};
+    use crate::agent::skill::{SkillManager, SkillStoreConfig};
+    use crate::core::Config;
 
     #[test]
     fn normalize_relative_resource_path_rejects_invalid_paths() {
@@ -697,5 +722,99 @@ mod tests {
         ids.insert("skill-a".to_string());
 
         assert_eq!(serialize_loaded_skill_ids(&ids), r#"["skill-a","skill-b"]"#);
+    }
+
+    #[derive(Default)]
+    struct TestStorage {
+        sessions: RwLock<HashMap<String, Session>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for TestStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.sessions
+                .write()
+                .await
+                .insert(session.id.clone(), session.clone());
+            Ok(())
+        }
+
+        async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+            Ok(self.sessions.read().await.get(session_id).cloned())
+        }
+
+        async fn append_event(&self, _session_id: &str, _event: &AgentEvent) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn load_events(&self, _session_id: &str) -> std::io::Result<Vec<AgentEvent>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
+            Ok(self.sessions.write().await.remove(session_id).is_some())
+        }
+    }
+
+    #[tokio::test]
+    async fn load_skill_rejects_globally_disabled_skill() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let skill_dir = temp_dir.path().join("skills").join("demo-skill");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: Demo Skill
+description: Demo description
+---
+Use this demo skill."#,
+        )
+        .expect("skill file should be written");
+
+        let skill_manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+            skills_dir: temp_dir.path().join("skills"),
+            project_dir: None,
+            active_mode: None,
+        }));
+        skill_manager
+            .initialize()
+            .await
+            .expect("skill manager should initialize");
+
+        let config = Arc::new(RwLock::new(Config::default()));
+        {
+            let mut cfg = config.write().await;
+            cfg.skills.disabled = vec!["demo-skill".to_string()];
+            cfg.normalize_skill_settings();
+        }
+
+        let session_id = "session-1";
+        let session = Session::new(session_id, "model");
+        let sessions = Arc::new(RwLock::new(HashMap::from([(
+            session_id.to_string(),
+            session.clone(),
+        )])));
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        storage
+            .save_session(&session)
+            .await
+            .expect("session should be saved");
+
+        let tool = LoadSkillTool::new(skill_manager, config, sessions, storage);
+        let ctx = ToolExecutionContext {
+            session_id: Some(session_id),
+            tool_call_id: "tool-call-1",
+            event_tx: None,
+            available_tool_schemas: None,
+        };
+
+        let error = tool
+            .execute_with_context(serde_json::json!({ "skill_id": "demo-skill" }), ctx)
+            .await
+            .expect_err("disabled skill should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("globally disabled in Bamboo settings"));
     }
 }

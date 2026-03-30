@@ -6,6 +6,10 @@ use super::super::prompt_context::{
 
 const CONTEXT_COMPRESSION_PROMPT_START: &str = "<!-- BAMBOO_CONTEXT_COMPRESSION_TOOL_START -->";
 const CONTEXT_COMPRESSION_PROMPT_END: &str = "<!-- BAMBOO_CONTEXT_COMPRESSION_TOOL_END -->";
+const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
+const EXTERNAL_MEMORY_END_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_END -->";
+const TASK_LIST_START_MARKER: &str = "<!-- BAMBOO_TASK_LIST_START -->";
+const TASK_LIST_END_MARKER: &str = "<!-- BAMBOO_TASK_LIST_END -->";
 
 pub(super) async fn refresh_round_prompt_context(session: &mut Session) {
     // Load/refresh persistent memory note for this round.
@@ -14,13 +18,55 @@ pub(super) async fn refresh_round_prompt_context(session: &mut Session) {
     // Inject task list into system message at the start of each round.
     inject_task_list_into_system_message(session);
 
+    let session_id = session.id.clone();
     if let Some(system_message) = session
         .messages
         .iter_mut()
         .find(|message| matches!(message.role, Role::System))
     {
         system_message.content = strip_context_compression_prompt(&system_message.content);
+        log_round_prompt_refresh_summary(session_id.as_str(), &system_message.content);
     }
+}
+
+fn log_round_prompt_refresh_summary(session_id: &str, prompt: &str) {
+    let external_memory_len = wrapped_section_len(
+        prompt,
+        EXTERNAL_MEMORY_START_MARKER,
+        EXTERNAL_MEMORY_END_MARKER,
+    );
+    let task_list_len = wrapped_section_len(prompt, TASK_LIST_START_MARKER, TASK_LIST_END_MARKER);
+
+    tracing::info!(
+        "[{}] Round prompt refresh summary: effective_len={} chars, has_external_memory={}, external_memory_len={}, has_task_list={}, task_list_len={}",
+        session_id,
+        prompt.len(),
+        external_memory_len > 0,
+        external_memory_len,
+        task_list_len > 0,
+        task_list_len,
+    );
+
+    tracing::debug!(
+        "[{}] ========== EFFECTIVE MODEL SYSTEM PROMPT AFTER ROUND REFRESH ==========" ,
+        session_id
+    );
+    tracing::debug!("[{}] {}", session_id, prompt);
+    tracing::debug!(
+        "[{}] ========== END EFFECTIVE MODEL SYSTEM PROMPT AFTER ROUND REFRESH ==========" ,
+        session_id
+    );
+}
+
+fn wrapped_section_len(prompt: &str, start_marker: &str, end_marker: &str) -> usize {
+    let Some(start_idx) = prompt.find(start_marker) else {
+        return 0;
+    };
+    let section_start = start_idx + start_marker.len();
+    let Some(end_rel_idx) = prompt[section_start..].find(end_marker) else {
+        return 0;
+    };
+    prompt[section_start..section_start + end_rel_idx].trim().len()
 }
 
 fn strip_context_compression_prompt(prompt: &str) -> String {

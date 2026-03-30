@@ -111,15 +111,49 @@ pub fn workspace_prompt_guidance() -> String {
     )
 }
 
+fn build_env_prompt_guidance() -> Option<String> {
+    let env_vars = crate::core::Config::current_prompt_safe_env_vars();
+    if env_vars.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    lines.push("Configured environment variables already available to Bash processes and may be relevant for skills/tools:".to_string());
+    lines.push("- Secret values are intentionally hidden from the model.".to_string());
+    lines.push(
+        "- Do not ask the user to re-provide these values unless truly necessary.".to_string(),
+    );
+
+    for entry in env_vars {
+        let visibility = if entry.secret { "secret" } else { "non-secret" };
+        let mut line = format!("- {} ({})", entry.name, visibility);
+        if let Some(description) = entry.description {
+            line.push_str(" — ");
+            line.push_str(&description);
+        }
+        lines.push(line);
+    }
+
+    Some(lines.join("\n"))
+}
+
 pub fn build_workspace_prompt_context(workspace_path: &str) -> Option<String> {
     let workspace_path = workspace_path.trim();
     if workspace_path.is_empty() {
         return None;
     }
 
-    Some(format!(
-        "{WORKSPACE_CONTEXT_START_MARKER}\n{WORKSPACE_CONTEXT_PREFIX}{workspace_path}\n{}\n{WORKSPACE_CONTEXT_END_MARKER}",
+    let mut body = format!(
+        "{WORKSPACE_CONTEXT_PREFIX}{workspace_path}\n{}",
         workspace_prompt_guidance()
+    );
+    if let Some(env_guidance) = build_env_prompt_guidance() {
+        body.push_str("\n\n");
+        body.push_str(&env_guidance);
+    }
+
+    Some(format!(
+        "{WORKSPACE_CONTEXT_START_MARKER}\n{body}\n{WORKSPACE_CONTEXT_END_MARKER}"
     ))
 }
 

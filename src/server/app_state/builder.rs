@@ -364,6 +364,7 @@ fn build_base_tools(
 
     let load_skill_tool = Arc::new(crate::server::tools::LoadSkillTool::new(
         skill_manager.clone(),
+        config.clone(),
         sessions.clone(),
         storage.clone(),
     ));
@@ -373,6 +374,7 @@ fn build_base_tools(
 
     let read_skill_resource_tool = Arc::new(crate::server::tools::ReadSkillResourceTool::new(
         skill_manager,
+        config,
         sessions,
         storage,
     ));
@@ -564,7 +566,7 @@ fn build_root_tools(
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
 ) -> Arc<dyn ToolExecutor> {
-    // Root sessions can manage schedules via `schedule_tasks`.
+    // Root sessions can manage schedules via `scheduler`.
     // Background schedule runs intentionally use `tools_for_schedules` above and therefore
     // do not get this management tool by default.
     let schedule_tasks_tool = Arc::new(crate::server::tools::ScheduleTasksTool::new(

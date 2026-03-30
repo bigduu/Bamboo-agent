@@ -153,6 +153,13 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "ToolsConfig::is_empty")]
     pub tools: ToolsConfig,
 
+    /// Global skill toggles.
+    ///
+    /// Any skill listed in `disabled` is excluded from skill context construction and
+    /// cannot be loaded through the skill runtime tools.
+    #[serde(default, skip_serializing_if = "SkillsConfig::is_empty")]
+    pub skills: SkillsConfig,
+
     /// User-managed environment variables injected into Bash tool processes.
     ///
     /// Secret entries are encrypted at rest; plaintext values are hydrated in memory.
@@ -331,6 +338,20 @@ pub struct ToolsConfig {
 }
 
 impl ToolsConfig {
+    fn is_empty(&self) -> bool {
+        self.disabled.is_empty()
+    }
+}
+
+/// Global skill toggle configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    /// Skill IDs that are disabled globally.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled: Vec<String>,
+}
+
+impl SkillsConfig {
     fn is_empty(&self) -> bool {
         self.disabled.is_empty()
     }
@@ -659,11 +680,22 @@ impl Default for Config {
     }
 }
 
+/// Prompt-safe snapshot of configured env vars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptSafeEnvVarEntry {
+    pub name: String,
+    pub secret: bool,
+    pub description: Option<String>,
+}
+
 /// Global cache of user-managed env vars for injection into child processes.
 ///
 /// Updated whenever the config is loaded or reloaded via [`Config::publish_env_vars`].
 static ENV_VARS_CACHE: std::sync::LazyLock<RwLock<HashMap<String, String>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+static PROMPT_SAFE_ENV_VARS_CACHE: std::sync::LazyLock<RwLock<Vec<PromptSafeEnvVarEntry>>> =
+    std::sync::LazyLock::new(|| RwLock::new(Vec::new()));
 
 impl Config {
     /// Load configuration from file with environment variable overrides
@@ -706,6 +738,7 @@ impl Config {
                         config.hydrate_mcp_secrets_from_encrypted();
                         config.hydrate_env_vars_from_encrypted();
                         config.normalize_tool_settings();
+                        config.normalize_skill_settings();
                         config
                     })
                     .unwrap_or_else(|e| {
@@ -728,6 +761,7 @@ impl Config {
         // Decrypt encrypted env vars into in-memory plaintext form.
         config.hydrate_env_vars_from_encrypted();
         config.normalize_tool_settings();
+        config.normalize_skill_settings();
 
         // Legacy: `data_dir` is no longer a persisted config field. The data directory is
         // derived from runtime (BAMBOO_DATA_DIR or `${HOME}/.bamboo`).
@@ -886,6 +920,22 @@ impl Config {
     /// Normalize tool settings (trim / dedupe / sort).
     pub fn normalize_tool_settings(&mut self) {
         self.tools.disabled = self.disabled_tool_names().into_iter().collect();
+    }
+
+    /// Get normalized disabled skill IDs.
+    pub fn disabled_skill_ids(&self) -> BTreeSet<String> {
+        self.skills
+            .disabled
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .map(|id| id.to_string())
+            .collect()
+    }
+
+    /// Normalize skill settings (trim / dedupe / sort).
+    pub fn normalize_skill_settings(&mut self) {
+        self.skills.disabled = self.disabled_skill_ids().into_iter().collect();
     }
 
     /// Populate `proxy_auth` (plaintext) from `proxy_auth_encrypted` if present.
@@ -1182,17 +1232,45 @@ impl Config {
             .collect()
     }
 
+    fn prompt_safe_env_vars(&self) -> Vec<PromptSafeEnvVarEntry> {
+        self.env_vars
+            .iter()
+            .filter(|entry| !entry.name.trim().is_empty() && !entry.value.trim().is_empty())
+            .map(|entry| PromptSafeEnvVarEntry {
+                name: entry.name.clone(),
+                secret: entry.secret,
+                description: entry
+                    .description
+                    .as_ref()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+            })
+            .collect()
+    }
+
     /// Update the global env vars cache (called on config load / reload).
     pub fn publish_env_vars(&self) {
         let map = self.env_vars_as_map();
         if let Ok(mut guard) = ENV_VARS_CACHE.write() {
             *guard = map;
         }
+        let prompt_safe = self.prompt_safe_env_vars();
+        if let Ok(mut guard) = PROMPT_SAFE_ENV_VARS_CACHE.write() {
+            *guard = prompt_safe;
+        }
     }
 
     /// Read the current env vars snapshot (called by Bash tool at process spawn time).
     pub fn current_env_vars() -> HashMap<String, String> {
         ENV_VARS_CACHE
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    /// Read the current prompt-safe env var snapshot (names + metadata only; no secret values).
+    pub fn current_prompt_safe_env_vars() -> Vec<PromptSafeEnvVarEntry> {
+        PROMPT_SAFE_ENV_VARS_CACHE
             .read()
             .map(|guard| guard.clone())
             .unwrap_or_default()
@@ -1214,6 +1292,7 @@ impl Config {
             gemini_model_mapping: GeminiModelMapping::default(),
             hooks: HooksConfig::default(),
             tools: ToolsConfig::default(),
+            skills: SkillsConfig::default(),
             env_vars: Vec::new(),
             mcp: crate::agent::mcp::McpConfig::default(),
             extra: BTreeMap::new(),
@@ -1251,6 +1330,7 @@ impl Config {
         to_save.refresh_env_vars_encrypted()?;
         to_save.sanitize_env_vars_for_disk();
         to_save.normalize_tool_settings();
+        to_save.normalize_skill_settings();
         let content =
             serde_json::to_string_pretty(&to_save).context("Failed to serialize config to JSON")?;
         write_atomic(&path, content.as_bytes())
@@ -1444,6 +1524,61 @@ mod tests {
     }
 
     #[test]
+    fn publish_env_vars_updates_prompt_safe_snapshot_without_secret_values() {
+        let mut config = Config::default();
+        config.env_vars = vec![
+            EnvVarEntry {
+                name: "SECRET_TOKEN".to_string(),
+                value: "top-secret".to_string(),
+                secret: true,
+                value_encrypted: None,
+                description: Some("Service token".to_string()),
+            },
+            EnvVarEntry {
+                name: "API_BASE".to_string(),
+                value: "https://internal.example".to_string(),
+                secret: false,
+                value_encrypted: None,
+                description: Some("Internal API base".to_string()),
+            },
+        ];
+
+        config.publish_env_vars();
+
+        let injected = Config::current_env_vars();
+        assert_eq!(
+            injected.get("SECRET_TOKEN").map(String::as_str),
+            Some("top-secret")
+        );
+        assert_eq!(
+            injected.get("API_BASE").map(String::as_str),
+            Some("https://internal.example")
+        );
+
+        let prompt_safe = Config::current_prompt_safe_env_vars();
+        assert_eq!(prompt_safe.len(), 2);
+        assert!(prompt_safe.iter().any(|entry| {
+            entry.name == "SECRET_TOKEN"
+                && entry.secret
+                && entry.description.as_deref() == Some("Service token")
+        }));
+        assert!(prompt_safe.iter().any(|entry| {
+            entry.name == "API_BASE"
+                && !entry.secret
+                && entry.description.as_deref() == Some("Internal API base")
+        }));
+        assert!(!prompt_safe
+            .iter()
+            .any(|entry| entry.name.contains("top-secret")));
+        assert!(!prompt_safe.iter().any(|entry| {
+            entry
+                .description
+                .as_deref()
+                .is_some_and(|value| value.contains("https://internal.example"))
+        }));
+    }
+
+    #[test]
     fn config_new_ignores_proxy_env_vars_when_proxy_fields_omitted() {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
@@ -1515,6 +1650,45 @@ mod tests {
         assert!(config.disabled_tool_names().contains("Bash"));
         assert!(config.disabled_tool_names().contains("Read"));
         assert!(config.disabled_tool_names().contains("GetCurrentDir"));
+    }
+
+    #[test]
+    fn normalize_skill_settings_trims_dedupes_and_sorts() {
+        let mut config = Config::default();
+        config.skills.disabled = vec![
+            " pdf ".to_string(),
+            "".to_string(),
+            "pdf".to_string(),
+            "skill-creator".to_string(),
+        ];
+
+        config.normalize_skill_settings();
+
+        assert_eq!(
+            config.skills.disabled,
+            vec!["pdf".to_string(), "skill-creator".to_string()]
+        );
+    }
+
+    #[test]
+    fn config_load_reads_disabled_skills_as_normalized_ids() {
+        let _lock = env_lock_acquire();
+        let temp_home = TempHome::new();
+        temp_home.set_config_json(
+            r#"{
+  "skills": {
+    "disabled": [" pdf ", "skill-creator", "pdf", ""]
+  }
+}"#,
+        );
+
+        let config = Config::from_data_dir(Some(temp_home.path.clone()));
+        assert_eq!(
+            config.skills.disabled,
+            vec!["pdf".to_string(), "skill-creator".to_string()]
+        );
+        assert!(config.disabled_skill_ids().contains("pdf"));
+        assert!(config.disabled_skill_ids().contains("skill-creator"));
     }
 
     #[test]

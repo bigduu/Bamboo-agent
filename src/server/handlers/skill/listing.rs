@@ -17,12 +17,20 @@ pub async fn list_skills(
     }
 
     let refresh = query.refresh.unwrap_or(false);
+    let include_disabled = query.include_disabled.unwrap_or(false);
+    let disabled_skill_ids = {
+        let config = state.config.read().await;
+        config.disabled_skill_ids()
+    };
     let skills = state
         .skill_manager
         .as_ref()
         .store()
         .list_skills(Some(filter), refresh)
-        .await;
+        .await
+        .into_iter()
+        .filter(|skill| include_disabled || !disabled_skill_ids.contains(&skill.id))
+        .collect::<Vec<_>>();
 
     Ok(HttpResponse::Ok().json(SkillListResponse {
         total: skills.len(),

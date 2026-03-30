@@ -34,6 +34,8 @@ pub struct ImageFallbackConfig {
 pub struct AgentLoopConfig {
     pub max_rounds: usize,
     pub system_prompt: Option<String>,
+    /// Skill IDs that are disabled globally for this execution.
+    pub disabled_skill_ids: BTreeSet<String>,
     /// Optional explicit skill selection for this execution.
     /// When set, only these skill IDs are considered for skill context and allowlists.
     pub selected_skill_ids: Option<Vec<String>>,
@@ -80,6 +82,7 @@ impl Default for AgentLoopConfig {
         Self {
             max_rounds: 200,
             system_prompt: None,
+            disabled_skill_ids: BTreeSet::new(),
             selected_skill_ids: None,
             selected_skill_mode: None,
             additional_tool_schemas: Vec::new(),

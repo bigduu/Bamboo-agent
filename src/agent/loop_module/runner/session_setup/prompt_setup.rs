@@ -92,6 +92,14 @@ pub(super) fn apply_system_prompt_contexts(
         tool_guide_context,
         merged_prompt.as_str(),
     );
+
+    log_runtime_prompt_assembly_summary(
+        session,
+        base_prompt.as_str(),
+        skill_context,
+        tool_guide_context,
+        merged_prompt.as_str(),
+    );
 }
 
 fn build_runtime_prompt_fingerprint(
@@ -111,6 +119,58 @@ fn build_runtime_prompt_fingerprint(
     hasher.update([0u8]);
     hasher.update(final_prompt.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn log_runtime_prompt_assembly_summary(
+    session: &Session,
+    base_prompt: &str,
+    skill_context: &str,
+    tool_guide_context: &str,
+    final_prompt: &str,
+) {
+    let session_id = session.id.as_str();
+    let fingerprint = session
+        .metadata
+        .get(RUNTIME_PROMPT_FINGERPRINT_KEY)
+        .map(String::as_str)
+        .unwrap_or("missing");
+    let flags = session
+        .metadata
+        .get(RUNTIME_PROMPT_FLAGS_KEY)
+        .map(String::as_str)
+        .unwrap_or("missing");
+    let lengths = session
+        .metadata
+        .get(RUNTIME_PROMPT_LENGTHS_KEY)
+        .map(String::as_str)
+        .unwrap_or("missing");
+
+    tracing::info!(
+        "[{}] Runtime prompt assembly summary: composer_version={}, {}, {}, fingerprint={}",
+        session_id,
+        RUNTIME_PROMPT_COMPOSER_VERSION,
+        flags,
+        lengths,
+        fingerprint,
+    );
+
+    tracing::debug!(
+        "[{}] Runtime prompt assembly details: base_len={}, skill_len={}, tool_guide_len={}, final_len={}",
+        session_id,
+        base_prompt.len(),
+        skill_context.len(),
+        tool_guide_context.len(),
+        final_prompt.len(),
+    );
+    tracing::debug!(
+        "[{}] ========== EFFECTIVE SYSTEM PROMPT AFTER SESSION SETUP ==========" ,
+        session_id
+    );
+    tracing::debug!("[{}] {}", session_id, final_prompt);
+    tracing::debug!(
+        "[{}] ========== END EFFECTIVE SYSTEM PROMPT AFTER SESSION SETUP ==========" ,
+        session_id
+    );
 }
 
 fn persist_runtime_prompt_metadata(

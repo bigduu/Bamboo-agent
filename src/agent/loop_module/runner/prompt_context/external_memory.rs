@@ -201,4 +201,13 @@ pub(super) async fn inject_external_memory_into_system_message(session: &mut Ses
     section.push_str(EXTERNAL_MEMORY_END_MARKER);
 
     system_message.content = format!("{}{}", base_prompt.trim_end(), section);
+
+    tracing::info!(
+        "[{}] External memory injected: topics={}, rendered_len={}, source_chars={}, truncated_topics={}",
+        session_id,
+        snippets.len(),
+        section.len(),
+        total_chars,
+        snippets.iter().filter(|snippet| snippet.truncated).count(),
+    );
 }

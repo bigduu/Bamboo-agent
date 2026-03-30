@@ -28,10 +28,15 @@ pub async fn get_filtered_tools(
     let session_id = resolve_session_identifier(&query);
     let selected_skill_ids = selected_skill_ids_for_session(state.get_ref(), session_id).await;
     let selected_skill_mode = selected_skill_mode_for_session(state.get_ref(), session_id).await;
+    let disabled_skill_ids = {
+        let config = state.config.read().await;
+        config.disabled_skill_ids()
+    };
     let allowed_tools = state
         .skill_manager
         .as_ref()
         .get_allowed_tools_for_selection_with_mode(
+            &disabled_skill_ids,
             selected_skill_ids.as_deref(),
             selected_skill_mode.as_deref(),
         )

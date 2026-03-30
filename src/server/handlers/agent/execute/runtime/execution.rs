@@ -20,6 +20,11 @@ use super::session_state::{
     selected_skill_mode_for_session, system_prompt_for_session,
 };
 
+const SKILL_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_SKILL_CONTEXT_START -->";
+const TOOL_GUIDE_START_MARKER: &str = "<!-- BAMBOO_TOOL_GUIDE_START -->";
+const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
+const TASK_LIST_START_MARKER: &str = "<!-- BAMBOO_TASK_LIST_START -->";
+
 pub(in crate::server::handlers::agent::execute) struct SpawnAgentExecution {
     pub(in crate::server::handlers::agent::execute) state: actix_web::web::Data<AppState>,
     pub(in crate::server::handlers::agent::execute) session_id: String,
@@ -33,6 +38,7 @@ pub(in crate::server::handlers::agent::execute) struct SpawnAgentExecution {
     pub(in crate::server::handlers::agent::execute) reasoning_effort: Option<ReasoningEffort>,
     pub(in crate::server::handlers::agent::execute) reasoning_effort_source: String,
     pub(in crate::server::handlers::agent::execute) disabled_tools: BTreeSet<String>,
+    pub(in crate::server::handlers::agent::execute) disabled_skill_ids: BTreeSet<String>,
     pub(in crate::server::handlers::agent::execute) cancel_token: CancellationToken,
     pub(in crate::server::handlers::agent::execute) mpsc_tx: mpsc::Sender<AgentEvent>,
     pub(in crate::server::handlers::agent::execute) image_fallback: Option<ImageFallbackConfig>,
@@ -57,10 +63,13 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
                 reasoning_effort,
                 reasoning_effort_source,
                 disabled_tools,
+                disabled_skill_ids,
                 cancel_token,
                 mpsc_tx,
                 image_fallback,
             } = args;
+            let initial_title = session.title.clone();
+            let initial_pinned = session.pinned;
 
             let system_prompt = system_prompt_for_session(&session);
             let initial_message = initial_user_message_for_session(&session);
@@ -89,15 +98,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
             session.model = model.clone();
 
             if let Some(prompt) = system_prompt.as_ref() {
-                tracing::info!("[{}] ========== SYSTEM PROMPT ==========", session_id);
-                tracing::info!(
-                    "[{}] Final prompt length: {} chars",
-                    session_id,
-                    prompt.len()
-                );
-                tracing::info!("[{}] -----------------------------------", session_id);
-                tracing::info!("[{}] {}", session_id, prompt);
-                tracing::info!("[{}] ========== END SYSTEM PROMPT ==========", session_id);
+                log_base_system_prompt_snapshot(&session_id, prompt);
             }
 
             // Run agent loop.
@@ -114,6 +115,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
                 AgentLoopConfig {
                     max_rounds: 200,
                     system_prompt,
+                    disabled_skill_ids,
                     selected_skill_ids,
                     selected_skill_mode,
                     skill_manager: Some(state.skill_manager.clone()),
@@ -146,6 +148,26 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
                 }
             }
 
+            // Avoid clobbering concurrent UI edits (title/pin) that may arrive while
+            // the agent loop is running. If this execution never touched those fields,
+            // preserve the latest persisted values.
+            match state.storage.load_session(&session_id).await {
+                Ok(Some(latest_persisted)) => preserve_concurrent_session_overrides(
+                    &mut session,
+                    &latest_persisted,
+                    &initial_title,
+                    initial_pinned,
+                ),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        "[{}] Failed to load latest session before final save: {}",
+                        session_id,
+                        error
+                    );
+                }
+            }
+
             // Save session.
             state.save_session(&session).await;
 
@@ -165,6 +187,39 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
         }
         .instrument(session_span),
     );
+}
+
+fn log_base_system_prompt_snapshot(session_id: &str, prompt: &str) {
+    tracing::info!(
+        "[{}] Base system prompt snapshot: len={} chars, has_skill={}, has_tool_guide={}, has_external_memory={}, has_task_list={}",
+        session_id,
+        prompt.len(),
+        prompt.contains(SKILL_CONTEXT_START_MARKER),
+        prompt.contains(TOOL_GUIDE_START_MARKER),
+        prompt.contains(EXTERNAL_MEMORY_START_MARKER),
+        prompt.contains(TASK_LIST_START_MARKER),
+    );
+
+    tracing::debug!("[{}] ========== BASE SYSTEM PROMPT SNAPSHOT ==========" , session_id);
+    tracing::debug!("[{}] Snapshot length: {} chars", session_id, prompt.len());
+    tracing::debug!("[{}] -----------------------------------", session_id);
+    tracing::debug!("[{}] {}", session_id, prompt);
+    tracing::debug!("[{}] ========== END BASE SYSTEM PROMPT SNAPSHOT ==========" , session_id);
+}
+
+pub(super) fn preserve_concurrent_session_overrides(
+    session: &mut Session,
+    latest_persisted: &Session,
+    initial_title: &str,
+    initial_pinned: bool,
+) {
+    // Preserve user/system edits made via PATCH /sessions/{id} during execution.
+    if session.title == initial_title {
+        session.title = latest_persisted.title.clone();
+    }
+    if session.pinned == initial_pinned {
+        session.pinned = latest_persisted.pinned;
+    }
 }
 
 pub(super) fn terminal_error_event_for_result<E>(result: &Result<(), E>) -> Option<AgentEvent>

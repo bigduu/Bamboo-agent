@@ -212,6 +212,7 @@ pub async fn handler(
     let default_reasoning_effort = config_snapshot.get_reasoning_effort();
     let effective_reasoning_effort = request_reasoning_effort.or(default_reasoning_effort);
     let disabled_tools = config_snapshot.disabled_tool_names();
+    let disabled_skill_ids = config_snapshot.disabled_skill_ids();
     let reasoning_effort_source = if request_reasoning_effort.is_some() {
         "request"
     } else if default_reasoning_effort.is_some() {
@@ -295,6 +296,7 @@ pub async fn handler(
         reasoning_effort: effective_reasoning_effort,
         reasoning_effort_source: reasoning_effort_source.to_string(),
         disabled_tools,
+        disabled_skill_ids,
         cancel_token,
         mpsc_tx,
         image_fallback,
