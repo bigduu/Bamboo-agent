@@ -148,8 +148,19 @@ pub(super) fn responses_input_to_chat_messages(
                     .unwrap_or("");
 
                 match part_type {
-                    "input_text" | "text" => {
+                    "input_text" | "output_text" | "text" => {
                         if let Some(text) = part_obj.get("text").and_then(|value| value.as_str()) {
+                            content_parts.push(ContentPart::Text {
+                                text: text.to_string(),
+                            });
+                        }
+                    }
+                    "refusal" => {
+                        if let Some(text) = part_obj
+                            .get("refusal")
+                            .or_else(|| part_obj.get("text"))
+                            .and_then(|value| value.as_str())
+                        {
                             content_parts.push(ContentPart::Text {
                                 text: text.to_string(),
                             });

@@ -53,6 +53,52 @@ fn responses_input_parts_support_input_text() {
 }
 
 #[test]
+fn responses_input_parts_support_output_text() {
+    let msgs = responses_input_to_chat_messages(serde_json::json!([
+        {
+          "role": "assistant",
+          "content": [{ "type": "output_text", "text": "hello from assistant" }]
+        }
+    ]))
+    .unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].role, Role::Assistant);
+    match &msgs[0].content {
+        Content::Parts(parts) => {
+            assert_eq!(parts.len(), 1);
+            match &parts[0] {
+                ContentPart::Text { text } => assert_eq!(text, "hello from assistant"),
+                _ => panic!("expected text part"),
+            }
+        }
+        _ => panic!("expected parts content"),
+    }
+}
+
+#[test]
+fn responses_input_parts_support_refusal() {
+    let msgs = responses_input_to_chat_messages(serde_json::json!([
+        {
+          "role": "assistant",
+          "content": [{ "type": "refusal", "refusal": "I can't help with that." }]
+        }
+    ]))
+    .unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].role, Role::Assistant);
+    match &msgs[0].content {
+        Content::Parts(parts) => {
+            assert_eq!(parts.len(), 1);
+            match &parts[0] {
+                ContentPart::Text { text } => assert_eq!(text, "I can't help with that."),
+                _ => panic!("expected text part"),
+            }
+        }
+        _ => panic!("expected parts content"),
+    }
+}
+
+#[test]
 fn build_completion_response_populates_core_openai_fields() {
     let tool_call = ToolCall {
         id: "call_1".to_string(),

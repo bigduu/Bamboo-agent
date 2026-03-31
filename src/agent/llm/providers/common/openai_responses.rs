@@ -49,7 +49,7 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
                 // Emit assistant text content as a message item (even if empty, for completeness).
                 let has_text = !m.content.trim().is_empty();
                 if has_text || m.tool_calls.is_none() {
-                    let content = build_content_value(m, has_images, None);
+                    let content = build_content_value(m, has_images, None, "output_text");
                     let mut message_item = json!({
                         "type": "message",
                         "role": "assistant",
@@ -100,7 +100,7 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
                 } else {
                     "user"
                 };
-                let content = build_content_value(m, has_images, None);
+                let content = build_content_value(m, has_images, None, "input_text");
                 out.push(json!({
                     "type": "message",
                     "role": role,
@@ -139,16 +139,22 @@ fn assistant_phase_for_responses_input(message: &Message) -> Option<&'static str
 
 /// Build the `content` value for a message item.
 ///
-/// If `has_images` is true, uses typed content array (`input_text` / `input_image`).
+/// If `has_images` is true, uses typed content array.
+/// `text_part_type` should be `input_text` for user/system and `output_text` for assistant.
 /// Otherwise, uses a plain string value.
-fn build_content_value(m: &Message, has_images: bool, text_override: Option<&str>) -> Value {
+fn build_content_value(
+    m: &Message,
+    has_images: bool,
+    text_override: Option<&str>,
+    text_part_type: &str,
+) -> Value {
     if has_images {
         let mut parts = Vec::new();
         if let Some(content_parts) = m.content_parts.as_ref() {
             for part in content_parts {
                 match part {
                     ContentPart::Text { text } => {
-                        parts.push(json!({"type": "input_text", "text": text}));
+                        parts.push(json!({"type": text_part_type, "text": text}));
                     }
                     ContentPart::ImageUrl { image_url } => {
                         parts.push(json!({"type": "input_image", "image_url": image_url.url}));
@@ -157,7 +163,7 @@ fn build_content_value(m: &Message, has_images: bool, text_override: Option<&str
             }
         } else {
             let text = text_override.unwrap_or(&m.content);
-            parts.push(json!({"type": "input_text", "text": text}));
+            parts.push(json!({"type": text_part_type, "text": text}));
         }
         json!(parts)
     } else {
@@ -1168,6 +1174,7 @@ mod tests {
     use crate::agent::core::tools::{FunctionCall, ToolCall};
     use crate::agent::core::tools::{FunctionSchema, ToolSchema};
     use crate::agent::core::MessagePhase;
+    use crate::agent::llm::models::{ContentPart, ImageUrl};
 
     #[test]
     fn build_responses_body_includes_input_and_stream() {
@@ -1427,6 +1434,29 @@ mod tests {
         assert_eq!(out[0]["role"], "assistant");
         assert_eq!(out[0]["content"], "Just a text reply");
         assert_eq!(out[0]["phase"], "final_answer");
+    }
+
+    #[test]
+    fn messages_to_responses_input_json_uses_output_text_for_assistant_in_typed_content_mode() {
+        let messages = vec![
+            Message::user_with_parts(
+                "Describe this image",
+                vec![ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/image.png".to_string(),
+                        detail: None,
+                    },
+                }],
+            ),
+            Message::assistant("It is a screenshot.", None),
+        ];
+
+        let out = messages_to_responses_input_json(&messages);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1]["type"], "message");
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[1]["content"][0]["type"], "output_text");
+        assert_eq!(out[1]["content"][0]["text"], "It is a screenshot.");
     }
 
     #[test]

@@ -1,7 +1,37 @@
 use super::{apply_image_fallback_to_llm_messages, persistable_image_urls};
 use crate::agent::core::{AgentError, Message, Session};
+use crate::agent::core::tools::ToolSchema;
 use crate::agent::llm::models::{ContentPart, ImageUrl};
+use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream};
+use crate::agent::llm::types::LLMChunk;
 use crate::agent::loop_module::config::{ImageFallbackConfig, ImageFallbackMode};
+use async_trait::async_trait;
+use futures::stream;
+use std::sync::{Arc, Mutex};
+
+#[derive(Default)]
+struct RecordingVisionProvider {
+    models: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl LLMProvider for RecordingVisionProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        self.models
+            .lock()
+            .expect("model lock should not be poisoned")
+            .push(model.to_string());
+        Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Token(
+            "vision summary".to_string(),
+        ))])))
+    }
+}
 
 #[test]
 fn persistable_image_urls_filters_out_data_urls() {
@@ -113,4 +143,70 @@ async fn image_fallback_skips_messages_without_image_parts() {
 
     assert_eq!(messages[0].content, "纯文本消息");
     assert!(messages[0].content_parts.is_none());
+}
+
+#[tokio::test]
+async fn image_fallback_vision_rewrites_with_llm_description() {
+    let mut messages = vec![Message::user_with_parts(
+        "请描述图片",
+        vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "https://example.com/image.png".to_string(),
+                detail: None,
+            },
+        }],
+    )];
+
+    let recording = Arc::new(RecordingVisionProvider::default());
+    let llm: Arc<dyn LLMProvider> = recording.clone();
+    apply_image_fallback_to_llm_messages(
+        &mut messages,
+        ImageFallbackConfig {
+            mode: ImageFallbackMode::Vision,
+            vision_model: Some("vision-model-test".to_string()),
+        },
+        None,
+        Some(&llm),
+    )
+    .await
+    .expect("vision fallback should rewrite images");
+
+    assert!(messages[0].content_parts.is_none());
+    assert!(messages[0].content.contains("[Vision description of image 1:"));
+    assert!(messages[0].content.contains("vision summary"));
+    assert_eq!(
+        recording
+            .models
+            .lock()
+            .expect("model lock should not be poisoned")
+            .as_slice(),
+        ["vision-model-test"]
+    );
+}
+
+#[tokio::test]
+async fn image_fallback_vision_without_llm_leaves_images_intact() {
+    let mut messages = vec![Message::user_with_parts(
+        "请描述图片",
+        vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "https://example.com/image.png".to_string(),
+                detail: None,
+            },
+        }],
+    )];
+
+    apply_image_fallback_to_llm_messages(
+        &mut messages,
+        ImageFallbackConfig {
+            mode: ImageFallbackMode::Vision,
+            vision_model: Some("vision-model-test".to_string()),
+        },
+        None,
+        None,
+    )
+    .await
+    .expect("vision fallback without llm should not fail");
+
+    assert!(messages[0].content_parts.is_some());
 }
