@@ -1,6 +1,6 @@
 use crate::core::process_utils::{
-    decode_process_line_lossy, hide_window_for_tokio_command, preferred_bash_shell,
-    trace_windows_command,
+    build_command_environment, decode_process_line_lossy, hide_window_for_tokio_command,
+    preferred_bash_shell, trace_windows_command, CommandEnvironmentDiagnostics,
 };
 use dashmap::DashMap;
 use regex::Regex;
@@ -21,6 +21,7 @@ const COMPLETED_SESSION_TTL_SECS: u64 = 300;
 pub struct ShellSession {
     pub id: String,
     pub command: String,
+    pub environment: CommandEnvironmentDiagnostics,
     child: Arc<Mutex<Child>>,
     output: Arc<Mutex<Vec<String>>>,
     base_index: Arc<Mutex<usize>>,
@@ -131,15 +132,14 @@ pub async fn spawn_background(
         &shell.program,
         [shell.arg, command],
     );
+    let overrides = crate::core::Config::current_env_vars();
+    let prepared_env = build_command_environment(&overrides).await;
     let mut cmd = Command::new(&shell.program);
     hide_window_for_tokio_command(&mut cmd);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
-    // Inject user-managed environment variables from config.
-    for (key, value) in crate::core::Config::current_env_vars() {
-        cmd.env(&key, &value);
-    }
+    prepared_env.apply_to_tokio_command(&mut cmd);
     cmd.arg(shell.arg)
         .arg(command)
         .stdin(Stdio::null())
@@ -169,6 +169,7 @@ pub async fn spawn_background(
     let session = Arc::new(ShellSession {
         id: session_id.clone(),
         command: command.to_string(),
+        environment: prepared_env.diagnostics.clone(),
         child: Arc::new(Mutex::new(child)),
         output: output.clone(),
         base_index: base_index.clone(),

@@ -21,6 +21,13 @@ fn default_base_prompt_does_not_unconditionally_require_conclusion_with_options(
     assert!(!normalized.contains("before ending a task, always call conclusion_with_options"));
     assert!(!normalized.contains("do not ask final confirmation in plain assistant text"));
 }
+#[test]
+fn default_base_prompt_prefers_using_injected_context_before_reasking() {
+    assert!(DEFAULT_BASE_PROMPT.contains("treat it as available working context"));
+    assert!(DEFAULT_BASE_PROMPT.contains("Prefer a minimal verifiable attempt first"));
+    assert!(DEFAULT_BASE_PROMPT.contains("only ask follow-up questions for information that is still genuinely missing"));
+}
+
 #[tokio::test]
 async fn test_app_state_creation() {
     let temp_dir = tempfile::tempdir().unwrap();

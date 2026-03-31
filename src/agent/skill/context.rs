@@ -54,6 +54,12 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
         "4. When a resource response has `has_more=true`, continue with `next_offset` until you have enough context.\n\n",
     );
 
+    context.push_str("### Execution Behavior With Injected Context\n");
+    context.push_str("1. Treat Bamboo-injected workspace and environment context as already available working context.\n");
+    context.push_str("2. If injected env variables appear sufficient for a skill workflow, prefer a minimal execution or verification attempt before asking the user for more information.\n");
+    context.push_str("3. When execution fails, diagnose the concrete failure first and only ask follow-up questions for information that remains genuinely missing after using the injected context and available tools.\n");
+    context.push_str("4. Do NOT ask the user to re-send env var values that Bamboo has already injected by name unless the value is clearly missing, malformed, or the user must change it.\n\n");
+
     context.push_str("### Available Skills\n");
 
     for skill in skills {
@@ -121,6 +127,9 @@ mod tests {
         assert!(context.contains("load_skill"));
         assert!(context.contains("read_skill_resource"));
         assert!(context.contains("skill_check_completed=true"));
+        assert!(context.contains("Execution Behavior With Injected Context"));
+        assert!(context.contains("prefer a minimal execution or verification attempt"));
+        assert!(context.contains("Do NOT ask the user to re-send env var values"));
 
         // Should contain skill metadata
         assert!(context.contains("Demo Skill"));

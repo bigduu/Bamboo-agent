@@ -1,7 +1,8 @@
 use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use crate::core::process_utils::{
-    decode_process_line_lossy, hide_window_for_tokio_command, preferred_bash_shell,
-    render_command_line, trace_windows_command, windows_command_trace_enabled,
+    build_command_environment, decode_process_line_lossy, hide_window_for_tokio_command,
+    preferred_bash_shell, render_command_line, trace_windows_command,
+    windows_command_trace_enabled, PreparedCommandEnvironment,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -113,6 +114,11 @@ impl BashTool {
         })
     }
 
+    async fn prepare_environment() -> PreparedCommandEnvironment {
+        let overrides = crate::core::Config::current_env_vars();
+        build_command_environment(&overrides).await
+    }
+
     async fn run_foreground(
         &self,
         command: &str,
@@ -132,13 +138,12 @@ impl BashTool {
                 .await;
         }
 
+        let prepared_env = Self::prepare_environment().await;
+
         let mut cmd = Command::new(&shell.program);
         hide_window_for_tokio_command(&mut cmd);
         cmd.current_dir(cwd);
-        // Inject user-managed environment variables from config.
-        for (key, value) in crate::core::Config::current_env_vars() {
-            cmd.env(&key, &value);
-        }
+        prepared_env.apply_to_tokio_command(&mut cmd);
         cmd.arg(shell.arg)
             .arg(command)
             .stdin(Stdio::null())
@@ -241,6 +246,20 @@ impl BashTool {
                 "timed_out": timed_out,
                 "stdout_truncated": stdout_truncated,
                 "stderr_truncated": stderr_truncated,
+                "environment": {
+                    "source": prepared_env.diagnostics.source.as_str(),
+                    "import_shell": prepared_env.diagnostics.import_shell,
+                    "import_error": prepared_env.diagnostics.import_error,
+                    "path": prepared_env.diagnostics.path,
+                    "path_entries": prepared_env.diagnostics.path_entries,
+                    "python": {
+                        "configured": prepared_env.diagnostics.python.configured,
+                        "resolved": prepared_env.diagnostics.python.resolved,
+                        "invocation": prepared_env.diagnostics.python.invocation,
+                        "source": prepared_env.diagnostics.python.source,
+                        "tried": prepared_env.diagnostics.python.tried,
+                    },
+                },
             })
             .to_string(),
             display_preference: Some("Collapsible".to_string()),
@@ -341,6 +360,20 @@ impl Tool for BashTool {
                     "command": shell.command,
                     "status": "running",
                     "cwd": crate::core::paths::path_to_display_string(&cwd),
+                    "environment": {
+                        "source": shell.environment.source.as_str(),
+                        "import_shell": shell.environment.import_shell,
+                        "import_error": shell.environment.import_error,
+                        "path": shell.environment.path,
+                        "path_entries": shell.environment.path_entries,
+                        "python": {
+                            "configured": shell.environment.python.configured,
+                            "resolved": shell.environment.python.resolved,
+                            "invocation": shell.environment.python.invocation,
+                            "source": shell.environment.python.source,
+                            "tried": shell.environment.python.tried,
+                        },
+                    },
                 })
                 .to_string(),
                 display_preference: Some("Collapsible".to_string()),
@@ -355,7 +388,12 @@ impl Tool for BashTool {
 mod tests {
     use super::*;
     use crate::agent::core::AgentEvent;
+    use crate::core::process_utils::{
+        clear_command_environment_cache_for_tests, prime_command_environment_cache_for_tests,
+        CommandEnvironmentDiagnostics, CommandEnvironmentSource, PythonDiscoveryDiagnostics,
+    };
     use serde_json::Value;
+    use std::collections::HashMap;
     use tokio::sync::mpsc;
     use tokio::time::{sleep, Duration, Instant};
 
@@ -384,8 +422,34 @@ mod tests {
         "printf '\\377\\n' 1>&2".to_string()
     }
 
+    fn test_environment_diagnostics() -> CommandEnvironmentDiagnostics {
+        CommandEnvironmentDiagnostics {
+            source: CommandEnvironmentSource::InheritedProcess,
+            import_shell: None,
+            import_error: Some("test-import-disabled".to_string()),
+            path: Some("/usr/bin:/bin".to_string()),
+            path_entries: Some(2),
+            python: PythonDiscoveryDiagnostics {
+                configured: Some("python3".to_string()),
+                resolved: Some("/usr/bin/python3".to_string()),
+                invocation: Some("/usr/bin/python3".to_string()),
+                source: Some("path".to_string()),
+                tried: vec!["python3".to_string(), "python".to_string()],
+            },
+        }
+    }
+
+    fn prime_test_command_environment() {
+        clear_command_environment_cache_for_tests();
+        prime_command_environment_cache_for_tests(
+            HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
+            test_environment_diagnostics(),
+        );
+    }
+
     #[tokio::test]
     async fn bash_foreground_returns_stdout_stderr_and_streams_tokens() {
+        prime_test_command_environment();
         let tool = BashTool::new();
         let (tx, mut rx) = mpsc::channel(32);
 
@@ -417,6 +481,11 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("err"));
+        assert_eq!(payload["environment"]["source"], "process_env");
+        assert_eq!(payload["environment"]["import_error"], "test-import-disabled");
+        assert_eq!(payload["environment"]["python"]["resolved"], "/usr/bin/python3");
+        assert_eq!(payload["environment"]["python"]["invocation"], "/usr/bin/python3");
+        assert_eq!(payload["environment"]["python"]["source"], "path");
 
         let mut streamed = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -431,6 +500,7 @@ mod tests {
 
     #[tokio::test]
     async fn bash_foreground_tolerates_invalid_utf8_stderr() {
+        prime_test_command_environment();
         let tool = BashTool::new();
         let result = tool
             .execute(json!({
@@ -447,6 +517,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_foreground_sets_stdout_truncated_when_output_exceeds_cap() {
+        prime_test_command_environment();
         let tool = BashTool::new();
         let result = tool
             .execute(json!({
@@ -463,6 +534,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_background_honors_explicit_timeout() {
+        prime_test_command_environment();
         let tool = BashTool::new();
         let result = tool
             .execute(json!({
@@ -473,6 +545,9 @@ mod tests {
             .await
             .unwrap();
         let payload: Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(payload["environment"]["source"], "process_env");
+        assert_eq!(payload["environment"]["python"]["resolved"], "/usr/bin/python3");
+        assert_eq!(payload["environment"]["python"]["invocation"], "/usr/bin/python3");
         let shell_id = payload["bash_id"].as_str().unwrap().to_string();
 
         let started = Instant::now();
@@ -490,6 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn bash_resolves_relative_workdir_from_session_workspace() {
+        prime_test_command_environment();
         let tool = BashTool::new();
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
@@ -522,6 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn bash_rejects_workdir_that_is_not_directory() {
+        prime_test_command_environment();
         let tool = BashTool::new();
         let file = tempfile::NamedTempFile::new().unwrap();
 
