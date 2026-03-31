@@ -23,6 +23,7 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::agent::core::agent::{AgentEvent, Session, SessionKind};
+use crate::core::ReasoningEffort;
 
 use super::search_index::{should_index_session, SessionSearchIndex};
 use super::AttachmentReader;
@@ -54,6 +55,10 @@ pub struct SessionIndexEntry {
     pub parent_session_id: Option<String>,
     pub root_session_id: String,
     pub spawn_depth: u32,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// If the session was created by a schedule, store the schedule id here for fast filtering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_schedule_id: Option<String>,
@@ -327,6 +332,8 @@ impl SessionStoreV2 {
                     parent_session_id: session.parent_session_id.clone(),
                     root_session_id: session.root_session_id.clone(),
                     spawn_depth: session.spawn_depth,
+                    model: session.model.clone(),
+                    reasoning_effort: session.reasoning_effort,
                     created_by_schedule_id,
                     created_at: session.created_at,
                     updated_at: session.updated_at,

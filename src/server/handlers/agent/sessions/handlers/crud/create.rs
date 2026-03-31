@@ -2,6 +2,7 @@ use actix_web::{web, HttpResponse, Result};
 use uuid::Uuid;
 
 use crate::agent::core::{Message, Session};
+use crate::core::ReasoningEffort;
 use crate::server::app_state::AppState;
 
 use super::super::super::types::{CreateSessionRequest, CreateSessionResponse, SessionSummary};
@@ -14,7 +15,8 @@ pub async fn create_session(
     let id = Uuid::new_v4().to_string();
     let global_default_prompt =
         crate::server::prompt_defaults::read_global_default_system_prompt_template();
-    let session = build_new_session(&id, &req, global_default_prompt.as_str());
+    let config_snapshot = state.config.read().await.clone();
+    let session = build_new_session(&id, &req, global_default_prompt.as_str(), &config_snapshot);
 
     state
         .storage
@@ -44,9 +46,11 @@ pub(super) fn build_new_session(
     id: &str,
     req: &CreateSessionRequest,
     global_default_prompt: &str,
+    config: &crate::core::Config,
 ) -> Session {
-    let model = model_from_request(req);
+    let model = model_from_request(req, config);
     let mut session = Session::new(id.to_string(), model);
+    session.reasoning_effort = reasoning_effort_from_request(req, config);
 
     if let Some(title) = trimmed_non_empty_owned(req.title.as_deref()) {
         session.title = title;
@@ -72,8 +76,17 @@ pub(super) fn build_new_session(
     session
 }
 
-pub(super) fn model_from_request(req: &CreateSessionRequest) -> String {
-    trimmed_non_empty_owned(req.model.as_deref()).unwrap_or_else(|| "unknown".to_string())
+pub(super) fn model_from_request(req: &CreateSessionRequest, config: &crate::core::Config) -> String {
+    trimmed_non_empty_owned(req.model.as_deref())
+        .or_else(|| config.get_model())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+pub(super) fn reasoning_effort_from_request(
+    req: &CreateSessionRequest,
+    config: &crate::core::Config,
+) -> Option<ReasoningEffort> {
+    req.reasoning_effort.or_else(|| config.get_reasoning_effort())
 }
 
 fn trimmed_non_empty_owned(value: Option<&str>) -> Option<String> {

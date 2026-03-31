@@ -39,51 +39,46 @@ fn test_runner_creation() {
     let _token_clone = runner.cancel_token.clone();
 }
 
-// ========== MODEL REQUIREMENT ARCHITECTURE TESTS ==========
+// ========== SESSION-DRIVEN EXECUTE REQUEST TESTS ==========
 // These tests ensure the design principle:
-// "execute must receive model in request body, not from session"
+// "execute is session-driven; request.model is only a compatibility fallback"
 
-/// Test: ExecuteRequest.model must be String (not Option<String>)
 #[test]
-fn execute_request_model_type_is_string_not_option() {
+fn execute_request_model_type_is_optional() {
     let json = r#"{
             "model": "kimi-for-coding"
         }"#;
 
     let request: ExecuteRequest =
         serde_json::from_str(json).expect("execute request should deserialize");
-    // This proves model is String, not Option<String>.
-    let _model_str: &str = &request.model;
-    assert_eq!(request.model, "kimi-for-coding");
+    let _model_str: Option<&str> = request.model.as_deref();
+    assert_eq!(request.model.as_deref(), Some("kimi-for-coding"));
 }
 
-/// Test: ExecuteRequest deserialization fails without model
 #[test]
-fn execute_request_requires_model() {
+fn execute_request_allows_missing_model() {
     let json = r#"{}"#;
     let result: Result<ExecuteRequest, _> = serde_json::from_str(json);
     assert!(
-        result.is_err(),
-        "ExecuteRequest should fail without model field"
+        result.is_ok(),
+        "ExecuteRequest should deserialize without model field"
     );
+    assert!(result.expect("request should deserialize").model.is_none());
 }
 
-/// Test: Empty/whitespace model should fail validation
 #[test]
-fn execute_request_empty_model_fails_validation() {
+fn execute_request_empty_model_normalizes_to_compat_absent() {
     let request = ExecuteRequest {
-        model: "   ".to_string(),
+        model: Some("   ".to_string()),
         skill_mode: None,
         reasoning_effort: None,
         client_sync: None,
     };
 
-    // Handler validation: trim and check if empty.
-    let model = request.model.trim();
-    assert!(model.is_empty(), "Empty model should fail validation");
+    let model = request.model.as_deref().unwrap_or("").trim();
+    assert!(model.is_empty(), "Empty compatibility model should normalize to absent");
 }
 
-/// Test: ExecuteRequest with valid model succeeds
 #[test]
 fn execute_request_with_valid_model_succeeds() {
     let json = r#"{
@@ -92,7 +87,7 @@ fn execute_request_with_valid_model_succeeds() {
 
     let request: ExecuteRequest =
         serde_json::from_str(json).expect("execute request should deserialize");
-    assert_eq!(request.model, "gpt-4o-mini");
+    assert_eq!(request.model.as_deref(), Some("gpt-4o-mini"));
 }
 
 #[test]

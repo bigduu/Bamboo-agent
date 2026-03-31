@@ -82,13 +82,16 @@ pub struct ExecuteResponse {
 ///
 /// # Fields
 ///
-/// * `model` - Required model identifier for execution
+/// * `model` - Optional model identifier used only as a compatibility fallback
 ///
 /// # Note
 ///
-/// The `model` parameter is **required** and must be provided in every request.
-/// It is not read from the session. This ensures explicit model selection
-/// for each execution.
+/// The `model` parameter is optional.
+///
+/// Runtime behavior is session-driven:
+/// - prefer `session.model`
+/// - then provider default model
+/// - finally `request.model` as a compatibility fallback
 ///
 /// # Examples
 ///
@@ -99,8 +102,9 @@ pub struct ExecuteResponse {
 /// ```
 #[derive(Deserialize)]
 pub struct ExecuteRequest {
-    /// Model to use for execution (required)
-    pub model: String,
+    /// Optional model compatibility fallback for execution.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Optional per-execution skill mode override (for example: "code", "ask").
     ///
     /// When provided, skill discovery prefers `skills-<mode>` directories.
@@ -162,7 +166,7 @@ mod tests {
         let json = r#"{"model":"claude-3-opus"}"#;
         let req: ExecuteRequest = serde_json::from_str(json).unwrap();
 
-        assert_eq!(req.model, "claude-3-opus");
+        assert_eq!(req.model.as_deref(), Some("claude-3-opus"));
         assert!(req.skill_mode.is_none());
         assert!(req.reasoning_effort.is_none());
         assert!(req.client_sync.is_none());
@@ -173,7 +177,7 @@ mod tests {
         let json = r#"{"model":"claude-3-opus","reasoning_effort":"high"}"#;
         let req: ExecuteRequest = serde_json::from_str(json).unwrap();
 
-        assert_eq!(req.model, "claude-3-opus");
+        assert_eq!(req.model.as_deref(), Some("claude-3-opus"));
         assert!(req.skill_mode.is_none());
         assert!(req.reasoning_effort.is_some());
         assert!(req.client_sync.is_none());
@@ -184,7 +188,7 @@ mod tests {
         let json = r#"{"model":"claude-3-opus","skill_mode":"code"}"#;
         let req: ExecuteRequest = serde_json::from_str(json).unwrap();
 
-        assert_eq!(req.model, "claude-3-opus");
+        assert_eq!(req.model.as_deref(), Some("claude-3-opus"));
         assert_eq!(req.skill_mode.as_deref(), Some("code"));
     }
 
@@ -219,7 +223,7 @@ mod tests {
         let json = r#"{"model":"gpt-4"}"#;
         let req: ExecuteRequest = serde_json::from_str(json).unwrap();
 
-        assert_eq!(req.model, "gpt-4");
+        assert_eq!(req.model.as_deref(), Some("gpt-4"));
     }
 
     #[test]
@@ -227,7 +231,7 @@ mod tests {
         let json = r#"{"model":""}"#;
         let req: ExecuteRequest = serde_json::from_str(json).unwrap();
 
-        assert_eq!(req.model, "");
+        assert_eq!(req.model.as_deref(), Some(""));
     }
 
     #[test]
@@ -235,7 +239,7 @@ mod tests {
         let json = r#"{"model":"claude-3-opus-20240229"}"#;
         let req: ExecuteRequest = serde_json::from_str(json).unwrap();
 
-        assert_eq!(req.model, "claude-3-opus-20240229");
+        assert_eq!(req.model.as_deref(), Some("claude-3-opus-20240229"));
     }
 
     #[test]

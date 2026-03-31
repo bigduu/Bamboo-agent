@@ -5,11 +5,12 @@ use tokio::fs;
 
 use crate::server::{app_state::AppState, error::AppError};
 
-use super::common::config_file_path;
+use super::common::{config_file_path, model_limits_file_path};
 
 /// Resets (deletes) the Bamboo configuration file.
 pub async fn reset_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     remove_config_file_if_exists(&config_file_path(&app_state.app_data_dir)).await?;
+    remove_config_file_if_exists(&model_limits_file_path(&app_state.app_data_dir)).await?;
 
     // Reset in-memory config and best-effort reload provider.
     let new_config = app_state.reload_config().await;

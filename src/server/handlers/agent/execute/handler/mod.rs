@@ -15,7 +15,7 @@ use self::response::{
     already_running_response, bad_request_error_response, completed_response,
     internal_server_error_response, started_response,
 };
-use self::validation::validate_and_normalize_model;
+use self::validation::{require_resolved_model, validate_and_normalize_model};
 
 mod response;
 #[cfg(test)]
@@ -170,19 +170,13 @@ pub async fn handler(
     req: web::Json<ExecuteRequest>,
 ) -> HttpResponse {
     let session_id = path.into_inner();
-    let model = match validate_and_normalize_model(&req.model) {
+    let request_model = match validate_and_normalize_model(req.model.as_deref()) {
         Ok(model) => model,
         Err(response) => return response,
     };
     let request_reasoning_effort = req.reasoning_effort;
     let request_skill_mode = req.skill_mode.clone();
     let request_client_sync = req.client_sync.clone();
-
-    tracing::debug!(
-        "[{}] Execute request received with model: {}",
-        session_id,
-        model
-    );
 
     let mut session = match load_session(&state, &session_id).await {
         Ok(session) => session,
@@ -209,14 +203,42 @@ pub async fn handler(
     // is intended for LLM request construction only. Persisted session history must keep
     // the original multimodal parts so the frontend can render attachments.
     let config_snapshot = state.config.read().await.clone();
+    let default_model = config_snapshot.get_model();
     let default_reasoning_effort = config_snapshot.get_reasoning_effort();
-    let effective_reasoning_effort = request_reasoning_effort.or(default_reasoning_effort);
+    let session_model = match validate_and_normalize_model(Some(session.model.as_str())) {
+        Ok(model) => model,
+        Err(response) => return response,
+    };
+    let effective_model = match require_resolved_model(
+        session_model
+            .clone()
+            .or_else(|| default_model.clone())
+            .or(request_model.clone()),
+    ) {
+        Ok(model) => model,
+        Err(response) => return response,
+    };
+    let effective_reasoning_effort = session
+        .reasoning_effort
+        .or(default_reasoning_effort)
+        .or(request_reasoning_effort);
     let disabled_tools = config_snapshot.disabled_tool_names();
     let disabled_skill_ids = config_snapshot.disabled_skill_ids();
-    let reasoning_effort_source = if request_reasoning_effort.is_some() {
+    let model_source = if session_model.is_some() {
+        "session"
+    } else if default_model.is_some() {
+        "provider_default"
+    } else if request_model.is_some() {
         "request"
+    } else {
+        "none"
+    };
+    let reasoning_effort_source = if session.reasoning_effort.is_some() {
+        "session"
     } else if default_reasoning_effort.is_some() {
         "provider_default"
+    } else if request_reasoning_effort.is_some() {
+        "request"
     } else {
         "none"
     };
@@ -237,18 +259,23 @@ pub async fn handler(
         return completed_response(&session_id, server_snapshot.to_sync_info(None));
     }
 
+    session.model = effective_model.clone();
+    session.reasoning_effort = effective_reasoning_effort;
+    session
+        .metadata
+        .insert("model_source".to_string(), model_source.to_string());
     if let Some(reasoning_effort) = effective_reasoning_effort {
-        session.metadata.insert(
-            "reasoning_effort".to_string(),
-            reasoning_effort.as_str().to_string(),
-        );
         session.metadata.insert(
             "reasoning_effort_source".to_string(),
             reasoning_effort_source.to_string(),
         );
+        session.metadata.insert(
+            "reasoning_effort_compat".to_string(),
+            reasoning_effort.as_str().to_string(),
+        );
     } else {
-        session.metadata.remove("reasoning_effort");
         session.metadata.remove("reasoning_effort_source");
+        session.metadata.remove("reasoning_effort_compat");
     }
 
     if let Some(skill_mode) = request_skill_mode {
@@ -274,7 +301,27 @@ pub async fn handler(
 
     consume_pending_conclusion_with_options_resume(&mut session);
 
-    tracing::info!("[{}] Starting agent execution", session_id);
+    if let Err(error) = state.storage.save_session(&session).await {
+        return internal_server_error_response(format!(
+            "Failed to persist session config before execute: {}",
+            error
+        ));
+    }
+    {
+        let mut sessions = state.sessions.write().await;
+        sessions.insert(session_id.clone(), session.clone());
+    }
+
+    tracing::info!(
+        "[{}] Starting agent execution with model={}, model_source={}, reasoning_effort={}, reasoning_source={}",
+        session_id,
+        effective_model,
+        model_source,
+        effective_reasoning_effort
+            .map(crate::core::ReasoningEffort::as_str)
+            .unwrap_or("none"),
+        reasoning_effort_source
+    );
 
     // Create mpsc channel for agent loop.
     let (mpsc_tx, mpsc_rx) = mpsc::channel::<crate::agent::core::AgentEvent>(100);
@@ -291,7 +338,7 @@ pub async fn handler(
         session,
         is_child_session,
         provider_name: config_snapshot.provider.clone(),
-        model,
+        model: effective_model,
         fast_model: config_snapshot.get_fast_model(),
         reasoning_effort: effective_reasoning_effort,
         reasoning_effort_source: reasoning_effort_source.to_string(),

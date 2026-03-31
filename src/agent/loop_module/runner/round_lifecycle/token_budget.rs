@@ -24,47 +24,55 @@ pub(super) async fn resolve_token_budget(
     // Default to model limits:
     // 1. built-in defaults
     // 2. provider runtime metadata (copilot only)
-    // 3. optional unified config override: config.json -> model_limits
-    // 4. legacy fallback: model_limits.json
+    // 3. dedicated config file: model_limits.json
+    // 4. legacy fallback: config.json -> model_limits
     let mut registry = ModelLimitsRegistry::default();
 
     if let Some(provider_limit) = resolve_provider_runtime_limit(config, llm, model_name).await {
         registry.add_limit(provider_limit);
     }
 
-    let unified_model_limits = match tokio::task::spawn_blocking(|| {
-        let config = crate::core::Config::new();
-        load_model_limits_from_unified_config(&config)
-    })
-    .await
-    {
-        Ok(Ok(limits)) => limits,
-        Ok(Err(error)) => {
-            tracing::warn!(
-                "Failed to parse model limits from config.json key 'model_limits': {}. Falling back to legacy file.",
-                error
-            );
-            None
-        }
+    let loaded_from_file = match registry.load_user_config().await {
+        Ok(()) => true,
         Err(error) => {
             tracing::warn!(
-                "Failed to load model limits from config.json: {}. Falling back to legacy file.",
+                "Failed to load model limits from {:?}: {}. Falling back to legacy config.json key.",
+                crate::agent::core::budget::limits::get_default_config_path(),
                 error
             );
-            None
+            false
         }
     };
 
-    if let Some(limits) = unified_model_limits {
-        for limit in limits {
-            registry.add_limit(limit);
+    if !loaded_from_file {
+        let unified_model_limits = match tokio::task::spawn_blocking(|| {
+            let config = crate::core::Config::new();
+            load_model_limits_from_unified_config(&config)
+        })
+        .await
+        {
+            Ok(Ok(limits)) => limits,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    "Failed to parse legacy model limits from config.json key 'model_limits': {}.",
+                    error
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to load legacy model limits from config.json: {}.",
+                    error
+                );
+                None
+            }
+        };
+
+        if let Some(limits) = unified_model_limits {
+            for limit in limits {
+                registry.add_limit(limit);
+            }
         }
-    } else if let Err(error) = registry.load_user_config().await {
-        tracing::warn!(
-            "Failed to load model limits from legacy {:?}: {}",
-            crate::agent::core::budget::limits::get_default_config_path(),
-            error
-        );
     }
 
     let matched_limit = registry.get(model_name);

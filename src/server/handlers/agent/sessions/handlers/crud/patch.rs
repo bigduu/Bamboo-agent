@@ -33,6 +33,17 @@ pub async fn patch_session(
     if let Some(pinned) = req.pinned {
         session.pinned = pinned;
     }
+    if let Some(model) = req.model.as_ref() {
+        let trimmed = model.trim();
+        if !trimmed.is_empty() {
+            session.model = trimmed.to_string();
+        }
+    }
+    if req.clear_reasoning_effort.unwrap_or(false) {
+        session.reasoning_effort = None;
+    } else if let Some(reasoning_effort) = req.reasoning_effort {
+        session.reasoning_effort = Some(reasoning_effort);
+    }
     session.updated_at = chrono::Utc::now();
 
     state

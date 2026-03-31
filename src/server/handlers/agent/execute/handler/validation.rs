@@ -2,10 +2,20 @@ use actix_web::HttpResponse;
 
 use super::response::bad_request_error_response;
 
-pub(super) fn validate_and_normalize_model(model: &str) -> Result<String, HttpResponse> {
+pub(super) fn validate_and_normalize_model(model: Option<&str>) -> Result<Option<String>, HttpResponse> {
+    let Some(model) = model else {
+        return Ok(None);
+    };
     let normalized = model.trim();
     if normalized.is_empty() {
-        return Err(bad_request_error_response("model parameter is required"));
+        return Ok(None);
     }
-    Ok(normalized.to_string())
+    if normalized == "unknown" {
+        return Ok(None);
+    }
+    Ok(Some(normalized.to_string()))
+}
+
+pub(super) fn require_resolved_model(model: Option<String>) -> Result<String, HttpResponse> {
+    model.ok_or_else(|| bad_request_error_response("no model configured for session or provider"))
 }

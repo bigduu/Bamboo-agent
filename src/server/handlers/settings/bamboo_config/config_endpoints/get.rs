@@ -11,5 +11,5 @@ pub async fn get_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpRes
     }
 
     let config = app_state.config.read().await.clone();
-    Ok(HttpResponse::Ok().json(redacted_config_json(&config)?))
+    Ok(HttpResponse::Ok().json(redacted_config_json(&config, &app_state.app_data_dir).await?))
 }

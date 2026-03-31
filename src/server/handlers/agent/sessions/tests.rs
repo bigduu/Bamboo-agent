@@ -2,6 +2,7 @@ use super::SessionSummary;
 
 use crate::agent::core::storage::SessionIndexEntry;
 use crate::agent::core::SessionKind;
+use crate::core::ReasoningEffort;
 use chrono::Utc;
 
 #[test]
@@ -15,6 +16,8 @@ fn session_summary_from_entry_includes_last_run_fields() {
         parent_session_id: Some("root".to_string()),
         root_session_id: "root".to_string(),
         spawn_depth: 1,
+        model: "gpt-4o".to_string(),
+        reasoning_effort: Some(ReasoningEffort::High),
         created_by_schedule_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

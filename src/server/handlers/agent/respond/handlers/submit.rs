@@ -25,7 +25,6 @@ pub async fn submit_response(
 ) -> Result<HttpResponse> {
     let session_id = session_id.into_inner();
     let user_response = req.response.clone();
-    let requested_model = req.model.clone();
 
     tracing::info!("[{}] Received user response: {}", session_id, user_response);
 
@@ -82,13 +81,22 @@ pub async fn submit_response(
         "true".to_string(),
     );
 
-    // Resolve reasoning_effort: request → session metadata fallback.
-    // Read from session *before* it is moved into the sessions map.
-    let metadata_reasoning_effort = session
-        .metadata
-        .get("reasoning_effort")
-        .and_then(|v| crate::core::ReasoningEffort::parse(v));
-    let effective_reasoning_effort = req.reasoning_effort.or(metadata_reasoning_effort);
+    // Resolve reasoning_effort in the same session-driven order as execute.
+    let config_snapshot = state.config.read().await.clone();
+    let effective_reasoning_effort = session
+        .reasoning_effort
+        .or(config_snapshot.get_reasoning_effort())
+        .or(req.reasoning_effort);
+
+    if let Some(model) = req.model.as_ref() {
+        let trimmed = model.trim();
+        if !trimmed.is_empty() && trimmed != "unknown" {
+            session.model = trimmed.to_string();
+        }
+    }
+    if let Some(reasoning_effort) = req.reasoning_effort {
+        session.reasoning_effort = Some(reasoning_effort);
+    }
 
     if let Err(error) = state.storage.save_session(&session).await {
         tracing::warn!(
@@ -111,7 +119,6 @@ pub async fn submit_response(
     let auto_resume_status = trigger_auto_resume_if_requested(
         state.clone(),
         &session_id,
-        requested_model,
         effective_reasoning_effort,
     )
     .await;
@@ -127,21 +134,13 @@ pub async fn submit_response(
 async fn trigger_auto_resume_if_requested(
     state: web::Data<AppState>,
     session_id: &str,
-    requested_model: Option<String>,
     reasoning_effort: Option<crate::core::ReasoningEffort>,
 ) -> String {
-    let Some(model) = requested_model.map(|model| model.trim().to_string()) else {
-        return "not_requested".to_string();
-    };
-    if model.is_empty() {
-        return "invalid_model".to_string();
-    }
-
     let response = crate::server::handlers::agent::execute::handler(
         state,
         web::Path::from(session_id.to_string()),
         web::Json(crate::server::handlers::agent::execute::ExecuteRequest {
-            model,
+            model: None,
             skill_mode: None,
             reasoning_effort,
             client_sync: None,

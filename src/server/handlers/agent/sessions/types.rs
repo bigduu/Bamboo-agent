@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agent::core::storage::SessionIndexEntry;
+use crate::core::ReasoningEffort;
 
 #[derive(Debug, Serialize)]
 pub struct SessionSummary {
@@ -11,6 +12,9 @@ pub struct SessionSummary {
     pub parent_session_id: Option<String>,
     pub root_session_id: String,
     pub spawn_depth: u32,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_schedule_id: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -37,6 +41,8 @@ impl SessionSummary {
             parent_session_id: entry.parent_session_id,
             root_session_id: entry.root_session_id,
             spawn_depth: entry.spawn_depth,
+            model: entry.model,
+            reasoning_effort: entry.reasoning_effort,
             created_by_schedule_id: entry.created_by_schedule_id,
             created_at: entry.created_at,
             updated_at: entry.updated_at,
@@ -64,6 +70,8 @@ pub struct CreateSessionRequest {
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,8 +106,16 @@ pub struct SessionSystemPromptResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct PatchSessionRequest {
+    #[serde(default)]
     pub title: Option<String>,
+    #[serde(default)]
     pub pinned: Option<bool>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub clear_reasoning_effort: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,16 +138,18 @@ mod tests {
         assert!(req.title.is_none());
         assert!(req.system_prompt.is_none());
         assert!(req.model.is_none());
+        assert!(req.reasoning_effort.is_none());
     }
 
     #[test]
     fn test_create_session_request_full() {
-        let json = r#"{"title":"Test Session","system_prompt":"You are helpful","model":"gpt-4"}"#;
+        let json = r#"{"title":"Test Session","system_prompt":"You are helpful","model":"gpt-4","reasoning_effort":"high"}"#;
         let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
 
         assert_eq!(req.title, Some("Test Session".to_string()));
         assert_eq!(req.system_prompt, Some("You are helpful".to_string()));
         assert_eq!(req.model, Some("gpt-4".to_string()));
+        assert_eq!(req.reasoning_effort, Some(ReasoningEffort::High));
     }
 
     #[test]
@@ -140,6 +158,7 @@ mod tests {
             title: Some("Test".to_string()),
             system_prompt: None,
             model: None,
+            reasoning_effort: None,
         };
 
         let debug_str = format!("{:?}", req);
@@ -153,15 +172,20 @@ mod tests {
 
         assert_eq!(req.title, Some("New Title".to_string()));
         assert!(req.pinned.is_none());
+        assert!(req.model.is_none());
+        assert!(req.reasoning_effort.is_none());
+        assert!(req.clear_reasoning_effort.is_none());
     }
 
     #[test]
     fn test_patch_session_request_both() {
-        let json = r#"{"title":"New Title","pinned":true}"#;
+        let json = r#"{"title":"New Title","pinned":true,"model":"gpt-5","reasoning_effort":"medium"}"#;
         let req: PatchSessionRequest = serde_json::from_str(json).unwrap();
 
         assert_eq!(req.title, Some("New Title".to_string()));
         assert_eq!(req.pinned, Some(true));
+        assert_eq!(req.model, Some("gpt-5".to_string()));
+        assert_eq!(req.reasoning_effort, Some(ReasoningEffort::Medium));
     }
 
     #[test]
@@ -171,6 +195,9 @@ mod tests {
 
         assert!(req.title.is_none());
         assert!(req.pinned.is_none());
+        assert!(req.model.is_none());
+        assert!(req.reasoning_effort.is_none());
+        assert!(req.clear_reasoning_effort.is_none());
     }
 
     #[test]
@@ -209,6 +236,8 @@ mod tests {
             parent_session_id: None,
             root_session_id: "root-id".to_string(),
             spawn_depth: 0,
+            model: "gpt-4".to_string(),
+            reasoning_effort: Some(ReasoningEffort::Medium),
             created_by_schedule_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -238,6 +267,8 @@ mod tests {
             parent_session_id: Some("parent-id".to_string()),
             root_session_id: "root-id".to_string(),
             spawn_depth: 1,
+            model: "gpt-4.1".to_string(),
+            reasoning_effort: None,
             created_by_schedule_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -308,6 +339,8 @@ mod tests {
             parent_session_id: None,
             root_session_id: "root".to_string(),
             spawn_depth: 0,
+            model: "gpt-4o".to_string(),
+            reasoning_effort: Some(ReasoningEffort::Low),
             created_by_schedule_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),

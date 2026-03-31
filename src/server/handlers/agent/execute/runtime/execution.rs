@@ -83,9 +83,10 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
                 state.tools.clone()
             };
 
-            // Use model from request (not from session - session.model is just for recording/debugging).
+            // Execute is session-driven. The resolved model/reasoning have already been
+            // materialized onto the session before spawning this runtime.
             tracing::info!(
-                "[{}] Using model from request: {}, reasoning_effort={}, reasoning_source={}",
+                "[{}] Using resolved session model: {}, reasoning_effort={}, reasoning_source={}",
                 session_id,
                 model,
                 reasoning_effort
@@ -94,7 +95,7 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
                 reasoning_effort_source
             );
 
-            // Update session.model for debugging/recording purposes.
+            // Keep session.model aligned with the resolved model for persistence/debugging.
             session.model = model.clone();
 
             if let Some(prompt) = system_prompt.as_ref() {

@@ -31,6 +31,7 @@
 
 use crate::agent::core::tools::ToolCall;
 use crate::agent::core::{TaskItemStatus, TaskList};
+use crate::core::ReasoningEffort;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -652,6 +653,9 @@ pub struct Session {
     /// Model name for this session (e.g., "gpt-4o", "gpt-4o-mini")
     #[serde(default)]
     pub model: String,
+    /// Reasoning effort configured for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Session metadata for extensibility (other configuration)
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub metadata: std::collections::HashMap<String, String>,
@@ -713,6 +717,7 @@ impl Session {
             task_list: None,
             pending_question: None,
             model: model.into(),
+            reasoning_effort: None,
             metadata: std::collections::HashMap::new(),
             token_budget: None,
             token_usage: None,
@@ -745,6 +750,7 @@ impl Session {
             task_list: None,
             pending_question: None,
             model: model.into(),
+            reasoning_effort: None,
             metadata: std::collections::HashMap::new(),
             token_budget: None,
             token_usage: None,

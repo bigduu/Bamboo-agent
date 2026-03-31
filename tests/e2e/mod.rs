@@ -25,6 +25,7 @@ mod openai;
 mod respond;
 mod settings;
 mod skills;
+mod sessions;
 mod stop;
 mod task;
 mod tools;
