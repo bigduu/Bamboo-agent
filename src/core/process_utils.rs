@@ -14,6 +14,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const PYTHON_TRIED_PREVIEW_LIMIT: usize = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellCommand {
@@ -43,6 +44,10 @@ pub struct PythonDiscoveryDiagnostics {
     pub invocation: Option<String>,
     pub source: Option<String>,
     pub tried: Vec<String>,
+    pub tried_preview: Vec<String>,
+    pub tried_total: usize,
+    pub tried_truncated: bool,
+    pub hint: Option<String>,
 }
 
 impl PythonDiscoveryDiagnostics {
@@ -53,6 +58,10 @@ impl PythonDiscoveryDiagnostics {
             invocation: None,
             source: None,
             tried: Vec::new(),
+            tried_preview: Vec::new(),
+            tried_total: 0,
+            tried_truncated: false,
+            hint: None,
         }
     }
 }
@@ -298,7 +307,8 @@ fn resolve_executable_from_env_path(path_env: Option<&str>, name: &str) -> Optio
 
 #[cfg(target_os = "windows")]
 fn windows_common_python_paths(env: &HashMap<String, String>) -> Vec<PathBuf> {
-    let mut known = Vec::new();
+    let mut preferred = Vec::new();
+    let mut low_priority = Vec::new();
 
     let local_app_data = env
         .get("LocalAppData")
@@ -317,54 +327,128 @@ fn windows_common_python_paths(env: &HashMap<String, String>) -> Vec<PathBuf> {
         if let Some(base) = env.get(key).cloned().or_else(|| std::env::var(key).ok()) {
             let base = PathBuf::from(base);
             for version in ["Python313", "Python312", "Python311", "Python310", "Python39"] {
-                known.push(base.join("Python").join(version).join("python.exe"));
+                preferred.push(base.join("Python").join(version).join("python.exe"));
             }
-            known.push(base.join("Python").join("Launcher").join("py.exe"));
-            known.push(base.join("Python311").join("python.exe"));
-            known.push(base.join("Python312").join("python.exe"));
-            known.push(base.join("Python313").join("python.exe"));
-            known.push(base.join("Anaconda3").join("python.exe"));
-            known.push(base.join("Miniconda3").join("python.exe"));
+            preferred.push(base.join("Python").join("Launcher").join("py.exe"));
+            preferred.push(base.join("Python311").join("python.exe"));
+            preferred.push(base.join("Python312").join("python.exe"));
+            preferred.push(base.join("Python313").join("python.exe"));
+            preferred.push(base.join("Anaconda3").join("python.exe"));
+            preferred.push(base.join("Miniconda3").join("python.exe"));
         }
     }
 
     if let Some(local_app_data) = local_app_data {
         let base = PathBuf::from(local_app_data);
         for version in ["Python313", "Python312", "Python311", "Python310", "Python39"] {
-            known.push(
+            preferred.push(
                 base.join("Programs")
                     .join("Python")
                     .join(version)
                     .join("python.exe"),
             );
         }
-        known.push(base.join("Programs").join("Python").join("Launcher").join("py.exe"));
-        known.push(base.join("Microsoft").join("WindowsApps").join("python.exe"));
-        known.push(base.join("Microsoft").join("WindowsApps").join("python3.exe"));
-        known.push(base.join("Programs").join("Python").join("Python312").join("python.exe"));
-        known.push(base.join("Programs").join("Python").join("Python311").join("python.exe"));
+        preferred.push(base.join("Programs").join("Python").join("Launcher").join("py.exe"));
+        preferred.push(base.join("Programs").join("Python").join("Python312").join("python.exe"));
+        preferred.push(base.join("Programs").join("Python").join("Python311").join("python.exe"));
+        low_priority.push(base.join("Microsoft").join("WindowsApps").join("python.exe"));
+        low_priority.push(base.join("Microsoft").join("WindowsApps").join("python3.exe"));
     }
 
     if let Some(app_data) = app_data {
         let roaming = PathBuf::from(app_data);
-        known.push(roaming.join("Python").join("Python312").join("python.exe"));
-        known.push(roaming.join("Python").join("Python311").join("python.exe"));
-        known.push(roaming.join("pyenv").join("pyenv-win").join("shims").join("python.exe"));
-        known.push(roaming.join("pyenv").join("pyenv-win").join("shims").join("python3.exe"));
-        known.push(roaming.join("pyenv").join("pyenv-win").join("bin").join("pyenv.bat"));
+        preferred.push(roaming.join("Python").join("Python312").join("python.exe"));
+        preferred.push(roaming.join("Python").join("Python311").join("python.exe"));
+        preferred.push(roaming.join("pyenv").join("pyenv-win").join("shims").join("python.exe"));
+        preferred.push(roaming.join("pyenv").join("pyenv-win").join("shims").join("python3.exe"));
+        preferred.push(roaming.join("pyenv").join("pyenv-win").join("bin").join("pyenv.bat"));
     }
 
     if let Some(user_profile) = user_profile {
         let home = PathBuf::from(user_profile);
-        known.push(home.join("AppData").join("Local").join("Programs").join("Python").join("Python312").join("python.exe"));
-        known.push(home.join("AppData").join("Local").join("Programs").join("Python").join("Python311").join("python.exe"));
-        known.push(home.join("miniconda3").join("python.exe"));
-        known.push(home.join("anaconda3").join("python.exe"));
-        known.push(home.join(".pyenv").join("pyenv-win").join("shims").join("python.exe"));
-        known.push(home.join(".pyenv").join("pyenv-win").join("shims").join("python3.exe"));
+        preferred.push(home.join("AppData").join("Local").join("Programs").join("Python").join("Python312").join("python.exe"));
+        preferred.push(home.join("AppData").join("Local").join("Programs").join("Python").join("Python311").join("python.exe"));
+        preferred.push(home.join("miniconda3").join("python.exe"));
+        preferred.push(home.join("anaconda3").join("python.exe"));
+        preferred.push(home.join(".pyenv").join("pyenv-win").join("shims").join("python.exe"));
+        preferred.push(home.join(".pyenv").join("pyenv-win").join("shims").join("python3.exe"));
     }
 
-    known
+    preferred.extend(low_priority);
+    preferred
+}
+
+#[cfg(target_os = "windows")]
+fn windows_python_candidate_dedupe_key(candidate: &PythonCandidate) -> String {
+    let program = candidate.program.replace('/', "\\").to_ascii_lowercase();
+    let args = candidate
+        .args
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{}|{}", program, args)
+}
+
+fn dedupe_python_candidates(candidates: Vec<PythonCandidate>) -> Vec<PythonCandidate> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::new();
+        for candidate in candidates {
+            let key = windows_python_candidate_dedupe_key(&candidate);
+            if seen.insert(key) {
+                deduped.push(candidate);
+            }
+        }
+        return deduped;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::new();
+        for candidate in candidates {
+            let key = candidate.display();
+            if seen.insert(key) {
+                deduped.push(candidate);
+            }
+        }
+        deduped
+    }
+}
+
+fn python_resolution_hint(diagnostics: &PythonDiscoveryDiagnostics) -> Option<String> {
+    if diagnostics.resolved.is_some() {
+        return None;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return Some(
+            "Python was not resolved. Try `py -3`, `python`, set `BAMBOO_PYTHON`, or install Python 3 and restart Bamboo.".to_string(),
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Some(
+            "Python was not resolved. Try `python3`, set `BAMBOO_PYTHON`, or install Python 3 and restart Bamboo.".to_string(),
+        )
+    }
+}
+
+fn finalize_python_diagnostics(mut diagnostics: PythonDiscoveryDiagnostics) -> PythonDiscoveryDiagnostics {
+    diagnostics.tried_total = diagnostics.tried.len();
+    diagnostics.tried_preview = diagnostics
+        .tried
+        .iter()
+        .take(PYTHON_TRIED_PREVIEW_LIMIT)
+        .cloned()
+        .collect();
+    diagnostics.tried_truncated = diagnostics.tried_total > diagnostics.tried_preview.len();
+    diagnostics.hint = python_resolution_hint(&diagnostics);
+    diagnostics
 }
 
 fn python_candidate_sequence(
@@ -434,7 +518,7 @@ fn python_candidate_sequence(
         ));
     }
 
-    (candidates, configured)
+    (dedupe_python_candidates(candidates), configured)
 }
 
 fn resolve_python_candidate(
@@ -481,6 +565,10 @@ fn resolve_python_diagnostics(env: &HashMap<String, String>) -> PythonDiscoveryD
         invocation: None,
         source: None,
         tried: Vec::new(),
+        tried_preview: Vec::new(),
+        tried_total: 0,
+        tried_truncated: false,
+        hint: None,
     };
 
     for candidate in candidates {
@@ -494,7 +582,7 @@ fn resolve_python_diagnostics(env: &HashMap<String, String>) -> PythonDiscoveryD
         }
     }
 
-    diagnostics
+    finalize_python_diagnostics(diagnostics)
 }
 
 fn count_path_entries(path: &str) -> usize {
@@ -944,6 +1032,10 @@ mod tests {
                 invocation: Some("/usr/bin/python3".to_string()),
                 source: Some("path".to_string()),
                 tried: vec!["python3".to_string(), "python".to_string()],
+                tried_preview: vec!["python3".to_string(), "python".to_string()],
+                tried_total: 2,
+                tried_truncated: false,
+                hint: None,
             },
         };
 
@@ -1096,7 +1188,9 @@ mod tests {
         assert_eq!(diagnostics.resolved, Some(configured.to_string_lossy().to_string()));
         assert_eq!(diagnostics.invocation, Some(configured.to_string_lossy().to_string()));
         assert_eq!(diagnostics.source, Some("configured".to_string()));
-        assert!(!diagnostics.tried.is_empty());
+        assert_eq!(diagnostics.tried_total, diagnostics.tried.len());
+        assert!(!diagnostics.tried_preview.is_empty());
+        assert!(diagnostics.hint.is_none());
     }
 
     #[test]
@@ -1126,6 +1220,38 @@ mod tests {
             Some(python.to_string_lossy().to_string())
         );
         assert_eq!(diagnostics.source, Some("path".to_string()));
+        assert_eq!(diagnostics.tried_total, diagnostics.tried.len());
+        assert!(!diagnostics.tried_preview.is_empty());
+        assert!(diagnostics.hint.is_none());
+    }
+
+    #[test]
+    fn finalize_python_diagnostics_adds_preview_and_hint_for_unresolved_case() {
+        let diagnostics = finalize_python_diagnostics(PythonDiscoveryDiagnostics {
+            configured: None,
+            resolved: None,
+            invocation: None,
+            source: None,
+            tried: vec![
+                "py -3".to_string(),
+                "py".to_string(),
+                "python".to_string(),
+                "python3".to_string(),
+                "custom/python".to_string(),
+                "another/python".to_string(),
+                "last/python".to_string(),
+            ],
+            tried_preview: Vec::new(),
+            tried_total: 0,
+            tried_truncated: false,
+            hint: None,
+        });
+
+        assert!(diagnostics.resolved.is_none());
+        assert_eq!(diagnostics.tried_total, 7);
+        assert_eq!(diagnostics.tried_preview.len(), PYTHON_TRIED_PREVIEW_LIMIT);
+        assert!(diagnostics.tried_truncated);
+        assert!(diagnostics.hint.is_some());
     }
 
     #[test]

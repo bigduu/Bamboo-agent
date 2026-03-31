@@ -6,7 +6,7 @@ use crate::core::process_utils::{
 };
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -70,6 +70,69 @@ impl BashTool {
             }
         }
         *truncated = true;
+    }
+
+    fn python_diagnostics_json(
+        diagnostics: &crate::core::process_utils::PythonDiscoveryDiagnostics,
+        include_full_tried: bool,
+    ) -> Value {
+        let mut python = Map::new();
+        if let Some(configured) = diagnostics.configured.as_ref() {
+            python.insert("configured".to_string(), json!(configured));
+        }
+        if let Some(resolved) = diagnostics.resolved.as_ref() {
+            python.insert("resolved".to_string(), json!(resolved));
+        }
+        if let Some(invocation) = diagnostics.invocation.as_ref() {
+            python.insert("invocation".to_string(), json!(invocation));
+        }
+        if let Some(source) = diagnostics.source.as_ref() {
+            python.insert("source".to_string(), json!(source));
+        }
+        if !diagnostics.tried_preview.is_empty() {
+            python.insert("tried_preview".to_string(), json!(diagnostics.tried_preview));
+        }
+        if diagnostics.tried_total > 0 {
+            python.insert("tried_total".to_string(), json!(diagnostics.tried_total));
+            python.insert(
+                "tried_truncated".to_string(),
+                json!(diagnostics.tried_truncated),
+            );
+        }
+        if let Some(hint) = diagnostics.hint.as_ref() {
+            python.insert("hint".to_string(), json!(hint));
+        }
+        if include_full_tried && !diagnostics.tried.is_empty() {
+            python.insert("tried".to_string(), json!(diagnostics.tried));
+        }
+        Value::Object(python)
+    }
+
+    fn environment_json(
+        diagnostics: &crate::core::process_utils::CommandEnvironmentDiagnostics,
+        include_full_python_tried: bool,
+    ) -> Value {
+        let mut environment = Map::new();
+        environment.insert("source".to_string(), json!(diagnostics.source.as_str()));
+        if let Some(import_shell) = diagnostics.import_shell.as_ref() {
+            environment.insert("import_shell".to_string(), json!(import_shell));
+        }
+        if let Some(import_error) = diagnostics.import_error.as_ref() {
+            environment.insert("import_error".to_string(), json!(import_error));
+        }
+        if let Some(path) = diagnostics.path.as_ref() {
+            environment.insert("path".to_string(), json!(path));
+        }
+        if let Some(path_entries) = diagnostics.path_entries {
+            environment.insert("path_entries".to_string(), json!(path_entries));
+        }
+
+        let python = Self::python_diagnostics_json(&diagnostics.python, include_full_python_tried);
+        if python.as_object().map(|map| !map.is_empty()).unwrap_or(false) {
+            environment.insert("python".to_string(), python);
+        }
+
+        Value::Object(environment)
     }
 
     fn resolve_cwd(session_workspace: &Path, workdir: Option<&str>) -> Result<PathBuf, ToolError> {
@@ -235,6 +298,8 @@ impl BashTool {
         let success = !timed_out && exit_code.unwrap_or(-1) == 0;
         let cwd_display = crate::core::paths::path_to_display_string(cwd);
 
+        let environment = Self::environment_json(&prepared_env.diagnostics, !success);
+
         Ok(ToolResult {
             success,
             result: json!({
@@ -246,20 +311,7 @@ impl BashTool {
                 "timed_out": timed_out,
                 "stdout_truncated": stdout_truncated,
                 "stderr_truncated": stderr_truncated,
-                "environment": {
-                    "source": prepared_env.diagnostics.source.as_str(),
-                    "import_shell": prepared_env.diagnostics.import_shell,
-                    "import_error": prepared_env.diagnostics.import_error,
-                    "path": prepared_env.diagnostics.path,
-                    "path_entries": prepared_env.diagnostics.path_entries,
-                    "python": {
-                        "configured": prepared_env.diagnostics.python.configured,
-                        "resolved": prepared_env.diagnostics.python.resolved,
-                        "invocation": prepared_env.diagnostics.python.invocation,
-                        "source": prepared_env.diagnostics.python.source,
-                        "tried": prepared_env.diagnostics.python.tried,
-                    },
-                },
+                "environment": environment,
             })
             .to_string(),
             display_preference: Some("Collapsible".to_string()),
@@ -360,20 +412,7 @@ impl Tool for BashTool {
                     "command": shell.command,
                     "status": "running",
                     "cwd": crate::core::paths::path_to_display_string(&cwd),
-                    "environment": {
-                        "source": shell.environment.source.as_str(),
-                        "import_shell": shell.environment.import_shell,
-                        "import_error": shell.environment.import_error,
-                        "path": shell.environment.path,
-                        "path_entries": shell.environment.path_entries,
-                        "python": {
-                            "configured": shell.environment.python.configured,
-                            "resolved": shell.environment.python.resolved,
-                            "invocation": shell.environment.python.invocation,
-                            "source": shell.environment.python.source,
-                            "tried": shell.environment.python.tried,
-                        },
-                    },
+                    "environment": Self::environment_json(&shell.environment, false),
                 })
                 .to_string(),
                 display_preference: Some("Collapsible".to_string()),
@@ -435,6 +474,10 @@ mod tests {
                 invocation: Some("/usr/bin/python3".to_string()),
                 source: Some("path".to_string()),
                 tried: vec!["python3".to_string(), "python".to_string()],
+                tried_preview: vec!["python3".to_string(), "python".to_string()],
+                tried_total: 2,
+                tried_truncated: false,
+                hint: None,
             },
         }
     }
@@ -486,6 +529,9 @@ mod tests {
         assert_eq!(payload["environment"]["python"]["resolved"], "/usr/bin/python3");
         assert_eq!(payload["environment"]["python"]["invocation"], "/usr/bin/python3");
         assert_eq!(payload["environment"]["python"]["source"], "path");
+        assert_eq!(payload["environment"]["python"]["tried_preview"][0], "python3");
+        assert_eq!(payload["environment"]["python"]["tried_total"], 1);
+        assert!(payload["environment"]["python"].get("tried").is_none());
 
         let mut streamed = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -512,6 +558,25 @@ mod tests {
         let payload: Value = serde_json::from_str(&result.unwrap().result).unwrap();
         let stderr = payload["stderr"].as_str().unwrap_or_default();
         assert!(!stderr.is_empty());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn bash_foreground_failure_includes_full_python_tried_list() {
+        prime_test_command_environment();
+        let tool = BashTool::new();
+        let result = tool
+            .execute(json!({
+                "command": "false"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let payload: Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(payload["exit_code"], 1);
+        assert_eq!(payload["environment"]["python"]["tried_total"], 1);
+        assert_eq!(payload["environment"]["python"]["tried"][0], "python3");
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -548,6 +613,8 @@ mod tests {
         assert_eq!(payload["environment"]["source"], "process_env");
         assert_eq!(payload["environment"]["python"]["resolved"], "/usr/bin/python3");
         assert_eq!(payload["environment"]["python"]["invocation"], "/usr/bin/python3");
+        assert_eq!(payload["environment"]["python"]["tried_total"], 1);
+        assert!(payload["environment"]["python"].get("tried").is_none());
         let shell_id = payload["bash_id"].as_str().unwrap().to_string();
 
         let started = Instant::now();
