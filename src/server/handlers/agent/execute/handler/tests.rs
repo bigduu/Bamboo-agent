@@ -13,8 +13,7 @@ fn validate_and_normalize_model_treats_empty_value_as_absent() {
 
 #[test]
 fn validate_and_normalize_model_trims_whitespace() {
-    let model = validate_and_normalize_model(Some(" gpt-4o-mini "))
-        .expect("model should be valid");
+    let model = validate_and_normalize_model(Some(" gpt-4o-mini ")).expect("model should be valid");
     assert_eq!(model.as_deref(), Some("gpt-4o-mini"));
 }
 

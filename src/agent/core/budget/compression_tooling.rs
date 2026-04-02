@@ -659,6 +659,7 @@ mod tests {
                     status: TaskItemStatus::InProgress,
                     depends_on: Vec::new(),
                     notes: "避免刚压缩完又立刻再次压缩".to_string(),
+                    ..TaskItem::default()
                 },
                 TaskItem {
                     id: "task_2".to_string(),
@@ -666,6 +667,7 @@ mod tests {
                     status: TaskItemStatus::Pending,
                     depends_on: Vec::new(),
                     notes: String::new(),
+                    ..TaskItem::default()
                 },
             ],
             created_at: Utc::now(),

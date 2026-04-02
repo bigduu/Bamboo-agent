@@ -34,6 +34,7 @@ use crate::agent::core::{TaskItemStatus, TaskList};
 use crate::core::ReasoningEffort;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 const MAX_TOOL_MESSAGE_BYTES: usize = 256 * 1024;
@@ -829,19 +830,108 @@ impl Session {
         item_id: &str,
         status: TaskItemStatus,
         notes: Option<&str>,
+        criteria_met: Option<&[String]>,
     ) -> Result<String, String> {
+        fn normalize_criterion(value: &str) -> Option<String> {
+            let normalized = value
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim()
+                .to_lowercase();
+            if normalized.is_empty() {
+                None
+            } else {
+                Some(normalized)
+            }
+        }
+
+        fn parse_criterion_ref(value: &str) -> Option<usize> {
+            let trimmed = value.trim().to_ascii_lowercase();
+            let as_c_ref = trimmed
+                .strip_prefix("criterion_")
+                .or_else(|| trimmed.strip_prefix("criterion-"))
+                .or_else(|| trimmed.strip_prefix('c'));
+            if let Some(raw_index) = as_c_ref {
+                return raw_index.parse::<usize>().ok().filter(|index| *index > 0);
+            }
+            None
+        }
+
+        fn missing_completion_criteria(
+            required: &[String],
+            criteria_met: &[String],
+        ) -> Vec<String> {
+            let mut required_lookup: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for (index, criterion) in required.iter().enumerate() {
+                if let Some(normalized) = normalize_criterion(criterion) {
+                    required_lookup.insert(normalized, index + 1);
+                }
+            }
+
+            let mut met_refs: HashSet<usize> = HashSet::new();
+            for criterion in criteria_met {
+                if let Some(index) = parse_criterion_ref(criterion) {
+                    met_refs.insert(index);
+                    continue;
+                }
+                if let Some(normalized) = normalize_criterion(criterion) {
+                    if let Some(index) = required_lookup.get(&normalized).copied() {
+                        met_refs.insert(index);
+                    }
+                }
+            }
+
+            required
+                .iter()
+                .enumerate()
+                .filter_map(|(index, criterion)| {
+                    if met_refs.contains(&(index + 1)) {
+                        return None;
+                    }
+                    Some(criterion.trim().to_string())
+                })
+                .collect()
+        }
+
         if let Some(ref mut task_list) = self.task_list {
             if let Some(item) = task_list.items.iter_mut().find(|i| i.id == item_id) {
-                item.status = status;
-                if let Some(n) = notes {
-                    if !item.notes.is_empty() {
-                        item.notes.push('\n');
+                let mut desired_status = status;
+                let mut effective_notes = notes.map(str::to_string);
+                if matches!(desired_status, TaskItemStatus::Completed)
+                    && !matches!(item.status, TaskItemStatus::Completed)
+                    && !item.completion_criteria.is_empty()
+                {
+                    let provided_criteria = criteria_met.unwrap_or(&[]);
+                    let missing =
+                        missing_completion_criteria(&item.completion_criteria, provided_criteria);
+                    if !missing.is_empty() {
+                        desired_status = TaskItemStatus::InProgress;
+                        let gate_note = format!(
+                            "Completion criteria not fully met; keeping task in_progress. Missing: {}",
+                            missing.join(" | ")
+                        );
+                        effective_notes = match effective_notes {
+                            Some(mut note) if !note.trim().is_empty() => {
+                                note.push('\n');
+                                note.push_str(&gate_note);
+                                Some(note)
+                            }
+                            _ => Some(gate_note),
+                        };
                     }
-                    item.notes.push_str(n);
                 }
+
+                let transitioned =
+                    item.transition_to(desired_status, effective_notes.as_deref(), None);
                 task_list.updated_at = Utc::now();
                 self.updated_at = Utc::now();
-                Ok(format!("Updated item '{}' to {:?}", item_id, item.status))
+                if transitioned {
+                    Ok(format!("Updated item '{}' to {:?}", item_id, item.status))
+                } else {
+                    Ok(format!("Task item '{}' remains {:?}", item_id, item.status))
+                }
             } else {
                 Err(format!("Task item '{}' not found", item_id))
             }

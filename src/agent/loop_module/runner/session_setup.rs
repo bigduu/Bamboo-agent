@@ -7,6 +7,13 @@ use crate::agent::core::{Message, Session};
 use crate::agent::loop_module::config::AgentLoopConfig;
 use crate::agent::loop_module::task_context::TaskLoopContext;
 use crate::agent::metrics::MetricsCollector;
+use crate::agent::skill::runtime_metadata::{
+    SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY, SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY,
+    SKILL_RUNTIME_SELECTION_COUNT_KEY, SKILL_RUNTIME_SELECTION_SOURCE_KEY,
+    SKILL_RUNTIME_SELECTION_TRACE_KEY,
+};
+
+use super::logging::DebugLogger;
 
 mod compaction;
 pub(super) mod prompt_setup;
@@ -20,9 +27,51 @@ pub(super) async fn prepare_session_for_loop(
     tools: &dyn ToolExecutor,
     metrics_collector: Option<&MetricsCollector>,
     session_id: &str,
+    debug_logger: &DebugLogger,
 ) -> Option<TaskLoopContext> {
-    let skill_context =
-        skill_context::load_skill_context(config, session_id, initial_message).await;
+    let skill_result = skill_context::load_skill_context(config, session_id, initial_message).await;
+    let skill_context = skill_result.context.clone();
+
+    if let Some(source) = skill_result.selection_source.as_deref() {
+        debug_logger.log_event(
+            session_id,
+            "skill_selection_runtime_state",
+            serde_json::json!({
+                "source": source,
+                "selected_skill_ids": skill_result.selected_skill_ids,
+                "selected_skill_mode": skill_result.selected_skill_mode,
+                "request_hint_present": skill_result.request_hint_present
+            }),
+        );
+        session.metadata.insert(
+            SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+            source.to_string(),
+        );
+        session.metadata.insert(
+            SKILL_RUNTIME_SELECTION_COUNT_KEY.to_string(),
+            skill_result.selected_skill_ids.len().to_string(),
+        );
+        session.metadata.insert(
+            SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+            serde_json::to_string(&skill_result.selected_skill_ids).unwrap_or("[]".to_string()),
+        );
+        session.metadata.insert(
+            SKILL_RUNTIME_SELECTION_TRACE_KEY.to_string(),
+            serde_json::json!({
+                "source": source,
+                "selected_skill_ids": skill_result.selected_skill_ids,
+                "selected_skill_mode": skill_result.selected_skill_mode,
+                "request_hint_present": skill_result.request_hint_present
+            })
+            .to_string(),
+        );
+        if let Some(mode) = skill_result.selected_skill_mode.as_ref() {
+            session.metadata.insert(
+                SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY.to_string(),
+                mode.clone(),
+            );
+        }
+    }
 
     let tool_schemas =
         tool_schemas::resolve_available_tool_schemas_for_session(config, tools, session);

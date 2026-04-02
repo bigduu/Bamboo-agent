@@ -4,7 +4,9 @@ use tempfile::tempdir;
 
 use crate::core::{Config, OpenAIConfig};
 
-use super::common::{config_file_path, model_limits_file_path, redacted_config_json, write_model_limits_file};
+use super::common::{
+    config_file_path, model_limits_file_path, redacted_config_json, write_model_limits_file,
+};
 use super::reset::remove_config_file_if_exists;
 
 #[test]

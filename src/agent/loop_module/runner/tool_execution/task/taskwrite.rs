@@ -27,7 +27,10 @@ pub(super) async fn maybe_handle_taskwrite(
         SessionKind::Root => session.id.clone(),
     };
 
-    let Ok(task_list) = TaskTool::task_list_from_args(&args, &shared_session_id) else {
+    let existing_task_list = session.task_list.as_ref();
+    let Ok(task_list) =
+        TaskTool::task_list_from_args_with_existing(&args, &shared_session_id, existing_task_list)
+    else {
         return;
     };
 

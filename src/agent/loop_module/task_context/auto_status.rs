@@ -1,3 +1,4 @@
+use crate::agent::core::todo::{TaskBlocker, TaskBlockerKind};
 use crate::agent::core::tools::ToolResult;
 use crate::agent::core::TaskItemStatus;
 use chrono::Utc;
@@ -16,6 +17,12 @@ impl TaskLoopContext {
             .items
             .iter()
             .find(|item| {
+                if matches!(item.status, TaskItemStatus::Completed) {
+                    return false;
+                }
+                if !self.unresolved_dependencies(&item.depends_on).is_empty() {
+                    return false;
+                }
                 let desc_lower = item.description.to_lowercase();
                 desc_lower.contains(&tool_lower)
                     || (tool_lower.contains("file") && desc_lower.contains("file"))
@@ -56,13 +63,47 @@ impl TaskLoopContext {
 
             if let Some(new_status) = action {
                 if let Some(item) = self.items.iter_mut().find(|item| &item.id == active_id) {
-                    item.status = new_status.clone();
-                    if matches!(new_status, TaskItemStatus::Completed) {
+                    if matches!(new_status, TaskItemStatus::Blocked) {
+                        let mut summary = format!("Tool `{}` failed repeatedly", tool_name);
+                        let detail = result.result.trim();
+                        if !detail.is_empty() {
+                            let clipped: String = detail.chars().take(120).collect();
+                            if detail.chars().count() > 120 {
+                                summary.push_str(&format!(": {}…", clipped.trim_end()));
+                            } else {
+                                summary.push_str(&format!(": {clipped}"));
+                            }
+                        }
+                        TaskLoopContext::add_item_blocker(
+                            item,
+                            TaskBlocker {
+                                kind: TaskBlockerKind::ToolFailure,
+                                summary,
+                                waiting_on: None,
+                            },
+                        );
+                    }
+
+                    let reason = if result.success {
+                        Some("Auto-updated after sufficient successful tool calls")
+                    } else {
+                        Some("Auto-updated after repeated tool failures")
+                    };
+                    let changed = TaskLoopContext::transition_item(
+                        item,
+                        new_status.clone(),
+                        reason,
+                        Some(self.current_round),
+                    );
+
+                    if changed && matches!(new_status, TaskItemStatus::Completed) {
                         item.completed_at_round = Some(self.current_round);
                         self.active_item_id = None;
                     }
-                    self.version += 1;
-                    self.updated_at = Utc::now();
+                    if changed {
+                        self.version += 1;
+                        self.updated_at = Utc::now();
+                    }
                 }
             }
         }
@@ -70,6 +111,9 @@ impl TaskLoopContext {
 
     /// Determine if item should be marked as completed.
     fn should_mark_completed(&self, item: &TaskLoopItem) -> bool {
+        if !item.completion_criteria.is_empty() {
+            return false;
+        }
         let success_count = item
             .tool_calls
             .iter()

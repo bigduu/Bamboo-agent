@@ -6,12 +6,38 @@ use crate::agent::metrics::MetricsCollector;
 
 use super::super::logging::DebugLogger;
 
+const MAX_CONSECUTIVE_OVERFLOW_RECOVERIES: usize = 3;
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct OverflowRecoveryState {
+    pub(super) total_recoveries: usize,
+    pub(super) consecutive_recoveries: usize,
+    pub(super) last_recovered_round: Option<usize>,
+}
+
+impl OverflowRecoveryState {
+    pub(super) fn can_attempt_recovery(&self) -> bool {
+        self.consecutive_recoveries < MAX_CONSECUTIVE_OVERFLOW_RECOVERIES
+    }
+
+    pub(super) fn record_recovery(&mut self, round: usize) {
+        self.total_recoveries += 1;
+        self.consecutive_recoveries += 1;
+        self.last_recovered_round = Some(round);
+    }
+
+    pub(super) fn reset_after_stable_round(&mut self) {
+        self.consecutive_recoveries = 0;
+    }
+}
+
 pub(super) struct LoopRunState {
     pub(super) session_id: String,
     pub(super) model_name: String,
     pub(super) metrics_collector: Option<MetricsCollector>,
     pub(super) debug_logger: DebugLogger,
     pub(super) task_context: Option<TaskLoopContext>,
+    pub(super) overflow_recovery: OverflowRecoveryState,
 }
 
 pub(super) async fn initialize_loop_state(
@@ -58,6 +84,7 @@ pub(super) async fn initialize_loop_state(
         tools,
         metrics_collector.as_ref(),
         &session_id,
+        &debug_logger,
     )
     .await;
 
@@ -67,5 +94,34 @@ pub(super) async fn initialize_loop_state(
         metrics_collector,
         debug_logger,
         task_context,
+        overflow_recovery: OverflowRecoveryState::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OverflowRecoveryState;
+
+    #[test]
+    fn overflow_recovery_state_tracks_recoveries_and_resets() {
+        let mut state = OverflowRecoveryState::default();
+        assert!(state.can_attempt_recovery());
+
+        state.record_recovery(0);
+        assert_eq!(state.total_recoveries, 1);
+        assert_eq!(state.consecutive_recoveries, 1);
+        assert_eq!(state.last_recovered_round, Some(0));
+        assert!(state.can_attempt_recovery());
+
+        state.record_recovery(1);
+        state.record_recovery(2);
+        assert_eq!(state.total_recoveries, 3);
+        assert_eq!(state.consecutive_recoveries, 3);
+        assert!(!state.can_attempt_recovery());
+
+        state.reset_after_stable_round();
+        assert_eq!(state.consecutive_recoveries, 0);
+        assert!(state.can_attempt_recovery());
+        assert_eq!(state.total_recoveries, 3);
     }
 }

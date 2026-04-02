@@ -1,6 +1,6 @@
 use super::{apply_image_fallback_to_llm_messages, persistable_image_urls};
-use crate::agent::core::{AgentError, Message, Session};
 use crate::agent::core::tools::ToolSchema;
+use crate::agent::core::{AgentError, Message, Session};
 use crate::agent::llm::models::{ContentPart, ImageUrl};
 use crate::agent::llm::provider::{LLMError, LLMProvider, LLMStream};
 use crate::agent::llm::types::LLMChunk;
@@ -172,7 +172,9 @@ async fn image_fallback_vision_rewrites_with_llm_description() {
     .expect("vision fallback should rewrite images");
 
     assert!(messages[0].content_parts.is_none());
-    assert!(messages[0].content.contains("[Vision description of image 1:"));
+    assert!(messages[0]
+        .content
+        .contains("[Vision description of image 1:"));
     assert!(messages[0].content.contains("vision summary"));
     assert_eq!(
         recording

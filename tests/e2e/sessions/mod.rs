@@ -30,4 +30,3 @@ async fn configure_openai_defaults(
     config.provider = "openai".to_string();
     config.providers.openai = Some(openai_config_with(model, reasoning_effort));
 }
-

@@ -29,6 +29,9 @@ pub struct TaskItemUpdate {
     pub item_id: String,
     pub status: TaskItemStatus,
     pub notes: Option<String>,
+    pub evidence: Option<String>,
+    pub blocker: Option<String>,
+    pub criteria_met: Option<Vec<String>>,
 }
 
 pub use executor::evaluate_task_progress;

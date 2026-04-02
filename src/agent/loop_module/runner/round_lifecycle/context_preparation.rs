@@ -5,11 +5,15 @@ use crate::agent::core::budget::{
     TokenBudget,
 };
 use crate::agent::core::tools::ToolSchema;
-use crate::agent::core::{AgentError, AgentEvent, Session};
+use crate::agent::core::{AgentError, AgentEvent, Role, Session};
 use crate::agent::llm::LLMProvider;
 use crate::agent::loop_module::config::AgentLoopConfig;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+use super::super::prompt_context::{
+    strip_existing_skill_context, strip_existing_tool_guide_context,
+};
 
 mod logging;
 mod ocr_cache;
@@ -36,6 +40,30 @@ async fn emit_context_compression_status(
             status: status.to_string(),
         })
         .await;
+}
+
+fn degrade_prompt_context_sections_for_overflow(session: &mut Session) -> Option<&'static str> {
+    let Some(system_message) = session
+        .messages
+        .iter_mut()
+        .find(|message| matches!(message.role, Role::System))
+    else {
+        return None;
+    };
+
+    let without_tool_guide = strip_existing_tool_guide_context(&system_message.content);
+    if without_tool_guide != system_message.content {
+        system_message.content = without_tool_guide;
+        return Some("tool_guide_context");
+    }
+
+    let without_skill = strip_existing_skill_context(&system_message.content);
+    if without_skill != system_message.content {
+        system_message.content = without_skill;
+        return Some("skill_context");
+    }
+
+    None
 }
 
 async fn maybe_apply_host_context_compression_with_budget(
@@ -179,6 +207,39 @@ pub(super) async fn maybe_apply_host_context_compression(
         &budget,
         event_tx,
         phase_label,
+    )
+    .await
+}
+
+pub(crate) async fn force_overflow_context_recovery(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    model_name: &str,
+    session_id: &str,
+    llm: &Arc<dyn LLMProvider>,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
+) -> Result<bool, AgentError> {
+    if let Some(degraded_section) = degrade_prompt_context_sections_for_overflow(session) {
+        tracing::info!(
+            "[{}] Overflow recovery pre-pass degraded prompt section: {}",
+            session_id,
+            degraded_section,
+        );
+        emit_context_compression_status(event_tx, "overflow-recovery", "degraded_sections").await;
+        return Ok(true);
+    }
+
+    let budget =
+        super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref()).await;
+    maybe_apply_host_context_compression_with_budget(
+        session,
+        config,
+        model_name,
+        session_id,
+        llm,
+        &budget,
+        event_tx,
+        "overflow-recovery",
     )
     .await
 }

@@ -36,7 +36,15 @@ impl Tool for BashOutputTool {
     }
 
     fn description(&self) -> &str {
-        "Retrieve incremental output from a running or completed background Bash shell"
+        "Retrieve incremental output from a running or completed background Bash shell. Use the returned cursor to continue reading without replaying earlier lines."
+    }
+
+    fn mutability(&self) -> crate::agent::tools::ToolMutability {
+        crate::agent::tools::ToolMutability::ReadOnly
+    }
+
+    fn concurrency_safe(&self) -> bool {
+        true
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

@@ -298,7 +298,15 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search file contents using ripgrep-style regex parameters"
+        "Search file contents using ripgrep-style regex parameters. Start with files_with_matches or a narrowed path/glob/type before using content or multiline mode."
+    }
+
+    fn mutability(&self) -> crate::agent::tools::ToolMutability {
+        crate::agent::tools::ToolMutability::ReadOnly
+    }
+
+    fn concurrency_safe(&self) -> bool {
+        true
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -306,21 +314,21 @@ impl Tool for GrepTool {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Regex pattern" },
-                "path": { "type": "string", "description": "File or directory to search" },
-                "glob": { "type": "string", "description": "Glob file filter" },
+                "path": { "type": "string", "description": "File or directory to search. Narrow this for expensive or multiline searches." },
+                "glob": { "type": "string", "description": "Glob file filter used to limit candidate files" },
                 "output_mode": {
                     "type": "string",
                     "enum": ["content", "files_with_matches", "count"],
-                    "description": "Output mode"
+                    "description": "Output mode. Prefer files_with_matches for broad discovery, then refine with Read or content mode."
                 },
                 "-B": { "type": "number", "description": "Lines before match" },
                 "-A": { "type": "number", "description": "Lines after match" },
                 "-C": { "type": "number", "description": "Lines before and after match" },
                 "-n": { "type": "boolean", "description": "Show line numbers" },
                 "-i": { "type": "boolean", "description": "Case insensitive" },
-                "type": { "type": "string", "description": "File type filter" },
-                "head_limit": { "type": "number", "description": "Limit output entries" },
-                "multiline": { "type": "boolean", "description": "Enable multiline regex" }
+                "type": { "type": "string", "description": "File type filter (for example rust, js, ts, py)" },
+                "head_limit": { "type": "number", "description": "Limit output entries. Keep this small for broad queries." },
+                "multiline": { "type": "boolean", "description": "Enable multiline regex. Requires a narrowed path." }
             },
             "required": ["pattern"],
             "additionalProperties": false

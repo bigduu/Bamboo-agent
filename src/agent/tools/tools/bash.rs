@@ -90,7 +90,10 @@ impl BashTool {
             python.insert("source".to_string(), json!(source));
         }
         if !diagnostics.tried_preview.is_empty() {
-            python.insert("tried_preview".to_string(), json!(diagnostics.tried_preview));
+            python.insert(
+                "tried_preview".to_string(),
+                json!(diagnostics.tried_preview),
+            );
         }
         if diagnostics.tried_total > 0 {
             python.insert("tried_total".to_string(), json!(diagnostics.tried_total));
@@ -128,7 +131,11 @@ impl BashTool {
         }
 
         let python = Self::python_diagnostics_json(&diagnostics.python, include_full_python_tried);
-        if python.as_object().map(|map| !map.is_empty()).unwrap_or(false) {
+        if python
+            .as_object()
+            .map(|map| !map.is_empty())
+            .unwrap_or(false)
+        {
             environment.insert("python".to_string(), python);
         }
 
@@ -525,11 +532,23 @@ mod tests {
             .unwrap_or_default()
             .contains("err"));
         assert_eq!(payload["environment"]["source"], "process_env");
-        assert_eq!(payload["environment"]["import_error"], "test-import-disabled");
-        assert_eq!(payload["environment"]["python"]["resolved"], "/usr/bin/python3");
-        assert_eq!(payload["environment"]["python"]["invocation"], "/usr/bin/python3");
+        assert_eq!(
+            payload["environment"]["import_error"],
+            "test-import-disabled"
+        );
+        assert_eq!(
+            payload["environment"]["python"]["resolved"],
+            "/usr/bin/python3"
+        );
+        assert_eq!(
+            payload["environment"]["python"]["invocation"],
+            "/usr/bin/python3"
+        );
         assert_eq!(payload["environment"]["python"]["source"], "path");
-        assert_eq!(payload["environment"]["python"]["tried_preview"][0], "python3");
+        assert_eq!(
+            payload["environment"]["python"]["tried_preview"][0],
+            "python3"
+        );
         assert_eq!(payload["environment"]["python"]["tried_total"], 1);
         assert!(payload["environment"]["python"].get("tried").is_none());
 
@@ -611,8 +630,14 @@ mod tests {
             .unwrap();
         let payload: Value = serde_json::from_str(&result.result).unwrap();
         assert_eq!(payload["environment"]["source"], "process_env");
-        assert_eq!(payload["environment"]["python"]["resolved"], "/usr/bin/python3");
-        assert_eq!(payload["environment"]["python"]["invocation"], "/usr/bin/python3");
+        assert_eq!(
+            payload["environment"]["python"]["resolved"],
+            "/usr/bin/python3"
+        );
+        assert_eq!(
+            payload["environment"]["python"]["invocation"],
+            "/usr/bin/python3"
+        );
         assert_eq!(payload["environment"]["python"]["tried_total"], 1);
         assert!(payload["environment"]["python"].get("tried").is_none());
         let shell_id = payload["bash_id"].as_str().unwrap().to_string();

@@ -25,7 +25,8 @@ fn default_base_prompt_does_not_unconditionally_require_conclusion_with_options(
 fn default_base_prompt_prefers_using_injected_context_before_reasking() {
     assert!(DEFAULT_BASE_PROMPT.contains("treat it as available working context"));
     assert!(DEFAULT_BASE_PROMPT.contains("Prefer a minimal verifiable attempt first"));
-    assert!(DEFAULT_BASE_PROMPT.contains("only ask follow-up questions for information that is still genuinely missing"));
+    assert!(DEFAULT_BASE_PROMPT
+        .contains("only ask follow-up questions for information that is still genuinely missing"));
 }
 
 #[tokio::test]
@@ -73,8 +74,10 @@ async fn default_first_round_tool_surface_is_smaller_than_full_root_tool_catalog
         .iter()
         .filter(|schema| crate::agent::tools::exposure::is_core_tool(&schema.function.name))
         .collect();
-    let visible_names: std::collections::HashSet<&str> =
-        visible.iter().map(|schema| schema.function.name.as_str()).collect();
+    let visible_names: std::collections::HashSet<&str> = visible
+        .iter()
+        .map(|schema| schema.function.name.as_str())
+        .collect();
     eprintln!(
         "tool_surface_metrics: full={}, visible={}, hidden={}",
         full.len(),

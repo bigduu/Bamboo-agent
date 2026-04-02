@@ -14,11 +14,13 @@ use crate::agent::core::Session;
 use crate::agent::skill::SkillManager;
 use crate::core::Config;
 
-const SELECTED_SKILL_IDS_METADATA_KEY: &str = "selected_skill_ids";
-const SELECTED_SKILL_MODE_METADATA_KEY: &str = "skill_mode";
+use crate::agent::skill::runtime_metadata::{
+    LAST_LOADED_SKILL_ID_METADATA_KEY, LAST_LOADED_SKILL_SUMMARY_METADATA_KEY,
+    LAST_RESOURCE_READ_SUMMARY_METADATA_KEY, LOADED_SKILL_IDS_METADATA_KEY,
+    SELECTED_SKILL_IDS_METADATA_KEY, SELECTED_SKILL_MODE_METADATA_KEY,
+};
+
 const MAX_RESOURCE_CONTENT_CHARS: usize = 50_000;
-const LOADED_SKILL_IDS_METADATA_KEY: &str = "skill_runtime_loaded_skill_ids";
-const LAST_LOADED_SKILL_ID_METADATA_KEY: &str = "skill_runtime_last_loaded_skill_id";
 
 fn parse_loaded_skill_ids(raw: &str) -> HashSet<String> {
     let trimmed = raw.trim();
@@ -225,6 +227,16 @@ impl SkillToolAccess {
         session.metadata.insert(
             LAST_LOADED_SKILL_ID_METADATA_KEY.to_string(),
             skill_id.to_string(),
+        );
+        session.metadata.insert(
+            LAST_LOADED_SKILL_SUMMARY_METADATA_KEY.to_string(),
+            json!({
+                "skill_id": skill_id,
+                "loaded_ids": loaded_ids.iter().cloned().collect::<BTreeSet<_>>(),
+                "selected_skill_mode": session.metadata.get(SELECTED_SKILL_MODE_METADATA_KEY).cloned(),
+                "loaded_count": loaded_ids.len()
+            })
+            .to_string(),
         );
 
         self.storage.save_session(&session).await.map_err(|error| {
@@ -508,6 +520,30 @@ impl Tool for ReadSkillResourceTool {
                 let (paged, start, end, total_lines) = page_text_lines(&text, offset, parsed.limit);
                 let (excerpt, truncated) = truncate_text(&paged, MAX_RESOURCE_CONTENT_CHARS);
                 let has_more = end < total_lines;
+                let summary = json!({
+                    "skill_id": skill_id,
+                    "resource_path": display_relative_path(&resource_path),
+                    "offset": start,
+                    "limit": parsed.limit,
+                    "returned_lines": end.saturating_sub(start),
+                    "total_lines": total_lines,
+                    "has_more": has_more,
+                    "truncated": truncated,
+                    "binary": false
+                });
+                if let Some(session_id) = ctx.session_id {
+                    if let Some(mut session) =
+                        self.access.session_for_context(Some(session_id)).await
+                    {
+                        session.metadata.insert(
+                            LAST_RESOURCE_READ_SUMMARY_METADATA_KEY.to_string(),
+                            summary.to_string(),
+                        );
+                        let _ = self.access.storage.save_session(&session).await;
+                        let mut sessions = self.access.sessions.write().await;
+                        sessions.insert(session_id.to_string(), session);
+                    }
+                }
                 json!({
                     "skill_id": skill_id,
                     "resource_path": display_relative_path(&resource_path),
@@ -651,7 +687,8 @@ fn display_relative_path(path: &Path) -> String {
 mod tests {
     use super::{
         normalize_relative_resource_path, page_text_lines, parse_loaded_skill_ids,
-        serialize_loaded_skill_ids, truncate_text, LoadSkillTool,
+        serialize_loaded_skill_ids, truncate_text, LoadSkillTool, ReadSkillResourceTool,
+        LAST_LOADED_SKILL_SUMMARY_METADATA_KEY, LAST_RESOURCE_READ_SUMMARY_METADATA_KEY,
     };
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
@@ -743,7 +780,11 @@ mod tests {
             Ok(self.sessions.read().await.get(session_id).cloned())
         }
 
-        async fn append_event(&self, _session_id: &str, _event: &AgentEvent) -> std::io::Result<()> {
+        async fn append_event(
+            &self,
+            _session_id: &str,
+            _event: &AgentEvent,
+        ) -> std::io::Result<()> {
             Ok(())
         }
 
@@ -764,7 +805,7 @@ mod tests {
         std::fs::write(
             skill_dir.join("SKILL.md"),
             r#"---
-name: Demo Skill
+name: demo-skill
 description: Demo description
 ---
 Use this demo skill."#,
@@ -816,5 +857,163 @@ Use this demo skill."#,
         assert!(error
             .to_string()
             .contains("globally disabled in Bamboo settings"));
+    }
+
+    #[tokio::test]
+    async fn load_skill_persists_last_loaded_skill_summary() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let skill_dir = temp_dir.path().join("skills").join("demo-skill");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: demo-skill
+description: Demo description
+---
+Use this demo skill."#,
+        )
+        .expect("skill file should be written");
+
+        let skill_manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+            skills_dir: temp_dir.path().join("skills"),
+            project_dir: None,
+            active_mode: None,
+        }));
+        skill_manager
+            .initialize()
+            .await
+            .expect("skill manager should initialize");
+
+        let config = Arc::new(RwLock::new(Config::default()));
+        let session_id = "session-2";
+        let session = Session::new(session_id, "model");
+        let sessions = Arc::new(RwLock::new(HashMap::from([(
+            session_id.to_string(),
+            session.clone(),
+        )])));
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        storage
+            .save_session(&session)
+            .await
+            .expect("session should be saved");
+
+        let tool = LoadSkillTool::new(skill_manager, config, sessions.clone(), storage.clone());
+        let ctx = ToolExecutionContext {
+            session_id: Some(session_id),
+            tool_call_id: "tool-call-2",
+            event_tx: None,
+            available_tool_schemas: None,
+        };
+
+        let _ = tool
+            .execute_with_context(serde_json::json!({ "skill_id": "demo-skill" }), ctx)
+            .await
+            .expect("load_skill should succeed");
+
+        let saved = storage
+            .load_session(session_id)
+            .await
+            .expect("load session should succeed")
+            .expect("session should exist");
+        let summary = saved
+            .metadata
+            .get(LAST_LOADED_SKILL_SUMMARY_METADATA_KEY)
+            .expect("last loaded skill summary should be present");
+        assert!(summary.contains("demo-skill"));
+    }
+
+    #[tokio::test]
+    async fn read_skill_resource_persists_last_resource_read_summary() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let skill_dir = temp_dir.path().join("skills").join("demo-skill");
+        let refs_dir = skill_dir.join("references");
+        std::fs::create_dir_all(&refs_dir).expect("references dir should exist");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: demo-skill
+description: Demo description
+---
+Use this demo skill."#,
+        )
+        .expect("skill file should be written");
+        std::fs::write(refs_dir.join("policy.md"), "line1\nline2\nline3\n")
+            .expect("resource file should be written");
+
+        let skill_manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+            skills_dir: temp_dir.path().join("skills"),
+            project_dir: None,
+            active_mode: None,
+        }));
+        skill_manager
+            .initialize()
+            .await
+            .expect("skill manager should initialize");
+
+        let config = Arc::new(RwLock::new(Config::default()));
+        let session_id = "session-3";
+        let session = Session::new(session_id, "model");
+        let sessions = Arc::new(RwLock::new(HashMap::from([(
+            session_id.to_string(),
+            session.clone(),
+        )])));
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        storage
+            .save_session(&session)
+            .await
+            .expect("session should be saved");
+
+        let load_tool = LoadSkillTool::new(
+            skill_manager.clone(),
+            config.clone(),
+            sessions.clone(),
+            storage.clone(),
+        );
+        let read_tool =
+            ReadSkillResourceTool::new(skill_manager, config, sessions, storage.clone());
+
+        let load_ctx = ToolExecutionContext {
+            session_id: Some(session_id),
+            tool_call_id: "tool-call-load",
+            event_tx: None,
+            available_tool_schemas: None,
+        };
+        let read_ctx = ToolExecutionContext {
+            session_id: Some(session_id),
+            tool_call_id: "tool-call-read",
+            event_tx: None,
+            available_tool_schemas: None,
+        };
+
+        let _ = load_tool
+            .execute_with_context(serde_json::json!({ "skill_id": "demo-skill" }), load_ctx)
+            .await
+            .expect("load_skill should succeed");
+
+        let _ = read_tool
+            .execute_with_context(
+                serde_json::json!({
+                    "skill_id": "demo-skill",
+                    "resource_path": "references/policy.md",
+                    "offset": 1,
+                    "limit": 1
+                }),
+                read_ctx,
+            )
+            .await
+            .expect("read_skill_resource should succeed");
+
+        let saved = storage
+            .load_session(session_id)
+            .await
+            .expect("load session should succeed")
+            .expect("session should exist");
+        let summary = saved
+            .metadata
+            .get(LAST_RESOURCE_READ_SUMMARY_METADATA_KEY)
+            .expect("last resource read summary should be present");
+        assert!(summary.contains("demo-skill"));
+        assert!(summary.contains("references/policy.md"));
+        assert!(summary.contains("\"offset\":1"));
     }
 }

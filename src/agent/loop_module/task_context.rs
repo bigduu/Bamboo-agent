@@ -3,9 +3,13 @@
 //! This module provides TaskLoopContext which integrates TaskList
 //! as a first-class citizen in the Agent Loop, similar to Token Budget.
 
+use crate::agent::core::todo::{
+    TaskBlocker, TaskEvidence, TaskPhase, TaskPriority, TaskTransition,
+};
 use crate::agent::core::TaskItemStatus;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 mod auto_status;
 mod conversion;
@@ -44,7 +48,7 @@ pub struct TaskLoopContext {
 }
 
 /// Task item with execution tracking
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TaskLoopItem {
     /// Item ID
     pub id: String,
@@ -54,6 +58,36 @@ pub struct TaskLoopItem {
 
     /// Item status
     pub status: TaskItemStatus,
+
+    /// IDs of other items this item depends on.
+    pub depends_on: Vec<String>,
+
+    /// Additional notes or context.
+    pub notes: String,
+
+    /// Present-progress phrasing for the active task.
+    pub active_form: Option<String>,
+
+    /// Optional parent task ID when this item is part of a larger task tree.
+    pub parent_id: Option<String>,
+
+    /// Phase of work for the task.
+    pub phase: TaskPhase,
+
+    /// Relative priority of the task.
+    pub priority: TaskPriority,
+
+    /// Explicit completion criteria for the task.
+    pub completion_criteria: Vec<String>,
+
+    /// Structured evidence gathered while working on the task.
+    pub evidence: Vec<TaskEvidence>,
+
+    /// Structured blocker information.
+    pub blockers: Vec<TaskBlocker>,
+
+    /// Transition history for this task item.
+    pub transitions: Vec<TaskTransition>,
 
     /// Tool call history (tracks execution process)
     pub tool_calls: Vec<ToolCallRecord>,
@@ -89,6 +123,92 @@ impl TaskLoopContext {
                 .items
                 .iter()
                 .all(|item| matches!(item.status, TaskItemStatus::Completed))
+    }
+
+    fn completed_item_ids(&self) -> HashSet<String> {
+        self.items
+            .iter()
+            .filter(|item| matches!(item.status, TaskItemStatus::Completed))
+            .map(|item| item.id.clone())
+            .collect()
+    }
+
+    fn unresolved_dependencies(&self, depends_on: &[String]) -> Vec<String> {
+        let completed = self.completed_item_ids();
+        depends_on
+            .iter()
+            .filter(|dependency| !completed.contains(*dependency))
+            .cloned()
+            .collect()
+    }
+
+    fn append_item_notes(item: &mut TaskLoopItem, note: &str) {
+        let note = note.trim();
+        if note.is_empty() {
+            return;
+        }
+        if !item.notes.is_empty() {
+            item.notes.push('\n');
+        }
+        item.notes.push_str(note);
+    }
+
+    fn transition_item(
+        item: &mut TaskLoopItem,
+        status: TaskItemStatus,
+        reason: Option<&str>,
+        round: Option<u32>,
+    ) -> bool {
+        let reason = reason.map(str::trim).filter(|value| !value.is_empty());
+        if item.status == status {
+            if let Some(reason) = reason {
+                Self::append_item_notes(item, reason);
+            }
+            return false;
+        }
+
+        let transition = TaskTransition {
+            from_status: item.status.clone(),
+            to_status: status.clone(),
+            reason: reason.map(ToOwned::to_owned),
+            round,
+            changed_at: Utc::now(),
+        };
+        item.status = status.clone();
+
+        if matches!(status, TaskItemStatus::InProgress) && item.started_at_round.is_none() {
+            item.started_at_round = round;
+        }
+        if matches!(status, TaskItemStatus::Completed) {
+            item.completed_at_round = round;
+        }
+        if let Some(reason) = transition.reason.as_deref() {
+            Self::append_item_notes(item, reason);
+        }
+
+        item.transitions.push(transition);
+        true
+    }
+
+    fn add_item_blocker(item: &mut TaskLoopItem, blocker: TaskBlocker) {
+        if blocker.summary.trim().is_empty() {
+            return;
+        }
+        if item.blockers.iter().any(|existing| {
+            existing.kind == blocker.kind
+                && existing.summary == blocker.summary
+                && existing.waiting_on == blocker.waiting_on
+        }) {
+            return;
+        }
+        item.blockers.push(blocker);
+    }
+
+    fn push_item_evidence(item: &mut TaskLoopItem, evidence: TaskEvidence) {
+        if evidence.summary.trim().is_empty() {
+            return;
+        }
+        item.evidence.push(evidence);
     }
 }
 

@@ -2,12 +2,12 @@ use std::collections::HashMap;
 #[cfg(target_os = "windows")]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::{LazyLock, RwLock};
-use std::time::{Duration, Instant};
 #[cfg(not(target_os = "windows"))]
 use std::process::Stdio;
 #[cfg(target_os = "windows")]
 use std::sync::OnceLock;
+use std::sync::{LazyLock, RwLock};
+use std::time::{Duration, Instant};
 
 #[cfg(not(target_os = "windows"))]
 use tokio::sync::Mutex as AsyncMutex;
@@ -160,7 +160,11 @@ pub async fn build_command_environment(
 ) -> PreparedCommandEnvironment {
     let base = imported_command_environment().await;
     let mut env = base.env;
-    env.extend(overrides.iter().map(|(key, value)| (key.clone(), value.clone())));
+    env.extend(
+        overrides
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
 
     let mut diagnostics = base.diagnostics;
     diagnostics.path = env.get("PATH").cloned();
@@ -326,7 +330,13 @@ fn windows_common_python_paths(env: &HashMap<String, String>) -> Vec<PathBuf> {
     for key in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
         if let Some(base) = env.get(key).cloned().or_else(|| std::env::var(key).ok()) {
             let base = PathBuf::from(base);
-            for version in ["Python313", "Python312", "Python311", "Python310", "Python39"] {
+            for version in [
+                "Python313",
+                "Python312",
+                "Python311",
+                "Python310",
+                "Python39",
+            ] {
                 preferred.push(base.join("Python").join(version).join("python.exe"));
             }
             preferred.push(base.join("Python").join("Launcher").join("py.exe"));
@@ -340,7 +350,13 @@ fn windows_common_python_paths(env: &HashMap<String, String>) -> Vec<PathBuf> {
 
     if let Some(local_app_data) = local_app_data {
         let base = PathBuf::from(local_app_data);
-        for version in ["Python313", "Python312", "Python311", "Python310", "Python39"] {
+        for version in [
+            "Python313",
+            "Python312",
+            "Python311",
+            "Python310",
+            "Python39",
+        ] {
             preferred.push(
                 base.join("Programs")
                     .join("Python")
@@ -348,30 +364,95 @@ fn windows_common_python_paths(env: &HashMap<String, String>) -> Vec<PathBuf> {
                     .join("python.exe"),
             );
         }
-        preferred.push(base.join("Programs").join("Python").join("Launcher").join("py.exe"));
-        preferred.push(base.join("Programs").join("Python").join("Python312").join("python.exe"));
-        preferred.push(base.join("Programs").join("Python").join("Python311").join("python.exe"));
-        low_priority.push(base.join("Microsoft").join("WindowsApps").join("python.exe"));
-        low_priority.push(base.join("Microsoft").join("WindowsApps").join("python3.exe"));
+        preferred.push(
+            base.join("Programs")
+                .join("Python")
+                .join("Launcher")
+                .join("py.exe"),
+        );
+        preferred.push(
+            base.join("Programs")
+                .join("Python")
+                .join("Python312")
+                .join("python.exe"),
+        );
+        preferred.push(
+            base.join("Programs")
+                .join("Python")
+                .join("Python311")
+                .join("python.exe"),
+        );
+        low_priority.push(
+            base.join("Microsoft")
+                .join("WindowsApps")
+                .join("python.exe"),
+        );
+        low_priority.push(
+            base.join("Microsoft")
+                .join("WindowsApps")
+                .join("python3.exe"),
+        );
     }
 
     if let Some(app_data) = app_data {
         let roaming = PathBuf::from(app_data);
         preferred.push(roaming.join("Python").join("Python312").join("python.exe"));
         preferred.push(roaming.join("Python").join("Python311").join("python.exe"));
-        preferred.push(roaming.join("pyenv").join("pyenv-win").join("shims").join("python.exe"));
-        preferred.push(roaming.join("pyenv").join("pyenv-win").join("shims").join("python3.exe"));
-        preferred.push(roaming.join("pyenv").join("pyenv-win").join("bin").join("pyenv.bat"));
+        preferred.push(
+            roaming
+                .join("pyenv")
+                .join("pyenv-win")
+                .join("shims")
+                .join("python.exe"),
+        );
+        preferred.push(
+            roaming
+                .join("pyenv")
+                .join("pyenv-win")
+                .join("shims")
+                .join("python3.exe"),
+        );
+        preferred.push(
+            roaming
+                .join("pyenv")
+                .join("pyenv-win")
+                .join("bin")
+                .join("pyenv.bat"),
+        );
     }
 
     if let Some(user_profile) = user_profile {
         let home = PathBuf::from(user_profile);
-        preferred.push(home.join("AppData").join("Local").join("Programs").join("Python").join("Python312").join("python.exe"));
-        preferred.push(home.join("AppData").join("Local").join("Programs").join("Python").join("Python311").join("python.exe"));
+        preferred.push(
+            home.join("AppData")
+                .join("Local")
+                .join("Programs")
+                .join("Python")
+                .join("Python312")
+                .join("python.exe"),
+        );
+        preferred.push(
+            home.join("AppData")
+                .join("Local")
+                .join("Programs")
+                .join("Python")
+                .join("Python311")
+                .join("python.exe"),
+        );
         preferred.push(home.join("miniconda3").join("python.exe"));
         preferred.push(home.join("anaconda3").join("python.exe"));
-        preferred.push(home.join(".pyenv").join("pyenv-win").join("shims").join("python.exe"));
-        preferred.push(home.join(".pyenv").join("pyenv-win").join("shims").join("python3.exe"));
+        preferred.push(
+            home.join(".pyenv")
+                .join("pyenv-win")
+                .join("shims")
+                .join("python.exe"),
+        );
+        preferred.push(
+            home.join(".pyenv")
+                .join("pyenv-win")
+                .join("shims")
+                .join("python3.exe"),
+        );
     }
 
     preferred.extend(low_priority);
@@ -438,7 +519,9 @@ fn python_resolution_hint(diagnostics: &PythonDiscoveryDiagnostics) -> Option<St
     }
 }
 
-fn finalize_python_diagnostics(mut diagnostics: PythonDiscoveryDiagnostics) -> PythonDiscoveryDiagnostics {
+fn finalize_python_diagnostics(
+    mut diagnostics: PythonDiscoveryDiagnostics,
+) -> PythonDiscoveryDiagnostics {
     diagnostics.tried_total = diagnostics.tried.len();
     diagnostics.tried_preview = diagnostics
         .tried
@@ -467,13 +550,21 @@ fn python_candidate_sequence(
 
     #[cfg(target_os = "windows")]
     {
-        if let Some(virtual_env) = env.get("VIRTUAL_ENV").filter(|value| !value.trim().is_empty()) {
+        if let Some(virtual_env) = env
+            .get("VIRTUAL_ENV")
+            .filter(|value| !value.trim().is_empty())
+        {
             candidates.push(PythonCandidate::hinted_path(
                 "virtual_env",
-                PathBuf::from(virtual_env).join("Scripts").join("python.exe"),
+                PathBuf::from(virtual_env)
+                    .join("Scripts")
+                    .join("python.exe"),
             ));
         }
-        if let Some(conda_prefix) = env.get("CONDA_PREFIX").filter(|value| !value.trim().is_empty()) {
+        if let Some(conda_prefix) = env
+            .get("CONDA_PREFIX")
+            .filter(|value| !value.trim().is_empty())
+        {
             candidates.push(PythonCandidate::hinted_path(
                 "conda_env",
                 PathBuf::from(conda_prefix).join("python.exe"),
@@ -490,13 +581,19 @@ fn python_candidate_sequence(
 
     #[cfg(not(target_os = "windows"))]
     {
-        if let Some(virtual_env) = env.get("VIRTUAL_ENV").filter(|value| !value.trim().is_empty()) {
+        if let Some(virtual_env) = env
+            .get("VIRTUAL_ENV")
+            .filter(|value| !value.trim().is_empty())
+        {
             candidates.push(PythonCandidate::hinted_path(
                 "virtual_env",
                 PathBuf::from(virtual_env).join("bin").join("python"),
             ));
         }
-        if let Some(conda_prefix) = env.get("CONDA_PREFIX").filter(|value| !value.trim().is_empty()) {
+        if let Some(conda_prefix) = env
+            .get("CONDA_PREFIX")
+            .filter(|value| !value.trim().is_empty())
+        {
             candidates.push(PythonCandidate::hinted_path(
                 "conda_env",
                 PathBuf::from(conda_prefix).join("bin").join("python"),
@@ -650,7 +747,10 @@ fn preferred_unix_env_import_shell() -> Option<PathBuf> {
         if configured_shell.is_file() {
             return Some(configured_shell);
         }
-        if let Some(file_name) = configured_shell.file_name().and_then(|value| value.to_str()) {
+        if let Some(file_name) = configured_shell
+            .file_name()
+            .and_then(|value| value.to_str())
+        {
             if let Some(found) = find_unix_shell_on_path(file_name) {
                 return Some(found);
             }
@@ -1013,8 +1113,14 @@ mod tests {
             "warning before env\nPATH=/usr/bin:/bin\nMULTI=line1\nline2\nHOME=/Users/test\n",
         );
 
-        assert_eq!(parsed.get("PATH").map(String::as_str), Some("/usr/bin:/bin"));
-        assert_eq!(parsed.get("MULTI").map(String::as_str), Some("line1\nline2"));
+        assert_eq!(
+            parsed.get("PATH").map(String::as_str),
+            Some("/usr/bin:/bin")
+        );
+        assert_eq!(
+            parsed.get("MULTI").map(String::as_str),
+            Some("line1\nline2")
+        );
         assert_eq!(parsed.get("HOME").map(String::as_str), Some("/Users/test"));
     }
 
@@ -1184,9 +1290,18 @@ mod tests {
         env.insert("PATH".to_string(), String::new());
 
         let diagnostics = resolve_python_diagnostics(&env);
-        assert_eq!(diagnostics.configured, Some(configured.to_string_lossy().to_string()));
-        assert_eq!(diagnostics.resolved, Some(configured.to_string_lossy().to_string()));
-        assert_eq!(diagnostics.invocation, Some(configured.to_string_lossy().to_string()));
+        assert_eq!(
+            diagnostics.configured,
+            Some(configured.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            diagnostics.resolved,
+            Some(configured.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            diagnostics.invocation,
+            Some(configured.to_string_lossy().to_string())
+        );
         assert_eq!(diagnostics.source, Some("configured".to_string()));
         assert_eq!(diagnostics.tried_total, diagnostics.tried.len());
         assert!(!diagnostics.tried_preview.is_empty());
@@ -1207,7 +1322,10 @@ mod tests {
         let mut env = HashMap::new();
         env.insert(
             "PATH".to_string(),
-            std::env::join_paths([dir.path()]).unwrap().to_string_lossy().to_string(),
+            std::env::join_paths([dir.path()])
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
         );
 
         let diagnostics = resolve_python_diagnostics(&env);
@@ -1263,14 +1381,20 @@ mod tests {
             candidates.first().map(PythonCandidate::display).as_deref(),
             Some("/custom/python")
         );
-        assert!(candidates.iter().any(|candidate| candidate.program == "python"));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.program == "python"));
         #[cfg(target_os = "windows")]
         {
             assert!(candidates.iter().any(|candidate| candidate.program == "py"));
-            assert!(candidates.iter().any(|candidate| candidate.display() == "py -3"));
+            assert!(candidates
+                .iter()
+                .any(|candidate| candidate.display() == "py -3"));
         }
         #[cfg(not(target_os = "windows"))]
-        assert!(candidates.iter().any(|candidate| candidate.program == "python3"));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.program == "python3"));
     }
 
     #[cfg(target_os = "windows")]
@@ -1292,13 +1416,21 @@ mod tests {
     #[test]
     fn windows_python_candidates_include_launcher_and_common_paths() {
         let mut env = HashMap::new();
-        env.insert("LocalAppData".to_string(), r"C:\Users\dev\AppData\Local".to_string());
-        env.insert("AppData".to_string(), r"C:\Users\dev\AppData\Roaming".to_string());
+        env.insert(
+            "LocalAppData".to_string(),
+            r"C:\Users\dev\AppData\Local".to_string(),
+        );
+        env.insert(
+            "AppData".to_string(),
+            r"C:\Users\dev\AppData\Roaming".to_string(),
+        );
         env.insert("USERPROFILE".to_string(), r"C:\Users\dev".to_string());
         env.insert("ProgramFiles".to_string(), r"C:\Program Files".to_string());
 
         let (candidates, _) = python_candidate_sequence(&env, None);
-        assert!(candidates.iter().any(|candidate| candidate.display() == "py -3"));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.display() == "py -3"));
         assert!(candidates.iter().any(|candidate| {
             candidate
                 .path_hint

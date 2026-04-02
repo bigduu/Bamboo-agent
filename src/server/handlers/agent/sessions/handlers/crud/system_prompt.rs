@@ -19,6 +19,8 @@ const WORKSPACE_CONTEXT_START_MARKER: &str =
     crate::server::app_state::WORKSPACE_CONTEXT_START_MARKER;
 const WORKSPACE_CONTEXT_END_MARKER: &str = crate::server::app_state::WORKSPACE_CONTEXT_END_MARKER;
 const WORKSPACE_CONTEXT_PREFIX: &str = crate::server::app_state::WORKSPACE_CONTEXT_PREFIX;
+const ENV_CONTEXT_START_MARKER: &str = crate::server::app_state::ENV_CONTEXT_START_MARKER;
+const ENV_CONTEXT_END_MARKER: &str = crate::server::app_state::ENV_CONTEXT_END_MARKER;
 
 fn global_default_prompt() -> String {
     crate::server::prompt_defaults::read_global_default_system_prompt_template()
@@ -96,9 +98,10 @@ fn build_system_prompt_response(
     let prompt_without_generated_sections = strip_generated_sections(&effective_system_prompt);
     let (prompt_without_workspace, workspace_from_prompt) =
         split_workspace_context(&prompt_without_generated_sections);
+    let (prompt_without_env, env_context) = split_env_context(&prompt_without_workspace);
 
     let base_system_prompt = metadata_value(session, "base_system_prompt").unwrap_or_else(|| {
-        let derived = prompt_without_workspace.trim();
+        let derived = prompt_without_env.trim();
         if derived.is_empty() {
             global_default_prompt()
         } else {
@@ -107,16 +110,11 @@ fn build_system_prompt_response(
     });
 
     let enhancement_prompt = metadata_value(session, "enhance_prompt")
-        .or_else(|| derive_enhancement_prompt(&base_system_prompt, &prompt_without_workspace));
+        .or_else(|| derive_enhancement_prompt(&base_system_prompt, &prompt_without_env));
 
     let workspace_context = metadata_value(session, "workspace_path")
-        .map(|workspace_path| {
-            format!(
-                "{}{}\n{}",
-                WORKSPACE_CONTEXT_PREFIX,
-                workspace_path,
-                workspace_prompt_guidance()
-            )
+        .and_then(|workspace_path| {
+            crate::server::app_state::build_workspace_prompt_context(&workspace_path)
         })
         .or(workspace_from_prompt);
 
@@ -125,6 +123,7 @@ fn build_system_prompt_response(
         base_system_prompt,
         enhancement_prompt,
         workspace_context,
+        env_context,
         skill_context,
         tool_guide_context,
         external_memory,
@@ -232,6 +231,15 @@ fn split_workspace_context(prompt: &str) -> (String, Option<String>) {
     split_legacy_workspace_context(prompt)
 }
 
+fn split_env_context(prompt: &str) -> (String, Option<String>) {
+    let env_context = extract_wrapped_section(prompt, ENV_CONTEXT_START_MARKER, ENV_CONTEXT_END_MARKER);
+    if env_context.is_some() {
+        let stripped = strip_wrapped_sections(prompt, ENV_CONTEXT_START_MARKER, ENV_CONTEXT_END_MARKER);
+        return (stripped.trim().to_string(), env_context);
+    }
+    (prompt.trim().to_string(), None)
+}
+
 fn split_legacy_workspace_context(prompt: &str) -> (String, Option<String>) {
     let Some(start_idx) = prompt.find(WORKSPACE_CONTEXT_PREFIX) else {
         return (prompt.trim().to_string(), None);
@@ -290,8 +298,24 @@ mod tests {
     use super::build_system_prompt_response;
     use crate::agent::core::{Message, Session};
 
+    fn publish_test_env_context() {
+        let config = crate::core::Config {
+            env_vars: vec![crate::core::EnvVarEntry {
+                name: "TEST_TOOL_TOKEN".to_string(),
+                value: "hidden-value".to_string(),
+                secret: true,
+                value_encrypted: None,
+                description: Some("Snapshot test token".to_string()),
+            }],
+            ..crate::core::Config::default()
+        };
+        config.publish_env_vars();
+    }
+
     #[test]
-    fn snapshot_extracts_generated_sections_and_workspace() {
+    fn snapshot_extracts_generated_sections_workspace_and_env_context() {
+        publish_test_env_context();
+
         let mut session = Session::new("session-1", "gpt-5");
         session
             .metadata
@@ -306,8 +330,10 @@ mod tests {
         let workspace_context =
             crate::server::app_state::build_workspace_prompt_context("/tmp/workspace")
                 .expect("workspace context");
+        let env_context = crate::server::app_state::build_env_prompt_context()
+            .expect("env context should exist for snapshot test");
         session.add_message(Message::system(format!(
-            "Base prompt\n\nExtra guidance\n\n{workspace_context}\n\n<!-- BAMBOO_SKILL_CONTEXT_START -->\n## Skill System\n\nSkill details\n<!-- BAMBOO_SKILL_CONTEXT_END -->\n\n<!-- BAMBOO_TOOL_GUIDE_START -->\n## Tool Usage Guidelines\n\nGuide details\n<!-- BAMBOO_TOOL_GUIDE_END -->\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\nMemory details\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->\n\n<!-- BAMBOO_TASK_LIST_START -->\n## Current Task List:\n- [ ] item\n<!-- BAMBOO_TASK_LIST_END -->"
+            "Base prompt\n\nExtra guidance\n\n{workspace_context}\n\n{env_context}\n\n<!-- BAMBOO_SKILL_CONTEXT_START -->\n## Skill System\n\nSkill details\n<!-- BAMBOO_SKILL_CONTEXT_END -->\n\n<!-- BAMBOO_TOOL_GUIDE_START -->\n## Tool Usage Guidelines\n\nGuide details\n<!-- BAMBOO_TOOL_GUIDE_END -->\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\nMemory details\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->\n\n<!-- BAMBOO_TASK_LIST_START -->\n## Current Task List:\n- [ ] item\n<!-- BAMBOO_TASK_LIST_END -->"
         )));
 
         let snapshot = build_system_prompt_response("session-1", &session);
@@ -320,6 +346,14 @@ mod tests {
             .workspace_context
             .as_deref()
             .is_some_and(|value| value.contains("/tmp/workspace")));
+        assert!(snapshot
+            .env_context
+            .as_deref()
+            .is_some_and(|value| value.contains("environment variables were explicitly configured by the user inside Bodhi")));
+        assert!(snapshot
+            .env_context
+            .as_deref()
+            .is_some_and(|value| value.contains("Bash/tool processes launched by Bodhi")));
         assert!(snapshot
             .skill_context
             .as_deref()

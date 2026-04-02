@@ -132,6 +132,12 @@ fn build_system_prompt(base: &str, enhance: Option<&str>, workspace_path: Option
             prompt.push_str(&segment);
         }
     }
+    if let Some(segment) = crate::server::app_state::build_env_prompt_context() {
+        if !prompt.is_empty() {
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str(&segment);
+    }
     prompt
 }
 

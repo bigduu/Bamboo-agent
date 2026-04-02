@@ -25,6 +25,7 @@ fn create_test_context() -> TaskLoopContext {
             status: TaskItemStatus::InProgress,
             depends_on: Vec::new(),
             notes: String::new(),
+            ..TaskItem::default()
         }],
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -37,6 +38,16 @@ fn create_test_context() -> TaskLoopContext {
         id: "1".to_string(),
         description: "Fix bug in authentication".to_string(),
         status: TaskItemStatus::InProgress,
+        depends_on: Vec::new(),
+        notes: String::new(),
+        active_form: None,
+        parent_id: None,
+        phase: crate::agent::core::todo::TaskPhase::Execution,
+        priority: crate::agent::core::todo::TaskPriority::Medium,
+        completion_criteria: Vec::new(),
+        evidence: Vec::new(),
+        blockers: Vec::new(),
+        transitions: Vec::new(),
         tool_calls: vec![
             ToolCallRecord {
                 round: 0,

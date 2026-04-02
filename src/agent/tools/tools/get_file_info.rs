@@ -25,7 +25,15 @@ impl Tool for GetFileInfoTool {
     }
 
     fn description(&self) -> &str {
-        "Get file metadata such as type, size, and modification time"
+        "Get file metadata such as type, size, modification time, and existence without loading file contents."
+    }
+
+    fn mutability(&self) -> crate::agent::tools::ToolMutability {
+        crate::agent::tools::ToolMutability::ReadOnly
+    }
+
+    fn concurrency_safe(&self) -> bool {
+        true
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

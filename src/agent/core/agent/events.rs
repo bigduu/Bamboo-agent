@@ -400,6 +400,7 @@ mod tests {
                 status: TaskItemStatus::InProgress,
                 depends_on: Vec::new(),
                 notes: "Implementing".to_string(),
+                ..TaskItem::default()
             }],
             created_at: Utc::now(),
             updated_at: Utc::now(),

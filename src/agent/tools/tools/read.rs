@@ -6,6 +6,21 @@ use std::path::Path;
 
 use super::read_tracker;
 
+const BLOCKED_DEVICE_PATHS: &[&str] = &[
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/full",
+    "/dev/stdin",
+    "/dev/tty",
+    "/dev/console",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/fd/0",
+    "/dev/fd/1",
+    "/dev/fd/2",
+];
+
 #[derive(Debug, Deserialize)]
 struct ReadArgs {
     file_path: String,
@@ -20,6 +35,21 @@ pub struct ReadTool;
 impl ReadTool {
     pub fn new() -> Self {
         Self
+    }
+
+    fn is_blocked_device_path(path: &Path) -> bool {
+        let display = path.to_string_lossy();
+        if BLOCKED_DEVICE_PATHS
+            .iter()
+            .any(|blocked| display == *blocked)
+        {
+            return true;
+        }
+
+        display.starts_with("/proc/")
+            && (display.ends_with("/fd/0")
+                || display.ends_with("/fd/1")
+                || display.ends_with("/fd/2"))
     }
 }
 
@@ -113,7 +143,15 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a local file or directory with line-numbered output (supports offset/limit). Use this before Edit/Write on existing files."
+        "Read a local file or directory with line-numbered output (supports offset/limit). Use this before Edit/Write on existing files. Safe for text files and directories; binary files are omitted and blocking device paths are rejected."
+    }
+
+    fn mutability(&self) -> crate::agent::tools::ToolMutability {
+        crate::agent::tools::ToolMutability::ReadOnly
+    }
+
+    fn concurrency_safe(&self) -> bool {
+        true
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -126,11 +164,11 @@ impl Tool for ReadTool {
                 },
                 "offset": {
                     "type": "number",
-                    "description": "The line number offset to start reading from"
+                    "description": "The line offset to start reading from. Omit when you want the full file or directory listing."
                 },
                 "limit": {
                     "type": "number",
-                    "description": "The number of lines to read"
+                    "description": "The maximum number of lines or directory entries to read. Omit for the full result when safe."
                 }
             },
             "required": ["file_path"],
@@ -156,6 +194,12 @@ impl Tool for ReadTool {
             return Err(ToolError::InvalidArguments(
                 "file_path must be an absolute path".to_string(),
             ));
+        }
+        if Self::is_blocked_device_path(path) {
+            return Err(ToolError::InvalidArguments(format!(
+                "Refusing to read blocking or unbounded device path: {}",
+                path.display()
+            )));
         }
 
         let metadata = tokio::fs::metadata(path)
@@ -239,7 +283,7 @@ mod tests {
             session_id: Some("session_binary_read"),
             tool_call_id: "call_1",
             event_tx: None,
-                    available_tool_schemas: None,
+            available_tool_schemas: None,
         };
 
         let read_tool = ReadTool::new();
@@ -310,5 +354,21 @@ mod tests {
         assert!(result.success);
         assert!(result.result.contains("l1"));
         assert!(result.result.contains("Continue with offset=1"));
+    }
+
+    #[tokio::test]
+    async fn read_rejects_blocking_device_paths() {
+        let tool = ReadTool::new();
+        let result = tool
+            .execute(json!({
+                "file_path": "/dev/stdin"
+            }))
+            .await;
+
+        let error = result.expect_err("device path should be rejected");
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        assert!(error
+            .to_string()
+            .contains("Refusing to read blocking or unbounded device path"));
     }
 }

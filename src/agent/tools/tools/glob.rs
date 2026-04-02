@@ -69,7 +69,15 @@ impl Tool for GlobTool {
     }
 
     fn description(&self) -> &str {
-        "Fast file pattern matching tool"
+        "Fast file pattern matching tool. Use it to find candidate files before deeper Read or Grep steps. Avoid unbounded root patterns without narrowing path or pattern."
+    }
+
+    fn mutability(&self) -> crate::agent::tools::ToolMutability {
+        crate::agent::tools::ToolMutability::ReadOnly
+    }
+
+    fn concurrency_safe(&self) -> bool {
+        true
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -78,15 +86,15 @@ impl Tool for GlobTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "The glob pattern to match files against"
+                    "description": "The glob pattern to match files against (for example **/*.rs or src/**/*.ts)"
                 },
                 "path": {
                     "type": "string",
-                    "description": "The directory to search in"
+                    "description": "The directory to search in. Omit to use the current workspace root."
                 },
                 "limit": {
                     "type": "number",
-                    "description": "Maximum number of returned matches (default 100, hard cap 200)"
+                    "description": "Maximum number of returned matches (default 100, hard cap 200). Use a smaller limit for broad searches."
                 }
             },
             "required": ["pattern"],

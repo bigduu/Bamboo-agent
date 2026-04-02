@@ -99,6 +99,8 @@ pub const DEFAULT_BASE_PROMPT: &str =
 pub const WORKSPACE_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_WORKSPACE_CONTEXT_START -->";
 pub const WORKSPACE_CONTEXT_END_MARKER: &str = "<!-- BAMBOO_WORKSPACE_CONTEXT_END -->";
 pub const WORKSPACE_CONTEXT_PREFIX: &str = "Workspace path: ";
+pub const ENV_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_ENV_CONTEXT_START -->";
+pub const ENV_CONTEXT_END_MARKER: &str = "<!-- BAMBOO_ENV_CONTEXT_END -->";
 
 /// Guidance for workspace-based interactions
 pub fn workspace_prompt_guidance() -> String {
@@ -118,16 +120,26 @@ fn build_env_prompt_guidance() -> Option<String> {
     }
 
     let mut lines = Vec::new();
-    lines.push("Configured environment variables already available to Bash processes and may be relevant for skills/tools:".to_string());
+    lines.push(
+        "These environment variables were explicitly configured by the user inside Bodhi."
+            .to_string(),
+    );
+    lines.push(
+        "- They are already available to Bash/tool processes launched by Bodhi and may be relevant to tools and skills."
+            .to_string(),
+    );
+    lines.push(
+        "- Treat them as user-approved runtime context instead of asking the user to repeat them immediately."
+            .to_string(),
+    );
     lines.push("- Secret values are intentionally hidden from the model.".to_string());
     lines.push(
-        "- Do not ask the user to re-provide these values unless truly necessary.".to_string(),
+        "- If the listed variables appear sufficient, prefer a minimal verification or execution attempt before asking follow-up questions."
+            .to_string(),
     );
     lines.push(
-        "- If these variables appear sufficient for the next step, prefer a minimal verification or execution attempt before asking follow-up questions.".to_string(),
-    );
-    lines.push(
-        "- Only ask the user for additional env details after you have identified a concrete missing variable, invalid value shape, or execution failure that cannot be resolved from the injected context.".to_string(),
+        "- Only ask the user for additional env details after identifying a concrete missing variable, malformed value shape, or execution failure that cannot be resolved from this injected context."
+            .to_string(),
     );
 
     for entry in env_vars {
@@ -143,20 +155,23 @@ fn build_env_prompt_guidance() -> Option<String> {
     Some(lines.join("\n"))
 }
 
+pub fn build_env_prompt_context() -> Option<String> {
+    let body = build_env_prompt_guidance()?;
+    Some(format!(
+        "{ENV_CONTEXT_START_MARKER}\n{body}\n{ENV_CONTEXT_END_MARKER}"
+    ))
+}
+
 pub fn build_workspace_prompt_context(workspace_path: &str) -> Option<String> {
     let workspace_path = workspace_path.trim();
     if workspace_path.is_empty() {
         return None;
     }
 
-    let mut body = format!(
+    let body = format!(
         "{WORKSPACE_CONTEXT_PREFIX}{workspace_path}\n{}",
         workspace_prompt_guidance()
     );
-    if let Some(env_guidance) = build_env_prompt_guidance() {
-        body.push_str("\n\n");
-        body.push_str(&env_guidance);
-    }
 
     Some(format!(
         "{WORKSPACE_CONTEXT_START_MARKER}\n{body}\n{WORKSPACE_CONTEXT_END_MARKER}"

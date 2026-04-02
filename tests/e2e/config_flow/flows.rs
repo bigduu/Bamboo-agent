@@ -190,8 +190,5 @@ async fn test_bamboo_config_persists_disabled_skills() {
     assert!(resp.status().is_success());
 
     let cfg = read_config_json(&config_path);
-    assert_eq!(
-        cfg["skills"]["disabled"],
-        json!(["pdf", "skill-creator"])
-    );
+    assert_eq!(cfg["skills"]["disabled"], json!(["pdf", "skill-creator"]));
 }

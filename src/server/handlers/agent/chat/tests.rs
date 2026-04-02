@@ -59,7 +59,7 @@ fn build_enhanced_system_prompt_appends_workspace_context_before_skills() {
 }
 
 #[test]
-fn build_workspace_context_includes_prompt_safe_env_metadata_without_secret_values() {
+fn build_env_context_includes_prompt_safe_env_metadata_without_secret_values() {
     let config = crate::core::Config {
         env_vars: vec![
             crate::core::EnvVarEntry {
@@ -86,6 +86,8 @@ fn build_workspace_context_includes_prompt_safe_env_metadata_without_secret_valu
     assert!(prompt.contains("INTERNAL_API_BASE"));
     assert!(prompt.contains("OpenAI credential"));
     assert!(prompt.contains("Internal API endpoint"));
+    assert!(prompt.contains("These environment variables were explicitly configured by the user inside Bodhi"));
+    assert!(prompt.contains("already available to Bash/tool processes launched by Bodhi"));
     assert!(prompt.contains("secret"));
     assert!(!prompt.contains("super-secret-value"));
     assert!(!prompt.contains("https://internal.example"));
@@ -122,9 +124,12 @@ fn prompt_profile_exposes_component_flags_and_lengths() {
 
     assert!(profile.has_enhancement);
     assert!(profile.has_workspace_context);
+    assert!(profile.has_env_context);
     assert_eq!(profile.final_len, prompt.len());
     assert!(profile.component_flags_value().contains("enhance=1"));
+    assert!(profile.component_flags_value().contains("env=1"));
     assert!(profile.component_lengths_value().contains("base="));
+    assert!(profile.component_lengths_value().contains("env="));
     assert!(profile.component_lengths_value().contains("final="));
 }
 

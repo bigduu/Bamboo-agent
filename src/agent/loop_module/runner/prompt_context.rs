@@ -26,6 +26,14 @@ pub(super) fn merge_system_prompt_with_contexts(
     )
 }
 
+pub(super) fn strip_existing_skill_context(prompt: &str) -> String {
+    system_sections::strip_existing_skill_context(prompt)
+}
+
+pub(super) fn strip_existing_tool_guide_context(prompt: &str) -> String {
+    system_sections::strip_existing_tool_guide_context(prompt)
+}
+
 pub(super) fn inject_task_list_into_system_message(session: &mut crate::agent::core::Session) {
     task::inject_task_list_into_system_message(session);
 }

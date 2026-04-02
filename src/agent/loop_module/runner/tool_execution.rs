@@ -30,19 +30,21 @@ enum ToolSchedulingMode {
     Sequential,
 }
 
-fn scheduling_mode_for_tool_call(tool_call: &ToolCall) -> ToolSchedulingMode {
+fn scheduling_mode_for_tool_call(
+    tool_call: &ToolCall,
+    tools: &Arc<dyn ToolExecutor>,
+) -> ToolSchedulingMode {
     let normalized = crate::agent::tools::normalize_tool_ref(&tool_call.function.name)
         .unwrap_or_else(|| tool_call.function.name.trim().to_string());
 
-    // Resolve aliases to canonical names (e.g. FileExists → GetFileInfo)
-    // so the classifier sees the canonical tool name.
     let canonical = crate::agent::tools::resolve_alias(&normalized)
         .map(|s| s.to_string())
         .unwrap_or(normalized);
 
-    // Delegate to the centralized classification in orchestrator.rs
-    // which also powers ToolCallRuntime's concurrency control.
-    if crate::agent::tools::parallel::ToolCallRuntime::supports_parallel(&canonical) {
+    let mut effective_call = tool_call.clone();
+    effective_call.function.name = canonical;
+
+    if crate::agent::tools::parallel::ToolCallRuntime::supports_parallel(tools, &effective_call) {
         ToolSchedulingMode::ParallelSafe
     } else {
         ToolSchedulingMode::Sequential
@@ -214,10 +216,10 @@ pub(super) async fn execute_round_tool_calls(
     'tool_calls: while next_index < tool_calls.len() {
         let tool_call = &tool_calls[next_index];
 
-        if scheduling_mode_for_tool_call(tool_call) == ToolSchedulingMode::ParallelSafe {
+        if scheduling_mode_for_tool_call(tool_call, tools) == ToolSchedulingMode::ParallelSafe {
             let batch_start = next_index;
             while next_index < tool_calls.len()
-                && scheduling_mode_for_tool_call(&tool_calls[next_index])
+                && scheduling_mode_for_tool_call(&tool_calls[next_index], tools)
                     == ToolSchedulingMode::ParallelSafe
             {
                 next_index += 1;
@@ -440,34 +442,46 @@ pub(super) async fn execute_round_tool_calls(
 #[cfg(test)]
 mod tests {
     use super::{scheduling_mode_for_tool_call, ToolSchedulingMode};
-    use crate::agent::core::tools::{FunctionCall, ToolCall};
+    use crate::agent::core::tools::{FunctionCall, ToolCall, ToolExecutor};
+    use crate::agent::tools::BuiltinToolExecutor;
+    use serde_json::json;
+    use std::sync::Arc;
 
     fn tool_call(name: &str) -> ToolCall {
+        tool_call_with_args(name, json!({}))
+    }
+
+    fn tool_call_with_args(name: &str, args: serde_json::Value) -> ToolCall {
         ToolCall {
             id: "call_1".to_string(),
             tool_type: "function".to_string(),
             function: FunctionCall {
                 name: name.to_string(),
-                arguments: "{}".to_string(),
+                arguments: args.to_string(),
             },
         }
     }
 
+    fn builtin_tools() -> Arc<dyn ToolExecutor> {
+        Arc::new(BuiltinToolExecutor::new())
+    }
+
     #[test]
     fn read_tools_are_parallel_safe() {
+        let tools = builtin_tools();
         assert_eq!(
-            scheduling_mode_for_tool_call(&tool_call("Read")),
+            scheduling_mode_for_tool_call(&tool_call("Read"), &tools),
             ToolSchedulingMode::ParallelSafe
         );
         assert_eq!(
-            scheduling_mode_for_tool_call(&tool_call("read_file")),
+            scheduling_mode_for_tool_call(&tool_call("read_file"), &tools),
             ToolSchedulingMode::ParallelSafe
         );
     }
 
     #[test]
     fn all_parallel_safe_tools_are_classified_correctly() {
-        // Canonical read-only tools (from orchestrator::READ_ONLY_TOOLS)
+        let tools = builtin_tools();
         let parallel_tools = [
             "GetFileInfo",
             "Glob",
@@ -478,34 +492,59 @@ mod tests {
             "Workspace",
             "BashOutput",
             "tool_search",
-            "memory_note",
             "recall",
             "Sleep",
         ];
         for name in &parallel_tools {
             assert_eq!(
-                scheduling_mode_for_tool_call(&tool_call(name)),
+                scheduling_mode_for_tool_call(&tool_call(name), &tools),
                 ToolSchedulingMode::ParallelSafe,
                 "{name} should be parallel-safe"
             );
         }
+
+        assert_eq!(
+            scheduling_mode_for_tool_call(
+                &tool_call_with_args("memory_note", json!({"action": "read"})),
+                &tools
+            ),
+            ToolSchedulingMode::ParallelSafe,
+            "memory_note read action should be parallel-safe"
+        );
+        assert_eq!(
+            scheduling_mode_for_tool_call(
+                &tool_call_with_args("memory_note", json!({"action": "list_topics"})),
+                &tools
+            ),
+            ToolSchedulingMode::ParallelSafe,
+            "memory_note list_topics action should be parallel-safe"
+        );
+        assert_eq!(
+            scheduling_mode_for_tool_call(
+                &tool_call_with_args("memory_note", json!({"action": "append", "content": "x"})),
+                &tools
+            ),
+            ToolSchedulingMode::Sequential,
+            "memory_note append action should be sequential"
+        );
     }
 
     #[test]
     fn aliases_resolve_to_parallel_safe() {
+        let tools = builtin_tools();
         let aliases = [
-            "read_file",       // alias for Read
-            "file_exists",     // alias → FileExists → GetFileInfo
-            "fileExists",      // alias → FileExists → GetFileInfo
-            "list_directory",  // alias for Glob
-            "get_file_info",   // alias for GetFileInfo
-            "getFileInfo",     // alias for GetFileInfo
-            "get_current_dir", // alias → GetCurrentDir → Workspace
-            "getCurrentDir",   // alias → GetCurrentDir → Workspace
+            "read_file",
+            "file_exists",
+            "fileExists",
+            "list_directory",
+            "get_file_info",
+            "getFileInfo",
+            "get_current_dir",
+            "getCurrentDir",
         ];
         for alias in &aliases {
             assert_eq!(
-                scheduling_mode_for_tool_call(&tool_call(alias)),
+                scheduling_mode_for_tool_call(&tool_call(alias), &tools),
                 ToolSchedulingMode::ParallelSafe,
                 "alias {alias} should resolve to a parallel-safe tool"
             );
@@ -514,6 +553,7 @@ mod tests {
 
     #[test]
     fn side_effect_tools_remain_sequential() {
+        let tools = builtin_tools();
         let sequential_tools = [
             "Write",
             "Edit",
@@ -527,7 +567,7 @@ mod tests {
         ];
         for name in &sequential_tools {
             assert_eq!(
-                scheduling_mode_for_tool_call(&tool_call(name)),
+                scheduling_mode_for_tool_call(&tool_call(name), &tools),
                 ToolSchedulingMode::Sequential,
                 "{name} should be sequential"
             );
@@ -536,25 +576,26 @@ mod tests {
 
     #[test]
     fn mcp_tools_are_sequential() {
-        // MCP tool names use __ separator, not ::
+        let tools = builtin_tools();
         assert_eq!(
-            scheduling_mode_for_tool_call(&tool_call("mcp__playwright__browser_snapshot")),
+            scheduling_mode_for_tool_call(&tool_call("mcp__playwright__browser_snapshot"), &tools),
             ToolSchedulingMode::Sequential,
         );
         assert_eq!(
-            scheduling_mode_for_tool_call(&tool_call("mcp__some_server__some_tool")),
+            scheduling_mode_for_tool_call(&tool_call("mcp__some_server__some_tool"), &tools),
             ToolSchedulingMode::Sequential,
         );
     }
 
     #[test]
     fn unknown_tools_are_sequential() {
+        let tools = builtin_tools();
         assert_eq!(
-            scheduling_mode_for_tool_call(&tool_call("totally_unknown_tool")),
+            scheduling_mode_for_tool_call(&tool_call("totally_unknown_tool"), &tools),
             ToolSchedulingMode::Sequential,
         );
         assert_eq!(
-            scheduling_mode_for_tool_call(&tool_call("")),
+            scheduling_mode_for_tool_call(&tool_call(""), &tools),
             ToolSchedulingMode::Sequential,
         );
     }

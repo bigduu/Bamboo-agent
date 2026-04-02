@@ -201,11 +201,17 @@ fn log_base_system_prompt_snapshot(session_id: &str, prompt: &str) {
         prompt.contains(TASK_LIST_START_MARKER),
     );
 
-    tracing::debug!("[{}] ========== BASE SYSTEM PROMPT SNAPSHOT ==========" , session_id);
+    tracing::debug!(
+        "[{}] ========== BASE SYSTEM PROMPT SNAPSHOT ==========",
+        session_id
+    );
     tracing::debug!("[{}] Snapshot length: {} chars", session_id, prompt.len());
     tracing::debug!("[{}] -----------------------------------", session_id);
     tracing::debug!("[{}] {}", session_id, prompt);
-    tracing::debug!("[{}] ========== END BASE SYSTEM PROMPT SNAPSHOT ==========" , session_id);
+    tracing::debug!(
+        "[{}] ========== END BASE SYSTEM PROMPT SNAPSHOT ==========",
+        session_id
+    );
 }
 
 pub(super) fn preserve_concurrent_session_overrides(

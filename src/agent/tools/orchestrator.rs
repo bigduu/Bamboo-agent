@@ -132,7 +132,7 @@ impl ToolOrchestrator {
         ctx: ToolExecutionContext<'_>,
     ) -> OrchestratorResult {
         let tool_name = call.function.name.trim();
-        let mutability = classify_tool(tool_name);
+        let mutability = executor.call_mutability(call);
         let is_mutating = mutability == ToolMutability::Mutating;
         let auto_approved = !is_mutating && self.config.auto_approve_readonly;
 
@@ -202,6 +202,7 @@ mod tests {
     use super::*;
     use crate::agent::core::tools::{FunctionCall, ToolSchema};
     use crate::agent::tools::events::ToolEventPhase;
+    use crate::agent::tools::BuiltinToolExecutor;
     use async_trait::async_trait;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -354,6 +355,30 @@ mod tests {
         let result = orch.run(&call, &executor, ctx).await;
         assert!(result.result.is_err());
         assert_eq!(result.attempts, 3); // 1 initial + 2 retries
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_auto_approves_tool_search() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(BuiltinToolExecutor::new());
+        let orch = ToolOrchestrator::new();
+        let call = make_call("tool_search", json!({"query": "read"}));
+        let ctx = ToolExecutionContext::none("test");
+
+        let result = orch.run(&call, &executor, ctx).await;
+        assert!(result.result.is_ok());
+        assert!(result.auto_approved);
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_workspace_set_is_not_auto_approved() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(BuiltinToolExecutor::new());
+        let orch = ToolOrchestrator::new();
+        let call = make_call("Workspace", json!({"path": "/tmp"}));
+        let ctx = ToolExecutionContext::none("test");
+
+        let result = orch.run(&call, &executor, ctx).await;
+        assert!(!result.auto_approved);
+        assert!(result.result.is_err());
     }
 
     #[test]

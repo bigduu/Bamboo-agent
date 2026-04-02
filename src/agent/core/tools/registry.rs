@@ -106,6 +106,25 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     /// JSON Schema for tool parameters.
     fn parameters_schema(&self) -> serde_json::Value;
+    /// Declares whether this tool is read-only or mutating for orchestration and
+    /// parallel scheduling decisions. Defaults to mutating to stay conservative.
+    fn mutability(&self) -> crate::agent::tools::ToolMutability {
+        crate::agent::tools::ToolMutability::Mutating
+    }
+    /// Args-aware mutability hook. Defaults to the static mutability declaration.
+    fn call_mutability(&self, _args: &serde_json::Value) -> crate::agent::tools::ToolMutability {
+        self.mutability()
+    }
+    /// Declares whether this tool can safely run in parallel with other
+    /// read-only tools. Defaults to false so tools remain serialized unless
+    /// they opt in explicitly.
+    fn concurrency_safe(&self) -> bool {
+        false
+    }
+    /// Args-aware parallel-safety hook. Defaults to the static declaration.
+    fn call_concurrency_safe(&self, _args: &serde_json::Value) -> bool {
+        self.concurrency_safe()
+    }
     /// Execute the tool with given arguments.
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError>;
 

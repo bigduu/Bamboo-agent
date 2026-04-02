@@ -1,6 +1,7 @@
 //! Agent skill management crate.
 
 pub mod context;
+pub mod runtime_metadata;
 pub mod selection;
 pub mod store;
 pub mod types;
@@ -168,7 +169,7 @@ impl SkillManager {
         &self.store
     }
 
-    async fn list_skills_for_selection(
+    pub(crate) async fn list_skills_for_selection(
         &self,
         disabled_skill_ids: &BTreeSet<String>,
         selected_skill_ids: Option<&[String]>,
@@ -224,8 +225,13 @@ impl SkillManager {
         disabled_skill_ids: &BTreeSet<String>,
         selected_skill_ids: Option<&[String]>,
     ) -> String {
-        self.build_skill_context_for_request_with_mode(disabled_skill_ids, selected_skill_ids, None, None)
-            .await
+        self.build_skill_context_for_request_with_mode(
+            disabled_skill_ids,
+            selected_skill_ids,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Build system prompt context from a selected subset of skills with mode override.
@@ -244,14 +250,13 @@ impl SkillManager {
         .await
     }
 
-    /// Build system prompt context from a selected subset of skills with mode and user request hint.
-    pub async fn build_skill_context_for_request_with_mode(
+    pub(crate) async fn resolve_skills_for_request_with_mode(
         &self,
         disabled_skill_ids: &BTreeSet<String>,
         selected_skill_ids: Option<&[String]>,
         selected_skill_mode: Option<&str>,
         request_hint: Option<&str>,
-    ) -> String {
+    ) -> Vec<SkillDefinition> {
         let mut skills = self
             .list_skills_for_selection(disabled_skill_ids, selected_skill_ids, selected_skill_mode)
             .await;
@@ -270,6 +275,26 @@ impl SkillManager {
                 );
             }
         }
+
+        skills
+    }
+
+    /// Build system prompt context from a selected subset of skills with mode and user request hint.
+    pub async fn build_skill_context_for_request_with_mode(
+        &self,
+        disabled_skill_ids: &BTreeSet<String>,
+        selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
+        request_hint: Option<&str>,
+    ) -> String {
+        let skills = self
+            .resolve_skills_for_request_with_mode(
+                disabled_skill_ids,
+                selected_skill_ids,
+                selected_skill_mode,
+                request_hint,
+            )
+            .await;
 
         tracing::info!(
             "Building skill context with {} skill(s), selection_mode={}, skill_mode={}",
@@ -290,7 +315,8 @@ impl SkillManager {
         disabled_skill_ids: &BTreeSet<String>,
         _chat_id: Option<&str>,
     ) -> String {
-        self.build_skill_context_for_selection(disabled_skill_ids, None).await
+        self.build_skill_context_for_selection(disabled_skill_ids, None)
+            .await
     }
 
     /// Get allowed tool refs from a selected subset of skills.
@@ -331,7 +357,8 @@ impl SkillManager {
         disabled_skill_ids: &BTreeSet<String>,
         _chat_id: Option<&str>,
     ) -> Vec<String> {
-        self.get_allowed_tools_for_selection(disabled_skill_ids, None).await
+        self.get_allowed_tools_for_selection(disabled_skill_ids, None)
+            .await
     }
 }
 
@@ -346,7 +373,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        filter_disabled_skills, shortlist_skills_for_context, tokenize_request_hint, SkillDefinition,
+        filter_disabled_skills, shortlist_skills_for_context, tokenize_request_hint,
+        SkillDefinition,
     };
 
     fn demo_skill(id: &str, description: &str) -> SkillDefinition {
@@ -385,7 +413,10 @@ mod tests {
 
     #[test]
     fn filter_disabled_skills_removes_matching_skill_ids() {
-        let skills = vec![demo_skill("pdf", "pdf helper"), demo_skill("pptx", "ppt helper")];
+        let skills = vec![
+            demo_skill("pdf", "pdf helper"),
+            demo_skill("pptx", "ppt helper"),
+        ];
         let disabled: BTreeSet<String> = ["pdf".to_string()].into_iter().collect();
 
         let filtered = filter_disabled_skills(skills, &disabled);

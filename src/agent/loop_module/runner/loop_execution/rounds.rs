@@ -45,6 +45,10 @@ fn should_retry_round_error(error: &crate::agent::core::AgentError) -> bool {
         .any(|pattern| message.contains(pattern))
 }
 
+fn is_overflow_recoverable(error: &crate::agent::core::AgentError) -> bool {
+    matches!(error, crate::agent::core::AgentError::LLMOverflow(_))
+}
+
 pub(super) async fn run_rounds(
     session: &mut Session,
     event_tx: &mpsc::Sender<AgentEvent>,
@@ -81,6 +85,7 @@ pub(super) async fn run_rounds(
 
         let mut round_flow_outcome: Option<super::super::round_flow::RoundFlowOutcome> = None;
         let mut terminal_error: Option<crate::agent::core::AgentError> = None;
+        let mut overflow_recovery_attempted_in_round = false;
 
         for attempt in 1..=MAX_LLM_ROUND_ATTEMPTS {
             let round_llm_output = match super::super::round_lifecycle::execute_llm_round(
@@ -97,7 +102,91 @@ pub(super) async fn run_rounds(
             {
                 Ok(output) => output,
                 Err(error) => {
-                    if should_retry_round_error(&error) && attempt < MAX_LLM_ROUND_ATTEMPTS {
+                    if is_overflow_recoverable(&error) && !overflow_recovery_attempted_in_round {
+                        overflow_recovery_attempted_in_round = true;
+                        if !state.overflow_recovery.can_attempt_recovery() {
+                            let breaker_error = crate::agent::core::AgentError::LLMOverflow(
+                                format!(
+                                    "overflow recovery circuit breaker opened after {} consecutive recoveries",
+                                    state.overflow_recovery.consecutive_recoveries
+                                ),
+                            );
+                            tracing::error!(
+                                "[{}] Round {} overflow recovery skipped by circuit breaker: {}",
+                                state.session_id,
+                                round + 1,
+                                breaker_error,
+                            );
+                            terminal_error = Some(breaker_error);
+                            break;
+                        }
+
+                        tracing::warn!(
+                            "[{}] Round {} detected overflow error (attempt {}/{}): {}. Trying forced overflow recovery.",
+                            state.session_id,
+                            round + 1,
+                            attempt,
+                            MAX_LLM_ROUND_ATTEMPTS,
+                            error,
+                        );
+                        let recovered =
+                            super::super::round_lifecycle::force_overflow_context_recovery(
+                                session,
+                                config,
+                                &state.model_name,
+                                &state.session_id,
+                                &llm,
+                                Some(event_tx),
+                            )
+                            .await?;
+                        if recovered {
+                            state.overflow_recovery.record_recovery(round);
+                            tracing::info!(
+                                "[{}] Overflow recovery applied: total_recoveries={}, consecutive_recoveries={}, round={}",
+                                state.session_id,
+                                state.overflow_recovery.total_recoveries,
+                                state.overflow_recovery.consecutive_recoveries,
+                                round + 1,
+                            );
+                            let tool_schemas_after_recovery = super::super::session_setup::tool_schemas::resolve_available_tool_schemas_for_session(
+                                config,
+                                tools.as_ref(),
+                                session,
+                            );
+                            match super::super::round_lifecycle::execute_llm_round(
+                                session,
+                                config,
+                                &llm,
+                                event_tx,
+                                cancel_token,
+                                &state.session_id,
+                                &state.model_name,
+                                &tool_schemas_after_recovery,
+                            )
+                            .await
+                            {
+                                Ok(round_llm_output) => round_llm_output,
+                                Err(recovery_error) => {
+                                    tracing::error!(
+                                        "[{}] Round {} overflow recovery retry failed: {}",
+                                        state.session_id,
+                                        round + 1,
+                                        recovery_error,
+                                    );
+                                    terminal_error = Some(recovery_error);
+                                    break;
+                                }
+                            }
+                        } else {
+                            tracing::error!(
+                                "[{}] Round {} overflow recovery was attempted but no compression was applied.",
+                                state.session_id,
+                                round + 1,
+                            );
+                            terminal_error = Some(error);
+                            break;
+                        }
+                    } else if should_retry_round_error(&error) && attempt < MAX_LLM_ROUND_ATTEMPTS {
                         let delay_ms = LLM_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1));
                         tracing::warn!(
                             "[{}] Round {} LLM call failed (attempt {}/{}): {}. Retrying in {}ms",
@@ -110,18 +199,18 @@ pub(super) async fn run_rounds(
                         );
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         continue;
+                    } else {
+                        tracing::error!(
+                            "[{}] Round {} LLM call failed terminally (attempt {}/{}): {}",
+                            state.session_id,
+                            round + 1,
+                            attempt,
+                            MAX_LLM_ROUND_ATTEMPTS,
+                            error,
+                        );
+                        terminal_error = Some(error);
+                        break;
                     }
-
-                    tracing::error!(
-                        "[{}] Round {} LLM call failed terminally (attempt {}/{}): {}",
-                        state.session_id,
-                        round + 1,
-                        attempt,
-                        MAX_LLM_ROUND_ATTEMPTS,
-                        error,
-                    );
-                    terminal_error = Some(error);
-                    break;
                 }
             };
 
@@ -201,6 +290,10 @@ pub(super) async fn run_rounds(
             return Err(error);
         };
 
+        if !overflow_recovery_attempted_in_round {
+            state.overflow_recovery.reset_after_stable_round();
+        }
+
         sent_complete = sent_complete || round_flow_outcome.sent_complete;
         if round_flow_outcome.should_break {
             break;
@@ -212,8 +305,9 @@ pub(super) async fn run_rounds(
 
 #[cfg(test)]
 mod tests {
-    use super::should_retry_round_error;
+    use super::{is_overflow_recoverable, should_retry_round_error};
     use crate::agent::core::AgentError;
+    use crate::agent::loop_module::runner::loop_execution::startup::OverflowRecoveryState;
 
     #[test]
     fn retries_transient_llm_errors() {
@@ -278,5 +372,27 @@ mod tests {
         assert!(!should_retry_round_error(&AgentError::LLM(
             "   ".to_string(),
         )));
+    }
+    #[test]
+    fn overflow_errors_use_dedicated_recovery_path() {
+        assert!(is_overflow_recoverable(&AgentError::LLMOverflow(
+            "prompt too long".to_string(),
+        )));
+        assert!(!is_overflow_recoverable(&AgentError::LLM(
+            "timeout while connecting".to_string(),
+        )));
+        assert!(!should_retry_round_error(&AgentError::LLMOverflow(
+            "maximum context length exceeded".to_string(),
+        )));
+    }
+
+    #[test]
+    fn overflow_recovery_state_opens_circuit_breaker_after_threshold() {
+        let mut state = OverflowRecoveryState::default();
+        assert!(state.can_attempt_recovery());
+        state.record_recovery(0);
+        state.record_recovery(1);
+        state.record_recovery(2);
+        assert!(!state.can_attempt_recovery());
     }
 }

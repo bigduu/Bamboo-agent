@@ -140,6 +140,41 @@ async fn maybe_apply_host_context_compression_uses_fast_model_for_summary_reques
 }
 
 #[tokio::test]
+async fn force_overflow_context_recovery_degrades_tool_guide_before_skill_context() {
+    let mut session = Session::new("session-cp-overflow-degrade", "test-model");
+    session.messages.push(Message::system(
+        "Base prompt\n\n<!-- BAMBOO_SKILL_CONTEXT_START -->\n## Skill System\nskill details\n<!-- BAMBOO_SKILL_CONTEXT_END -->\n\n<!-- BAMBOO_TOOL_GUIDE_START -->\n## Tool Usage Guidelines\nguide details\n<!-- BAMBOO_TOOL_GUIDE_END -->".to_string(),
+    ));
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+    let llm = noop_llm();
+
+    let applied = super::force_overflow_context_recovery(
+        &mut session,
+        &config,
+        "test-model",
+        "session-cp-overflow-degrade",
+        &llm,
+        None,
+    )
+    .await
+    .expect("overflow degradation should complete");
+
+    assert!(applied);
+    let system_prompt = session
+        .messages
+        .iter()
+        .find(|message| matches!(message.role, Role::System))
+        .map(|message| message.content.clone())
+        .unwrap_or_default();
+    assert!(system_prompt.contains("BAMBOO_SKILL_CONTEXT_START"));
+    assert!(!system_prompt.contains("BAMBOO_TOOL_GUIDE_START"));
+}
+
+#[tokio::test]
 async fn prepare_round_context_applies_placeholder_fallback_only_to_prepared_context() {
     let mut session = Session::new("session-cp-1", "test-model");
     session.messages.push(Message::user_with_parts(
@@ -674,6 +709,78 @@ async fn prepare_round_context_skips_host_auto_compression_below_trigger() {
         !session.messages.iter().any(|m| m.compressed),
         "messages should stay uncompressed below host auto-compression trigger"
     );
+}
+
+#[tokio::test]
+async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
+    let mut session = Session::new("session-cp-overflow-force", "test-model");
+    session.token_budget = Some(TokenBudget {
+        max_context_tokens: 1200,
+        max_output_tokens: 200,
+        strategy: BudgetStrategy::Hybrid {
+            window_size: 20,
+            enable_summarization: true,
+        },
+        safety_margin: 0,
+        compression_trigger_percent: 95,
+        compression_target_percent: 50,
+        prompt_cache_min_tool_output_chars: 1_200,
+        prompt_cache_head_chars: 280,
+        prompt_cache_tail_chars: 180,
+        prompt_cache_recent_user_turns: 2,
+        prompt_cache_recent_tool_chains: 2,
+    });
+    session.messages.push(Message::system("System prompt"));
+    for index in 0..12 {
+        session.messages.push(Message::user(format!(
+            "User message {} {}",
+            index,
+            "alpha beta gamma delta epsilon zeta ".repeat(8)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "Assistant response {} {}",
+                index,
+                "analysis plan files checks and next steps ".repeat(8)
+            ),
+            None,
+        ));
+    }
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: 100,
+        summary_tokens: 0,
+        window_tokens: 780,
+        total_tokens: 880,
+        max_context_tokens: 1200,
+        budget_limit: 1200,
+        truncation_occurred: false,
+        segments_removed: 0,
+        prompt_cached_tool_outputs: 0,
+    });
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+    let llm = noop_llm();
+
+    let applied = super::force_overflow_context_recovery(
+        &mut session,
+        &config,
+        "test-model",
+        "session-cp-overflow-force",
+        &llm,
+        None,
+    )
+    .await
+    .expect("forced overflow recovery should complete");
+
+    assert!(
+        applied,
+        "forced overflow recovery should bypass the normal trigger gate"
+    );
+    assert!(!session.compression_events.is_empty());
+    assert!(session.messages.iter().any(|m| m.compressed));
 }
 
 /// Integration test: multi-round compress → build pressure → re-expose → compress again.

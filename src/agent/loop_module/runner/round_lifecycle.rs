@@ -19,6 +19,8 @@ mod stream_execution;
 mod token_budget;
 mod token_estimation;
 
+pub(super) use context_preparation::force_overflow_context_recovery;
+
 pub(super) struct RoundLlmExecutionOutput {
     pub stream_output: StreamHandlingOutput,
     pub prompt_tokens: u64,

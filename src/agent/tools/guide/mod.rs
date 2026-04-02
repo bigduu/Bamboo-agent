@@ -462,7 +462,10 @@ impl EnhancedPromptBuilder {
         if !discoverable_guides.is_empty() {
             rendered_any = true;
             output.push('\n');
-            output.push_str(&Self::render_discoverable_section(&discoverable_guides, context));
+            output.push_str(&Self::render_discoverable_section(
+                &discoverable_guides,
+                context,
+            ));
         }
 
         let guided_names: BTreeSet<String> = core_guides
@@ -543,7 +546,10 @@ impl EnhancedPromptBuilder {
         sorted.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
 
         let mut output = String::new();
-        output.push_str(&format!("### {}\n", discoverable_tools_title(context.language)));
+        output.push_str(&format!(
+            "### {}\n",
+            discoverable_tools_title(context.language)
+        ));
         output.push_str(discoverable_tools_description(context.language));
         output.push('\n');
         for guide in sorted {
@@ -682,18 +688,21 @@ mod tests {
     use serde_json::json;
 
     use crate::agent::core::tools::{FunctionSchema, ToolExecutor, ToolSchema};
-    use crate::agent::tools::{BuiltinToolExecutor, tools::{ReadTool, ToolRegistry}};
+    use crate::agent::tools::{
+        tools::{ReadTool, ToolRegistry},
+        BuiltinToolExecutor,
+    };
 
     use super::{
-        context::GuideBuildContext,
-        context::GuideLanguage,
-        EnhancedPromptBuilder,
-        ToolCategory,
+        context::GuideBuildContext, context::GuideLanguage, EnhancedPromptBuilder, ToolCategory,
         ToolGuideSpec,
     };
 
     fn render_legacy_full_prompt(schemas: &[ToolSchema], context: &GuideBuildContext) -> String {
-        let tool_names: Vec<String> = schemas.iter().map(|schema| schema.function.name.clone()).collect();
+        let tool_names: Vec<String> = schemas
+            .iter()
+            .map(|schema| schema.function.name.clone())
+            .collect();
         let guides = EnhancedPromptBuilder::collect_guides(None, &tool_names);
 
         if guides.is_empty() {
@@ -754,7 +763,10 @@ mod tests {
             }
         }
 
-        let guided_names: BTreeSet<&str> = guides.iter().map(|guide| guide.tool_name.as_str()).collect();
+        let guided_names: BTreeSet<&str> = guides
+            .iter()
+            .map(|guide| guide.tool_name.as_str())
+            .collect();
         let unguided_schemas: Vec<ToolSchema> = schemas
             .iter()
             .filter(|schema| !guided_names.contains(schema.function.name.as_str()))
@@ -771,7 +783,10 @@ mod tests {
         }
 
         if context.include_best_practices {
-            output.push_str(&format!("\n### {}\n", super::best_practices_title(context.language)));
+            output.push_str(&format!(
+                "\n### {}\n",
+                super::best_practices_title(context.language)
+            ));
             for (index, rule) in context.best_practices().iter().enumerate() {
                 output.push_str(&format!("{}. {}\n", index + 1, rule));
             }
@@ -851,6 +866,9 @@ mod tests {
             saved,
             saved_ratio,
         );
-        assert!(saved > 0, "expected prompt savings for summarized discoverable tools");
+        assert!(
+            saved > 0,
+            "expected prompt savings for summarized discoverable tools"
+        );
     }
 }

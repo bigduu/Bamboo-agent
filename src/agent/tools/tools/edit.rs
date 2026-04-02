@@ -495,10 +495,14 @@ impl Tool for EditTool {
         let old_string = parsed.old_string.as_deref();
         let new_string = parsed.new_string.as_deref();
 
+        let requested_replace_all = parsed.replace_all.unwrap_or(false);
+        let line_number_hint = parsed.line_number;
+        let used_patch_mode = patch.is_some();
+
         let (updated, replacements, mode_label) = if let Some(patch_text) = patch {
             if Self::has_meaningful_optional_text(old_string)
                 || Self::has_meaningful_optional_text(new_string)
-                || parsed.replace_all == Some(true)
+                || requested_replace_all
             {
                 return Err(ToolError::InvalidArguments(
                     "patch mode cannot be combined with old_string/new_string/replace_all"
@@ -522,7 +526,7 @@ impl Tool for EditTool {
                 &content,
                 old,
                 new,
-                parsed.replace_all.unwrap_or(false),
+                requested_replace_all,
                 parsed.line_number,
             )?;
             (next, count, "legacy")
@@ -531,6 +535,9 @@ impl Tool for EditTool {
         let checkpoint = file_change::create_checkpoint(path, Some(content.as_bytes())).await?;
 
         file_change::atomic_write_text(path, &updated).await?;
+
+        let changed_bytes = updated.len().abs_diff(content.len());
+        let changed_lines = updated.lines().count().abs_diff(content.lines().count());
 
         let mut payload = file_change::build_file_change_payload_value(
             "Edit",
@@ -543,6 +550,18 @@ impl Tool for EditTool {
             &content,
             &updated,
         );
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("edit_mode".to_string(), json!(mode_label));
+            obj.insert("replacements".to_string(), json!(replacements));
+            obj.insert(
+                "requested_replace_all".to_string(),
+                json!(requested_replace_all),
+            );
+            obj.insert("used_patch_mode".to_string(), json!(used_patch_mode));
+            obj.insert("line_number_hint".to_string(), json!(line_number_hint));
+            obj.insert("changed_bytes".to_string(), json!(changed_bytes));
+            obj.insert("changed_lines".to_string(), json!(changed_lines));
+        }
         content_diagnostics::attach_file_diagnostics(&mut payload, path, &updated);
 
         Ok(ToolResult {

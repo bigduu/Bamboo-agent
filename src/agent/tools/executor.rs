@@ -208,6 +208,19 @@ pub fn is_builtin_tool(value: &str) -> bool {
     normalize_tool_ref(value).is_some()
 }
 
+fn resolve_registered_tool_name(registry: &ToolRegistry, raw_tool_name: &str) -> String {
+    if registry.get(raw_tool_name).is_some() {
+        return raw_tool_name.to_string();
+    }
+
+    let aliased = normalize_builtin_alias(raw_tool_name);
+    if registry.get(aliased).is_some() {
+        return aliased.to_string();
+    }
+
+    resolve_alias(aliased).unwrap_or(aliased).to_string()
+}
+
 /// Built-in tool executor that uses ToolRegistry for dynamic dispatch
 pub struct BuiltinToolExecutor {
     registry: ToolRegistry,
@@ -383,28 +396,17 @@ impl ToolExecutor for BuiltinToolExecutor {
             normalize_legacy_builtin_args(raw_tool_name, args_obj);
         }
 
-        let tool_name = if self.registry.get(raw_tool_name).is_some() {
-            raw_tool_name
-        } else {
-            let aliased = normalize_builtin_alias(raw_tool_name);
-            // If the aliased name isn't in the registry either, try resolving
-            // through the BUILTIN_TOOL_ALIASES table (e.g. apply_patch → Edit).
-            if self.registry.get(aliased).is_some() {
-                aliased
-            } else {
-                resolve_alias(aliased).unwrap_or(aliased)
-            }
-        };
+        let tool_name = resolve_registered_tool_name(&self.registry, raw_tool_name);
 
         // Look up the tool in the registry
         let tool = self
             .registry
-            .get(tool_name)
+            .get(&tool_name)
             .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", tool_name)))?;
 
         if let Some(permission_checker) = &self.permission_checker {
             if let Some(contexts) =
-                check_permissions(tool_name, &args).map_err(permission_error_to_tool_error)?
+                check_permissions(&tool_name, &args).map_err(permission_error_to_tool_error)?
             {
                 for context in contexts {
                     let resource = context.resource.clone();
@@ -427,6 +429,43 @@ impl ToolExecutor for BuiltinToolExecutor {
 
     fn list_tools(&self) -> Vec<ToolSchema> {
         self.registry.list_tools()
+    }
+
+    fn tool_mutability(&self, tool_name: &str) -> crate::agent::tools::ToolMutability {
+        self.registry
+            .get(tool_name)
+            .map(|tool| tool.mutability())
+            .unwrap_or_else(|| crate::agent::tools::classify_tool(tool_name))
+    }
+
+    fn call_mutability(&self, call: &ToolCall) -> crate::agent::tools::ToolMutability {
+        let canonical = resolve_registered_tool_name(&self.registry, call.function.name.trim());
+        let args =
+            crate::agent::core::tools::parse_tool_args_best_effort(&call.function.arguments).0;
+        self.registry
+            .get(&canonical)
+            .map(|tool| tool.call_mutability(&args))
+            .unwrap_or_else(|| self.tool_mutability(&canonical))
+    }
+
+    fn tool_concurrency_safe(&self, tool_name: &str) -> bool {
+        let canonical = resolve_registered_tool_name(&self.registry, tool_name);
+        self.registry
+            .get(&canonical)
+            .map(|tool| tool.concurrency_safe())
+            .unwrap_or_else(|| {
+                self.tool_mutability(&canonical) == crate::agent::tools::ToolMutability::ReadOnly
+            })
+    }
+
+    fn call_concurrency_safe(&self, call: &ToolCall) -> bool {
+        let canonical = resolve_registered_tool_name(&self.registry, call.function.name.trim());
+        let args =
+            crate::agent::core::tools::parse_tool_args_best_effort(&call.function.arguments).0;
+        self.registry
+            .get(&canonical)
+            .map(|tool| tool.call_concurrency_safe(&args))
+            .unwrap_or_else(|| self.tool_concurrency_safe(&canonical))
     }
 }
 
@@ -705,6 +744,37 @@ mod tests {
         let result = executor.execute(&call).await.unwrap();
         assert!(result.success);
         assert!(result.result.contains("canonical-list.txt"));
+    }
+
+    #[test]
+    fn test_executor_marks_tool_search_as_readonly() {
+        let executor = BuiltinToolExecutor::new();
+        let call = make_tool_call("tool_search", json!({"query": "read file"}));
+
+        assert_eq!(
+            executor.call_mutability(&call),
+            crate::agent::tools::ToolMutability::ReadOnly
+        );
+        assert!(executor.call_concurrency_safe(&call));
+    }
+
+    #[test]
+    fn test_executor_workspace_mutability_depends_on_path_argument() {
+        let executor = BuiltinToolExecutor::new();
+        let get_call = make_tool_call("Workspace", json!({}));
+        let set_call = make_tool_call("Workspace", json!({"path": "/tmp"}));
+
+        assert_eq!(
+            executor.call_mutability(&get_call),
+            crate::agent::tools::ToolMutability::ReadOnly
+        );
+        assert!(executor.call_concurrency_safe(&get_call));
+
+        assert_eq!(
+            executor.call_mutability(&set_call),
+            crate::agent::tools::ToolMutability::Mutating
+        );
+        assert!(!executor.call_concurrency_safe(&set_call));
     }
 
     #[tokio::test]

@@ -35,6 +35,27 @@ impl Tool for WorkspaceTool {
         "Get or set the current session workspace directory. Call without 'path' to get the current workspace; call with 'path' to change it."
     }
 
+    fn mutability(&self) -> crate::agent::tools::ToolMutability {
+        crate::agent::tools::ToolMutability::Mutating
+    }
+
+    fn call_mutability(&self, args: &serde_json::Value) -> crate::agent::tools::ToolMutability {
+        let has_path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .is_some_and(|v| !v.is_empty());
+        if has_path {
+            crate::agent::tools::ToolMutability::Mutating
+        } else {
+            crate::agent::tools::ToolMutability::ReadOnly
+        }
+    }
+
+    fn call_concurrency_safe(&self, args: &serde_json::Value) -> bool {
+        self.call_mutability(args) == crate::agent::tools::ToolMutability::ReadOnly
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",

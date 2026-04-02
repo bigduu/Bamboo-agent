@@ -17,6 +17,7 @@ fn completed_task_list(session_id: &str) -> TaskList {
             status: TaskItemStatus::Completed,
             depends_on: Vec::new(),
             notes: String::new(),
+            ..TaskItem::default()
         }],
         created_at: Utc::now(),
         updated_at: Utc::now(),

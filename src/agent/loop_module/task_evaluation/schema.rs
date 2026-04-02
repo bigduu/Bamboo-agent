@@ -23,6 +23,22 @@ pub fn get_task_evaluation_tools() -> Vec<ToolSchema> {
                     "notes": {
                         "type": "string",
                         "description": "Brief explanation of why the status changed"
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": "Optional concrete evidence that supports this status decision"
+                    },
+                    "blocker": {
+                        "type": "string",
+                        "description": "Optional blocker summary when status is blocked"
+                    },
+                    "criteria_met": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "pattern": "^(c\\d+|criterion[_-]\\d+)$"
+                        },
+                        "description": "Optional list of satisfied completion criteria represented by criterion IDs such as c1/c2"
                     }
                 },
                 "required": ["item_id", "status"]
@@ -109,6 +125,9 @@ mod tests {
         assert!(required.contains(&json!("item_id")));
         assert!(required.contains(&json!("status")));
         assert!(!required.contains(&json!("notes"))); // notes is optional
+        assert!(!required.contains(&json!("evidence")));
+        assert!(!required.contains(&json!("blocker")));
+        assert!(!required.contains(&json!("criteria_met")));
     }
 
     #[test]
@@ -118,9 +137,12 @@ mod tests {
             .as_object()
             .unwrap();
 
-        assert_eq!(props.len(), 3);
+        assert_eq!(props.len(), 6);
         assert!(props.contains_key("item_id"));
         assert!(props.contains_key("status"));
         assert!(props.contains_key("notes"));
+        assert!(props.contains_key("evidence"));
+        assert!(props.contains_key("blocker"));
+        assert!(props.contains_key("criteria_met"));
     }
 }

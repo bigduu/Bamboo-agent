@@ -7,8 +7,8 @@
 
 use tokio::sync::mpsc;
 
-use crate::agent::core::AgentEvent;
 use crate::agent::core::tools::ToolSchema;
+use crate::agent::core::AgentEvent;
 
 /// Context passed to tools during execution.
 ///
@@ -83,7 +83,7 @@ mod tests {
             session_id: Some("session_1"),
             tool_call_id: "call_1",
             event_tx: Some(&tx),
-                    available_tool_schemas: None,
+            available_tool_schemas: None,
         };
 
         tokio::time::timeout(
@@ -109,7 +109,7 @@ mod tests {
             session_id: Some("session_1"),
             tool_call_id: "call_123",
             event_tx: Some(&tx),
-                    available_tool_schemas: None,
+            available_tool_schemas: None,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -137,7 +137,7 @@ mod tests {
             session_id: Some("session_1"),
             tool_call_id: "call_456",
             event_tx: Some(&tx),
-                    available_tool_schemas: None,
+            available_tool_schemas: None,
         };
 
         // Test with various non-Token events
@@ -176,7 +176,7 @@ mod tests {
             session_id: None,
             tool_call_id: "call_abc",
             event_tx: Some(&tx),
-                    available_tool_schemas: None,
+            available_tool_schemas: None,
         };
 
         ctx.emit_tool_token("convenient output").await;
@@ -226,7 +226,7 @@ mod tests {
             session_id: None,
             tool_call_id: "call_clone",
             event_tx: Some(&tx),
-                    available_tool_schemas: None,
+            available_tool_schemas: None,
         };
 
         let cloned = ctx.cloned_sender();
@@ -249,7 +249,7 @@ mod tests {
             session_id: Some("session_multi"),
             tool_call_id: "call_multi",
             event_tx: Some(&tx),
-                    available_tool_schemas: None,
+            available_tool_schemas: None,
         };
 
         for i in 0..5 {
@@ -277,7 +277,7 @@ mod tests {
             session_id: Some("session_copy"),
             tool_call_id: "call_copy",
             event_tx: Some(&tx),
-                    available_tool_schemas: None,
+            available_tool_schemas: None,
         };
 
         // Can clone (Copy implies Clone)
@@ -304,7 +304,7 @@ mod tests {
             session_id: None,
             tool_call_id: "",
             event_tx: Some(&tx),
-                    available_tool_schemas: None,
+            available_tool_schemas: None,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -328,7 +328,7 @@ mod tests {
             session_id: Some("会话"),
             tool_call_id: "调用_123",
             event_tx: Some(&tx),
-                    available_tool_schemas: None,
+            available_tool_schemas: None,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -356,7 +356,7 @@ mod tests {
             session_id: None,
             tool_call_id: "call-with_special.chars:123",
             event_tx: Some(&tx),
-                    available_tool_schemas: None,
+            available_tool_schemas: None,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -380,7 +380,7 @@ mod tests {
             session_id: None,
             tool_call_id: "call_string",
             event_tx: Some(&tx),
-                    available_tool_schemas: None,
+            available_tool_schemas: None,
         };
 
         let content = String::from("owned string");
@@ -402,7 +402,7 @@ mod tests {
             session_id: None,
             tool_call_id: "call_str",
             event_tx: Some(&tx),
-                    available_tool_schemas: None,
+            available_tool_schemas: None,
         };
 
         ctx.emit_tool_token("string slice").await;

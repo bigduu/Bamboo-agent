@@ -105,6 +105,14 @@ impl Tool for WebFetchTool {
         "Fetch an HTTP(S) URL and return a cleaned text excerpt plus metadata. The `prompt` field is caller context only; this tool does not run an extra model."
     }
 
+    fn mutability(&self) -> crate::agent::tools::ToolMutability {
+        crate::agent::tools::ToolMutability::ReadOnly
+    }
+
+    fn concurrency_safe(&self) -> bool {
+        true
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",

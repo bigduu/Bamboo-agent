@@ -38,6 +38,14 @@ impl Tool for SleepTool {
         "Pause execution for a specified number of seconds (max 300s)"
     }
 
+    fn mutability(&self) -> crate::agent::tools::ToolMutability {
+        crate::agent::tools::ToolMutability::ReadOnly
+    }
+
+    fn concurrency_safe(&self) -> bool {
+        true
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",

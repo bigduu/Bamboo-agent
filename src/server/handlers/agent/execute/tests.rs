@@ -76,7 +76,10 @@ fn execute_request_empty_model_normalizes_to_compat_absent() {
     };
 
     let model = request.model.as_deref().unwrap_or("").trim();
-    assert!(model.is_empty(), "Empty compatibility model should normalize to absent");
+    assert!(
+        model.is_empty(),
+        "Empty compatibility model should normalize to absent"
+    );
 }
 
 #[test]

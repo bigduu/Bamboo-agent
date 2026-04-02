@@ -105,6 +105,31 @@ fn format_provider_error(error: crate::agent::llm::provider::LLMError) -> String
     }
 }
 
+fn is_llm_overflow_error(message: &str) -> bool {
+    let normalized = message.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let overflow_patterns = [
+        "prompt too long",
+        "context too long",
+        "maximum context length",
+        "maximum context size",
+        "context length exceeded",
+        "context window exceeded",
+        "request too large",
+        "too many tokens",
+        "input is too long",
+        "input too long",
+        "token limit exceeded",
+    ];
+
+    overflow_patterns
+        .iter()
+        .any(|pattern| normalized.contains(pattern))
+}
+
 pub(super) async fn execute_llm_stream(
     session: &mut Session,
     llm: &Arc<dyn LLMProvider>,
@@ -190,7 +215,14 @@ pub(super) async fn execute_llm_stream(
             Some(&request_options),
         )
         .await
-        .map_err(|error| AgentError::LLM(format_provider_error(error)))?;
+        .map_err(|error| {
+            let message = format_provider_error(error);
+            if is_llm_overflow_error(&message) {
+                AgentError::LLMOverflow(message)
+            } else {
+                AgentError::LLM(message)
+            }
+        })?;
 
     // Send token budget update AFTER LLM call succeeds.
     // This timing gives frontend time to subscribe to /events endpoint.

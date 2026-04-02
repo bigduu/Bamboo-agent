@@ -91,6 +91,31 @@ pub trait ToolExecutor: Send + Sync {
     ///
     /// Returns schemas for all tools that can be executed via this executor
     fn list_tools(&self) -> Vec<ToolSchema>;
+
+    /// Returns mutability metadata for a tool name when available.
+    /// Executors that can inspect concrete tools should override this.
+    fn tool_mutability(&self, tool_name: &str) -> crate::agent::tools::ToolMutability {
+        crate::agent::tools::classify_tool(tool_name)
+    }
+
+    /// Returns mutability metadata for a specific tool call when available.
+    /// Defaults to name-based classification.
+    fn call_mutability(&self, call: &ToolCall) -> crate::agent::tools::ToolMutability {
+        self.tool_mutability(call.function.name.trim())
+    }
+
+    /// Returns whether a tool can safely execute in parallel with other
+    /// read-only tools. Executors that can inspect concrete tools should
+    /// override this. Fallback keeps current behavior for known read-only tools.
+    fn tool_concurrency_safe(&self, tool_name: &str) -> bool {
+        self.tool_mutability(tool_name) == crate::agent::tools::ToolMutability::ReadOnly
+    }
+
+    /// Returns whether a specific tool call can safely run in parallel.
+    /// Defaults to the tool-name level classification.
+    fn call_concurrency_safe(&self, call: &ToolCall) -> bool {
+        self.tool_concurrency_safe(call.function.name.trim())
+    }
 }
 
 /// Executes a tool call with composition support

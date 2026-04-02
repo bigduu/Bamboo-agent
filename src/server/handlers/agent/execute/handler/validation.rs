@@ -2,7 +2,9 @@ use actix_web::HttpResponse;
 
 use super::response::bad_request_error_response;
 
-pub(super) fn validate_and_normalize_model(model: Option<&str>) -> Result<Option<String>, HttpResponse> {
+pub(super) fn validate_and_normalize_model(
+    model: Option<&str>,
+) -> Result<Option<String>, HttpResponse> {
     let Some(model) = model else {
         return Ok(None);
     };

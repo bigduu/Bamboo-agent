@@ -9,7 +9,9 @@ fn model_from_request_uses_provider_default_when_absent_or_blank() {
         provider: "copilot".to_string(),
         ..Config::default()
     };
-    let expected = config.get_model().expect("provider default model should exist");
+    let expected = config
+        .get_model()
+        .expect("provider default model should exist");
     let absent = CreateSessionRequest {
         title: None,
         system_prompt: None,
@@ -24,7 +26,10 @@ fn model_from_request_uses_provider_default_when_absent_or_blank() {
         model: Some("   ".to_string()),
         reasoning_effort: None,
     };
-    assert_eq!(model_from_request(&blank, &config), config.get_model().unwrap());
+    assert_eq!(
+        model_from_request(&blank, &config),
+        config.get_model().unwrap()
+    );
 }
 
 #[test]

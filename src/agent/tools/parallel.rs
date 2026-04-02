@@ -19,7 +19,6 @@ use tokio::sync::RwLock;
 use crate::agent::core::tools::{
     ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult,
 };
-use crate::agent::tools::orchestrator::classify_tool;
 use crate::agent::tools::orchestrator::ToolMutability;
 
 /// The parallel tool call runtime.
@@ -55,14 +54,15 @@ impl ToolCallRuntime {
     }
 
     /// Determine if a tool supports parallel execution.
-    pub fn supports_parallel(tool_name: &str) -> bool {
-        classify_tool(tool_name) == ToolMutability::ReadOnly
+    pub fn supports_parallel(executor: &Arc<dyn ToolExecutor>, call: &ToolCall) -> bool {
+        executor.call_mutability(call) == ToolMutability::ReadOnly
+            && executor.call_concurrency_safe(call)
     }
 
     /// Execute a single tool call with appropriate concurrency control.
     pub async fn execute(&self, call: &ToolCall, ctx: ToolExecutionContext<'_>) -> ToolCallResult {
         let tool_name = call.function.name.trim().to_string();
-        let parallel = Self::supports_parallel(&tool_name);
+        let parallel = Self::supports_parallel(&self.executor, call);
         let started = Instant::now();
 
         let result = if parallel {
@@ -103,7 +103,7 @@ impl ToolCallRuntime {
         let mut parallel_batch: Vec<(ToolCall, ToolExecutionContext<'_>)> = Vec::new();
 
         for (call, ctx) in calls {
-            if Self::supports_parallel(call.function.name.trim()) {
+            if Self::supports_parallel(&self.executor, &call) {
                 parallel_batch.push((call, ctx));
             } else {
                 // Flush any pending parallel batch first
@@ -224,12 +224,31 @@ mod tests {
 
     #[test]
     fn test_supports_parallel() {
-        assert!(ToolCallRuntime::supports_parallel("Read"));
-        assert!(ToolCallRuntime::supports_parallel("Grep"));
-        assert!(ToolCallRuntime::supports_parallel("Glob"));
-        assert!(!ToolCallRuntime::supports_parallel("Bash"));
-        assert!(!ToolCallRuntime::supports_parallel("Write"));
-        assert!(!ToolCallRuntime::supports_parallel("Edit"));
+        let executor: Arc<dyn ToolExecutor> = Arc::new(CountingExecutor::new(Duration::ZERO));
+        assert!(ToolCallRuntime::supports_parallel(
+            &executor,
+            &make_call("Read")
+        ));
+        assert!(ToolCallRuntime::supports_parallel(
+            &executor,
+            &make_call("Grep")
+        ));
+        assert!(ToolCallRuntime::supports_parallel(
+            &executor,
+            &make_call("Glob")
+        ));
+        assert!(!ToolCallRuntime::supports_parallel(
+            &executor,
+            &make_call("Bash")
+        ));
+        assert!(!ToolCallRuntime::supports_parallel(
+            &executor,
+            &make_call("Write")
+        ));
+        assert!(!ToolCallRuntime::supports_parallel(
+            &executor,
+            &make_call("Edit")
+        ));
     }
 
     #[tokio::test]
@@ -265,7 +284,7 @@ mod tests {
 
         // Execute 3 reads concurrently
         let handles: Vec<_> = (0..3)
-            .map(|i| {
+            .map(|_| {
                 let rt = runtime.clone();
                 let call = make_call("Read");
                 tokio::spawn(

@@ -1,3 +1,7 @@
+use crate::agent::core::todo::{
+    TaskBlocker, TaskBlockerKind, TaskEvidence, TaskEvidenceKind, TaskPhase, TaskPriority,
+    TaskTransition,
+};
 use crate::agent::core::tools::ToolResult;
 use crate::agent::core::TaskItemStatus;
 use crate::agent::core::{TaskItem, TaskList};
@@ -17,6 +21,7 @@ fn create_test_session() -> crate::agent::core::Session {
                 status: TaskItemStatus::Pending,
                 depends_on: Vec::new(),
                 notes: String::new(),
+                ..TaskItem::default()
             },
             TaskItem {
                 id: "task-2".to_string(),
@@ -24,6 +29,37 @@ fn create_test_session() -> crate::agent::core::Session {
                 status: TaskItemStatus::Pending,
                 depends_on: Vec::new(),
                 notes: String::new(),
+                ..TaskItem::default()
+            },
+        ],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    session.set_task_list(task_list);
+    session
+}
+
+fn create_dependency_session(root_status: TaskItemStatus) -> crate::agent::core::Session {
+    let mut session = crate::agent::core::Session::new("dep-session", "test-model");
+    let task_list = TaskList {
+        session_id: "dep-session".to_string(),
+        title: "Dependency Tasks".to_string(),
+        items: vec![
+            TaskItem {
+                id: "task-1".to_string(),
+                description: "Prepare environment".to_string(),
+                status: root_status,
+                depends_on: Vec::new(),
+                notes: String::new(),
+                ..TaskItem::default()
+            },
+            TaskItem {
+                id: "task-2".to_string(),
+                description: "Read configuration file".to_string(),
+                status: TaskItemStatus::Pending,
+                depends_on: vec!["task-1".to_string()],
+                notes: String::new(),
+                ..TaskItem::default()
             },
         ],
         created_at: Utc::now(),
@@ -66,7 +102,7 @@ fn track_tool_execution_appends_record_for_active_item() {
 }
 
 #[test]
-fn set_active_item_marks_previous_completed() {
+fn set_active_item_deactivates_previous_without_forcing_completion() {
     let session = create_test_session();
     let mut context =
         TaskLoopContext::from_session(&session).expect("task context should initialize");
@@ -76,9 +112,51 @@ fn set_active_item_marks_previous_completed() {
     context.set_active_item("task-2");
 
     assert_eq!(context.active_item_id.as_deref(), Some("task-2"));
-    assert_eq!(context.items[0].status, TaskItemStatus::Completed);
-    assert_eq!(context.items[0].completed_at_round, Some(3));
+    assert_eq!(context.items[0].status, TaskItemStatus::Pending);
+    assert_eq!(context.items[0].completed_at_round, None);
     assert_eq!(context.items[1].status, TaskItemStatus::InProgress);
+}
+
+#[test]
+fn set_active_item_blocks_when_dependencies_unmet() {
+    let session = create_dependency_session(TaskItemStatus::Pending);
+    let mut context =
+        TaskLoopContext::from_session(&session).expect("task context should initialize");
+
+    context.set_active_item("task-2");
+
+    assert!(context.active_item_id.is_none());
+    let task = context
+        .items
+        .iter()
+        .find(|item| item.id == "task-2")
+        .expect("task-2 should exist");
+    assert_eq!(task.status, TaskItemStatus::Blocked);
+    assert!(task
+        .blockers
+        .iter()
+        .any(|blocker| blocker.kind == TaskBlockerKind::Dependency));
+    assert!(task
+        .transitions
+        .iter()
+        .any(|transition| transition.to_status == TaskItemStatus::Blocked));
+}
+
+#[test]
+fn set_active_item_activates_when_dependencies_ready() {
+    let session = create_dependency_session(TaskItemStatus::Completed);
+    let mut context =
+        TaskLoopContext::from_session(&session).expect("task context should initialize");
+
+    context.set_active_item("task-2");
+
+    assert_eq!(context.active_item_id.as_deref(), Some("task-2"));
+    let task = context
+        .items
+        .iter()
+        .find(|item| item.id == "task-2")
+        .expect("task-2 should exist");
+    assert_eq!(task.status, TaskItemStatus::InProgress);
 }
 
 #[test]
@@ -217,6 +295,7 @@ fn format_for_prompt_with_single_item() {
             status: TaskItemStatus::InProgress,
             depends_on: Vec::new(),
             notes: String::new(),
+            ..TaskItem::default()
         }],
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -249,6 +328,7 @@ fn format_for_prompt_with_many_items() {
             },
             depends_on: Vec::new(),
             notes: String::new(),
+            ..TaskItem::default()
         })
         .collect();
 
@@ -304,6 +384,7 @@ fn format_for_prompt_mixed_statuses_with_tool_calls() {
                 status: TaskItemStatus::Completed,
                 depends_on: Vec::new(),
                 notes: String::new(),
+                ..TaskItem::default()
             },
             TaskItem {
                 id: "active-task".to_string(),
@@ -311,6 +392,7 @@ fn format_for_prompt_mixed_statuses_with_tool_calls() {
                 status: TaskItemStatus::InProgress,
                 depends_on: Vec::new(),
                 notes: String::new(),
+                ..TaskItem::default()
             },
             TaskItem {
                 id: "blocked-task".to_string(),
@@ -318,6 +400,7 @@ fn format_for_prompt_mixed_statuses_with_tool_calls() {
                 status: TaskItemStatus::Blocked,
                 depends_on: Vec::new(),
                 notes: String::new(),
+                ..TaskItem::default()
             },
         ],
         created_at: Utc::now(),
@@ -356,6 +439,17 @@ fn auto_match_tool_to_item_uses_keyword_heuristic() {
 }
 
 #[test]
+fn auto_match_tool_to_item_skips_unready_dependencies() {
+    let session = create_dependency_session(TaskItemStatus::Pending);
+    let mut context =
+        TaskLoopContext::from_session(&session).expect("task context should initialize");
+
+    context.auto_match_tool_to_item("read_file");
+
+    assert!(context.active_item_id.is_none());
+}
+
+#[test]
 fn auto_update_status_marks_completed_after_success_threshold() {
     let session = create_test_session();
     let mut context =
@@ -383,6 +477,33 @@ fn auto_update_status_marks_completed_after_success_threshold() {
 
     assert_eq!(context.items[0].status, TaskItemStatus::Completed);
     assert!(context.active_item_id.is_none());
+}
+
+#[test]
+fn auto_update_status_does_not_auto_complete_when_completion_criteria_exist() {
+    let session = create_test_session();
+    let mut context =
+        TaskLoopContext::from_session(&session).expect("task context should initialize");
+
+    context.items[0].completion_criteria = vec!["All tests pass".to_string()];
+    context.set_active_item("task-1");
+    context.current_round = 1;
+
+    let success = ToolResult {
+        success: true,
+        result: "OK".to_string(),
+        display_preference: None,
+    };
+
+    context.track_tool_execution("read_file", &success, 1);
+    context.auto_update_status("read_file", &success);
+    context.track_tool_execution("read_file", &success, 2);
+    context.auto_update_status("read_file", &success);
+    context.track_tool_execution("read_file", &success, 3);
+    context.auto_update_status("read_file", &success);
+
+    assert_eq!(context.items[0].status, TaskItemStatus::InProgress);
+    assert_eq!(context.active_item_id.as_deref(), Some("task-1"));
 }
 
 #[test]
@@ -419,4 +540,114 @@ fn into_task_list_preserves_core_items() {
 
     assert_eq!(task_list.session_id, "test-session");
     assert_eq!(task_list.items.len(), 2);
+}
+
+#[test]
+fn round_trip_preserves_structured_fields() {
+    let mut session = crate::agent::core::Session::new("rt-session", "test-model");
+    session.set_task_list(TaskList {
+        session_id: "rt-session".to_string(),
+        title: "RoundTrip".to_string(),
+        items: vec![TaskItem {
+            id: "task-a".to_string(),
+            description: "Run integration checks".to_string(),
+            status: TaskItemStatus::InProgress,
+            depends_on: vec!["task-root".to_string()],
+            notes: "Check flaky tests".to_string(),
+            active_form: Some("Running integration checks".to_string()),
+            parent_id: Some("task-root".to_string()),
+            phase: TaskPhase::Verification,
+            priority: TaskPriority::High,
+            completion_criteria: vec![
+                "All integration tests pass".to_string(),
+                "No regression in auth flow".to_string(),
+            ],
+            evidence: vec![TaskEvidence {
+                kind: TaskEvidenceKind::Test,
+                summary: "integration/auth suite green".to_string(),
+                reference: Some("cargo test -p auth --tests".to_string()),
+                tool_name: Some("Bash".to_string()),
+                tool_call_id: Some("call-123".to_string()),
+                round: Some(4),
+                success: Some(true),
+            }],
+            blockers: vec![TaskBlocker {
+                kind: TaskBlockerKind::Dependency,
+                summary: "Awaiting upstream service fixture".to_string(),
+                waiting_on: Some("service-fixture".to_string()),
+            }],
+            transitions: vec![TaskTransition {
+                from_status: TaskItemStatus::Pending,
+                to_status: TaskItemStatus::InProgress,
+                reason: Some("Started verification".to_string()),
+                round: Some(3),
+                changed_at: Utc::now(),
+            }],
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+
+    let context = TaskLoopContext::from_session(&session).expect("task context should initialize");
+    let round_tripped = context.into_task_list();
+    let item = &round_tripped.items[0];
+
+    assert_eq!(item.depends_on, vec!["task-root".to_string()]);
+    assert_eq!(item.parent_id.as_deref(), Some("task-root"));
+    assert_eq!(item.phase, TaskPhase::Verification);
+    assert_eq!(item.priority, TaskPriority::High);
+    assert_eq!(
+        item.completion_criteria,
+        vec![
+            "All integration tests pass".to_string(),
+            "No regression in auth flow".to_string()
+        ]
+    );
+    assert_eq!(
+        item.active_form.as_deref(),
+        Some("Running integration checks")
+    );
+    assert_eq!(item.evidence.len(), 1);
+    assert_eq!(item.blockers.len(), 1);
+    assert_eq!(item.transitions.len(), 1);
+}
+
+#[test]
+fn tool_execution_records_evidence_and_blockers() {
+    let session = create_test_session();
+    let mut context =
+        TaskLoopContext::from_session(&session).expect("task context should initialize");
+    context.set_active_item("task-1");
+    context.current_round = 1;
+
+    let failure = ToolResult {
+        success: false,
+        result: "Permission denied while opening file".to_string(),
+        display_preference: None,
+    };
+    context.track_tool_execution("read_file", &failure, 1);
+    context.auto_update_status("read_file", &failure);
+    context.track_tool_execution("read_file", &failure, 2);
+    context.auto_update_status("read_file", &failure);
+
+    let item = context
+        .items
+        .iter()
+        .find(|task| task.id == "task-1")
+        .expect("task-1 should exist");
+
+    assert_eq!(item.status, TaskItemStatus::Blocked);
+    assert!(!item.evidence.is_empty());
+    assert!(item
+        .evidence
+        .iter()
+        .any(|evidence| matches!(evidence.kind, TaskEvidenceKind::ToolCall)));
+    assert!(item
+        .blockers
+        .iter()
+        .any(|blocker| matches!(blocker.kind, TaskBlockerKind::ToolFailure)));
+    assert!(item
+        .transitions
+        .iter()
+        .any(|transition| transition.to_status == TaskItemStatus::Blocked));
 }

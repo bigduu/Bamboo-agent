@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 
-use crate::agent::core::Session;
 use crate::agent::core::tools::normalize_tool_name;
+use crate::agent::core::Session;
 
 use super::resolve_alias;
 
@@ -83,10 +83,9 @@ where
     let mut names: Vec<String> = activated.into_iter().collect();
     names.truncate(MAX_ACTIVATED_DISCOVERABLE_TOOLS);
     if let Ok(raw) = serde_json::to_string(&names) {
-        session.metadata.insert(
-            ACTIVATED_DISCOVERABLE_TOOLS_METADATA_KEY.to_string(),
-            raw,
-        );
+        session
+            .metadata
+            .insert(ACTIVATED_DISCOVERABLE_TOOLS_METADATA_KEY.to_string(), raw);
     }
 }
 
@@ -97,7 +96,10 @@ mod tests {
     #[test]
     fn canonical_name_resolves_builtin_aliases() {
         assert_eq!(canonical_tool_name("FileExists"), "GetFileInfo");
-        assert_eq!(canonical_tool_name("default::set_workspace"), "set_workspace");
+        assert_eq!(
+            canonical_tool_name("default::set_workspace"),
+            "set_workspace"
+        );
     }
 
     #[test]

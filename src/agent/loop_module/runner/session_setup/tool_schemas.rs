@@ -1,7 +1,9 @@
 use crate::agent::core::tools::{ToolExecutor, ToolSchema};
 use crate::agent::core::Session;
 use crate::agent::loop_module::config::AgentLoopConfig;
-use crate::agent::tools::exposure::{activated_discoverable_tools, canonical_tool_name, is_core_tool};
+use crate::agent::tools::exposure::{
+    activated_discoverable_tools, canonical_tool_name, is_core_tool,
+};
 
 const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str =
     "copilot_conclusion_with_options_enhancement_enabled";

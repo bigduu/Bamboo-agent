@@ -7,15 +7,22 @@ use serde_json::json;
 async fn test_create_session_inherits_provider_default_model_and_reasoning() {
     let _lock = crate::e2e::common::data_dir_lock();
     let state = super::sessions_test_app().await;
-    super::configure_openai_defaults(&state, "gpt-session-default", Some(ReasoningEffort::High)).await;
+    super::configure_openai_defaults(&state, "gpt-session-default", Some(ReasoningEffort::High))
+        .await;
 
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
             .route("/api/v1/sessions", web::post().to(sessions::create_session))
             .route("/api/v1/sessions", web::get().to(sessions::list_sessions))
-            .route("/api/v1/sessions/{session_id}", web::get().to(sessions::get_session))
-            .route("/api/v1/sessions/{session_id}", web::patch().to(sessions::patch_session)),
+            .route(
+                "/api/v1/sessions/{session_id}",
+                web::get().to(sessions::get_session),
+            )
+            .route(
+                "/api/v1/sessions/{session_id}",
+                web::patch().to(sessions::patch_session),
+            ),
     )
     .await;
 
@@ -68,15 +75,22 @@ async fn test_create_session_inherits_provider_default_model_and_reasoning() {
 async fn test_patch_session_persists_model_and_reasoning_to_storage_and_file() {
     let _lock = crate::e2e::common::data_dir_lock();
     let state = super::sessions_test_app().await;
-    super::configure_openai_defaults(&state, "gpt-session-default", Some(ReasoningEffort::Medium)).await;
+    super::configure_openai_defaults(&state, "gpt-session-default", Some(ReasoningEffort::Medium))
+        .await;
 
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
             .route("/api/v1/sessions", web::post().to(sessions::create_session))
             .route("/api/v1/sessions", web::get().to(sessions::list_sessions))
-            .route("/api/v1/sessions/{session_id}", web::get().to(sessions::get_session))
-            .route("/api/v1/sessions/{session_id}", web::patch().to(sessions::patch_session)),
+            .route(
+                "/api/v1/sessions/{session_id}",
+                web::get().to(sessions::get_session),
+            )
+            .route(
+                "/api/v1/sessions/{session_id}",
+                web::patch().to(sessions::patch_session),
+            ),
     )
     .await;
 
@@ -143,15 +157,22 @@ async fn test_patch_session_persists_model_and_reasoning_to_storage_and_file() {
 async fn test_patch_session_can_clear_reasoning_effort_without_changing_model() {
     let _lock = crate::e2e::common::data_dir_lock();
     let state = super::sessions_test_app().await;
-    super::configure_openai_defaults(&state, "gpt-session-default", Some(ReasoningEffort::High)).await;
+    super::configure_openai_defaults(&state, "gpt-session-default", Some(ReasoningEffort::High))
+        .await;
 
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
             .route("/api/v1/sessions", web::post().to(sessions::create_session))
             .route("/api/v1/sessions", web::get().to(sessions::list_sessions))
-            .route("/api/v1/sessions/{session_id}", web::get().to(sessions::get_session))
-            .route("/api/v1/sessions/{session_id}", web::patch().to(sessions::patch_session)),
+            .route(
+                "/api/v1/sessions/{session_id}",
+                web::get().to(sessions::get_session),
+            )
+            .route(
+                "/api/v1/sessions/{session_id}",
+                web::patch().to(sessions::patch_session),
+            ),
     )
     .await;
 

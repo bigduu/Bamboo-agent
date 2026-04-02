@@ -76,7 +76,10 @@ pub(super) fn build_new_session(
     session
 }
 
-pub(super) fn model_from_request(req: &CreateSessionRequest, config: &crate::core::Config) -> String {
+pub(super) fn model_from_request(
+    req: &CreateSessionRequest,
+    config: &crate::core::Config,
+) -> String {
     trimmed_non_empty_owned(req.model.as_deref())
         .or_else(|| config.get_model())
         .unwrap_or_else(|| "unknown".to_string())
@@ -86,7 +89,8 @@ pub(super) fn reasoning_effort_from_request(
     req: &CreateSessionRequest,
     config: &crate::core::Config,
 ) -> Option<ReasoningEffort> {
-    req.reasoning_effort.or_else(|| config.get_reasoning_effort())
+    req.reasoning_effort
+        .or_else(|| config.get_reasoning_effort())
 }
 
 fn trimmed_non_empty_owned(value: Option<&str>) -> Option<String> {

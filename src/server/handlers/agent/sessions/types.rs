@@ -93,6 +93,8 @@ pub struct SessionSystemPromptResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub skill_context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_guide_context: Option<String>,
@@ -179,7 +181,8 @@ mod tests {
 
     #[test]
     fn test_patch_session_request_both() {
-        let json = r#"{"title":"New Title","pinned":true,"model":"gpt-5","reasoning_effort":"medium"}"#;
+        let json =
+            r#"{"title":"New Title","pinned":true,"model":"gpt-5","reasoning_effort":"medium"}"#;
         let req: PatchSessionRequest = serde_json::from_str(json).unwrap();
 
         assert_eq!(req.title, Some("New Title".to_string()));
@@ -296,6 +299,7 @@ mod tests {
             base_system_prompt: "You are helpful".to_string(),
             enhancement_prompt: None,
             workspace_context: None,
+            env_context: None,
             skill_context: None,
             tool_guide_context: None,
             external_memory: None,
@@ -316,6 +320,7 @@ mod tests {
             base_system_prompt: "Base".to_string(),
             enhancement_prompt: Some("Enhancement".to_string()),
             workspace_context: Some("Workspace".to_string()),
+            env_context: Some("Env".to_string()),
             skill_context: Some("Skill".to_string()),
             tool_guide_context: Some("Tool guide".to_string()),
             external_memory: Some("Memory".to_string()),

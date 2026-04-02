@@ -1,7 +1,7 @@
 use crate::agent::core::{Role, Session};
 use sha2::{Digest, Sha256};
 
-pub(super) const PROMPT_COMPOSER_VERSION: &str = "bamboo.prompt-composer.v1";
+pub(super) const PROMPT_COMPOSER_VERSION: &str = "bamboo.prompt-composer.v2";
 
 pub(super) fn upsert_system_prompt_message(session: &mut Session, system_prompt: String) {
     session
@@ -18,24 +18,32 @@ pub(super) struct PromptCompositionProfile {
     pub fingerprint: String,
     pub has_enhancement: bool,
     pub has_workspace_context: bool,
+    pub has_env_context: bool,
     pub base_len: usize,
     pub enhancement_len: usize,
     pub workspace_context_len: usize,
+    pub env_context_len: usize,
     pub final_len: usize,
 }
 
 impl PromptCompositionProfile {
     pub(super) fn component_flags_value(&self) -> String {
         format!(
-            "enhance={};workspace={}",
-            self.has_enhancement as u8, self.has_workspace_context as u8
+            "enhance={};workspace={};env={}",
+            self.has_enhancement as u8,
+            self.has_workspace_context as u8,
+            self.has_env_context as u8,
         )
     }
 
     pub(super) fn component_lengths_value(&self) -> String {
         format!(
-            "base={};enhance={};workspace={};final={}",
-            self.base_len, self.enhancement_len, self.workspace_context_len, self.final_len
+            "base={};enhance={};workspace={};env={};final={}",
+            self.base_len,
+            self.enhancement_len,
+            self.workspace_context_len,
+            self.env_context_len,
+            self.final_len
         )
     }
 }
@@ -44,6 +52,7 @@ fn build_prompt_fingerprint(
     base_prompt: &str,
     enhancement: Option<&str>,
     workspace: Option<&str>,
+    env_context: Option<&str>,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(PROMPT_COMPOSER_VERSION.as_bytes());
@@ -53,6 +62,8 @@ fn build_prompt_fingerprint(
     hasher.update(enhancement.unwrap_or_default().as_bytes());
     hasher.update([0u8]);
     hasher.update(workspace.unwrap_or_default().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(env_context.unwrap_or_default().as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -90,18 +101,27 @@ pub(super) fn build_enhanced_system_prompt_with_profile(
         merged_prompt.push_str(workspace_context.as_str());
     }
 
+    let env_context = crate::server::app_state::build_env_prompt_context();
+    if let Some(env_context) = env_context.as_ref() {
+        merged_prompt.push_str("\n\n");
+        merged_prompt.push_str(env_context.as_str());
+    }
+
     let profile = PromptCompositionProfile {
         version: PROMPT_COMPOSER_VERSION,
         fingerprint: build_prompt_fingerprint(
             base_prompt,
             enhancement.as_deref(),
             workspace_context.as_deref(),
+            env_context.as_deref(),
         ),
         has_enhancement: enhancement.is_some(),
         has_workspace_context: workspace_context.is_some(),
+        has_env_context: env_context.is_some(),
         base_len: base_prompt.len(),
         enhancement_len: enhancement.as_ref().map(|s| s.len()).unwrap_or(0),
         workspace_context_len: workspace_context.as_ref().map(|s| s.len()).unwrap_or(0),
+        env_context_len: env_context.as_ref().map(|s| s.len()).unwrap_or(0),
         final_len: merged_prompt.len(),
     };
 

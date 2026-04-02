@@ -79,6 +79,14 @@ impl Tool for ToolSearchTool {
         })
     }
 
+    fn mutability(&self) -> crate::agent::tools::ToolMutability {
+        crate::agent::tools::ToolMutability::ReadOnly
+    }
+
+    fn concurrency_safe(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult, ToolError> {
         let parsed: ToolSearchArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid tool_search args: {}", e)))?;
@@ -302,7 +310,8 @@ fn build_tool_docs(schemas: &[ToolSchema]) -> Vec<ToolSearchDocument> {
 
     for schema in schemas {
         let canonical = canonical_tool_name(&schema.function.name);
-        let guide = builtin_guide_spec(&schema.function.name).or_else(|| builtin_guide_spec(&canonical));
+        let guide =
+            builtin_guide_spec(&schema.function.name).or_else(|| builtin_guide_spec(&canonical));
         let parameters = parameter_names(schema);
         let category = guide.as_ref().map(|guide| format!("{:?}", guide.category));
         let when_to_use = guide.as_ref().map(|guide| guide.when_to_use.clone());
@@ -311,18 +320,21 @@ fn build_tool_docs(schemas: &[ToolSchema]) -> Vec<ToolSearchDocument> {
             .map(|guide| guide.related_tools.clone())
             .unwrap_or_default();
         let source = source_for_tool_name(&schema.function.name);
-        let search_text = build_search_text(schema, guide.as_ref(), &parameters, &source, &canonical);
+        let search_text =
+            build_search_text(schema, guide.as_ref(), &parameters, &source, &canonical);
 
-        deduped.entry(canonical.clone()).or_insert_with(|| ToolSearchDocument {
-            name: canonical,
-            description: schema.function.description.clone(),
-            search_text,
-            parameters,
-            category,
-            source,
-            when_to_use,
-            related_tools,
-        });
+        deduped
+            .entry(canonical.clone())
+            .or_insert_with(|| ToolSearchDocument {
+                name: canonical,
+                description: schema.function.description.clone(),
+                search_text,
+                parameters,
+                category,
+                source,
+                when_to_use,
+                related_tools,
+            });
     }
 
     deduped.into_values().collect()
@@ -368,7 +380,11 @@ fn build_search_text(
 
 fn source_for_tool_name(tool_name: &str) -> String {
     match canonical_tool_name(tool_name).as_str() {
-        "scheduler" | "SubSession" | "sub_session_manager" | "recall" | "load_skill"
+        "scheduler"
+        | "SubSession"
+        | "sub_session_manager"
+        | "recall"
+        | "load_skill"
         | "read_skill_resource" => "server".to_string(),
         _ => "builtin".to_string(),
     }
@@ -386,11 +402,19 @@ fn tokenize(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::tools::ToolMutability;
 
     #[test]
     fn test_tool_name() {
         let tool = ToolSearchTool::new();
         assert_eq!(tool.name(), "tool_search");
+    }
+
+    #[test]
+    fn test_tool_search_declares_readonly_and_parallel_safe() {
+        let tool = ToolSearchTool::new();
+        assert_eq!(tool.mutability(), ToolMutability::ReadOnly);
+        assert!(tool.concurrency_safe());
     }
 
     #[tokio::test]

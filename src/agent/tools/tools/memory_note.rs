@@ -48,6 +48,30 @@ impl Tool for MemoryNoteTool {
         "Read or update the persistent session-scoped note (markdown). Use this for durable local context, user preferences, constraints, and compression-resistant reminders within the current session/workstream. Do not use it as the primary long-term knowledge base. Hard limit: 12000 characters; compress before append/replace if needed."
     }
 
+    fn mutability(&self) -> crate::agent::tools::ToolMutability {
+        crate::agent::tools::ToolMutability::Mutating
+    }
+
+    fn call_mutability(&self, args: &serde_json::Value) -> crate::agent::tools::ToolMutability {
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        match action.as_str() {
+            "read" | "list_topics" => crate::agent::tools::ToolMutability::ReadOnly,
+            _ => crate::agent::tools::ToolMutability::Mutating,
+        }
+    }
+
+    fn call_concurrency_safe(&self, args: &serde_json::Value) -> bool {
+        matches!(
+            self.call_mutability(args),
+            crate::agent::tools::ToolMutability::ReadOnly
+        )
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -314,7 +338,7 @@ mod tests {
             session_id: Some("session-1"),
             tool_call_id: "tool_call",
             event_tx: None,
-                    available_tool_schemas: None,
+            available_tool_schemas: None,
         };
 
         let unknown = tool

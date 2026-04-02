@@ -63,6 +63,14 @@ impl Tool for WebSearchTool {
         "Search DuckDuckGo and return up to 10 filtered results (title, url, domain) with optional allow/block domain filters."
     }
 
+    fn mutability(&self) -> crate::agent::tools::ToolMutability {
+        crate::agent::tools::ToolMutability::ReadOnly
+    }
+
+    fn concurrency_safe(&self) -> bool {
+        true
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",

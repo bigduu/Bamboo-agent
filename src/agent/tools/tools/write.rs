@@ -132,7 +132,7 @@ mod tests {
             session_id: Some(session_id),
             tool_call_id: "call_1",
             event_tx: None,
-                    available_tool_schemas: None,
+            available_tool_schemas: None,
         }
     }
 

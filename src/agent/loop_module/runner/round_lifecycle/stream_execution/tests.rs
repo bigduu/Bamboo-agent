@@ -488,3 +488,18 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
         .metadata
         .contains_key("responses.previous_response_id"));
 }
+
+#[test]
+fn overflow_error_detection_matches_common_provider_messages() {
+    assert!(super::is_llm_overflow_error("prompt too long"));
+    assert!(super::is_llm_overflow_error(
+        "API error: maximum context length exceeded"
+    ));
+    assert!(super::is_llm_overflow_error(
+        "Request too large for model context window"
+    ));
+    assert!(!super::is_llm_overflow_error("timeout while connecting"));
+    assert!(!super::is_llm_overflow_error(
+        "authentication error: invalid api key"
+    ));
+}

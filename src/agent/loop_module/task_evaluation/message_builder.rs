@@ -18,6 +18,7 @@ Review the task list and execution history, then decide if any tasks should be m
 2. Mark as "blocked" if there are unresolvable issues
 3. Keep as "in_progress" if more work is needed
 4. Add brief notes explaining your decision
+5. If a task includes completion criteria, only mark it completed when every criterion is met
 
 ## Available Actions
 - update_task_item: Update the status of a task item
@@ -26,6 +27,7 @@ Review the task list and execution history, then decide if any tasks should be m
 - Only update items that are currently "in_progress"
 - You MUST call update_task_item if a task is complete
 - Provide clear reasoning in notes
+- When status is "completed" for a task with completion criteria, `criteria_met` MUST use criterion IDs (for example `c1`, `c2`); do not paraphrase criteria text
 "#;
 
     messages.push(Message::system(system_prompt));
@@ -42,7 +44,7 @@ Review the task list and execution history, then decide if any tasks should be m
 ## Instructions
 Review each "in_progress" task above. For each task:
 1. Check if the goal has been achieved based on tool execution results
-2. If complete, call update_task_item with status="completed" and brief notes
+2. If complete, call update_task_item with status="completed", brief notes, and `criteria_met` criterion IDs for tasks that define criteria
 3. If blocked, call update_task_item with status="blocked" and explain the issue
 
 Remember: You are NOT executing the task. You are only evaluating if existing work has completed it.

@@ -116,12 +116,9 @@ pub async fn submit_response(
         session_id
     );
 
-    let auto_resume_status = trigger_auto_resume_if_requested(
-        state.clone(),
-        &session_id,
-        effective_reasoning_effort,
-    )
-    .await;
+    let auto_resume_status =
+        trigger_auto_resume_if_requested(state.clone(), &session_id, effective_reasoning_effort)
+            .await;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,

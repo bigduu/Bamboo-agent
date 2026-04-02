@@ -211,6 +211,7 @@ fn test_session_set_task_list() {
             status: TaskItemStatus::Pending,
             depends_on: vec![],
             notes: String::new(),
+            ..TaskItem::default()
         }],
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -238,6 +239,7 @@ fn test_session_update_task_item() {
             status: TaskItemStatus::Pending,
             depends_on: vec![],
             notes: String::new(),
+            ..TaskItem::default()
         }],
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -245,12 +247,139 @@ fn test_session_update_task_item() {
     session.set_task_list(task_list);
 
     // Update the task item
-    let result = session.update_task_item("item-1", TaskItemStatus::Completed, Some("Done!"));
+    let result = session.update_task_item("item-1", TaskItemStatus::Completed, Some("Done!"), None);
 
     assert!(result.is_ok());
     let list = session.task_list.unwrap();
     assert_eq!(list.items[0].status, TaskItemStatus::Completed);
     assert_eq!(list.items[0].notes, "Done!");
+    assert_eq!(list.items[0].transitions.len(), 1);
+    assert_eq!(
+        list.items[0].transitions[0].from_status,
+        TaskItemStatus::Pending
+    );
+    assert_eq!(
+        list.items[0].transitions[0].to_status,
+        TaskItemStatus::Completed
+    );
+    assert_eq!(
+        list.items[0].transitions[0].reason.as_deref(),
+        Some("Done!")
+    );
+}
+
+#[test]
+fn test_session_update_task_item_same_status_does_not_create_transition() {
+    let mut session = Session::new("session-1", "gpt-4o-mini");
+
+    let task_list = TaskList {
+        session_id: "session-1".to_string(),
+        title: "Task List".to_string(),
+        items: vec![TaskItem {
+            id: "item-1".to_string(),
+            description: "Task 1".to_string(),
+            status: TaskItemStatus::Pending,
+            depends_on: vec![],
+            notes: String::new(),
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    session.set_task_list(task_list);
+
+    let result = session.update_task_item(
+        "item-1",
+        TaskItemStatus::Pending,
+        Some("Still pending"),
+        None,
+    );
+
+    assert!(result.is_ok());
+    let list = session.task_list.unwrap();
+    assert_eq!(list.items[0].status, TaskItemStatus::Pending);
+    assert_eq!(list.items[0].notes, "Still pending");
+    assert!(list.items[0].transitions.is_empty());
+}
+
+#[test]
+fn test_session_update_task_item_enforces_completion_criteria_gate() {
+    let mut session = Session::new("session-1", "gpt-4o-mini");
+
+    let task_list = TaskList {
+        session_id: "session-1".to_string(),
+        title: "Task List".to_string(),
+        items: vec![TaskItem {
+            id: "item-1".to_string(),
+            description: "Task with criteria".to_string(),
+            status: TaskItemStatus::InProgress,
+            depends_on: vec![],
+            notes: String::new(),
+            completion_criteria: vec!["All tests pass".to_string(), "No lint errors".to_string()],
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    session.set_task_list(task_list);
+
+    let incomplete = vec!["c1".to_string()];
+    let result = session.update_task_item(
+        "item-1",
+        TaskItemStatus::Completed,
+        Some("Attempt completion"),
+        Some(&incomplete),
+    );
+
+    assert!(result.is_ok());
+    let list = session.task_list.as_ref().expect("task list should exist");
+    assert_eq!(list.items[0].status, TaskItemStatus::InProgress);
+    assert!(list.items[0]
+        .notes
+        .contains("Completion criteria not fully met"));
+
+    let complete = vec!["c1".to_string(), "c2".to_string()];
+    let result = session.update_task_item(
+        "item-1",
+        TaskItemStatus::Completed,
+        Some("All done"),
+        Some(&complete),
+    );
+
+    assert!(result.is_ok());
+    let list = session.task_list.as_ref().expect("task list should exist");
+    assert_eq!(list.items[0].status, TaskItemStatus::Completed);
+}
+
+#[test]
+fn test_session_update_task_item_completion_gate_blocks_when_criteria_not_provided() {
+    let mut session = Session::new("session-1", "gpt-4o-mini");
+
+    let task_list = TaskList {
+        session_id: "session-1".to_string(),
+        title: "Task List".to_string(),
+        items: vec![TaskItem {
+            id: "item-1".to_string(),
+            description: "Task with criteria".to_string(),
+            status: TaskItemStatus::InProgress,
+            depends_on: vec![],
+            notes: String::new(),
+            completion_criteria: vec!["All tests pass".to_string(), "No lint errors".to_string()],
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    session.set_task_list(task_list);
+
+    let result = session.update_task_item("item-1", TaskItemStatus::Completed, Some("Done"), None);
+    assert!(result.is_ok());
+
+    let list = session.task_list.as_ref().expect("task list should exist");
+    assert_eq!(list.items[0].status, TaskItemStatus::InProgress);
+    assert!(list.items[0]
+        .notes
+        .contains("Completion criteria not fully met"));
 }
 
 #[test]
@@ -266,7 +395,7 @@ fn test_session_update_task_item_not_found() {
     };
     session.set_task_list(task_list);
 
-    let result = session.update_task_item("nonexistent", TaskItemStatus::Completed, None);
+    let result = session.update_task_item("nonexistent", TaskItemStatus::Completed, None, None);
 
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("not found"));
@@ -276,7 +405,7 @@ fn test_session_update_task_item_not_found() {
 fn test_session_update_task_item_no_list() {
     let mut session = Session::new("session-1", "gpt-4o-mini");
 
-    let result = session.update_task_item("item-1", TaskItemStatus::Completed, None);
+    let result = session.update_task_item("item-1", TaskItemStatus::Completed, None, None);
 
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("No task list exists"));
@@ -424,6 +553,7 @@ fn test_session_format_task_list_for_prompt() {
             status: TaskItemStatus::Pending,
             depends_on: vec![],
             notes: String::new(),
+            ..TaskItem::default()
         }],
         created_at: Utc::now(),
         updated_at: Utc::now(),
