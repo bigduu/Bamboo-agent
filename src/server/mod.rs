@@ -112,6 +112,7 @@ pub mod handlers;
 // Backward compatibility: "controllers" and "handlers" are unified.
 // Keep the old module name as an alias so existing imports keep working.
 pub use handlers as controllers;
+pub mod instruction_layer;
 pub mod logging;
 pub mod message_hooks;
 pub mod metrics;

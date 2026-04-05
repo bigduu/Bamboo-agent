@@ -1,4 +1,7 @@
-//! Persistent external memory note tool.
+//! Persistent session-scoped note tool.
+//!
+//! Canonical tool name: `session_note`.
+//! The legacy `memory_note` name is accepted via executor-level alias routing.
 //!
 //! This tool lets the model store (and later retrieve) per-session notes that
 //! are loaded into the system prompt at the start of each round.
@@ -7,45 +10,54 @@
 //! workstreams without clobbering each other.
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use serde_json::json;
-use std::sync::{Arc, OnceLock};
-use tokio::sync::Mutex;
 
-use crate::agent::core::memory::{ExternalMemory, DEFAULT_TOPIC};
+use crate::agent::core::memory_store::MemoryStore;
 use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use crate::agent::tools::tools::session_memory::{
+    SESSION_NOTE_ACTION_NAMES, execute_session_memory_action, parse_session_note_action,
+};
 
-const MAX_NOTE_CHARS: usize = 12_000;
+const TOOL_NAME: &str = "session_note";
+const TOOL_DESCRIPTION: &str = "Read or update the persistent session-scoped note (markdown). Use this for durable local context, user preferences, constraints, and compression-resistant reminders within the current session/workstream. Do not use it as the primary long-term knowledge base. Hard limit: 12000 characters; compress before append/replace if needed.";
 
-fn note_locks() -> &'static DashMap<String, Arc<Mutex<()>>> {
-    static NOTE_LOCKS: OnceLock<DashMap<String, Arc<Mutex<()>>>> = OnceLock::new();
-    NOTE_LOCKS.get_or_init(DashMap::new)
+#[derive(Debug, Clone)]
+pub struct SessionNoteTool {
+    memory_store: MemoryStore,
 }
 
-fn session_lock(session_id: &str) -> Arc<Mutex<()>> {
-    note_locks()
-        .entry(session_id.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
-}
-
-#[derive(Debug, Default)]
-pub struct MemoryNoteTool;
-
-impl MemoryNoteTool {
+impl SessionNoteTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            memory_store: MemoryStore::with_defaults(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_memory_store(memory_store: MemoryStore) -> Self {
+        Self { memory_store }
     }
 }
 
+impl Default for SessionNoteTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Deprecated compatibility alias for older code paths. The canonical tool type
+/// and registered tool name is [`SessionNoteTool`] / `session_note`.
+#[allow(dead_code)]
+pub type MemoryNoteTool = SessionNoteTool;
+
 #[async_trait]
-impl Tool for MemoryNoteTool {
+impl Tool for SessionNoteTool {
     fn name(&self) -> &str {
-        "memory_note"
+        TOOL_NAME
     }
 
     fn description(&self) -> &str {
-        "Read or update the persistent session-scoped note (markdown). Use this for durable local context, user preferences, constraints, and compression-resistant reminders within the current session/workstream. Do not use it as the primary long-term knowledge base. Hard limit: 12000 characters; compress before append/replace if needed."
+        TOOL_DESCRIPTION
     }
 
     fn mutability(&self) -> crate::agent::tools::ToolMutability {
@@ -95,10 +107,9 @@ impl Tool for MemoryNoteTool {
     }
 
     async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
-        Err(ToolError::Execution(
-            "memory_note must be executed with ToolExecutionContext (session_id required)"
-                .to_string(),
-        ))
+        Err(ToolError::Execution(format!(
+            "{TOOL_NAME} must be executed with ToolExecutionContext (session_id required)"
+        )))
     }
 
     async fn execute_with_context(
@@ -112,183 +123,21 @@ impl Tool for MemoryNoteTool {
             ));
         };
 
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_lowercase();
+        let action_raw = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let action = parse_session_note_action(action_raw)?;
+        let topic = args.get("topic").and_then(|v| v.as_str());
+        let content = args.get("content").and_then(|v| v.as_str());
 
-        let topic = args
-            .get("topic")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .unwrap_or(DEFAULT_TOPIC);
-
-        let memory = ExternalMemory::with_defaults();
-        let session_guard = session_lock(session_id);
-        let _guard = session_guard.lock().await;
-
-        match action.as_str() {
-            "read" => {
-                let content = memory
-                    .read_topic(session_id, topic)
-                    .await
-                    .map_err(|e| {
-                        ToolError::Execution(format!(
-                            "Failed to read note: {e}. Rewrite and retry memory_note with valid JSON, e.g. {{\"action\":\"read\",\"topic\":\"{topic}\"}}."
-                        ))
-                    })?;
-                Ok(ToolResult {
-                    success: true,
-                    result: json!({
-                        "session_id": session_id,
-                        "topic": topic,
-                        "exists": content.is_some(),
-                        "content": content.unwrap_or_default(),
-                        "max_chars": MAX_NOTE_CHARS
-                    })
-                    .to_string(),
-                    display_preference: Some("json".to_string()),
-                })
-            }
-            "clear" => {
-                let deleted = memory
-                    .delete_topic(session_id, topic)
-                    .await
-                    .map_err(|e| {
-                        ToolError::Execution(format!(
-                            "Failed to delete note: {e}. Rewrite and retry memory_note with valid JSON, e.g. {{\"action\":\"clear\",\"topic\":\"{topic}\"}}."
-                        ))
-                    })?;
-                Ok(ToolResult {
-                    success: true,
-                    result: json!({
-                        "session_id": session_id,
-                        "topic": topic,
-                        "deleted": deleted
-                    })
-                    .to_string(),
-                    display_preference: Some("json".to_string()),
-                })
-            }
-            "list_topics" => {
-                let topics = memory
-                    .list_topics(session_id)
-                    .await
-                    .map_err(|e| {
-                        ToolError::Execution(format!(
-                            "Failed to list topics: {e}. Rewrite and retry memory_note with valid JSON, e.g. {{\"action\":\"list_topics\"}}."
-                        ))
-                    })?;
-                Ok(ToolResult {
-                    success: true,
-                    result: json!({
-                        "session_id": session_id,
-                        "topics": topics,
-                        "count": topics.len()
-                    })
-                    .to_string(),
-                    display_preference: Some("json".to_string()),
-                })
-            }
-            "replace" | "append" => {
-                let content = args
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .ok_or_else(|| {
-                        ToolError::InvalidArguments(
-                            "content is required for action=append|replace. Rewrite the memory_note call with valid JSON and include non-empty content."
-                                .to_string(),
-                        )
-                    })?;
-
-                if action == "replace" {
-                    if content.chars().count() > MAX_NOTE_CHARS {
-                        return Err(ToolError::Execution(format!(
-                            "memory note too long (>{} chars). Compress it (rewrite more concisely) and call memory_note with action=replace again.",
-                            MAX_NOTE_CHARS
-                        )));
-                    }
-
-                    let path = memory
-                        .save_topic(session_id, topic, content)
-                        .await
-                        .map_err(|e| {
-                            ToolError::Execution(format!(
-                                "Failed to write note: {e}. Rewrite and retry memory_note with valid JSON, e.g. {{\"action\":\"replace\",\"topic\":\"{topic}\",\"content\":\"...\"}}."
-                            ))
-                        })?;
-
-                    Ok(ToolResult {
-                        success: true,
-                        result: json!({
-                            "session_id": session_id,
-                            "topic": topic,
-                            "action": "replace",
-                            "path": path,
-                            "length_chars": content.chars().count(),
-                            "max_chars": MAX_NOTE_CHARS
-                        })
-                        .to_string(),
-                        display_preference: Some("json".to_string()),
-                    })
-                } else {
-                    let existing = memory
-                        .read_topic(session_id, topic)
-                        .await
-                        .map_err(|e| {
-                            ToolError::Execution(format!(
-                                "Failed to read note: {e}. Rewrite and retry memory_note with valid JSON, e.g. {{\"action\":\"append\",\"topic\":\"{topic}\",\"content\":\"...\"}}."
-                            ))
-                        })?;
-
-                    let mut next = existing.unwrap_or_default();
-                    if !next.is_empty() {
-                        next.push_str("\n\n");
-                    }
-                    next.push_str(content);
-
-                    let next_len = next.chars().count();
-                    if next_len > MAX_NOTE_CHARS {
-                        return Err(ToolError::Execution(format!(
-                            "memory note would exceed the limit ({}>{} chars). Compress the existing note (use memory_note action=read topic={topic}), then call memory_note action=replace with a shorter version, then append again if needed.",
-                            next_len, MAX_NOTE_CHARS
-                        )));
-                    }
-
-                    let path = memory
-                        .save_topic(session_id, topic, &next)
-                        .await
-                        .map_err(|e| {
-                            ToolError::Execution(format!(
-                                "Failed to write note: {e}. Rewrite and retry memory_note with valid JSON, e.g. {{\"action\":\"append\",\"topic\":\"{topic}\",\"content\":\"...\"}}."
-                            ))
-                        })?;
-
-                    Ok(ToolResult {
-                        success: true,
-                        result: json!({
-                            "session_id": session_id,
-                            "topic": topic,
-                            "action": "append",
-                            "path": path,
-                            "length_chars": next_len,
-                            "max_chars": MAX_NOTE_CHARS
-                        })
-                        .to_string(),
-                        display_preference: Some("json".to_string()),
-                    })
-                }
-            }
-            _ => Err(ToolError::InvalidArguments(
-                "action must be one of: read, append, replace, clear, list_topics. Rewrite the memory_note call with valid JSON."
-                    .to_string(),
-            )),
-        }
+        execute_session_memory_action(
+            &self.memory_store,
+            session_id,
+            action,
+            topic,
+            content,
+            None,
+            SESSION_NOTE_ACTION_NAMES,
+        )
+        .await
     }
 }
 
@@ -297,10 +146,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_note_schema_requires_action() {
-        let tool = MemoryNoteTool::new();
+    fn session_note_schema_requires_action() {
+        let tool = SessionNoteTool::new();
         let schema = tool.parameters_schema();
         assert_eq!(schema["required"], json!(["action"]));
+        assert_eq!(tool.name(), TOOL_NAME);
         assert_eq!(
             schema["properties"]["action"]["enum"],
             json!(["read", "append", "replace", "clear", "list_topics"])
@@ -308,16 +158,16 @@ mod tests {
     }
 
     #[test]
-    fn memory_note_schema_has_topic_field() {
-        let tool = MemoryNoteTool::new();
+    fn session_note_schema_has_topic_field() {
+        let tool = SessionNoteTool::new();
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["topic"].is_object());
         assert_eq!(schema["properties"]["topic"]["type"], "string");
     }
 
     #[tokio::test]
-    async fn memory_note_requires_session_context() {
-        let tool = MemoryNoteTool::new();
+    async fn session_note_requires_session_context() {
+        let tool = SessionNoteTool::new();
         let result = tool
             .execute_with_context(
                 json!({"action": "read"}),
@@ -332,17 +182,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_note_validates_action_and_content_before_io() {
-        let tool = MemoryNoteTool::new();
-        let ctx = ToolExecutionContext {
-            session_id: Some("session-1"),
-            tool_call_id: "tool_call",
-            event_tx: None,
-            available_tool_schemas: None,
-        };
+    async fn session_note_validates_action_and_content_before_io() {
+        let tool = SessionNoteTool::new();
 
         let unknown = tool
-            .execute_with_context(json!({"action": "unknown"}), ctx)
+            .execute_with_context(
+                json!({"action": "unknown"}),
+                ToolExecutionContext {
+                    session_id: Some("session-1"),
+                    tool_call_id: "tool_call_unknown",
+                    event_tx: None,
+                    available_tool_schemas: None,
+                },
+            )
             .await;
         assert!(matches!(
             unknown,
@@ -350,11 +202,156 @@ mod tests {
         ));
 
         let missing_content = tool
-            .execute_with_context(json!({"action": "replace"}), ctx)
+            .execute_with_context(
+                json!({"action": "replace"}),
+                ToolExecutionContext {
+                    session_id: Some("session-1"),
+                    tool_call_id: "tool_call_replace",
+                    event_tx: None,
+                    available_tool_schemas: None,
+                },
+            )
             .await;
         assert!(matches!(
             missing_content,
             Err(ToolError::InvalidArguments(msg)) if msg.contains("content is required")
         ));
+    }
+
+    #[tokio::test]
+    async fn session_note_uses_memory_store_session_topics() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = SessionNoteTool::with_memory_store(MemoryStore::new(dir.path()));
+
+        let append = tool
+            .execute_with_context(
+                json!({"action": "append", "topic": "backend", "content": "API finalized"}),
+                ToolExecutionContext {
+                    session_id: Some("session-1"),
+                    tool_call_id: "tool_call_append",
+                    event_tx: None,
+                    available_tool_schemas: None,
+                },
+            )
+            .await
+            .expect("append should succeed");
+        let append_json: serde_json::Value = serde_json::from_str(&append.result).unwrap();
+        assert_eq!(append_json["action"], "append");
+        assert_eq!(append_json["length_chars"], "API finalized".chars().count());
+
+        let read = tool
+            .execute_with_context(
+                json!({"action": "read", "topic": "backend"}),
+                ToolExecutionContext {
+                    session_id: Some("session-1"),
+                    tool_call_id: "tool_call_read",
+                    event_tx: None,
+                    available_tool_schemas: None,
+                },
+            )
+            .await
+            .expect("read should succeed");
+        let read_json: serde_json::Value = serde_json::from_str(&read.result).unwrap();
+        assert_eq!(read_json["action"], "read");
+        assert_eq!(read_json["content"], "API finalized");
+        assert_eq!(read_json["length_chars"], "API finalized".chars().count());
+        assert_eq!(read_json["body_truncated"], false);
+
+        let list = tool
+            .execute_with_context(
+                json!({"action": "list_topics"}),
+                ToolExecutionContext {
+                    session_id: Some("session-1"),
+                    tool_call_id: "tool_call_list",
+                    event_tx: None,
+                    available_tool_schemas: None,
+                },
+            )
+            .await
+            .expect("list should succeed");
+        let list_json: serde_json::Value = serde_json::from_str(&list.result).unwrap();
+        assert_eq!(list_json["topics"][0], "backend");
+        assert_eq!(list_json["count"], 1);
+
+        let clear = tool
+            .execute_with_context(
+                json!({"action": "clear", "topic": "backend"}),
+                ToolExecutionContext {
+                    session_id: Some("session-1"),
+                    tool_call_id: "tool_call_clear",
+                    event_tx: None,
+                    available_tool_schemas: None,
+                },
+            )
+            .await
+            .expect("clear should succeed");
+        let clear_json: serde_json::Value = serde_json::from_str(&clear.result).unwrap();
+        assert_eq!(clear_json["action"], "clear");
+        assert_eq!(clear_json["deleted"], true);
+    }
+
+    #[tokio::test]
+    async fn session_note_read_reports_truncation_and_append_enforces_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = SessionNoteTool::with_memory_store(MemoryStore::new(dir.path()));
+        let long_content = "x".repeat(32);
+
+        tool.execute_with_context(
+            json!({"action": "replace", "topic": "default", "content": long_content}),
+            ToolExecutionContext {
+                session_id: Some("session-2"),
+                tool_call_id: "tool_call_replace_long",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("replace should succeed");
+
+        let read = tool
+            .execute_with_context(
+                json!({"action": "read", "topic": "default"}),
+                ToolExecutionContext {
+                    session_id: Some("session-2"),
+                    tool_call_id: "tool_call_read_long",
+                    event_tx: None,
+                    available_tool_schemas: None,
+                },
+            )
+            .await
+            .expect("read should succeed");
+        let read_json: serde_json::Value = serde_json::from_str(&read.result).unwrap();
+        assert_eq!(read_json["length_chars"], 32);
+        assert_eq!(read_json["body_truncated"], false);
+
+        tool.execute_with_context(
+            json!({"action": "replace", "topic": "limit", "content": "x".repeat(crate::agent::tools::tools::session_memory::MAX_SESSION_NOTE_CHARS - 1)}),
+            ToolExecutionContext {
+                session_id: Some("session-3"),
+                tool_call_id: "tool_call_replace_limit",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("replace near limit should succeed");
+
+        let append_err = tool
+            .execute_with_context(
+                json!({"action": "append", "topic": "limit", "content": "y"}),
+                ToolExecutionContext {
+                    session_id: Some("session-3"),
+                    tool_call_id: "tool_call_append_limit",
+                    event_tx: None,
+                    available_tool_schemas: None,
+                },
+            )
+            .await
+            .expect_err("append should exceed limit");
+        assert!(
+            append_err
+                .to_string()
+                .contains("session note would exceed the limit")
+        );
     }
 }

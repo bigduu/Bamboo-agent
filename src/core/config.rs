@@ -83,6 +83,29 @@ pub struct EnvVarEntry {
     pub description: Option<String>,
 }
 
+/// Default work area configuration.
+///
+/// Allows Bamboo to operate without an explicit initial workspace while still
+/// providing a stable fallback directory for relative-path tool execution.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DefaultWorkAreaConfig {
+    /// Optional default filesystem path used when a session has no active workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// Memory and background summarization configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryConfig {
+    /// Optional dedicated model for memory/session summarization and reflection.
+    /// Falls back to the provider fast model when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_model: Option<String>,
+    /// Whether lightweight automatic Dream-style consolidation should run in the background.
+    #[serde(default)]
+    pub auto_dream_enabled: bool,
+}
+
 /// Main configuration structure for Bamboo agent
 ///
 /// Contains all settings needed to run the agent, including provider credentials,
@@ -165,6 +188,14 @@ pub struct Config {
     /// Secret entries are encrypted at rest; plaintext values are hydrated in memory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_vars: Vec<EnvVarEntry>,
+
+    /// Default work area used when a session has no explicit active workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_work_area: Option<DefaultWorkAreaConfig>,
+
+    /// Memory/background summarization settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryConfig>,
 
     /// MCP server configuration.
     ///
@@ -674,6 +705,16 @@ fn parse_bool_env(value: &str) -> bool {
     )
 }
 
+fn expand_user_path(value: &str) -> PathBuf {
+    let trimmed = value.trim();
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self::new()
@@ -846,6 +887,82 @@ impl Config {
             _ => None,
         };
         fast.or_else(|| self.get_model())
+    }
+
+    /// Get the configured memory/background summarization model.
+    ///
+    /// Falls back to the provider fast model when `memory.background_model`
+    /// is not configured or resolves to an empty string.
+    ///
+    /// IMPORTANT: this intentionally does **not** fall back to the main
+    /// interaction model. Memory compaction / reflection should be skipped or
+    /// fail loudly when no background/fast model is configured.
+    pub fn get_memory_background_model(&self) -> Option<String> {
+        let configured = self
+            .memory
+            .as_ref()
+            .and_then(|memory| memory.background_model.as_ref())
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        configured.or_else(|| match self.provider.as_str() {
+            "openai" => self
+                .providers
+                .openai
+                .as_ref()
+                .and_then(|c| c.fast_model.clone()),
+            "anthropic" => self
+                .providers
+                .anthropic
+                .as_ref()
+                .and_then(|c| c.fast_model.clone()),
+            "gemini" => self
+                .providers
+                .gemini
+                .as_ref()
+                .and_then(|c| c.fast_model.clone()),
+            "copilot" => self
+                .providers
+                .copilot
+                .as_ref()
+                .and_then(|c| c.fast_model.clone()),
+            _ => None,
+        })
+    }
+
+    /// Resolve the configured default work area path when present.
+    ///
+    /// This validates that the configured directory exists, but intentionally
+    /// returns the stable expanded path rather than the platform-specific
+    /// canonicalized path. On macOS, `canonicalize()` may rewrite `/var/...`
+    /// to `/private/var/...`, which is correct at the filesystem layer but
+    /// undesirable as a user-facing/config-derived workspace path.
+    pub fn get_default_work_area_path(&self) -> Option<PathBuf> {
+        let raw = self
+            .default_work_area
+            .as_ref()
+            .and_then(|config| config.path.as_ref())
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())?;
+
+        let candidate = expand_user_path(raw);
+        if candidate.is_absolute() {
+            let canonical = std::fs::canonicalize(&candidate).ok();
+            return canonical
+                .as_ref()
+                .filter(|path| path.is_dir())
+                .map(|_| candidate.clone())
+                .or_else(|| candidate.is_dir().then_some(candidate));
+        }
+
+        let from_bamboo_dir = crate::core::paths::bamboo_dir().join(&candidate);
+        let canonical = std::fs::canonicalize(&from_bamboo_dir).ok();
+        canonical
+            .as_ref()
+            .filter(|path| path.is_dir())
+            .map(|_| from_bamboo_dir.clone())
+            .or_else(|| from_bamboo_dir.is_dir().then_some(from_bamboo_dir))
+            .or_else(|| candidate.is_dir().then_some(candidate))
     }
 
     /// Get the vision-capable model for the currently active provider.
@@ -1294,6 +1411,8 @@ impl Config {
             tools: ToolsConfig::default(),
             skills: SkillsConfig::default(),
             env_vars: Vec::new(),
+            default_work_area: None,
+            memory: None,
             mcp: crate::agent::mcp::McpConfig::default(),
             extra: BTreeMap::new(),
         }
@@ -1525,6 +1644,7 @@ mod tests {
 
     #[test]
     fn publish_env_vars_updates_prompt_safe_snapshot_without_secret_values() {
+        let _lock = crate::test_support::env_cache_lock_acquire();
         let mut config = Config::default();
         config.env_vars = vec![
             EnvVarEntry {
@@ -1615,6 +1735,126 @@ mod tests {
             config.https_proxy.is_empty(),
             "config should keep https_proxy empty when field is omitted"
         );
+    }
+
+    #[test]
+    fn get_memory_background_model_prefers_memory_specific_override() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.providers.openai = Some(OpenAIConfig {
+            api_key: "test".to_string(),
+            api_key_encrypted: None,
+            base_url: None,
+            model: Some("gpt-main".to_string()),
+            fast_model: Some("gpt-fast".to_string()),
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: vec![],
+            request_overrides: None,
+            extra: BTreeMap::new(),
+        });
+        config.memory = Some(MemoryConfig {
+            background_model: Some("memory-fast".to_string()),
+            auto_dream_enabled: false,
+        });
+
+        assert_eq!(
+            config.get_memory_background_model().as_deref(),
+            Some("memory-fast")
+        );
+    }
+
+    #[test]
+    fn get_memory_background_model_falls_back_to_provider_fast_model() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.providers.openai = Some(OpenAIConfig {
+            api_key: "test".to_string(),
+            api_key_encrypted: None,
+            base_url: None,
+            model: Some("gpt-main".to_string()),
+            fast_model: Some("gpt-fast".to_string()),
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: vec![],
+            request_overrides: None,
+            extra: BTreeMap::new(),
+        });
+
+        assert_eq!(
+            config.get_memory_background_model().as_deref(),
+            Some("gpt-fast")
+        );
+    }
+
+    #[test]
+    fn get_memory_background_model_does_not_fall_back_to_main_model() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.providers.openai = Some(OpenAIConfig {
+            api_key: "test".to_string(),
+            api_key_encrypted: None,
+            base_url: None,
+            model: Some("gpt-main".to_string()),
+            fast_model: None,
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: vec![],
+            request_overrides: None,
+            extra: BTreeMap::new(),
+        });
+
+        assert!(config.get_memory_background_model().is_none());
+    }
+
+    #[test]
+    fn memory_config_preserves_auto_dream_flag() {
+        let config = Config {
+            memory: Some(MemoryConfig {
+                background_model: Some("dream-fast".to_string()),
+                auto_dream_enabled: true,
+            }),
+            ..Config::default()
+        };
+
+        let serialized = serde_json::to_string(&config).expect("config should serialize");
+        let roundtrip: Config =
+            serde_json::from_str(&serialized).expect("config should deserialize");
+        assert!(roundtrip
+            .memory
+            .as_ref()
+            .map(|memory| memory.auto_dream_enabled)
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn get_default_work_area_path_expands_tilde_and_requires_directory() {
+        let _lock = env_lock_acquire();
+        let temp_home = TempHome::new();
+        let _home = EnvVarGuard::set("HOME", temp_home.path.to_string_lossy().as_ref());
+        let target = temp_home.path.join("workspace-default");
+        std::fs::create_dir_all(&target).expect("default work area dir should exist");
+
+        let mut config = Config::default();
+        config.default_work_area = Some(DefaultWorkAreaConfig {
+            path: Some("~/workspace-default".to_string()),
+        });
+
+        assert_eq!(config.get_default_work_area_path(), Some(target));
+    }
+
+    #[test]
+    fn get_default_work_area_path_returns_none_for_missing_directory() {
+        let _lock = env_lock_acquire();
+        let temp_home = TempHome::new();
+        let _home = EnvVarGuard::set("HOME", temp_home.path.to_string_lossy().as_ref());
+
+        let mut config = Config::default();
+        config.default_work_area = Some(DefaultWorkAreaConfig {
+            path: Some("~/missing-default-work-area".to_string()),
+        });
+
+        assert!(config.get_default_work_area_path().is_none());
     }
 
     #[test]

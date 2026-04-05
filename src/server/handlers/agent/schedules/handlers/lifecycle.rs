@@ -3,9 +3,10 @@ use actix_web::{web, HttpResponse, Result};
 use crate::server::app_state::AppState;
 use crate::server::schedules::ScheduleRunJob;
 
-use super::super::types::{CreateScheduleRequest, PatchScheduleRequest};
+use super::super::types::{CreateScheduleRequest, PatchScheduleRequest, ScheduleView};
 use super::super::validation::{
-    validate_auto_execute_run_config, validate_create_interval_seconds, validate_schedule_name,
+    resolve_create_schedule_definition, resolve_patch_schedule_definition,
+    validate_auto_execute_run_config, validate_schedule_name,
 };
 use super::response::{internal_server_error, schedule_not_found};
 
@@ -18,25 +19,21 @@ pub async fn create_schedule(
         Ok(name) => name,
         Err(response) => return Ok(response),
     };
-    if let Err(response) = validate_create_interval_seconds(req.interval_seconds) {
-        return Ok(response);
-    }
+    let resolved = match resolve_create_schedule_definition(&req) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
     if let Err(response) = validate_auto_execute_run_config(&state, &req.run_config).await {
         return Ok(response);
     }
 
     let created = state
         .schedule_store
-        .create_schedule(
-            name,
-            req.interval_seconds,
-            req.enabled,
-            req.run_config.clone(),
-        )
+        .create_schedule_with_definition(name, req.enabled, req.run_config.clone(), resolved.definition)
         .await
         .map_err(|error| internal_server_error("create schedule", error))?;
 
-    Ok(HttpResponse::Ok().json(created))
+    Ok(HttpResponse::Ok().json(ScheduleView::from(created)))
 }
 
 /// `PATCH /api/v1/schedules/{schedule_id}`
@@ -54,20 +51,19 @@ pub async fn patch_schedule(
         }
     }
 
+    let resolved = match resolve_patch_schedule_definition(&req) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+
     let updated = state
         .schedule_store
-        .patch_schedule(
-            &id,
-            name,
-            req.enabled,
-            req.interval_seconds,
-            req.run_config.clone(),
-        )
+        .patch_schedule_with_definition(&id, name, req.enabled, req.run_config.clone(), resolved.definition)
         .await
         .map_err(|error| internal_server_error("patch schedule", error))?;
 
     match updated {
-        Some(schedule) => Ok(HttpResponse::Ok().json(schedule)),
+        Some(schedule) => Ok(HttpResponse::Ok().json(ScheduleView::from(schedule))),
         None => Ok(schedule_not_found(&id)),
     }
 }
@@ -103,14 +99,17 @@ pub async fn run_now(state: web::Data<AppState>, path: web::Path<String>) -> Res
         return Ok(schedule_not_found(&id));
     };
 
-    let now = chrono::Utc::now();
+    let enqueued_at = claimed.claimed_at;
     state
         .schedule_manager
         .enqueue_run_now(ScheduleRunJob {
+            run_id: claimed.run_id.clone(),
             schedule_id: claimed.schedule_id.clone(),
             schedule_name: claimed.schedule_name.clone(),
             run_config: claimed.run_config.clone(),
-            claimed_at: now,
+            scheduled_for: claimed.scheduled_for,
+            claimed_at: claimed.claimed_at,
+            was_catch_up: claimed.was_catch_up,
         })
         .await
         .map_err(|error| internal_server_error("enqueue run", error))?;
@@ -118,7 +117,8 @@ pub async fn run_now(state: web::Data<AppState>, path: web::Path<String>) -> Res
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "schedule_id": claimed.schedule_id,
-        "enqueued_at": now
+        "run_id": claimed.run_id,
+        "enqueued_at": enqueued_at
     })))
 }
 

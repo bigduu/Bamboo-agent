@@ -27,6 +27,7 @@ pub fn exposure_for_tool_name(name: &str) -> ToolExposure {
         | "js_repl"
         | "WebFetch"
         | "WebSearch"
+        | "memory"
         | "scheduler"
         | "SubSession"
         | "sub_session_manager"

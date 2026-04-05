@@ -1,162 +1,73 @@
-//! External memory and note-taking for conversation context persistence.
+//! External memory and note-taking compatibility layer for session-scoped context.
 //!
-//! Provides a way to store and retrieve session-related notes that can
-//! persist across conversations and be retrieved when resuming sessions.
+//! Provides a backward-compatible API for storing and retrieving session-related
+//! notes that persist across conversations.
 //!
-//! ## Storage Layout (v2 — multi-topic)
+//! ## Storage Layout (v2 — multi-topic session notes)
 //!
 //! ```text
-//! ~/.bamboo/notes/{session_id}/{topic}.md
+//! ${BAMBOO_DATA_DIR}/memory/v1/sessions/{session_id}/note/{topic}.md
 //! ```
 //!
 //! The default topic is `"default"`. Legacy single-file notes
 //! (`{session_id}.md`) are auto-migrated on first access.
+//!
+//! Dream notebook data is **not** part of this session-note API's canonical scope.
+//! Dream is handled separately as a derived view (`views/DREAM_NOTEBOOK.md`) by
+//! `MemoryStore` and `auto_dream`.
 
 use std::io;
 use std::path::PathBuf;
 
-/// Default topic name when none is specified.
-pub const DEFAULT_TOPIC: &str = "default";
+use crate::agent::core::memory_store::{MemoryStore, DEFAULT_SESSION_TOPIC};
 
-/// Maximum allowed topic name length.
-const MAX_TOPIC_LEN: usize = 50;
+/// Default topic name when none is specified.
+pub const DEFAULT_TOPIC: &str = DEFAULT_SESSION_TOPIC;
 
 /// External memory manager for storing and retrieving session notes.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExternalMemory {
-    /// Directory to store notes
-    notes_dir: PathBuf,
+    store: MemoryStore,
 }
 
 impl ExternalMemory {
     /// Create a new external memory manager.
-    pub fn new(notes_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
-            notes_dir: notes_dir.into(),
+            store: MemoryStore::new(data_dir),
         }
     }
 
     /// Create with default settings.
     ///
-    /// Uses the Bamboo data directory's `notes/` folder as the storage directory.
+    /// Uses the Bamboo data directory's session memory store.
     pub fn with_defaults() -> Self {
-        let notes_dir = crate::core::paths::bamboo_dir().join("notes");
-        Self::new(notes_dir)
+        Self {
+            store: MemoryStore::with_defaults(),
+        }
+    }
+
+    pub fn store(&self) -> &MemoryStore {
+        &self.store
     }
 
     // ── Validation ──────────────────────────────────────────────────────
 
     fn validate_session_id(session_id: &str) -> io::Result<()> {
-        let trimmed = session_id.trim();
-        if trimmed.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "session_id cannot be empty",
-            ));
-        }
-        if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "session_id contains invalid path characters",
-            ));
-        }
-        if !trimmed
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "session_id contains unsupported characters",
-            ));
-        }
-        Ok(())
+        crate::agent::core::memory_store::validate_session_id(session_id).map(|_| ())
     }
 
     fn validate_topic(topic: &str) -> io::Result<()> {
-        let trimmed = topic.trim();
-        if trimmed.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "topic cannot be empty",
-            ));
-        }
-        if trimmed.len() > MAX_TOPIC_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "topic name too long (max {} chars, got {})",
-                    MAX_TOPIC_LEN,
-                    trimmed.len()
-                ),
-            ));
-        }
-        if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "topic contains invalid path characters",
-            ));
-        }
-        if !trimmed
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "topic must contain only alphanumeric, dash, or underscore characters",
-            ));
-        }
-        Ok(())
+        crate::agent::core::memory_store::validate_session_topic(topic).map(|_| ())
     }
 
     // ── Path resolution ─────────────────────────────────────────────────
 
-    /// Returns the session directory: `{notes_dir}/{session_id}/`
-    fn session_dir(&self, session_id: &str) -> io::Result<PathBuf> {
-        Self::validate_session_id(session_id)?;
-        Ok(self.notes_dir.join(session_id.trim()))
-    }
-
-    /// Returns the topic file path: `{notes_dir}/{session_id}/{topic}.md`
+    /// Returns the topic file path: `{memory/v1/sessions}/{session_id}/note/{topic}.md`
     fn topic_path(&self, session_id: &str, topic: &str) -> io::Result<PathBuf> {
-        let dir = self.session_dir(session_id)?;
-        Self::validate_topic(topic)?;
-        Ok(dir.join(format!("{}.md", topic.trim())))
-    }
-
-    /// Legacy single-file path: `{notes_dir}/{session_id}.md`
-    fn legacy_note_path(&self, session_id: &str) -> io::Result<PathBuf> {
         Self::validate_session_id(session_id)?;
-        Ok(self.notes_dir.join(format!("{}.md", session_id.trim())))
-    }
-
-    // ── Legacy migration ────────────────────────────────────────────────
-
-    /// Auto-migrate `{session_id}.md` → `{session_id}/default.md` if needed.
-    async fn maybe_migrate_legacy(&self, session_id: &str) -> io::Result<()> {
-        let legacy = self.legacy_note_path(session_id)?;
-        if !legacy.exists() {
-            return Ok(());
-        }
-
-        let new_dir = self.session_dir(session_id)?;
-        let new_path = new_dir.join(format!("{DEFAULT_TOPIC}.md"));
-
-        // Only migrate if the new path doesn't already exist
-        if new_path.exists() {
-            // Both exist — delete legacy to avoid confusion
-            let _ = tokio::fs::remove_file(&legacy).await;
-            return Ok(());
-        }
-
-        tokio::fs::create_dir_all(&new_dir).await?;
-        tokio::fs::rename(&legacy, &new_path).await?;
-
-        tracing::info!(
-            "Migrated legacy note {} -> {}",
-            legacy.display(),
-            new_path.display()
-        );
-        Ok(())
+        Self::validate_topic(topic)?;
+        Ok(self.store.resolver().session_topic_path(session_id, topic))
     }
 
     // ── Topic-aware API (primary) ───────────────────────────────────────
@@ -168,34 +79,19 @@ impl ExternalMemory {
         topic: &str,
         note: &str,
     ) -> io::Result<PathBuf> {
-        self.maybe_migrate_legacy(session_id).await?;
-        let path = self.topic_path(session_id, topic)?;
-        tokio::fs::create_dir_all(path.parent().unwrap()).await?;
-        tokio::fs::write(&path, note).await?;
-        Ok(path)
+        self.store
+            .write_session_topic(session_id, topic, note)
+            .await
     }
 
     /// Read a note for a specific topic.
     pub async fn read_topic(&self, session_id: &str, topic: &str) -> io::Result<Option<String>> {
-        self.maybe_migrate_legacy(session_id).await?;
-        let path = self.topic_path(session_id, topic)?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        let content = tokio::fs::read_to_string(&path).await?;
-        Ok(Some(content))
+        self.store.read_session_topic(session_id, topic).await
     }
 
     /// Delete a note for a specific topic.
     pub async fn delete_topic(&self, session_id: &str, topic: &str) -> io::Result<bool> {
-        self.maybe_migrate_legacy(session_id).await?;
-        let path = self.topic_path(session_id, topic)?;
-        if path.exists() {
-            tokio::fs::remove_file(&path).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.store.delete_session_topic(session_id, topic).await
     }
 
     /// Append to an existing topic note, or create a new one.
@@ -205,40 +101,14 @@ impl ExternalMemory {
         topic: &str,
         content: &str,
     ) -> io::Result<PathBuf> {
-        let existing = self.read_topic(session_id, topic).await?;
-        let note = match existing {
-            Some(mut prev) => {
-                prev.push_str("\n\n");
-                prev.push_str(content);
-                prev
-            }
-            None => content.to_string(),
-        };
-        self.save_topic(session_id, topic, &note).await
+        self.store
+            .append_session_topic(session_id, topic, content)
+            .await
     }
 
     /// List all topics for a session.
     pub async fn list_topics(&self, session_id: &str) -> io::Result<Vec<String>> {
-        self.maybe_migrate_legacy(session_id).await?;
-        let dir = self.session_dir(session_id)?;
-        let mut topics = Vec::new();
-
-        if !dir.exists() {
-            return Ok(topics);
-        }
-
-        let mut entries = tokio::fs::read_dir(&dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "md") {
-                if let Some(stem) = path.file_stem() {
-                    topics.push(stem.to_string_lossy().to_string());
-                }
-            }
-        }
-
-        topics.sort();
-        Ok(topics)
+        self.store.list_session_topics(session_id).await
     }
 
     // ── Backward-compatible API (uses DEFAULT_TOPIC) ────────────────────
@@ -265,29 +135,39 @@ impl ExternalMemory {
 
     /// List all session IDs that have notes.
     pub async fn list_sessions_with_notes(&self) -> io::Result<Vec<String>> {
+        let root = self.store.resolver().sessions_root();
         let mut sessions = Vec::new();
 
-        if !self.notes_dir.exists() {
+        if !root.exists() {
             return Ok(sessions);
         }
 
-        let mut entries = tokio::fs::read_dir(&self.notes_dir).await?;
+        let mut entries = tokio::fs::read_dir(root).await?;
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if path.is_dir() {
-                if let Some(name) = path.file_name() {
-                    sessions.push(name.to_string_lossy().to_string());
+                let note_dir = path.join("note");
+                if note_dir.exists() {
+                    if let Some(name) = path.file_name() {
+                        sessions.push(name.to_string_lossy().to_string());
+                    }
                 }
             }
         }
 
+        sessions.sort();
         Ok(sessions)
     }
 
     /// Get the path to the default notes file for a session.
     pub fn get_note_path(&self, session_id: &str) -> PathBuf {
         self.topic_path(session_id, DEFAULT_TOPIC)
-            .unwrap_or_else(|_| self.notes_dir.join("invalid-session-id.md"))
+            .unwrap_or_else(|_| {
+                self.store
+                    .resolver()
+                    .sessions_root()
+                    .join("invalid-session-id.md")
+            })
     }
 
     /// Check if a note exists for a session (default topic).
@@ -447,8 +327,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let memory = ExternalMemory::new(dir.path());
 
-        // Simulate legacy: create {notes_dir}/session-1.md directly
-        let legacy_path = dir.path().join("session-1.md");
+        // Simulate legacy: create {data_dir}/notes/session-1.md directly
+        let legacy_notes_dir = dir.path().join("notes");
+        tokio::fs::create_dir_all(&legacy_notes_dir).await.unwrap();
+        let legacy_path = legacy_notes_dir.join("session-1.md");
         tokio::fs::write(&legacy_path, "legacy content")
             .await
             .unwrap();
@@ -460,8 +342,15 @@ mod tests {
         // Legacy file should be gone
         assert!(!legacy_path.exists());
 
-        // New file should exist at session-1/default.md
-        let new_path = dir.path().join("session-1").join("default.md");
+        // New file should exist at memory/v1/sessions/session-1/note/default.md
+        let new_path = dir
+            .path()
+            .join("memory")
+            .join("v1")
+            .join("sessions")
+            .join("session-1")
+            .join("note")
+            .join("default.md");
         assert!(new_path.exists());
     }
 
@@ -477,7 +366,9 @@ mod tests {
             .unwrap();
 
         // Simulate legacy file appearing (e.g., from an older version)
-        let legacy_path = dir.path().join("session-1.md");
+        let legacy_notes_dir = dir.path().join("notes");
+        tokio::fs::create_dir_all(&legacy_notes_dir).await.unwrap();
+        let legacy_path = legacy_notes_dir.join("session-1.md");
         tokio::fs::write(&legacy_path, "old content").await.unwrap();
 
         // Reading should prefer new content and delete legacy
@@ -515,7 +406,7 @@ mod tests {
         assert!(memory.save_topic("s1", "has space", "bad").await.is_err());
         assert!(memory.save_topic("s1", "", "bad").await.is_err());
 
-        let long_name = "a".repeat(MAX_TOPIC_LEN + 1);
+        let long_name = "a".repeat(crate::agent::core::memory_store::MAX_SESSION_TOPIC_LEN + 1);
         assert!(memory.save_topic("s1", &long_name, "bad").await.is_err());
     }
 

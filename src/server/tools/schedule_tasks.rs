@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -7,8 +6,10 @@ use std::sync::Arc;
 use crate::agent::core::storage::{SessionStoreV2, Storage};
 use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use crate::agent::core::{Session, SessionKind};
-use crate::server::schedules::store::ScheduleRunConfig;
-use crate::server::schedules::{ScheduleManager, ScheduleRunJob, ScheduleStore};
+use crate::server::handlers::agent::schedules::ScheduleView;
+use crate::server::schedules::{
+    ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore, ScheduleTrigger,
+};
 
 /// One tool for schedule CRUD + actions.
 ///
@@ -55,7 +56,17 @@ enum ScheduleTasksArgs {
     List {},
     Create {
         name: String,
-        interval_seconds: u64,
+        trigger: ScheduleTrigger,
+        #[serde(default)]
+        timezone: Option<String>,
+        #[serde(default)]
+        start_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(default)]
+        end_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(default)]
+        misfire_policy: Option<crate::server::schedules::MisfirePolicy>,
+        #[serde(default)]
+        overlap_policy: Option<crate::server::schedules::OverlapPolicy>,
         #[serde(default)]
         enabled: Option<bool>,
         #[serde(default)]
@@ -68,7 +79,17 @@ enum ScheduleTasksArgs {
         #[serde(default)]
         enabled: Option<bool>,
         #[serde(default)]
-        interval_seconds: Option<u64>,
+        trigger: Option<ScheduleTrigger>,
+        #[serde(default)]
+        timezone: Option<String>,
+        #[serde(default)]
+        start_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(default)]
+        end_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(default)]
+        misfire_policy: Option<crate::server::schedules::MisfirePolicy>,
+        #[serde(default)]
+        overlap_policy: Option<crate::server::schedules::OverlapPolicy>,
         #[serde(default)]
         run_config: Option<ScheduleRunConfig>,
     },
@@ -106,7 +127,15 @@ impl Tool for ScheduleTasksTool {
                 "schedule_id": { "type": "string", "description": "Schedule id for patch/delete/run_now/list_sessions." },
                 "name": { "type": "string", "description": "Schedule name (create/patch)." },
                 "enabled": { "type": "boolean", "description": "Enable/disable schedule (create/patch)." },
-                "interval_seconds": { "type": "number", "description": "Interval in seconds (create/patch)." },
+                "trigger": {
+                    "type": "object",
+                    "description": "Canonical schedule trigger definition for create/patch. Required for create."
+                },
+                "timezone": { "type": "string", "description": "Optional IANA timezone for calendar-based triggers." },
+                "start_at": { "type": "string", "description": "Optional RFC3339 inclusive schedule window start." },
+                "end_at": { "type": "string", "description": "Optional RFC3339 exclusive schedule window end." },
+                "misfire_policy": { "type": "object", "description": "Optional misfire handling policy." },
+                "overlap_policy": { "type": "string", "enum": ["allow", "skip", "queue_one"], "description": "Optional overlap policy." },
                 "run_config": {
                     "type": "object",
                     "description": "Schedule run configuration (create/patch).",
@@ -154,7 +183,13 @@ impl Tool for ScheduleTasksTool {
 
         match parsed {
             ScheduleTasksArgs::List {} => {
-                let items = self.schedule_store.list_schedules().await;
+                let items = self
+                    .schedule_store
+                    .list_schedules()
+                    .await
+                    .into_iter()
+                    .map(ScheduleView::from)
+                    .collect::<Vec<_>>();
                 Ok(ToolResult {
                     success: true,
                     result: json!({ "schedules": items }).to_string(),
@@ -163,7 +198,12 @@ impl Tool for ScheduleTasksTool {
             }
             ScheduleTasksArgs::Create {
                 name,
-                interval_seconds,
+                trigger,
+                timezone,
+                start_at,
+                end_at,
+                misfire_policy,
+                overlap_policy,
                 enabled,
                 run_config,
             } => {
@@ -173,9 +213,9 @@ impl Tool for ScheduleTasksTool {
                         "name must be a non-empty string".to_string(),
                     ));
                 }
-                if interval_seconds == 0 {
+                if matches!(trigger, ScheduleTrigger::Interval { every_seconds: 0, .. }) {
                     return Err(ToolError::InvalidArguments(
-                        "interval_seconds must be > 0".to_string(),
+                        "trigger.every_seconds must be > 0".to_string(),
                     ));
                 }
                 let run_config = run_config.unwrap_or_default();
@@ -196,13 +236,25 @@ impl Tool for ScheduleTasksTool {
 
                 let created = self
                     .schedule_store
-                    .create_schedule(name, interval_seconds, enabled.unwrap_or(false), run_config)
+                    .create_schedule_with_definition(
+                        name,
+                        enabled.unwrap_or(false),
+                        run_config,
+                        crate::server::schedules::store::ScheduleDefinitionChanges {
+                            trigger: Some(trigger),
+                            timezone,
+                            start_at,
+                            end_at,
+                            misfire_policy,
+                            overlap_policy,
+                        },
+                    )
                     .await
                     .map_err(|e| ToolError::Execution(format!("Failed to create schedule: {e}")))?;
                 Ok(ToolResult {
                     success: true,
                     result: json!({
-                        "schedule": created,
+                        "schedule": ScheduleView::from(created),
                         "note": "If run_config.auto_execute is false, scheduled runs will only create sessions (they will not run the agent loop)."
                     })
                     .to_string(),
@@ -213,7 +265,12 @@ impl Tool for ScheduleTasksTool {
                 schedule_id,
                 name,
                 enabled,
-                interval_seconds,
+                trigger,
+                timezone,
+                start_at,
+                end_at,
+                misfire_policy,
+                overlap_policy,
                 run_config,
             } => {
                 if schedule_id.trim().is_empty() {
@@ -221,9 +278,9 @@ impl Tool for ScheduleTasksTool {
                         "schedule_id must be a non-empty string".to_string(),
                     ));
                 }
-                if matches!(interval_seconds, Some(0)) {
+                if matches!(trigger, Some(ScheduleTrigger::Interval { every_seconds: 0, .. })) {
                     return Err(ToolError::InvalidArguments(
-                        "interval_seconds must be > 0".to_string(),
+                        "trigger.every_seconds must be > 0".to_string(),
                     ));
                 }
 
@@ -246,12 +303,19 @@ impl Tool for ScheduleTasksTool {
 
                 let updated = self
                     .schedule_store
-                    .patch_schedule(
+                    .patch_schedule_with_definition(
                         schedule_id.trim(),
                         name.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
                         enabled,
-                        interval_seconds,
                         run_config,
+                        crate::server::schedules::store::ScheduleDefinitionChanges {
+                            trigger,
+                            timezone,
+                            start_at,
+                            end_at,
+                            misfire_policy,
+                            overlap_policy,
+                        },
                     )
                     .await
                     .map_err(|e| ToolError::Execution(format!("Failed to patch schedule: {e}")))?;
@@ -265,7 +329,7 @@ impl Tool for ScheduleTasksTool {
 
                 Ok(ToolResult {
                     success: true,
-                    result: json!({ "schedule": schedule }).to_string(),
+                    result: json!({ "schedule": ScheduleView::from(schedule) }).to_string(),
                     display_preference: Some("Collapsible".to_string()),
                 })
             }
@@ -311,13 +375,16 @@ impl Tool for ScheduleTasksTool {
                     )));
                 };
 
-                let now = Utc::now();
+                let enqueued_at = claimed.claimed_at;
                 self.schedule_manager
                     .enqueue_run_now(ScheduleRunJob {
+                        run_id: claimed.run_id.clone(),
                         schedule_id: claimed.schedule_id.clone(),
                         schedule_name: claimed.schedule_name.clone(),
                         run_config: claimed.run_config.clone(),
-                        claimed_at: now,
+                        scheduled_for: claimed.scheduled_for,
+                        claimed_at: claimed.claimed_at,
+                        was_catch_up: claimed.was_catch_up,
                     })
                     .await
                     .map_err(|e| ToolError::Execution(format!("Failed to enqueue run: {e}")))?;
@@ -327,7 +394,8 @@ impl Tool for ScheduleTasksTool {
                     result: json!({
                         "success": true,
                         "schedule_id": claimed.schedule_id,
-                        "enqueued_at": now
+                        "run_id": claimed.run_id,
+                        "enqueued_at": enqueued_at
                     })
                     .to_string(),
                     display_preference: Some("Default".to_string()),

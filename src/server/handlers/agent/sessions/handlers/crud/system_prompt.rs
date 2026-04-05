@@ -19,6 +19,10 @@ const WORKSPACE_CONTEXT_START_MARKER: &str =
     crate::server::app_state::WORKSPACE_CONTEXT_START_MARKER;
 const WORKSPACE_CONTEXT_END_MARKER: &str = crate::server::app_state::WORKSPACE_CONTEXT_END_MARKER;
 const WORKSPACE_CONTEXT_PREFIX: &str = crate::server::app_state::WORKSPACE_CONTEXT_PREFIX;
+const INSTRUCTION_CONTEXT_START_MARKER: &str =
+    crate::server::instruction_layer::INSTRUCTION_CONTEXT_START_MARKER;
+const INSTRUCTION_CONTEXT_END_MARKER: &str =
+    crate::server::instruction_layer::INSTRUCTION_CONTEXT_END_MARKER;
 const ENV_CONTEXT_START_MARKER: &str = crate::server::app_state::ENV_CONTEXT_START_MARKER;
 const ENV_CONTEXT_END_MARKER: &str = crate::server::app_state::ENV_CONTEXT_END_MARKER;
 
@@ -66,6 +70,24 @@ fn build_system_prompt_response(
     session_id: &str,
     session: &Session,
 ) -> SessionSystemPromptResponse {
+    if let Some(snapshot) = crate::agent::loop_module::runner::read_prompt_snapshot(session) {
+        return SessionSystemPromptResponse {
+            session_id: session_id.to_string(),
+            base_system_prompt: snapshot.base_system_prompt,
+            enhancement_prompt: snapshot.enhancement_prompt,
+            workspace_context: snapshot.workspace_context,
+            instruction_context: snapshot.instruction_context,
+            env_context: snapshot.env_context,
+            skill_context: snapshot.skill_context,
+            tool_guide_context: snapshot.tool_guide_context,
+            dream_notebook: snapshot.dream_notebook,
+            session_memory_note: snapshot.session_memory_note,
+            external_memory: snapshot.external_memory,
+            task_list: snapshot.task_list,
+            effective_system_prompt: snapshot.effective_system_prompt,
+        };
+    }
+
     let effective_system_prompt = resolve_effective_system_prompt(session);
     let skill_context = extract_wrapped_section(
         &effective_system_prompt,
@@ -82,6 +104,8 @@ fn build_system_prompt_response(
         EXTERNAL_MEMORY_START_MARKER,
         EXTERNAL_MEMORY_END_MARKER,
     );
+    let (dream_notebook, session_memory_note) =
+        split_external_memory_components(external_memory.as_deref());
     let task_list = extract_wrapped_section(
         &effective_system_prompt,
         TASK_LIST_START_MARKER,
@@ -98,7 +122,9 @@ fn build_system_prompt_response(
     let prompt_without_generated_sections = strip_generated_sections(&effective_system_prompt);
     let (prompt_without_workspace, workspace_from_prompt) =
         split_workspace_context(&prompt_without_generated_sections);
-    let (prompt_without_env, env_context) = split_env_context(&prompt_without_workspace);
+    let (prompt_without_instruction, instruction_from_prompt) =
+        split_instruction_context(&prompt_without_workspace);
+    let (prompt_without_env, env_context) = split_env_context(&prompt_without_instruction);
 
     let base_system_prompt = metadata_value(session, "base_system_prompt").unwrap_or_else(|| {
         let derived = prompt_without_env.trim();
@@ -110,7 +136,7 @@ fn build_system_prompt_response(
     });
 
     let enhancement_prompt = metadata_value(session, "enhance_prompt")
-        .or_else(|| derive_enhancement_prompt(&base_system_prompt, &prompt_without_env));
+        .or_else(|| derive_enhancement_prompt_legacy(&base_system_prompt, &prompt_without_env));
 
     let workspace_context = metadata_value(session, "workspace_path")
         .and_then(|workspace_path| {
@@ -118,14 +144,23 @@ fn build_system_prompt_response(
         })
         .or(workspace_from_prompt);
 
+    let instruction_context = metadata_value(session, "workspace_path")
+        .and_then(|workspace_path| {
+            crate::server::instruction_layer::build_instruction_prompt_context(&workspace_path)
+        })
+        .or(instruction_from_prompt);
+
     SessionSystemPromptResponse {
         session_id: session_id.to_string(),
         base_system_prompt,
         enhancement_prompt,
         workspace_context,
+        instruction_context,
         env_context,
         skill_context,
         tool_guide_context,
+        dream_notebook,
+        session_memory_note,
         external_memory,
         task_list,
         effective_system_prompt,
@@ -166,6 +201,66 @@ fn extract_wrapped_section(prompt: &str, start_marker: &str, end_marker: &str) -
     } else {
         Some(section.to_string())
     }
+}
+
+fn split_external_memory_components(
+    external_memory: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Some(external_memory) = external_memory
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (None, None);
+    };
+
+    let dream_notebook = extract_markdown_block_by_heading(
+        external_memory,
+        "### Cross-session Dream Notebook (read-only)",
+    );
+    let session_memory_note =
+        extract_markdown_block_by_heading(external_memory, "### Session Memory Note (markdown)")
+            .or_else(|| collect_session_memory_topics(external_memory));
+
+    (dream_notebook, session_memory_note)
+}
+
+fn extract_markdown_block_by_heading(content: &str, heading: &str) -> Option<String> {
+    let start_idx = content.find(heading)?;
+    let after_heading = &content[start_idx + heading.len()..];
+    let fence_start_rel = after_heading.find("````md")?;
+    let after_fence = &after_heading[fence_start_rel + "````md".len()..];
+    let fence_end_rel = after_fence.find("````")?;
+    let block = after_fence[..fence_end_rel].trim();
+    (!block.is_empty()).then(|| block.to_string())
+}
+
+fn collect_session_memory_topics(content: &str) -> Option<String> {
+    let mut collected = Vec::new();
+    let mut remaining = content;
+    let heading = "### Session Memory Topic: `";
+    while let Some(start_idx) = remaining.find(heading) {
+        let after_start = &remaining[start_idx..];
+        let Some(line_end) = after_start.find('\n') else {
+            break;
+        };
+        let title_line = after_start[..line_end].trim();
+        let rest = &after_start[line_end + 1..];
+        let Some(fence_start_rel) = rest.find("````md") else {
+            remaining = rest;
+            continue;
+        };
+        let after_fence = &rest[fence_start_rel + "````md".len()..];
+        let Some(fence_end_rel) = after_fence.find("````") else {
+            break;
+        };
+        let block = after_fence[..fence_end_rel].trim();
+        if !block.is_empty() {
+            collected.push(format!("{}\n\n{}", title_line, block));
+        }
+        remaining = &after_fence[fence_end_rel + "````".len()..];
+    }
+
+    (!collected.is_empty()).then(|| collected.join("\n\n---\n\n"))
 }
 
 fn strip_wrapped_sections(prompt: &str, start_marker: &str, end_marker: &str) -> String {
@@ -211,7 +306,12 @@ fn strip_generated_sections(prompt: &str) -> String {
         SKILL_CONTEXT_START_MARKER,
         SKILL_CONTEXT_END_MARKER,
     );
-    strip_wrapped_sections(&prompt, TOOL_GUIDE_START_MARKER, TOOL_GUIDE_END_MARKER)
+    let prompt = strip_wrapped_sections(&prompt, TOOL_GUIDE_START_MARKER, TOOL_GUIDE_END_MARKER);
+    strip_wrapped_sections(
+        &prompt,
+        INSTRUCTION_CONTEXT_START_MARKER,
+        INSTRUCTION_CONTEXT_END_MARKER,
+    )
 }
 
 fn split_workspace_context(prompt: &str) -> (String, Option<String>) {
@@ -231,10 +331,29 @@ fn split_workspace_context(prompt: &str) -> (String, Option<String>) {
     split_legacy_workspace_context(prompt)
 }
 
+fn split_instruction_context(prompt: &str) -> (String, Option<String>) {
+    let instruction_context = extract_wrapped_section(
+        prompt,
+        INSTRUCTION_CONTEXT_START_MARKER,
+        INSTRUCTION_CONTEXT_END_MARKER,
+    );
+    if instruction_context.is_some() {
+        let stripped = strip_wrapped_sections(
+            prompt,
+            INSTRUCTION_CONTEXT_START_MARKER,
+            INSTRUCTION_CONTEXT_END_MARKER,
+        );
+        return (stripped.trim().to_string(), instruction_context);
+    }
+    (prompt.trim().to_string(), None)
+}
+
 fn split_env_context(prompt: &str) -> (String, Option<String>) {
-    let env_context = extract_wrapped_section(prompt, ENV_CONTEXT_START_MARKER, ENV_CONTEXT_END_MARKER);
+    let env_context =
+        extract_wrapped_section(prompt, ENV_CONTEXT_START_MARKER, ENV_CONTEXT_END_MARKER);
     if env_context.is_some() {
-        let stripped = strip_wrapped_sections(prompt, ENV_CONTEXT_START_MARKER, ENV_CONTEXT_END_MARKER);
+        let stripped =
+            strip_wrapped_sections(prompt, ENV_CONTEXT_START_MARKER, ENV_CONTEXT_END_MARKER);
         return (stripped.trim().to_string(), env_context);
     }
     (prompt.trim().to_string(), None)
@@ -270,7 +389,7 @@ fn split_legacy_workspace_context(prompt: &str) -> (String, Option<String>) {
     (stripped, workspace_context)
 }
 
-fn derive_enhancement_prompt(
+fn derive_enhancement_prompt_legacy(
     base_system_prompt: &str,
     prompt_without_workspace: &str,
 ) -> Option<String> {
@@ -314,7 +433,14 @@ mod tests {
 
     #[test]
     fn snapshot_extracts_generated_sections_workspace_and_env_context() {
+        let _lock = crate::test_support::env_cache_lock_acquire();
         publish_test_env_context();
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        std::fs::write(root.path().join("AGENTS.md"), "Snapshot instruction policy")
+            .expect("agents file");
 
         let mut session = Session::new("session-1", "gpt-5");
         session
@@ -323,17 +449,24 @@ mod tests {
         session
             .metadata
             .insert("enhance_prompt".to_string(), "Extra guidance".to_string());
-        session
-            .metadata
-            .insert("workspace_path".to_string(), "/tmp/workspace".to_string());
+        session.metadata.insert(
+            "workspace_path".to_string(),
+            workspace.to_string_lossy().to_string(),
+        );
 
-        let workspace_context =
-            crate::server::app_state::build_workspace_prompt_context("/tmp/workspace")
-                .expect("workspace context");
+        let workspace_context = crate::server::app_state::build_workspace_prompt_context(
+            workspace.to_string_lossy().as_ref(),
+        )
+        .expect("workspace context");
+        let instruction_context =
+            crate::server::instruction_layer::build_instruction_prompt_context(
+                workspace.to_string_lossy().as_ref(),
+            )
+            .expect("instruction context");
         let env_context = crate::server::app_state::build_env_prompt_context()
             .expect("env context should exist for snapshot test");
         session.add_message(Message::system(format!(
-            "Base prompt\n\nExtra guidance\n\n{workspace_context}\n\n{env_context}\n\n<!-- BAMBOO_SKILL_CONTEXT_START -->\n## Skill System\n\nSkill details\n<!-- BAMBOO_SKILL_CONTEXT_END -->\n\n<!-- BAMBOO_TOOL_GUIDE_START -->\n## Tool Usage Guidelines\n\nGuide details\n<!-- BAMBOO_TOOL_GUIDE_END -->\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\nMemory details\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->\n\n<!-- BAMBOO_TASK_LIST_START -->\n## Current Task List:\n- [ ] item\n<!-- BAMBOO_TASK_LIST_END -->"
+            "Base prompt\n\nExtra guidance\n\n{workspace_context}\n\n{instruction_context}\n\n{env_context}\n\n<!-- BAMBOO_SKILL_CONTEXT_START -->\n## Skill System\n\nSkill details\n<!-- BAMBOO_SKILL_CONTEXT_END -->\n\n<!-- BAMBOO_TOOL_GUIDE_START -->\n## Tool Usage Guidelines\n\nGuide details\n<!-- BAMBOO_TOOL_GUIDE_END -->\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\nMemory details\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->\n\n<!-- BAMBOO_TASK_LIST_START -->\n## Current Task List:\n- [ ] item\n<!-- BAMBOO_TASK_LIST_END -->"
         )));
 
         let snapshot = build_system_prompt_response("session-1", &session);
@@ -345,11 +478,17 @@ mod tests {
         assert!(snapshot
             .workspace_context
             .as_deref()
-            .is_some_and(|value| value.contains("/tmp/workspace")));
+            .is_some_and(|value| value.contains(workspace.to_string_lossy().as_ref())));
+        assert!(snapshot
+            .instruction_context
+            .as_deref()
+            .is_some_and(|value| value.contains("Snapshot instruction policy")));
         assert!(snapshot
             .env_context
             .as_deref()
-            .is_some_and(|value| value.contains("environment variables were explicitly configured by the user inside Bodhi")));
+            .is_some_and(|value| value.contains(
+                "environment variables were explicitly configured by the user inside Bodhi"
+            )));
         assert!(snapshot
             .env_context
             .as_deref()
@@ -370,6 +509,68 @@ mod tests {
             .task_list
             .as_deref()
             .is_some_and(|value| value.contains("Current Task List")));
+    }
+
+    #[test]
+    fn snapshot_extracts_dream_notebook_and_session_memory_note_from_external_memory() {
+        let mut session = Session::new("session-memory-split", "gpt-5");
+        session.add_message(Message::system(
+            "Base prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\n### Cross-session Dream Notebook (read-only)\n````md\nDream note content\n````\n\n### Session Memory Note (markdown)\n````md\nSession note content\n````\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->",
+        ));
+
+        let snapshot = build_system_prompt_response("session-memory-split", &session);
+        assert_eq!(
+            snapshot.dream_notebook.as_deref(),
+            Some("Dream note content")
+        );
+        assert_eq!(
+            snapshot.session_memory_note.as_deref(),
+            Some("Session note content")
+        );
+        assert!(snapshot
+            .external_memory
+            .as_deref()
+            .is_some_and(|value| value.contains("Dream note content")));
+    }
+
+    #[test]
+    fn snapshot_extracts_multi_topic_session_memory_note_from_external_memory() {
+        let mut session = Session::new("session-memory-topics", "gpt-5");
+        session.add_message(Message::system(
+            "Base prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\n### Cross-session Dream Notebook (read-only)\n````md\nDream note content\n````\n\n### Session Memory Topic: `backend-api`\n````md\n/users and /orders finalized\n````\n\n### Session Memory Topic: `ui-copy`\n````md\nCTA wording approved\n````\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->",
+        ));
+
+        let snapshot = build_system_prompt_response("session-memory-topics", &session);
+        assert_eq!(
+            snapshot.dream_notebook.as_deref(),
+            Some("Dream note content")
+        );
+        let merged = snapshot
+            .session_memory_note
+            .as_deref()
+            .expect("session memory note should be merged from topic blocks");
+        assert!(merged.contains("### Session Memory Topic: `backend-api`"));
+        assert!(merged.contains("/users and /orders finalized"));
+        assert!(merged.contains("### Session Memory Topic: `ui-copy`"));
+        assert!(merged.contains("CTA wording approved"));
+    }
+
+    #[test]
+    fn snapshot_preserves_truncated_topic_placeholder_in_multi_topic_memory_note() {
+        let mut session = Session::new("session-memory-truncated-topic", "gpt-5");
+        session.add_message(Message::system(
+            "Base prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\n### Session Memory Topic: `backend-api`\n````md\n_(truncated — use action=read topic=backend-api to view)_\n````\n\n### Session Memory Topic: `ui-copy`\n````md\nCTA wording approved\n````\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->",
+        ));
+
+        let snapshot = build_system_prompt_response("session-memory-truncated-topic", &session);
+        let merged = snapshot
+            .session_memory_note
+            .as_deref()
+            .expect("session memory note should be merged from topic blocks");
+        assert!(merged.contains("### Session Memory Topic: `backend-api`"));
+        assert!(merged.contains("_(truncated — use action=read topic=backend-api to view)_"));
+        assert!(merged.contains("### Session Memory Topic: `ui-copy`"));
+        assert!(merged.contains("CTA wording approved"));
     }
 
     #[test]
@@ -398,6 +599,42 @@ mod tests {
         assert_eq!(snapshot.base_system_prompt, expected);
         assert_eq!(snapshot.effective_system_prompt, expected);
         assert!(snapshot.enhancement_prompt.is_none());
+    }
+
+    #[test]
+    fn snapshot_prefers_shared_prompt_snapshot_metadata_when_present() {
+        let mut session = Session::new("session-shared", "gpt-5");
+        session.add_message(Message::system("legacy system prompt"));
+        session.metadata.insert(
+            "runtime_prompt_snapshot".to_string(),
+            serde_json::to_string(&crate::agent::loop_module::runner::PromptSnapshot {
+                base_system_prompt: "Shared base".to_string(),
+                enhancement_prompt: Some("Shared enhancement".to_string()),
+                workspace_context: Some("Shared workspace".to_string()),
+                instruction_context: Some("Shared instruction".to_string()),
+                env_context: Some("Shared env".to_string()),
+                skill_context: Some("Shared skill".to_string()),
+                tool_guide_context: Some("Shared tool guide".to_string()),
+                dream_notebook: Some("Dream block".to_string()),
+                session_memory_note: Some("Session note block".to_string()),
+                external_memory: Some("Shared memory".to_string()),
+                task_list: Some("Shared task list".to_string()),
+                effective_system_prompt: "Shared effective prompt".to_string(),
+            })
+            .expect("snapshot should serialize"),
+        );
+
+        let snapshot = build_system_prompt_response("session-shared", &session);
+        assert_eq!(snapshot.base_system_prompt, "Shared base");
+        assert_eq!(
+            snapshot.enhancement_prompt.as_deref(),
+            Some("Shared enhancement")
+        );
+        assert_eq!(
+            snapshot.workspace_context.as_deref(),
+            Some("Shared workspace")
+        );
+        assert_eq!(snapshot.effective_system_prompt, "Shared effective prompt");
     }
 
     #[test]

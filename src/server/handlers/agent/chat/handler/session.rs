@@ -85,6 +85,7 @@ pub(super) fn resolve_base_prompt(
 pub(super) fn resolve_workspace_path(
     session: &mut Session,
     workspace_path_from_request: Option<&str>,
+    config_data_dir: Option<&std::path::Path>,
 ) -> Option<String> {
     if let Some(path) = workspace_path_from_request {
         session
@@ -95,6 +96,24 @@ pub(super) fn resolve_workspace_path(
     workspace_path_from_request
         .map(ToString::to_string)
         .or_else(|| session.metadata.get("workspace_path").cloned())
+        .or_else(|| {
+            crate::core::Config::from_data_dir(config_data_dir.map(|path| path.to_path_buf()))
+                .get_default_work_area_path()
+                .map(|path| crate::core::paths::path_to_display_string(&path))
+        })
+}
+
+pub(super) fn sync_runtime_workspace(session_id: &str, workspace_path: Option<&str>) {
+    let preferred = workspace_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)))
+        .filter(|path| path.is_dir());
+
+    let _ = crate::agent::tools::tools::workspace_state::ensure_session_workspace(
+        session_id, preferred,
+    );
 }
 
 pub(super) fn resolve_enhance_prompt(

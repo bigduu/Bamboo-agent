@@ -138,4 +138,13 @@ fn apply_workspace_path_to_session_updates_metadata_and_prompt() {
     assert!(system_content.contains("Workspace path: /tmp/workspace"));
     assert!(system_content.contains(crate::server::app_state::WORKSPACE_CONTEXT_START_MARKER));
     assert!(system_content.contains(crate::server::app_state::WORKSPACE_CONTEXT_END_MARKER));
+    let snapshot = crate::agent::loop_module::runner::read_prompt_snapshot(&session)
+        .expect("prompt snapshot should exist after workspace update");
+    assert!(snapshot
+        .workspace_context
+        .as_deref()
+        .is_some_and(|value| value.contains("/tmp/workspace")));
+    assert!(snapshot
+        .effective_system_prompt
+        .contains("Workspace path: /tmp/workspace"));
 }

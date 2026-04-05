@@ -52,6 +52,7 @@ pub mod agent;
 pub mod budget;
 pub mod composition;
 pub mod memory;
+pub mod memory_store;
 /// Persistent storage backends
 pub mod storage;
 pub mod todo;
@@ -59,8 +60,8 @@ pub mod tools;
 
 pub use agent::events::{AgentEvent, TokenBudgetUsage, TokenUsage};
 pub use agent::types::{
-    ConversationSummary, ImageOcrLine, ImageOcrResult, Message, MessageContent, MessagePhase, Role,
-    Session, SessionKind,
+    ConversationSummary, ImageOcrLine, ImageOcrResult, Message, MessageContent, MessagePhase,
+    PromptSnapshot, Role, Session, SessionKind,
 };
 pub use agent::AgentError;
 pub use budget::limits::create_budget_for_model;

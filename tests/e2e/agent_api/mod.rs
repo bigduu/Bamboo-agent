@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 mod integration;
 mod projects;
+mod schedules;
 mod sessions;
 mod settings;
 mod system_prompt;

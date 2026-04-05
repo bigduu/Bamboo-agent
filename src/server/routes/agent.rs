@@ -124,6 +124,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 "/schedules/{schedule_id}/sessions",
                 web::get().to(agent::schedules::list_sessions_for_schedule),
             )
+            .route(
+                "/schedules/{schedule_id}/runs",
+                web::get().to(agent::schedules::list_runs_for_schedule),
+            )
             // New separated execute + events endpoints
             .route(
                 "/execute/{session_id}",
@@ -170,6 +174,18 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 web::get().to(agent::metrics::session_detail),
             )
             .route("/metrics/daily", web::get().to(agent::metrics::daily))
+            .route(
+                "/metrics/usage-breakdown",
+                web::get().to(agent::metrics::usage_breakdown),
+            )
+            .route(
+                "/metrics/memory/summary",
+                web::get().to(agent::metrics::memory_summary),
+            )
+            .route(
+                "/metrics/memory/timeline",
+                web::get().to(agent::metrics::memory_timeline),
+            )
             // Forward metrics routes (API proxy metrics)
             .route(
                 "/metrics/forward/summary",
@@ -182,6 +198,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             .route(
                 "/metrics/forward/requests",
                 web::get().to(agent::metrics::forward_requests),
+            )
+            .route(
+                "/metrics/v2/summary",
+                web::get().to(agent::metrics::v2_unified_summary),
+            )
+            .route(
+                "/metrics/v2/timeline",
+                web::get().to(agent::metrics::v2_unified_timeline),
             )
             // MCP routes
             .service(mcp_scope()),

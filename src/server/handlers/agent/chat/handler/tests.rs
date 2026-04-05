@@ -4,7 +4,7 @@ use super::request::{optional_non_empty, resolve_session_id, validate_and_normal
 use super::session::{
     clear_skill_runtime_state, resolve_base_prompt,
     resolve_copilot_conclusion_with_options_enhancement_enabled, resolve_enhance_prompt,
-    resolve_selected_skill_ids, resolve_workspace_path,
+    resolve_selected_skill_ids, resolve_workspace_path, sync_runtime_workspace,
 };
 
 #[test]
@@ -91,15 +91,57 @@ fn resolve_base_prompt_uses_global_default_when_missing_everywhere() {
 fn resolve_workspace_path_uses_request_then_metadata() {
     let mut session = Session::new("session-1", "model");
 
-    let from_request = resolve_workspace_path(&mut session, Some("/tmp/workspace"));
+    let from_request = resolve_workspace_path(&mut session, Some("/tmp/workspace"), None);
     assert_eq!(from_request.as_deref(), Some("/tmp/workspace"));
     assert_eq!(
         session.metadata.get("workspace_path").map(String::as_str),
         Some("/tmp/workspace")
     );
 
-    let from_metadata = resolve_workspace_path(&mut session, None);
+    let from_metadata = resolve_workspace_path(&mut session, None, None);
     assert_eq!(from_metadata.as_deref(), Some("/tmp/workspace"));
+}
+
+#[test]
+fn resolve_workspace_path_falls_back_to_default_work_area_config() {
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let workspace = temp_dir.path().join("default-workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace should exist");
+    let original = std::env::var_os("BAMBOO_DATA_DIR");
+    std::env::set_var("BAMBOO_DATA_DIR", temp_dir.path());
+    std::fs::write(
+        temp_dir.path().join("config.json"),
+        serde_json::json!({
+            "default_work_area": { "path": workspace.to_string_lossy() }
+        })
+        .to_string(),
+    )
+    .expect("config should be written");
+
+    let mut session = Session::new("session-1", "model");
+    let resolved = resolve_workspace_path(&mut session, None, Some(temp_dir.path()));
+    let expected = crate::core::paths::path_to_display_string(&workspace);
+    assert_eq!(resolved.as_deref(), Some(expected.as_str()));
+
+    if let Some(value) = original {
+        std::env::set_var("BAMBOO_DATA_DIR", value);
+    } else {
+        std::env::remove_var("BAMBOO_DATA_DIR");
+    }
+}
+
+#[test]
+fn sync_runtime_workspace_persists_workspace_for_tools() {
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let workspace = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace should exist");
+    let session_id = "session-runtime-workspace";
+
+    sync_runtime_workspace(session_id, Some(workspace.to_string_lossy().as_ref()));
+
+    let resolved = crate::agent::tools::tools::workspace_state::get_workspace(session_id)
+        .expect("workspace should be stored");
+    assert_eq!(resolved, workspace.canonicalize().unwrap_or(workspace));
 }
 
 #[test]

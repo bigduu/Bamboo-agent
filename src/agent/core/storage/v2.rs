@@ -18,11 +18,10 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::agent::core::agent::{AgentEvent, Session, SessionKind};
+use crate::agent::core::agent::{Session, SessionKind};
 use crate::core::ReasoningEffort;
 
 use super::search_index::{should_index_session, SessionSearchIndex};
@@ -62,6 +61,9 @@ pub struct SessionIndexEntry {
     /// If the session was created by a schedule, store the schedule id here for fast filtering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_schedule_id: Option<String>,
+    /// If the session was created by a specific schedule run, keep the run id here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_run_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_activity_at: DateTime<Utc>,
@@ -273,14 +275,6 @@ impl SessionStoreV2 {
         }
     }
 
-    async fn events_jsonl_path(&self, session_id: &str) -> io::Result<Option<PathBuf>> {
-        if let Some(rel) = self.resolve_rel_path(session_id).await {
-            Ok(Some(self.abs_path_from_rel(&rel).join("events.jsonl")))
-        } else {
-            Ok(None)
-        }
-    }
-
     async fn attachments_dir(&self, session_id: &str) -> io::Result<Option<PathBuf>> {
         if let Some(rel) = self.resolve_rel_path(session_id).await {
             Ok(Some(self.abs_path_from_rel(&rel).join("attachments")))
@@ -320,6 +314,11 @@ impl SessionStoreV2 {
             .get("created_by_schedule_id")
             .cloned()
             .filter(|v| !v.trim().is_empty());
+        let schedule_run_id = session
+            .metadata
+            .get("schedule_run_id")
+            .cloned()
+            .filter(|v| !v.trim().is_empty());
         self.update_index(|index| {
             index.sessions.insert(
                 session.id.clone(),
@@ -335,6 +334,7 @@ impl SessionStoreV2 {
                     model: session.model.clone(),
                     reasoning_effort: session.reasoning_effort,
                     created_by_schedule_id,
+                    schedule_run_id,
                     created_at: session.created_at,
                     updated_at: session.updated_at,
                     last_activity_at: session.updated_at,
@@ -764,44 +764,6 @@ impl Storage for SessionStoreV2 {
         Ok(Some(session))
     }
 
-    async fn append_event(&self, session_id: &str, event: &AgentEvent) -> io::Result<()> {
-        validate_session_id(session_id)?;
-        let Some(path) = self.events_jsonl_path(session_id).await? else {
-            // No index entry -> ignore. This path is best-effort debugging.
-            return Ok(());
-        };
-        let json = serde_json::to_string(event).map_err(|e| other_io_error(e.to_string()))?;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
-        file.write_all(json.as_bytes()).await?;
-        file.write_all(b"\n").await?;
-        file.flush().await
-    }
-
-    async fn load_events(&self, session_id: &str) -> io::Result<Vec<AgentEvent>> {
-        validate_session_id(session_id)?;
-        let Some(path) = self.events_jsonl_path(session_id).await? else {
-            return Ok(Vec::new());
-        };
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let file = fs::File::open(path).await?;
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-        let mut events = Vec::new();
-
-        while let Some(line) = lines.next_line().await? {
-            if let Ok(event) = serde_json::from_str(&line) {
-                events.push(event);
-            }
-        }
-        Ok(events)
-    }
-
     async fn delete_session(&self, session_id: &str) -> io::Result<bool> {
         // Historical API deletes sessions. In V2, treat this as recursive and forced.
         self.delete_session_recursive(session_id, true).await
@@ -879,37 +841,6 @@ mod tests {
         let (storage, _temp_dir) = create_temp_storage().await?;
         let loaded = storage.load_session("nonexistent").await?;
         assert!(loaded.is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_append_and_load_events() -> io::Result<()> {
-        let (storage, _temp_dir) = create_temp_storage().await?;
-        let session = Session::new("session-1", "test-model");
-
-        storage.save_session(&session).await?;
-
-        let event1 = AgentEvent::Token {
-            content: "hello".to_string(),
-        };
-        let event2 = AgentEvent::Error {
-            message: "test error".to_string(),
-        };
-
-        storage.append_event(&session.id, &event1).await?;
-        storage.append_event(&session.id, &event2).await?;
-
-        let events = storage.load_events(&session.id).await?;
-        assert_eq!(events.len(), 2);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_load_events_returns_empty_when_not_found() -> io::Result<()> {
-        let (storage, _temp_dir) = create_temp_storage().await?;
-        let events = storage.load_events("nonexistent").await?;
-        assert!(events.is_empty());
         Ok(())
     }
 

@@ -41,7 +41,7 @@ async fn test_app_state_creation() {
 }
 
 #[tokio::test]
-async fn root_tools_include_server_overlays_and_memory_note() {
+async fn root_tools_include_server_overlays_and_session_note() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
@@ -57,9 +57,10 @@ async fn root_tools_include_server_overlays_and_memory_note() {
     assert!(names.contains("scheduler"));
     assert!(names.contains("sub_session_manager"));
     assert!(names.contains("recall"));
+    assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
-    assert!(names.contains("memory_note"));
+    assert!(names.contains("session_note"));
 }
 
 #[tokio::test]
@@ -112,9 +113,10 @@ async fn child_tools_exclude_scheduler_and_recall() {
     assert!(!names.contains("scheduler"));
     assert!(!names.contains("sub_session_manager"));
     assert!(!names.contains("recall"));
+    assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
-    assert!(names.contains("memory_note"));
+    assert!(names.contains("session_note"));
 }
 
 #[tokio::test]
@@ -142,6 +144,18 @@ async fn overlay_tools_require_session_context() {
         Err(ToolError::Execution(msg)) if msg.contains("session_id")
     ));
 
+    let memory_result = state
+        .tools
+        .execute(&make_tool_call(
+            "memory",
+            json!({ "action": "inspect", "scope": "global" }),
+        ))
+        .await;
+    assert!(matches!(
+        memory_result,
+        Err(ToolError::Execution(msg)) if msg.contains("session_id")
+    ));
+
     let sub_session_manager_result = state
         .tools
         .execute(&make_tool_call(
@@ -153,6 +167,497 @@ async fn overlay_tools_require_session_context() {
         sub_session_manager_result,
         Err(ToolError::Execution(msg)) if msg.contains("session_id")
     ));
+}
+
+#[tokio::test]
+async fn memory_tool_merge_action_updates_existing_project_memory() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    crate::core::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+
+    crate::agent::tools::tools::workspace_state::ensure_session_workspace(
+        "session-merge",
+        Some(temp_dir.path().to_path_buf()),
+    );
+
+    let write_target = make_tool_call(
+        "memory",
+        json!({
+            "action": "write",
+            "scope": "project",
+            "type": "project",
+            "title": "Release freeze begins next week",
+            "content": "Merge freeze begins on Tuesday.",
+            "tags": ["release"]
+        }),
+    );
+    let target_result = state
+        .tools
+        .execute_with_context(
+            &write_target,
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-merge"),
+                tool_call_id: "tool-call-write-target",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("write target should succeed");
+    let target_json: serde_json::Value = serde_json::from_str(&target_result.result).unwrap();
+    let target_id = target_json["memory"]["id"].as_str().unwrap().to_string();
+
+    let write_source = make_tool_call(
+        "memory",
+        json!({
+            "action": "write",
+            "scope": "project",
+            "type": "project",
+            "title": "Mobile release note",
+            "content": "Stakeholders confirmed freeze applies to mobile release cut.",
+            "tags": ["mobile"]
+        }),
+    );
+    let source_result = state
+        .tools
+        .execute_with_context(
+            &write_source,
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-merge"),
+                tool_call_id: "tool-call-write-source",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("write source should succeed");
+    let source_json: serde_json::Value = serde_json::from_str(&source_result.result).unwrap();
+    let source_id = source_json["memory"]["id"].as_str().unwrap().to_string();
+
+    let merge_call = make_tool_call(
+        "memory",
+        json!({
+            "action": "merge",
+            "id": target_id,
+            "content": "Additional confirmation from a later session.",
+            "tags": ["confirmed"],
+            "source_memory_ids": [source_id]
+        }),
+    );
+    let merge_result = state
+        .tools
+        .execute_with_context(
+            &merge_call,
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-merge"),
+                tool_call_id: "tool-call-merge",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("merge should succeed");
+    let merge_json: serde_json::Value = serde_json::from_str(&merge_result.result).unwrap();
+    assert_eq!(merge_json["action"], "merge");
+    assert_eq!(merge_json["data"]["appended"], true);
+    assert_eq!(
+        merge_json["data"]["superseded_ids"][0],
+        source_json["memory"]["id"]
+    );
+}
+
+#[tokio::test]
+async fn memory_tool_write_merges_heuristically_similar_memory_when_enabled() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    crate::core::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+
+    crate::agent::tools::tools::workspace_state::ensure_session_workspace(
+        "session-heuristic-merge",
+        Some(temp_dir.path().to_path_buf()),
+    );
+
+    let original = state
+        .tools
+        .execute_with_context(
+            &make_tool_call(
+                "memory",
+                json!({
+                    "action": "write",
+                    "scope": "project",
+                    "type": "project",
+                    "title": "Release freeze begins next week",
+                    "content": "Merge freeze begins on Tuesday for mobile release cut.",
+                    "tags": ["release", "freeze"],
+                    "options": { "allow_merge_if_similar": false }
+                }),
+            ),
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-heuristic-merge"),
+                tool_call_id: "tool-call-write-heuristic-original",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("original write should succeed");
+    let original_json: serde_json::Value = serde_json::from_str(&original.result).unwrap();
+    let original_id = original_json["memory"]["id"].as_str().unwrap().to_string();
+
+    let merged = state
+        .tools
+        .execute_with_context(
+            &make_tool_call(
+                "memory",
+                json!({
+                    "action": "write",
+                    "scope": "project",
+                    "type": "project",
+                    "title": "Mobile release freeze starts Tuesday",
+                    "content": "Stakeholders confirmed the mobile release freeze starts Tuesday.",
+                    "tags": ["mobile", "release"],
+                    "options": { "allow_merge_if_similar": true }
+                }),
+            ),
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-heuristic-merge"),
+                tool_call_id: "tool-call-write-heuristic-merge",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("heuristic merge write should succeed");
+    let merged_json: serde_json::Value = serde_json::from_str(&merged.result).unwrap();
+    let merged_id = merged_json["memory"]["id"].as_str().unwrap().to_string();
+    assert_eq!(merged_id, original_id);
+
+    let inspect = state
+        .tools
+        .execute_with_context(
+            &make_tool_call(
+                "memory",
+                json!({
+                    "action": "inspect",
+                    "scope": "project"
+                }),
+            ),
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-heuristic-merge"),
+                tool_call_id: "tool-call-inspect-heuristic-merge",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("inspect should succeed");
+    let inspect_json: serde_json::Value = serde_json::from_str(&inspect.result).unwrap();
+    assert_eq!(inspect_json["data"]["total_memories"], 1);
+}
+
+#[tokio::test]
+async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    crate::core::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+
+    crate::agent::tools::tools::workspace_state::ensure_session_workspace(
+        "session-contradict",
+        Some(temp_dir.path().to_path_buf()),
+    );
+
+    let target = state
+        .tools
+        .execute_with_context(
+            &make_tool_call(
+                "memory",
+                json!({
+                    "action": "write",
+                    "scope": "project",
+                    "type": "project",
+                    "title": "Release freeze begins next week",
+                    "content": "Freeze begins on Tuesday."
+                }),
+            ),
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-contradict"),
+                tool_call_id: "tool-call-write-contradict-target",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("write target should succeed");
+    let target_json: serde_json::Value = serde_json::from_str(&target.result).unwrap();
+    let target_id = target_json["memory"]["id"].as_str().unwrap().to_string();
+
+    let source = state
+        .tools
+        .execute_with_context(
+            &make_tool_call(
+                "memory",
+                json!({
+                    "action": "write",
+                    "scope": "project",
+                    "type": "project",
+                    "title": "Updated release note",
+                    "content": "Freeze is postponed."
+                }),
+            ),
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-contradict"),
+                tool_call_id: "tool-call-write-contradict-source",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("write source should succeed");
+    let source_json: serde_json::Value = serde_json::from_str(&source.result).unwrap();
+    let source_id = source_json["memory"]["id"].as_str().unwrap().to_string();
+
+    let contradict_result = state
+        .tools
+        .execute_with_context(
+            &make_tool_call(
+                "memory",
+                json!({
+                    "action": "merge",
+                    "mode": "contradict",
+                    "id": target_id,
+                    "content": "newer info conflicts",
+                    "reason": "newer release update conflicts",
+                    "source_memory_ids": [source_id]
+                }),
+            ),
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-contradict"),
+                tool_call_id: "tool-call-contradict",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("contradict should succeed");
+    let contradict_json: serde_json::Value =
+        serde_json::from_str(&contradict_result.result).unwrap();
+    assert_eq!(contradict_json["action"], "merge");
+    assert_eq!(contradict_json["mode"], "contradict");
+    assert_eq!(contradict_json["data"]["changed"], true);
+    assert_eq!(
+        contradict_json["data"]["contradicted_ids"][0],
+        source_json["memory"]["id"]
+    );
+}
+
+#[tokio::test]
+async fn memory_tool_batch_purge_archives_filtered_items() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    crate::core::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+
+    crate::agent::tools::tools::workspace_state::ensure_session_workspace(
+        "session-batch-purge",
+        Some(temp_dir.path().to_path_buf()),
+    );
+
+    let stale_write = state
+        .tools
+        .execute_with_context(
+            &make_tool_call(
+                "memory",
+                json!({
+                    "action": "write",
+                    "scope": "project",
+                    "type": "reference",
+                    "title": "Old dashboard link",
+                    "content": "Legacy dashboard."
+                }),
+            ),
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-batch-purge"),
+                tool_call_id: "tool-call-write-stale",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("write stale memory should succeed");
+    let stale_json: serde_json::Value = serde_json::from_str(&stale_write.result).unwrap();
+    let stale_id = stale_json["memory"]["id"].as_str().unwrap().to_string();
+
+    state
+        .tools
+        .execute_with_context(
+            &make_tool_call(
+                "memory",
+                json!({
+                    "action": "purge",
+                    "id": stale_id,
+                    "mode": "stale",
+                    "reason": "mark stale first"
+                }),
+            ),
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-batch-purge"),
+                tool_call_id: "tool-call-mark-stale",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("mark stale should succeed");
+
+    state
+        .tools
+        .execute_with_context(
+            &make_tool_call(
+                "memory",
+                json!({
+                    "action": "write",
+                    "scope": "project",
+                    "type": "reference",
+                    "title": "Current dashboard link",
+                    "content": "Current dashboard."
+                }),
+            ),
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-batch-purge"),
+                tool_call_id: "tool-call-write-active",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("write active memory should succeed");
+
+    let batch_result = state
+        .tools
+        .execute_with_context(
+            &make_tool_call(
+                "memory",
+                json!({
+                    "action": "purge",
+                    "scope": "project",
+                    "mode": "archived",
+                    "reason": "archive stale references",
+                    "filters": {
+                        "type": ["reference"],
+                        "status": ["stale"]
+                    }
+                }),
+            ),
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-batch-purge"),
+                tool_call_id: "tool-call-batch-purge",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("batch purge should succeed");
+    let batch_json: serde_json::Value = serde_json::from_str(&batch_result.result).unwrap();
+    assert_eq!(batch_json["action"], "purge");
+    assert_eq!(batch_json["data"]["matched_count"], 1);
+}
+
+#[tokio::test]
+async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    crate::core::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+
+    crate::agent::tools::tools::workspace_state::ensure_session_workspace(
+        "session-inspect",
+        Some(temp_dir.path().to_path_buf()),
+    );
+
+    state
+        .tools
+        .execute_with_context(
+            &make_tool_call(
+                "memory",
+                json!({
+                    "action": "write",
+                    "scope": "project",
+                    "type": "reference",
+                    "title": "Old dashboard link",
+                    "content": "Legacy dashboard."
+                }),
+            ),
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-inspect"),
+                tool_call_id: "tool-call-write-inspect",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("write memory should succeed");
+
+    let inspect_result = state
+        .tools
+        .execute_with_context(
+            &make_tool_call(
+                "memory",
+                json!({
+                    "action": "inspect",
+                    "scope": "project"
+                }),
+            ),
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-inspect"),
+                tool_call_id: "tool-call-inspect",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("inspect should succeed");
+    let inspect_json: serde_json::Value = serde_json::from_str(&inspect_result.result).unwrap();
+    assert_eq!(inspect_json["action"], "inspect");
+    assert!(inspect_json["data"]["index_files"].is_array());
+    assert!(inspect_json["data"]["state_files"].is_array());
+    assert!(inspect_json["data"]["stale_candidate_count"].is_number());
+    assert!(inspect_json["data"]["last_reindex_at"].is_string());
+    assert!(inspect_json["data"]["last_dream_at"].is_string());
+
+    let rebuild_result = state
+        .tools
+        .execute_with_context(
+            &make_tool_call(
+                "memory",
+                json!({
+                    "action": "rebuild",
+                    "scope": "project"
+                }),
+            ),
+            crate::agent::core::tools::ToolExecutionContext {
+                session_id: Some("session-inspect"),
+                tool_call_id: "tool-call-rebuild",
+                event_tx: None,
+                available_tool_schemas: None,
+            },
+        )
+        .await
+        .expect("rebuild should succeed");
+    let rebuild_json: serde_json::Value = serde_json::from_str(&rebuild_result.result).unwrap();
+    assert_eq!(rebuild_json["action"], "rebuild");
+    assert!(rebuild_json["data"]["index_files"].is_array());
+    assert!(rebuild_json["data"]["state_files"].is_array());
+    assert!(rebuild_json["data"]["stale_candidate_count"].is_number());
+    assert!(rebuild_json["data"]["last_reindex_at"].is_string());
+    assert!(rebuild_json["data"]["last_dream_at"].is_string());
 }
 
 #[tokio::test]

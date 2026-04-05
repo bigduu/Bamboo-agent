@@ -30,6 +30,12 @@ fn canonical_tool_name_or_error_rejects_removed_compress_context() {
 }
 
 #[test]
+fn canonical_tool_name_or_error_accepts_memory_server_tool() {
+    let canonical = canonical_tool_name_or_error("memory").expect("memory should resolve");
+    assert_eq!(canonical, "memory");
+}
+
+#[test]
 fn parse_arguments_parses_json_and_plain_strings() {
     let args = parse_arguments(vec![
         ToolParameter {

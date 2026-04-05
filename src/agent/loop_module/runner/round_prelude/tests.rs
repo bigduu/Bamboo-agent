@@ -114,6 +114,80 @@ async fn prepare_round_refreshes_prompt_metadata_for_round_sections() {
 }
 
 #[tokio::test]
+async fn prepare_round_preserves_shared_prompt_snapshot_static_fields() {
+    let mut session = Session::new("session-round-snapshot", "test-model");
+    session.add_message(Message::system("Base prompt"));
+    session
+        .metadata
+        .insert("base_system_prompt".to_string(), "Base prompt".to_string());
+    session
+        .metadata
+        .insert("enhance_prompt".to_string(), "Extra guidance".to_string());
+    session.metadata.insert(
+        "workspace_path".to_string(),
+        "/tmp/session-round-snapshot".to_string(),
+    );
+    super::super::session_setup::prompt_setup::persist_prompt_snapshot_metadata(
+        &mut session,
+        crate::agent::core::PromptSnapshot {
+            base_system_prompt: "Base prompt".to_string(),
+            enhancement_prompt: Some("Extra guidance".to_string()),
+            workspace_context: Some("Workspace path: /tmp/session-round-snapshot".to_string()),
+            instruction_context: Some("Instruction block".to_string()),
+            env_context: Some("Env block".to_string()),
+            skill_context: Some("Skill block".to_string()),
+            tool_guide_context: Some("Tool guide block".to_string()),
+            dream_notebook: Some("Dream block".to_string()),
+            session_memory_note: Some("Session note block".to_string()),
+            external_memory: None,
+            task_list: None,
+            effective_system_prompt: "Base prompt".to_string(),
+        },
+    );
+    session.set_task_list(sample_task_list(
+        "session-round-snapshot",
+        TaskItemStatus::InProgress,
+    ));
+    let mut task_context = TaskLoopContext::from_session(&session);
+    let config = AgentLoopConfig::default();
+    let tools = BuiltinToolExecutor::new();
+
+    let _round_id = prepare_round(
+        &mut session,
+        &mut task_context,
+        0,
+        5,
+        &CancellationToken::new(),
+        None,
+        "session-round-snapshot",
+        "test-model",
+        false,
+        &config,
+        &tools,
+    )
+    .await
+    .expect("round should prepare");
+
+    let snapshot =
+        super::super::session_setup::prompt_setup::read_prompt_snapshot_metadata(&session)
+            .expect("prompt snapshot should exist after round refresh");
+    assert_eq!(snapshot.base_system_prompt, "Base prompt");
+    assert_eq!(
+        snapshot.enhancement_prompt.as_deref(),
+        Some("Extra guidance")
+    );
+    assert_eq!(snapshot.skill_context.as_deref(), Some("Skill block"));
+    assert!(snapshot
+        .task_list
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Current Task List"));
+    assert!(snapshot
+        .effective_system_prompt
+        .contains("Current Task List"));
+}
+
+#[tokio::test]
 async fn prepare_round_returns_cancelled_error_when_token_cancelled() {
     let mut session = Session::new("session-cancelled", "test-model");
     let mut task_context = None;

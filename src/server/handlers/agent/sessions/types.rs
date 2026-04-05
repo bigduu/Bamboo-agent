@@ -17,6 +17,8 @@ pub struct SessionSummary {
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_schedule_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_run_id: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub last_activity_at: chrono::DateTime<chrono::Utc>,
@@ -44,6 +46,7 @@ impl SessionSummary {
             model: entry.model,
             reasoning_effort: entry.reasoning_effort,
             created_by_schedule_id: entry.created_by_schedule_id,
+            schedule_run_id: entry.schedule_run_id,
             created_at: entry.created_at,
             updated_at: entry.updated_at,
             last_activity_at: entry.last_activity_at,
@@ -93,11 +96,17 @@ pub struct SessionSystemPromptResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub instruction_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub env_context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skill_context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_guide_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dream_notebook: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_memory_note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_memory: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -242,6 +251,7 @@ mod tests {
             model: "gpt-4".to_string(),
             reasoning_effort: Some(ReasoningEffort::Medium),
             created_by_schedule_id: None,
+            schedule_run_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_activity_at: Utc::now(),
@@ -273,6 +283,7 @@ mod tests {
             model: "gpt-4.1".to_string(),
             reasoning_effort: None,
             created_by_schedule_id: None,
+            schedule_run_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_activity_at: Utc::now(),
@@ -299,9 +310,12 @@ mod tests {
             base_system_prompt: "You are helpful".to_string(),
             enhancement_prompt: None,
             workspace_context: None,
+            instruction_context: None,
             env_context: None,
             skill_context: None,
             tool_guide_context: None,
+            dream_notebook: None,
+            session_memory_note: None,
             external_memory: None,
             task_list: None,
             effective_system_prompt: "You are helpful".to_string(),
@@ -320,9 +334,12 @@ mod tests {
             base_system_prompt: "Base".to_string(),
             enhancement_prompt: Some("Enhancement".to_string()),
             workspace_context: Some("Workspace".to_string()),
+            instruction_context: Some("Instruction".to_string()),
             env_context: Some("Env".to_string()),
             skill_context: Some("Skill".to_string()),
             tool_guide_context: Some("Tool guide".to_string()),
+            dream_notebook: Some("Dream".to_string()),
+            session_memory_note: Some("Session note".to_string()),
             external_memory: Some("Memory".to_string()),
             task_list: Some("Task".to_string()),
             effective_system_prompt: "Full prompt".to_string(),
@@ -347,6 +364,7 @@ mod tests {
             model: "gpt-4o".to_string(),
             reasoning_effort: Some(ReasoningEffort::Low),
             created_by_schedule_id: None,
+            schedule_run_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_activity_at: Utc::now(),

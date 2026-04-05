@@ -47,17 +47,46 @@ pub fn check_permissions(
             ));
             Ok(Some(contexts))
         }
-        "memory_note" => {
+        "session_note" | "memory_note" => {
             let action = required_string_arg(args, "action")?
                 .trim()
                 .to_ascii_lowercase();
             if matches!(action.as_str(), "append" | "replace" | "clear") {
-                let notes_dir = crate::core::paths::bamboo_dir().join("notes");
+                let notes_dir = crate::core::paths::bamboo_dir()
+                    .join("memory")
+                    .join("v1")
+                    .join("sessions");
                 let notes_path = crate::core::paths::path_to_display_string(&notes_dir);
                 Ok(Some(vec![PermissionContext::new(
                     PermissionType::WriteFile,
                     notes_path.clone(),
-                    format!("memory_note action={} in {}", action, notes_path),
+                    format!("{} action={} in {}", tool_name, action, notes_path),
+                )]))
+            } else {
+                Ok(None)
+            }
+        }
+        "memory" => {
+            let action = required_string_arg(args, "action")?
+                .trim()
+                .to_ascii_lowercase();
+            let bamboo_dir = crate::core::paths::bamboo_dir();
+            let session_memory_dir = crate::core::paths::path_to_display_string(
+                &bamboo_dir.join("memory").join("v1").join("sessions"),
+            );
+            let durable_memory_dir = crate::core::paths::path_to_display_string(
+                &bamboo_dir.join("memory").join("v1").join("scopes"),
+            );
+            let write_resource = match action.as_str() {
+                "session_append" | "session_replace" | "session_clear" => Some(session_memory_dir),
+                "write" | "merge" | "purge" | "rebuild" => Some(durable_memory_dir),
+                _ => None,
+            };
+            if let Some(resource) = write_resource {
+                Ok(Some(vec![PermissionContext::new(
+                    PermissionType::WriteFile,
+                    resource.clone(),
+                    format!("{} action={} in {}", tool_name, action, resource),
                 )]))
             } else {
                 Ok(None)
@@ -180,9 +209,11 @@ mod tests {
         let args = json!({"command": "rm -rf /tmp/a"});
         let contexts = check_permissions("Bash", &args).unwrap().unwrap();
         assert_eq!(contexts.len(), 2);
-        assert!(contexts
-            .iter()
-            .any(|ctx| ctx.permission_type == PermissionType::DeleteOperation));
+        assert!(
+            contexts
+                .iter()
+                .any(|ctx| ctx.permission_type == PermissionType::DeleteOperation)
+        );
     }
 
     #[test]
@@ -202,15 +233,38 @@ mod tests {
     }
 
     #[test]
-    fn check_permissions_memory_note_write_actions_require_write_context() {
-        let append = check_permissions("memory_note", &json!({"action": "append"}))
+    fn check_permissions_session_note_write_actions_require_write_context() {
+        let append = check_permissions("session_note", &json!({"action": "append"}))
             .unwrap()
             .unwrap();
         assert_eq!(append.len(), 1);
         assert_eq!(append[0].permission_type, PermissionType::WriteFile);
 
-        let read = check_permissions("memory_note", &json!({"action": "read"})).unwrap();
+        let read = check_permissions("session_note", &json!({"action": "read"})).unwrap();
         assert!(read.is_none());
+    }
+
+    #[test]
+    fn check_permissions_memory_action_scopes_read_vs_write() {
+        let session_read = check_permissions("memory", &json!({"action": "session_read"})).unwrap();
+        assert!(session_read.is_none());
+
+        let query = check_permissions("memory", &json!({"action": "query"})).unwrap();
+        assert!(query.is_none());
+
+        let session_append = check_permissions("memory", &json!({"action": "session_append"}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(session_append.len(), 1);
+        assert_eq!(session_append[0].permission_type, PermissionType::WriteFile);
+        assert!(session_append[0].resource.contains("/memory/v1/sessions"));
+
+        let write = check_permissions("memory", &json!({"action": "write"}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(write.len(), 1);
+        assert_eq!(write[0].permission_type, PermissionType::WriteFile);
+        assert!(write[0].resource.contains("/memory/v1/scopes"));
     }
 
     #[test]
@@ -229,9 +283,11 @@ mod tests {
         assert_eq!(contexts.len(), 1);
         assert_eq!(contexts[0].permission_type, PermissionType::ExecuteCommand);
         assert_eq!(contexts[0].resource, "node");
-        assert!(contexts[0]
-            .operation_description
-            .contains("console.log('hello')"));
+        assert!(
+            contexts[0]
+                .operation_description
+                .contains("console.log('hello')")
+        );
     }
 
     #[test]

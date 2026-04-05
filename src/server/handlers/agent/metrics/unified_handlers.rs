@@ -1,10 +1,13 @@
 use actix_web::{web, HttpResponse, Responder};
 
 use super::{
-    internal_error, CombinedSummary, MetricsDailyQuery, MetricsSummaryQuery, UnifiedSummary,
-    UnifiedTimelinePoint,
+    internal_error, CombinedSummary, MemoryMetricsQuery, MetricsDailyQuery, MetricsSummaryQuery,
+    UnifiedSummary, UnifiedTimelinePoint,
 };
+use crate::agent::core::memory_store::MemoryStore;
 use crate::server::app_state::AppState;
+
+use super::core_handlers::memory::build_memory_summary;
 
 /// Gets unified metrics summary combining chat and forward data
 ///
@@ -30,8 +33,21 @@ pub async fn v2_unified_summary(
         })
         .await;
 
-    match (chat_result, forward_result) {
-        (Ok(chat), Ok(forward)) => {
+    let memory_store = MemoryStore::new(state.app_data_dir.clone());
+    let memory_result = build_memory_summary(
+        &memory_store,
+        &MemoryMetricsQuery {
+            scope: None,
+            project_key: None,
+            days: None,
+            end_date: None,
+            granularity: None,
+        },
+    )
+    .await;
+
+    match (chat_result, forward_result, memory_result) {
+        (Ok(chat), Ok(forward), Ok(memory)) => {
             let prompt_cached_tool_outputs = chat.prompt_cached_tool_outputs;
             let total_sync_mismatches = chat.total_sync_mismatches;
             let total_requests = chat.total_sessions + forward.total_requests;
@@ -57,11 +73,14 @@ pub async fn v2_unified_summary(
                     prompt_cached_tool_outputs,
                     total_sync_mismatches,
                 },
+                memory,
             };
 
             HttpResponse::Ok().json(unified)
         }
-        (Err(e), _) | (_, Err(e)) => internal_error(e),
+        (Err(error), _, _) => internal_error(error),
+        (_, Err(error), _) => internal_error(error),
+        (_, _, Err(error)) => internal_error(error),
     }
 }
 

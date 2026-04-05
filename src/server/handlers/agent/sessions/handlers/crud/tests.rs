@@ -76,6 +76,10 @@ fn build_new_session_applies_title_and_system_prompt_metadata() {
             .map(|message| message.content.as_str()),
         Some("You are helpful")
     );
+    let snapshot = crate::agent::loop_module::runner::read_prompt_snapshot(&session)
+        .expect("prompt snapshot should exist for explicit prompt session");
+    assert_eq!(snapshot.base_system_prompt, "You are helpful");
+    assert_eq!(snapshot.effective_system_prompt, "You are helpful");
 }
 
 #[test]

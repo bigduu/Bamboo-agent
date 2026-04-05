@@ -1,0 +1,87 @@
+<svg width="1200" height="680" viewBox="0 0 1200 680" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="120" y1="80" x2="1080" y2="620" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B1F1A"/>
+      <stop offset="1" stop-color="#163F35"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="240" y1="140" x2="960" y2="540" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#163C33" stop-opacity="0.92"/>
+      <stop offset="1" stop-color="#0E2822" stop-opacity="0.92"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="300" y1="250" x2="900" y2="430" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#9EF3B7"/>
+      <stop offset="1" stop-color="#4FD8A6"/>
+    </linearGradient>
+    <filter id="shadow" x="0" y="0" width="1200" height="680" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="24" stdDeviation="32" flood-color="#07120F" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <rect x="24" y="24" width="1152" height="632" rx="36" fill="url(#bg)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="84" y="84" width="1032" height="512" rx="28" fill="url(#panel)" stroke="rgba(255,255,255,0.06)"/>
+  </g>
+
+  <rect x="120" y="118" width="150" height="38" rx="19" fill="#1E5648"/>
+  <text x="195" y="143" text-anchor="middle" fill="#CFF7DA" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="16" font-weight="600">Rust agent runtime</text>
+
+  <text x="120" y="236" fill="#F6FFF8" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="74" font-weight="800">Bamboo</text>
+  <text x="120" y="286" fill="#BCE8CC" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="28" font-weight="600">Structured context, tools, memory, tasks, skills, scheduler, and APIs —</text>
+  <text x="120" y="324" fill="#BCE8CC" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="28" font-weight="600">in one backend you can actually build a product on.</text>
+
+  <text x="120" y="392" fill="#D8F6E2" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="20" font-weight="500">Serve it. Embed it. Extend it. Keep long-running work traceable.</text>
+
+  <g>
+    <rect x="120" y="454" width="184" height="54" rx="16" fill="url(#accent)"/>
+    <text x="212" y="488" text-anchor="middle" fill="#072119" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="20" font-weight="800">Agent runtime</text>
+
+    <rect x="320" y="454" width="168" height="54" rx="16" fill="#173F35" stroke="#2C6B59"/>
+    <text x="404" y="488" text-anchor="middle" fill="#D8F6E2" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="20" font-weight="700">HTTP + SSE</text>
+
+    <rect x="504" y="454" width="160" height="54" rx="16" fill="#173F35" stroke="#2C6B59"/>
+    <text x="584" y="488" text-anchor="middle" fill="#D8F6E2" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="20" font-weight="700">Local-first</text>
+  </g>
+
+  <g>
+    <circle cx="902" cy="302" r="94" fill="#102E27" stroke="#2E7563" stroke-width="2"/>
+    <circle cx="902" cy="302" r="58" fill="url(#accent)"/>
+    <text x="902" y="297" text-anchor="middle" fill="#08221A" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="24" font-weight="800">Agent</text>
+    <text x="902" y="327" text-anchor="middle" fill="#08221A" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="24" font-weight="800">Loop</text>
+  </g>
+
+  <g fill="#163E35" stroke="#2F6F5D">
+    <rect x="760" y="148" width="110" height="44" rx="14"/>
+    <rect x="934" y="148" width="110" height="44" rx="14"/>
+    <rect x="1050" y="252" width="110" height="44" rx="14"/>
+    <rect x="1048" y="372" width="112" height="44" rx="14"/>
+    <rect x="934" y="468" width="110" height="44" rx="14"/>
+    <rect x="760" y="468" width="110" height="44" rx="14"/>
+    <rect x="644" y="372" width="112" height="44" rx="14"/>
+    <rect x="642" y="252" width="112" height="44" rx="14"/>
+  </g>
+
+  <g fill="#D8F6E2" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="18" font-weight="700">
+    <text x="815" y="176" text-anchor="middle">Context</text>
+    <text x="989" y="176" text-anchor="middle">Memory</text>
+    <text x="1105" y="280" text-anchor="middle">Tasks</text>
+    <text x="1104" y="400" text-anchor="middle">Skills</text>
+    <text x="989" y="496" text-anchor="middle">MCP</text>
+    <text x="815" y="496" text-anchor="middle">Tools</text>
+    <text x="700" y="400" text-anchor="middle">Scheduler</text>
+    <text x="698" y="280" text-anchor="middle">APIs</text>
+  </g>
+
+  <g stroke="#4FA78D" stroke-width="2" stroke-linecap="round" opacity="0.8">
+    <line x1="861" y1="229" x2="836" y2="192"/>
+    <line x1="944" y1="229" x2="970" y2="192"/>
+    <line x1="987" y1="270" x2="1052" y2="274"/>
+    <line x1="986" y1="334" x2="1050" y2="392"/>
+    <line x1="942" y1="377" x2="972" y2="468"/>
+    <line x1="861" y1="377" x2="836" y2="468"/>
+    <line x1="817" y1="333" x2="754" y2="392"/>
+    <line x1="817" y1="271" x2="752" y2="274"/>
+  </g>
+
+  <text x="120" y="566" fill="#86D8A8" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="18" font-weight="600">Built for agent products that need structure, extensibility, and operational control.</text>
+</svg>

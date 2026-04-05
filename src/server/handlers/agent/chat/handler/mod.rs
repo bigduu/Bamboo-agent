@@ -69,7 +69,9 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     let workspace_path = session::resolve_workspace_path(
         &mut session,
         request::optional_non_empty(req.workspace_path.as_deref()),
+        Some(&state.app_data_dir),
     );
+    session::sync_runtime_workspace(&session_id, workspace_path.as_deref());
     session::resolve_selected_skill_ids(
         &mut session,
         req.selected_skill_ids.as_deref(),
@@ -101,6 +103,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         prompt_profile.component_lengths_value(),
     );
     upsert_system_prompt_message(&mut session, system_prompt);
+    crate::agent::loop_module::runner::refresh_prompt_snapshot(&mut session);
 
     if let Err(response) =
         images::append_user_message(&state, &mut session, &req.message, req.images.as_deref()).await

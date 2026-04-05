@@ -34,9 +34,32 @@ pub fn get_workspace(session_id: &str) -> Option<PathBuf> {
     Some(entry.workspace.clone())
 }
 
+pub fn get_configured_default_workspace() -> Option<PathBuf> {
+    crate::core::Config::from_data_dir(Some(crate::core::paths::bamboo_dir()))
+        .get_default_work_area_path()
+}
+
+pub fn ensure_session_workspace(session_id: &str, preferred: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(workspace) = preferred {
+        set_workspace(session_id, workspace.clone());
+        return Some(workspace);
+    }
+
+    if let Some(existing) = get_workspace(session_id) {
+        return Some(existing);
+    }
+
+    if let Some(configured) = get_configured_default_workspace() {
+        set_workspace(session_id, configured.clone());
+        return Some(configured);
+    }
+
+    None
+}
+
 pub fn workspace_or_process_cwd(session_id: Option<&str>) -> PathBuf {
     if let Some(session_id) = session_id {
-        if let Some(workspace) = get_workspace(session_id) {
+        if let Some(workspace) = ensure_session_workspace(session_id, None) {
             return workspace;
         }
     }

@@ -20,6 +20,16 @@ pub(super) mod prompt_setup;
 mod skill_context;
 pub(super) mod tool_schemas;
 
+pub(crate) use crate::agent::core::PromptSnapshot;
+
+pub(crate) fn read_prompt_snapshot(session: &Session) -> Option<PromptSnapshot> {
+    prompt_setup::read_prompt_snapshot_metadata(session)
+}
+
+pub(crate) fn refresh_prompt_snapshot(session: &mut Session) {
+    prompt_setup::refresh_prompt_snapshot_from_session(session)
+}
+
 pub(super) async fn prepare_session_for_loop(
     session: &mut Session,
     initial_message: &str,

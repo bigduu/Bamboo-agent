@@ -505,27 +505,27 @@ mod tests {
 
         assert_eq!(
             scheduling_mode_for_tool_call(
-                &tool_call_with_args("memory_note", json!({"action": "read"})),
+                &tool_call_with_args("session_note", json!({"action": "read"})),
                 &tools
             ),
             ToolSchedulingMode::ParallelSafe,
-            "memory_note read action should be parallel-safe"
+            "session_note read action should be parallel-safe"
         );
         assert_eq!(
             scheduling_mode_for_tool_call(
-                &tool_call_with_args("memory_note", json!({"action": "list_topics"})),
+                &tool_call_with_args("session_note", json!({"action": "list_topics"})),
                 &tools
             ),
             ToolSchedulingMode::ParallelSafe,
-            "memory_note list_topics action should be parallel-safe"
+            "session_note list_topics action should be parallel-safe"
         );
         assert_eq!(
             scheduling_mode_for_tool_call(
-                &tool_call_with_args("memory_note", json!({"action": "append", "content": "x"})),
+                &tool_call_with_args("session_note", json!({"action": "append", "content": "x"})),
                 &tools
             ),
             ToolSchedulingMode::Sequential,
-            "memory_note append action should be sequential"
+            "session_note append action should be sequential"
         );
     }
 
@@ -549,6 +549,31 @@ mod tests {
                 "alias {alias} should resolve to a parallel-safe tool"
             );
         }
+
+        assert_eq!(
+            scheduling_mode_for_tool_call(
+                &tool_call_with_args("memory_note", json!({"action": "read"})),
+                &tools
+            ),
+            ToolSchedulingMode::ParallelSafe,
+            "memory_note read alias should be parallel-safe"
+        );
+        assert_eq!(
+            scheduling_mode_for_tool_call(
+                &tool_call_with_args("memory_note", json!({"action": "list_topics"})),
+                &tools
+            ),
+            ToolSchedulingMode::ParallelSafe,
+            "memory_note list_topics alias should be parallel-safe"
+        );
+        assert_eq!(
+            scheduling_mode_for_tool_call(
+                &tool_call_with_args("memory_note", json!({"action": "append", "content": "x"})),
+                &tools
+            ),
+            ToolSchedulingMode::Sequential,
+            "memory_note append alias should be sequential"
+        );
     }
 
     #[test]

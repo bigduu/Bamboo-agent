@@ -10,6 +10,14 @@ pub(super) async fn inject_external_memory_into_system_message(
     external_memory::inject_external_memory_into_system_message(session).await;
 }
 
+#[cfg(test)]
+pub(super) async fn inject_external_memory_into_system_message_with_store(
+    session: &mut crate::agent::core::Session,
+    memory: &crate::agent::core::memory_store::MemoryStore,
+) {
+    external_memory::inject_external_memory_into_system_message_with_store(session, memory).await;
+}
+
 pub(super) fn strip_existing_external_memory(prompt: &str) -> String {
     external_memory::strip_existing_external_memory(prompt)
 }

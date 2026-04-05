@@ -71,6 +71,7 @@ pub(super) fn build_new_session(
 
     if has_explicit_prompt {
         session.add_message(Message::system(base_prompt));
+        crate::agent::loop_module::runner::refresh_prompt_snapshot(&mut session);
     }
 
     session

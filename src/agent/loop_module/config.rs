@@ -59,9 +59,17 @@ pub struct AgentLoopConfig {
     pub metrics_collector: Option<MetricsCollector>,
     /// Model name used for metrics attribution
     pub model_name: Option<String>,
-    /// Fast/cheap model name for lightweight tasks (summarization, task evaluation).
-    /// Falls back to `model_name` when not set.
+    /// Optional explicit fast/cheap model name for lightweight foreground tasks
+    /// such as task evaluation.
+    ///
+    /// Call sites may fall back to `model_name` when this is unset.
     pub fast_model_name: Option<String>,
+    /// Dedicated background summarization model for host-side context compression
+    /// and other non-interactive maintenance work.
+    ///
+    /// Unlike `fast_model_name`, this must not silently fall back to the main
+    /// interaction model.
+    pub background_model_name: Option<String>,
     /// Provider name used for provider-specific request behavior.
     pub provider_name: Option<String>,
     /// Optional request-time reasoning effort override.
@@ -95,6 +103,7 @@ impl Default for AgentLoopConfig {
             metrics_collector: None,
             model_name: None,
             fast_model_name: None,
+            background_model_name: None,
             provider_name: None,
             reasoning_effort: None,
             disabled_tools: BTreeSet::new(),

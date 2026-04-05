@@ -3,5 +3,7 @@
 //! This module provides service layer components that handle business logic
 //! for various server operations, including model mapping and skill management.
 
+pub mod auto_dream;
+pub mod consolidation_prompt;
 pub mod gemini_model_mapping_service;
 pub mod skill_service;

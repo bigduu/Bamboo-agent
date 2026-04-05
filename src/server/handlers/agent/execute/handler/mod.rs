@@ -339,7 +339,7 @@ pub async fn handler(
         is_child_session,
         provider_name: config_snapshot.provider.clone(),
         model: effective_model,
-        fast_model: config_snapshot.get_fast_model(),
+        fast_model: config_snapshot.get_memory_background_model(),
         reasoning_effort: effective_reasoning_effort,
         reasoning_effort_source: reasoning_effort_source.to_string(),
         disabled_tools,

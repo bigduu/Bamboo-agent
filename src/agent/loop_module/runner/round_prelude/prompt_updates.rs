@@ -3,7 +3,10 @@ use crate::agent::core::{Role, Session};
 use super::super::prompt_context::{
     inject_external_memory_into_system_message, inject_task_list_into_system_message,
 };
-use super::super::session_setup::prompt_setup::PromptAssemblyReport;
+use super::super::session_setup::prompt_setup::{
+    persist_prompt_snapshot_metadata, PromptAssemblyReport,
+};
+use crate::agent::core::PromptSnapshot;
 
 const CONTEXT_COMPRESSION_PROMPT_START: &str = "<!-- BAMBOO_CONTEXT_COMPRESSION_TOOL_START -->";
 const CONTEXT_COMPRESSION_PROMPT_END: &str = "<!-- BAMBOO_CONTEXT_COMPRESSION_TOOL_END -->";
@@ -55,6 +58,58 @@ fn persist_round_prompt_metadata(session: &mut Session, prompt: &str) {
         RUNTIME_PROMPT_SECTION_LAYOUT_KEY.to_string(),
         report.section_layout_value(),
     );
+
+    let external_memory = extract_wrapped_section(
+        prompt,
+        EXTERNAL_MEMORY_START_MARKER,
+        EXTERNAL_MEMORY_END_MARKER,
+    )
+    .map(|section| {
+        strip_wrapped_markers(
+            &section,
+            EXTERNAL_MEMORY_START_MARKER,
+            EXTERNAL_MEMORY_END_MARKER,
+        )
+    });
+    let task_list = extract_wrapped_section(prompt, TASK_LIST_START_MARKER, TASK_LIST_END_MARKER)
+        .map(|section| {
+            strip_wrapped_markers(&section, TASK_LIST_START_MARKER, TASK_LIST_END_MARKER)
+        });
+
+    let mut snapshot =
+        super::super::session_setup::prompt_setup::read_prompt_snapshot_metadata(session)
+            .unwrap_or_else(|| PromptSnapshot {
+                base_system_prompt: session
+                    .metadata
+                    .get("base_system_prompt")
+                    .cloned()
+                    .unwrap_or_default(),
+                enhancement_prompt: session.metadata.get("enhance_prompt").cloned(),
+                workspace_context: session.metadata.get("workspace_path").and_then(
+                    |workspace_path| {
+                        crate::server::app_state::build_workspace_prompt_context(workspace_path)
+                    },
+                ),
+                instruction_context: session.metadata.get("workspace_path").and_then(
+                    |workspace_path| {
+                        crate::server::instruction_layer::build_instruction_prompt_context(
+                            workspace_path,
+                        )
+                    },
+                ),
+                env_context: None,
+                skill_context: None,
+                tool_guide_context: None,
+                dream_notebook: None,
+                session_memory_note: None,
+                external_memory: None,
+                task_list: None,
+                effective_system_prompt: prompt.trim().to_string(),
+            });
+    snapshot.external_memory = external_memory;
+    snapshot.task_list = task_list;
+    snapshot.effective_system_prompt = prompt.trim().to_string();
+    persist_prompt_snapshot_metadata(session, snapshot);
 }
 
 fn build_round_prompt_sections(
@@ -97,6 +152,15 @@ fn extract_wrapped_section(prompt: &str, start_marker: &str, end_marker: &str) -
     let section_end = section_start + end_rel_idx;
     let section = prompt[start_idx..section_end + end_marker.len()].trim();
     (!section.is_empty()).then(|| section.to_string())
+}
+
+fn strip_wrapped_markers(section: &str, start_marker: &str, end_marker: &str) -> String {
+    section
+        .trim()
+        .trim_start_matches(start_marker)
+        .trim_end_matches(end_marker)
+        .trim()
+        .to_string()
 }
 
 fn log_round_prompt_refresh_summary(session_id: &str, prompt: &str) {

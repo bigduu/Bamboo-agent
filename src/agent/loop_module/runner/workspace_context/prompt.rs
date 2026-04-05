@@ -36,11 +36,13 @@ pub(super) fn apply_workspace_path_to_session(session: &mut Session, workspace_p
         let base_prompt =
             strip_existing_task_list(&strip_existing_external_memory(&system_message.content));
         system_message.content = upsert_workspace_context(&base_prompt, workspace_path);
+        crate::agent::loop_module::runner::refresh_prompt_snapshot(session);
     } else {
         session.messages.insert(
             0,
             Message::system(upsert_workspace_context("", workspace_path)),
         );
+        crate::agent::loop_module::runner::refresh_prompt_snapshot(session);
     }
 }
 

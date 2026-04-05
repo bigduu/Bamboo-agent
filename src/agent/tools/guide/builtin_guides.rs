@@ -17,7 +17,7 @@ pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
     "Grep",
     "js_repl",
     "KillShell",
-    "memory_note",
+    "session_note",
     "NotebookEdit",
     "Read",
     "request_permissions",
@@ -97,7 +97,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                         }
                     }),
                     "Use at the end of review/explanation turns instead of a plain final paragraph.",
-                )
+                ),
             ],
         )),
         "Read" => Some(guide(
@@ -331,8 +331,12 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Use as a fast existence probe before deciding create vs update.",
             )],
         )),
-        "memory_note" => Some(guide(
-            "memory_note",
+        "session_note" | "memory_note" => Some(guide(
+            if tool_name == "memory_note" {
+                "memory_note"
+            } else {
+                "session_note"
+            },
             ToolCategory::TaskManagement,
             "Store durable session-scoped notes and retrieve them across turns. Use it for local context, user preferences, constraints, and compression-resistant reminders within the current workstream.",
             "Do not store secrets/tokens, one-turn scratch text, or use it as the primary long-term knowledge base.",
@@ -347,6 +351,40 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                     "Store notes for a specific topic",
                     json!({"action":"append","topic":"backend-api","content":"REST endpoints finalized: /users, /orders."}),
                     "Use topic to keep separate workstreams isolated from each other.",
+                ),
+            ],
+        )),
+        "memory" => Some(guide(
+            "memory",
+            ToolCategory::TaskManagement,
+            "Manage Bamboo's unified memory system. Use session_* actions only for current-session continuity notes, and use query/get/write/merge/purge/inspect/rebuild for durable project or global memories backed by canonical topic files.",
+            "Do not use session actions for long-term project knowledge, and do not dump large bodies through query when query -> get(id) or inspect is more appropriate. Prefer query first, then get the specific durable item you need before writing or merging.",
+            &["session_note", "recall", "Task"],
+            vec![
+                example(
+                    "Read the current session note topic",
+                    json!({"action":"session_read","topic":"default","options":{"max_chars":4000}}),
+                    "Use for continuity state inside the current session without touching durable project/global memory.",
+                ),
+                example(
+                    "Shortlist durable memories before reading full content",
+                    json!({"action":"query","scope":"project","query":"release freeze mobile","options":{"limit":5,"max_chars":3000}}),
+                    "Prefer query first so the model gets a shortlist summary under budget; call get(id) only for the durable item that needs full context.",
+                ),
+                example(
+                    "Read one durable memory in full after query",
+                    json!({"action":"get","id":"mem_20260403_001","options":{"max_chars":5000}}),
+                    "Use after query when you need the full body/frontmatter of a single durable memory item.",
+                ),
+                example(
+                    "Write a durable project memory",
+                    json!({"action":"write","scope":"project","type":"project","title":"Release freeze begins next week","content":"Merge freeze begins on Tuesday for the mobile release cut.","tags":["release","freeze"]}),
+                    "Use when the fact should persist across sessions as canonical project memory and should not live only in session_note.",
+                ),
+                example(
+                    "Merge follow-up details into an existing durable memory",
+                    json!({"action":"merge","id":"mem_20260403_001","content":"Additional confirmation from a later session.","tags":["confirmed"],"source_memory_ids":["mem_20260403_002"]}),
+                    "Use when new durable evidence belongs on an existing memory item and older overlapping items should be superseded.",
                 ),
             ],
         )),
@@ -445,11 +483,15 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             )],
         )),
         "recall" | "session_inspector" => Some(guide(
-            if tool_name == "session_inspector" { "session_inspector" } else { "recall" },
+            if tool_name == "session_inspector" {
+                "session_inspector"
+            } else {
+                "recall"
+            },
             ToolCategory::FileReading,
             "Inspect prior Bamboo context from local session storage. Use list/get_meta before deep reads when possible, then read bounded message slices, compressed recall, or search results to recover previous discussion context.",
             "Do not use as a broad substitute for local code search, and do not delegate child-session inspection unless the user explicitly asks for delegated work.",
-            &["memory_note", "Read", "Task"],
+            &["session_note", "Read", "Task"],
             vec![
                 example(
                     "Search prior discussion history",
@@ -464,7 +506,11 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ],
         )),
         "scheduler" | "schedule_tasks" => Some(guide(
-            if tool_name == "schedule_tasks" { "schedule_tasks" } else { "scheduler" },
+            if tool_name == "schedule_tasks" {
+                "schedule_tasks"
+            } else {
+                "scheduler"
+            },
             ToolCategory::TaskManagement,
             "Manage Bamboo scheduled automation jobs for recurring or delayed work. Use it to create, inspect, modify, run, or delete schedules without going through HTTP.",
             "Do not use for normal one-shot task planning inside the current conversation; use Task for active execution tracking instead.",
@@ -472,7 +518,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             vec![
                 example(
                     "Create a recurring schedule",
-                    json!({"action":"create","name":"daily-review","interval_seconds":86400,"enabled":true,"run_config":{"auto_execute":true,"task_message":"Review new tickets","workspace_path":"/workspace/project"}}),
+                    json!({"action":"create","name":"daily-review","trigger":{"type":"interval","every_seconds":86400},"enabled":true,"run_config":{"auto_execute":true,"task_message":"Review new tickets","workspace_path":"/workspace/project"}}),
                     "Use when work should recur automatically over time.",
                 ),
                 example(
@@ -557,7 +603,7 @@ fn example(scenario: &str, parameters: serde_json::Value, explanation: &str) -> 
 mod tests {
     use crate::agent::tools::executor::BUILTIN_TOOL_NAMES;
 
-    use super::{builtin_guide_spec, BUILTIN_GUIDE_NAMES};
+    use super::{BUILTIN_GUIDE_NAMES, builtin_guide_spec};
 
     #[test]
     fn every_builtin_tool_has_a_guide() {
@@ -579,5 +625,18 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn memory_server_tool_has_fallback_guide_spec() {
+        let guide = builtin_guide_spec("memory").expect("memory guide should exist");
+        assert_eq!(guide.tool_name, "memory");
+        assert!(guide.examples.iter().any(|example| {
+            example
+                .parameters
+                .get("action")
+                .and_then(|value| value.as_str())
+                == Some("merge")
+        }));
     }
 }

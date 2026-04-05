@@ -131,6 +131,7 @@ impl AppState {
             skill_manager.clone(),
             storage.clone(),
             sessions.clone(),
+            bamboo_home_dir.clone(),
         );
 
         // Long-lived session event senders map (UI subscriptions + background tasks).
@@ -175,6 +176,15 @@ impl AppState {
             agent_runners.clone(),
             session_event_senders.clone(),
             config.clone(),
+        );
+
+        crate::server::services::auto_dream::spawn_auto_dream_task(
+            crate::server::services::auto_dream::AutoDreamContext {
+                session_store: session_store.clone(),
+                storage: storage.clone(),
+                provider: provider_handle.clone(),
+                config: config.clone(),
+            },
         );
 
         let tools = build_root_tools(
@@ -339,6 +349,7 @@ fn build_base_tools(
     skill_manager: Arc<SkillManager>,
     storage: Arc<dyn Storage>,
     sessions: Arc<RwLock<HashMap<String, crate::agent::core::Session>>>,
+    app_data_dir: PathBuf,
 ) -> Arc<dyn ToolExecutor> {
     // Initialize built-in tools with permission checks.
     // If no permission config has been persisted yet, keep checks disabled for backward
@@ -362,6 +373,15 @@ fn build_base_tools(
         mcp_tools,
     ));
 
+    let memory_tool = Arc::new(crate::server::tools::MemoryTool::new(
+        sessions.clone(),
+        storage.clone(),
+        app_data_dir.clone(),
+    ));
+    let with_memory: Arc<dyn ToolExecutor> = Arc::new(
+        crate::server::tools::OverlayToolExecutor::new(base, memory_tool),
+    );
+
     let load_skill_tool = Arc::new(crate::server::tools::LoadSkillTool::new(
         skill_manager.clone(),
         config.clone(),
@@ -369,7 +389,7 @@ fn build_base_tools(
         storage.clone(),
     ));
     let with_load_skill: Arc<dyn ToolExecutor> = Arc::new(
-        crate::server::tools::OverlayToolExecutor::new(base, load_skill_tool),
+        crate::server::tools::OverlayToolExecutor::new(with_memory, load_skill_tool),
     );
 
     let read_skill_resource_tool = Arc::new(crate::server::tools::ReadSkillResourceTool::new(
@@ -552,6 +572,7 @@ fn build_schedule_manager(
         agent_runners,
         session_event_senders,
         config,
+        trigger_engine: crate::server::schedules::default_trigger_engine(),
     }))
 }
 

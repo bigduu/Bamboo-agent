@@ -113,7 +113,7 @@ async fn maybe_apply_host_context_compression_uses_fast_model_for_summary_reques
 
     let config = AgentLoopConfig {
         model_name: Some("main-model".to_string()),
-        fast_model_name: Some("fast-model".to_string()),
+        background_model_name: Some("fast-model".to_string()),
         ..Default::default()
     };
     let (llm, models) = recording_llm();
@@ -140,6 +140,71 @@ async fn maybe_apply_host_context_compression_uses_fast_model_for_summary_reques
 }
 
 #[tokio::test]
+async fn host_context_compression_skips_when_no_background_model_is_configured() {
+    let mut session = Session::new("session-cp-no-background-model", "test-model");
+    session.messages.push(Message::system("System prompt"));
+    for index in 0..12 {
+        session.messages.push(Message::user(format!(
+            "User message {} {}",
+            index,
+            "alpha beta gamma delta epsilon zeta ".repeat(8)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "Assistant response {} {}",
+                index,
+                "analysis plan files checks and next steps ".repeat(8)
+            ),
+            None,
+        ));
+    }
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: 100,
+        summary_tokens: 0,
+        window_tokens: 900,
+        total_tokens: 1000,
+        max_context_tokens: 1200,
+        budget_limit: 1200,
+        truncation_occurred: true,
+        segments_removed: 8,
+        prompt_cached_tool_outputs: 0,
+    });
+
+    let config = AgentLoopConfig {
+        model_name: Some("main-model".to_string()),
+        fast_model_name: None,
+        ..Default::default()
+    };
+    let (llm, models) = recording_llm();
+
+    let applied = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "main-model",
+        "session-cp-no-background-model",
+        &[],
+        &llm,
+        None,
+        "pre-turn",
+    )
+    .await
+    .expect("compression path should return cleanly when background model is absent");
+
+    assert!(
+        !applied,
+        "compression should be skipped without a background model"
+    );
+
+    let models = models
+        .lock()
+        .expect("recorded model list lock should not be poisoned");
+    assert!(
+        models.is_empty(),
+        "summarizer should not call the main model as fallback"
+    );
+}
+
+#[tokio::test]
 async fn force_overflow_context_recovery_degrades_tool_guide_before_skill_context() {
     let mut session = Session::new("session-cp-overflow-degrade", "test-model");
     session.messages.push(Message::system(
@@ -148,6 +213,7 @@ async fn force_overflow_context_recovery_degrades_tool_guide_before_skill_contex
 
     let config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
         ..Default::default()
     };
     let llm = noop_llm();
@@ -248,6 +314,7 @@ async fn prepare_round_context_auto_compresses_when_hard_limit_truncation_pressu
 
     let config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
         ..Default::default()
     };
 
@@ -296,7 +363,7 @@ async fn prepare_round_context_drops_orphan_tool_results_only_from_prepared_cont
             id: "call_1".to_string(),
             tool_type: "function".to_string(),
             function: FunctionCall {
-                name: "memory_note".to_string(),
+                name: "session_note".to_string(),
                 arguments: "{}".to_string(),
             },
         }]),
@@ -310,6 +377,7 @@ async fn prepare_round_context_drops_orphan_tool_results_only_from_prepared_cont
 
     let config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
         ..Default::default()
     };
 
@@ -355,7 +423,7 @@ async fn prepare_round_context_prunes_unresolved_tool_calls_from_prepared_contex
             id: "call_missing".to_string(),
             tool_type: "function".to_string(),
             function: FunctionCall {
-                name: "memory_note".to_string(),
+                name: "session_note".to_string(),
                 arguments: "{}".to_string(),
             },
         }]),
@@ -364,6 +432,7 @@ async fn prepare_round_context_prunes_unresolved_tool_calls_from_prepared_contex
 
     let config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
         ..Default::default()
     };
 
@@ -457,6 +526,7 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
 
     let config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
         ..Default::default()
     };
 
@@ -536,6 +606,7 @@ async fn maybe_apply_host_context_compression_supports_mid_turn_phase() {
 
     let config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
         ..Default::default()
     };
     let llm = noop_llm();
@@ -614,6 +685,7 @@ async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses
 
     let config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
         ..Default::default()
     };
 
@@ -760,6 +832,7 @@ async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
 
     let config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
         ..Default::default()
     };
     let llm = noop_llm();

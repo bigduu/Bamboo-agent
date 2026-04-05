@@ -1,4 +1,5 @@
-use crate::agent::core::{ExternalMemory, Session};
+use crate::agent::core::Session;
+use crate::agent::core::memory_store::MemoryStore;
 
 use super::system_sections::strip_existing_prompt_block;
 
@@ -8,7 +9,9 @@ const EXTERNAL_MEMORY_END_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_END -->";
 const EXTERNAL_MEMORY_PROMPT_MAX_CHARS_PER_TOPIC: usize = 4_000;
 /// Max total chars for the entire memory section (all topics combined).
 const EXTERNAL_MEMORY_PROMPT_MAX_TOTAL_CHARS: usize = 6_000;
-const EXTERNAL_MEMORY_TOOL_NAME: &str = "memory_note";
+/// Reserved budget for the cross-session Dream notebook inside the external-memory block.
+const DREAM_NOTEBOOK_PROMPT_MAX_CHARS: usize = 2_000;
+const EXTERNAL_MEMORY_TOOL_NAME: &str = "session_note";
 
 /// Context usage percentage at which we warn the LLM to save memory.
 /// This should be below the budget system's compression trigger (~90%).
@@ -34,6 +37,14 @@ fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
 }
 
 pub(super) async fn inject_external_memory_into_system_message(session: &mut Session) {
+    let memory = MemoryStore::with_defaults();
+    inject_external_memory_into_system_message_with_store(session, &memory).await;
+}
+
+pub(super) async fn inject_external_memory_into_system_message_with_store(
+    session: &mut Session,
+    memory: &MemoryStore,
+) {
     let Some(system_message) = session
         .messages
         .iter_mut()
@@ -46,11 +57,34 @@ pub(super) async fn inject_external_memory_into_system_message(session: &mut Ses
     // memory section for this round.
     let base_prompt = strip_existing_external_memory(&system_message.content);
 
-    let memory = ExternalMemory::with_defaults();
     let session_id = session.id.as_str();
+    let dream_notebook = match memory.read_dream_view().await {
+        Ok(Some(content)) => {
+            let content = content.trim();
+            if content.is_empty() {
+                None
+            } else {
+                Some(content.to_string())
+            }
+        }
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!("[{}] Failed to read Dream notebook: {}", session_id, error);
+            None
+        }
+    };
+    let (dream_notebook_snippet, dream_truncated, dream_full_len) = match dream_notebook.as_deref()
+    {
+        Some(content) => {
+            let full_len = content.chars().count();
+            let (snippet, truncated) = truncate_chars(content, DREAM_NOTEBOOK_PROMPT_MAX_CHARS);
+            (Some(snippet), truncated, full_len)
+        }
+        None => (None, false, 0),
+    };
 
     // Discover all topics for this session.
-    let topics = match memory.list_topics(session_id).await {
+    let topics = match memory.list_session_topics(session_id).await {
         Ok(t) => t,
         Err(error) => {
             tracing::warn!("[{}] Failed to list memory topics: {}", session_id, error);
@@ -69,7 +103,7 @@ pub(super) async fn inject_external_memory_into_system_message(session: &mut Ses
     let mut total_chars = 0usize;
 
     for topic in &topics {
-        let content = match memory.read_topic(session_id, topic).await {
+        let content = match memory.read_session_topic(session_id, topic).await {
             Ok(Some(c)) => c.trim().to_string(),
             _ => continue,
         };
@@ -105,13 +139,17 @@ pub(super) async fn inject_external_memory_into_system_message(session: &mut Ses
     section.push_str(EXTERNAL_MEMORY_START_MARKER);
     section.push('\n');
     section.push_str("## External Memory (Persistent)\n\n");
-    section.push_str("You have access to a persistent per-session memory note.\n");
-    section.push_str("- If you learn durable information that will help later (preferences, key decisions, constraints, environment details), update the note using the tool.\n");
+    section.push_str("You have access to two distinct persistence layers:\n");
+    section.push_str("- **Cross-session Dream Notebook**: a read-only, background-consolidated notebook synthesized from recent sessions\n");
+    section.push_str("- **Session Memory Note**: the current session's writable durable note managed via the tool below\n\n");
+    section.push_str("Use the Dream notebook for broad cross-session orientation. Use the session note only for current-workstream continuity, temporary constraints, and compression-resistant reminders inside this session. Use the `memory` tool for durable project/global knowledge that should persist across sessions.\n\n");
+    section.push_str("- If you learn durable information that will help later in other sessions (preferences, confirmed project decisions, stable references, non-derivable context), store it with the `memory` tool instead of only leaving it in session_note.\n");
+    section.push_str("- For durable memory, prefer `memory` action=query first, then `memory` action=get for the specific item you need, and use `memory` action=write/merge only when the fact should become canonical memory.\n");
     section.push_str("- Do NOT store secrets/tokens.\n");
     section.push_str(
-        "- Keep the note concise and factual. If it gets too long, compress it (rewrite a shorter version) and replace it.\n\n",
+        "- Keep the session note concise and factual. If it gets too long, compress it (rewrite a shorter version) and replace it.\n\n",
     );
-    section.push_str("Tool usage:\n");
+    section.push_str("Session-memory tool usage:\n");
     section.push_str(&format!(
         "- Append: call `{EXTERNAL_MEMORY_TOOL_NAME}` with `{{\"action\":\"append\",\"content\":\"...\"}}`\n"
     ));
@@ -128,13 +166,29 @@ pub(super) async fn inject_external_memory_into_system_message(session: &mut Ses
         "- List topics: call `{EXTERNAL_MEMORY_TOOL_NAME}` with `{{\"action\":\"list_topics\"}}`\n\n"
     ));
 
+    if let Some(dream_notebook) = dream_notebook_snippet.as_deref() {
+        section.push_str("### Cross-session Dream Notebook (read-only)\n");
+        section.push_str("````md\n");
+        section.push_str(dream_notebook);
+        section.push_str("\n````\n");
+        if dream_truncated {
+            section.push_str(&format!(
+                "_(showing {} of {} chars from the Dream notebook; full notebook is stored on disk and refreshed by auto_dream)_\n\n",
+                dream_notebook.chars().count(),
+                dream_full_len,
+            ));
+        } else {
+            section.push('\n');
+        }
+    }
+
     if snippets.is_empty() {
-        section.push_str("### Current Note (markdown)\n");
+        section.push_str("### Session Memory Note (markdown)\n");
         section.push_str("````md\n_(empty)_\n````\n");
     } else if snippets.len() == 1 && snippets[0].name == "default" {
         // Single default topic — keep the legacy-style display.
         let s = &snippets[0];
-        section.push_str("### Current Note (markdown)\n");
+        section.push_str("### Session Memory Note (markdown)\n");
         section.push_str("````md\n");
         if s.content.is_empty() {
             section.push_str("_(empty)_");
@@ -151,7 +205,7 @@ pub(super) async fn inject_external_memory_into_system_message(session: &mut Ses
     } else {
         // Multiple topics — show each under a sub-heading.
         for s in &snippets {
-            section.push_str(&format!("### Topic: `{}`\n", s.name));
+            section.push_str(&format!("### Session Memory Topic: `{}`\n", s.name));
             section.push_str("````md\n");
             if s.content.is_empty() {
                 section.push_str("_(truncated — use action=read topic=");
@@ -174,7 +228,7 @@ pub(super) async fn inject_external_memory_into_system_message(session: &mut Ses
 
     // ── Context pressure warning ────────────────────────────────────────
     // When the context window is filling up, proactively remind the LLM to
-    // save important state to memory_note before the budget system begins
+    // save important state to session_note before the budget system begins
     // purging older messages.
     if let Some(ref usage) = session.token_usage {
         let denominator = if usage.max_context_tokens > 0 {
@@ -203,9 +257,14 @@ pub(super) async fn inject_external_memory_into_system_message(session: &mut Ses
     system_message.content = format!("{}{}", base_prompt.trim_end(), section);
 
     tracing::info!(
-        "[{}] External memory injected: topics={}, rendered_len={}, source_chars={}, truncated_topics={}",
+        "[{}] External memory injected: session_topics={}, dream_loaded={}, dream_chars={}, rendered_len={}, source_chars={}, truncated_topics={}",
         session_id,
         snippets.len(),
+        dream_notebook_snippet.is_some(),
+        dream_notebook_snippet
+            .as_deref()
+            .map(|value| value.chars().count())
+            .unwrap_or(0),
         section.len(),
         total_chars,
         snippets.iter().filter(|snippet| snippet.truncated).count(),

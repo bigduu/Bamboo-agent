@@ -572,6 +572,33 @@ impl CompressionEvent {
     }
 }
 
+/// Structured snapshot of the effective system prompt and its major sections.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptSnapshot {
+    pub base_system_prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enhancement_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instruction_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_guide_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dream_notebook: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_memory_note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_memory: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_list: Option<String>,
+    pub effective_system_prompt: String,
+}
+
 /// A complete conversation session with state management.
 ///
 /// Represents a full conversation session including message history,
@@ -669,6 +696,9 @@ pub struct Session {
     /// Conversation summary for context management
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_summary: Option<ConversationSummary>,
+    /// Structured snapshot of the effective system prompt and its sections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_snapshot: Option<PromptSnapshot>,
     /// Historical compression events used by the UI to render compression separators.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compression_events: Vec<CompressionEvent>,
@@ -723,6 +753,7 @@ impl Session {
             token_budget: None,
             token_usage: None,
             conversation_summary: None,
+            prompt_snapshot: None,
             compression_events: Vec::new(),
         }
     }
@@ -756,6 +787,7 @@ impl Session {
             token_budget: None,
             token_usage: None,
             conversation_summary: None,
+            prompt_snapshot: None,
             compression_events: Vec::new(),
         }
     }
@@ -1219,6 +1251,42 @@ mod tests {
                 "Provider batch output should not contain stray metadata"
             );
         }
+    }
+
+    #[test]
+    fn session_serializes_and_deserializes_prompt_snapshot() {
+        let mut session = Session::new("session-with-snapshot", "gpt-test");
+        session.prompt_snapshot = Some(PromptSnapshot {
+            base_system_prompt: "Base prompt".to_string(),
+            enhancement_prompt: Some("Extra guidance".to_string()),
+            workspace_context: Some("Workspace path: /tmp/ws".to_string()),
+            instruction_context: Some("Instruction block".to_string()),
+            env_context: Some("Env block".to_string()),
+            skill_context: Some("Skill block".to_string()),
+            tool_guide_context: Some("Tool block".to_string()),
+            dream_notebook: Some("Dream block".to_string()),
+            session_memory_note: Some("Session note block".to_string()),
+            external_memory: Some("Memory block".to_string()),
+            task_list: Some("Task block".to_string()),
+            effective_system_prompt: "Effective prompt".to_string(),
+        });
+
+        let json = serde_json::to_string(&session).expect("session should serialize");
+        let roundtrip: Session = serde_json::from_str(&json).expect("session should deserialize");
+        assert_eq!(
+            roundtrip
+                .prompt_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.enhancement_prompt.as_deref()),
+            Some("Extra guidance")
+        );
+        assert_eq!(
+            roundtrip
+                .prompt_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.effective_system_prompt.as_str()),
+            Some("Effective prompt")
+        );
     }
 
     #[test]

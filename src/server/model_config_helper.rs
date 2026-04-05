@@ -57,14 +57,14 @@ pub fn get_default_model_from_config(config: &Config) -> Result<String, LLMError
     }
 }
 
-/// Get the fast/cheap model for the current provider from config.
+/// Get the memory/background summarization model for the current provider from config.
 ///
-/// Used for lightweight tasks like title generation and summarization.
-/// Falls back to the default model when no fast_model is configured.
-pub fn get_fast_model_from_config(config: &Config) -> Result<String, LLMError> {
-    config.get_fast_model().ok_or_else(|| {
+/// Used for lightweight memory tasks like session summarization and reflection.
+/// Falls back to the provider fast model when `memory.background_model` is not configured.
+pub fn get_memory_background_model_from_config(config: &Config) -> Result<String, LLMError> {
+    config.get_memory_background_model().ok_or_else(|| {
         LLMError::Auth(format!(
-            "No model configured for provider '{}'",
+            "No background memory model configured for provider '{}'",
             config.provider
         ))
     })

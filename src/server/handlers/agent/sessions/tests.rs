@@ -19,6 +19,7 @@ fn session_summary_from_entry_includes_last_run_fields() {
         model: "gpt-4o".to_string(),
         reasoning_effort: Some(ReasoningEffort::High),
         created_by_schedule_id: None,
+        schedule_run_id: Some("run-123".to_string()),
         created_at: Utc::now(),
         updated_at: Utc::now(),
         last_activity_at: Utc::now(),
@@ -33,4 +34,5 @@ fn session_summary_from_entry_includes_last_run_fields() {
 
     assert_eq!(summary.last_run_status.as_deref(), Some("completed"));
     assert_eq!(summary.last_run_error, None);
+    assert_eq!(summary.schedule_run_id.as_deref(), Some("run-123"));
 }

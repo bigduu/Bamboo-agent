@@ -16,14 +16,19 @@ use crate::agent::skill::SkillManager;
 use crate::core::Config;
 use crate::server::app_state::{AgentRunner, AgentStatus};
 
+use super::domain::ScheduleRunStatus;
 use super::store::{ClaimedScheduleRun, ScheduleRunConfig, ScheduleStore};
+use super::trigger_engine::DynTriggerEngine;
 
 #[derive(Debug, Clone)]
 pub struct ScheduleRunJob {
+    pub run_id: String,
     pub schedule_id: String,
     pub schedule_name: String,
     pub run_config: ScheduleRunConfig,
+    pub scheduled_for: chrono::DateTime<chrono::Utc>,
     pub claimed_at: chrono::DateTime<chrono::Utc>,
+    pub was_catch_up: bool,
 }
 
 #[derive(Clone)]
@@ -39,6 +44,13 @@ pub struct ScheduleContext {
     pub agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     pub config: Arc<RwLock<Config>>,
+    pub trigger_engine: DynTriggerEngine,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduleRunLifecycleResult {
+    Terminal(ScheduleRunStatus),
+    BackgroundExecutionInProgress,
 }
 
 #[derive(Clone)]
@@ -55,8 +67,56 @@ impl ScheduleManager {
             let ctx = ctx.clone();
             async move {
                 while let Some(job) = rx.recv().await {
-                    if let Err(e) = run_schedule_job(ctx.clone(), job).await {
-                        tracing::warn!("schedule job failed: {e}");
+                    if let Err(error) = ctx
+                        .schedule_store
+                        .mark_run_started(&job.schedule_id, &job.run_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            "failed to mark schedule run started for {} / {}: {}",
+                            job.schedule_id,
+                            job.run_id,
+                            error
+                        );
+                    }
+                    let schedule_id = job.schedule_id.clone();
+                    let run_id = job.run_id.clone();
+                    match run_schedule_job(ctx.clone(), job).await {
+                        Ok(ScheduleRunLifecycleResult::Terminal(status)) => {
+                            if let Err(error) = ctx
+                                .schedule_store
+                                .mark_run_terminal(&schedule_id, &run_id, status, None)
+                                .await
+                            {
+                                tracing::warn!(
+                                    "failed to mark schedule run terminal state for {} / {}: {}",
+                                    schedule_id,
+                                    run_id,
+                                    error
+                                );
+                            }
+                        }
+                        Ok(ScheduleRunLifecycleResult::BackgroundExecutionInProgress) => {}
+                        Err(e) => {
+                            tracing::warn!("schedule job failed: {e}");
+                            if let Err(error) = ctx
+                                .schedule_store
+                                .mark_run_terminal(
+                                    &schedule_id,
+                                    &run_id,
+                                    ScheduleRunStatus::Failed,
+                                    Some(e.clone()),
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "failed to mark schedule run failed state for {} / {}: {}",
+                                    schedule_id,
+                                    run_id,
+                                    error
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -66,12 +126,16 @@ impl ScheduleManager {
         tokio::spawn({
             let tx = tx.clone();
             let store = ctx.schedule_store.clone();
+            let trigger_engine = ctx.trigger_engine.clone();
             async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(15));
                 loop {
                     ticker.tick().await;
                     let now = Utc::now();
-                    let claimed: Vec<ClaimedScheduleRun> = match store.claim_due_runs(now).await {
+                    let claimed: Vec<ClaimedScheduleRun> = match store
+                        .claim_due_runs_with_engine(now, trigger_engine.as_ref())
+                        .await
+                    {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!("claim_due_runs failed: {e}");
@@ -79,14 +143,29 @@ impl ScheduleManager {
                         }
                     };
                     for c in claimed {
-                        let _ = tx
+                        let schedule_id = c.schedule_id.clone();
+                        let run_id = c.run_id.clone();
+                        if tx
                             .send(ScheduleRunJob {
+                                run_id: c.run_id,
                                 schedule_id: c.schedule_id,
                                 schedule_name: c.schedule_name,
                                 run_config: c.run_config,
-                                claimed_at: now,
+                                scheduled_for: c.scheduled_for,
+                                claimed_at: c.claimed_at,
+                                was_catch_up: c.was_catch_up,
                             })
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            let _ = store
+                                .mark_run_dequeued_without_start(
+                                    &schedule_id,
+                                    &run_id,
+                                    Some("schedule manager is not running".to_string()),
+                                )
+                                .await;
+                        }
                     }
                 }
             }
@@ -131,6 +210,14 @@ fn build_system_prompt(base: &str, enhance: Option<&str>, workspace_path: Option
             }
             prompt.push_str(&segment);
         }
+        if let Some(instruction_segment) =
+            crate::server::instruction_layer::build_instruction_prompt_context(path)
+        {
+            if !prompt.is_empty() {
+                prompt.push_str("\n\n");
+            }
+            prompt.push_str(&instruction_segment);
+        }
     }
     if let Some(segment) = crate::server::app_state::build_env_prompt_context() {
         if !prompt.is_empty() {
@@ -141,7 +228,10 @@ fn build_system_prompt(base: &str, enhance: Option<&str>, workspace_path: Option
     prompt
 }
 
-async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(), String> {
+async fn run_schedule_job(
+    ctx: ScheduleContext,
+    job: ScheduleRunJob,
+) -> Result<ScheduleRunLifecycleResult, String> {
     let now = Utc::now();
     let session_id = Uuid::new_v4().to_string();
     let config_snapshot = ctx.config.read().await.clone();
@@ -172,7 +262,9 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
                     "[schedule:{}] skipping run: no model configured (run_config.model is empty and config.get_model() returned None)",
                     job.schedule_id
                 );
-                return Ok(());
+                return Ok(ScheduleRunLifecycleResult::Terminal(
+                    ScheduleRunStatus::Skipped,
+                ));
             }
         }
     };
@@ -196,7 +288,13 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
         .workspace_path
         .as_deref()
         .map(str::trim)
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            config_snapshot
+                .get_default_work_area_path()
+                .map(|path| crate::core::paths::path_to_display_string(&path))
+        });
     let enhance_prompt = job
         .run_config
         .enhance_prompt
@@ -204,7 +302,11 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
         .map(str::trim)
         .filter(|v| !v.is_empty());
 
-    let system_prompt = build_system_prompt(base_system_prompt, enhance_prompt, workspace_path);
+    let system_prompt = build_system_prompt(
+        base_system_prompt,
+        enhance_prompt,
+        workspace_path.as_deref(),
+    );
 
     let mut session = Session::new(session_id.clone(), model.clone());
     session.title = title;
@@ -212,14 +314,21 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
         "created_by_schedule_id".to_string(),
         job.schedule_id.clone(),
     );
+    session
+        .metadata
+        .insert("schedule_run_id".to_string(), job.run_id.clone());
     session.metadata.insert(
         "base_system_prompt".to_string(),
         base_system_prompt.to_string(),
     );
-    if let Some(path) = workspace_path {
+    if let Some(path) = workspace_path.as_deref() {
         session
             .metadata
             .insert("workspace_path".to_string(), path.to_string());
+        crate::agent::tools::tools::workspace_state::ensure_session_workspace(
+            &session_id,
+            Some(std::path::PathBuf::from(path)),
+        );
     }
     if let Some(effort) = reasoning_effort {
         session
@@ -227,6 +336,7 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
             .insert("reasoning_effort".to_string(), effort.as_str().to_string());
     }
     session.add_message(Message::system(system_prompt));
+    crate::agent::loop_module::runner::refresh_prompt_snapshot(&mut session);
 
     if let Some(task) = job
         .run_config
@@ -243,6 +353,19 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
         .save_session(&session)
         .await
         .map_err(|e| format!("failed to save scheduled session: {e}"))?;
+    if let Err(error) = ctx
+        .schedule_store
+        .bind_run_session(&job.schedule_id, &job.run_id, &session_id)
+        .await
+    {
+        tracing::warn!(
+            "failed to bind session {} to schedule run {} / {}: {}",
+            session_id,
+            job.schedule_id,
+            job.run_id,
+            error
+        );
+    }
     {
         let mut sessions = ctx.sessions_cache.write().await;
         sessions.insert(session_id.clone(), session.clone());
@@ -275,7 +398,9 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
         }
     );
     if !should_execute {
-        return Ok(());
+        return Ok(ScheduleRunLifecycleResult::Terminal(
+            ScheduleRunStatus::Success,
+        ));
     }
 
     // Model is required by the provider trait; if resolution failed we'd have returned earlier.
@@ -288,13 +413,16 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
 
     let session_tx = get_or_create_sender(&ctx.session_event_senders, &session_id).await;
     let schedule_id_for_log = job.schedule_id.clone();
+    let run_id_for_log = job.run_id.clone();
 
     // Insert runner status (for cancellation/status introspection).
     let cancel_token = {
         let mut runners = ctx.agent_runners.write().await;
         if let Some(runner) = runners.get(&session_id) {
             if matches!(runner.status, AgentStatus::Running) {
-                return Ok(());
+                return Ok(ScheduleRunLifecycleResult::Terminal(
+                    ScheduleRunStatus::Skipped,
+                ));
             }
         }
         runners.remove(&session_id);
@@ -327,10 +455,13 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
     let provider = ctx.provider.clone();
     let tools = ctx.tools.clone();
     let storage = ctx.storage.clone();
+    let schedule_store = ctx.schedule_store.clone();
     let skill_manager = ctx.skill_manager.clone();
     let metrics = ctx.metrics_collector.clone();
     let attachment_reader = ctx.session_store.clone();
     let session_id_clone = session_id.clone();
+    let schedule_id_for_state = job.schedule_id.clone();
+    let run_id_for_state = job.run_id.clone();
     let agent_runners_for_status = ctx.agent_runners.clone();
     let sessions_cache = ctx.sessions_cache.clone();
 
@@ -348,6 +479,7 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
             .map(|m| m.content.clone())
             .unwrap_or_default();
         let provider_name = ctx.config.read().await.provider.clone();
+        let memory_background_model = ctx.config.read().await.get_memory_background_model();
 
         let result = run_agent_loop_with_config(
             &mut session,
@@ -365,6 +497,8 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
                 attachment_reader: Some(attachment_reader),
                 metrics_collector: Some(metrics),
                 model_name: Some(model.clone()),
+                fast_model_name: ctx.config.read().await.get_fast_model(),
+                background_model_name: memory_background_model,
                 provider_name: Some(provider_name),
                 reasoning_effort,
                 disabled_tools,
@@ -374,7 +508,7 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
         )
         .await;
 
-        if let Err(ref e) = result {
+        let terminal_status = if let Err(ref e) = result {
             // Persist a visible failure marker so the user can open the scheduled session
             // and understand why it didn't produce output.
             session.add_message(Message::assistant(
@@ -382,16 +516,36 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
                 None,
             ));
             tracing::warn!(
-                "[schedule:{}][session:{}] scheduled run failed: {}",
+                "[schedule:{}][run:{}][session:{}] scheduled run failed: {}",
                 schedule_id_for_log,
+                run_id_for_log,
                 session_id_clone,
                 e
             );
+            if e.to_string().contains("cancelled") {
+                ScheduleRunStatus::Cancelled
+            } else {
+                ScheduleRunStatus::Failed
+            }
         } else {
             tracing::info!(
-                "[schedule:{}][session:{}] scheduled run completed",
+                "[schedule:{}][run:{}][session:{}] scheduled run completed",
                 schedule_id_for_log,
+                run_id_for_log,
                 session_id_clone
+            );
+            ScheduleRunStatus::Success
+        };
+
+        if let Err(error) = schedule_store
+            .mark_run_terminal(&schedule_id_for_state, &run_id_for_state, terminal_status, None)
+            .await
+        {
+            tracing::warn!(
+                "failed to mark schedule run terminal state for {} / {}: {}",
+                schedule_id_for_state,
+                run_id_for_state,
+                error
             );
         }
 
@@ -414,5 +568,5 @@ async fn run_schedule_job(ctx: ScheduleContext, job: ScheduleRunJob) -> Result<(
         }
     });
 
-    Ok(())
+    Ok(ScheduleRunLifecycleResult::BackgroundExecutionInProgress)
 }

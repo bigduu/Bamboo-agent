@@ -4,4 +4,5 @@ use actix_web::{test, web, App};
 use bamboo_agent::server::handlers;
 
 mod core;
+mod usage;
 mod v2;

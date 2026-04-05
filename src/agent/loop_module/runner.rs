@@ -29,7 +29,16 @@ mod task_lifecycle;
 mod tool_execution;
 mod workspace_context;
 
+pub(crate) use crate::agent::core::PromptSnapshot;
 pub use loop_execution::run_agent_loop_with_config;
+
+pub(crate) fn read_prompt_snapshot(session: &Session) -> Option<PromptSnapshot> {
+    session_setup::read_prompt_snapshot(session)
+}
+
+pub(crate) fn refresh_prompt_snapshot(session: &mut Session) {
+    session_setup::refresh_prompt_snapshot(session)
+}
 
 pub(super) fn to_event_token_usage(prompt_tokens: u64, completion_tokens: u64) -> TokenUsage {
     let prompt_tokens_u32 = u32::try_from(prompt_tokens).unwrap_or(u32::MAX);

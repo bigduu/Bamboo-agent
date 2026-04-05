@@ -698,7 +698,7 @@ mod tests {
 
     use crate::agent::core::storage::Storage;
     use crate::agent::core::tools::{Tool, ToolExecutionContext};
-    use crate::agent::core::{AgentEvent, Session};
+    use crate::agent::core::Session;
     use crate::agent::skill::{SkillManager, SkillStoreConfig};
     use crate::core::Config;
 
@@ -778,18 +778,6 @@ mod tests {
 
         async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
             Ok(self.sessions.read().await.get(session_id).cloned())
-        }
-
-        async fn append_event(
-            &self,
-            _session_id: &str,
-            _event: &AgentEvent,
-        ) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        async fn load_events(&self, _session_id: &str) -> std::io::Result<Vec<AgentEvent>> {
-            Ok(Vec::new())
         }
 
         async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {

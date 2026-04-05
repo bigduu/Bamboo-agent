@@ -280,6 +280,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
         let disabled_tools = config_snapshot.disabled_tool_names();
         let disabled_skill_ids = config_snapshot.disabled_skill_ids();
         let provider_name = config_snapshot.provider.clone();
+        let memory_background_model = config_snapshot.get_memory_background_model();
 
         session.model = model.clone();
 
@@ -299,7 +300,9 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
                 storage: Some(storage),
                 attachment_reader: Some(attachment_reader),
                 metrics_collector: Some(metrics),
-                model_name: Some(model),
+                model_name: Some(model.clone()),
+                fast_model_name: config_snapshot.get_fast_model(),
+                background_model_name: memory_background_model,
                 provider_name: Some(provider_name),
                 disabled_tools,
                 disabled_skill_ids,

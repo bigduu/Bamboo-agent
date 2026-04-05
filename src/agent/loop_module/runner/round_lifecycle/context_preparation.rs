@@ -99,12 +99,20 @@ async fn maybe_apply_host_context_compression_with_budget(
         return Ok(false);
     }
 
-    let summary_model = config
-        .fast_model_name
+    let Some(summary_model) = config
+        .background_model_name
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(model_name);
+    else {
+        tracing::warn!(
+            "[{}] {} context compression skipped: no background/fast summarization model configured",
+            session_id,
+            phase_label,
+        );
+        emit_context_compression_status(event_tx, phase_label, "skipped_no_background_model").await;
+        return Ok(false);
+    };
     let existing_summary = session
         .conversation_summary
         .as_ref()

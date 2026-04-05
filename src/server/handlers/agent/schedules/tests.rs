@@ -1,4 +1,4 @@
-use super::validation::{validate_create_interval_seconds, validate_schedule_name};
+use super::validation::{validate_schedule_name, validate_schedule_trigger};
 
 #[test]
 fn validate_schedule_name_trims_and_accepts_non_empty_values() {
@@ -13,13 +13,20 @@ fn validate_schedule_name_rejects_empty_values() {
 }
 
 #[test]
-fn validate_create_interval_seconds_rejects_zero() {
-    let response =
-        validate_create_interval_seconds(0).expect_err("interval should reject zero value");
+fn validate_interval_trigger_rejects_zero() {
+    let response = validate_schedule_trigger(&crate::server::schedules::ScheduleTrigger::Interval {
+        every_seconds: 0,
+        anchor_at: None,
+    })
+    .expect_err("interval should reject zero value");
     assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
 }
 
 #[test]
-fn validate_create_interval_seconds_accepts_positive_values() {
-    validate_create_interval_seconds(1).expect("interval should accept positive value");
+fn validate_interval_trigger_accepts_positive_values() {
+    validate_schedule_trigger(&crate::server::schedules::ScheduleTrigger::Interval {
+        every_seconds: 1,
+        anchor_at: None,
+    })
+    .expect("interval should accept positive value");
 }

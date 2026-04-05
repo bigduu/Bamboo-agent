@@ -60,6 +60,7 @@ fn build_enhanced_system_prompt_appends_workspace_context_before_skills() {
 
 #[test]
 fn build_env_context_includes_prompt_safe_env_metadata_without_secret_values() {
+    let _lock = crate::test_support::env_cache_lock_acquire();
     let config = crate::core::Config {
         env_vars: vec![
             crate::core::EnvVarEntry {
@@ -86,7 +87,9 @@ fn build_env_context_includes_prompt_safe_env_metadata_without_secret_values() {
     assert!(prompt.contains("INTERNAL_API_BASE"));
     assert!(prompt.contains("OpenAI credential"));
     assert!(prompt.contains("Internal API endpoint"));
-    assert!(prompt.contains("These environment variables were explicitly configured by the user inside Bodhi"));
+    assert!(prompt.contains(
+        "These environment variables were explicitly configured by the user inside Bodhi"
+    ));
     assert!(prompt.contains("already available to Bash/tool processes launched by Bodhi"));
     assert!(prompt.contains("secret"));
     assert!(!prompt.contains("super-secret-value"));
@@ -116,6 +119,19 @@ fn prompt_profile_fingerprint_changes_when_components_change() {
 
 #[test]
 fn prompt_profile_exposes_component_flags_and_lengths() {
+    let _lock = crate::test_support::env_cache_lock_acquire();
+    let config = crate::core::Config {
+        env_vars: vec![crate::core::EnvVarEntry {
+            name: "PROFILE_TEST_TOKEN".to_string(),
+            value: "hidden".to_string(),
+            secret: true,
+            value_encrypted: None,
+            description: Some("Prompt profile token".to_string()),
+        }],
+        ..crate::core::Config::default()
+    };
+    config.publish_env_vars();
+
     let (prompt, profile) = build_enhanced_system_prompt_with_profile(
         "Base prompt",
         Some("Extra guidance"),

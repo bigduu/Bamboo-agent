@@ -10,9 +10,9 @@ use crate::agent::tools::guide::{context::GuideBuildContext, EnhancedPromptBuild
 use crate::agent::tools::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::agent::tools::tools::{
     BashOutputTool, BashTool, ConclusionWithOptionsTool, EditTool, ExitPlanModeTool,
-    GetFileInfoTool, GlobTool, GrepTool, JsReplTool, KillShellTool, MemoryNoteTool,
-    NotebookEditTool, ReadTool, RequestPermissionsTool, SleepTool, TaskTool, ToolRegistry,
-    ToolSearchTool, WebFetchTool, WebSearchTool, WorkspaceTool, WriteTool,
+    GetFileInfoTool, GlobTool, GrepTool, JsReplTool, KillShellTool, NotebookEditTool, ReadTool,
+    RequestPermissionsTool, SessionNoteTool, SleepTool, TaskTool, ToolRegistry, ToolSearchTool,
+    WebFetchTool, WebSearchTool, WorkspaceTool, WriteTool,
 };
 use crate::core::Config;
 use tokio::sync::RwLock;
@@ -48,7 +48,7 @@ pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
     "Grep",
     "js_repl",
     "KillShell",
-    "memory_note",
+    "session_note",
     "NotebookEdit",
     "Read",
     "request_permissions",
@@ -64,7 +64,7 @@ pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
 /// Tool names that are accepted as aliases for built-in/server tools but are not
 /// independently listed in `BUILTIN_TOOL_NAMES`/`SERVER_TOOL_NAMES`. Calls to these names are
 /// transparently routed to their canonical counterpart.
-pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 6] = [
+pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 7] = [
     // apply_patch is a patch-only alias for Edit
     ("apply_patch", "Edit"),
     // FileExists is subsumed by GetFileInfo (returns {exists: false} for missing paths)
@@ -72,16 +72,19 @@ pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 6] = [
     // GetCurrentDir + SetWorkspace are subsumed by Workspace
     ("GetCurrentDir", "Workspace"),
     ("SetWorkspace", "Workspace"),
+    // Session note rename
+    ("memory_note", "session_note"),
     // Server tool renames
     ("session_inspector", "recall"),
     ("schedule_tasks", "scheduler"),
 ];
 
-pub const SERVER_TOOL_NAMES: [&str; 6] = [
+pub const SERVER_TOOL_NAMES: [&str; 7] = [
     "SubSession",
     "scheduler",
     "sub_session_manager",
     "recall",
+    "memory",
     "load_skill",
     "read_skill_resource",
 ];
@@ -136,6 +139,7 @@ fn normalize_builtin_alias(name: &str) -> &str {
         "get_file_info" => "GetFileInfo",
         "getFileInfo" => "GetFileInfo",
         "list_directory" => "Glob",
+        "memory_note" => "memory_note",
         "read_file" => "Read",
         "set_workspace" => "SetWorkspace",
         "setWorkspace" => "SetWorkspace",
@@ -302,7 +306,7 @@ impl BuiltinToolExecutor {
         let _ = registry.register(GrepTool::new());
         let _ = registry.register(JsReplTool::new());
         let _ = registry.register(KillShellTool::new());
-        let _ = registry.register(MemoryNoteTool::new());
+        let _ = registry.register(SessionNoteTool::new());
         let _ = registry.register(NotebookEditTool::new());
         let _ = registry.register(ReadTool::new());
         let _ = registry.register(RequestPermissionsTool::new());
@@ -649,6 +653,10 @@ mod tests {
         assert_eq!(
             normalize_tool_ref("default::list_directory"),
             Some("Glob".to_string())
+        );
+        assert_eq!(
+            normalize_tool_ref("default::memory_note"),
+            Some("memory_note".to_string())
         );
         assert_eq!(
             normalize_tool_ref("default::read_file"),

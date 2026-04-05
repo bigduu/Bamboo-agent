@@ -230,6 +230,7 @@ impl Tool for SpawnSessionTool {
 
         // Keep the child prompt minimal; do NOT copy the parent's full system prompt.
         child.add_message(Message::system(CHILD_SYSTEM_PROMPT));
+        crate::agent::loop_module::runner::refresh_prompt_snapshot(&mut child);
         child.add_message(Message::user(format_child_assignment(&parsed)));
         if let Some(parent_task_list) = parent.task_list.clone() {
             child.set_task_list(parent_task_list);

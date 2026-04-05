@@ -1,5 +1,9 @@
+use std::collections::BTreeMap;
+
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
+
+use crate::agent::core::memory_store::MemoryScope;
 
 /// Query parameters for metrics summary requests
 #[derive(Debug, Deserialize)]
@@ -49,6 +53,130 @@ pub struct ForwardMetricsQuery {
     pub limit: Option<u32>,
 }
 
+/// Query parameters for usage breakdown requests
+#[derive(Debug, Deserialize)]
+pub struct MetricsUsageQuery {
+    /// Start date for filtering sessions/events
+    pub start_date: Option<NaiveDate>,
+    /// End date for filtering sessions/events
+    pub end_date: Option<NaiveDate>,
+    /// Filter by model name
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageCountItem {
+    pub name: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillUsageItem {
+    pub skill_id: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerUsageItem {
+    pub server_id: String,
+    pub count: u64,
+    pub unique_tools: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpToolUsageItem {
+    pub alias: String,
+    pub server_id: String,
+    pub tool_name: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetricsUsageBreakdownResponse {
+    pub total_sessions: u64,
+    pub total_tool_calls: u64,
+    pub core_tool_calls: u64,
+    pub skill_load_calls: u64,
+    pub mcp_calls: u64,
+    pub unique_skills: u64,
+    pub unique_mcp_servers: u64,
+    pub unique_mcp_tools: u64,
+    pub sessions_with_skill_loads: u64,
+    pub sessions_with_mcp_calls: u64,
+    #[serde(default)]
+    pub top_core_tools: Vec<UsageCountItem>,
+    #[serde(default)]
+    pub top_skills: Vec<SkillUsageItem>,
+    #[serde(default)]
+    pub top_mcp_servers: Vec<McpServerUsageItem>,
+    #[serde(default)]
+    pub top_mcp_tools: Vec<McpToolUsageItem>,
+}
+
+/// Query parameters for memory metrics summary and timeline requests
+#[derive(Debug, Deserialize)]
+pub struct MemoryMetricsQuery {
+    /// Optional scope filter. When omitted, aggregate across global + project durable memory.
+    pub scope: Option<MemoryScope>,
+    /// Optional project key for project scope queries.
+    pub project_key: Option<String>,
+    /// Number of days to include when requesting timeline views.
+    pub days: Option<u32>,
+    /// End date for timeline aggregation.
+    pub end_date: Option<NaiveDate>,
+    /// Granularity: "daily", "weekly", or "monthly".
+    pub granularity: Option<String>,
+}
+
+/// Aggregated durable memory summary for dashboard display.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryMetricsSummary {
+    /// Scope requested by the caller, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<MemoryScope>,
+    /// Project key requested by the caller, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    /// Total number of durable memories across the selected scope(s).
+    pub total_memories: u64,
+    /// Total number of stale candidates across the selected scope(s).
+    pub stale_candidate_count: u64,
+    /// Number of tracked project scopes contributing to this summary.
+    pub project_count: u64,
+    /// Breakdown of memories by durable memory type.
+    #[serde(default)]
+    pub by_type: BTreeMap<String, u64>,
+    /// Breakdown of memories by durable memory status.
+    #[serde(default)]
+    pub by_status: BTreeMap<String, u64>,
+    /// Breakdown of memories by scope label.
+    #[serde(default)]
+    pub by_scope: BTreeMap<String, u64>,
+    /// Latest observed reindex timestamp across the selected scope(s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reindex_at: Option<String>,
+    /// Latest observed dream timestamp across the selected scope(s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_dream_at: Option<String>,
+}
+
+/// Timeline point for durable memory activity and inventory trends.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryTimelinePoint {
+    /// Label shown in the chart.
+    pub label: String,
+    /// Period start in YYYY-MM-DD format.
+    pub period_start: String,
+    /// Period end in YYYY-MM-DD format.
+    pub period_end: String,
+    /// Number of memories created in the period.
+    pub created_memories: u64,
+    /// Number of memories updated in the period.
+    pub updated_memories: u64,
+    /// Running total memories observed by the end of the period.
+    pub total_memories: u64,
+}
+
 /// Unified summary combining chat and forward metrics
 #[derive(Debug, Serialize)]
 pub struct UnifiedSummary {
@@ -58,6 +186,8 @@ pub struct UnifiedSummary {
     pub forward: crate::agent::metrics::ForwardMetricsSummary,
     /// Combined aggregate metrics
     pub combined: CombinedSummary,
+    /// Current durable memory summary for dashboard display.
+    pub memory: MemoryMetricsSummary,
 }
 
 #[cfg(test)]

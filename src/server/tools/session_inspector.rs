@@ -172,6 +172,7 @@ fn map_index_entry(e: &SessionIndexEntry) -> serde_json::Value {
         "root_session_id": e.root_session_id,
         "spawn_depth": e.spawn_depth,
         "created_by_schedule_id": e.created_by_schedule_id,
+        "schedule_run_id": e.schedule_run_id,
         "created_at": e.created_at,
         "updated_at": e.updated_at,
         "last_activity_at": e.last_activity_at,
