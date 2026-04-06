@@ -28,6 +28,12 @@ pub enum AppError {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
+
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
     #[error("Tool '{0}' not found")]
     ToolNotFound(String),
 
@@ -70,6 +76,8 @@ impl ResponseError for AppError {
     fn status_code(&self) -> StatusCode {
         match self {
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::ToolNotFound(_) => StatusCode::NOT_FOUND,
             AppError::ToolExecutionError(_) => StatusCode::BAD_REQUEST,
             AppError::ToolApprovalRequired(_) => StatusCode::FORBIDDEN,

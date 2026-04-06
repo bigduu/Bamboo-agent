@@ -94,6 +94,23 @@ pub struct DefaultWorkAreaConfig {
     pub path: Option<String>,
 }
 
+/// Access control configuration for password-based UI/API gating.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessControlConfig {
+    /// Whether password protection is enabled.
+    #[serde(default)]
+    pub password_enabled: bool,
+    /// Password hash (hex-encoded). Never expose via API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_hash: Option<String>,
+    /// Salt used for hashing (hex-encoded). Never expose via API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_salt: Option<String>,
+    /// Last update timestamp for auditing / debugging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
 /// Memory and background summarization configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryConfig {
@@ -192,6 +209,10 @@ pub struct Config {
     /// Default work area used when a session has no explicit active workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_work_area: Option<DefaultWorkAreaConfig>,
+
+    /// Access control / password gate configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_control: Option<AccessControlConfig>,
 
     /// Memory/background summarization settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1412,6 +1433,7 @@ impl Config {
             skills: SkillsConfig::default(),
             env_vars: Vec::new(),
             default_work_area: None,
+            access_control: None,
             memory: None,
             mcp: crate::agent::mcp::McpConfig::default(),
             extra: BTreeMap::new(),

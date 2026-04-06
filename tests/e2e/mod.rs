@@ -3,7 +3,6 @@
 //! This module contains comprehensive end-to-end tests for all HTTP endpoints
 //! exposed by the Bamboo Agent server.
 
-mod agent_api;
 mod anthropic;
 mod chat;
 mod commands;

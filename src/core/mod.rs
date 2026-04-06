@@ -18,9 +18,10 @@ pub mod todo;
 
 // Re-export commonly used types
 pub use config::{
-    AnthropicConfig, BodyPatch, BodyPatchOp, Config, CopilotConfig, EnvVarEntry, GeminiConfig,
-    GeneratedValue, ModelRequestRule, OpenAIConfig, PatchValue, ProviderConfigs, ProxyAuth,
-    RequestOverridesConfig, RequestScopeOverride, TemplateExpr, TemplateExprSpec,
+    AccessControlConfig, AnthropicConfig, BodyPatch, BodyPatchOp, Config, CopilotConfig,
+    EnvVarEntry, GeminiConfig, GeneratedValue, ModelRequestRule, OpenAIConfig, PatchValue,
+    ProviderConfigs, ProxyAuth, RequestOverridesConfig, RequestScopeOverride, TemplateExpr,
+    TemplateExprSpec,
 };
 pub use encryption::{decrypt, encrypt};
 pub use keyword_masking::{KeywordEntry, KeywordMaskingConfig, MatchType};

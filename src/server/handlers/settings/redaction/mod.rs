@@ -27,6 +27,14 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
 
     mcp::redact_mcp_for_api(root, config);
 
+    if let Some(access_control) = root
+        .get_mut("access_control")
+        .and_then(|v| v.as_object_mut())
+    {
+        access_control.remove("password_hash");
+        access_control.remove("password_salt");
+    }
+
     // Redact secret env var values.
     if let Some(env_vars) = root.get_mut("env_vars").and_then(|v| v.as_array_mut()) {
         for entry in env_vars.iter_mut() {

@@ -6,7 +6,6 @@
 //! # Handler Organization
 //!
 //! - **agent/** - Core agent API handlers (chat, execute, events, etc.)
-//! - **agent_api/** - Agent management endpoints
 //! - **command.rs** - Command execution endpoints
 //! - **openai/** - OpenAI-compatible API endpoints
 //! - **anthropic/** - Anthropic Claude API endpoints
@@ -35,7 +34,6 @@ pub use agent::{
 };
 
 // Multi-provider API handlers
-pub mod agent_api;
 pub mod anthropic;
 pub mod command;
 pub mod copilot_auth;

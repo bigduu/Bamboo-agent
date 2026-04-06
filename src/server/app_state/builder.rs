@@ -102,9 +102,6 @@ impl AppState {
 
         let config = Arc::new(RwLock::new(config));
 
-        let claude_cli_path: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
-        spawn_claude_cli_discovery_task(claude_cli_path.clone());
-
         let permission_checker = load_permission_checker(&bamboo_home_dir).await;
         let mcp_manager = init_mcp_manager(config.clone());
 
@@ -114,10 +111,6 @@ impl AppState {
         let agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>> =
             Arc::new(RwLock::new(HashMap::new()));
         spawn_runner_cleanup_task(agent_runners.clone(), None);
-
-        let claude_runners: Arc<RwLock<HashMap<String, AgentRunner>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-        spawn_runner_cleanup_task(claude_runners.clone(), Some("claude"));
 
         // Initialize process registry (external process lifecycle)
         let process_registry = Arc::new(ProcessRegistry::new());
@@ -219,9 +212,6 @@ impl AppState {
             agent_runners,
             session_event_senders,
             process_registry,
-            claude_cli_path,
-            claude_runners,
-            claude_session_aliases: Arc::new(RwLock::new(HashMap::new())),
             metrics_bus: None, // Will be set by server if needed
         })
     }
@@ -305,24 +295,6 @@ async fn load_permission_checker(bamboo_home_dir: &PathBuf) -> Arc<PermissionChe
     Arc::new(
         crate::agent::tools::permission::ConfigPermissionChecker::new(Arc::new(permission_config)),
     )
-}
-
-fn spawn_claude_cli_discovery_task(claude_cli_path: Arc<RwLock<Option<String>>>) {
-    // Optional integration: discover Claude Code CLI in the background so server startup
-    // is not blocked by PATH scanning / process invocations (e.g. `claude --version`).
-    tokio::spawn(async move {
-        let discovered = tokio::task::spawn_blocking(crate::claude::try_find_claude_binary)
-            .await
-            .ok()
-            .flatten();
-
-        if let Some(path) = discovered {
-            *claude_cli_path.write().await = Some(path.clone());
-            tracing::info!("Claude Code CLI discovered (found at: {})", path);
-        } else {
-            tracing::warn!("Claude Code CLI not found; Claude integration disabled");
-        }
-    });
 }
 
 fn init_mcp_manager(config: Arc<RwLock<Config>>) -> Arc<McpServerManager> {

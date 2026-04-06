@@ -417,25 +417,8 @@ pub struct AppState {
     /// - sub-session forwarding (child -> parent)
     pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
 
-    /// Registry for tracking external processes (e.g., Claude Code CLI sessions)
+    /// Registry for tracking external processes.
     pub process_registry: Arc<ProcessRegistry>,
-
-    /// Discovered Claude Code CLI binary path (if installed).
-    ///
-    /// This is resolved asynchronously after server startup to avoid blocking
-    /// core endpoints like `/v1/bamboo/setup/status`.
-    pub claude_cli_path: Arc<RwLock<Option<String>>>,
-
-    /// Active Claude Code CLI runners indexed by Claude session ID
-    ///
-    /// These are streamed to clients via SSE under the `/v1/agent/...` endpoints.
-    pub claude_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
-
-    /// Maps client-provided session ids (aliases) to real Claude UUID session ids.
-    ///
-    /// Claude Code requires session ids to be UUIDs, but some clients/tests use
-    /// human-readable strings. We accept those as aliases and generate a UUID.
-    pub claude_session_aliases: Arc<RwLock<HashMap<String, String>>>,
 
     /// Optional metrics bus for event streaming
     ///

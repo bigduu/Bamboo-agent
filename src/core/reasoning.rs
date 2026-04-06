@@ -42,23 +42,13 @@ impl ReasoningEffort {
     /// Return the provider/model-appropriate wire-format string.
     ///
     /// Different model families expect different reasoning effort values:
-    /// - **GPT / o-series**: `low`, `medium`, `high`, `xhigh` (`max` → `xhigh`)
-    /// - **Claude**: `low`, `medium`, `high`, `max` (`xhigh` → `max`)
+    /// - **GPT / o-series / default**: `low`, `medium`, `high`, `xhigh` (`max` → `xhigh`)
     /// - **Gemini**: `low`, `medium`, `high` (`xhigh`/`max` → `high`)
     ///
-    /// This method inspects the model name to determine the correct mapping.
-    /// When the model family is unknown, it falls back to the GPT/OpenAI format.
+    /// This method only keeps the Gemini-specific mapping. All other models use
+    /// the default OpenAI-compatible format.
     pub fn to_wire_format(self, model: &str) -> &'static str {
         let model_lower = model.trim().to_ascii_lowercase();
-
-        if Self::is_claude_model(&model_lower) {
-            return match self {
-                Self::Low => "low",
-                Self::Medium => "medium",
-                Self::High => "high",
-                Self::Xhigh | Self::Max => "max",
-            };
-        }
 
         if Self::is_gemini_model(&model_lower) {
             return match self {
@@ -74,10 +64,6 @@ impl ReasoningEffort {
             Self::Max => "xhigh",
             other => other.as_str(),
         }
-    }
-
-    fn is_claude_model(model_lower: &str) -> bool {
-        model_lower.starts_with("claude") || model_lower.contains("anthropic")
     }
 
     fn is_gemini_model(model_lower: &str) -> bool {
@@ -300,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_format_claude_models_map_xhigh_and_max_to_max() {
+    fn wire_format_claude_models_default_to_openai_values() {
         assert_eq!(
             ReasoningEffort::Low.to_wire_format("claude-3.5-sonnet"),
             "low"
@@ -313,16 +299,18 @@ mod tests {
             ReasoningEffort::High.to_wire_format("claude-sonnet-4"),
             "high"
         );
-        // Both xhigh and max → "max" for Claude
         assert_eq!(
             ReasoningEffort::Xhigh.to_wire_format("claude-sonnet-4"),
-            "max"
+            "xhigh"
         );
         assert_eq!(
             ReasoningEffort::Max.to_wire_format("claude-sonnet-4"),
-            "max"
+            "xhigh"
         );
-        assert_eq!(ReasoningEffort::Max.to_wire_format("claude-3-opus"), "max");
+        assert_eq!(
+            ReasoningEffort::Max.to_wire_format("claude-3-opus"),
+            "xhigh"
+        );
     }
 
     #[test]
@@ -364,11 +352,11 @@ mod tests {
     fn wire_format_case_insensitive_model_matching() {
         assert_eq!(
             ReasoningEffort::Xhigh.to_wire_format("Claude-3.5-Sonnet"),
-            "max"
+            "xhigh"
         );
         assert_eq!(
             ReasoningEffort::Max.to_wire_format("Claude-3.5-Sonnet"),
-            "max"
+            "xhigh"
         );
         assert_eq!(
             ReasoningEffort::Xhigh.to_wire_format("GEMINI-2.5-PRO"),

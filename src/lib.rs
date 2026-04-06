@@ -7,7 +7,6 @@
 //! - Session management and persistence
 //! - Workflow and slash command systems
 //! - Process management for external tools
-//! - Claude Code integration
 //!
 //! # Features
 //!
@@ -63,7 +62,6 @@ pub mod error;
 
 // Placeholder modules (will be populated during migration)
 pub mod agent;
-pub mod claude;
 pub mod commands;
 pub mod core;
 pub mod process;
