@@ -1,13 +1,70 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use actix_files as fs;
-use actix_web::{web, App, HttpServer};
+use actix_web::{
+    dev::{fn_service, ServiceRequest, ServiceResponse},
+    web, App, HttpResponse, HttpServer,
+};
 use tracing::{error, info};
 
 use super::listeners::{build_bind_listeners, build_desktop_listeners, resolve_worker_count};
 use crate::server::app_state::AppState;
 use crate::server::config::{build_cors, build_security_headers};
 use crate::server::routes::{configure_routes, configure_routes_with_rate_limiting};
+use crate::server::services::frontend_package::{
+    ensure_current_frontend_dir_in, has_embedded_frontend_package, resolve_frontend_package_path,
+};
+
+fn canonicalize_static_dir(path: &Path) -> Result<PathBuf, String> {
+    let canonicalized = path
+        .canonicalize()
+        .map_err(|e| format!("Static directory not found: {:?}: {}", path, e))?;
+    if !canonicalized.is_dir() {
+        return Err(format!(
+            "Static path is not a directory: {}",
+            canonicalized.display()
+        ));
+    }
+    Ok(canonicalized)
+}
+
+fn resolve_runtime_static_dir(
+    bamboo_home_dir: &Path,
+    configured_static_dir: Option<PathBuf>,
+) -> Result<Option<PathBuf>, String> {
+    if let Some(path) = configured_static_dir {
+        let canonicalized = canonicalize_static_dir(&path)?;
+        info!("Serving static files from configured directory: {:?}", canonicalized);
+        return Ok(Some(canonicalized));
+    }
+
+    if !has_embedded_frontend_package() && resolve_frontend_package_path(None).is_none() {
+        info!("No embedded or sidecar Bamboo frontend package found; starting API-only server");
+        return Ok(None);
+    }
+
+    let status = ensure_current_frontend_dir_in(bamboo_home_dir, None)
+        .map_err(|e| format!("Failed to prepare Bamboo frontend assets: {e}"))?;
+    let frontend_dir = canonicalize_static_dir(&status.frontend_dir)?;
+
+    if status.refreshed {
+        info!(
+            "Refreshed Bamboo frontend assets at {} (version {}, hash {})",
+            frontend_dir.display(),
+            status.bundled_manifest.frontend_version,
+            status.bundled_manifest.bundle_hash
+        );
+    } else {
+        info!(
+            "Using existing Bamboo frontend assets at {} (version {}, hash {})",
+            frontend_dir.display(),
+            status.bundled_manifest.frontend_version,
+            status.bundled_manifest.bundle_hash
+        );
+    }
+
+    Ok(Some(frontend_dir))
+}
 
 /// Run the unified server in desktop mode (localhost only, no rate limiting)
 ///
@@ -23,6 +80,8 @@ use crate::server::routes::{configure_routes, configure_routes_with_rate_limitin
 pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
     info!("Starting unified server in desktop mode...");
 
+    let static_dir = resolve_runtime_static_dir(&bamboo_home_dir, None)?;
+
     let app_state = web::Data::new(
         AppState::new(bamboo_home_dir.clone())
             .await
@@ -31,10 +90,50 @@ pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
     let workers = resolve_worker_count();
 
     let app_factory = move || {
-        App::new()
+        let mut app = App::new()
             .app_data(app_state.clone())
             .wrap(build_cors("127.0.0.1", port))
-            .configure(configure_routes) // No rate limiting for desktop mode
+            .configure(configure_routes); // No rate limiting for desktop mode
+
+        if let Some(static_path) = &static_dir {
+            let index_file = static_path.join("index.html");
+            info!("Serving static files from: {:?}", static_path);
+            app = app.service(
+                fs::Files::new("/", static_path)
+                    .index_file("index.html")
+                    .prefer_utf8(true)
+                    .disable_content_disposition()
+                    .default_handler(fn_service(move |req: ServiceRequest| {
+                        let index_file = index_file.clone();
+                        async move {
+                            let path = req.path().to_string();
+                            if path.starts_with("/api/")
+                                || path.starts_with("/v1/")
+                                || path.starts_with("/openai/")
+                                || path.starts_with("/anthropic/")
+                                || path.starts_with("/gemini/")
+                            {
+                                let response = HttpResponse::NotFound().finish();
+                                return Ok(ServiceResponse::new(req.into_parts().0, response));
+                            }
+
+                            let (http_req, _) = req.into_parts();
+                            match actix_files::NamedFile::open_async(index_file).await {
+                                Ok(file) => Ok(ServiceResponse::new(
+                                    http_req.clone(),
+                                    file.into_response(&http_req),
+                                )),
+                                Err(_) => Ok(ServiceResponse::new(
+                                    http_req,
+                                    HttpResponse::NotFound().finish(),
+                                )),
+                            }
+                        }
+                    })),
+            );
+        }
+
+        app
     };
 
     let listeners = build_desktop_listeners(port)?;
@@ -72,47 +171,7 @@ pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
 /// * `port` - Port to listen on
 /// * `bind` - Bind address (127.0.0.1, 0.0.0.0, or custom)
 pub async fn run_with_bind(bamboo_home_dir: PathBuf, port: u16, bind: &str) -> Result<(), String> {
-    info!("Starting unified server on {}:{}", bind, port);
-
-    let app_state = web::Data::new(
-        AppState::new(bamboo_home_dir.clone())
-            .await
-            .map_err(|e| format!("Failed to initialize app state: {e}"))?,
-    );
-    let workers = resolve_worker_count();
-
-    let bind_for_cors = bind.to_string();
-    let app_factory = move || {
-        App::new()
-            // Request size limits to prevent DoS
-            // Chat requests may include base64 images; keep limits high enough for local usage.
-            .app_data(web::JsonConfig::default().limit(25 * 1024 * 1024)) // 25MB JSON limit
-            .app_data(web::PayloadConfig::new(30 * 1024 * 1024)) // 30MB payload limit
-            .app_data(app_state.clone())
-            .wrap(build_cors(&bind_for_cors, port))
-            .wrap(build_security_headers())
-            .configure(configure_routes_with_rate_limiting) // Enable rate limiting
-    };
-
-    let listeners = build_bind_listeners(bind, port)?;
-
-    let mut http = HttpServer::new(app_factory).workers(workers);
-    for (idx, listener) in listeners.into_iter().enumerate() {
-        http = http
-            .listen(listener)
-            .map_err(|e| format!("Failed to attach listener #{idx}: {e}"))?;
-    }
-
-    let server = http.run();
-
-    info!("Unified server running on http://{}:{}", bind, port);
-
-    if let Err(e) = server.await {
-        error!("Server error: {}", e);
-        return Err(format!("Server error: {e}"));
-    }
-
-    Ok(())
+    run_with_bind_and_static(bamboo_home_dir, port, bind, None).await
 }
 
 /// Run the unified server with custom bind address and static file serving
@@ -144,24 +203,7 @@ pub async fn run_with_bind_and_static(
 ) -> Result<(), String> {
     info!("Starting unified server on {}:{}...", bind, port);
 
-    // Canonicalize static_dir path to absolute path before passing to workers
-    // This is required for fs::Files to work correctly in multi-threaded environment
-    let static_dir: Option<PathBuf> = match static_dir {
-        Some(path) => {
-            let canonicalized = path
-                .canonicalize()
-                .map_err(|e| format!("Static directory not found: {:?}: {}", path, e))?;
-            if !canonicalized.is_dir() {
-                return Err(format!(
-                    "Static path is not a directory: {}",
-                    canonicalized.display()
-                ));
-            }
-            info!("Serving static files from: {:?}", canonicalized);
-            Some(canonicalized)
-        }
-        None => None,
-    };
+    let static_dir = resolve_runtime_static_dir(&bamboo_home_dir, static_dir)?;
 
     let app_state = web::Data::new(
         AppState::new(bamboo_home_dir.clone())
@@ -182,21 +224,41 @@ pub async fn run_with_bind_and_static(
             .wrap(build_security_headers())
             .configure(configure_routes_with_rate_limiting); // Enable rate limiting
 
-        // Add static file serving if directory is provided
         if let Some(static_path) = &static_dir {
+            let index_file = static_path.join("index.html");
             info!("Serving static files from: {:?}", static_path);
-
-            // Serve static files with security restrictions
-            // Note: fs::Files automatically handles path traversal via canonicalization
-            // Use a specific path for static assets to avoid conflicting with API routes
             app = app.service(
                 fs::Files::new("/", static_path)
                     .index_file("index.html")
                     .prefer_utf8(true)
-                    // Disable listing directories
                     .disable_content_disposition()
-                    // Don't show index file for directories (security)
-                    .disable_content_disposition(),
+                    .default_handler(fn_service(move |req: ServiceRequest| {
+                        let index_file = index_file.clone();
+                        async move {
+                            let path = req.path().to_string();
+                            if path.starts_with("/api/")
+                                || path.starts_with("/v1/")
+                                || path.starts_with("/openai/")
+                                || path.starts_with("/anthropic/")
+                                || path.starts_with("/gemini/")
+                            {
+                                let response = HttpResponse::NotFound().finish();
+                                return Ok(ServiceResponse::new(req.into_parts().0, response));
+                            }
+
+                            let (http_req, _) = req.into_parts();
+                            match actix_files::NamedFile::open_async(index_file).await {
+                                Ok(file) => Ok(ServiceResponse::new(
+                                    http_req.clone(),
+                                    file.into_response(&http_req),
+                                )),
+                                Err(_) => Ok(ServiceResponse::new(
+                                    http_req,
+                                    HttpResponse::NotFound().finish(),
+                                )),
+                            }
+                        }
+                    })),
             );
         }
 
@@ -222,4 +284,26 @@ pub async fn run_with_bind_and_static(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn resolve_runtime_static_dir_uses_configured_dir_when_present() {
+        let bamboo_home = tempdir().unwrap();
+        let static_dir = tempdir().unwrap();
+        std::fs::write(static_dir.path().join("index.html"), "ok").unwrap();
+
+        let resolved = resolve_runtime_static_dir(
+            bamboo_home.path(),
+            Some(static_dir.path().to_path_buf()),
+        )
+        .expect("configured static dir should resolve")
+        .expect("configured static dir should be returned");
+
+        assert_eq!(resolved, static_dir.path().canonicalize().unwrap());
+    }
 }

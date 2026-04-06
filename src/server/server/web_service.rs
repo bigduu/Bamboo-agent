@@ -1,13 +1,14 @@
 use std::path::PathBuf;
 
+use actix_files as fs;
 use actix_web::{web, App, HttpServer};
 use tokio::sync::oneshot;
 use tracing::{error, info};
 
 use super::listeners::DEFAULT_WORKER_COUNT;
 use crate::server::app_state::AppState;
-use crate::server::config::build_cors;
-use crate::server::routes::configure_routes;
+use crate::server::config::{build_cors, build_security_headers};
+use crate::server::routes::{configure_routes, configure_routes_with_rate_limiting};
 
 /// Manageable web service with start/stop lifecycle
 ///
@@ -35,8 +36,13 @@ impl WebService {
         }
     }
 
-    /// Start the web service on the specified port
+    /// Start the web service on the specified port using the default localhost bind.
     pub async fn start(&mut self, port: u16) -> Result<(), String> {
+        self.start_with_bind(port, "127.0.0.1").await
+    }
+
+    /// Start the web service on the specified port and bind address.
+    pub async fn start_with_bind(&mut self, port: u16, bind: &str) -> Result<(), String> {
         info!("Starting web service...");
         if self.server_handle.is_some() {
             return Err("Web service is already running".to_string());
@@ -50,7 +56,9 @@ impl WebService {
                 .await
                 .map_err(|e| format!("Failed to initialize app state: {e}"))?,
         );
-        let bind_addr = "127.0.0.1".to_string();
+        let bind_addr = bind.to_string();
+        let listen_addr = format!("{bind}:{port}");
+        let bind_for_log = bind_addr.clone();
 
         let server = HttpServer::new(move || {
             App::new()
@@ -59,7 +67,7 @@ impl WebService {
                 .configure(configure_routes) // No rate limiting for WebService
         })
         .workers(DEFAULT_WORKER_COUNT)
-        .bind(format!("127.0.0.1:{port}"))
+        .bind(&listen_addr)
         .map_err(|e| format!("Failed to bind server: {e}"))?
         .run();
 
@@ -80,7 +88,88 @@ impl WebService {
         self.server_handle = Some(server_handle);
 
         info!(
-            "Web service started successfully on http://127.0.0.1:{}",
+            "Web service started successfully on http://{}:{}",
+            bind_for_log,
+            port
+        );
+        Ok(())
+    }
+
+    /// Start the web service on the specified port and bind address, serving static files
+    /// alongside the API routes.
+    pub async fn start_with_bind_and_static(
+        &mut self,
+        port: u16,
+        bind: &str,
+        static_dir: PathBuf,
+    ) -> Result<(), String> {
+        info!("Starting web service with static frontend...");
+        if self.server_handle.is_some() {
+            return Err("Web service is already running".to_string());
+        }
+
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        self.port = port;
+
+        let static_dir = static_dir
+            .canonicalize()
+            .map_err(|e| format!("Static directory not found: {:?}: {}", static_dir, e))?;
+        if !static_dir.is_dir() {
+            return Err(format!(
+                "Static path is not a directory: {}",
+                static_dir.display()
+            ));
+        }
+
+        let app_state = web::Data::new(
+            AppState::new(self.bamboo_home_dir.clone())
+                .await
+                .map_err(|e| format!("Failed to initialize app state: {e}"))?,
+        );
+        let bind_addr = bind.to_string();
+        let listen_addr = format!("{bind}:{port}");
+        let bind_for_log = bind_addr.clone();
+
+        let server = HttpServer::new(move || {
+            App::new()
+                .app_data(web::JsonConfig::default().limit(25 * 1024 * 1024))
+                .app_data(web::PayloadConfig::new(30 * 1024 * 1024))
+                .app_data(app_state.clone())
+                .wrap(build_cors(&bind_addr, port))
+                .wrap(build_security_headers())
+                .configure(configure_routes_with_rate_limiting)
+                .service(
+                    fs::Files::new("/", static_dir.clone())
+                        .index_file("index.html")
+                        .prefer_utf8(true)
+                        .disable_content_disposition()
+                        .disable_content_disposition(),
+                )
+        })
+        .workers(DEFAULT_WORKER_COUNT)
+        .bind(&listen_addr)
+        .map_err(|e| format!("Failed to bind server: {e}"))?
+        .run();
+
+        let server_handle = tokio::spawn(async move {
+            tokio::select! {
+                result = server => {
+                    if let Err(e) = result {
+                        error!("Server error: {}", e);
+                    }
+                }
+                _ = &mut shutdown_rx => {
+                    info!("Web service shutdown signal received");
+                }
+            }
+        });
+
+        self.shutdown_tx = Some(shutdown_tx);
+        self.server_handle = Some(server_handle);
+
+        info!(
+            "Web service with static frontend started successfully on http://{}:{}",
+            bind_for_log,
             port
         );
         Ok(())
