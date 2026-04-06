@@ -26,6 +26,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Stage frontend package
+        run: |
+          node scripts/frontend-package.cjs stage
+          test -f frontend_package/lotus-frontend.zip
+          test -f frontend_package/frontend-manifest.json
+
       - name: Set crate version (workflow override)
         if: github.event.inputs.version != '' && github.event.inputs.version != 'latest'
         shell: bash
