@@ -3,6 +3,7 @@
 //! This module is split by domain so each area can evolve independently
 //! without growing a single monolithic file.
 
+mod access_control;
 mod bamboo_config;
 mod env_vars;
 mod keyword_masking;
@@ -11,10 +12,14 @@ mod redaction;
 mod setup;
 mod workflows;
 
+pub use access_control::{
+    enforce_access_password_middleware, get_access_status, update_access_password,
+    verify_access_password,
+};
 pub use bamboo_config::{
-    get_anthropic_model_mapping, get_bamboo_config, get_bamboo_tools, get_model_limit_defaults,
-    get_proxy_auth_status, reset_bamboo_config, set_anthropic_model_mapping, set_bamboo_config,
-    set_proxy_auth, validate_bamboo_config_patch, ProxyAuthPayload,
+    get_bamboo_config, get_bamboo_tools, get_model_limit_defaults, get_proxy_auth_status,
+    reset_bamboo_config, set_bamboo_config, set_proxy_auth, validate_bamboo_config_patch,
+    ProxyAuthPayload,
 };
 pub use env_vars::{delete_env_var, list_env_vars, replace_env_vars, upsert_env_var};
 pub use keyword_masking::{
@@ -52,6 +57,9 @@ pub fn config(cfg: &mut web::ServiceConfig) {
         )
         .route("/bamboo/config", web::get().to(get_bamboo_config))
         .route("/bamboo/config", web::post().to(set_bamboo_config))
+        .route("/bamboo/access/status", web::get().to(get_access_status))
+        .route("/bamboo/access/verify", web::post().to(verify_access_password))
+        .route("/bamboo/access/password", web::post().to(update_access_password))
         .route(
             "/bamboo/model-limits/defaults",
             web::get().to(get_model_limit_defaults),
@@ -93,14 +101,6 @@ pub fn config(cfg: &mut web::ServiceConfig) {
         .route(
             "/bamboo/settings/reload",
             web::post().to(reload_provider_config),
-        )
-        .route(
-            "/bamboo/anthropic-model-mapping",
-            web::get().to(get_anthropic_model_mapping),
-        )
-        .route(
-            "/bamboo/anthropic-model-mapping",
-            web::post().to(set_anthropic_model_mapping),
         )
         .route("/bamboo/tools", web::get().to(get_bamboo_tools))
         // ── Env vars ──────────────────────────────────────────────

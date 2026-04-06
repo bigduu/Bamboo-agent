@@ -1,6 +1,6 @@
 use actix_web::web;
 
-use crate::server::handlers::{anthropic, gemini, openai};
+use crate::server::handlers::{anthropic, gemini, openai, settings};
 
 /// Configure OpenAI-compatible API routes with an explicit prefix (/openai/v1/*)
 ///
@@ -10,6 +10,9 @@ use crate::server::handlers::{anthropic, gemini, openai};
 pub fn openai_prefixed_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/openai/v1")
+            .wrap(actix_web::middleware::from_fn(
+                settings::enforce_access_password_middleware,
+            ))
             .route(
                 "/chat/completions",
                 web::post().to(openai::chat_completions),
@@ -23,6 +26,9 @@ pub fn openai_prefixed_routes(cfg: &mut web::ServiceConfig) {
 pub fn anthropic_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/anthropic/v1")
+            .wrap(actix_web::middleware::from_fn(
+                settings::enforce_access_password_middleware,
+            ))
             .route("/messages", web::post().to(anthropic::messages))
             .route("/complete", web::post().to(anthropic::complete))
             .route("/models", web::get().to(anthropic::get_models)),
@@ -33,6 +39,9 @@ pub fn anthropic_routes(cfg: &mut web::ServiceConfig) {
 pub fn gemini_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/gemini/v1beta")
+            .wrap(actix_web::middleware::from_fn(
+                settings::enforce_access_password_middleware,
+            ))
             .route("/models", web::get().to(gemini::list_models))
             .route(
                 "/models/{model}:generateContent",

@@ -1,51 +1,12 @@
 use actix_web::{dev::HttpServiceFactory, web};
 
-use crate::server::handlers::{
-    agent_api, command, copilot_auth, settings, skill, tools, workspace,
-};
+use crate::server::handlers::{command, copilot_auth, settings, skill, tools, workspace};
 
 fn bamboo_v1_scope() -> impl HttpServiceFactory {
     web::scope("/v1")
-        // Agent management endpoints (Claude Code integration)
-        .service(
-            web::scope("/agent")
-                .route("/projects", web::get().to(agent_api::list_projects))
-                .route("/projects", web::post().to(agent_api::create_project))
-                .route(
-                    "/projects/{project_id}/sessions",
-                    web::get().to(agent_api::get_project_sessions),
-                )
-                .route("/settings", web::get().to(agent_api::get_claude_settings))
-                .route("/settings", web::post().to(agent_api::save_claude_settings))
-                .route(
-                    "/system-prompt",
-                    web::get().to(agent_api::get_system_prompt),
-                )
-                .route(
-                    "/system-prompt",
-                    web::post().to(agent_api::save_system_prompt),
-                )
-                .route(
-                    "/sessions/running",
-                    web::get().to(agent_api::list_running_claude_sessions_stateful),
-                )
-                .route(
-                    "/sessions/execute",
-                    web::post().to(agent_api::execute_claude_code),
-                )
-                .route(
-                    "/sessions/cancel",
-                    web::post().to(agent_api::cancel_claude_execution),
-                )
-                .route(
-                    "/sessions/{session_id}/events",
-                    web::get().to(agent_api::claude_events),
-                )
-                .route(
-                    "/sessions/{session_id}/jsonl",
-                    web::get().to(agent_api::get_session_jsonl),
-                ),
-        )
+        .wrap(actix_web::middleware::from_fn(
+            settings::enforce_access_password_middleware,
+        ))
         // Command routes
         .route("/commands", web::get().to(command::list_commands))
         .route(
@@ -79,6 +40,18 @@ fn bamboo_v1_scope() -> impl HttpServiceFactory {
         .route(
             "/bamboo/config",
             web::post().to(settings::set_bamboo_config),
+        )
+        .route(
+            "/bamboo/access/status",
+            web::get().to(settings::get_access_status),
+        )
+        .route(
+            "/bamboo/access/verify",
+            web::post().to(settings::verify_access_password),
+        )
+        .route(
+            "/bamboo/access/password",
+            web::post().to(settings::update_access_password),
         )
         .route(
             "/bamboo/model-limits/defaults",
@@ -127,14 +100,6 @@ fn bamboo_v1_scope() -> impl HttpServiceFactory {
         .route(
             "/bamboo/settings/reload",
             web::post().to(settings::reload_provider_config),
-        )
-        .route(
-            "/bamboo/anthropic-model-mapping",
-            web::get().to(settings::get_anthropic_model_mapping),
-        )
-        .route(
-            "/bamboo/anthropic-model-mapping",
-            web::post().to(settings::set_anthropic_model_mapping),
         )
         .route("/bamboo/tools", web::get().to(settings::get_bamboo_tools))
         // Env vars routes

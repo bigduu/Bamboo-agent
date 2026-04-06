@@ -1,7 +1,10 @@
-use actix_web::http::StatusCode;
-use actix_web::{test, App};
+use actix_web::http::{header, StatusCode};
+use actix_web::{test, web, App};
+use tempfile::tempdir;
 
 use super::{configure_routes, configure_routes_with_rate_limiting};
+use crate::core::AccessControlConfig;
+use crate::server::AppState;
 
 #[actix_web::test]
 async fn configure_routes_registers_expected_api_prefixes() {
@@ -10,6 +13,7 @@ async fn configure_routes_registers_expected_api_prefixes() {
     for uri in [
         "/api/v1/health",
         "/v1/bamboo/workflows",
+        "/v1/bamboo/access/status",
         "/openai/v1/models",
         "/anthropic/v1/models",
         "/gemini/v1beta/models",
@@ -31,6 +35,7 @@ async fn configure_routes_with_rate_limiting_registers_expected_api_prefixes() {
     for uri in [
         "/api/v1/health",
         "/v1/bamboo/workflows",
+        "/v1/bamboo/access/status",
         "/openai/v1/models",
         "/anthropic/v1/models",
         "/gemini/v1beta/models",
@@ -43,4 +48,123 @@ async fn configure_routes_with_rate_limiting_registers_expected_api_prefixes() {
             "expected route to be registered: {uri}"
         );
     }
+}
+
+#[actix_web::test]
+async fn remote_unverified_request_is_blocked_by_access_middleware() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            password_hash: Some("a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string()),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            updated_at: None,
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[actix_web::test]
+async fn access_bootstrap_endpoints_remain_public() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            password_hash: Some("a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string()),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            updated_at: None,
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    for req in [
+        test::TestRequest::get()
+            .uri("/v1/bamboo/access/status")
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .to_request(),
+        test::TestRequest::get()
+            .uri("/api/v1/health")
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .to_request(),
+    ] {
+        let resp = test::call_service(&app, req).await;
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[actix_web::test]
+async fn verified_cookie_allows_remote_request_through_middleware() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            password_hash: Some("a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string()),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            updated_at: None,
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let verify_req = test::TestRequest::post()
+        .uri("/v1/bamboo/access/verify")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "password": "secret" }))
+        .to_request();
+    let verify_resp = test::call_service(&app, verify_req).await;
+    assert_eq!(verify_resp.status(), StatusCode::OK);
+
+    let set_cookie = verify_resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("verify response should set cookie")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let protected_req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::COOKIE, set_cookie))
+        .to_request();
+    let protected_resp = test::call_service(&app, protected_req).await;
+    assert_eq!(protected_resp.status(), StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn local_request_bypasses_access_middleware() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            password_hash: Some("a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string()),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            updated_at: None,
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
 }

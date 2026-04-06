@@ -1,6 +1,6 @@
 use actix_web::{dev::HttpServiceFactory, web};
 
-use crate::server::handlers::agent;
+use crate::server::handlers::{agent, settings};
 
 fn mcp_scope() -> impl HttpServiceFactory {
     web::scope("/mcp")
@@ -38,6 +38,9 @@ fn mcp_scope() -> impl HttpServiceFactory {
 pub fn agent_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api/v1")
+            .wrap(actix_web::middleware::from_fn(
+                settings::enforce_access_password_middleware,
+            ))
             .route("/chat", web::post().to(agent::chat::handler))
             .route(
                 "/prompt-presets",

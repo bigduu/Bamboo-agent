@@ -26,24 +26,102 @@ use std::collections::HashSet;
 use tracing::info;
 use tracing::warn;
 
-// Keep the default CSP strict (no `unsafe-*`) to avoid weakening XSS protections.
-// If your UI requires inline scripts/styles or eval-like behavior, override with
-// `BAMBOO_CSP` at runtime.
+// Keep the default CSP reasonably strict while remaining compatible with the Lotus UI runtime.
+// Lotus + Ant Design inject runtime styles, so `style-src 'unsafe-inline'` is required for the
+// current frontend bundle. Keep scripts strict (no `unsafe-eval`) and allow operators to override
+// via `BAMBOO_CSP` when needed.
 const DEFAULT_CSP: &str = concat!(
     "default-src 'self'; ",
     "base-uri 'self'; ",
     "object-src 'none'; ",
     "frame-ancestors 'none'; ",
     "script-src 'self'; ",
-    "style-src 'self'; ",
+    "style-src 'self' 'unsafe-inline'; ",
     "img-src 'self' data: https:; ",
     "font-src 'self' data:; ",
-    "connect-src 'self' ws: wss:; ",
+    "connect-src 'self' ws: wss: http://bodhi.bigduu.com:9562 https://bodhi.bigduu.com:9562; ",
     "form-action 'self';"
 );
 
+fn normalize_csp_source_token(token: &str) -> Option<String> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.starts_with("'") {
+        return Some(trimmed.to_string());
+    }
+
+    normalize_origin(trimmed).or_else(|| Some(trimmed.to_string()))
+}
+
+fn parse_csp_connect_src_append(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c == ',' || c.is_ascii_whitespace())
+        .filter_map(normalize_csp_source_token)
+        .collect()
+}
+
+fn append_connect_src_sources(base_csp: &str, extra_sources: &[String]) -> String {
+    if extra_sources.is_empty() {
+        return base_csp.to_string();
+    }
+
+    let connect_src_marker = "connect-src ";
+    if let Some(start) = base_csp.find(connect_src_marker) {
+        let value_start = start + connect_src_marker.len();
+        if let Some(relative_end) = base_csp[value_start..].find(';') {
+            let value_end = value_start + relative_end;
+            let existing_value = base_csp[value_start..value_end].trim();
+            let mut merged = if existing_value.is_empty() {
+                String::new()
+            } else {
+                existing_value.to_string()
+            };
+
+            for source in extra_sources {
+                if merged.split_whitespace().any(|token| token == source) {
+                    continue;
+                }
+                if !merged.is_empty() {
+                    merged.push(' ');
+                }
+                merged.push_str(source);
+            }
+
+            let mut result = String::with_capacity(base_csp.len() + merged.len() + 1);
+            result.push_str(&base_csp[..value_start]);
+            result.push_str(&merged);
+            result.push_str(&base_csp[value_end..]);
+            return result;
+        }
+    }
+
+    base_csp.to_string()
+}
+
+fn resolve_default_csp() -> String {
+    const ENV_KEY: &str = "BAMBOO_CSP_CONNECT_SRC";
+
+    let extra_sources = match std::env::var(ENV_KEY) {
+        Ok(raw) => parse_csp_connect_src_append(&raw),
+        Err(_) => Vec::new(),
+    };
+
+    if !extra_sources.is_empty() {
+        info!(
+            "Extending CSP connect-src via {} with {} source(s)",
+            ENV_KEY,
+            extra_sources.len()
+        );
+    }
+
+    append_connect_src_sources(DEFAULT_CSP, &extra_sources)
+}
+
 fn resolve_csp_header_value(override_value: Option<&str>) -> header::HeaderValue {
-    let csp = override_value.unwrap_or(DEFAULT_CSP);
+    let default_csp = resolve_default_csp();
+    let csp = override_value.unwrap_or(default_csp.as_str());
     match header::HeaderValue::from_str(csp) {
         Ok(v) => v,
         Err(e) => {
@@ -52,7 +130,8 @@ fn resolve_csp_header_value(override_value: Option<&str>) -> header::HeaderValue
                 "Invalid BAMBOO_CSP value ({}); falling back to DEFAULT_CSP",
                 e
             );
-            header::HeaderValue::from_static(DEFAULT_CSP)
+            header::HeaderValue::from_str(default_csp.as_str())
+                .unwrap_or_else(|_| header::HeaderValue::from_static(DEFAULT_CSP))
         }
     }
 }
@@ -219,6 +298,10 @@ fn is_local_dev_origin(o: &str) -> bool {
         || o.starts_with("http://127.0.0.1:")
         || o.starts_with("https://localhost:")
         || o.starts_with("https://127.0.0.1:")
+        || o.starts_with("http://mac.local:")
+        || o.starts_with("https://mac.local:")
+        || o.starts_with("http://bodhi.bigduu.com:")
+        || o.starts_with("https://bodhi.bigduu.com:")
         || o.starts_with("http://[::1]:")
         || o.starts_with("https://[::1]:")
 }
@@ -303,6 +386,7 @@ pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
             .allow_any_origin()
             .allow_any_method()
             .allow_any_header()
+            .supports_credentials()
             .max_age(3600)
     } else if bind_addr == "0.0.0.0" {
         // Docker/sidecar mode.
@@ -355,6 +439,7 @@ pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
             // OpenAI's official JS client sends additional `x-stainless-*` headers which would
             // otherwise fail preflight; keep headers permissive while origin stays locked down.
             .allow_any_header()
+            .supports_credentials()
             .max_age(3600)
     } else {
         // Custom bind address - restrictive by default, but allow explicit env allowlist.
@@ -388,6 +473,7 @@ pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
             })
             .allow_any_method()
             .allow_any_header()
+            .supports_credentials()
             .max_age(3600)
     };
 
@@ -399,16 +485,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_csp_has_no_unsafe_keywords() {
-        assert!(!DEFAULT_CSP.contains("unsafe-inline"));
+    fn default_csp_keeps_scripts_strict_but_allows_inline_styles() {
+        assert!(DEFAULT_CSP.contains("script-src 'self'"));
+        assert!(DEFAULT_CSP.contains("style-src 'self' 'unsafe-inline'"));
         assert!(!DEFAULT_CSP.contains("unsafe-eval"));
+    }
+
+    #[test]
+    fn connect_src_append_normalizes_explicit_origins() {
+        let sources = parse_csp_connect_src_append(
+            "https://bodhi.bigduu.com:9562, http://bodhi.bigduu.com:9562/",
+        );
+        assert_eq!(
+            sources,
+            vec![
+                "https://bodhi.bigduu.com:9562".to_string(),
+                "http://bodhi.bigduu.com:9562".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn append_connect_src_sources_extends_default_csp() {
+        let csp = append_connect_src_sources(
+            DEFAULT_CSP,
+            &[
+                "https://bodhi.bigduu.com:9562".to_string(),
+                "http://bodhi.bigduu.com:9562".to_string(),
+            ],
+        );
+
+        assert!(csp.contains(
+            "connect-src 'self' ws: wss: https://bodhi.bigduu.com:9562 http://bodhi.bigduu.com:9562;"
+        ));
     }
 
     #[test]
     fn invalid_override_falls_back_to_default() {
         // Header values cannot contain newlines.
         let v = resolve_csp_header_value(Some("default-src 'self'\nscript-src 'self'"));
-        assert_eq!(v, header::HeaderValue::from_static(DEFAULT_CSP));
+        let rendered = v.to_str().expect("header should be valid utf-8");
+        assert!(rendered.contains("connect-src 'self' ws: wss: http://bodhi.bigduu.com:9562 https://bodhi.bigduu.com:9562;"));
+        assert!(rendered.contains("style-src 'self' 'unsafe-inline'"));
     }
 
     #[test]
@@ -451,5 +569,14 @@ mod tests {
         assert!(is_allowed_by_allowlist("https://x.example.net", &allow));
         assert!(!is_allowed_by_allowlist("https://example.net", &allow));
         assert!(!is_allowed_by_allowlist("https://evil.com", &allow));
+    }
+
+    #[test]
+    fn local_dev_origin_allows_mac_local_and_bodhi_domain() {
+        assert!(is_local_dev_origin("http://mac.local:1420"));
+        assert!(is_local_dev_origin("https://mac.local:1420"));
+        assert!(is_local_dev_origin("http://bodhi.bigduu.com:9562"));
+        assert!(is_local_dev_origin("https://bodhi.bigduu.com:9562"));
+        assert!(!is_local_dev_origin("http://evil.com:1420"));
     }
 }
