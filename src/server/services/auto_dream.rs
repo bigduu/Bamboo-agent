@@ -12,9 +12,12 @@ use crate::agent::core::{Message, Role, SessionKind};
 use crate::agent::llm::{LLMChunk, LLMProvider, LLMRequestOptions};
 use crate::core::{Config, ReasoningEffort};
 
-use super::consolidation_prompt::build_consolidation_prompt;
+use super::consolidation_prompt::{
+    build_consolidation_prompt, build_consolidation_prompt_with_existing_dream,
+};
 
 const DREAM_RUNTIME_SESSION_ID: &str = "__dream__";
+const DREAM_TRACING_TARGET: &str = "bamboo.auto_dream";
 const DREAM_INTERVAL_SECS: u64 = 60 * 30;
 const DREAM_MAX_SESSIONS: usize = 12;
 const DREAM_MAX_SUMMARY_CHARS: usize = 12_000;
@@ -45,6 +48,12 @@ struct CandidateSessionContext {
     session_id: String,
     project_key: Option<String>,
     topics: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+struct DreamSourceWindow {
+    existing_dream: Option<String>,
+    sessions: Vec<(SessionIndexEntry, Option<String>)>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -118,14 +127,53 @@ async fn collect_candidate_sessions(
     out
 }
 
-async fn collect_candidate_session_contexts(
+async fn resolve_session_project_key(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
+    session_id: &str,
+) -> Option<String> {
+    ctx.storage
+        .load_session(session_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|session| session.metadata.get("workspace_path").cloned())
+        .map(std::path::PathBuf::from)
+        .map(|path| crate::agent::core::memory_store::project_key_from_path(&path))
+        .or_else(|| memory.project_key_for_session(Some(session_id)))
+}
+
+async fn collect_candidate_sessions_for_project(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    project_key: &str,
     since: DateTime<Utc>,
+) -> Vec<(SessionIndexEntry, Option<String>)> {
+    let mut out = Vec::new();
+    for (entry, summary) in collect_candidate_sessions(ctx, since).await {
+        if resolve_session_project_key(ctx, memory, &entry.id)
+            .await
+            .as_deref()
+            != Some(project_key)
+        {
+            continue;
+        }
+        out.push((entry, summary));
+        if out.len() >= DREAM_MAX_SESSIONS {
+            break;
+        }
+    }
+    out
+}
+
+async fn collect_candidate_session_contexts_from_sessions(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    sessions: Vec<(SessionIndexEntry, Option<String>)>,
 ) -> Vec<CandidateSessionContext> {
-    let sessions = collect_candidate_sessions(ctx, since).await;
     let mut out = Vec::new();
     for (entry, summary) in sessions {
+        let project_key = resolve_session_project_key(ctx, memory, &entry.id).await;
         let topics = memory
             .read_session_topics_with_content(&entry.id)
             .await
@@ -145,22 +193,40 @@ async fn collect_candidate_session_contexts(
         }
         out.push(CandidateSessionContext {
             session_id: entry.id.clone(),
-            project_key: ctx
-                .storage
-                .load_session(&entry.id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|session| session.metadata.get("workspace_path").cloned())
-                .map(std::path::PathBuf::from)
-                .map(|path| crate::agent::core::memory_store::project_key_from_path(&path))
-                .or_else(|| memory.project_key_for_session(Some(&entry.id))),
+            project_key,
             entry,
             summary,
             topics,
         });
     }
     out
+}
+
+async fn collect_candidate_session_contexts(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    since: DateTime<Utc>,
+) -> Vec<CandidateSessionContext> {
+    collect_candidate_session_contexts_from_sessions(
+        ctx,
+        memory,
+        collect_candidate_sessions(ctx, since).await,
+    )
+    .await
+}
+
+async fn collect_candidate_session_contexts_for_project(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    project_key: &str,
+    since: DateTime<Utc>,
+) -> Vec<CandidateSessionContext> {
+    collect_candidate_session_contexts_from_sessions(
+        ctx,
+        memory,
+        collect_candidate_sessions_for_project(ctx, memory, project_key, since).await,
+    )
+    .await
 }
 
 fn build_extraction_prompt(sessions: &[CandidateSessionContext]) -> String {
@@ -380,6 +446,75 @@ fn derive_session_outline(session: &crate::agent::core::Session) -> Option<Strin
     (!parts.is_empty()).then(|| parts.join("\n\n---\n\n"))
 }
 
+fn strip_markdown_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("```markdown") {
+        return rest.trim().trim_end_matches("```").trim();
+    }
+    if let Some(rest) = trimmed.strip_prefix("```md") {
+        return rest.trim().trim_end_matches("```").trim();
+    }
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        return rest.trim().trim_end_matches("```").trim();
+    }
+    trimmed
+}
+
+fn strip_dream_notebook_wrapper(raw: &str) -> Option<String> {
+    let trimmed = strip_markdown_fence(raw).trim();
+    let mut lines = trimmed.lines();
+    if lines.next()?.trim() != "# Bamboo Dream Notebook" {
+        return None;
+    }
+
+    let mut body_lines = Vec::new();
+    let mut in_body = false;
+    for line in lines {
+        let trimmed_line = line.trim();
+        if !in_body {
+            if trimmed_line.is_empty() {
+                continue;
+            }
+            if trimmed_line.starts_with("Project key: ")
+                || trimmed_line.starts_with("Last consolidated at: ")
+                || trimmed_line.starts_with("Sessions reviewed: ")
+                || trimmed_line.starts_with("Model: ")
+            {
+                continue;
+            }
+            in_body = true;
+        }
+        body_lines.push(line);
+    }
+
+    let body = body_lines.join("\n").trim().to_string();
+    (!body.is_empty()).then_some(body)
+}
+
+fn normalize_dream_notebook_body(raw: &str) -> Result<String, String> {
+    let mut current = raw.trim().to_string();
+    if current.is_empty() {
+        return Err("auto-dream returned empty content".to_string());
+    }
+
+    for _ in 0..3 {
+        let stripped = strip_markdown_fence(&current).trim().to_string();
+        if stripped.is_empty() {
+            return Err("auto-dream returned empty content".to_string());
+        }
+
+        if let Some(body) = strip_dream_notebook_wrapper(&stripped) {
+            current = body;
+            continue;
+        }
+
+        current = stripped;
+        break;
+    }
+
+    Ok(truncate_chars(current.trim(), DREAM_MAX_SUMMARY_CHARS))
+}
+
 async fn collect_stream_text(
     provider: Arc<dyn LLMProvider>,
     model: &str,
@@ -387,7 +522,7 @@ async fn collect_stream_text(
 ) -> Result<String, String> {
     let messages = vec![
         Message::system(
-            "You are Bamboo's background Dream consolidator. Return only markdown notebook content."
+            "You are Bamboo's background Dream consolidator. Return only the Dream notebook body sections as plain markdown. Do not return an outer '# Bamboo Dream Notebook' title, metadata lines, or markdown fences."
         ),
         Message::user(prompt),
     ];
@@ -425,69 +560,310 @@ async fn collect_stream_text(
     Ok(truncate_chars(trimmed, DREAM_MAX_SUMMARY_CHARS))
 }
 
-async fn run_auto_dream_once_with_store(
+async fn read_existing_dream_for_scope(
+    memory: &MemoryStore,
+    scope: MemoryScope,
+    project_key: Option<&str>,
+) -> Result<Option<String>, String> {
+    match scope {
+        MemoryScope::Global => memory
+            .read_dream_view()
+            .await
+            .map_err(|error| format!("failed to read Dream notebook: {error}")),
+        MemoryScope::Project => {
+            let project_key = project_key
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "project Dream generation requires a project_key".to_string())?;
+            memory
+                .read_project_dream_view(project_key)
+                .await
+                .map_err(|error| {
+                    format!("failed to read project Dream notebook for '{project_key}': {error}")
+                })
+        }
+        MemoryScope::Session => Err("session-scoped Dream generation is not supported".to_string()),
+    }
+}
+
+async fn write_dream_for_scope(
+    memory: &MemoryStore,
+    scope: MemoryScope,
+    project_key: Option<&str>,
+    content: &str,
+) -> Result<std::path::PathBuf, String> {
+    match scope {
+        MemoryScope::Global => memory
+            .write_dream_view(content)
+            .await
+            .map_err(|error| format!("failed to persist Dream notebook: {error}")),
+        MemoryScope::Project => {
+            let project_key = project_key
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "project Dream generation requires a project_key".to_string())?;
+            memory
+                .write_project_dream_view(project_key, content)
+                .await
+                .map_err(|error| {
+                    format!("failed to persist project Dream notebook for '{project_key}': {error}")
+                })
+        }
+        MemoryScope::Session => Err("session-scoped Dream generation is not supported".to_string()),
+    }
+}
+
+fn should_use_dream_refine_mode(memory_cfg: &crate::core::config::MemoryConfig) -> bool {
+    memory_cfg.dream_refine_mode
+}
+
+async fn build_dream_notebook_body(
+    ctx: &AutoDreamContext,
+    model: &str,
+    source_window: &DreamSourceWindow,
+    refine_mode_enabled: bool,
+) -> Result<String, String> {
+    if refine_mode_enabled {
+        tracing::info!(
+            target: DREAM_TRACING_TARGET,
+            event = "refine_attempt",
+            model = model,
+            session_count = source_window.sessions.len(),
+            existing_dream_present = source_window.existing_dream.is_some(),
+            "Attempting refine-mode Dream synthesis"
+        );
+
+        let existing_dream_for_prompt = source_window.existing_dream.as_deref().and_then(|dream| {
+            match normalize_dream_notebook_body(dream) {
+                Ok(body) => Some(body),
+                Err(error) => {
+                    tracing::warn!(
+                        target: DREAM_TRACING_TARGET,
+                        event = "existing_input_normalization_failed",
+                        model = model,
+                        session_count = source_window.sessions.len(),
+                        existing_dream_present = source_window.existing_dream.is_some(),
+                        "[auto_dream] failed to normalize existing Dream input for refine-mode; omitting prior Dream context: {}",
+                        error
+                    );
+                    None
+                }
+            }
+        });
+        let refine_prompt = build_consolidation_prompt_with_existing_dream(
+            existing_dream_for_prompt.as_deref(),
+            &source_window.sessions,
+        );
+        match collect_stream_text(ctx.provider.clone(), model, refine_prompt).await {
+            Ok(raw_body) => match normalize_dream_notebook_body(&raw_body) {
+                Ok(body) => {
+                    tracing::info!(
+                        target: DREAM_TRACING_TARGET,
+                        event = "refine_success",
+                        model = model,
+                        session_count = source_window.sessions.len(),
+                        notebook_body_chars = body.chars().count(),
+                        existing_dream_present = source_window.existing_dream.is_some(),
+                        "Refine-mode Dream synthesis succeeded"
+                    );
+                    return Ok(body);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: DREAM_TRACING_TARGET,
+                        event = "refine_output_normalization_failed",
+                        model = model,
+                        session_count = source_window.sessions.len(),
+                        existing_dream_present = source_window.existing_dream.is_some(),
+                        "[auto_dream] refine-mode Dream output normalization failed; falling back to legacy prompt: {}",
+                        error
+                    );
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    target: DREAM_TRACING_TARGET,
+                    event = "refine_provider_failed",
+                    model = model,
+                    session_count = source_window.sessions.len(),
+                    existing_dream_present = source_window.existing_dream.is_some(),
+                    "[auto_dream] refine-mode Dream synthesis failed; falling back to legacy prompt: {}",
+                    error
+                );
+            }
+        }
+
+        tracing::info!(
+            target: DREAM_TRACING_TARGET,
+            event = "refine_fallback",
+            model = model,
+            session_count = source_window.sessions.len(),
+            existing_dream_present = source_window.existing_dream.is_some(),
+            "Falling back to legacy Dream synthesis prompt"
+        );
+    }
+
+    let prompt = build_consolidation_prompt(&source_window.sessions);
+    let raw_body = collect_stream_text(ctx.provider.clone(), model, prompt).await?;
+    normalize_dream_notebook_body(&raw_body)
+}
+
+async fn run_auto_dream_once_for_scope(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
+    scope: MemoryScope,
+    project_key: Option<&str>,
+    require_auto_dream_enabled: bool,
 ) -> Result<Option<AutoDreamRunResult>, String> {
+    let scope_label = match scope {
+        MemoryScope::Global => "global",
+        MemoryScope::Project => "project",
+        MemoryScope::Session => "session",
+    };
+
     let config_snapshot = ctx.config.read().await.clone();
     let memory_cfg = config_snapshot.memory.clone().unwrap_or_default();
-    if !memory_cfg.auto_dream_enabled {
+    if require_auto_dream_enabled && !memory_cfg.auto_dream_enabled {
+        tracing::info!(
+            target: DREAM_TRACING_TARGET,
+            event = "run_skip",
+            reason = "auto_dream_disabled",
+            scope = scope_label,
+            project_key = project_key.unwrap_or(""),
+            "Skipping Dream generation because auto_dream is disabled"
+        );
         return Ok(None);
     }
 
     let Some(model) = config_snapshot.get_memory_background_model() else {
         tracing::warn!(
+            target: DREAM_TRACING_TARGET,
+            event = "run_skip",
+            reason = "no_background_model",
+            scope = scope_label,
+            project_key = project_key.unwrap_or(""),
             "[auto_dream] skipped: no memory.background_model / provider.fast_model configured"
         );
         return Ok(None);
     };
 
-    let existing = memory
-        .read_dream_view()
-        .await
-        .map_err(|error| format!("failed to read Dream notebook: {error}"))?;
+    let existing = read_existing_dream_for_scope(memory, scope, project_key).await?;
     let since = match existing.as_deref().and_then(parse_last_consolidated_at) {
         Some(ts) => ts,
         None => Utc::now() - chrono::Duration::hours(24),
     };
 
-    let sessions = collect_candidate_sessions(ctx, since).await;
+    let sessions = match scope {
+        MemoryScope::Global => collect_candidate_sessions(ctx, since).await,
+        MemoryScope::Project => {
+            let project_key = project_key
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "project Dream generation requires a project_key".to_string())?;
+            collect_candidate_sessions_for_project(ctx, memory, project_key, since).await
+        }
+        MemoryScope::Session => {
+            return Err("session-scoped Dream generation is not supported".to_string())
+        }
+    };
     if sessions.is_empty() {
+        tracing::info!(
+            target: DREAM_TRACING_TARGET,
+            event = "run_skip",
+            reason = "no_candidate_sessions",
+            scope = scope_label,
+            project_key = project_key.unwrap_or(""),
+            model = model.as_str(),
+            existing_dream_present = existing.is_some(),
+            "Skipping Dream generation because there are no candidate sessions"
+        );
         return Ok(None);
     }
 
-    let prompt = build_consolidation_prompt(&sessions);
-    let notebook_body = collect_stream_text(ctx.provider.clone(), &model, prompt).await?;
-    let final_note = format!(
-        "# Bamboo Dream Notebook\n\nLast consolidated at: {}\nSessions reviewed: {}\nModel: {}\n\n{}\n",
-        Utc::now().to_rfc3339(),
-        sessions.len(),
-        model,
-        notebook_body.trim(),
+    let refine_enabled = should_use_dream_refine_mode(&memory_cfg) && existing.is_some();
+    tracing::info!(
+        target: DREAM_TRACING_TARGET,
+        event = "run_start",
+        scope = scope_label,
+        project_key = project_key.unwrap_or(""),
+        model = model.as_str(),
+        session_count = sessions.len(),
+        existing_dream_present = existing.is_some(),
+        refine_enabled = refine_enabled,
+        require_auto_dream_enabled = require_auto_dream_enabled,
+        "Starting Dream generation run"
     );
 
-    let note_path = memory
-        .write_dream_view(&final_note)
-        .await
-        .map_err(|error| format!("failed to persist Dream notebook: {error}"))?;
+    let source_window = DreamSourceWindow {
+        existing_dream: existing,
+        sessions,
+    };
+    let notebook_body =
+        build_dream_notebook_body(ctx, &model, &source_window, refine_enabled).await?;
+    let final_note = match scope {
+        MemoryScope::Global => format!(
+            "# Bamboo Dream Notebook\n\nLast consolidated at: {}\nSessions reviewed: {}\nModel: {}\n\n{}\n",
+            Utc::now().to_rfc3339(),
+            source_window.sessions.len(),
+            model,
+            notebook_body.trim(),
+        ),
+        MemoryScope::Project => format!(
+            "# Bamboo Dream Notebook\n\nProject key: {}\nLast consolidated at: {}\nSessions reviewed: {}\nModel: {}\n\n{}\n",
+            project_key.unwrap_or_default(),
+            Utc::now().to_rfc3339(),
+            source_window.sessions.len(),
+            model,
+            notebook_body.trim(),
+        ),
+        MemoryScope::Session => unreachable!("session scope handled above"),
+    };
 
-    let extraction_sessions = collect_candidate_session_contexts(ctx, memory, since).await;
+    let note_path = write_dream_for_scope(memory, scope, project_key, &final_note).await?;
+
+    let extraction_sessions = match scope {
+        MemoryScope::Global => collect_candidate_session_contexts(ctx, memory, since).await,
+        MemoryScope::Project => {
+            let project_key = project_key
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "project Dream generation requires a project_key".to_string())?;
+            collect_candidate_session_contexts_for_project(ctx, memory, project_key, since).await
+        }
+        MemoryScope::Session => unreachable!("session scope handled above"),
+    };
     let extracted_count =
         extract_and_persist_durable_candidates(ctx, memory, &model, &extraction_sessions).await?;
+    let notebook_chars = final_note.chars().count();
 
     tracing::info!(
-        "[auto_dream] updated Dream notebook using model '{}' from {} sessions; persisted {} durable candidates",
-        model,
-        sessions.len(),
-        extracted_count
+        target: DREAM_TRACING_TARGET,
+        event = "run_complete",
+        scope = scope_label,
+        project_key = project_key.unwrap_or(""),
+        model = model.as_str(),
+        session_count = source_window.sessions.len(),
+        existing_dream_present = source_window.existing_dream.is_some(),
+        refine_enabled = refine_enabled,
+        notebook_chars = notebook_chars,
+        durable_candidates_persisted = extracted_count,
+        note_path = %note_path.display(),
+        "Dream generation run completed"
     );
 
     Ok(Some(AutoDreamRunResult {
         used_model: model,
-        session_count: sessions.len(),
+        session_count: source_window.sessions.len(),
         note_path,
-        notebook_chars: final_note.chars().count(),
+        notebook_chars,
     }))
+}
+
+async fn run_auto_dream_once_with_store(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+) -> Result<Option<AutoDreamRunResult>, String> {
+    run_auto_dream_once_for_scope(ctx, memory, MemoryScope::Global, None, true).await
 }
 
 pub async fn run_auto_dream_once(
@@ -495,6 +871,26 @@ pub async fn run_auto_dream_once(
 ) -> Result<Option<AutoDreamRunResult>, String> {
     let memory = MemoryStore::with_defaults();
     run_auto_dream_once_with_store(ctx, &memory).await
+}
+
+pub async fn run_project_auto_dream_once(
+    ctx: &AutoDreamContext,
+    project_key: &str,
+) -> Result<Option<AutoDreamRunResult>, String> {
+    let memory = MemoryStore::with_defaults();
+    run_project_auto_dream_once_with_store(ctx, &memory, project_key).await
+}
+
+async fn run_project_auto_dream_once_with_store(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    project_key: &str,
+) -> Result<Option<AutoDreamRunResult>, String> {
+    let project_key = project_key.trim();
+    if project_key.is_empty() {
+        return Err("project Dream generation requires a non-empty project_key".to_string());
+    }
+    run_auto_dream_once_for_scope(ctx, memory, MemoryScope::Project, Some(project_key), false).await
 }
 
 fn parse_last_consolidated_at(note: &str) -> Option<DateTime<Utc>> {
@@ -510,7 +906,12 @@ pub fn spawn_auto_dream_task(ctx: AutoDreamContext) {
         loop {
             ticker.tick().await;
             if let Err(error) = run_auto_dream_once(&ctx).await {
-                tracing::warn!("[auto_dream] run failed: {}", error);
+                tracing::warn!(
+                    target: DREAM_TRACING_TARGET,
+                    event = "run_failed",
+                    "[auto_dream] run failed: {}",
+                    error
+                );
             }
         }
     });
@@ -528,16 +929,32 @@ mod tests {
     use crate::agent::core::storage::Storage;
     use crate::agent::llm::{LLMError, LLMStream};
 
+    #[derive(Debug, Clone)]
+    enum SequenceStep {
+        Response(String),
+        Fail(String),
+    }
+
     #[derive(Clone)]
     struct SequenceProvider {
-        responses: Arc<Mutex<Vec<String>>>,
+        steps: Arc<Mutex<Vec<SequenceStep>>>,
+        prompts: Arc<Mutex<Vec<String>>>,
     }
 
     impl SequenceProvider {
         fn new(responses: Vec<String>) -> Self {
+            Self::from_steps(responses.into_iter().map(SequenceStep::Response).collect())
+        }
+
+        fn from_steps(steps: Vec<SequenceStep>) -> Self {
             Self {
-                responses: Arc::new(Mutex::new(responses)),
+                steps: Arc::new(Mutex::new(steps)),
+                prompts: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn recorded_prompts(&self) -> Vec<String> {
+            self.prompts.lock().expect("lock poisoned").clone()
         }
     }
 
@@ -545,16 +962,22 @@ mod tests {
     impl LLMProvider for SequenceProvider {
         async fn chat_stream(
             &self,
-            _messages: &[Message],
+            messages: &[Message],
             _tools: &[crate::agent::core::tools::ToolSchema],
             _max_output_tokens: Option<u32>,
             _model: &str,
         ) -> Result<LLMStream, LLMError> {
-            let next = self.responses.lock().expect("lock poisoned").remove(0);
-            Ok(Box::pin(stream::iter(vec![
-                Ok(LLMChunk::Token(next)),
-                Ok(LLMChunk::Done),
-            ])))
+            if let Some(prompt) = messages.last().map(|message| message.content.clone()) {
+                self.prompts.lock().expect("lock poisoned").push(prompt);
+            }
+            let next = self.steps.lock().expect("lock poisoned").remove(0);
+            match next {
+                SequenceStep::Response(text) => Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token(text)),
+                    Ok(LLMChunk::Done),
+                ]))),
+                SequenceStep::Fail(error) => Err(LLMError::Stream(error)),
+            }
         }
     }
 
@@ -592,6 +1015,7 @@ mod tests {
             memory: Some(crate::core::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
+                dream_refine_mode: false,
             }),
             ..Config::default()
         }));
@@ -680,20 +1104,23 @@ mod tests {
                 .unwrap(),
         );
         let storage: Arc<dyn Storage> = session_store.clone();
-        let provider: Arc<dyn LLMProvider> =
-            Arc::new(SequenceProvider::new(vec!["{\"candidates\":[]}".to_string()]));
+        let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
+            "{\"candidates\":[]}".to_string(),
+        ]));
         let config = Arc::new(RwLock::new(Config {
             memory: Some(crate::core::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
+                dream_refine_mode: false,
             }),
             ..Config::default()
         }));
 
         let mut session = crate::agent::core::Session::new("session-empty", "model");
-        session
-            .metadata
-            .insert("workspace_path".to_string(), temp_dir.path().to_string_lossy().to_string());
+        session.metadata.insert(
+            "workspace_path".to_string(),
+            temp_dir.path().to_string_lossy().to_string(),
+        );
         session.add_message(Message::user("This should not produce durable memory."));
         storage.save_session(&session).await.expect("save session");
 
@@ -715,9 +1142,10 @@ mod tests {
             Utc::now() - chrono::Duration::hours(24),
         )
         .await;
-        let writes = extract_and_persist_durable_candidates(&context, &memory, "fast-model", &sessions)
-            .await
-            .expect("empty extraction should succeed");
+        let writes =
+            extract_and_persist_durable_candidates(&context, &memory, "fast-model", &sessions)
+                .await
+                .expect("empty extraction should succeed");
         assert_eq!(writes, 0);
 
         let state = memory
@@ -746,6 +1174,7 @@ mod tests {
             memory: Some(crate::core::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
+                dream_refine_mode: false,
             }),
             ..Config::default()
         }));
@@ -823,6 +1252,556 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_project_auto_dream_once_filters_sessions_by_project_and_writes_project_dream() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        crate::core::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+
+        let workspace_a = temp_dir.path().join("workspace-a");
+        let workspace_b = temp_dir.path().join("workspace-b");
+        std::fs::create_dir_all(&workspace_a).expect("workspace a");
+        std::fs::create_dir_all(&workspace_b).expect("workspace b");
+        let project_key_a = crate::agent::core::memory_store::project_key_from_path(&workspace_a);
+
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
+            "## Current durable context\n- Project A signal only\n\n## Cross-session patterns\n- Focus on project A\n\n## Active threads to remember\n- Ship project A\n\n## Stable constraints and preferences\n- Keep scope isolated\n\n## Open risks or questions\n- None".to_string(),
+            "{\"candidates\":[{\"title\":\"Project A prefers concise planning\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"Project A plans should stay concise and scoped.\",\"tags\":[\"planning\"],\"session_id\":\"session-project-a\"}]}".to_string(),
+        ]));
+        let config = Arc::new(RwLock::new(Config {
+            memory: Some(crate::core::config::MemoryConfig {
+                background_model: Some("fast-model".to_string()),
+                auto_dream_enabled: true,
+                dream_refine_mode: false,
+            }),
+            ..Config::default()
+        }));
+
+        let mut session_a = crate::agent::core::Session::new("session-project-a", "model");
+        session_a.title = "Project A session".to_string();
+        session_a.metadata.insert(
+            "workspace_path".to_string(),
+            workspace_a.to_string_lossy().to_string(),
+        );
+        session_a.conversation_summary = Some(crate::agent::core::ConversationSummary::new(
+            "Project A stable direction.",
+            4,
+            160,
+        ));
+        session_a.add_message(Message::user("Keep project A plans concise."));
+        storage
+            .save_session(&session_a)
+            .await
+            .expect("save session a");
+
+        let mut session_b = crate::agent::core::Session::new("session-project-b", "model");
+        session_b.title = "Project B session".to_string();
+        session_b.metadata.insert(
+            "workspace_path".to_string(),
+            workspace_b.to_string_lossy().to_string(),
+        );
+        session_b.conversation_summary = Some(crate::agent::core::ConversationSummary::new(
+            "Project B unrelated direction.",
+            4,
+            160,
+        ));
+        session_b.add_message(Message::user("This is unrelated project B context."));
+        storage
+            .save_session(&session_b)
+            .await
+            .expect("save session b");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .write_session_topic(
+                "session-project-a",
+                "default",
+                "Project A planning should remain concise.",
+            )
+            .await
+            .expect("write session topic a");
+        memory
+            .write_session_topic(
+                "session-project-b",
+                "default",
+                "Project B note that should not be included.",
+            )
+            .await
+            .expect("write session topic b");
+
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            provider,
+            config,
+        };
+        let result = run_project_auto_dream_once_with_store(&context, &memory, &project_key_a)
+            .await
+            .expect("project auto dream should succeed")
+            .expect("project auto dream should produce output");
+        assert_eq!(result.used_model, "fast-model");
+        assert_eq!(result.session_count, 1);
+
+        let project_dream = memory
+            .read_project_dream_view(&project_key_a)
+            .await
+            .expect("read project dream")
+            .expect("project dream should exist");
+        assert!(project_dream.contains("Bamboo Dream Notebook"));
+        assert!(project_dream.contains("Project key: "));
+        assert!(project_dream.contains(&project_key_a));
+        assert!(project_dream.contains("Project A signal only"));
+        assert!(!project_dream.contains("unrelated project B"));
+
+        let global_dream = memory.read_dream_view().await.expect("read global dream");
+        assert!(global_dream.is_none());
+
+        let results = memory
+            .query_scope(
+                MemoryScope::Project,
+                Some(&project_key_a),
+                Some("concise planning"),
+                None,
+                None,
+                &crate::agent::core::memory_store::MemoryQueryOptions {
+                    limit: Some(5),
+                    max_chars: Some(2000),
+                    cursor: None,
+                    include_related: false,
+                },
+            )
+            .await
+            .expect("query should succeed");
+        assert_eq!(results.matched_count, 1);
+        assert_eq!(results.items[0].title, "Project A prefers concise planning");
+    }
+
+    #[tokio::test]
+    async fn run_project_auto_dream_once_returns_none_without_target_project_sessions_and_preserves_existing_dream(
+    ) {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        crate::core::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+
+        let workspace_other = temp_dir.path().join("workspace-other");
+        let workspace_target = temp_dir.path().join("workspace-target");
+        std::fs::create_dir_all(&workspace_other).expect("workspace other");
+        std::fs::create_dir_all(&workspace_target).expect("workspace target");
+        let target_project_key =
+            crate::agent::core::memory_store::project_key_from_path(&workspace_target);
+
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![]));
+        let config = Arc::new(RwLock::new(Config {
+            memory: Some(crate::core::config::MemoryConfig {
+                background_model: Some("fast-model".to_string()),
+                auto_dream_enabled: true,
+                dream_refine_mode: false,
+            }),
+            ..Config::default()
+        }));
+
+        let mut other_session = crate::agent::core::Session::new("session-other-project", "model");
+        other_session.title = "Other project session".to_string();
+        other_session.metadata.insert(
+            "workspace_path".to_string(),
+            workspace_other.to_string_lossy().to_string(),
+        );
+        other_session.conversation_summary = Some(crate::agent::core::ConversationSummary::new(
+            "Other project only.",
+            2,
+            80,
+        ));
+        other_session.add_message(Message::user("Other project context only."));
+        storage
+            .save_session(&other_session)
+            .await
+            .expect("save other session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .write_project_dream_view(
+                &target_project_key,
+                "# Bamboo Dream Notebook\n\nExisting target project dream",
+            )
+            .await
+            .expect("write existing project dream");
+
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            provider,
+            config,
+        };
+        let result = run_project_auto_dream_once_with_store(&context, &memory, &target_project_key)
+            .await
+            .expect("project auto dream without sessions should not error");
+        assert!(result.is_none());
+
+        let project_dream = memory
+            .read_project_dream_view(&target_project_key)
+            .await
+            .expect("read project dream")
+            .expect("existing dream should remain");
+        assert!(project_dream.contains("Existing target project dream"));
+    }
+
+    #[tokio::test]
+    async fn run_project_auto_dream_once_still_runs_when_auto_background_dream_is_disabled() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        crate::core::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+
+        let workspace = temp_dir.path().join("workspace-manual-project-dream");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let project_key = crate::agent::core::memory_store::project_key_from_path(&workspace);
+
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
+            "## Current durable context\n- Manual project dream worked\n\n## Cross-session patterns\n- None\n\n## Active threads to remember\n- None\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None".to_string(),
+            "{\"candidates\":[]}".to_string(),
+        ]));
+        let config = Arc::new(RwLock::new(Config {
+            memory: Some(crate::core::config::MemoryConfig {
+                background_model: Some("fast-model".to_string()),
+                auto_dream_enabled: false,
+                dream_refine_mode: false,
+            }),
+            ..Config::default()
+        }));
+
+        let mut session = crate::agent::core::Session::new("session-manual-project-dream", "model");
+        session.title = "Manual project dream session".to_string();
+        session.metadata.insert(
+            "workspace_path".to_string(),
+            workspace.to_string_lossy().to_string(),
+        );
+        session.conversation_summary = Some(crate::agent::core::ConversationSummary::new(
+            "Manual project dream summary.",
+            3,
+            100,
+        ));
+        session.add_message(Message::user("Generate a project-scoped dream manually."));
+        storage.save_session(&session).await.expect("save session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .write_session_topic(
+                "session-manual-project-dream",
+                "default",
+                "Manual project dream note.",
+            )
+            .await
+            .expect("write session topic");
+
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            provider,
+            config,
+        };
+        let result = run_project_auto_dream_once_with_store(&context, &memory, &project_key)
+            .await
+            .expect(
+                "manual project dream should succeed even when auto background dream is disabled",
+            )
+            .expect("manual project dream should produce output");
+        assert_eq!(result.session_count, 1);
+
+        let project_dream = memory
+            .read_project_dream_view(&project_key)
+            .await
+            .expect("read project dream")
+            .expect("project dream should exist");
+        assert!(project_dream.contains("Manual project dream worked"));
+    }
+
+    #[tokio::test]
+    async fn run_auto_dream_once_refine_mode_includes_existing_dream_in_prompt() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        crate::core::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let provider = SequenceProvider::new(vec![
+            "## Current durable context\n- Refined durable theme\n\n## Cross-session patterns\n- Keep continuity\n\n## Active threads to remember\n- Update the notebook\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None".to_string(),
+            "{\"candidates\":[]}".to_string(),
+        ]);
+        let provider_handle: Arc<dyn LLMProvider> = Arc::new(provider.clone());
+        let config = Arc::new(RwLock::new(Config {
+            memory: Some(crate::core::config::MemoryConfig {
+                background_model: Some("fast-model".to_string()),
+                auto_dream_enabled: true,
+                dream_refine_mode: true,
+            }),
+            ..Config::default()
+        }));
+
+        let workspace = temp_dir.path().join("workspace-refine-mode");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+
+        let mut session = crate::agent::core::Session::new("session-refine-mode", "model");
+        session.title = "Refine mode test".to_string();
+        session.metadata.insert(
+            "workspace_path".to_string(),
+            workspace.to_string_lossy().to_string(),
+        );
+        session.conversation_summary = Some(crate::agent::core::ConversationSummary::new(
+            "Recent session summary for refine mode.",
+            3,
+            120,
+        ));
+        session.add_message(Message::user("Update the dream with the latest thread."));
+        storage.save_session(&session).await.expect("save session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .write_dream_view(
+                "# Bamboo Dream Notebook\n\nLast consolidated at: 2026-04-02T16:00:00Z\nSessions reviewed: 2\nModel: fast-model\n\n## Current durable context\n- Existing durable thread\n",
+            )
+            .await
+            .expect("write existing dream");
+        memory
+            .write_session_topic("session-refine-mode", "default", "Recent session note.")
+            .await
+            .expect("write session topic");
+
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            provider: provider_handle,
+            config,
+        };
+
+        let result = run_auto_dream_once_with_store(&context, &memory)
+            .await
+            .expect("refine-mode auto dream should succeed")
+            .expect("dream output should be produced");
+        assert_eq!(result.session_count, 1);
+
+        let prompts = provider.recorded_prompts();
+        assert!(prompts.len() >= 2);
+        assert!(prompts[0].contains("## Existing Dream notebook"));
+        assert!(prompts[0].contains("Existing durable thread"));
+        assert!(prompts[0].contains("start from it and preserve still-valid durable context"));
+    }
+
+    #[test]
+    fn normalize_dream_notebook_body_strips_nested_fenced_notebook_wrapper() {
+        let raw = r#"
+```md
+# Bamboo Dream Notebook
+
+Last consolidated at: 2026-04-10T06:28:54.680302+00:00
+Sessions reviewed: 2
+Model: gpt-5-mini
+
+## Current durable context
+- Existing durable thread
+
+## Cross-session patterns
+- Keep continuity
+
+## Active threads to remember
+- Update the notebook
+
+## Stable constraints and preferences
+- None
+
+## Open risks or questions
+- None
+```
+"#;
+
+        let normalized = normalize_dream_notebook_body(raw).expect("normalization should succeed");
+        assert!(!normalized.contains("```md"));
+        assert!(!normalized.contains("# Bamboo Dream Notebook"));
+        assert!(normalized.contains("## Current durable context"));
+        assert!(normalized.contains("Existing durable thread"));
+    }
+
+    #[tokio::test]
+    async fn run_auto_dream_once_refine_mode_normalizes_nested_notebook_output() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        crate::core::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let provider = SequenceProvider::new(vec![
+            "```md\n# Bamboo Dream Notebook\n\nLast consolidated at: 2026-04-10T06:28:54.680302+00:00\nSessions reviewed: 2\nModel: gpt-5-mini\n\n## Current durable context\n- Refined durable theme\n\n## Cross-session patterns\n- Keep continuity\n\n## Active threads to remember\n- Update the notebook\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None\n```".to_string(),
+            "{\"candidates\":[]}".to_string(),
+        ]);
+        let provider_handle: Arc<dyn LLMProvider> = Arc::new(provider.clone());
+        let config = Arc::new(RwLock::new(Config {
+            memory: Some(crate::core::config::MemoryConfig {
+                background_model: Some("fast-model".to_string()),
+                auto_dream_enabled: true,
+                dream_refine_mode: true,
+            }),
+            ..Config::default()
+        }));
+
+        let workspace = temp_dir.path().join("workspace-refine-normalize");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+
+        let mut session = crate::agent::core::Session::new("session-refine-normalize", "model");
+        session.title = "Refine normalize test".to_string();
+        session.metadata.insert(
+            "workspace_path".to_string(),
+            workspace.to_string_lossy().to_string(),
+        );
+        session.conversation_summary = Some(crate::agent::core::ConversationSummary::new(
+            "Recent session summary for refine normalization.",
+            3,
+            120,
+        ));
+        session.add_message(Message::user("Normalize the refined dream output."));
+        storage.save_session(&session).await.expect("save session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .write_dream_view(
+                "# Bamboo Dream Notebook\n\nLast consolidated at: 2026-04-02T16:00:00Z\nSessions reviewed: 2\nModel: fast-model\n\n## Current durable context\n- Existing durable thread\n",
+            )
+            .await
+            .expect("write existing dream");
+        memory
+            .write_session_topic(
+                "session-refine-normalize",
+                "default",
+                "Recent session note.",
+            )
+            .await
+            .expect("write session topic");
+
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            provider: provider_handle,
+            config,
+        };
+
+        let result = run_auto_dream_once_with_store(&context, &memory)
+            .await
+            .expect("refine normalize auto dream should succeed")
+            .expect("dream output should be produced");
+        assert_eq!(result.session_count, 1);
+
+        let dream = memory
+            .read_dream_view()
+            .await
+            .expect("read dream view")
+            .expect("dream should exist");
+        assert!(dream.contains("Refined durable theme"));
+        assert!(!dream.contains("```md"));
+        assert_eq!(dream.matches("# Bamboo Dream Notebook").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_auto_dream_once_refine_mode_falls_back_to_legacy_prompt_on_failure() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        crate::core::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let provider = SequenceProvider::from_steps(vec![
+            SequenceStep::Fail("refine prompt failed".to_string()),
+            SequenceStep::Response(
+                "## Current durable context\n- Legacy fallback result\n\n## Cross-session patterns\n- None\n\n## Active threads to remember\n- None\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None".to_string(),
+            ),
+            SequenceStep::Response("{\"candidates\":[]}".to_string()),
+        ]);
+        let provider_handle: Arc<dyn LLMProvider> = Arc::new(provider.clone());
+        let config = Arc::new(RwLock::new(Config {
+            memory: Some(crate::core::config::MemoryConfig {
+                background_model: Some("fast-model".to_string()),
+                auto_dream_enabled: true,
+                dream_refine_mode: true,
+            }),
+            ..Config::default()
+        }));
+
+        let workspace = temp_dir.path().join("workspace-refine-fallback");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+
+        let mut session = crate::agent::core::Session::new("session-refine-fallback", "model");
+        session.title = "Refine fallback test".to_string();
+        session.metadata.insert(
+            "workspace_path".to_string(),
+            workspace.to_string_lossy().to_string(),
+        );
+        session.conversation_summary = Some(crate::agent::core::ConversationSummary::new(
+            "Recent summary for fallback mode.",
+            3,
+            120,
+        ));
+        session.add_message(Message::user("Please update the dream safely."));
+        storage.save_session(&session).await.expect("save session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .write_dream_view(
+                "# Bamboo Dream Notebook\n\nLast consolidated at: 2026-04-02T16:00:00Z\nSessions reviewed: 2\nModel: fast-model\n\n## Current durable context\n- Existing durable thread\n",
+            )
+            .await
+            .expect("write existing dream");
+        memory
+            .write_session_topic("session-refine-fallback", "default", "Recent session note.")
+            .await
+            .expect("write session topic");
+
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            provider: provider_handle,
+            config,
+        };
+
+        let result = run_auto_dream_once_with_store(&context, &memory)
+            .await
+            .expect("fallback auto dream should succeed")
+            .expect("dream output should be produced");
+        assert_eq!(result.session_count, 1);
+
+        let prompts = provider.recorded_prompts();
+        assert!(prompts.len() >= 3);
+        assert!(prompts[0].contains("## Existing Dream notebook"));
+        assert!(!prompts[1].contains("## Existing Dream notebook"));
+        assert!(prompts[1].contains("## Recent sessions"));
+
+        let dream = memory
+            .read_dream_view()
+            .await
+            .expect("read dream view")
+            .expect("dream should exist after fallback");
+        assert!(dream.contains("Legacy fallback result"));
+    }
+
+    #[tokio::test]
     async fn run_auto_dream_once_returns_none_when_disabled() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         crate::core::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
@@ -838,6 +1817,7 @@ mod tests {
             memory: Some(crate::core::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: false,
+                dream_refine_mode: false,
             }),
             ..Config::default()
         }));
@@ -870,6 +1850,7 @@ mod tests {
             memory: Some(crate::core::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
+                dream_refine_mode: false,
             }),
             ..Config::default()
         }));

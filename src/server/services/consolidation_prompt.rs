@@ -15,7 +15,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     out
 }
 
-pub fn build_consolidation_prompt(sessions: &[(SessionIndexEntry, Option<String>)]) -> String {
+fn build_consolidation_prompt_prefix() -> String {
     let mut prompt = String::from("# Bamboo Dream Consolidation\n\n");
     prompt
         .push_str("You are performing a lightweight reflective consolidation pass for Bamboo.\n\n");
@@ -34,11 +34,17 @@ pub fn build_consolidation_prompt(sessions: &[(SessionIndexEntry, Option<String>
     prompt.push_str("3. ## Active threads to remember\n");
     prompt.push_str("4. ## Stable constraints and preferences\n");
     prompt.push_str("5. ## Open risks or questions\n\n");
+    prompt
+}
 
+fn append_recent_sessions_section(
+    prompt: &mut String,
+    sessions: &[(SessionIndexEntry, Option<String>)],
+) {
     prompt.push_str("## Recent sessions\n\n");
     if sessions.is_empty() {
         prompt.push_str("_(no recent sessions supplied)_\n");
-        return prompt;
+        return;
     }
 
     for (index, (entry, summary)) in sessions.iter().take(MAX_INCLUDED_SESSIONS).enumerate() {
@@ -74,7 +80,34 @@ pub fn build_consolidation_prompt(sessions: &[(SessionIndexEntry, Option<String>
             sessions.len()
         ));
     }
+}
 
+pub fn build_consolidation_prompt(sessions: &[(SessionIndexEntry, Option<String>)]) -> String {
+    let mut prompt = build_consolidation_prompt_prefix();
+    append_recent_sessions_section(&mut prompt, sessions);
+    prompt
+}
+
+pub fn build_consolidation_prompt_with_existing_dream(
+    existing_dream: Option<&str>,
+    sessions: &[(SessionIndexEntry, Option<String>)],
+) -> String {
+    let mut prompt = build_consolidation_prompt_prefix();
+    prompt.push_str(
+        "When an existing Dream notebook is provided, start from it and preserve still-valid durable context while updating active threads based on recent sessions. Remove obsolete items only when the recent evidence justifies it.\n\n",
+    );
+    prompt.push_str("## Existing Dream notebook\n\n");
+    if let Some(existing_dream) = existing_dream
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        prompt.push_str("```md\n");
+        prompt.push_str(existing_dream);
+        prompt.push_str("\n```\n\n");
+    } else {
+        prompt.push_str("_(no existing Dream notebook supplied; fall back to synthesizing from recent sessions only)_\n\n");
+    }
+    append_recent_sessions_section(&mut prompt, sessions);
     prompt
 }
 
@@ -119,5 +152,18 @@ mod tests {
         assert!(prompt.contains("session-1"));
         assert!(prompt.contains("Important summary"));
         assert!(prompt.contains("## Current durable context"));
+    }
+
+    #[test]
+    fn refine_consolidation_prompt_includes_existing_dream_and_refine_guidance() {
+        let prompt = build_consolidation_prompt_with_existing_dream(
+            Some("## Current durable context\n- Existing durable thread"),
+            &[(sample_entry("session-2"), Some("Fresh summary".to_string()))],
+        );
+        assert!(prompt.contains("## Existing Dream notebook"));
+        assert!(prompt.contains("Existing durable thread"));
+        assert!(prompt.contains("start from it and preserve still-valid durable context"));
+        assert!(prompt.contains("session-2"));
+        assert!(prompt.contains("Fresh summary"));
     }
 }

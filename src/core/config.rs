@@ -121,6 +121,11 @@ pub struct MemoryConfig {
     /// Whether lightweight automatic Dream-style consolidation should run in the background.
     #[serde(default)]
     pub auto_dream_enabled: bool,
+    /// Whether Dream generation should refine from the existing notebook when present.
+    ///
+    /// This rolls out cumulative/refining Dream synthesis behind an explicit opt-in flag.
+    #[serde(default, alias = "memory_dream_refine_mode")]
+    pub dream_refine_mode: bool,
 }
 
 /// Main configuration structure for Bamboo agent
@@ -1778,6 +1783,7 @@ mod tests {
         config.memory = Some(MemoryConfig {
             background_model: Some("memory-fast".to_string()),
             auto_dream_enabled: false,
+            dream_refine_mode: false,
         });
 
         assert_eq!(
@@ -1830,11 +1836,12 @@ mod tests {
     }
 
     #[test]
-    fn memory_config_preserves_auto_dream_flag() {
+    fn memory_config_preserves_auto_dream_and_dream_refine_flags() {
         let config = Config {
             memory: Some(MemoryConfig {
                 background_model: Some("dream-fast".to_string()),
                 auto_dream_enabled: true,
+                dream_refine_mode: true,
             }),
             ..Config::default()
         };
@@ -1842,11 +1849,9 @@ mod tests {
         let serialized = serde_json::to_string(&config).expect("config should serialize");
         let roundtrip: Config =
             serde_json::from_str(&serialized).expect("config should deserialize");
-        assert!(roundtrip
-            .memory
-            .as_ref()
-            .map(|memory| memory.auto_dream_enabled)
-            .unwrap_or(false));
+        let memory = roundtrip.memory.expect("memory config should exist");
+        assert!(memory.auto_dream_enabled);
+        assert!(memory.dream_refine_mode);
     }
 
     #[test]
