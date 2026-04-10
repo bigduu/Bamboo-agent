@@ -337,6 +337,9 @@ pub struct ResponsesSseParser {
     // Whether this response already surfaced reasoning text via dedicated reasoning events.
     // `response.output_item.done` reasoning payloads are treated as fallback only.
     saw_reasoning_text_stream: bool,
+    // Aggregate of reasoning text actually emitted to downstream consumers.
+    // Used to restore paragraph boundaries when a new reasoning summary stream starts.
+    emitted_reasoning_text: String,
     provider_label: String,
     model: String,
     requested_reasoning_effort: Option<ReasoningEffort>,
@@ -371,6 +374,7 @@ impl ResponsesSseParser {
             reasoning_item_content: HashMap::new(),
             streamed_reasoning_stream_keys: HashSet::new(),
             saw_reasoning_text_stream: false,
+            emitted_reasoning_text: String::new(),
             provider_label: provider_label.to_string(),
             model: model.to_string(),
             requested_reasoning_effort,
@@ -663,15 +667,62 @@ impl ResponsesSseParser {
         Self::text_item_id(v).map(|item_id| format!("item:{item_id}"))
     }
 
+    fn reasoning_summary_stream_starts_new_block(stream_key: &str) -> bool {
+        stream_key.starts_with("summary:") || stream_key.starts_with("item:")
+    }
+
+    fn with_reasoning_block_separator_if_needed(&self, stream_key: &str, chunk: &str) -> String {
+        if chunk.is_empty()
+            || self.emitted_reasoning_text.is_empty()
+            || !Self::reasoning_summary_stream_starts_new_block(stream_key)
+        {
+            return chunk.to_string();
+        }
+
+        let trimmed_output = self
+            .emitted_reasoning_text
+            .trim_end_matches(|c| c == ' ' || c == '\t' || c == '\r');
+        let trailing_newlines = trimmed_output
+            .chars()
+            .rev()
+            .take_while(|&c| c == '\n')
+            .count();
+        let leading_newlines = chunk
+            .chars()
+            .take_while(|&c| c == '\n' || c == '\r')
+            .filter(|&c| c == '\n')
+            .count();
+        let missing_newlines = 2usize.saturating_sub(trailing_newlines + leading_newlines);
+
+        if missing_newlines == 0 {
+            return chunk.to_string();
+        }
+
+        format!("{}{}", "\n".repeat(missing_newlines), chunk)
+    }
+
+    fn track_emitted_reasoning_text(&mut self, chunk: &str) {
+        if !chunk.is_empty() {
+            self.emitted_reasoning_text.push_str(chunk);
+        }
+    }
+
     fn emit_reasoning_delta_with_key(&mut self, stream_key: &str, text: &str) -> Option<LLMChunk> {
         if text.is_empty() {
             return None;
         }
         self.saw_reasoning_text_stream = true;
+        let is_new_stream = !self.streamed_reasoning_stream_keys.contains(stream_key);
         self.streamed_reasoning_stream_keys
             .insert(stream_key.to_string());
-        self.normalize_reasoning_item_chunk(stream_key, text)
-            .map(LLMChunk::ReasoningToken)
+        let emitted = self.normalize_reasoning_item_chunk(stream_key, text)?;
+        let emitted = if is_new_stream {
+            self.with_reasoning_block_separator_if_needed(stream_key, emitted.as_str())
+        } else {
+            emitted
+        };
+        self.track_emitted_reasoning_text(emitted.as_str());
+        Some(LLMChunk::ReasoningToken(emitted))
     }
 
     fn emit_reasoning_done_with_key(&mut self, stream_key: &str, text: &str) -> Option<LLMChunk> {
@@ -679,13 +730,16 @@ impl ResponsesSseParser {
             return None;
         }
         self.saw_reasoning_text_stream = true;
-        if self.streamed_reasoning_stream_keys.contains(stream_key) {
+        let is_new_stream = !self.streamed_reasoning_stream_keys.contains(stream_key);
+        if !is_new_stream {
             return None;
         }
         self.streamed_reasoning_stream_keys
             .insert(stream_key.to_string());
-        self.normalize_reasoning_item_chunk(stream_key, text)
-            .map(LLMChunk::ReasoningToken)
+        let emitted = self.normalize_reasoning_item_chunk(stream_key, text)?;
+        let emitted = self.with_reasoning_block_separator_if_needed(stream_key, emitted.as_str());
+        self.track_emitted_reasoning_text(emitted.as_str());
+        Some(LLMChunk::ReasoningToken(emitted))
     }
 
     fn emit_reasoning_item_text(&mut self, item_id: Option<&str>, text: &str) -> Option<LLMChunk> {
@@ -700,12 +754,13 @@ impl ResponsesSseParser {
 
         if let Some(item_id) = item_id {
             self.streamed_reasoning_item_ids.insert(item_id.to_string());
-            return self
-                .normalize_reasoning_item_chunk(item_id, text)
-                .map(LLMChunk::ReasoningToken);
+            let emitted = self.normalize_reasoning_item_chunk(item_id, text)?;
+            self.track_emitted_reasoning_text(emitted.as_str());
+            return Some(LLMChunk::ReasoningToken(emitted));
         }
 
         self.saw_unkeyed_reasoning_delta = true;
+        self.track_emitted_reasoning_text(text);
         Some(LLMChunk::ReasoningToken(text.to_string()))
     }
 
@@ -717,15 +772,16 @@ impl ResponsesSseParser {
 
         if let Some(item_id) = item_id {
             self.streamed_reasoning_item_ids.insert(item_id.to_string());
-            return self
-                .normalize_reasoning_item_chunk(item_id, text)
-                .map(LLMChunk::ReasoningToken);
+            let emitted = self.normalize_reasoning_item_chunk(item_id, text)?;
+            self.track_emitted_reasoning_text(emitted.as_str());
+            return Some(LLMChunk::ReasoningToken(emitted));
         }
 
         if self.saw_unkeyed_reasoning_delta {
             return None;
         }
 
+        self.track_emitted_reasoning_text(text);
         Some(LLMChunk::ReasoningToken(text.to_string()))
     }
 
@@ -2031,5 +2087,59 @@ mod tests {
             )
             .unwrap();
         assert!(second.is_none());
+    }
+
+    #[test]
+    fn parser_inserts_blank_line_before_new_reasoning_summary_stream_delta() {
+        let mut p = ResponsesSseParser::new();
+
+        let first = p
+            .handle_event(
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_block_1","output_index":0,"summary_index":0,"delta":"I've noticed some strong evidence to analyze."}"#,
+            )
+            .unwrap();
+        match first {
+            Some(LLMChunk::ReasoningToken(text)) => {
+                assert_eq!(text, "I've noticed some strong evidence to analyze.")
+            }
+            other => panic!("expected reasoning token, got {other:?}"),
+        }
+
+        let second = p
+            .handle_event(
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_block_2","output_index":0,"summary_index":1,"delta":"Analyzing dream view functionality"}"#,
+            )
+            .unwrap();
+        match second {
+            Some(LLMChunk::ReasoningToken(text)) => {
+                assert_eq!(text, "\n\nAnalyzing dream view functionality")
+            }
+            other => panic!("expected reasoning token with separator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_does_not_duplicate_blank_line_when_new_reasoning_stream_already_has_separator() {
+        let mut p = ResponsesSseParser::new();
+
+        let _ = p
+            .handle_event(
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_block_3","output_index":0,"summary_index":0,"delta":"First block."}"#,
+            )
+            .unwrap();
+
+        let second = p
+            .handle_event(
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_block_4","output_index":0,"summary_index":1,"delta":"\n\nSecond block."}"#,
+            )
+            .unwrap();
+        match second {
+            Some(LLMChunk::ReasoningToken(text)) => assert_eq!(text, "\n\nSecond block."),
+            other => panic!("expected reasoning token, got {other:?}"),
+        }
     }
 }
