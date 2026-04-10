@@ -6,9 +6,7 @@ use crate::server::handlers::agent::schedules::types::{
     CreateScheduleRequest, PatchScheduleRequest,
 };
 use crate::server::model_config_helper::get_default_model_from_config;
-use crate::server::schedules::{
-    MisfirePolicy, OverlapPolicy, ScheduleRunConfig, ScheduleTrigger,
-};
+use crate::server::schedules::{MisfirePolicy, OverlapPolicy, ScheduleRunConfig, ScheduleTrigger};
 
 pub(super) fn validate_schedule_name(name: &str) -> Result<String, HttpResponse> {
     let trimmed = name.trim();
@@ -31,7 +29,9 @@ fn validate_interval_seconds(interval_seconds: u64) -> Result<(), HttpResponse> 
 
 pub(super) fn validate_schedule_trigger(trigger: &ScheduleTrigger) -> Result<(), HttpResponse> {
     match trigger {
-        ScheduleTrigger::Interval { every_seconds, .. } => validate_interval_seconds(*every_seconds),
+        ScheduleTrigger::Interval { every_seconds, .. } => {
+            validate_interval_seconds(*every_seconds)
+        }
         ScheduleTrigger::Daily {
             hour,
             minute,

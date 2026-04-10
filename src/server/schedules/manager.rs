@@ -538,7 +538,12 @@ async fn run_schedule_job(
         };
 
         if let Err(error) = schedule_store
-            .mark_run_terminal(&schedule_id_for_state, &run_id_for_state, terminal_status, None)
+            .mark_run_terminal(
+                &schedule_id_for_state,
+                &run_id_for_state,
+                terminal_status,
+                None,
+            )
             .await
         {
             tracing::warn!(

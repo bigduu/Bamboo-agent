@@ -60,10 +60,7 @@ pub async fn list_runs_for_schedule(
         .map(ScheduleRunRecordView::from)
         .collect();
 
-    Ok(HttpResponse::Ok().json(ListScheduleRunsResponse {
-        schedule_id,
-        runs,
-    }))
+    Ok(HttpResponse::Ok().json(ListScheduleRunsResponse { schedule_id, runs }))
 }
 
 async fn running_session_ids(state: &web::Data<AppState>) -> HashSet<String> {

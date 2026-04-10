@@ -178,7 +178,9 @@ async fn schedule_tasks_rejects_child_sessions() {
         )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("not allowed inside child sessions"));
+    assert!(err
+        .to_string()
+        .contains("not allowed inside child sessions"));
 }
 
 #[tokio::test]
@@ -239,7 +241,9 @@ async fn schedule_tasks_rejects_invalid_create_arguments() {
         )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("trigger.every_seconds must be > 0"));
+    assert!(err
+        .to_string()
+        .contains("trigger.every_seconds must be > 0"));
 
     let err = tool
         .execute_with_context(
@@ -286,7 +290,12 @@ async fn schedule_tasks_rejects_invalid_patch_arguments() {
         trigger_engine: bamboo_agent::server::schedules::default_trigger_engine(),
     }));
 
-    let tool = ScheduleTasksTool::new(schedule_store.clone(), manager, store.clone(), store.clone());
+    let tool = ScheduleTasksTool::new(
+        schedule_store.clone(),
+        manager,
+        store.clone(),
+        store.clone(),
+    );
 
     let mut caller = Session::new("root-session", "test-model");
     caller.add_message(Message::user("hi".to_string()));
@@ -303,7 +312,9 @@ async fn schedule_tasks_rejects_invalid_patch_arguments() {
         )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("schedule_id must be a non-empty string"));
+    assert!(err
+        .to_string()
+        .contains("schedule_id must be a non-empty string"));
 
     let err = tool
         .execute_with_context(
@@ -316,7 +327,9 @@ async fn schedule_tasks_rejects_invalid_patch_arguments() {
         )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("trigger.every_seconds must be > 0"));
+    assert!(err
+        .to_string()
+        .contains("trigger.every_seconds must be > 0"));
 
     let err = tool
         .execute_with_context(
@@ -396,11 +409,26 @@ async fn schedule_tasks_crud_and_list_sessions() {
     let created_v: serde_json::Value = serde_json::from_str(&created.result).unwrap();
     let schedule_id = created_v["schedule"]["id"].as_str().unwrap().to_string();
     assert!(!schedule_id.is_empty());
-    assert!(created_v["schedule"].get("state").is_some(), "schedule view should expose state");
-    assert_eq!(created_v["schedule"]["timezone"].as_str(), Some("Asia/Shanghai"));
-    assert_eq!(created_v["schedule"]["overlap_policy"].as_str(), Some("skip"));
-    assert_eq!(created_v["schedule"]["misfire_policy"]["type"].as_str(), Some("catch_up_window"));
-    assert_eq!(created_v["schedule"]["trigger"]["type"].as_str(), Some("daily"));
+    assert!(
+        created_v["schedule"].get("state").is_some(),
+        "schedule view should expose state"
+    );
+    assert_eq!(
+        created_v["schedule"]["timezone"].as_str(),
+        Some("Asia/Shanghai")
+    );
+    assert_eq!(
+        created_v["schedule"]["overlap_policy"].as_str(),
+        Some("skip")
+    );
+    assert_eq!(
+        created_v["schedule"]["misfire_policy"]["type"].as_str(),
+        Some("catch_up_window")
+    );
+    assert_eq!(
+        created_v["schedule"]["trigger"]["type"].as_str(),
+        Some("daily")
+    );
 
     // List schedules should include it.
     let listed = tool
@@ -412,14 +440,9 @@ async fn schedule_tasks_crud_and_list_sessions() {
         .unwrap();
     let listed_v: serde_json::Value = serde_json::from_str(&listed.result).unwrap();
     assert!(
-        listed_v["schedules"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|s| {
-                s["id"].as_str() == Some(schedule_id.as_str())
-                    && s.get("state").is_some()
-            }),
+        listed_v["schedules"].as_array().unwrap().iter().any(|s| {
+            s["id"].as_str() == Some(schedule_id.as_str()) && s.get("state").is_some()
+        }),
         "schedule missing from list: {}",
         listed.result
     );
@@ -442,10 +465,19 @@ async fn schedule_tasks_crud_and_list_sessions() {
         .unwrap();
     let patched_v: serde_json::Value = serde_json::from_str(&patched.result).unwrap();
     assert_eq!(patched_v["schedule"]["enabled"].as_bool(), Some(true));
-    assert!(patched_v["schedule"].get("state").is_some(), "patched schedule should expose state");
+    assert!(
+        patched_v["schedule"].get("state").is_some(),
+        "patched schedule should expose state"
+    );
     assert_eq!(patched_v["schedule"]["timezone"].as_str(), Some("UTC"));
-    assert_eq!(patched_v["schedule"]["misfire_policy"]["type"].as_str(), Some("skip"));
-    assert_eq!(patched_v["schedule"]["overlap_policy"].as_str(), Some("queue_one"));
+    assert_eq!(
+        patched_v["schedule"]["misfire_policy"]["type"].as_str(),
+        Some("skip")
+    );
+    assert_eq!(
+        patched_v["schedule"]["overlap_policy"].as_str(),
+        Some("queue_one")
+    );
     assert!(matches!(
         patched_v["schedule"]["trigger"]["type"].as_str(),
         Some("interval")
@@ -572,7 +604,10 @@ async fn schedule_run_non_auto_execute_completes_with_success_accounting() {
 
     let entries = store.list_index_entries().await;
     assert_eq!(entries.len(), 1, "expected one session, got: {entries:?}");
-    assert_eq!(entries[0].schedule_run_id.as_deref(), Some(claimed.run_id.as_str()));
+    assert_eq!(
+        entries[0].schedule_run_id.as_deref(),
+        Some(claimed.run_id.as_str())
+    );
 
     let updated = schedule_store.get_schedule(&created.id).await.unwrap();
     assert_eq!(updated.state.running_run_count, 0);
@@ -776,7 +811,10 @@ async fn schedule_auto_execute_keeps_running_until_background_completion() {
         .get_run_record(&claimed.run_id)
         .await
         .expect("run record should exist while running");
-    assert_eq!(running_record.status, bamboo_agent::server::schedules::ScheduleRunStatus::Running);
+    assert_eq!(
+        running_record.status,
+        bamboo_agent::server::schedules::ScheduleRunStatus::Running
+    );
     assert!(running_record.started_at.is_some());
     assert!(running_record.session_id.is_some());
 
@@ -800,7 +838,10 @@ async fn schedule_auto_execute_keeps_running_until_background_completion() {
         .get_run_record(&claimed.run_id)
         .await
         .expect("run record should still exist after completion");
-    assert_eq!(completed_record.status, bamboo_agent::server::schedules::ScheduleRunStatus::Success);
+    assert_eq!(
+        completed_record.status,
+        bamboo_agent::server::schedules::ScheduleRunStatus::Success
+    );
     assert!(completed_record.completed_at.is_some());
     assert!(completed_record.execution_duration_ms.is_some());
 }

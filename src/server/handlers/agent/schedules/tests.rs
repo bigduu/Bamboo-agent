@@ -14,11 +14,12 @@ fn validate_schedule_name_rejects_empty_values() {
 
 #[test]
 fn validate_interval_trigger_rejects_zero() {
-    let response = validate_schedule_trigger(&crate::server::schedules::ScheduleTrigger::Interval {
-        every_seconds: 0,
-        anchor_at: None,
-    })
-    .expect_err("interval should reject zero value");
+    let response =
+        validate_schedule_trigger(&crate::server::schedules::ScheduleTrigger::Interval {
+            every_seconds: 0,
+            anchor_at: None,
+        })
+        .expect_err("interval should reject zero value");
     assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
 }
 

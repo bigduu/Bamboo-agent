@@ -29,7 +29,12 @@ pub async fn create_schedule(
 
     let created = state
         .schedule_store
-        .create_schedule_with_definition(name, req.enabled, req.run_config.clone(), resolved.definition)
+        .create_schedule_with_definition(
+            name,
+            req.enabled,
+            req.run_config.clone(),
+            resolved.definition,
+        )
         .await
         .map_err(|error| internal_server_error("create schedule", error))?;
 
@@ -58,7 +63,13 @@ pub async fn patch_schedule(
 
     let updated = state
         .schedule_store
-        .patch_schedule_with_definition(&id, name, req.enabled, req.run_config.clone(), resolved.definition)
+        .patch_schedule_with_definition(
+            &id,
+            name,
+            req.enabled,
+            req.run_config.clone(),
+            resolved.definition,
+        )
         .await
         .map_err(|error| internal_server_error("patch schedule", error))?;
 

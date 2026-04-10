@@ -213,7 +213,13 @@ impl Tool for ScheduleTasksTool {
                         "name must be a non-empty string".to_string(),
                     ));
                 }
-                if matches!(trigger, ScheduleTrigger::Interval { every_seconds: 0, .. }) {
+                if matches!(
+                    trigger,
+                    ScheduleTrigger::Interval {
+                        every_seconds: 0,
+                        ..
+                    }
+                ) {
                     return Err(ToolError::InvalidArguments(
                         "trigger.every_seconds must be > 0".to_string(),
                     ));
@@ -278,7 +284,13 @@ impl Tool for ScheduleTasksTool {
                         "schedule_id must be a non-empty string".to_string(),
                     ));
                 }
-                if matches!(trigger, Some(ScheduleTrigger::Interval { every_seconds: 0, .. })) {
+                if matches!(
+                    trigger,
+                    Some(ScheduleTrigger::Interval {
+                        every_seconds: 0,
+                        ..
+                    })
+                ) {
                     return Err(ToolError::InvalidArguments(
                         "trigger.every_seconds must be > 0".to_string(),
                     ));

@@ -209,12 +209,14 @@ impl ScheduleEntry {
         {
             return Some(*anchor_at);
         }
-        self.state.last_scheduled_at.or_else(|| {
-            self.state
-                .next_fire_at
-                .map(|next| next - Duration::seconds(every_seconds as i64))
-        })
-        .or(Some(self.created_at))
+        self.state
+            .last_scheduled_at
+            .or_else(|| {
+                self.state
+                    .next_fire_at
+                    .map(|next| next - Duration::seconds(every_seconds as i64))
+            })
+            .or(Some(self.created_at))
     }
 
     pub fn to_schedule_spec(&self) -> ScheduleSpec {
@@ -338,7 +340,10 @@ fn compute_initial_next_run_at(
         .ok_or_else(|| other_io_error("schedule has no next run within configured window"))
 }
 
-fn normalize_trigger_for_storage(trigger: ScheduleTrigger, anchor_at: DateTime<Utc>) -> ScheduleTrigger {
+fn normalize_trigger_for_storage(
+    trigger: ScheduleTrigger,
+    anchor_at: DateTime<Utc>,
+) -> ScheduleTrigger {
     match trigger {
         ScheduleTrigger::Interval {
             every_seconds,
@@ -807,7 +812,8 @@ impl ScheduleStore {
             now,
         );
         let timezone = normalize_optional_string(definition.timezone);
-        let next_fire_at = compute_initial_next_run_at(&trigger, timezone.as_deref(), &window, now)?;
+        let next_fire_at =
+            compute_initial_next_run_at(&trigger, timezone.as_deref(), &window, now)?;
         let entry = ScheduleEntry {
             id: id.clone(),
             name,
@@ -876,7 +882,10 @@ impl ScheduleStore {
             }
 
             let trigger = normalize_trigger_for_storage(
-                definition.trigger.clone().unwrap_or_else(|| existing.trigger.clone()),
+                definition
+                    .trigger
+                    .clone()
+                    .unwrap_or_else(|| existing.trigger.clone()),
                 existing.derived_anchor_at().unwrap_or(now),
             );
             existing.trigger = trigger.clone();
@@ -920,7 +929,9 @@ impl ScheduleStore {
         self.update_index(|index| {
             let deleted = index.schedules.remove(id).is_some();
             if deleted {
-                index.run_records.retain(|_, record| record.schedule_id != id);
+                index
+                    .run_records
+                    .retain(|_, record| record.schedule_id != id);
             }
             Ok(deleted)
         })
@@ -1078,7 +1089,9 @@ impl ScheduleStore {
             let record = index
                 .run_records
                 .entry(run_id.to_string())
-                .or_insert_with(|| make_fallback_run_record(run_id, schedule_id, now, ScheduleRunStatus::Queued));
+                .or_insert_with(|| {
+                    make_fallback_run_record(run_id, schedule_id, now, ScheduleRunStatus::Queued)
+                });
             update_run_record_started(record, now, None);
             Ok(())
         })
@@ -1096,7 +1109,9 @@ impl ScheduleStore {
             let record = index
                 .run_records
                 .entry(run_id.to_string())
-                .or_insert_with(|| make_fallback_run_record(run_id, schedule_id, now, ScheduleRunStatus::Running));
+                .or_insert_with(|| {
+                    make_fallback_run_record(run_id, schedule_id, now, ScheduleRunStatus::Running)
+                });
             record.session_id = Some(session_id.to_string());
             Ok(())
         })
@@ -1142,8 +1157,16 @@ impl ScheduleStore {
             let record = index
                 .run_records
                 .entry(run_id.to_string())
-                .or_insert_with(|| make_fallback_run_record(run_id, schedule_id, now, ScheduleRunStatus::Queued));
-            update_run_record_terminal(record, ScheduleRunStatus::Missed, now, outcome_reason, None);
+                .or_insert_with(|| {
+                    make_fallback_run_record(run_id, schedule_id, now, ScheduleRunStatus::Queued)
+                });
+            update_run_record_terminal(
+                record,
+                ScheduleRunStatus::Missed,
+                now,
+                outcome_reason,
+                None,
+            );
             Ok(())
         })
         .await
@@ -1353,7 +1376,10 @@ mod tests {
 
         let updated = store.get_schedule(&created.id).await.unwrap();
         assert_eq!(updated.state.last_scheduled_at, Some(now));
-        assert_eq!(updated.state.next_fire_at, Some(now + Duration::seconds(300)));
+        assert_eq!(
+            updated.state.next_fire_at,
+            Some(now + Duration::seconds(300))
+        );
     }
 
     #[tokio::test]
@@ -1389,7 +1415,10 @@ mod tests {
                 second: 0
             } if days == vec![1, 15]
         ));
-        assert!(created.state.next_fire_at.is_some_and(|next| next > created.created_at));
+        assert!(created
+            .state
+            .next_fire_at
+            .is_some_and(|next| next > created.created_at));
     }
 
     #[tokio::test]
@@ -1663,7 +1692,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .mark_run_terminal(&created.id, "run-cancelled", ScheduleRunStatus::Cancelled, None)
+            .mark_run_terminal(
+                &created.id,
+                "run-cancelled",
+                ScheduleRunStatus::Cancelled,
+                None,
+            )
             .await
             .unwrap();
 
