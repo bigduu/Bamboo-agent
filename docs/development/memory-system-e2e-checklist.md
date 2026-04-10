@@ -68,6 +68,32 @@ git init
 
 ## Automated Validation Commands
 
+### Clean-room acceptance shortcut
+
+For the current Phase 3 memory acceptance surface, you can run the repeatable targeted clean-room script first:
+
+```bash
+cd bamboo
+./scripts/memory-clean-room-acceptance.sh
+```
+
+What this covers:
+
+- targeted Auto Dream / refine-mode regression tests
+- targeted prompt-context external memory injection coverage
+- cross-project isolation regression
+- targeted system prompt snapshot parsing
+- handler-level system prompt snapshot response
+- real HTTP route validation for `GET /api/v1/sessions/{session_id}/system-prompt`
+
+What this does **not** cover:
+
+- live provider-backed Dream generation quality
+- real background extraction against your configured model
+- Lotus UI rendering / settings persistence
+
+Use the manual Layer 5 and Layer 6 steps below when you need live-provider or UI validation.
+
 ### Backend
 
 Run these first:

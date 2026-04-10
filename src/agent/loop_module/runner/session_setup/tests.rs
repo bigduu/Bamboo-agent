@@ -319,6 +319,30 @@ fn refresh_prompt_snapshot_from_session_preserves_multi_topic_memory_split_field
 }
 
 #[test]
+fn refresh_prompt_snapshot_from_session_supports_global_dream_fallback_heading() {
+    let mut session = Session::new("snapshot-memory-fallback-dream", "gpt-test");
+    session
+        .metadata
+        .insert("base_system_prompt".to_string(), "Base prompt".to_string());
+    session.add_message(Message::system(
+        "Base prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\n### Global Dream Summary (fallback)\n````md\nDream fallback content\n````\n\n### Session Memory Note (markdown)\n````md\nSession note content\n````\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->"
+    ));
+
+    super::prompt_setup::refresh_prompt_snapshot_from_session(&mut session);
+
+    let snapshot = super::prompt_setup::read_prompt_snapshot_metadata(&session)
+        .expect("runtime prompt snapshot should exist");
+    assert_eq!(
+        snapshot.dream_notebook.as_deref(),
+        Some("Dream fallback content")
+    );
+    assert_eq!(
+        snapshot.session_memory_note.as_deref(),
+        Some("Session note content")
+    );
+}
+
+#[test]
 fn refresh_prompt_snapshot_from_session_ignores_topic_truncation_note_outside_code_block() {
     let mut session = Session::new("snapshot-memory-topic-note", "gpt-test");
     session

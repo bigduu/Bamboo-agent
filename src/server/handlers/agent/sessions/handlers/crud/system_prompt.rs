@@ -216,7 +216,11 @@ fn split_external_memory_components(
     let dream_notebook = extract_markdown_block_by_heading(
         external_memory,
         "### Cross-session Dream Notebook (read-only)",
-    );
+    )
+    .or_else(|| extract_markdown_block_by_heading(external_memory, "### Project Dream Summary"))
+    .or_else(|| {
+        extract_markdown_block_by_heading(external_memory, "### Global Dream Summary (fallback)")
+    });
     let session_memory_note =
         extract_markdown_block_by_heading(external_memory, "### Session Memory Note (markdown)")
             .or_else(|| collect_session_memory_topics(external_memory));
@@ -414,8 +418,9 @@ fn derive_enhancement_prompt_legacy(
 
 #[cfg(test)]
 mod tests {
-    use super::build_system_prompt_response;
+    use super::{build_system_prompt_response, get_system_prompt_snapshot};
     use crate::agent::core::{Message, Session};
+    use actix_web::{body::to_bytes, http::StatusCode, web};
 
     fn publish_test_env_context() {
         let config = crate::core::Config {
@@ -429,6 +434,51 @@ mod tests {
             ..crate::core::Config::default()
         };
         config.publish_env_vars();
+    }
+
+    #[actix_web::test]
+    async fn handler_returns_project_dream_snapshot_from_persisted_session() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        crate::core::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = crate::server::app_state::AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize");
+        let state = web::Data::new(state);
+
+        let mut session = Session::new("session-handler-project-dream", "gpt-5");
+        session.add_message(Message::system(
+            "Base prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\n### Project Dream Summary\n````md\nHandler project dream content\n````\n\n### Session Memory Note (markdown)\n````md\nHandler session note content\n````\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->",
+        ));
+
+        state
+            .storage
+            .save_session(&session)
+            .await
+            .expect("save session");
+
+        let response = get_system_prompt_snapshot(
+            state.clone(),
+            web::Path::from("session-handler-project-dream".to_string()),
+        )
+        .await
+        .expect("handler should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body())
+            .await
+            .expect("response body should read");
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&body).expect("response should deserialize");
+
+        assert_eq!(snapshot["session_id"], "session-handler-project-dream");
+        assert_eq!(snapshot["dream_notebook"], "Handler project dream content");
+        assert_eq!(snapshot["session_memory_note"], "Handler session note content");
+        assert!(snapshot["external_memory"]
+            .as_str()
+            .is_some_and(|value| value.contains("### Project Dream Summary")));
+        assert!(snapshot["external_memory"]
+            .as_str()
+            .is_some_and(|value| value.contains("Handler project dream content")));
     }
 
     #[test]
@@ -531,6 +581,42 @@ mod tests {
             .external_memory
             .as_deref()
             .is_some_and(|value| value.contains("Dream note content")));
+    }
+
+    #[test]
+    fn snapshot_extracts_project_dream_heading_from_external_memory() {
+        let mut session = Session::new("session-memory-project-dream", "gpt-5");
+        session.add_message(Message::system(
+            "Base prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\n### Project Dream Summary\n````md\nProject dream content\n````\n\n### Session Memory Note (markdown)\n````md\nSession note content\n````\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->",
+        ));
+
+        let snapshot = build_system_prompt_response("session-memory-project-dream", &session);
+        assert_eq!(
+            snapshot.dream_notebook.as_deref(),
+            Some("Project dream content")
+        );
+        assert_eq!(
+            snapshot.session_memory_note.as_deref(),
+            Some("Session note content")
+        );
+    }
+
+    #[test]
+    fn snapshot_extracts_global_dream_fallback_heading_from_external_memory() {
+        let mut session = Session::new("session-memory-fallback-dream", "gpt-5");
+        session.add_message(Message::system(
+            "Base prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\n### Global Dream Summary (fallback)\n````md\nDream fallback content\n````\n\n### Session Memory Note (markdown)\n````md\nSession note content\n````\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->",
+        ));
+
+        let snapshot = build_system_prompt_response("session-memory-fallback-dream", &session);
+        assert_eq!(
+            snapshot.dream_notebook.as_deref(),
+            Some("Dream fallback content")
+        );
+        assert_eq!(
+            snapshot.session_memory_note.as_deref(),
+            Some("Session note content")
+        );
     }
 
     #[test]

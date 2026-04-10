@@ -473,7 +473,11 @@ fn split_external_memory_components(
     let dream_notebook = extract_markdown_block_by_heading(
         external_memory,
         "### Cross-session Dream Notebook (read-only)",
-    );
+    )
+    .or_else(|| extract_markdown_block_by_heading(external_memory, "### Project Dream Summary"))
+    .or_else(|| {
+        extract_markdown_block_by_heading(external_memory, "### Global Dream Summary (fallback)")
+    });
 
     let session_memory_note =
         extract_markdown_block_by_heading(external_memory, "### Session Memory Note (markdown)")
