@@ -15,7 +15,7 @@ use serde_json::json;
 use crate::agent::core::memory_store::MemoryStore;
 use crate::agent::core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use crate::agent::tools::tools::session_memory::{
-    SESSION_NOTE_ACTION_NAMES, execute_session_memory_action, parse_session_note_action,
+    execute_session_memory_action, parse_session_note_action, SESSION_NOTE_ACTION_NAMES,
 };
 
 const TOOL_NAME: &str = "session_note";
@@ -348,10 +348,8 @@ mod tests {
             )
             .await
             .expect_err("append should exceed limit");
-        assert!(
-            append_err
-                .to_string()
-                .contains("session note would exceed the limit")
-        );
+        assert!(append_err
+            .to_string()
+            .contains("session note would exceed the limit"));
     }
 }

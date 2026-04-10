@@ -5,11 +5,18 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod freshness;
 pub mod paths;
+pub mod recall;
 pub mod store;
 pub mod types;
 
+pub use freshness::{
+    memory_age_days, memory_age_label, memory_freshness_text, render_memory_freshness_note,
+    FreshnessKind,
+};
 pub use paths::{MemoryPathResolver, SESSIONS_DIR, TOPICS_DIR};
+pub use recall::{shortlist_relevant_memories, MemoryRecallCandidate, MemoryRecallOptions};
 pub use store::MemoryStore;
 pub use types::{
     CreatedBy, DurableContentLocation, DurableMemoryDocument, DurableMemoryFrontmatter,

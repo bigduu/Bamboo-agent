@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 
 use crate::agent::core::memory::DEFAULT_TOPIC;
-use crate::agent::core::memory_store::{MemoryStore, count_chars, truncate_chars};
+use crate::agent::core::memory_store::{count_chars, truncate_chars, MemoryStore};
 use crate::agent::core::tools::{ToolError, ToolResult};
 
 pub const MAX_SESSION_NOTE_CHARS: usize = 12_000;

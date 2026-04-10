@@ -214,38 +214,78 @@ impl MemoryStore {
     }
 
     pub async fn read_dream_view(&self) -> io::Result<Option<String>> {
-        self.maybe_migrate_legacy_dream().await?;
+        self.read_scope_dream_view(MemoryScope::Global, None).await
+    }
+
+    pub async fn read_project_dream_view(&self, project_key: &str) -> io::Result<Option<String>> {
+        self.read_scope_dream_view(MemoryScope::Project, Some(project_key))
+            .await
+    }
+
+    pub async fn read_memory_view(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<Option<String>> {
+        let project_key = self.require_project_key(scope, project_key)?;
         let path = self
             .resolver
-            .views_dir(MemoryScope::Global, None)
-            .join(DREAM_VIEW_FILE);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let raw = fs::read_to_string(path).await?;
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(trimmed.to_string()))
-        }
+            .views_dir(scope, project_key)
+            .join(MEMORY_VIEW_FILE);
+        self.read_optional_trimmed_text_file(path).await
+    }
+
+    pub async fn read_recent_view(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<Option<String>> {
+        let project_key = self.require_project_key(scope, project_key)?;
+        let path = self
+            .resolver
+            .views_dir(scope, project_key)
+            .join(RECENT_VIEW_FILE);
+        self.read_optional_trimmed_text_file(path).await
+    }
+
+    pub async fn read_stale_view(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<Option<String>> {
+        let project_key = self.require_project_key(scope, project_key)?;
+        let path = self
+            .resolver
+            .views_dir(scope, project_key)
+            .join(STALE_VIEW_FILE);
+        self.read_optional_trimmed_text_file(path).await
+    }
+
+    pub async fn read_lexical_index(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<Option<LexicalIndex>> {
+        let project_key = self.require_project_key(scope, project_key)?;
+        let path = self
+            .resolver
+            .indexes_dir(scope, project_key)
+            .join(LEXICAL_INDEX_FILE);
+        self.read_optional_json_file(path).await
     }
 
     pub async fn write_dream_view(&self, content: &str) -> io::Result<PathBuf> {
-        self.ensure_scope_dirs(MemoryScope::Global, None).await?;
-        let path = self
-            .resolver
-            .views_dir(MemoryScope::Global, None)
-            .join(DREAM_VIEW_FILE);
-        fs::write(&path, build_dream_view(Some(content))).await?;
-        self.write_state_marker(
-            MemoryScope::Global,
-            None,
-            "last_dream.json",
-            json_obj("updated_at", now_rfc3339()),
-        )
-        .await?;
-        Ok(path)
+        self.write_scope_dream_view(MemoryScope::Global, None, content)
+            .await
+    }
+
+    pub async fn write_project_dream_view(
+        &self,
+        project_key: &str,
+        content: &str,
+    ) -> io::Result<PathBuf> {
+        self.write_scope_dream_view(MemoryScope::Project, Some(project_key), content)
+            .await
     }
 
     pub async fn query_scope(
@@ -1554,6 +1594,78 @@ impl MemoryStore {
         fs::write(path, data).await
     }
 
+    async fn read_optional_trimmed_text_file(&self, path: PathBuf) -> io::Result<Option<String>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(path).await?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+
+    async fn read_optional_json_file<T: serde::de::DeserializeOwned>(
+        &self,
+        path: PathBuf,
+    ) -> io::Result<Option<T>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(path).await?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_str(trimmed).map(Some).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to deserialize json: {error}"),
+            )
+        })
+    }
+
+    async fn read_scope_dream_view(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<Option<String>> {
+        let project_key = self.require_project_key(scope, project_key)?;
+        if scope == MemoryScope::Global {
+            self.maybe_migrate_legacy_dream().await?;
+        }
+        let path = self
+            .resolver
+            .views_dir(scope, project_key)
+            .join(DREAM_VIEW_FILE);
+        self.read_optional_trimmed_text_file(path).await
+    }
+
+    async fn write_scope_dream_view(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        content: &str,
+    ) -> io::Result<PathBuf> {
+        let project_key = self.require_project_key(scope, project_key)?;
+        self.ensure_scope_dirs(scope, project_key).await?;
+        let path = self
+            .resolver
+            .views_dir(scope, project_key)
+            .join(DREAM_VIEW_FILE);
+        fs::write(&path, build_dream_view(Some(content))).await?;
+        self.write_state_marker(
+            scope,
+            project_key,
+            "last_dream.json",
+            json_obj("updated_at", now_rfc3339()),
+        )
+        .await?;
+        Ok(path)
+    }
+
     async fn write_state_marker(
         &self,
         scope: MemoryScope,
@@ -2074,7 +2186,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_session_topics_with_content_skips_empty_topics_and_mark_session_extracted_roundtrips() {
+    async fn read_session_topics_with_content_skips_empty_topics_and_mark_session_extracted_roundtrips(
+    ) {
         let dir = tempdir().unwrap();
         let store = MemoryStore::new(dir.path());
 
@@ -2087,15 +2200,24 @@ mod tests {
             .await
             .unwrap();
 
-        let topics = store.read_session_topics_with_content("session-1").await.unwrap();
-        assert_eq!(topics, vec![("default".to_string(), "primary note".to_string())]);
+        let topics = store
+            .read_session_topics_with_content("session-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            topics,
+            vec![("default".to_string(), "primary note".to_string())]
+        );
 
         store
             .mark_session_extracted("session-1", "2026-04-05T03:00:00Z")
             .await
             .unwrap();
         let state = store.read_session_state("session-1").await.unwrap();
-        assert_eq!(state.last_extracted_at.as_deref(), Some("2026-04-05T03:00:00Z"));
+        assert_eq!(
+            state.last_extracted_at.as_deref(),
+            Some("2026-04-05T03:00:00Z")
+        );
         assert!(state.topics.contains(&"default".to_string()));
         assert!(state.topics.contains(&"empty".to_string()));
     }
@@ -2165,5 +2287,168 @@ mod tests {
         assert!(!second.truncated);
         assert_eq!(second.remaining_count, 0);
         assert!(second.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_memory_views_support_project_and_global_scopes() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Release freeze begins next week",
+                "Merge freeze begins on Tuesday for mobile release cut.",
+                &["release".to_string(), "freeze".to_string()],
+                Some("session-1"),
+                "main-model",
+                false,
+            )
+            .await
+            .unwrap();
+        store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Reference,
+                "Team handbook location",
+                "Canonical team handbook lives in docs/handbook.",
+                &[],
+                Some("session-1"),
+                "main-model",
+                false,
+            )
+            .await
+            .unwrap();
+
+        let project_view = store
+            .read_memory_view(MemoryScope::Project, Some("proj-1"))
+            .await
+            .unwrap()
+            .expect("project view should exist");
+        assert!(project_view.contains("Bamboo Memory Index (Project: proj-1)"));
+        assert!(project_view.contains("Release freeze begins next week"));
+
+        let global_view = store
+            .read_memory_view(MemoryScope::Global, None)
+            .await
+            .unwrap()
+            .expect("global view should exist");
+        assert!(global_view.contains("Bamboo Memory Index (Global)"));
+        assert!(global_view.contains("Team handbook location"));
+    }
+
+    #[tokio::test]
+    async fn read_memory_view_returns_none_for_missing_or_empty_files() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        assert!(store
+            .read_memory_view(MemoryScope::Project, Some("proj-missing"))
+            .await
+            .unwrap()
+            .is_none());
+
+        let empty_path = store
+            .resolver()
+            .views_dir(MemoryScope::Project, Some("proj-empty"))
+            .join(MEMORY_VIEW_FILE);
+        fs::create_dir_all(empty_path.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(&empty_path, "   \n\n  ").await.unwrap();
+
+        assert!(store
+            .read_memory_view(MemoryScope::Project, Some("proj-empty"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn read_lexical_index_roundtrips_generated_index() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        let doc = store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-lexical"),
+                DurableMemoryType::Feedback,
+                "User prefers concise answers",
+                "Keep responses concise and avoid unnecessary recap.",
+                &["user-preference".to_string()],
+                Some("session-1"),
+                "main-model",
+                false,
+            )
+            .await
+            .unwrap();
+
+        let lexical = store
+            .read_lexical_index(MemoryScope::Project, Some("proj-lexical"))
+            .await
+            .unwrap()
+            .expect("lexical index should exist");
+        assert_eq!(lexical.items.len(), 1);
+        assert_eq!(lexical.items[0].id, doc.frontmatter.id);
+        assert_eq!(lexical.items[0].title, "User prefers concise answers");
+        assert!(lexical.items[0].keywords.iter().any(|k| k == "concise"));
+    }
+
+    #[tokio::test]
+    async fn project_dream_view_roundtrips_and_updates_project_state_marker() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        let path = store
+            .write_project_dream_view(
+                "proj-dream",
+                "# Bamboo Dream Notebook\n\nProject-only dream",
+            )
+            .await
+            .expect("write project dream");
+        assert!(path.ends_with("scopes/projects/proj-dream/views/DREAM_NOTEBOOK.md"));
+
+        let dream = store
+            .read_project_dream_view("proj-dream")
+            .await
+            .expect("read project dream")
+            .expect("project dream should exist");
+        assert!(dream.contains("Project-only dream"));
+
+        let state_marker = store
+            .resolver()
+            .state_dir(MemoryScope::Project, Some("proj-dream"))
+            .join("last_dream.json");
+        let raw = fs::read_to_string(state_marker)
+            .await
+            .expect("read state marker");
+        assert!(raw.contains("updated_at"));
+    }
+
+    #[tokio::test]
+    async fn missing_project_dream_view_returns_none_and_global_behavior_remains_unchanged() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        assert!(store
+            .read_project_dream_view("proj-missing")
+            .await
+            .expect("read project dream")
+            .is_none());
+
+        store
+            .write_dream_view("# Bamboo Dream Notebook\n\nGlobal dream remains intact")
+            .await
+            .expect("write global dream");
+        let global = store
+            .read_dream_view()
+            .await
+            .expect("read global dream")
+            .expect("global dream should exist");
+        assert!(global.contains("Global dream remains intact"));
     }
 }
