@@ -17,6 +17,7 @@ Use this directory for:
 - [Schedule System Redesign](schedule-system-redesign.md) - Long-term scheduler redesign covering trigger abstraction, calendar scheduling, misfire handling, run history, metrics, and migration strategy.
 - [ScheduleState Refactor Plan](schedule-state-refactor-plan.md) - Focused migration plan for making `ScheduleState` authoritative while preserving `ScheduleEntry` compatibility.
 - [Session-Level Model Selection Refactor Plan](session-model-refactor-plan.md) - Plan for moving model and reasoning configuration to the session level.
+- [Memory Recall Architecture Refactor Plan](memory-recall-architecture-refactor-plan.md) - Detailed implementation plan for making project durable memory the primary recall layer, adding relevant memory recall, and demoting Dream to an auxiliary synthesis layer.
 - [Bamboo Strengthening Roadmap and Backlog](bamboo-strengthening-roadmap-and-backlog.md) - Phased roadmap for hardening Bamboo’s runtime, governance, and capability model.
 - [Memory System E2E Checklist](memory-system-e2e-checklist.md) - End-to-end validation checklist for Bamboo memory system behavior.
 
