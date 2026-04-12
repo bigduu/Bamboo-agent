@@ -21,6 +21,14 @@ function fail(message) {
   process.exit(1);
 }
 
+function fileExists(target) {
+  try {
+    return fs.statSync(target).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function dirExists(target) {
   try {
     return fs.statSync(target).isDirectory();
@@ -75,6 +83,21 @@ function runNpmScript(prefix, script) {
   fail(`Failed to run npm script "${script}" in ${prefix}`);
 }
 
+function hasExistingStagedPackage() {
+  return fileExists(OUTPUT_ZIP) && fileExists(OUTPUT_MANIFEST);
+}
+
+function reuseExistingStagedPackage(reason) {
+  if (!hasExistingStagedPackage()) {
+    return false;
+  }
+
+  console.log(`ℹ️ ${reason}`);
+  console.log(`ℹ️ Reusing committed frontend package: ${OUTPUT_ZIP}`);
+  console.log(`ℹ️ Reusing committed frontend manifest: ${OUTPUT_MANIFEST}`);
+  return true;
+}
+
 function resolveSource() {
   if (!["auto", "local", "package"].includes(SOURCE_MODE)) {
     fail(`Invalid LOTUS_SOURCE="${SOURCE_MODE}" (expected auto|local|package)`);
@@ -108,9 +131,7 @@ function resolveSource() {
     return { mode: "package", packageRoot };
   }
 
-  fail(
-    `No Lotus source found. Expected local checkout at ${LOCAL_PATH} or installed package "${PACKAGE_NAME}".`,
-  );
+  return null;
 }
 
 function listFilesRecursively(rootDir) {
@@ -237,6 +258,20 @@ function stagePackageFromDist(distDir, version) {
 
 function stagePackage() {
   const source = resolveSource();
+  if (!source) {
+    if (
+      reuseExistingStagedPackage(
+        `No Lotus source found at ${LOCAL_PATH} and package "${PACKAGE_NAME}" is not installed.`,
+      )
+    ) {
+      return;
+    }
+
+    fail(
+      `No Lotus source found. Expected local checkout at ${LOCAL_PATH} or installed package "${PACKAGE_NAME}".`,
+    );
+  }
+
   stagePackageFromDist(resolveDistDir(source), resolveLotusVersion(source));
 }
 
