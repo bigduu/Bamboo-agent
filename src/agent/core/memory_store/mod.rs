@@ -16,7 +16,10 @@ pub use freshness::{
     FreshnessKind,
 };
 pub use paths::{MemoryPathResolver, SESSIONS_DIR, TOPICS_DIR};
-pub use recall::{shortlist_relevant_memories, MemoryRecallCandidate, MemoryRecallOptions};
+pub use recall::{
+    select_relevant_memories, shortlist_relevant_memories, MemoryRecallCandidate,
+    MemoryRecallOptions, MemoryRecallRerankContext, MemoryRecallSelection, MemoryRecallStrategy,
+};
 pub use store::MemoryStore;
 pub use types::{
     CreatedBy, DurableContentLocation, DurableMemoryDocument, DurableMemoryFrontmatter,

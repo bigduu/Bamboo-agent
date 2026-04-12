@@ -1,5 +1,14 @@
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::io;
+use std::sync::Arc;
+
+use futures::StreamExt;
+use serde::Deserialize;
+
+use crate::agent::core::Message;
+use crate::agent::llm::{LLMChunk, LLMProvider, LLMRequestOptions};
+use crate::core::ReasoningEffort;
 
 use super::{
     extract_keywords, parse_rfc3339, DurableMemoryStatus, LexicalIndexItem, MemoryScope,
@@ -35,7 +44,128 @@ impl Default for MemoryRecallOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryRecallStrategy {
+    Lexical,
+    Reranked,
+    RerankFallback,
+}
+
+impl MemoryRecallStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lexical => "lexical",
+            Self::Reranked => "reranked",
+            Self::RerankFallback => "rerank_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryRecallSelection {
+    pub candidates: Vec<MemoryRecallCandidate>,
+    pub strategy: MemoryRecallStrategy,
+}
+
+#[derive(Clone)]
+pub struct MemoryRecallRerankContext {
+    pub llm: Arc<dyn LLMProvider>,
+    pub model: String,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryRecallRerankEnvelope {
+    #[serde(default)]
+    ids: Vec<String>,
+}
+
 pub async fn shortlist_relevant_memories(
+    store: &MemoryStore,
+    project_key: Option<&str>,
+    query: &str,
+    options: &MemoryRecallOptions,
+) -> io::Result<Vec<MemoryRecallCandidate>> {
+    let limit = options.shortlist_limit.max(1);
+    let mut candidates =
+        lexical_shortlist_relevant_memories(store, project_key, query, options).await?;
+    candidates.truncate(limit);
+    Ok(candidates)
+}
+
+pub async fn select_relevant_memories(
+    store: &MemoryStore,
+    project_key: Option<&str>,
+    query: &str,
+    options: &MemoryRecallOptions,
+    rerank_context: Option<&MemoryRecallRerankContext>,
+) -> io::Result<MemoryRecallSelection> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(MemoryRecallSelection {
+            candidates: Vec::new(),
+            strategy: MemoryRecallStrategy::Lexical,
+        });
+    }
+
+    let limit = options.shortlist_limit.max(1);
+    let mut shortlist =
+        lexical_shortlist_relevant_memories(store, project_key, query, options).await?;
+    if shortlist.is_empty() {
+        return Ok(MemoryRecallSelection {
+            candidates: shortlist,
+            strategy: MemoryRecallStrategy::Lexical,
+        });
+    }
+
+    let Some(rerank_context) = rerank_context else {
+        shortlist.truncate(limit);
+        return Ok(MemoryRecallSelection {
+            candidates: shortlist,
+            strategy: MemoryRecallStrategy::Lexical,
+        });
+    };
+
+    if shortlist.len() <= 1 {
+        shortlist.truncate(limit);
+        return Ok(MemoryRecallSelection {
+            candidates: shortlist,
+            strategy: MemoryRecallStrategy::Lexical,
+        });
+    }
+
+    match rerank_candidate_ids(query, &shortlist, limit, rerank_context).await {
+        Ok(ids) => {
+            let reranked = reorder_candidates_by_ids(&shortlist, &ids, limit);
+            if reranked.is_empty() {
+                let mut lexical = shortlist;
+                lexical.truncate(limit);
+                return Ok(MemoryRecallSelection {
+                    candidates: lexical,
+                    strategy: MemoryRecallStrategy::RerankFallback,
+                });
+            }
+            Ok(MemoryRecallSelection {
+                candidates: reranked,
+                strategy: MemoryRecallStrategy::Reranked,
+            })
+        }
+        Err(error) => {
+            tracing::warn!(
+                "Relevant memory rerank failed for model '{}': {}. Falling back to lexical shortlist.",
+                rerank_context.model,
+                error
+            );
+            shortlist.truncate(limit);
+            Ok(MemoryRecallSelection {
+                candidates: shortlist,
+                strategy: MemoryRecallStrategy::RerankFallback,
+            })
+        }
+    }
+}
+
+async fn lexical_shortlist_relevant_memories(
     store: &MemoryStore,
     project_key: Option<&str>,
     query: &str,
@@ -54,7 +184,6 @@ pub async fn shortlist_relevant_memories(
             shortlist_scope(store, MemoryScope::Project, Some(project_key), query).await?;
         project_hits.truncate(per_scope_limit);
         if !project_hits.is_empty() {
-            project_hits.truncate(limit);
             return Ok(project_hits);
         }
     }
@@ -62,7 +191,6 @@ pub async fn shortlist_relevant_memories(
     if options.include_global_fallback {
         let mut global_hits = shortlist_scope(store, MemoryScope::Global, None, query).await?;
         global_hits.truncate(per_scope_limit);
-        global_hits.truncate(limit);
         return Ok(global_hits);
     }
 
@@ -188,10 +316,203 @@ fn sort_recall_candidates(candidates: &mut [MemoryRecallCandidate]) {
     });
 }
 
+fn build_rerank_prompt(query: &str, candidates: &[MemoryRecallCandidate], limit: usize) -> String {
+    let mut prompt = String::from("# Bamboo Relevant Memory Recall Rerank\n\n");
+    prompt.push_str(
+        "Select the durable memory candidates that are most relevant to the user query.\n",
+    );
+    prompt.push_str("Return JSON only in the form {\"ids\":[\"candidate-id\", ...]}.\n");
+    prompt
+        .push_str("Do not include commentary, markdown fences, explanations, or unknown ids.\n\n");
+    prompt.push_str("## User query\n");
+    prompt.push_str(query.trim());
+    prompt.push_str("\n\n## Candidate memories\n");
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        prompt.push_str(&format!(
+            "{}. id={}\n   title: {}\n   scope: {}\n   status: {}\n   updated_at: {}\n   lexical_score: {:.2}\n   summary: {}\n",
+            index + 1,
+            candidate.id,
+            candidate.title,
+            candidate.scope.as_str(),
+            candidate.status.as_str(),
+            candidate.updated_at,
+            candidate.score,
+            candidate.summary.replace('\n', " "),
+        ));
+    }
+
+    prompt.push_str(&format!(
+        "\n## Selection rules\n- Return at most {limit} ids.\n- Use only ids from the candidate list above.\n- Prefer candidates that best answer the user query or encode active preferences/constraints relevant to it.\n- Prefer active memories over stale ones when relevance is otherwise similar.\n- Keep the ids ordered best-to-worst.\n"
+    ));
+    prompt
+}
+
+async fn rerank_candidate_ids(
+    query: &str,
+    candidates: &[MemoryRecallCandidate],
+    limit: usize,
+    context: &MemoryRecallRerankContext,
+) -> Result<Vec<String>, String> {
+    let model = context.model.trim();
+    if model.is_empty() {
+        return Err("rerank model is empty".to_string());
+    }
+
+    let messages = vec![
+        Message::system(
+            "You rerank Bamboo durable-memory recall candidates. Return strict JSON only in the form {\"ids\":[...]} using only candidate ids from the prompt.",
+        ),
+        Message::user(build_rerank_prompt(query, candidates, limit)),
+    ];
+    let options = LLMRequestOptions {
+        session_id: context.session_id.clone(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        parallel_tool_calls: None,
+        responses: None,
+    };
+
+    let mut stream = context
+        .llm
+        .chat_stream_with_options(&messages, &[], Some(200), model, Some(&options))
+        .await
+        .map_err(|error| format!("rerank provider call failed: {error}"))?;
+
+    let mut content = String::new();
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(LLMChunk::Token(text)) => content.push_str(&text),
+            Ok(LLMChunk::Done) => break,
+            Ok(_) => {}
+            Err(error) => {
+                if !content.trim().is_empty() {
+                    break;
+                }
+                return Err(format!("rerank stream failed: {error}"));
+            }
+        }
+    }
+
+    parse_reranked_ids(&content, candidates)
+        .ok_or_else(|| format!("failed to parse rerank response: {}", content.trim()))
+}
+
+fn reorder_candidates_by_ids(
+    lexical_candidates: &[MemoryRecallCandidate],
+    preferred_ids: &[String],
+    limit: usize,
+) -> Vec<MemoryRecallCandidate> {
+    if lexical_candidates.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+
+    let allowed = lexical_candidates
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::new();
+
+    for id in preferred_ids {
+        let trimmed = id.trim();
+        if trimmed.is_empty() || !allowed.contains(trimmed) || !seen.insert(trimmed.to_string()) {
+            continue;
+        }
+        if let Some(candidate) = lexical_candidates
+            .iter()
+            .find(|candidate| candidate.id == trimmed)
+            .cloned()
+        {
+            ordered.push(candidate);
+            if ordered.len() >= limit {
+                return ordered;
+            }
+        }
+    }
+
+    for candidate in lexical_candidates {
+        if seen.insert(candidate.id.clone()) {
+            ordered.push(candidate.clone());
+            if ordered.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    ordered
+}
+
+fn parse_reranked_ids(raw: &str, candidates: &[MemoryRecallCandidate]) -> Option<Vec<String>> {
+    let stripped = strip_markdown_fence(raw);
+    let fragment = extract_json_fragment(&stripped).unwrap_or(stripped.trim());
+    let ids = serde_json::from_str::<MemoryRecallRerankEnvelope>(fragment)
+        .map(|value| value.ids)
+        .or_else(|_| serde_json::from_str::<Vec<String>>(fragment))
+        .ok()?;
+
+    let allowed = candidates
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+
+    for id in ids {
+        let trimmed = id.trim();
+        if trimmed.is_empty() || !allowed.contains(trimmed) || !seen.insert(trimmed.to_string()) {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+
+    (!out.is_empty()).then_some(out)
+}
+
+fn strip_markdown_fence(raw: &str) -> String {
+    let trimmed = raw.trim();
+    for fence in ["````", "```"] {
+        if let Some(after_fence) = trimmed.strip_prefix(fence) {
+            let Some(first_newline) = after_fence.find('\n') else {
+                continue;
+            };
+            let body = &after_fence[first_newline + 1..];
+            if let Some(end_idx) = body.rfind(fence) {
+                return body[..end_idx].trim().to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+fn extract_json_fragment(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start <= end {
+            return Some(trimmed[start..=end].trim());
+        }
+    }
+
+    if let (Some(start), Some(end)) = (trimmed.find('['), trimmed.rfind(']')) {
+        if start <= end {
+            return Some(trimmed[start..=end].trim());
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::core::memory_store::DurableMemoryType;
+    use crate::agent::llm::{LLMError, LLMStream};
+    use async_trait::async_trait;
+    use futures::stream;
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
     fn item(
@@ -217,6 +538,41 @@ mod tests {
             updated_at: updated_at.to_string(),
             created_at: updated_at.to_string(),
             summary: summary.to_string(),
+        }
+    }
+
+    #[derive(Clone)]
+    struct StaticResponseProvider {
+        response: String,
+        requested_models: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl StaticResponseProvider {
+        fn new(response: impl Into<String>) -> Self {
+            Self {
+                response: response.into(),
+                requested_models: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for StaticResponseProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[crate::agent::core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.requested_models
+                .lock()
+                .expect("lock poisoned")
+                .push(model.to_string());
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token(self.response.clone())),
+                Ok(LLMChunk::Done),
+            ])))
         }
     }
 
@@ -306,6 +662,83 @@ mod tests {
         assert!(score_lexical_index_item(&archived, &query_tokens).is_none());
     }
 
+    #[test]
+    fn parse_reranked_ids_accepts_fenced_json_and_filters_unknown_ids() {
+        let candidates = vec![
+            MemoryRecallCandidate {
+                id: "mem-a".to_string(),
+                title: "A".to_string(),
+                score: 10.0,
+                scope: MemoryScope::Project,
+                project_key: Some("proj-1".to_string()),
+                status: DurableMemoryStatus::Active,
+                updated_at: "2026-04-09T00:00:00Z".to_string(),
+                summary: "summary a".to_string(),
+            },
+            MemoryRecallCandidate {
+                id: "mem-b".to_string(),
+                title: "B".to_string(),
+                score: 9.0,
+                scope: MemoryScope::Project,
+                project_key: Some("proj-1".to_string()),
+                status: DurableMemoryStatus::Active,
+                updated_at: "2026-04-09T00:00:00Z".to_string(),
+                summary: "summary b".to_string(),
+            },
+        ];
+
+        let parsed = parse_reranked_ids(
+            "```json\n{\"ids\":[\"mem-b\",\"unknown\",\"mem-a\",\"mem-b\"]}\n```",
+            &candidates,
+        )
+        .expect("reranked ids should parse");
+
+        assert_eq!(parsed, vec!["mem-b".to_string(), "mem-a".to_string()]);
+    }
+
+    #[test]
+    fn reorder_candidates_by_ids_appends_remaining_lexical_candidates() {
+        let lexical = vec![
+            MemoryRecallCandidate {
+                id: "mem-a".to_string(),
+                title: "A".to_string(),
+                score: 10.0,
+                scope: MemoryScope::Project,
+                project_key: Some("proj-1".to_string()),
+                status: DurableMemoryStatus::Active,
+                updated_at: "2026-04-09T00:00:00Z".to_string(),
+                summary: "summary a".to_string(),
+            },
+            MemoryRecallCandidate {
+                id: "mem-b".to_string(),
+                title: "B".to_string(),
+                score: 9.0,
+                scope: MemoryScope::Project,
+                project_key: Some("proj-1".to_string()),
+                status: DurableMemoryStatus::Active,
+                updated_at: "2026-04-09T00:00:00Z".to_string(),
+                summary: "summary b".to_string(),
+            },
+            MemoryRecallCandidate {
+                id: "mem-c".to_string(),
+                title: "C".to_string(),
+                score: 8.0,
+                scope: MemoryScope::Project,
+                project_key: Some("proj-1".to_string()),
+                status: DurableMemoryStatus::Active,
+                updated_at: "2026-04-09T00:00:00Z".to_string(),
+                summary: "summary c".to_string(),
+            },
+        ];
+
+        let reordered =
+            reorder_candidates_by_ids(&lexical, &["mem-c".to_string(), "mem-a".to_string()], 3);
+
+        assert_eq!(reordered[0].id, "mem-c");
+        assert_eq!(reordered[1].id, "mem-a");
+        assert_eq!(reordered[2].id, "mem-b");
+    }
+
     #[tokio::test]
     async fn project_scope_shortlist_excludes_global_when_project_hits_exist() {
         let dir = tempdir().unwrap();
@@ -388,5 +821,130 @@ mod tests {
         assert!(candidates
             .iter()
             .all(|candidate| candidate.scope == MemoryScope::Global));
+    }
+
+    #[tokio::test]
+    async fn model_rerank_reorders_lexical_shortlist_when_enabled() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        let lexical_first = store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Release freeze checklist",
+                "Generic release freeze checklist for shipping work.",
+                &["release".to_string(), "freeze".to_string()],
+                Some("session-1"),
+                "main-model",
+                false,
+            )
+            .await
+            .unwrap();
+        let reranked_first = store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Mobile launch blocker",
+                "This durable note captures the release freeze decision for the mobile app and should be preferred for mobile freeze requests.",
+                &["mobile".to_string(), "launch".to_string()],
+                Some("session-1"),
+                "main-model",
+                false,
+            )
+            .await
+            .unwrap();
+
+        let provider = StaticResponseProvider::new(format!(
+            "{{\"ids\":[\"{}\",\"{}\"]}}",
+            reranked_first.frontmatter.id, lexical_first.frontmatter.id
+        ));
+        let requested_models = provider.requested_models.clone();
+        let selection = select_relevant_memories(
+            &store,
+            Some("proj-1"),
+            "release freeze for mobile",
+            &MemoryRecallOptions {
+                shortlist_limit: 2,
+                include_global_fallback: false,
+                max_candidates_per_scope: 12,
+            },
+            Some(&MemoryRecallRerankContext {
+                llm: Arc::new(provider),
+                model: "rerank-fast-model".to_string(),
+                session_id: Some("session-1".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(selection.strategy, MemoryRecallStrategy::Reranked);
+        assert_eq!(selection.candidates.len(), 2);
+        assert_eq!(selection.candidates[0].id, reranked_first.frontmatter.id);
+        assert_eq!(selection.candidates[1].id, lexical_first.frontmatter.id);
+        assert_eq!(
+            requested_models.lock().expect("lock poisoned").as_slice(),
+            ["rerank-fast-model"]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_model_rerank_response_falls_back_to_lexical_order() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        let lexical_first = store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Release freeze checklist",
+                "Generic release freeze checklist for shipping work.",
+                &["release".to_string(), "freeze".to_string()],
+                Some("session-1"),
+                "main-model",
+                false,
+            )
+            .await
+            .unwrap();
+        let lexical_second = store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Mobile launch blocker",
+                "This durable note captures the release freeze decision for the mobile app.",
+                &["mobile".to_string(), "launch".to_string()],
+                Some("session-1"),
+                "main-model",
+                false,
+            )
+            .await
+            .unwrap();
+
+        let selection = select_relevant_memories(
+            &store,
+            Some("proj-1"),
+            "release freeze for mobile",
+            &MemoryRecallOptions {
+                shortlist_limit: 2,
+                include_global_fallback: false,
+                max_candidates_per_scope: 12,
+            },
+            Some(&MemoryRecallRerankContext {
+                llm: Arc::new(StaticResponseProvider::new("not valid json")),
+                model: "rerank-fast-model".to_string(),
+                session_id: Some("session-1".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(selection.strategy, MemoryRecallStrategy::RerankFallback);
+        assert_eq!(selection.candidates.len(), 2);
+        assert_eq!(selection.candidates[0].id, lexical_first.frontmatter.id);
+        assert_eq!(selection.candidates[1].id, lexical_second.frontmatter.id);
     }
 }

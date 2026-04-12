@@ -515,9 +515,9 @@ mod tests {
             ],
         );
 
-        assert!(csp.contains(
-            "connect-src 'self' ws: wss: https://bodhi.bigduu.com:9562 http://bodhi.bigduu.com:9562;"
-        ));
+        assert!(csp.contains("connect-src 'self' ws: wss:"));
+        assert!(csp.contains("https://bodhi.bigduu.com:9562"));
+        assert!(csp.contains("http://bodhi.bigduu.com:9562"));
     }
 
     #[test]

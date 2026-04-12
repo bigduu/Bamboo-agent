@@ -131,6 +131,14 @@ pub(in crate::server::handlers::agent::execute) fn spawn_agent_execution(
                     reasoning_effort,
                     disabled_tools,
                     image_fallback,
+                    prompt_memory_flags: state
+                        .config
+                        .read()
+                        .await
+                        .memory
+                        .as_ref()
+                        .map(crate::agent::loop_module::config::PromptMemoryFlags::from)
+                        .unwrap_or_default(),
                     ..Default::default()
                 },
             )

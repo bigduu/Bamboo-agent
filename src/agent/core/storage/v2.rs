@@ -154,6 +154,10 @@ impl SessionStoreV2 {
         &self.search_index
     }
 
+    pub fn bamboo_home_dir(&self) -> &Path {
+        &self.bamboo_home_dir
+    }
+
     pub fn index_path(&self) -> &Path {
         &self.index_path
     }

@@ -113,6 +113,45 @@ pub struct MetricsUsageBreakdownResponse {
     pub top_mcp_tools: Vec<McpToolUsageItem>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PromptMemoryMetricsSummary {
+    /// Number of sessions that recorded prompt-memory observability.
+    pub observed_sessions: u64,
+    /// Sessions where project memory index was loaded/loaded_truncated.
+    pub project_memory_index_hits: u64,
+    /// Sessions where relevant durable memories were rendered.
+    pub relevant_memory_hits: u64,
+    /// Sessions where rerank actually succeeded and changed recall strategy.
+    pub relevant_memory_reranked_hits: u64,
+    /// Sessions where rerank was enabled for the round.
+    pub relevant_memory_rerank_enabled_sessions: u64,
+    /// Sessions where relevant recall fell back to lexical after rerank attempt.
+    pub relevant_memory_rerank_fallbacks: u64,
+    /// Sessions with global Dream fallback injected.
+    pub global_dream_fallback_hits: u64,
+    /// Sessions with project Dream injected.
+    pub project_dream_hits: u64,
+    /// Sessions that surfaced a context-pressure warning in external memory.
+    pub context_pressure_warning_hits: u64,
+    /// Total relevant recalled memories rendered across observed sessions.
+    pub total_relevant_memory_count: u64,
+    /// Average relevant recalled memories rendered per observed session.
+    pub avg_relevant_memory_count: u64,
+    /// Average chars rendered for the relevant-memory section.
+    pub avg_relevant_memory_section_chars: u64,
+    /// Average chars rendered for the external-memory section.
+    pub avg_external_memory_section_chars: u64,
+    /// Breakdown of relevant recall status values.
+    #[serde(default)]
+    pub relevant_memory_status_breakdown: BTreeMap<String, u64>,
+    /// Breakdown of dream source values.
+    #[serde(default)]
+    pub dream_source_breakdown: BTreeMap<String, u64>,
+    /// Breakdown of resolved prompt-memory project/global scope usage.
+    #[serde(default)]
+    pub resolved_scope_breakdown: BTreeMap<String, u64>,
+}
+
 /// Query parameters for memory metrics summary and timeline requests
 #[derive(Debug, Deserialize)]
 pub struct MemoryMetricsQuery {
@@ -158,6 +197,9 @@ pub struct MemoryMetricsSummary {
     /// Latest observed dream timestamp across the selected scope(s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_dream_at: Option<String>,
+    /// Aggregated prompt-memory observability derived from persisted sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_memory: Option<PromptMemoryMetricsSummary>,
 }
 
 /// Timeline point for durable memory activity and inventory trends.

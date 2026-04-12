@@ -89,8 +89,7 @@ impl WebService {
 
         info!(
             "Web service started successfully on http://{}:{}",
-            bind_for_log,
-            port
+            bind_for_log, port
         );
         Ok(())
     }
@@ -169,8 +168,7 @@ impl WebService {
 
         info!(
             "Web service with static frontend started successfully on http://{}:{}",
-            bind_for_log,
-            port
+            bind_for_log, port
         );
         Ok(())
     }

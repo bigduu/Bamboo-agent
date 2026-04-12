@@ -1,5 +1,8 @@
 use crate::agent::core::tools::ToolSchema;
-use crate::agent::core::{Message, PromptSnapshot, Session};
+use crate::agent::core::{
+    parse_prompt_external_memory_sections, Message, PromptMemoryObservability, PromptSnapshot,
+    Session,
+};
 use crate::agent::loop_module::config::AgentLoopConfig;
 use crate::agent::tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder};
 
@@ -11,6 +14,8 @@ const RUNTIME_PROMPT_FLAGS_KEY: &str = "runtime_prompt_component_flags";
 const RUNTIME_PROMPT_LENGTHS_KEY: &str = "runtime_prompt_component_lengths";
 const RUNTIME_PROMPT_SECTION_LAYOUT_KEY: &str = "runtime_prompt_section_layout";
 pub(crate) const RUNTIME_PROMPT_SNAPSHOT_KEY: &str = "runtime_prompt_snapshot";
+const RUNTIME_PROMPT_MEMORY_OBSERVABILITY_KEY: &str =
+    crate::agent::loop_module::runner::prompt_context::PROMPT_MEMORY_OBSERVABILITY_KEY;
 
 const BASE_PROMPT_SECTION_ID: &str = "base_prompt";
 const WORKSPACE_CONTEXT_SECTION_ID: &str = "workspace_context";
@@ -204,7 +209,7 @@ impl PromptAssemblyReport {
             None,
         );
 
-        let (dream_notebook, session_memory_note) = split_external_memory_components(None);
+        let external_memory_parts = parse_prompt_external_memory_sections(None);
 
         PromptSnapshot {
             base_system_prompt,
@@ -214,8 +219,13 @@ impl PromptAssemblyReport {
             env_context,
             skill_context,
             tool_guide_context,
-            dream_notebook,
-            session_memory_note,
+            dream_notebook: external_memory_parts.dream_notebook,
+            session_memory_note: external_memory_parts.session_memory_note,
+            project_memory_index: external_memory_parts.project_memory_index,
+            relevant_durable_memories: external_memory_parts.relevant_durable_memories,
+            project_dream: external_memory_parts.project_dream,
+            global_dream_fallback: external_memory_parts.global_dream_fallback,
+            prompt_memory_observability: None,
             external_memory: None,
             task_list: None,
             effective_system_prompt: effective_system_prompt.trim().to_string(),
@@ -368,6 +378,19 @@ pub(crate) fn read_prompt_snapshot_metadata(session: &Session) -> Option<PromptS
     })
 }
 
+fn read_prompt_memory_observability(session: &Session) -> Option<PromptMemoryObservability> {
+    session
+        .prompt_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.prompt_memory_observability.clone())
+        .or_else(|| {
+            session
+                .metadata
+                .get(RUNTIME_PROMPT_MEMORY_OBSERVABILITY_KEY)
+                .and_then(|raw| serde_json::from_str::<PromptMemoryObservability>(raw).ok())
+        })
+}
+
 pub(crate) fn refresh_prompt_snapshot_from_session(session: &mut Session) {
     let effective_system_prompt = session
         .messages
@@ -438,8 +461,7 @@ pub(crate) fn refresh_prompt_snapshot_from_session(session: &mut Session) {
         )
     });
 
-    let (dream_notebook, session_memory_note) =
-        split_external_memory_components(external_memory.as_deref());
+    let external_memory_parts = parse_prompt_external_memory_sections(external_memory.as_deref());
 
     persist_prompt_snapshot_metadata(
         session,
@@ -451,78 +473,18 @@ pub(crate) fn refresh_prompt_snapshot_from_session(session: &mut Session) {
             env_context,
             skill_context,
             tool_guide_context,
-            dream_notebook,
-            session_memory_note,
+            dream_notebook: external_memory_parts.dream_notebook,
+            session_memory_note: external_memory_parts.session_memory_note,
+            project_memory_index: external_memory_parts.project_memory_index,
+            relevant_durable_memories: external_memory_parts.relevant_durable_memories,
+            project_dream: external_memory_parts.project_dream,
+            global_dream_fallback: external_memory_parts.global_dream_fallback,
+            prompt_memory_observability: read_prompt_memory_observability(session),
             external_memory,
             task_list,
             effective_system_prompt,
         },
     );
-}
-
-fn split_external_memory_components(
-    external_memory: Option<&str>,
-) -> (Option<String>, Option<String>) {
-    let Some(external_memory) = external_memory
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return (None, None);
-    };
-
-    let dream_notebook = extract_markdown_block_by_heading(
-        external_memory,
-        "### Cross-session Dream Notebook (read-only)",
-    )
-    .or_else(|| extract_markdown_block_by_heading(external_memory, "### Project Dream Summary"))
-    .or_else(|| {
-        extract_markdown_block_by_heading(external_memory, "### Global Dream Summary (fallback)")
-    });
-
-    let session_memory_note =
-        extract_markdown_block_by_heading(external_memory, "### Session Memory Note (markdown)")
-            .or_else(|| collect_session_memory_topics(external_memory));
-
-    (dream_notebook, session_memory_note)
-}
-
-fn extract_markdown_block_by_heading(content: &str, heading: &str) -> Option<String> {
-    let start_idx = content.find(heading)?;
-    let after_heading = &content[start_idx + heading.len()..];
-    let fence_start_rel = after_heading.find("````md")?;
-    let after_fence = &after_heading[fence_start_rel + "````md".len()..];
-    let fence_end_rel = after_fence.find("````")?;
-    let block = after_fence[..fence_end_rel].trim();
-    (!block.is_empty()).then(|| block.to_string())
-}
-
-fn collect_session_memory_topics(content: &str) -> Option<String> {
-    let mut collected = Vec::new();
-    let mut remaining = content;
-    let heading = "### Session Memory Topic: `";
-    while let Some(start_idx) = remaining.find(heading) {
-        let after_start = &remaining[start_idx..];
-        let Some(line_end) = after_start.find('\n') else {
-            break;
-        };
-        let title_line = after_start[..line_end].trim();
-        let rest = &after_start[line_end + 1..];
-        let Some(fence_start_rel) = rest.find("````md") else {
-            remaining = rest;
-            continue;
-        };
-        let after_fence = &rest[fence_start_rel + "````md".len()..];
-        let Some(fence_end_rel) = after_fence.find("````") else {
-            break;
-        };
-        let block = after_fence[..fence_end_rel].trim();
-        if !block.is_empty() {
-            collected.push(format!("{}\n\n{}", title_line, block));
-        }
-        remaining = &after_fence[fence_end_rel + "````".len()..];
-    }
-
-    (!collected.is_empty()).then(|| collected.join("\n\n---\n\n"))
 }
 
 fn build_prompt_sections(

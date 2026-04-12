@@ -14,6 +14,8 @@ pub mod types;
 
 pub use error::AgentError;
 pub use events::{AgentEvent, TokenUsage};
+pub(crate) use types::parse_prompt_external_memory_sections;
 pub use types::{
-    Message, MessageContent, MessagePhase, PromptSnapshot, Role, Session, SessionKind,
+    Message, MessageContent, MessagePhase, PromptMemoryObservability, PromptSnapshot, Role,
+    Session, SessionKind,
 };

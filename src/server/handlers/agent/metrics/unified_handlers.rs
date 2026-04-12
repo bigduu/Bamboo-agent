@@ -36,6 +36,8 @@ pub async fn v2_unified_summary(
     let memory_store = MemoryStore::new(state.app_data_dir.clone());
     let memory_result = build_memory_summary(
         &memory_store,
+        &state.session_store,
+        state.storage.as_ref(),
         &MemoryMetricsQuery {
             scope: None,
             project_key: None,

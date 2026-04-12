@@ -1,6 +1,7 @@
 use crate::agent::core::Session;
+use crate::core::config::MemoryConfig;
 
-use super::AgentLoopConfig;
+use super::{AgentLoopConfig, PromptMemoryFlags};
 
 #[test]
 fn agent_loop_config_model_name_defaults_to_none() {
@@ -46,4 +47,21 @@ fn model_must_come_from_config_not_session() {
         session.model, "session-model",
         "session.model is just for recording, not execution"
     );
+}
+
+#[test]
+fn prompt_memory_flags_map_from_memory_config() {
+    let memory = MemoryConfig {
+        project_prompt_injection: false,
+        relevant_recall: false,
+        relevant_recall_rerank: true,
+        project_first_dream: false,
+        ..MemoryConfig::default()
+    };
+
+    let flags = PromptMemoryFlags::from(&memory);
+    assert!(!flags.project_prompt_injection);
+    assert!(!flags.relevant_recall);
+    assert!(flags.relevant_recall_rerank);
+    assert!(!flags.project_first_dream);
 }

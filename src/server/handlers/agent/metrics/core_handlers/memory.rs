@@ -4,10 +4,15 @@ use std::io;
 use actix_web::{web, HttpResponse, Responder};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Weekday};
 
-use super::super::{internal_error, MemoryMetricsQuery, MemoryMetricsSummary, MemoryTimelinePoint};
+use super::super::{
+    internal_error, MemoryMetricsQuery, MemoryMetricsSummary, MemoryTimelinePoint,
+    PromptMemoryMetricsSummary,
+};
 use crate::agent::core::memory_store::{
     DurableMemoryDocument, MemoryInspectResult, MemoryScope, MemoryStore,
 };
+use crate::agent::core::storage::{SessionStoreV2, Storage};
+use crate::agent::core::PromptMemoryObservability;
 use crate::server::app_state::AppState;
 use crate::server::handlers::agent::metrics::core_handlers::filters::{
     normalize_days, resolve_timeline_granularity, TimelineGranularity,
@@ -33,11 +38,115 @@ fn update_latest_timestamp(target: &mut Option<DateTime<FixedOffset>>, value: Op
     }
 }
 
+async fn collect_prompt_memory_metrics(
+    session_store: &SessionStoreV2,
+    storage: &dyn Storage,
+) -> io::Result<Option<PromptMemoryMetricsSummary>> {
+    let entries = session_store.list_index_entries().await;
+    let mut observed_sessions = 0_u64;
+    let mut project_memory_index_hits = 0_u64;
+    let mut relevant_memory_hits = 0_u64;
+    let mut relevant_memory_reranked_hits = 0_u64;
+    let mut relevant_memory_rerank_enabled_sessions = 0_u64;
+    let mut relevant_memory_rerank_fallbacks = 0_u64;
+    let mut global_dream_fallback_hits = 0_u64;
+    let mut project_dream_hits = 0_u64;
+    let mut context_pressure_warning_hits = 0_u64;
+    let mut total_relevant_memory_count = 0_u64;
+    let mut total_relevant_memory_section_chars = 0_u64;
+    let mut total_external_memory_section_chars = 0_u64;
+    let mut relevant_memory_status_breakdown = BTreeMap::new();
+    let mut dream_source_breakdown = BTreeMap::new();
+    let mut resolved_scope_breakdown = BTreeMap::new();
+
+    for entry in entries {
+        let Some(session) = storage.load_session(&entry.id).await? else {
+            continue;
+        };
+        let Some(raw) = session.metadata.get("runtime_prompt_memory_observability") else {
+            continue;
+        };
+        let Ok(observability) = serde_json::from_str::<PromptMemoryObservability>(raw) else {
+            continue;
+        };
+
+        observed_sessions += 1;
+        if matches!(
+            observability.project_memory_index_status.as_str(),
+            "loaded" | "loaded_truncated"
+        ) {
+            project_memory_index_hits += 1;
+        }
+        if observability.relevant_memory_count > 0 {
+            relevant_memory_hits += 1;
+        }
+        if observability.relevant_recall_rerank_enabled {
+            relevant_memory_rerank_enabled_sessions += 1;
+        }
+        if observability.relevant_memory_status == "reranked" {
+            relevant_memory_reranked_hits += 1;
+        }
+        if observability.relevant_memory_status == "rerank_fallback" {
+            relevant_memory_rerank_fallbacks += 1;
+        }
+        if observability.dream_source == "global_fallback" {
+            global_dream_fallback_hits += 1;
+        }
+        if observability.dream_source == "project" {
+            project_dream_hits += 1;
+        }
+        if observability.context_pressure_warning_chars > 0 {
+            context_pressure_warning_hits += 1;
+        }
+        total_relevant_memory_count += observability.relevant_memory_count as u64;
+        total_relevant_memory_section_chars += observability.relevant_memory_section_chars as u64;
+        total_external_memory_section_chars += observability.external_memory_section_chars as u64;
+        *relevant_memory_status_breakdown
+            .entry(observability.relevant_memory_status.clone())
+            .or_insert(0) += 1;
+        *dream_source_breakdown
+            .entry(observability.dream_source.clone())
+            .or_insert(0) += 1;
+        let resolved_scope = if observability.resolved_project_key.is_some() {
+            "project".to_string()
+        } else {
+            "global_or_unscoped".to_string()
+        };
+        *resolved_scope_breakdown.entry(resolved_scope).or_insert(0) += 1;
+    }
+
+    if observed_sessions == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(PromptMemoryMetricsSummary {
+        observed_sessions,
+        project_memory_index_hits,
+        relevant_memory_hits,
+        relevant_memory_reranked_hits,
+        relevant_memory_rerank_enabled_sessions,
+        relevant_memory_rerank_fallbacks,
+        global_dream_fallback_hits,
+        project_dream_hits,
+        context_pressure_warning_hits,
+        total_relevant_memory_count,
+        avg_relevant_memory_count: total_relevant_memory_count / observed_sessions.max(1),
+        avg_relevant_memory_section_chars: total_relevant_memory_section_chars
+            / observed_sessions.max(1),
+        avg_external_memory_section_chars: total_external_memory_section_chars
+            / observed_sessions.max(1),
+        relevant_memory_status_breakdown,
+        dream_source_breakdown,
+        resolved_scope_breakdown,
+    }))
+}
+
 fn summarize_memory_results(
     results: &[MemoryInspectResult],
     scope: Option<MemoryScope>,
     project_key: Option<String>,
     project_count: u64,
+    prompt_memory: Option<PromptMemoryMetricsSummary>,
 ) -> MemoryMetricsSummary {
     let mut total_memories = 0_u64;
     let mut stale_candidate_count = 0_u64;
@@ -70,13 +179,17 @@ fn summarize_memory_results(
         by_scope,
         last_reindex_at: last_reindex_at.map(|value| value.to_rfc3339()),
         last_dream_at: last_dream_at.map(|value| value.to_rfc3339()),
+        prompt_memory,
     }
 }
 
 pub(crate) async fn build_memory_summary(
     store: &MemoryStore,
+    session_store: &SessionStoreV2,
+    storage: &dyn Storage,
     query: &MemoryMetricsQuery,
 ) -> io::Result<MemoryMetricsSummary> {
+    let prompt_memory = collect_prompt_memory_metrics(session_store, storage).await?;
     let normalized_project_key = query
         .project_key
         .as_deref()
@@ -97,6 +210,7 @@ pub(crate) async fn build_memory_summary(
                 Some(MemoryScope::Global),
                 None,
                 0,
+                prompt_memory,
             ))
         }
         Some(MemoryScope::Project) => {
@@ -114,6 +228,7 @@ pub(crate) async fn build_memory_summary(
                     Some(MemoryScope::Project),
                     Some(project_key),
                     project_count,
+                    prompt_memory,
                 ))
             } else {
                 let mut results = Vec::new();
@@ -129,6 +244,7 @@ pub(crate) async fn build_memory_summary(
                     Some(MemoryScope::Project),
                     None,
                     project_keys.len() as u64,
+                    prompt_memory,
                 ))
             }
         }
@@ -147,6 +263,7 @@ pub(crate) async fn build_memory_summary(
                 None,
                 None,
                 project_keys.len() as u64,
+                prompt_memory,
             ))
         }
     }
@@ -327,7 +444,14 @@ pub async fn memory_summary(
     }
 
     let store = MemoryStore::new(state.app_data_dir.clone());
-    match build_memory_summary(&store, &query.into_inner()).await {
+    match build_memory_summary(
+        &store,
+        &state.session_store,
+        state.storage.as_ref(),
+        &query.into_inner(),
+    )
+    .await
+    {
         Ok(summary) => HttpResponse::Ok().json(summary),
         Err(error) => internal_error(error),
     }
@@ -357,14 +481,30 @@ pub async fn memory_timeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use tempfile::tempdir;
 
     use crate::agent::core::memory_store::DurableMemoryType;
+    use crate::agent::core::storage::{SessionStoreV2, Storage};
+
+    async fn create_session_storage(
+        dir: &std::path::Path,
+    ) -> (Arc<SessionStoreV2>, Arc<dyn Storage>) {
+        let session_store = Arc::new(
+            SessionStoreV2::new(dir.to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        (session_store, storage)
+    }
 
     #[tokio::test]
     async fn build_memory_summary_aggregates_global_and_project_scopes() {
         let dir = tempdir().expect("temp dir");
         let store = MemoryStore::new(dir.path());
+        let (session_store, storage) = create_session_storage(dir.path()).await;
 
         store
             .write_memory(
@@ -401,6 +541,8 @@ mod tests {
 
         let summary = build_memory_summary(
             &store,
+            &session_store,
+            storage.as_ref(),
             &MemoryMetricsQuery {
                 scope: None,
                 project_key: None,
@@ -425,6 +567,7 @@ mod tests {
     async fn build_memory_summary_aggregates_all_projects_for_project_scope() {
         let dir = tempdir().expect("temp dir");
         let store = MemoryStore::new(dir.path());
+        let (session_store, storage) = create_session_storage(dir.path()).await;
 
         for project_key in ["proj-a", "proj-b"] {
             store
@@ -445,6 +588,8 @@ mod tests {
 
         let summary = build_memory_summary(
             &store,
+            &session_store,
+            storage.as_ref(),
             &MemoryMetricsQuery {
                 scope: Some(MemoryScope::Project),
                 project_key: None,
@@ -466,9 +611,12 @@ mod tests {
     async fn build_memory_summary_rejects_session_scope() {
         let dir = tempdir().expect("temp dir");
         let store = MemoryStore::new(dir.path());
+        let (session_store, storage) = create_session_storage(dir.path()).await;
 
         let error = build_memory_summary(
             &store,
+            &session_store,
+            storage.as_ref(),
             &MemoryMetricsQuery {
                 scope: Some(MemoryScope::Session),
                 project_key: None,
@@ -482,6 +630,158 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("session scope is not supported"));
+    }
+
+    #[tokio::test]
+    async fn build_memory_summary_includes_prompt_memory_observability_aggregates() {
+        let dir = tempdir().expect("temp dir");
+        let store = MemoryStore::new(dir.path());
+        let (session_store, storage) = create_session_storage(dir.path()).await;
+
+        store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Project note",
+                "Project memory content",
+                &[],
+                Some("session-metrics-a"),
+                "tester",
+                false,
+            )
+            .await
+            .expect("write project memory");
+
+        let mut session_a = crate::agent::core::Session::new("session-metrics-a", "test-model");
+        session_a.metadata.insert(
+            "runtime_prompt_memory_observability".to_string(),
+            serde_json::to_string(&PromptMemoryObservability {
+                project_prompt_injection_enabled: true,
+                relevant_recall_enabled: true,
+                relevant_recall_rerank_enabled: true,
+                project_first_dream_enabled: true,
+                latest_user_query_present: true,
+                resolved_project_key: Some("proj-1".to_string()),
+                session_notes_status: "loaded".to_string(),
+                project_memory_index_status: "loaded".to_string(),
+                relevant_memory_status: "reranked".to_string(),
+                project_dream_status: "loaded".to_string(),
+                global_dream_fallback_status: "skipped_project_memory_or_dream_present".to_string(),
+                dream_source: "project".to_string(),
+                session_topic_count: 1,
+                truncated_session_topic_count: 0,
+                relevant_memory_count: 2,
+                session_note_section_chars: 120,
+                project_memory_index_section_chars: 300,
+                relevant_memory_section_chars: 180,
+                project_dream_section_chars: 240,
+                global_dream_fallback_section_chars: 0,
+                context_pressure_warning_chars: 0,
+                external_memory_section_chars: 900,
+            })
+            .expect("serialize observability"),
+        );
+        storage
+            .save_session(&session_a)
+            .await
+            .expect("save session a");
+
+        let mut session_b = crate::agent::core::Session::new("session-metrics-b", "test-model");
+        session_b.metadata.insert(
+            "runtime_prompt_memory_observability".to_string(),
+            serde_json::to_string(&PromptMemoryObservability {
+                project_prompt_injection_enabled: true,
+                relevant_recall_enabled: true,
+                relevant_recall_rerank_enabled: true,
+                project_first_dream_enabled: true,
+                latest_user_query_present: true,
+                resolved_project_key: None,
+                session_notes_status: "empty".to_string(),
+                project_memory_index_status: "no_project_key".to_string(),
+                relevant_memory_status: "rerank_fallback".to_string(),
+                project_dream_status: "no_project_key".to_string(),
+                global_dream_fallback_status: "fallback_loaded".to_string(),
+                dream_source: "global_fallback".to_string(),
+                session_topic_count: 0,
+                truncated_session_topic_count: 0,
+                relevant_memory_count: 1,
+                session_note_section_chars: 0,
+                project_memory_index_section_chars: 0,
+                relevant_memory_section_chars: 120,
+                project_dream_section_chars: 0,
+                global_dream_fallback_section_chars: 220,
+                context_pressure_warning_chars: 64,
+                external_memory_section_chars: 700,
+            })
+            .expect("serialize observability"),
+        );
+        storage
+            .save_session(&session_b)
+            .await
+            .expect("save session b");
+
+        let summary = build_memory_summary(
+            &store,
+            &session_store,
+            storage.as_ref(),
+            &MemoryMetricsQuery {
+                scope: None,
+                project_key: None,
+                days: None,
+                end_date: None,
+                granularity: None,
+            },
+        )
+        .await
+        .expect("summary should succeed");
+
+        let prompt_memory = summary
+            .prompt_memory
+            .expect("prompt memory summary should exist");
+        assert_eq!(prompt_memory.observed_sessions, 2);
+        assert_eq!(prompt_memory.project_memory_index_hits, 1);
+        assert_eq!(prompt_memory.relevant_memory_hits, 2);
+        assert_eq!(prompt_memory.relevant_memory_reranked_hits, 1);
+        assert_eq!(prompt_memory.relevant_memory_rerank_enabled_sessions, 2);
+        assert_eq!(prompt_memory.relevant_memory_rerank_fallbacks, 1);
+        assert_eq!(prompt_memory.project_dream_hits, 1);
+        assert_eq!(prompt_memory.global_dream_fallback_hits, 1);
+        assert_eq!(prompt_memory.context_pressure_warning_hits, 1);
+        assert_eq!(prompt_memory.total_relevant_memory_count, 3);
+        assert_eq!(prompt_memory.avg_relevant_memory_count, 1);
+        assert_eq!(prompt_memory.avg_relevant_memory_section_chars, 150);
+        assert_eq!(prompt_memory.avg_external_memory_section_chars, 800);
+        assert_eq!(
+            prompt_memory
+                .relevant_memory_status_breakdown
+                .get("reranked"),
+            Some(&1)
+        );
+        assert_eq!(
+            prompt_memory
+                .relevant_memory_status_breakdown
+                .get("rerank_fallback"),
+            Some(&1)
+        );
+        assert_eq!(
+            prompt_memory.dream_source_breakdown.get("project"),
+            Some(&1)
+        );
+        assert_eq!(
+            prompt_memory.dream_source_breakdown.get("global_fallback"),
+            Some(&1)
+        );
+        assert_eq!(
+            prompt_memory.resolved_scope_breakdown.get("project"),
+            Some(&1)
+        );
+        assert_eq!(
+            prompt_memory
+                .resolved_scope_breakdown
+                .get("global_or_unscoped"),
+            Some(&1)
+        );
     }
 
     #[tokio::test]
@@ -599,7 +899,7 @@ mod tests {
             topic_paths: vec![],
         };
 
-        let summary = summarize_memory_results(&[result_a, result_b], None, None, 1);
+        let summary = summarize_memory_results(&[result_a, result_b], None, None, 1, None);
         assert_eq!(summary.total_memories, 5);
         assert_eq!(summary.stale_candidate_count, 3);
         assert_eq!(summary.by_type.get("project"), Some(&4));
@@ -608,7 +908,13 @@ mod tests {
         assert_eq!(summary.by_status.get("stale"), Some(&1));
         assert_eq!(summary.by_scope.get("global"), Some(&2));
         assert_eq!(summary.by_scope.get("project"), Some(&3));
-        assert_eq!(summary.last_reindex_at.as_deref(), Some("2026-04-05T03:00:00+00:00"));
-        assert_eq!(summary.last_dream_at.as_deref(), Some("2026-04-05T02:05:00+00:00"));
+        assert_eq!(
+            summary.last_reindex_at.as_deref(),
+            Some("2026-04-05T03:00:00+00:00")
+        );
+        assert_eq!(
+            summary.last_dream_at.as_deref(),
+            Some("2026-04-05T02:05:00+00:00")
+        );
     }
 }

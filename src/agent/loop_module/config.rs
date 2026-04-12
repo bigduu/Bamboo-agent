@@ -9,7 +9,7 @@ use crate::agent::core::tools::ToolSchema;
 use crate::agent::metrics::MetricsCollector;
 use crate::agent::skill::SkillManager;
 use crate::agent::tools::ToolRegistry;
-use crate::core::ReasoningEffort;
+use crate::core::{config::MemoryConfig, ReasoningEffort};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFallbackMode {
@@ -28,6 +28,36 @@ pub struct ImageFallbackConfig {
     /// Vision model name for `Vision` mode. Falls back to the session's main model
     /// when `None`.
     pub vision_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptMemoryFlags {
+    pub project_prompt_injection: bool,
+    pub relevant_recall: bool,
+    pub relevant_recall_rerank: bool,
+    pub project_first_dream: bool,
+}
+
+impl Default for PromptMemoryFlags {
+    fn default() -> Self {
+        Self {
+            project_prompt_injection: true,
+            relevant_recall: true,
+            relevant_recall_rerank: false,
+            project_first_dream: true,
+        }
+    }
+}
+
+impl From<&MemoryConfig> for PromptMemoryFlags {
+    fn from(value: &MemoryConfig) -> Self {
+        Self {
+            project_prompt_injection: value.project_prompt_injection,
+            relevant_recall: value.relevant_recall,
+            relevant_recall_rerank: value.relevant_recall_rerank,
+            project_first_dream: value.project_first_dream,
+        }
+    }
 }
 
 /// Configuration for the agent loop.
@@ -83,6 +113,8 @@ pub struct AgentLoopConfig {
     /// This is intended for text-only provider paths where image parts must be degraded
     /// (placeholder / OCR / error) without leaking into stored session history or UI.
     pub image_fallback: Option<ImageFallbackConfig>,
+    /// Feature flags controlling prompt-time memory injection behavior.
+    pub prompt_memory_flags: PromptMemoryFlags,
 }
 
 impl Default for AgentLoopConfig {
@@ -109,6 +141,7 @@ impl Default for AgentLoopConfig {
             disabled_tools: BTreeSet::new(),
             token_budget: None,
             image_fallback: None,
+            prompt_memory_flags: PromptMemoryFlags::default(),
         }
     }
 }

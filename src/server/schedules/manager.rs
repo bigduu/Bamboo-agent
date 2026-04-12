@@ -503,6 +503,14 @@ async fn run_schedule_job(
                 reasoning_effort,
                 disabled_tools,
                 disabled_skill_ids,
+                prompt_memory_flags: ctx
+                    .config
+                    .read()
+                    .await
+                    .memory
+                    .as_ref()
+                    .map(crate::agent::loop_module::config::PromptMemoryFlags::from)
+                    .unwrap_or_default(),
                 ..Default::default()
             },
         )

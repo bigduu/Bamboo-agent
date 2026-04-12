@@ -72,6 +72,7 @@ pub(super) async fn run_rounds(
             &state.model_name,
             state.debug_logger.enabled,
             config,
+            llm.clone(),
             tools.as_ref(),
         )
         .await?;

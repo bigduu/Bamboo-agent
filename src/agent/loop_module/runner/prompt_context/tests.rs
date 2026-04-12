@@ -1,5 +1,47 @@
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use futures::stream;
+
 use super::merge_system_prompt_with_contexts;
 use super::system_sections::{strip_existing_skill_context, strip_existing_tool_guide_context};
+use crate::agent::core::Message;
+use crate::agent::llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
+
+#[derive(Clone)]
+struct StaticResponseProvider {
+    response: String,
+    requested_models: Arc<Mutex<Vec<String>>>,
+}
+
+impl StaticResponseProvider {
+    fn new(response: impl Into<String>) -> Self {
+        Self {
+            response: response.into(),
+            requested_models: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl LLMProvider for StaticResponseProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[crate::agent::core::tools::ToolSchema],
+        _max_output_tokens: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        self.requested_models
+            .lock()
+            .expect("lock poisoned")
+            .push(model.to_string());
+        Ok(Box::pin(stream::iter(vec![
+            Ok(LLMChunk::Token(self.response.clone())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
 
 #[test]
 fn merge_system_prompt_with_contexts_appends_both_contexts() {
@@ -75,7 +117,13 @@ async fn inject_external_memory_includes_global_dream_fallback_and_session_note_
     let mut session = crate::agent::core::Session::new("session-dream-test", "test-model");
     session.add_message(crate::agent::core::Message::system("Base prompt"));
 
-    super::inject_external_memory_into_system_message_with_store(&mut session, &store).await;
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await;
 
     let system_prompt = session
         .messages
@@ -127,7 +175,13 @@ async fn inject_external_memory_includes_project_memory_index_and_omits_global_d
         workspace.to_string_lossy().to_string(),
     );
 
-    super::inject_external_memory_into_system_message_with_store(&mut session, &store).await;
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await;
 
     let system_prompt = session
         .messages
@@ -190,7 +244,13 @@ async fn inject_external_memory_excludes_other_project_memory_index_content() {
         workspace_a.to_string_lossy().to_string(),
     );
 
-    super::inject_external_memory_into_system_message_with_store(&mut session, &store).await;
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await;
 
     let system_prompt = session
         .messages
@@ -237,7 +297,13 @@ async fn inject_external_memory_truncates_project_memory_index_and_adds_freshnes
         workspace.to_string_lossy().to_string(),
     );
 
-    super::inject_external_memory_into_system_message_with_store(&mut session, &store).await;
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await;
 
     let system_prompt = session
         .messages
@@ -270,8 +336,20 @@ async fn inject_external_memory_truncates_multi_topic_content_and_is_idempotent(
     let mut session = crate::agent::core::Session::new("session-memory-many", "test-model");
     session.add_message(crate::agent::core::Message::system("Base prompt"));
 
-    super::inject_external_memory_into_system_message_with_store(&mut session, &store).await;
-    super::inject_external_memory_into_system_message_with_store(&mut session, &store).await;
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await;
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await;
 
     let system_prompt = session
         .messages
@@ -325,7 +403,13 @@ async fn inject_external_memory_renders_relevant_memory_section_for_project_hits
         "请记住我更喜欢 concise answers 并减少 recap",
     ));
 
-    super::inject_external_memory_into_system_message_with_store(&mut session, &store).await;
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await;
 
     let system_prompt = session
         .messages
@@ -338,6 +422,75 @@ async fn inject_external_memory_renders_relevant_memory_section_for_project_hits
     assert!(system_prompt.contains("User prefers concise answers"));
     assert!(system_prompt.contains("Summary: Keep responses concise"));
     assert!(system_prompt.contains("[active][project]"));
+}
+
+#[tokio::test]
+async fn inject_external_memory_adds_stale_guidance_for_old_relevant_memory_hits() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let store = crate::agent::core::memory_store::MemoryStore::new(temp_dir.path());
+    let workspace = temp_dir.path().join("workspace-recall-stale");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let project_key = crate::agent::core::memory_store::project_key_from_path(&workspace);
+
+    let doc = store
+        .write_memory(
+            crate::agent::core::memory_store::MemoryScope::Project,
+            Some(project_key.as_str()),
+            crate::agent::core::memory_store::DurableMemoryType::Project,
+            "Release freeze policy",
+            "Mobile release freeze starts Tuesday and needs verification.",
+            &["release".to_string(), "freeze".to_string()],
+            Some("session-recall-stale"),
+            "main-model",
+            false,
+        )
+        .await
+        .expect("save stale-eligible project memory");
+
+    let raw = std::fs::read_to_string(&doc.path).expect("read stored memory doc");
+    let old_timestamp = "2026-03-01T00:00:00Z";
+    let rewritten = raw
+        .replace(&doc.frontmatter.updated_at, old_timestamp)
+        .replace(&doc.frontmatter.created_at, old_timestamp);
+    std::fs::write(&doc.path, rewritten).expect("rewrite timestamps");
+    store
+        .rebuild_scope(
+            crate::agent::core::memory_store::MemoryScope::Project,
+            Some(project_key.as_str()),
+        )
+        .await
+        .expect("rebuild scope after timestamp rewrite");
+
+    let mut session = crate::agent::core::Session::new("session-recall-stale", "test-model");
+    session.add_message(crate::agent::core::Message::system("Base prompt"));
+    session.metadata.insert(
+        "workspace_path".to_string(),
+        workspace.to_string_lossy().to_string(),
+    );
+    session.add_message(crate::agent::core::Message::user("release freeze policy"));
+
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await;
+
+    let system_prompt = session
+        .messages
+        .iter()
+        .find(|message| matches!(message.role, crate::agent::core::Role::System))
+        .map(|message| message.content.clone())
+        .expect("system prompt should exist");
+
+    assert!(system_prompt.contains("### Relevant Durable Memories"));
+    assert!(system_prompt.contains("Release freeze policy"));
+    assert!(
+        system_prompt.contains("Historical memory")
+            || system_prompt.contains("Older historical memory")
+    );
+    assert!(system_prompt.contains("verify against current"));
 }
 
 #[tokio::test]
@@ -357,7 +510,13 @@ async fn inject_external_memory_omits_relevant_memory_section_when_no_match_exis
         "this query should not match anything relevant",
     ));
 
-    super::inject_external_memory_into_system_message_with_store(&mut session, &store).await;
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await;
 
     let system_prompt = session
         .messages
@@ -403,7 +562,13 @@ async fn inject_external_memory_limits_relevant_memories_to_top_k() {
     );
     session.add_message(crate::agent::core::Message::user("release freeze"));
 
-    super::inject_external_memory_into_system_message_with_store(&mut session, &store).await;
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await;
 
     let system_prompt = session
         .messages
@@ -462,7 +627,13 @@ async fn inject_external_memory_uses_global_relevant_memory_fallback_only_when_p
     );
     session.add_message(crate::agent::core::Message::user("release checklist"));
 
-    super::inject_external_memory_into_system_message_with_store(&mut session, &store).await;
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await;
 
     let system_prompt = session
         .messages
@@ -504,7 +675,13 @@ async fn inject_external_memory_prefers_project_dream_over_global_fallback() {
         workspace.to_string_lossy().to_string(),
     );
 
-    super::inject_external_memory_into_system_message_with_store(&mut session, &store).await;
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await;
 
     let system_prompt = session
         .messages
@@ -540,7 +717,13 @@ async fn inject_external_memory_uses_global_dream_fallback_when_project_dream_an
         workspace.to_string_lossy().to_string(),
     );
 
-    super::inject_external_memory_into_system_message_with_store(&mut session, &store).await;
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await;
 
     let system_prompt = session
         .messages
@@ -552,4 +735,255 @@ async fn inject_external_memory_uses_global_dream_fallback_when_project_dream_an
     assert!(system_prompt.contains("### Global Dream Summary (fallback)"));
     assert!(system_prompt.contains("Global fallback dream"));
     assert!(!system_prompt.contains("### Project Dream Summary"));
+}
+
+#[tokio::test]
+async fn inject_external_memory_omits_project_index_when_project_prompt_injection_disabled() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let store = crate::agent::core::memory_store::MemoryStore::new(temp_dir.path());
+    let workspace = temp_dir.path().join("workspace-no-project-index");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let project_key = crate::agent::core::memory_store::project_key_from_path(&workspace);
+
+    store
+        .write_memory(
+            crate::agent::core::memory_store::MemoryScope::Project,
+            Some(project_key.as_str()),
+            crate::agent::core::memory_store::DurableMemoryType::Project,
+            "Project release rule",
+            "Use the strict release checklist.",
+            &["release".to_string()],
+            Some("session-no-project-index"),
+            "main-model",
+            false,
+        )
+        .await
+        .expect("save project memory");
+
+    let mut session = crate::agent::core::Session::new("session-no-project-index", "test-model");
+    session.add_message(crate::agent::core::Message::system("Base prompt"));
+    session.metadata.insert(
+        "workspace_path".to_string(),
+        workspace.to_string_lossy().to_string(),
+    );
+
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags {
+            project_prompt_injection: false,
+            ..crate::agent::loop_module::config::PromptMemoryFlags::default()
+        },
+        None,
+    )
+    .await;
+
+    let system_prompt = session
+        .messages
+        .iter()
+        .find(|message| matches!(message.role, crate::agent::core::Role::System))
+        .map(|message| message.content.clone())
+        .expect("system prompt should exist");
+
+    assert!(!system_prompt.contains("### Project Durable Memory Index"));
+    assert!(!system_prompt.contains("Project release rule"));
+
+    let observability = session
+        .metadata
+        .get("runtime_prompt_memory_observability")
+        .and_then(|raw| {
+            serde_json::from_str::<crate::agent::core::PromptMemoryObservability>(raw).ok()
+        })
+        .expect("observability should be recorded");
+    assert!(!observability.project_prompt_injection_enabled);
+    assert!(!observability.relevant_recall_rerank_enabled);
+    assert_eq!(observability.project_memory_index_status, "disabled");
+    assert_eq!(observability.project_dream_status, "loaded");
+    assert_eq!(
+        observability.global_dream_fallback_status,
+        "skipped_project_memory_or_dream_present"
+    );
+    assert_eq!(observability.dream_source, "project");
+}
+
+#[tokio::test]
+async fn inject_external_memory_omits_relevant_recall_and_uses_global_dream_when_project_first_disabled(
+) {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let store = crate::agent::core::memory_store::MemoryStore::new(temp_dir.path());
+    let workspace = temp_dir.path().join("workspace-global-dream-mode");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let project_key = crate::agent::core::memory_store::project_key_from_path(&workspace);
+
+    store
+        .write_memory(
+            crate::agent::core::memory_store::MemoryScope::Project,
+            Some(project_key.as_str()),
+            crate::agent::core::memory_store::DurableMemoryType::Feedback,
+            "User prefers concise answers",
+            "Keep answers concise.",
+            &["concise".to_string()],
+            Some("session-global-dream-mode"),
+            "main-model",
+            false,
+        )
+        .await
+        .expect("save relevant project memory");
+    store
+        .write_project_dream_view(
+            project_key.as_str(),
+            "# Bamboo Dream Notebook\n\nProject dream context",
+        )
+        .await
+        .expect("write project dream");
+    store
+        .write_dream_view("# Bamboo Dream Notebook\n\nGlobal dream fallback")
+        .await
+        .expect("write global dream");
+
+    let mut session = crate::agent::core::Session::new("session-global-dream-mode", "test-model");
+    session.add_message(crate::agent::core::Message::system("Base prompt"));
+    session.metadata.insert(
+        "workspace_path".to_string(),
+        workspace.to_string_lossy().to_string(),
+    );
+    session.add_message(crate::agent::core::Message::user("concise answers"));
+
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags {
+            relevant_recall: false,
+            project_first_dream: false,
+            ..crate::agent::loop_module::config::PromptMemoryFlags::default()
+        },
+        None,
+    )
+    .await;
+
+    let system_prompt = session
+        .messages
+        .iter()
+        .find(|message| matches!(message.role, crate::agent::core::Role::System))
+        .map(|message| message.content.clone())
+        .expect("system prompt should exist");
+
+    assert!(!system_prompt.contains("### Relevant Durable Memories"));
+    assert!(system_prompt.contains("### Global Dream Summary (fallback)"));
+    assert!(system_prompt.contains("Global dream fallback"));
+    assert!(!system_prompt.contains("### Project Dream Summary"));
+    assert!(!system_prompt.contains("Project dream context"));
+
+    let observability = session
+        .metadata
+        .get("runtime_prompt_memory_observability")
+        .and_then(|raw| {
+            serde_json::from_str::<crate::agent::core::PromptMemoryObservability>(raw).ok()
+        })
+        .expect("observability should be recorded");
+    assert!(!observability.relevant_recall_enabled);
+    assert!(!observability.relevant_recall_rerank_enabled);
+    assert!(!observability.project_first_dream_enabled);
+    assert_eq!(observability.relevant_memory_status, "disabled");
+    assert_eq!(observability.global_dream_fallback_status, "forced_loaded");
+    assert_eq!(observability.dream_source, "global_fallback");
+}
+
+#[tokio::test]
+async fn inject_external_memory_uses_model_rerank_for_relevant_memories_when_enabled() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let store = crate::agent::core::memory_store::MemoryStore::new(temp_dir.path());
+    let workspace = temp_dir.path().join("workspace-rerank-recall");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let project_key = crate::agent::core::memory_store::project_key_from_path(&workspace);
+
+    let lexical_first = store
+        .write_memory(
+            crate::agent::core::memory_store::MemoryScope::Project,
+            Some(project_key.as_str()),
+            crate::agent::core::memory_store::DurableMemoryType::Feedback,
+            "Release freeze checklist",
+            "Generic release freeze checklist for shipping work.",
+            &["release".to_string(), "freeze".to_string()],
+            Some("session-rerank-recall"),
+            "main-model",
+            false,
+        )
+        .await
+        .expect("save lexical-first memory");
+    let reranked_first = store
+        .write_memory(
+            crate::agent::core::memory_store::MemoryScope::Project,
+            Some(project_key.as_str()),
+            crate::agent::core::memory_store::DurableMemoryType::Feedback,
+            "Mobile launch blocker",
+            "This durable note captures the release freeze decision for the mobile app and should be preferred for mobile freeze requests.",
+            &["mobile".to_string(), "launch".to_string()],
+            Some("session-rerank-recall"),
+            "main-model",
+            false,
+        )
+        .await
+        .expect("save reranked-first memory");
+
+    let provider = StaticResponseProvider::new(format!(
+        "{{\"ids\":[\"{}\",\"{}\"]}}",
+        reranked_first.frontmatter.id, lexical_first.frontmatter.id
+    ));
+    let requested_models = provider.requested_models.clone();
+    let runtime_context = super::PromptMemoryRuntimeContext {
+        llm: Arc::new(provider),
+        background_model_name: Some("rerank-fast-model".to_string()),
+    };
+
+    let mut session = crate::agent::core::Session::new("session-rerank-recall", "test-model");
+    session.add_message(crate::agent::core::Message::system("Base prompt"));
+    session.metadata.insert(
+        "workspace_path".to_string(),
+        workspace.to_string_lossy().to_string(),
+    );
+    session.add_message(crate::agent::core::Message::user(
+        "release freeze for mobile launch",
+    ));
+
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::agent::loop_module::config::PromptMemoryFlags {
+            relevant_recall_rerank: true,
+            ..crate::agent::loop_module::config::PromptMemoryFlags::default()
+        },
+        Some(&runtime_context),
+    )
+    .await;
+
+    let system_prompt = session
+        .messages
+        .iter()
+        .find(|message| matches!(message.role, crate::agent::core::Role::System))
+        .map(|message| message.content.clone())
+        .expect("system prompt should exist");
+
+    let reranked_pos = system_prompt
+        .find("Mobile launch blocker")
+        .expect("reranked memory should be rendered");
+    let lexical_pos = system_prompt
+        .find("Release freeze checklist")
+        .expect("lexical memory should be rendered");
+    assert!(reranked_pos < lexical_pos);
+
+    let observability = session
+        .metadata
+        .get("runtime_prompt_memory_observability")
+        .and_then(|raw| {
+            serde_json::from_str::<crate::agent::core::PromptMemoryObservability>(raw).ok()
+        })
+        .expect("observability should be recorded");
+    assert!(observability.relevant_recall_enabled);
+    assert!(observability.relevant_recall_rerank_enabled);
+    assert_eq!(observability.relevant_memory_status, "reranked");
+    assert_eq!(
+        requested_models.lock().expect("lock poisoned").as_slice(),
+        ["rerank-fast-model"]
+    );
 }

@@ -288,6 +288,7 @@ fn apply_system_prompt_contexts_persists_shared_prompt_snapshot() {
         .unwrap_or_default()
         .contains("Tool details"));
     assert!(snapshot.effective_system_prompt.contains("Base prompt"));
+    assert!(snapshot.prompt_memory_observability.is_none());
 }
 
 #[test]
@@ -340,6 +341,92 @@ fn refresh_prompt_snapshot_from_session_supports_global_dream_fallback_heading()
         snapshot.session_memory_note.as_deref(),
         Some("Session note content")
     );
+}
+
+#[test]
+fn refresh_prompt_snapshot_from_session_extracts_fine_grained_external_memory_fields() {
+    let mut session = Session::new("snapshot-memory-fine-grained", "gpt-test");
+    session
+        .metadata
+        .insert("base_system_prompt".to_string(), "Base prompt".to_string());
+    session.add_message(Message::system(
+        "Base prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\n### Relevant Durable Memories\nTurn-specific historical memories shortlisted for the latest user request.\n- [active][project] Release rule\n  Summary: Use the release checklist.\n\n### Project Durable Memory Index\n````md\n# Bamboo Memory Index\n- memory entry\n````\n\n### Global Dream Summary (fallback)\n````md\nDream fallback content\n````\n\n### Session Memory Note (markdown)\n````md\nSession note content\n````\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->"
+    ));
+
+    super::prompt_setup::refresh_prompt_snapshot_from_session(&mut session);
+
+    let snapshot = super::prompt_setup::read_prompt_snapshot_metadata(&session)
+        .expect("runtime prompt snapshot should exist");
+    assert!(snapshot
+        .relevant_durable_memories
+        .as_deref()
+        .is_some_and(|value| value.contains("Release rule")));
+    assert_eq!(
+        snapshot.project_memory_index.as_deref(),
+        Some("# Bamboo Memory Index\n- memory entry")
+    );
+    assert_eq!(
+        snapshot.global_dream_fallback.as_deref(),
+        Some("Dream fallback content")
+    );
+    assert_eq!(
+        snapshot.dream_notebook.as_deref(),
+        Some("Dream fallback content")
+    );
+    assert_eq!(
+        snapshot.session_memory_note.as_deref(),
+        Some("Session note content")
+    );
+}
+
+#[test]
+fn refresh_prompt_snapshot_from_session_restores_prompt_memory_observability_from_metadata() {
+    let mut session = Session::new("snapshot-memory-observability", "gpt-test");
+    session
+        .metadata
+        .insert("base_system_prompt".to_string(), "Base prompt".to_string());
+    session.metadata.insert(
+        "runtime_prompt_memory_observability".to_string(),
+        serde_json::to_string(&crate::agent::core::PromptMemoryObservability {
+            project_prompt_injection_enabled: true,
+            relevant_recall_enabled: false,
+            relevant_recall_rerank_enabled: false,
+            project_first_dream_enabled: false,
+            latest_user_query_present: true,
+            resolved_project_key: Some("project-key".to_string()),
+            session_notes_status: "loaded".to_string(),
+            project_memory_index_status: "loaded".to_string(),
+            relevant_memory_status: "disabled".to_string(),
+            project_dream_status: "disabled".to_string(),
+            global_dream_fallback_status: "forced_loaded".to_string(),
+            dream_source: "global_fallback".to_string(),
+            session_topic_count: 1,
+            truncated_session_topic_count: 0,
+            relevant_memory_count: 0,
+            session_note_section_chars: 10,
+            project_memory_index_section_chars: 20,
+            relevant_memory_section_chars: 0,
+            project_dream_section_chars: 0,
+            global_dream_fallback_section_chars: 40,
+            context_pressure_warning_chars: 0,
+            external_memory_section_chars: 120,
+        })
+        .expect("observability should serialize"),
+    );
+    session.add_message(Message::system(
+        "Base prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\n### Global Dream Summary (fallback)\n````md\nDream fallback content\n````\n\n### Session Memory Note (markdown)\n````md\nSession note content\n````\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->"
+    ));
+
+    super::prompt_setup::refresh_prompt_snapshot_from_session(&mut session);
+
+    let snapshot = super::prompt_setup::read_prompt_snapshot_metadata(&session)
+        .expect("runtime prompt snapshot should exist");
+    let observability = snapshot
+        .prompt_memory_observability
+        .expect("observability should be restored");
+    assert!(!observability.relevant_recall_enabled);
+    assert_eq!(observability.global_dream_fallback_status, "forced_loaded");
+    assert_eq!(observability.dream_source, "global_fallback");
 }
 
 #[test]

@@ -4,18 +4,35 @@ mod external_memory;
 mod system_sections;
 mod task;
 
+pub(crate) use external_memory::{PromptMemoryRuntimeContext, PROMPT_MEMORY_OBSERVABILITY_KEY};
+
 pub(super) async fn inject_external_memory_into_system_message(
     session: &mut crate::agent::core::Session,
+    prompt_memory_flags: crate::agent::loop_module::config::PromptMemoryFlags,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
 ) {
-    external_memory::inject_external_memory_into_system_message(session).await;
+    external_memory::inject_external_memory_into_system_message(
+        session,
+        prompt_memory_flags,
+        runtime_context,
+    )
+    .await;
 }
 
 #[cfg(test)]
 pub(super) async fn inject_external_memory_into_system_message_with_store(
     session: &mut crate::agent::core::Session,
     memory: &crate::agent::core::memory_store::MemoryStore,
+    prompt_memory_flags: crate::agent::loop_module::config::PromptMemoryFlags,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
 ) {
-    external_memory::inject_external_memory_into_system_message_with_store(session, memory).await;
+    external_memory::inject_external_memory_into_system_message_with_store(
+        session,
+        memory,
+        prompt_memory_flags,
+        runtime_context,
+    )
+    .await;
 }
 
 pub(super) fn strip_existing_external_memory(prompt: &str) -> String {

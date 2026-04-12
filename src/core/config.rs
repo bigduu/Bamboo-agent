@@ -112,7 +112,7 @@ pub struct AccessControlConfig {
 }
 
 /// Memory and background summarization configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryConfig {
     /// Optional dedicated model for memory/session summarization and reflection.
     /// Falls back to the provider fast model when unset.
@@ -121,11 +121,59 @@ pub struct MemoryConfig {
     /// Whether lightweight automatic Dream-style consolidation should run in the background.
     #[serde(default)]
     pub auto_dream_enabled: bool,
+    /// Whether project durable-memory index injection is enabled for the main prompt.
+    #[serde(
+        default = "default_true_memory_project_prompt_injection",
+        alias = "memory_project_prompt_injection"
+    )]
+    pub project_prompt_injection: bool,
+    /// Whether automatic relevant durable-memory recall is enabled for the main prompt.
+    #[serde(
+        default = "default_true_memory_relevant_recall",
+        alias = "memory_relevant_recall"
+    )]
+    pub relevant_recall: bool,
+    /// Whether relevant durable-memory recall should rerank lexical shortlist candidates
+    /// using the configured memory/background model.
+    #[serde(default, alias = "memory_relevant_recall_rerank")]
+    pub relevant_recall_rerank: bool,
+    /// Whether Dream prompt injection should prefer project Dream and only use global Dream as fallback.
+    #[serde(
+        default = "default_true_memory_project_first_dream",
+        alias = "memory_project_first_dream"
+    )]
+    pub project_first_dream: bool,
     /// Whether Dream generation should refine from the existing notebook when present.
     ///
     /// This rolls out cumulative/refining Dream synthesis behind an explicit opt-in flag.
     #[serde(default, alias = "memory_dream_refine_mode")]
     pub dream_refine_mode: bool,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            background_model: None,
+            auto_dream_enabled: false,
+            project_prompt_injection: default_true_memory_project_prompt_injection(),
+            relevant_recall: default_true_memory_relevant_recall(),
+            relevant_recall_rerank: false,
+            project_first_dream: default_true_memory_project_first_dream(),
+            dream_refine_mode: false,
+        }
+    }
+}
+
+fn default_true_memory_project_prompt_injection() -> bool {
+    true
+}
+
+fn default_true_memory_relevant_recall() -> bool {
+    true
+}
+
+fn default_true_memory_project_first_dream() -> bool {
+    true
 }
 
 /// Main configuration structure for Bamboo agent
@@ -779,6 +827,10 @@ impl Config {
     /// - `BAMBOO_DATA_DIR`: Override data directory
     /// - `BAMBOO_PROVIDER`: Override default provider
     /// - `BAMBOO_HEADLESS`: Enable headless authentication mode
+    /// - `BAMBOO_MEMORY_PROJECT_PROMPT_INJECTION`: Override project durable-memory index prompt injection
+    /// - `BAMBOO_MEMORY_RELEVANT_RECALL`: Override relevant durable-memory recall prompt injection
+    /// - `BAMBOO_MEMORY_RELEVANT_RECALL_RERANK`: Override model-based relevant recall reranking
+    /// - `BAMBOO_MEMORY_PROJECT_FIRST_DREAM`: Override project-first Dream prompt behavior
     pub fn new() -> Self {
         Self::from_data_dir(None)
     }
@@ -852,6 +904,28 @@ impl Config {
 
         if let Ok(headless) = std::env::var("BAMBOO_HEADLESS") {
             config.headless_auth = parse_bool_env(&headless);
+        }
+
+        if let Ok(project_prompt_injection) =
+            std::env::var("BAMBOO_MEMORY_PROJECT_PROMPT_INJECTION")
+        {
+            let memory = config.memory.get_or_insert_with(MemoryConfig::default);
+            memory.project_prompt_injection = parse_bool_env(&project_prompt_injection);
+        }
+
+        if let Ok(relevant_recall) = std::env::var("BAMBOO_MEMORY_RELEVANT_RECALL") {
+            let memory = config.memory.get_or_insert_with(MemoryConfig::default);
+            memory.relevant_recall = parse_bool_env(&relevant_recall);
+        }
+
+        if let Ok(relevant_recall_rerank) = std::env::var("BAMBOO_MEMORY_RELEVANT_RECALL_RERANK") {
+            let memory = config.memory.get_or_insert_with(MemoryConfig::default);
+            memory.relevant_recall_rerank = parse_bool_env(&relevant_recall_rerank);
+        }
+
+        if let Ok(project_first_dream) = std::env::var("BAMBOO_MEMORY_PROJECT_FIRST_DREAM") {
+            let memory = config.memory.get_or_insert_with(MemoryConfig::default);
+            memory.project_first_dream = parse_bool_env(&project_first_dream);
         }
 
         // Publish env vars to the global cache so Bash tools can inject them.
@@ -1782,8 +1856,7 @@ mod tests {
         });
         config.memory = Some(MemoryConfig {
             background_model: Some("memory-fast".to_string()),
-            auto_dream_enabled: false,
-            dream_refine_mode: false,
+            ..MemoryConfig::default()
         });
 
         assert_eq!(
@@ -1836,12 +1909,17 @@ mod tests {
     }
 
     #[test]
-    fn memory_config_preserves_auto_dream_and_dream_refine_flags() {
+    fn memory_config_preserves_auto_dream_dream_refine_and_prompt_flags() {
         let config = Config {
             memory: Some(MemoryConfig {
                 background_model: Some("dream-fast".to_string()),
                 auto_dream_enabled: true,
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: true,
+                project_first_dream: false,
                 dream_refine_mode: true,
+                ..MemoryConfig::default()
             }),
             ..Config::default()
         };
@@ -1851,7 +1929,32 @@ mod tests {
             serde_json::from_str(&serialized).expect("config should deserialize");
         let memory = roundtrip.memory.expect("memory config should exist");
         assert!(memory.auto_dream_enabled);
+        assert!(!memory.project_prompt_injection);
+        assert!(!memory.relevant_recall);
+        assert!(memory.relevant_recall_rerank);
+        assert!(!memory.project_first_dream);
         assert!(memory.dream_refine_mode);
+    }
+
+    #[test]
+    fn memory_config_env_overrides_prompt_flags() {
+        let _lock = env_lock_acquire();
+        let temp_home = TempHome::new();
+        let _home = EnvVarGuard::set("HOME", temp_home.path.to_string_lossy().as_ref());
+        let _project_prompt = EnvVarGuard::set("BAMBOO_MEMORY_PROJECT_PROMPT_INJECTION", "false");
+        let _relevant_recall = EnvVarGuard::set("BAMBOO_MEMORY_RELEVANT_RECALL", "0");
+        let _relevant_recall_rerank =
+            EnvVarGuard::set("BAMBOO_MEMORY_RELEVANT_RECALL_RERANK", "yes");
+        let _project_first_dream = EnvVarGuard::set("BAMBOO_MEMORY_PROJECT_FIRST_DREAM", "no");
+
+        let config = Config::from_data_dir(Some(temp_home.path.clone()));
+        let memory = config
+            .memory
+            .expect("memory config should be created by env overrides");
+        assert!(!memory.project_prompt_injection);
+        assert!(!memory.relevant_recall);
+        assert!(memory.relevant_recall_rerank);
+        assert!(!memory.project_first_dream);
     }
 
     #[test]

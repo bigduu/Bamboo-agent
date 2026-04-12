@@ -58,8 +58,14 @@ pub fn config(cfg: &mut web::ServiceConfig) {
         .route("/bamboo/config", web::get().to(get_bamboo_config))
         .route("/bamboo/config", web::post().to(set_bamboo_config))
         .route("/bamboo/access/status", web::get().to(get_access_status))
-        .route("/bamboo/access/verify", web::post().to(verify_access_password))
-        .route("/bamboo/access/password", web::post().to(update_access_password))
+        .route(
+            "/bamboo/access/verify",
+            web::post().to(verify_access_password),
+        )
+        .route(
+            "/bamboo/access/password",
+            web::post().to(update_access_password),
+        )
         .route(
             "/bamboo/model-limits/defaults",
             web::get().to(get_model_limit_defaults),

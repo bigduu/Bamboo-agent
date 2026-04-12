@@ -37,6 +37,24 @@ fn build_consolidation_prompt_prefix() -> String {
     prompt
 }
 
+fn append_markdown_reference_section(
+    prompt: &mut String,
+    heading: &str,
+    content: Option<&str>,
+    empty_placeholder: &str,
+) {
+    prompt.push_str(heading);
+    prompt.push_str("\n\n");
+    if let Some(content) = content.map(str::trim).filter(|value| !value.is_empty()) {
+        prompt.push_str("```md\n");
+        prompt.push_str(content);
+        prompt.push_str("\n```\n\n");
+    } else {
+        prompt.push_str(empty_placeholder);
+        prompt.push_str("\n\n");
+    }
+}
+
 fn append_recent_sessions_section(
     prompt: &mut String,
     sessions: &[(SessionIndexEntry, Option<String>)],
@@ -92,21 +110,48 @@ pub fn build_consolidation_prompt_with_existing_dream(
     existing_dream: Option<&str>,
     sessions: &[(SessionIndexEntry, Option<String>)],
 ) -> String {
+    build_refine_consolidation_prompt(existing_dream, None, sessions)
+}
+
+pub fn build_refine_consolidation_prompt(
+    existing_dream: Option<&str>,
+    recent_durable_memory: Option<&str>,
+    sessions: &[(SessionIndexEntry, Option<String>)],
+) -> String {
     let mut prompt = build_consolidation_prompt_prefix();
     prompt.push_str(
-        "When an existing Dream notebook is provided, start from it and preserve still-valid durable context while updating active threads based on recent sessions. Remove obsolete items only when the recent evidence justifies it.\n\n",
+        "When an existing Dream notebook is provided, start from it and preserve still-valid durable context while updating active threads based on recent sessions and recent durable memory updates. Remove obsolete items only when the recent evidence justifies it.\n\n",
     );
-    prompt.push_str("## Existing Dream notebook\n\n");
-    if let Some(existing_dream) = existing_dream
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        prompt.push_str("```md\n");
-        prompt.push_str(existing_dream);
-        prompt.push_str("\n```\n\n");
-    } else {
-        prompt.push_str("_(no existing Dream notebook supplied; fall back to synthesizing from recent sessions only)_\n\n");
-    }
+    append_markdown_reference_section(
+        &mut prompt,
+        "## Existing Dream notebook",
+        existing_dream,
+        "_(no existing Dream notebook supplied; fall back to synthesizing from recent sessions only)_",
+    );
+    append_markdown_reference_section(
+        &mut prompt,
+        "## Recent durable memory updates",
+        recent_durable_memory,
+        "_(no recent durable memory updates supplied)_",
+    );
+    append_recent_sessions_section(&mut prompt, sessions);
+    prompt
+}
+
+pub fn build_rebuild_consolidation_prompt(
+    durable_memory_index: Option<&str>,
+    sessions: &[(SessionIndexEntry, Option<String>)],
+) -> String {
+    let mut prompt = build_consolidation_prompt_prefix();
+    prompt.push_str(
+        "You are rebuilding the Dream notebook from canonical durable memory plus recent session activity. Use the durable memory index as the primary long-lived signal, and use recent sessions to refresh active threads, current priorities, and unresolved questions.\n\n",
+    );
+    append_markdown_reference_section(
+        &mut prompt,
+        "## Durable memory index",
+        durable_memory_index,
+        "_(no durable memory index supplied)_",
+    );
     append_recent_sessions_section(&mut prompt, sessions);
     prompt
 }
@@ -156,14 +201,30 @@ mod tests {
 
     #[test]
     fn refine_consolidation_prompt_includes_existing_dream_and_refine_guidance() {
-        let prompt = build_consolidation_prompt_with_existing_dream(
+        let prompt = build_refine_consolidation_prompt(
             Some("## Current durable context\n- Existing durable thread"),
+            Some("# Recent Memory Updates\n\n- `mem-1` User prefers concise plans"),
             &[(sample_entry("session-2"), Some("Fresh summary".to_string()))],
         );
         assert!(prompt.contains("## Existing Dream notebook"));
         assert!(prompt.contains("Existing durable thread"));
+        assert!(prompt.contains("## Recent durable memory updates"));
+        assert!(prompt.contains("User prefers concise plans"));
         assert!(prompt.contains("start from it and preserve still-valid durable context"));
         assert!(prompt.contains("session-2"));
         assert!(prompt.contains("Fresh summary"));
+    }
+
+    #[test]
+    fn rebuild_consolidation_prompt_includes_durable_memory_index() {
+        let prompt = build_rebuild_consolidation_prompt(
+            Some("# Bamboo Memory Index (Project: proj-1)\n\n- `mem-1` Release freeze decision [project / active] updated 2026-04-10T00:00:00Z"),
+            &[(sample_entry("session-3"), Some("Recent shipping summary".to_string()))],
+        );
+        assert!(prompt.contains("## Durable memory index"));
+        assert!(prompt.contains("Release freeze decision"));
+        assert!(prompt.contains("canonical durable memory plus recent session activity"));
+        assert!(prompt.contains("session-3"));
+        assert!(prompt.contains("Recent shipping summary"));
     }
 }

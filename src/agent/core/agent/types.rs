@@ -572,6 +572,163 @@ impl CompressionEvent {
     }
 }
 
+/// Structured snapshot of parsed external-memory subsections used for prompt observability.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PromptSnapshotExternalMemoryParts {
+    pub dream_notebook: Option<String>,
+    pub session_memory_note: Option<String>,
+    pub project_memory_index: Option<String>,
+    pub relevant_durable_memories: Option<String>,
+    pub project_dream: Option<String>,
+    pub global_dream_fallback: Option<String>,
+}
+
+pub(crate) fn parse_prompt_external_memory_sections(
+    external_memory: Option<&str>,
+) -> PromptSnapshotExternalMemoryParts {
+    let Some(external_memory) = external_memory
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return PromptSnapshotExternalMemoryParts::default();
+    };
+
+    let legacy_dream_notebook = extract_prompt_markdown_block_by_heading(
+        external_memory,
+        "### Cross-session Dream Notebook (read-only)",
+    );
+    let project_memory_index = extract_prompt_markdown_block_by_heading(
+        external_memory,
+        "### Project Durable Memory Index",
+    );
+    let relevant_durable_memories =
+        extract_prompt_plain_section_by_heading(external_memory, "### Relevant Durable Memories");
+    let project_dream =
+        extract_prompt_markdown_block_by_heading(external_memory, "### Project Dream Summary");
+    let global_dream_fallback = extract_prompt_markdown_block_by_heading(
+        external_memory,
+        "### Global Dream Summary (fallback)",
+    );
+    let session_memory_note = extract_prompt_markdown_block_by_heading(
+        external_memory,
+        "### Session Memory Note (markdown)",
+    )
+    .or_else(|| collect_prompt_session_memory_topics(external_memory));
+    let dream_notebook = legacy_dream_notebook
+        .clone()
+        .or_else(|| project_dream.clone())
+        .or_else(|| global_dream_fallback.clone());
+
+    PromptSnapshotExternalMemoryParts {
+        dream_notebook,
+        session_memory_note,
+        project_memory_index,
+        relevant_durable_memories,
+        project_dream,
+        global_dream_fallback,
+    }
+}
+
+fn extract_prompt_markdown_block_by_heading(content: &str, heading: &str) -> Option<String> {
+    let start_idx = content.find(heading)?;
+    let after_heading = &content[start_idx + heading.len()..];
+    let fence_start_rel = after_heading.find("````md")?;
+    let after_fence = &after_heading[fence_start_rel + "````md".len()..];
+    let fence_end_rel = after_fence.find("````")?;
+    let block = after_fence[..fence_end_rel].trim();
+    (!block.is_empty()).then(|| block.to_string())
+}
+
+fn extract_prompt_plain_section_by_heading(content: &str, heading: &str) -> Option<String> {
+    let mut collecting = false;
+    let mut collected = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !collecting {
+            if trimmed == heading {
+                collecting = true;
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("### ") {
+            break;
+        }
+        collected.push(line);
+    }
+
+    let section = collected.join("\n").trim().to_string();
+    (!section.is_empty()).then_some(section)
+}
+
+fn collect_prompt_session_memory_topics(content: &str) -> Option<String> {
+    let mut collected = Vec::new();
+    let mut remaining = content;
+    let heading = "### Session Memory Topic: `";
+    while let Some(start_idx) = remaining.find(heading) {
+        let after_start = &remaining[start_idx..];
+        let Some(line_end) = after_start.find('\n') else {
+            break;
+        };
+        let title_line = after_start[..line_end].trim();
+        let rest = &after_start[line_end + 1..];
+        let Some(fence_start_rel) = rest.find("````md") else {
+            remaining = rest;
+            continue;
+        };
+        let after_fence = &rest[fence_start_rel + "````md".len()..];
+        let Some(fence_end_rel) = after_fence.find("````") else {
+            break;
+        };
+        let block = after_fence[..fence_end_rel].trim();
+        if !block.is_empty() {
+            collected.push(format!("{}\n\n{}", title_line, block));
+        }
+        remaining = &after_fence[fence_end_rel + "````".len()..];
+    }
+
+    (!collected.is_empty()).then(|| collected.join("\n\n---\n\n"))
+}
+
+/// Prompt-memory observability summary captured during external-memory injection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PromptMemoryObservability {
+    pub project_prompt_injection_enabled: bool,
+    pub relevant_recall_enabled: bool,
+    pub relevant_recall_rerank_enabled: bool,
+    pub project_first_dream_enabled: bool,
+    pub latest_user_query_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_project_key: Option<String>,
+    pub session_notes_status: String,
+    pub project_memory_index_status: String,
+    pub relevant_memory_status: String,
+    pub project_dream_status: String,
+    pub global_dream_fallback_status: String,
+    pub dream_source: String,
+    #[serde(default)]
+    pub session_topic_count: usize,
+    #[serde(default)]
+    pub truncated_session_topic_count: usize,
+    #[serde(default)]
+    pub relevant_memory_count: usize,
+    #[serde(default)]
+    pub session_note_section_chars: usize,
+    #[serde(default)]
+    pub project_memory_index_section_chars: usize,
+    #[serde(default)]
+    pub relevant_memory_section_chars: usize,
+    #[serde(default)]
+    pub project_dream_section_chars: usize,
+    #[serde(default)]
+    pub global_dream_fallback_section_chars: usize,
+    #[serde(default)]
+    pub context_pressure_warning_chars: usize,
+    #[serde(default)]
+    pub external_memory_section_chars: usize,
+}
+
 /// Structured snapshot of the effective system prompt and its major sections.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromptSnapshot {
@@ -592,6 +749,16 @@ pub struct PromptSnapshot {
     pub dream_notebook: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_memory_note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_memory_index: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relevant_durable_memories: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_dream: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_dream_fallback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_memory_observability: Option<PromptMemoryObservability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_memory: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1266,6 +1433,34 @@ mod tests {
             tool_guide_context: Some("Tool block".to_string()),
             dream_notebook: Some("Dream block".to_string()),
             session_memory_note: Some("Session note block".to_string()),
+            project_memory_index: Some("Project index block".to_string()),
+            relevant_durable_memories: Some("Relevant memories block".to_string()),
+            project_dream: Some("Project dream block".to_string()),
+            global_dream_fallback: Some("Global fallback block".to_string()),
+            prompt_memory_observability: Some(PromptMemoryObservability {
+                project_prompt_injection_enabled: true,
+                relevant_recall_enabled: true,
+                relevant_recall_rerank_enabled: false,
+                project_first_dream_enabled: true,
+                latest_user_query_present: true,
+                resolved_project_key: Some("project-key".to_string()),
+                session_notes_status: "loaded".to_string(),
+                project_memory_index_status: "loaded".to_string(),
+                relevant_memory_status: "lexical".to_string(),
+                project_dream_status: "loaded".to_string(),
+                global_dream_fallback_status: "skipped_project_memory_or_dream_present".to_string(),
+                dream_source: "project".to_string(),
+                session_topic_count: 1,
+                truncated_session_topic_count: 0,
+                relevant_memory_count: 2,
+                session_note_section_chars: 42,
+                project_memory_index_section_chars: 84,
+                relevant_memory_section_chars: 126,
+                project_dream_section_chars: 64,
+                global_dream_fallback_section_chars: 0,
+                context_pressure_warning_chars: 0,
+                external_memory_section_chars: 320,
+            }),
             external_memory: Some("Memory block".to_string()),
             task_list: Some("Task block".to_string()),
             effective_system_prompt: "Effective prompt".to_string(),

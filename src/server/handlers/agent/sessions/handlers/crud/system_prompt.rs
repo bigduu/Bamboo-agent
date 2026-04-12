@@ -1,6 +1,6 @@
 use actix_web::{web, HttpResponse, Result};
 
-use crate::agent::core::{Role, Session};
+use crate::agent::core::{parse_prompt_external_memory_sections, Role, Session};
 use crate::server::app_state::{workspace_prompt_guidance, AppState};
 
 use super::super::super::types::SessionSystemPromptResponse;
@@ -82,6 +82,11 @@ fn build_system_prompt_response(
             tool_guide_context: snapshot.tool_guide_context,
             dream_notebook: snapshot.dream_notebook,
             session_memory_note: snapshot.session_memory_note,
+            project_memory_index: snapshot.project_memory_index,
+            relevant_durable_memories: snapshot.relevant_durable_memories,
+            project_dream: snapshot.project_dream,
+            global_dream_fallback: snapshot.global_dream_fallback,
+            prompt_memory_observability: snapshot.prompt_memory_observability,
             external_memory: snapshot.external_memory,
             task_list: snapshot.task_list,
             effective_system_prompt: snapshot.effective_system_prompt,
@@ -104,8 +109,7 @@ fn build_system_prompt_response(
         EXTERNAL_MEMORY_START_MARKER,
         EXTERNAL_MEMORY_END_MARKER,
     );
-    let (dream_notebook, session_memory_note) =
-        split_external_memory_components(external_memory.as_deref());
+    let external_memory_parts = parse_prompt_external_memory_sections(external_memory.as_deref());
     let task_list = extract_wrapped_section(
         &effective_system_prompt,
         TASK_LIST_START_MARKER,
@@ -159,8 +163,13 @@ fn build_system_prompt_response(
         env_context,
         skill_context,
         tool_guide_context,
-        dream_notebook,
-        session_memory_note,
+        dream_notebook: external_memory_parts.dream_notebook,
+        session_memory_note: external_memory_parts.session_memory_note,
+        project_memory_index: external_memory_parts.project_memory_index,
+        relevant_durable_memories: external_memory_parts.relevant_durable_memories,
+        project_dream: external_memory_parts.project_dream,
+        global_dream_fallback: external_memory_parts.global_dream_fallback,
+        prompt_memory_observability: None,
         external_memory,
         task_list,
         effective_system_prompt,
@@ -201,70 +210,6 @@ fn extract_wrapped_section(prompt: &str, start_marker: &str, end_marker: &str) -
     } else {
         Some(section.to_string())
     }
-}
-
-fn split_external_memory_components(
-    external_memory: Option<&str>,
-) -> (Option<String>, Option<String>) {
-    let Some(external_memory) = external_memory
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return (None, None);
-    };
-
-    let dream_notebook = extract_markdown_block_by_heading(
-        external_memory,
-        "### Cross-session Dream Notebook (read-only)",
-    )
-    .or_else(|| extract_markdown_block_by_heading(external_memory, "### Project Dream Summary"))
-    .or_else(|| {
-        extract_markdown_block_by_heading(external_memory, "### Global Dream Summary (fallback)")
-    });
-    let session_memory_note =
-        extract_markdown_block_by_heading(external_memory, "### Session Memory Note (markdown)")
-            .or_else(|| collect_session_memory_topics(external_memory));
-
-    (dream_notebook, session_memory_note)
-}
-
-fn extract_markdown_block_by_heading(content: &str, heading: &str) -> Option<String> {
-    let start_idx = content.find(heading)?;
-    let after_heading = &content[start_idx + heading.len()..];
-    let fence_start_rel = after_heading.find("````md")?;
-    let after_fence = &after_heading[fence_start_rel + "````md".len()..];
-    let fence_end_rel = after_fence.find("````")?;
-    let block = after_fence[..fence_end_rel].trim();
-    (!block.is_empty()).then(|| block.to_string())
-}
-
-fn collect_session_memory_topics(content: &str) -> Option<String> {
-    let mut collected = Vec::new();
-    let mut remaining = content;
-    let heading = "### Session Memory Topic: `";
-    while let Some(start_idx) = remaining.find(heading) {
-        let after_start = &remaining[start_idx..];
-        let Some(line_end) = after_start.find('\n') else {
-            break;
-        };
-        let title_line = after_start[..line_end].trim();
-        let rest = &after_start[line_end + 1..];
-        let Some(fence_start_rel) = rest.find("````md") else {
-            remaining = rest;
-            continue;
-        };
-        let after_fence = &rest[fence_start_rel + "````md".len()..];
-        let Some(fence_end_rel) = after_fence.find("````") else {
-            break;
-        };
-        let block = after_fence[..fence_end_rel].trim();
-        if !block.is_empty() {
-            collected.push(format!("{}\n\n{}", title_line, block));
-        }
-        remaining = &after_fence[fence_end_rel + "````".len()..];
-    }
-
-    (!collected.is_empty()).then(|| collected.join("\n\n---\n\n"))
 }
 
 fn strip_wrapped_sections(prompt: &str, start_marker: &str, end_marker: &str) -> String {
@@ -472,7 +417,10 @@ mod tests {
 
         assert_eq!(snapshot["session_id"], "session-handler-project-dream");
         assert_eq!(snapshot["dream_notebook"], "Handler project dream content");
-        assert_eq!(snapshot["session_memory_note"], "Handler session note content");
+        assert_eq!(
+            snapshot["session_memory_note"],
+            "Handler session note content"
+        );
         assert!(snapshot["external_memory"]
             .as_str()
             .is_some_and(|value| value.contains("### Project Dream Summary")));
@@ -660,6 +608,33 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_extracts_fine_grained_external_memory_sections() {
+        let mut session = Session::new("session-memory-fine-grained", "gpt-5");
+        session.add_message(Message::system(
+            "Base prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\n### Relevant Durable Memories\nTurn-specific historical memories shortlisted for the latest user request.\n- [active][project] Release rule\n  Summary: Use the release checklist.\n\n### Project Durable Memory Index\n````md\n# Bamboo Memory Index\n- memory entry\n````\n\n### Project Dream Summary\n````md\nProject dream content\n````\n\n### Session Memory Note (markdown)\n````md\nSession note content\n````\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->",
+        ));
+
+        let snapshot = build_system_prompt_response("session-memory-fine-grained", &session);
+        assert!(snapshot
+            .relevant_durable_memories
+            .as_deref()
+            .is_some_and(|value| value.contains("Release rule")));
+        assert_eq!(
+            snapshot.project_memory_index.as_deref(),
+            Some("# Bamboo Memory Index\n- memory entry")
+        );
+        assert_eq!(
+            snapshot.project_dream.as_deref(),
+            Some("Project dream content")
+        );
+        assert!(snapshot.global_dream_fallback.is_none());
+        assert_eq!(
+            snapshot.dream_notebook.as_deref(),
+            Some("Project dream content")
+        );
+    }
+
+    #[test]
     fn snapshot_extracts_workspace_from_legacy_unwrapped_context() {
         let mut session = Session::new("session-legacy", "gpt-5");
         let guidance = crate::server::app_state::workspace_prompt_guidance();
@@ -703,6 +678,35 @@ mod tests {
                 tool_guide_context: Some("Shared tool guide".to_string()),
                 dream_notebook: Some("Dream block".to_string()),
                 session_memory_note: Some("Session note block".to_string()),
+                project_memory_index: Some("Shared project index".to_string()),
+                relevant_durable_memories: Some("Shared relevant memories".to_string()),
+                project_dream: Some("Shared project dream".to_string()),
+                global_dream_fallback: Some("Shared global fallback".to_string()),
+                prompt_memory_observability: Some(crate::agent::core::PromptMemoryObservability {
+                    project_prompt_injection_enabled: true,
+                    relevant_recall_enabled: true,
+                    relevant_recall_rerank_enabled: false,
+                    project_first_dream_enabled: true,
+                    latest_user_query_present: true,
+                    resolved_project_key: Some("shared-project".to_string()),
+                    session_notes_status: "loaded".to_string(),
+                    project_memory_index_status: "loaded".to_string(),
+                    relevant_memory_status: "lexical".to_string(),
+                    project_dream_status: "loaded".to_string(),
+                    global_dream_fallback_status: "skipped_project_memory_or_dream_present"
+                        .to_string(),
+                    dream_source: "project".to_string(),
+                    session_topic_count: 1,
+                    truncated_session_topic_count: 0,
+                    relevant_memory_count: 1,
+                    session_note_section_chars: 10,
+                    project_memory_index_section_chars: 20,
+                    relevant_memory_section_chars: 30,
+                    project_dream_section_chars: 40,
+                    global_dream_fallback_section_chars: 0,
+                    context_pressure_warning_chars: 0,
+                    external_memory_section_chars: 120,
+                }),
                 external_memory: Some("Shared memory".to_string()),
                 task_list: Some("Shared task list".to_string()),
                 effective_system_prompt: "Shared effective prompt".to_string(),
@@ -719,6 +723,29 @@ mod tests {
         assert_eq!(
             snapshot.workspace_context.as_deref(),
             Some("Shared workspace")
+        );
+        assert_eq!(
+            snapshot.project_memory_index.as_deref(),
+            Some("Shared project index")
+        );
+        assert_eq!(
+            snapshot.relevant_durable_memories.as_deref(),
+            Some("Shared relevant memories")
+        );
+        assert_eq!(
+            snapshot.project_dream.as_deref(),
+            Some("Shared project dream")
+        );
+        assert_eq!(
+            snapshot.global_dream_fallback.as_deref(),
+            Some("Shared global fallback")
+        );
+        assert_eq!(
+            snapshot
+                .prompt_memory_observability
+                .as_ref()
+                .and_then(|item| item.resolved_project_key.as_deref()),
+            Some("shared-project")
         );
         assert_eq!(snapshot.effective_system_prompt, "Shared effective prompt");
     }

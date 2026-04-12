@@ -59,9 +59,10 @@ pub mod todo;
 pub mod tools;
 
 pub use agent::events::{AgentEvent, TokenBudgetUsage, TokenUsage};
+pub(crate) use agent::parse_prompt_external_memory_sections;
 pub use agent::types::{
     ConversationSummary, ImageOcrLine, ImageOcrResult, Message, MessageContent, MessagePhase,
-    PromptSnapshot, Role, Session, SessionKind,
+    PromptMemoryObservability, PromptSnapshot, Role, Session, SessionKind,
 };
 pub use agent::AgentError;
 pub use budget::limits::create_budget_for_model;

@@ -11,8 +11,9 @@ pub use core_handlers::{
 pub use types::{
     CombinedSummary, ForwardMetricsQuery, McpServerUsageItem, McpToolUsageItem, MemoryMetricsQuery,
     MemoryMetricsSummary, MemoryTimelinePoint, MetricsDailyQuery, MetricsSessionsQuery,
-    MetricsSummaryQuery, MetricsUsageBreakdownResponse, MetricsUsageQuery, SkillUsageItem,
-    UnifiedSummary, UnifiedTimelinePoint, UsageCountItem,
+    MetricsSummaryQuery, MetricsUsageBreakdownResponse, MetricsUsageQuery,
+    PromptMemoryMetricsSummary, SkillUsageItem, UnifiedSummary, UnifiedTimelinePoint,
+    UsageCountItem,
 };
 pub use unified_handlers::{v2_unified_summary, v2_unified_timeline};
 

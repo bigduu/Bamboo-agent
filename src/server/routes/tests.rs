@@ -199,9 +199,14 @@ async fn system_prompt_snapshot_route_returns_project_dream_over_http() {
         serde_json::json!("HTTP project dream content")
     );
     assert_eq!(
+        payload["project_dream"],
+        serde_json::json!("HTTP project dream content")
+    );
+    assert_eq!(
         payload["session_memory_note"],
         serde_json::json!("HTTP session note content")
     );
+    assert!(payload.get("global_dream_fallback").is_none());
     assert!(payload["external_memory"]
         .as_str()
         .unwrap_or_default()

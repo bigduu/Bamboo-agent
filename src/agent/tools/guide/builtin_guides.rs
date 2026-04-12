@@ -603,7 +603,7 @@ fn example(scenario: &str, parameters: serde_json::Value, explanation: &str) -> 
 mod tests {
     use crate::agent::tools::executor::BUILTIN_TOOL_NAMES;
 
-    use super::{BUILTIN_GUIDE_NAMES, builtin_guide_spec};
+    use super::{builtin_guide_spec, BUILTIN_GUIDE_NAMES};
 
     #[test]
     fn every_builtin_tool_has_a_guide() {

@@ -1,11 +1,14 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::agent::core::memory_store::{
-    project_key_from_path, render_memory_freshness_note, shortlist_relevant_memories,
+    project_key_from_path, render_memory_freshness_note, select_relevant_memories,
     truncate_chars as memory_truncate_chars, FreshnessKind, MemoryRecallCandidate,
-    MemoryRecallOptions, MemoryScope, MemoryStore,
+    MemoryRecallOptions, MemoryRecallRerankContext, MemoryRecallStrategy, MemoryScope, MemoryStore,
 };
-use crate::agent::core::Session;
+use crate::agent::core::{PromptMemoryObservability, Session};
+use crate::agent::llm::LLMProvider;
+use crate::agent::loop_module::config::PromptMemoryFlags;
 use crate::agent::tools::tools::workspace_state;
 
 use super::system_sections::strip_existing_prompt_block;
@@ -27,6 +30,7 @@ const RELEVANT_MEMORY_PER_ITEM_MAX_CHARS: usize = 220;
 /// Max chars injected from the global Dream notebook fallback.
 const GLOBAL_DREAM_NOTEBOOK_PROMPT_MAX_CHARS: usize = 1_500;
 const EXTERNAL_MEMORY_TOOL_NAME: &str = "session_note";
+pub(crate) const PROMPT_MEMORY_OBSERVABILITY_KEY: &str = "runtime_prompt_memory_observability";
 
 /// Context usage percentage at which we warn the LLM to save memory.
 /// This should be below the budget system's compression trigger (~90%).
@@ -74,6 +78,29 @@ struct RelevantMemorySnippet {
     freshness_note: Option<String>,
 }
 
+#[derive(Clone)]
+struct RelevantMemoryLoadResult {
+    snippets: Vec<RelevantMemorySnippet>,
+    strategy: MemoryRecallStrategy,
+}
+
+#[derive(Clone)]
+pub(crate) struct PromptMemoryRuntimeContext {
+    pub llm: Arc<dyn LLMProvider>,
+    pub background_model_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ExternalMemoryRenderParts {
+    session_note_section: String,
+    relevant_memory_section: String,
+    project_memory_index_section: String,
+    project_dream_section: String,
+    global_dream_fallback_section: String,
+    context_pressure_warning: String,
+    full_section: String,
+}
+
 pub(super) fn strip_existing_external_memory(prompt: &str) -> String {
     strip_existing_prompt_block(
         prompt,
@@ -97,14 +124,26 @@ fn count_chars(value: &str) -> usize {
     value.chars().count()
 }
 
-pub(super) async fn inject_external_memory_into_system_message(session: &mut Session) {
+pub(super) async fn inject_external_memory_into_system_message(
+    session: &mut Session,
+    prompt_memory_flags: PromptMemoryFlags,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
+) {
     let memory = MemoryStore::with_defaults();
-    inject_external_memory_into_system_message_with_store(session, &memory).await;
+    inject_external_memory_into_system_message_with_store(
+        session,
+        &memory,
+        prompt_memory_flags,
+        runtime_context,
+    )
+    .await;
 }
 
 pub(super) async fn inject_external_memory_into_system_message_with_store(
     session: &mut Session,
     memory: &MemoryStore,
+    prompt_memory_flags: PromptMemoryFlags,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
 ) {
     let Some(system_message_index) = session
         .messages
@@ -119,24 +158,54 @@ pub(super) async fn inject_external_memory_into_system_message_with_store(
     let base_prompt =
         strip_existing_external_memory(&session.messages[system_message_index].content);
 
-    let session_id = session.id.as_str();
+    let session_id = session.id.clone();
     let resolved_project_key = resolve_prompt_project_key(session);
-    let session_note_snippets = load_session_note_snippets(memory, session_id).await;
-    let project_memory_index =
-        load_project_memory_index_snippet(memory, session_id, resolved_project_key.as_deref())
-            .await;
-    let relevant_memory_snippets =
-        load_relevant_memory_snippets(session, memory, session_id, resolved_project_key.as_deref())
-            .await;
-    let project_dream =
-        load_project_dream_snippet(memory, session_id, resolved_project_key.as_deref()).await;
-    let global_dream_fallback = if project_dream.is_none() && project_memory_index.is_none() {
-        load_global_dream_fallback_snippet(memory, session_id).await
+    let session_note_snippets = load_session_note_snippets(memory, session_id.as_str()).await;
+    let project_memory_index = if prompt_memory_flags.project_prompt_injection {
+        load_project_memory_index_snippet(
+            memory,
+            session_id.as_str(),
+            resolved_project_key.as_deref(),
+        )
+        .await
     } else {
         None
     };
+    let relevant_memory_result = if prompt_memory_flags.relevant_recall {
+        load_relevant_memory_snippets(
+            session,
+            memory,
+            session_id.as_str(),
+            resolved_project_key.as_deref(),
+            prompt_memory_flags,
+            runtime_context,
+        )
+        .await
+    } else {
+        RelevantMemoryLoadResult {
+            snippets: Vec::new(),
+            strategy: MemoryRecallStrategy::Lexical,
+        }
+    };
+    let relevant_memory_snippets = relevant_memory_result.snippets.clone();
+    let project_dream = if prompt_memory_flags.project_first_dream {
+        load_project_dream_snippet(memory, session_id.as_str(), resolved_project_key.as_deref())
+            .await
+    } else {
+        None
+    };
+    let global_dream_fallback = if prompt_memory_flags.project_first_dream {
+        if project_dream.is_none() && project_memory_index.is_none() {
+            load_global_dream_fallback_snippet(memory, session_id.as_str()).await
+        } else {
+            None
+        }
+    } else {
+        load_global_dream_fallback_snippet(memory, session_id.as_str()).await
+    };
 
-    let section = build_external_memory_section(
+    let latest_user_query_present = latest_user_query_text(session).is_some();
+    let render_parts = build_external_memory_render_parts(
         session,
         &session_note_snippets,
         project_memory_index.as_ref(),
@@ -144,12 +213,25 @@ pub(super) async fn inject_external_memory_into_system_message_with_store(
         project_dream.as_ref(),
         global_dream_fallback.as_ref(),
     );
+    let observability = build_prompt_memory_observability(
+        prompt_memory_flags,
+        resolved_project_key.clone(),
+        latest_user_query_present,
+        &session_note_snippets,
+        project_memory_index.as_ref(),
+        &relevant_memory_snippets,
+        relevant_memory_result.strategy,
+        project_dream.as_ref(),
+        global_dream_fallback.as_ref(),
+        &render_parts,
+    );
 
     session.messages[system_message_index].content =
-        format!("{}{}", base_prompt.trim_end(), section);
+        format!("{}{}", base_prompt.trim_end(), render_parts.full_section);
+    persist_prompt_memory_observability(session, &observability);
 
     tracing::info!(
-        "[{}] External memory injected: project_key_resolved={}, project_index_loaded={}, project_index_chars={}, relevant_query_present={}, relevant_count={}, project_dream_loaded={}, project_dream_chars={}, global_dream_fallback_used={}, global_dream_chars={}, session_topics={}, session_note_chars={}, truncated_topics={}",
+        "[{}] External memory injected: project_key_resolved={}, project_index_loaded={}, project_index_chars={}, relevant_query_present={}, relevant_count={}, project_dream_loaded={}, project_dream_chars={}, global_dream_fallback_used={}, global_dream_chars={}, session_topics={}, session_note_chars={}, truncated_topics={}, dream_source={}, external_memory_section_chars={}",
         session_id,
         resolved_project_key.as_deref().unwrap_or(""),
         project_memory_index.is_some(),
@@ -157,7 +239,7 @@ pub(super) async fn inject_external_memory_into_system_message_with_store(
             .as_ref()
             .map(|snippet| count_chars(&snippet.content))
             .unwrap_or(0),
-        latest_user_query_text(session).is_some(),
+        latest_user_query_present,
         relevant_memory_snippets.len(),
         project_dream.is_some(),
         project_dream
@@ -178,6 +260,8 @@ pub(super) async fn inject_external_memory_into_system_message_with_store(
             .iter()
             .filter(|snippet| snippet.truncated)
             .count(),
+        observability.dream_source,
+        observability.external_memory_section_chars,
     );
 }
 
@@ -307,12 +391,33 @@ async fn load_relevant_memory_snippets(
     memory: &MemoryStore,
     session_id: &str,
     project_key: Option<&str>,
-) -> Vec<RelevantMemorySnippet> {
+    prompt_memory_flags: PromptMemoryFlags,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
+) -> RelevantMemoryLoadResult {
     let Some(query) = latest_user_query_text(session) else {
-        return Vec::new();
+        return RelevantMemoryLoadResult {
+            snippets: Vec::new(),
+            strategy: MemoryRecallStrategy::Lexical,
+        };
     };
 
-    let candidates = match shortlist_relevant_memories(
+    let rerank_context = if prompt_memory_flags.relevant_recall_rerank {
+        runtime_context.and_then(|ctx| {
+            ctx.background_model_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(|model| MemoryRecallRerankContext {
+                    llm: ctx.llm.clone(),
+                    model: model.to_string(),
+                    session_id: Some(session_id.to_string()),
+                })
+        })
+    } else {
+        None
+    };
+
+    let selection = match select_relevant_memories(
         memory,
         project_key,
         &query,
@@ -321,24 +426,28 @@ async fn load_relevant_memory_snippets(
             include_global_fallback: true,
             max_candidates_per_scope: RELEVANT_MEMORY_RESULT_LIMIT.max(12),
         },
+        rerank_context.as_ref(),
     )
     .await
     {
-        Ok(candidates) => candidates,
+        Ok(selection) => selection,
         Err(error) => {
             tracing::warn!(
-                "[{}] Failed to shortlist relevant durable memories: {}",
+                "[{}] Failed to select relevant durable memories: {}",
                 session_id,
                 error
             );
-            return Vec::new();
+            return RelevantMemoryLoadResult {
+                snippets: Vec::new(),
+                strategy: MemoryRecallStrategy::Lexical,
+            };
         }
     };
 
     let mut rendered = Vec::new();
     let mut total_chars = 0usize;
 
-    for candidate in candidates {
+    for candidate in selection.candidates {
         let Some(snippet) =
             build_relevant_memory_snippet(candidate, RELEVANT_MEMORY_PER_ITEM_MAX_CHARS)
         else {
@@ -360,7 +469,10 @@ async fn load_relevant_memory_snippets(
         rendered.push(snippet);
     }
 
-    rendered
+    RelevantMemoryLoadResult {
+        snippets: rendered,
+        strategy: selection.strategy,
+    }
 }
 
 fn build_relevant_memory_snippet(
@@ -458,14 +570,31 @@ fn extract_latest_updated_at_from_memory_view(content: &str) -> Option<String> {
     })
 }
 
-fn build_external_memory_section(
+fn build_external_memory_render_parts(
     session: &Session,
     session_note_snippets: &[TopicSnippet],
     project_memory_index: Option<&ProjectMemoryIndexSnippet>,
     relevant_memory_snippets: &[RelevantMemorySnippet],
     project_dream: Option<&ProjectDreamSnippet>,
     global_dream_fallback: Option<&LoadedSnippet>,
-) -> String {
+) -> ExternalMemoryRenderParts {
+    let session_note_section = render_session_note_section(session_note_snippets);
+    let relevant_memory_section = if relevant_memory_snippets.is_empty() {
+        String::new()
+    } else {
+        render_relevant_memory_section(relevant_memory_snippets)
+    };
+    let project_memory_index_section = project_memory_index
+        .map(render_project_memory_index_section)
+        .unwrap_or_default();
+    let project_dream_section = project_dream
+        .map(render_project_dream_section)
+        .unwrap_or_default();
+    let global_dream_fallback_section = global_dream_fallback
+        .map(render_global_dream_fallback_section)
+        .unwrap_or_default();
+    let context_pressure_warning = render_context_pressure_warning(session).unwrap_or_default();
+
     let mut section = String::new();
     section.push_str("\n\n");
     section.push_str(EXTERNAL_MEMORY_START_MARKER);
@@ -519,31 +648,152 @@ fn build_external_memory_section(
         "- List topics: call `{EXTERNAL_MEMORY_TOOL_NAME}` with `{{\"action\":\"list_topics\"}}`\n\n"
     ));
 
-    section.push_str(&render_session_note_section(session_note_snippets));
-
-    if !relevant_memory_snippets.is_empty() {
-        section.push_str(&render_relevant_memory_section(relevant_memory_snippets));
-    }
-
-    if let Some(project_memory_index) = project_memory_index {
-        section.push_str(&render_project_memory_index_section(project_memory_index));
-    }
-
-    if let Some(project_dream) = project_dream {
-        section.push_str(&render_project_dream_section(project_dream));
-    }
-
-    if let Some(global_dream_fallback) = global_dream_fallback {
-        section.push_str(&render_global_dream_fallback_section(global_dream_fallback));
-    }
-
-    if let Some(context_pressure_warning) = render_context_pressure_warning(session) {
-        section.push_str(&context_pressure_warning);
-    }
-
+    section.push_str(&session_note_section);
+    section.push_str(&relevant_memory_section);
+    section.push_str(&project_memory_index_section);
+    section.push_str(&project_dream_section);
+    section.push_str(&global_dream_fallback_section);
+    section.push_str(&context_pressure_warning);
     section.push('\n');
     section.push_str(EXTERNAL_MEMORY_END_MARKER);
-    section
+
+    ExternalMemoryRenderParts {
+        session_note_section,
+        relevant_memory_section,
+        project_memory_index_section,
+        project_dream_section,
+        global_dream_fallback_section,
+        context_pressure_warning,
+        full_section: section,
+    }
+}
+
+fn build_prompt_memory_observability(
+    prompt_memory_flags: PromptMemoryFlags,
+    resolved_project_key: Option<String>,
+    latest_user_query_present: bool,
+    session_note_snippets: &[TopicSnippet],
+    project_memory_index: Option<&ProjectMemoryIndexSnippet>,
+    relevant_memory_snippets: &[RelevantMemorySnippet],
+    relevant_memory_strategy: MemoryRecallStrategy,
+    project_dream: Option<&ProjectDreamSnippet>,
+    global_dream_fallback: Option<&LoadedSnippet>,
+    render_parts: &ExternalMemoryRenderParts,
+) -> PromptMemoryObservability {
+    let session_notes_status = if session_note_snippets.is_empty() {
+        "empty"
+    } else if session_note_snippets
+        .iter()
+        .any(|snippet| snippet.truncated)
+    {
+        "loaded_truncated"
+    } else {
+        "loaded"
+    };
+    let project_memory_index_status = if !prompt_memory_flags.project_prompt_injection {
+        "disabled"
+    } else if let Some(snippet) = project_memory_index {
+        if snippet.truncated {
+            "loaded_truncated"
+        } else {
+            "loaded"
+        }
+    } else if resolved_project_key.is_some() {
+        "missing"
+    } else {
+        "no_project_key"
+    };
+    let relevant_memory_status = if !prompt_memory_flags.relevant_recall {
+        "disabled"
+    } else if !latest_user_query_present {
+        "no_query"
+    } else if relevant_memory_snippets.is_empty() {
+        "no_match"
+    } else {
+        relevant_memory_strategy.as_str()
+    };
+    let project_dream_status = if !prompt_memory_flags.project_first_dream {
+        "disabled"
+    } else if let Some(snippet) = project_dream {
+        if snippet.truncated {
+            "loaded_truncated"
+        } else {
+            "loaded"
+        }
+    } else if resolved_project_key.is_some() {
+        "missing"
+    } else {
+        "no_project_key"
+    };
+    let global_dream_fallback_status = if !prompt_memory_flags.project_first_dream {
+        if let Some(snippet) = global_dream_fallback {
+            if snippet.truncated {
+                "forced_loaded_truncated"
+            } else {
+                "forced_loaded"
+            }
+        } else {
+            "forced_missing"
+        }
+    } else if project_dream.is_some() || project_memory_index.is_some() {
+        "skipped_project_memory_or_dream_present"
+    } else if let Some(snippet) = global_dream_fallback {
+        if snippet.truncated {
+            "fallback_loaded_truncated"
+        } else {
+            "fallback_loaded"
+        }
+    } else {
+        "fallback_missing"
+    };
+    let dream_source = if project_dream.is_some() {
+        "project"
+    } else if global_dream_fallback.is_some() {
+        "global_fallback"
+    } else {
+        "none"
+    };
+
+    PromptMemoryObservability {
+        project_prompt_injection_enabled: prompt_memory_flags.project_prompt_injection,
+        relevant_recall_enabled: prompt_memory_flags.relevant_recall,
+        relevant_recall_rerank_enabled: prompt_memory_flags.relevant_recall_rerank,
+        project_first_dream_enabled: prompt_memory_flags.project_first_dream,
+        latest_user_query_present,
+        resolved_project_key,
+        session_notes_status: session_notes_status.to_string(),
+        project_memory_index_status: project_memory_index_status.to_string(),
+        relevant_memory_status: relevant_memory_status.to_string(),
+        project_dream_status: project_dream_status.to_string(),
+        global_dream_fallback_status: global_dream_fallback_status.to_string(),
+        dream_source: dream_source.to_string(),
+        session_topic_count: session_note_snippets.len(),
+        truncated_session_topic_count: session_note_snippets
+            .iter()
+            .filter(|snippet| snippet.truncated)
+            .count(),
+        relevant_memory_count: relevant_memory_snippets.len(),
+        session_note_section_chars: count_chars(&render_parts.session_note_section),
+        project_memory_index_section_chars: count_chars(&render_parts.project_memory_index_section),
+        relevant_memory_section_chars: count_chars(&render_parts.relevant_memory_section),
+        project_dream_section_chars: count_chars(&render_parts.project_dream_section),
+        global_dream_fallback_section_chars: count_chars(
+            &render_parts.global_dream_fallback_section,
+        ),
+        context_pressure_warning_chars: count_chars(&render_parts.context_pressure_warning),
+        external_memory_section_chars: count_chars(&render_parts.full_section),
+    }
+}
+
+fn persist_prompt_memory_observability(
+    session: &mut Session,
+    observability: &PromptMemoryObservability,
+) {
+    if let Ok(raw) = serde_json::to_string(observability) {
+        session
+            .metadata
+            .insert(PROMPT_MEMORY_OBSERVABILITY_KEY.to_string(), raw);
+    }
 }
 
 fn render_session_note_section(snippets: &[TopicSnippet]) -> String {

@@ -34,7 +34,10 @@ fn resolve_runtime_static_dir(
 ) -> Result<Option<PathBuf>, String> {
     if let Some(path) = configured_static_dir {
         let canonicalized = canonicalize_static_dir(&path)?;
-        info!("Serving static files from configured directory: {:?}", canonicalized);
+        info!(
+            "Serving static files from configured directory: {:?}",
+            canonicalized
+        );
         return Ok(Some(canonicalized));
     }
 
@@ -297,12 +300,10 @@ mod tests {
         let static_dir = tempdir().unwrap();
         std::fs::write(static_dir.path().join("index.html"), "ok").unwrap();
 
-        let resolved = resolve_runtime_static_dir(
-            bamboo_home.path(),
-            Some(static_dir.path().to_path_buf()),
-        )
-        .expect("configured static dir should resolve")
-        .expect("configured static dir should be returned");
+        let resolved =
+            resolve_runtime_static_dir(bamboo_home.path(), Some(static_dir.path().to_path_buf()))
+                .expect("configured static dir should resolve")
+                .expect("configured static dir should be returned");
 
         assert_eq!(resolved, static_dir.path().canonicalize().unwrap());
     }

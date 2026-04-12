@@ -108,6 +108,16 @@ pub struct SessionSystemPromptResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_memory_note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_memory_index: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relevant_durable_memories: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_dream: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_dream_fallback: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_memory_observability: Option<crate::agent::core::PromptMemoryObservability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub external_memory: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "task_list", alias = "todo_list")]
@@ -316,6 +326,11 @@ mod tests {
             tool_guide_context: None,
             dream_notebook: None,
             session_memory_note: None,
+            project_memory_index: None,
+            relevant_durable_memories: None,
+            project_dream: None,
+            global_dream_fallback: None,
+            prompt_memory_observability: None,
             external_memory: None,
             task_list: None,
             effective_system_prompt: "You are helpful".to_string(),
@@ -340,6 +355,34 @@ mod tests {
             tool_guide_context: Some("Tool guide".to_string()),
             dream_notebook: Some("Dream".to_string()),
             session_memory_note: Some("Session note".to_string()),
+            project_memory_index: Some("Project index".to_string()),
+            relevant_durable_memories: Some("Relevant memories".to_string()),
+            project_dream: Some("Project dream".to_string()),
+            global_dream_fallback: Some("Global fallback".to_string()),
+            prompt_memory_observability: Some(crate::agent::core::PromptMemoryObservability {
+                project_prompt_injection_enabled: true,
+                relevant_recall_enabled: true,
+                relevant_recall_rerank_enabled: false,
+                project_first_dream_enabled: true,
+                latest_user_query_present: true,
+                resolved_project_key: Some("project-key".to_string()),
+                session_notes_status: "loaded".to_string(),
+                project_memory_index_status: "loaded".to_string(),
+                relevant_memory_status: "lexical".to_string(),
+                project_dream_status: "loaded".to_string(),
+                global_dream_fallback_status: "skipped_project_memory_or_dream_present".to_string(),
+                dream_source: "project".to_string(),
+                session_topic_count: 1,
+                truncated_session_topic_count: 0,
+                relevant_memory_count: 2,
+                session_note_section_chars: 12,
+                project_memory_index_section_chars: 34,
+                relevant_memory_section_chars: 56,
+                project_dream_section_chars: 78,
+                global_dream_fallback_section_chars: 0,
+                context_pressure_warning_chars: 0,
+                external_memory_section_chars: 180,
+            }),
             external_memory: Some("Memory".to_string()),
             task_list: Some("Task".to_string()),
             effective_system_prompt: "Full prompt".to_string(),
@@ -349,6 +392,11 @@ mod tests {
         assert!(json.contains("\"enhancement_prompt\""));
         assert!(json.contains("\"workspace_context\""));
         assert!(json.contains("\"skill_context\""));
+        assert!(json.contains("\"project_memory_index\""));
+        assert!(json.contains("\"relevant_durable_memories\""));
+        assert!(json.contains("\"project_dream\""));
+        assert!(json.contains("\"global_dream_fallback\""));
+        assert!(json.contains("\"prompt_memory_observability\""));
     }
 
     #[test]

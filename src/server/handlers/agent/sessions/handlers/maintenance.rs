@@ -247,8 +247,7 @@ mod tests {
         let config = Config {
             memory: Some(crate::core::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
-                auto_dream_enabled: false,
-                dream_refine_mode: false,
+                ..crate::core::config::MemoryConfig::default()
             }),
             ..Config::default()
         };

@@ -1,9 +1,12 @@
 //! Per-round prelude helpers for the agent loop runner.
 
+use std::sync::Arc;
+
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::core::tools::ToolExecutor;
 use crate::agent::core::{AgentError, Session};
+use crate::agent::llm::LLMProvider;
 use crate::agent::loop_module::config::AgentLoopConfig;
 use crate::agent::loop_module::task_context::TaskLoopContext;
 use crate::agent::metrics::MetricsCollector;
@@ -16,6 +19,8 @@ use cancellation::ensure_not_cancelled;
 use prompt_updates::refresh_round_prompt_context;
 use round_state::{build_round_id, log_round_start, update_task_round_state};
 
+use super::prompt_context::PromptMemoryRuntimeContext;
+
 pub(super) async fn prepare_round(
     session: &mut Session,
     task_context: &mut Option<TaskLoopContext>,
@@ -27,10 +32,15 @@ pub(super) async fn prepare_round(
     model_name: &str,
     debug_enabled: bool,
     config: &AgentLoopConfig,
+    llm: Arc<dyn LLMProvider>,
     _tools: &dyn ToolExecutor,
 ) -> Result<String, AgentError> {
-    let _ = (config, session_id);
-    refresh_round_prompt_context(session).await;
+    let _ = session_id;
+    let runtime_context = PromptMemoryRuntimeContext {
+        llm,
+        background_model_name: config.background_model_name.clone(),
+    };
+    refresh_round_prompt_context(session, config.prompt_memory_flags, Some(&runtime_context)).await;
     update_task_round_state(task_context, round, max_rounds);
 
     let round_id = build_round_id(session_id, round);

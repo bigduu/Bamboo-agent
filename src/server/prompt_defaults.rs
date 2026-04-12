@@ -82,7 +82,9 @@ mod tests {
 
     #[test]
     fn global_default_template_is_never_empty() {
-        assert!(!read_global_default_system_prompt_template().trim().is_empty());
+        assert!(!read_global_default_system_prompt_template()
+            .trim()
+            .is_empty());
     }
 
     #[test]

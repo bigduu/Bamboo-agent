@@ -209,11 +209,9 @@ mod tests {
         let args = json!({"command": "rm -rf /tmp/a"});
         let contexts = check_permissions("Bash", &args).unwrap().unwrap();
         assert_eq!(contexts.len(), 2);
-        assert!(
-            contexts
-                .iter()
-                .any(|ctx| ctx.permission_type == PermissionType::DeleteOperation)
-        );
+        assert!(contexts
+            .iter()
+            .any(|ctx| ctx.permission_type == PermissionType::DeleteOperation));
     }
 
     #[test]
@@ -283,11 +281,9 @@ mod tests {
         assert_eq!(contexts.len(), 1);
         assert_eq!(contexts[0].permission_type, PermissionType::ExecuteCommand);
         assert_eq!(contexts[0].resource, "node");
-        assert!(
-            contexts[0]
-                .operation_description
-                .contains("console.log('hello')")
-        );
+        assert!(contexts[0]
+            .operation_description
+            .contains("console.log('hello')"));
     }
 
     #[test]

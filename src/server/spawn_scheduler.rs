@@ -306,6 +306,11 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
                 provider_name: Some(provider_name),
                 disabled_tools,
                 disabled_skill_ids,
+                prompt_memory_flags: config_snapshot
+                    .memory
+                    .as_ref()
+                    .map(crate::agent::loop_module::config::PromptMemoryFlags::from)
+                    .unwrap_or_default(),
                 ..Default::default()
             },
         )

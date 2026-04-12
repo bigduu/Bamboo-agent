@@ -1,7 +1,11 @@
-use crate::agent::core::{Role, Session};
+use crate::agent::core::{
+    parse_prompt_external_memory_sections, PromptMemoryObservability, Role, Session,
+};
+use crate::agent::loop_module::config::PromptMemoryFlags;
 
 use super::super::prompt_context::{
     inject_external_memory_into_system_message, inject_task_list_into_system_message,
+    PromptMemoryRuntimeContext,
 };
 use super::super::session_setup::prompt_setup::{
     persist_prompt_snapshot_metadata, PromptAssemblyReport,
@@ -17,10 +21,16 @@ const TASK_LIST_END_MARKER: &str = "<!-- BAMBOO_TASK_LIST_END -->";
 const RUNTIME_PROMPT_FLAGS_KEY: &str = "runtime_prompt_component_flags";
 const RUNTIME_PROMPT_LENGTHS_KEY: &str = "runtime_prompt_component_lengths";
 const RUNTIME_PROMPT_SECTION_LAYOUT_KEY: &str = "runtime_prompt_section_layout";
+const RUNTIME_PROMPT_MEMORY_OBSERVABILITY_KEY: &str =
+    crate::agent::loop_module::runner::prompt_context::PROMPT_MEMORY_OBSERVABILITY_KEY;
 
-pub(super) async fn refresh_round_prompt_context(session: &mut Session) {
+pub(super) async fn refresh_round_prompt_context(
+    session: &mut Session,
+    prompt_memory_flags: PromptMemoryFlags,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
+) {
     // Load/refresh persistent memory note for this round.
-    inject_external_memory_into_system_message(session).await;
+    inject_external_memory_into_system_message(session, prompt_memory_flags, runtime_context).await;
 
     // Inject task list into system message at the start of each round.
     inject_task_list_into_system_message(session);
@@ -102,10 +112,26 @@ fn persist_round_prompt_metadata(session: &mut Session, prompt: &str) {
                 tool_guide_context: None,
                 dream_notebook: None,
                 session_memory_note: None,
+                project_memory_index: None,
+                relevant_durable_memories: None,
+                project_dream: None,
+                global_dream_fallback: None,
+                prompt_memory_observability: None,
                 external_memory: None,
                 task_list: None,
                 effective_system_prompt: prompt.trim().to_string(),
             });
+    let external_memory_parts = parse_prompt_external_memory_sections(external_memory.as_deref());
+    snapshot.dream_notebook = external_memory_parts.dream_notebook;
+    snapshot.session_memory_note = external_memory_parts.session_memory_note;
+    snapshot.project_memory_index = external_memory_parts.project_memory_index;
+    snapshot.relevant_durable_memories = external_memory_parts.relevant_durable_memories;
+    snapshot.project_dream = external_memory_parts.project_dream;
+    snapshot.global_dream_fallback = external_memory_parts.global_dream_fallback;
+    snapshot.prompt_memory_observability = session
+        .metadata
+        .get(RUNTIME_PROMPT_MEMORY_OBSERVABILITY_KEY)
+        .and_then(|raw| serde_json::from_str::<PromptMemoryObservability>(raw).ok());
     snapshot.external_memory = external_memory;
     snapshot.task_list = task_list;
     snapshot.effective_system_prompt = prompt.trim().to_string();

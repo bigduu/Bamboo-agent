@@ -82,7 +82,10 @@ fn split_host_and_port(value: &str) -> &str {
 }
 
 fn is_local_host(host: &str) -> bool {
-    let normalized = split_host_and_port(host).trim().trim_end_matches('.').to_lowercase();
+    let normalized = split_host_and_port(host)
+        .trim()
+        .trim_end_matches('.')
+        .to_lowercase();
     if normalized.is_empty() {
         return false;
     }
@@ -97,7 +100,10 @@ fn is_local_host(host: &str) -> bool {
             v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
         }
         Ok(IpAddr::V6(v6)) => {
-            v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local() || v6.is_unspecified()
+            v6.is_loopback()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_unspecified()
         }
         Err(_) => false,
     }
@@ -111,7 +117,11 @@ fn request_host_candidates(req: &HttpRequest) -> Vec<String> {
         header::HeaderName::from_static("x-forwarded-host"),
         header::HeaderName::from_static("x-original-host"),
     ] {
-        if let Some(value) = req.headers().get(&header_name).and_then(|v| v.to_str().ok()) {
+        if let Some(value) = req
+            .headers()
+            .get(&header_name)
+            .and_then(|v| v.to_str().ok())
+        {
             for part in value.split(',') {
                 let host = part.trim();
                 if !host.is_empty() {
@@ -142,7 +152,10 @@ fn is_local_request(req: &HttpRequest) -> bool {
     }
 
     let conn = req.connection_info();
-    for candidate in [conn.realip_remote_addr(), conn.peer_addr()].into_iter().flatten() {
+    for candidate in [conn.realip_remote_addr(), conn.peer_addr()]
+        .into_iter()
+        .flatten()
+    {
         if is_local_host(candidate) {
             return true;
         }
@@ -167,8 +180,10 @@ fn verify_password(config: &Config, password: &str) -> bool {
         return false;
     }
 
-    let (Some(hash), Some(salt)) = (access.password_hash.as_deref(), access.password_salt.as_deref())
-    else {
+    let (Some(hash), Some(salt)) = (
+        access.password_hash.as_deref(),
+        access.password_salt.as_deref(),
+    ) else {
         return false;
     };
 
@@ -195,7 +210,11 @@ fn access_verification_cookie_value(config: &Config) -> Option<String> {
     hasher.update(hash.as_bytes());
     hasher.update(b":");
     hasher.update(salt.as_bytes());
-    Some(format!("{}:{}", ACCESS_VERIFIED_COOKIE_VERSION, hex::encode(hasher.finalize())))
+    Some(format!(
+        "{}:{}",
+        ACCESS_VERIFIED_COOKIE_VERSION,
+        hex::encode(hasher.finalize())
+    ))
 }
 
 fn request_has_verified_access_cookie(req: &HttpRequest, config: &Config) -> bool {
@@ -235,18 +254,31 @@ pub async fn enforce_access_password_middleware<B: MessageBody + 'static>(
 ) -> Result<ServiceResponse<EitherBody<B>>, actix_web::Error> {
     let path = req.path().to_string();
     if is_public_access_route(&path) {
-        return next.call(req).await.map(ServiceResponse::map_into_left_body);
+        return next
+            .call(req)
+            .await
+            .map(ServiceResponse::map_into_left_body);
     }
 
     let app_state = match req.app_data::<web::Data<AppState>>() {
         Some(state) => state.clone(),
-        None => return next.call(req).await.map(ServiceResponse::map_into_left_body),
+        None => {
+            return next
+                .call(req)
+                .await
+                .map(ServiceResponse::map_into_left_body)
+        }
     };
 
     let config = app_state.config.read().await.clone();
     let access_status = build_access_status(&config, req.request());
-    if !access_status.requires_password || request_has_verified_access_cookie(req.request(), &config) {
-        return next.call(req).await.map(ServiceResponse::map_into_left_body);
+    if !access_status.requires_password
+        || request_has_verified_access_cookie(req.request(), &config)
+    {
+        return next
+            .call(req)
+            .await
+            .map(ServiceResponse::map_into_left_body);
     }
 
     let response = AppError::Unauthorized("access password verification required".to_string())
@@ -336,18 +368,23 @@ pub async fn update_access_password(
     if password_already_enabled && !local_bypass {
         let current_password = payload.current_password.trim();
         if current_password.is_empty() {
-            return Err(AppError::Unauthorized("current_password is required".to_string()));
+            return Err(AppError::Unauthorized(
+                "current_password is required".to_string(),
+            ));
         }
         if !verify_password(&current_config, current_password) {
-            return Err(AppError::Unauthorized("invalid current password".to_string()));
+            return Err(AppError::Unauthorized(
+                "invalid current password".to_string(),
+            ));
         }
     }
 
     let mut salt_bytes = [0_u8; 16];
     rand::thread_rng().fill_bytes(&mut salt_bytes);
     let salt_hex = hex::encode(salt_bytes);
-    let password_hash = compute_password_hash(new_password, &salt_hex)
-        .ok_or_else(|| AppError::InternalError(anyhow::anyhow!("failed to compute password hash")))?;
+    let password_hash = compute_password_hash(new_password, &salt_hex).ok_or_else(|| {
+        AppError::InternalError(anyhow::anyhow!("failed to compute password hash"))
+    })?;
     let updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
 
     app_state
