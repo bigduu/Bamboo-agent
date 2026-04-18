@@ -1,0 +1,24 @@
+[package]
+name = "bamboo-application-schedule"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bamboo-domain-schedule = { path = "../bamboo-domain-schedule" }
+bamboo-domain-session = { path = "../bamboo-domain-session" }
+bamboo-application-runtime = { path = "../bamboo-application-runtime" }
+bamboo-application-agent = { path = "../bamboo-application-agent" }
+bamboo-application-tools = { path = "../bamboo-application-tools" }
+bamboo-shared-types = { path = "../bamboo-shared-types" }
+serde = { workspace = true }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+cron = "0.15"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,21 @@
+[package]
+name = "bamboo-server-tools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bamboo-application-agent = { path = "../bamboo-application-agent" }
+bamboo-application-memory = { path = "../bamboo-application-memory" }
+bamboo-application-tools = { path = "../bamboo-application-tools" }
+bamboo-application-skills = { path = "../bamboo-application-skills" }
+bamboo-infrastructure-storage = { path = "../bamboo-infrastructure-storage" }
+bamboo-infrastructure-config = { path = "../bamboo-infrastructure-config" }
+
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

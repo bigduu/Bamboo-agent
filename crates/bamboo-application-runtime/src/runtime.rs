@@ -1,0 +1,279 @@
+//! Unified agent execution runtime.
+//!
+//! [`AgentRuntime`] holds shared resources assembled once at server startup,
+//! including the LLM provider and default tool executor.
+//! [`ExecuteRequest`] captures per-request parameters.  Together they replace
+//! the three duplicated `AgentLoopConfig` construction sites in the server
+//! layer (HTTP handler, spawn scheduler, schedule manager).
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use tokio::sync::{mpsc, RwLock};
+use tokio_util::sync::CancellationToken;
+
+use bamboo_application_agent::storage::{AttachmentReader, Storage};
+use bamboo_application_agent::tools::ToolExecutor;
+use bamboo_application_agent::{AgentEvent, Role, Session};
+use bamboo_application_metrics::MetricsCollector;
+use bamboo_application_skills::SkillManager;
+use bamboo_infrastructure_config::Config;
+use bamboo_shared_types::ReasoningEffort;
+use bamboo_infrastructure_llm::LLMProvider;
+
+use crate::config::{AgentLoopConfig, ImageFallbackConfig, PromptMemoryFlags};
+use crate::runner::run_agent_loop_with_config;
+
+// ---------------------------------------------------------------------------
+// AgentRuntime — shared resources (assembled once)
+// ---------------------------------------------------------------------------
+
+/// Shared runtime resources assembled once at server startup.
+///
+/// Each field is an `Arc` or `Clone`-cheap handle so that `AgentRuntime` itself
+/// is cheaply cloneable across tasks.
+#[derive(Clone)]
+pub struct AgentRuntime {
+    pub storage: Arc<dyn Storage>,
+    pub attachment_reader: Arc<dyn AttachmentReader>,
+    pub skill_manager: Arc<SkillManager>,
+    pub metrics_collector: MetricsCollector,
+    pub config: Arc<RwLock<Config>>,
+
+    /// Reloadable LLM provider handle (delegates to the latest provider).
+    pub provider: Arc<dyn LLMProvider>,
+
+    /// Default tool executor (root tools with full surface).
+    /// Call sites that need a reduced tool set (child / schedule) pass their
+    /// own via `ExecuteRequest::tools`.
+    pub default_tools: Arc<dyn ToolExecutor>,
+}
+
+// ---------------------------------------------------------------------------
+// AgentRuntimeBuilder
+// ---------------------------------------------------------------------------
+
+/// Builder for [`AgentRuntime`].
+///
+/// ```
+/// # use bamboo_application_runtime::AgentRuntimeBuilder;
+/// // In real code all fields are provided by the server assembly.
+/// let rt = AgentRuntimeBuilder::new()
+///     // .storage(...)
+///     // .provider(...)
+///     .build();
+/// ```
+pub struct AgentRuntimeBuilder {
+    storage: Option<Arc<dyn Storage>>,
+    attachment_reader: Option<Arc<dyn AttachmentReader>>,
+    skill_manager: Option<Arc<SkillManager>>,
+    metrics_collector: Option<MetricsCollector>,
+    config: Option<Arc<RwLock<Config>>>,
+    provider: Option<Arc<dyn LLMProvider>>,
+    default_tools: Option<Arc<dyn ToolExecutor>>,
+}
+
+impl AgentRuntimeBuilder {
+    pub fn new() -> Self {
+        Self {
+            storage: None,
+            attachment_reader: None,
+            skill_manager: None,
+            metrics_collector: None,
+            config: None,
+            provider: None,
+            default_tools: None,
+        }
+    }
+
+    pub fn storage(mut self, v: Arc<dyn Storage>) -> Self {
+        self.storage = Some(v);
+        self
+    }
+
+    pub fn attachment_reader(mut self, v: Arc<dyn AttachmentReader>) -> Self {
+        self.attachment_reader = Some(v);
+        self
+    }
+
+    pub fn skill_manager(mut self, v: Arc<SkillManager>) -> Self {
+        self.skill_manager = Some(v);
+        self
+    }
+
+    pub fn metrics_collector(mut self, v: MetricsCollector) -> Self {
+        self.metrics_collector = Some(v);
+        self
+    }
+
+    pub fn config(mut self, v: Arc<RwLock<Config>>) -> Self {
+        self.config = Some(v);
+        self
+    }
+
+    pub fn provider(mut self, v: Arc<dyn LLMProvider>) -> Self {
+        self.provider = Some(v);
+        self
+    }
+
+    pub fn default_tools(mut self, v: Arc<dyn ToolExecutor>) -> Self {
+        self.default_tools = Some(v);
+        self
+    }
+
+    pub fn build(self) -> Result<AgentRuntime, &'static str> {
+        Ok(AgentRuntime {
+            storage: self.storage.ok_or_else(|| format_missing("storage"))?,
+            attachment_reader: self
+                .attachment_reader
+                .ok_or_else(|| format_missing("attachment_reader"))?,
+            skill_manager: self
+                .skill_manager
+                .ok_or_else(|| format_missing("skill_manager"))?,
+            metrics_collector: self
+                .metrics_collector
+                .ok_or_else(|| format_missing("metrics_collector"))?,
+            config: self.config.ok_or_else(|| format_missing("config"))?,
+            provider: self.provider.ok_or_else(|| format_missing("provider"))?,
+            default_tools: self
+                .default_tools
+                .ok_or_else(|| format_missing("default_tools"))?,
+        })
+    }
+}
+
+fn format_missing(field: &str) -> &'static str {
+    // Static strings for the common fields keep the error type `&'static str`.
+    // This is good enough for a builder that only runs at startup.
+    match field {
+        "storage" => "AgentRuntimeBuilder: missing storage",
+        "attachment_reader" => "AgentRuntimeBuilder: missing attachment_reader",
+        "skill_manager" => "AgentRuntimeBuilder: missing skill_manager",
+        "metrics_collector" => "AgentRuntimeBuilder: missing metrics_collector",
+        "config" => "AgentRuntimeBuilder: missing config",
+        "provider" => "AgentRuntimeBuilder: missing provider",
+        "default_tools" => "AgentRuntimeBuilder: missing default_tools",
+        _ => "AgentRuntimeBuilder: missing required field",
+    }
+}
+
+impl Default for AgentRuntimeBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ExecuteRequest — per-request parameters
+// ---------------------------------------------------------------------------
+
+/// Per-request parameters for agent execution.
+///
+/// Required fields (`initial_message`, `event_tx`, `cancel_token`) must always
+/// be provided.  The provider is taken from [`AgentRuntime::provider`]; tools
+/// default to [`AgentRuntime::default_tools`] when `None`.
+pub struct ExecuteRequest {
+    // -- Required ----------------------------------------------------------
+    pub initial_message: String,
+    pub event_tx: mpsc::Sender<AgentEvent>,
+    pub cancel_token: CancellationToken,
+
+    // -- Tool override -----------------------------------------------------
+    /// Override runtime's `default_tools`.  When `None`, uses the runtime's
+    /// default tool executor.
+    pub tools: Option<Arc<dyn ToolExecutor>>,
+
+    // -- Optional overrides (None → config defaults) ----------------------
+    pub model: Option<String>,
+    pub provider_name: Option<String>,
+    /// When `None`, falls back to `Config::get_memory_background_model()`.
+    pub background_model: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// When `None`, falls back to `Config::disabled_tool_names()`.
+    pub disabled_tools: Option<BTreeSet<String>>,
+    /// When `None`, falls back to `Config::disabled_skill_ids()`.
+    pub disabled_skill_ids: Option<BTreeSet<String>>,
+    pub selected_skill_ids: Option<Vec<String>>,
+    pub selected_skill_mode: Option<String>,
+    pub image_fallback: Option<ImageFallbackConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the system prompt from session messages.
+fn extract_system_prompt(session: &Session) -> Option<String> {
+    session
+        .messages
+        .iter()
+        .find(|m| matches!(m.role, Role::System))
+        .map(|m| m.content.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Execution
+// ---------------------------------------------------------------------------
+
+impl AgentRuntime {
+    /// Execute the agent loop with the given request.
+    ///
+    /// Builds an [`AgentLoopConfig`] from the request parameters and shared
+    /// runtime resources, then delegates to [`run_agent_loop_with_config`].
+    pub async fn execute(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+    ) -> crate::runner::Result<()> {
+        let system_prompt = extract_system_prompt(session);
+        let config = self.config.read().await;
+        let tools = req.tools.unwrap_or_else(|| self.default_tools.clone());
+
+        let loop_config = AgentLoopConfig {
+            max_rounds: 200,
+            system_prompt,
+            disabled_skill_ids: req
+                .disabled_skill_ids
+                .unwrap_or_else(|| config.disabled_skill_ids()),
+            selected_skill_ids: req.selected_skill_ids,
+            selected_skill_mode: req.selected_skill_mode,
+            skill_manager: Some(self.skill_manager.clone()),
+            skip_initial_user_message: true,
+            storage: Some(self.storage.clone()),
+            attachment_reader: Some(self.attachment_reader.clone()),
+            metrics_collector: Some(self.metrics_collector.clone()),
+            model_name: req.model,
+            fast_model_name: config.get_fast_model(),
+            background_model_name: req
+                .background_model
+                .or_else(|| config.get_memory_background_model()),
+            provider_name: Some(
+                req.provider_name.unwrap_or_else(|| config.provider.clone()),
+            ),
+            reasoning_effort: req.reasoning_effort,
+            disabled_tools: req
+                .disabled_tools
+                .unwrap_or_else(|| config.disabled_tool_names()),
+            image_fallback: req.image_fallback,
+            prompt_memory_flags: config
+                .memory
+                .as_ref()
+                .map(PromptMemoryFlags::from)
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+
+        drop(config);
+
+        run_agent_loop_with_config(
+            session,
+            req.initial_message,
+            req.event_tx,
+            self.provider.clone(),
+            tools,
+            req.cancel_token,
+            loop_config,
+        )
+        .await
+    }
+}

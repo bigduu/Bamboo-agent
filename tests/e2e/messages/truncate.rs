@@ -50,7 +50,7 @@ async fn test_truncate_after_last_user() {
     assert_eq!(loaded.messages.len(), 4);
     assert_eq!(
         loaded.messages.last().unwrap().role,
-        bamboo_agent::agent::core::Role::User
+        bamboo_agent::agent::Role::User
     );
     assert_eq!(loaded.messages.last().unwrap().content, "u2");
 }

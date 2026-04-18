@@ -7,8 +7,10 @@
 //! - Tool message truncation
 //! - Conversation summaries
 
-use bamboo_agent::agent::core::agent::types::*;
-use bamboo_agent::agent::core::{TaskItem, TaskItemStatus, TaskList};
+use bamboo_agent::agent::{Message, Role, Session};
+use bamboo_application_agent::agent::types::{CompressionEvent, ConversationSummary, SessionKind};
+use bamboo_application_agent::tools::{FunctionCall, ToolCall};
+use bamboo_domain_session::{TaskItem, TaskItemStatus, TaskList};
 use chrono::Utc;
 
 #[test]
@@ -68,10 +70,10 @@ fn test_message_assistant_constructor() {
 
 #[test]
 fn test_message_assistant_with_tool_calls() {
-    let tool_call = bamboo_agent::agent::core::tools::ToolCall {
+    let tool_call = ToolCall {
         id: "call-123".to_string(),
         tool_type: "function".to_string(),
-        function: bamboo_agent::agent::core::tools::FunctionCall {
+        function: FunctionCall {
             name: "test_tool".to_string(),
             arguments: r#"{"arg": "value"}"#.to_string(),
         },

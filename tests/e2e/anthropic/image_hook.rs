@@ -1,4 +1,5 @@
 use super::*;
+use bamboo_domain_session::MessagePart;
 
 #[actix_web::test]
 async fn test_anthropic_messages_passes_image_parts_through_when_hook_disabled() {
@@ -62,11 +63,11 @@ async fn test_anthropic_messages_passes_image_parts_through_when_hook_disabled()
     assert_eq!(parts.len(), 2);
     assert!(matches!(
         &parts[0],
-        ContentPart::Text { text } if text == "describe this"
+        MessagePart::Text { text } if text == "describe this"
     ));
     assert!(matches!(
         &parts[1],
-        ContentPart::ImageUrl { image_url } if image_url.url == "data:image/png;base64,QUJDRA=="
+        MessagePart::ImageUrl { image_url } if image_url.url == "data:image/png;base64,QUJDRA=="
     ));
 }
 

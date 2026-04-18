@@ -6,9 +6,10 @@
 mod tests {
     #[test]
     fn test_provider_types_exist() {
+        use bamboo_infrastructure_llm::AVAILABLE_PROVIDERS;
         use std::collections::HashSet;
 
-        let providers = bamboo_agent::agent::llm::AVAILABLE_PROVIDERS;
+        let providers = AVAILABLE_PROVIDERS;
         let provider_set: HashSet<&str> = providers.iter().copied().collect();
 
         assert!(provider_set.contains("openai"));
@@ -20,8 +21,8 @@ mod tests {
 
     #[test]
     fn test_message_conversion() {
-        use bamboo_agent::agent::llm::api::models::ChatMessage as OpenAIChatMessage;
-        use bamboo_agent::agent::llm::protocol::ToProvider;
+        use bamboo_infrastructure_llm::api::models::ChatMessage as OpenAIChatMessage;
+        use bamboo_infrastructure_llm::protocol::ToProvider;
         use bamboo_agent::agent::Message;
 
         let msg = Message::user("Test message");
@@ -30,13 +31,13 @@ mod tests {
         // Verify we can convert internal messages to the OpenAI-compatible API model.
         assert_eq!(
             openai_msg.role,
-            bamboo_agent::agent::llm::api::models::Role::User
+            bamboo_infrastructure_llm::api::models::Role::User
         );
     }
 
     #[test]
     fn test_llm_chunk_types() {
-        use bamboo_agent::agent::llm::types::LLMChunk;
+        use bamboo_infrastructure_llm::types::LLMChunk;
 
         // Test token chunk
         let token_chunk = LLMChunk::Token("Hello".to_string());
@@ -60,8 +61,8 @@ mod tests {
 
     #[test]
     fn test_tool_schema_creation() {
-        use bamboo_agent::agent::core::tools::FunctionSchema;
-        use bamboo_agent::agent::core::ToolSchema;
+        use bamboo_application_agent::tools::FunctionSchema;
+        use bamboo_application_agent::tools::ToolSchema;
         use serde_json::json;
 
         let tool = ToolSchema {
@@ -94,7 +95,7 @@ mod tests {
     #[test]
     fn test_available_providers() {
         // Verify that AVAILABLE_PROVIDERS is accessible
-        let providers = bamboo_agent::agent::llm::AVAILABLE_PROVIDERS;
+        let providers = bamboo_infrastructure_llm::AVAILABLE_PROVIDERS;
 
         // Should include at least these providers
         assert!(providers.contains(&"openai"));
@@ -106,11 +107,11 @@ mod tests {
     #[test]
     fn test_protocol_enums() {
         let openai_type =
-            std::any::type_name::<bamboo_agent::agent::llm::protocol::OpenAIProtocol>();
+            std::any::type_name::<bamboo_infrastructure_llm::protocol::OpenAIProtocol>();
         let anthropic_type =
-            std::any::type_name::<bamboo_agent::agent::llm::protocol::AnthropicProtocol>();
+            std::any::type_name::<bamboo_infrastructure_llm::protocol::AnthropicProtocol>();
         let gemini_type =
-            std::any::type_name::<bamboo_agent::agent::llm::protocol::GeminiProtocol>();
+            std::any::type_name::<bamboo_infrastructure_llm::protocol::GeminiProtocol>();
 
         assert!(openai_type.ends_with("OpenAIProtocol"));
         assert!(anthropic_type.ends_with("AnthropicProtocol"));
@@ -119,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_llm_error_types() {
-        use bamboo_agent::agent::llm::LLMError;
+        use bamboo_infrastructure_llm::LLMError;
 
         // Test error variants - using proper construction methods
         let api_error = LLMError::Api("Rate limit exceeded".to_string());

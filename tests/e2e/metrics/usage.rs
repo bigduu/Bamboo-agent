@@ -1,6 +1,6 @@
 use actix_web::{test, web, App};
-use bamboo_agent::agent::core::tools::FunctionCall;
-use bamboo_agent::agent::core::{Message, Session, ToolCall};
+use bamboo_agent::agent::{Message, Session};
+use bamboo_application_agent::tools::{FunctionCall, ToolCall};
 use bamboo_agent::server::handlers;
 
 #[actix_web::test]

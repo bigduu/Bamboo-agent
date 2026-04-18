@@ -6,7 +6,7 @@
 //! - Error handling
 //! - Edge cases (empty strings, unicode, large data)
 
-use bamboo_agent::core::encryption;
+use bamboo_infrastructure_config::encryption;
 use std::ffi::OsString;
 use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;

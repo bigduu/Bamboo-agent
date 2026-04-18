@@ -30,7 +30,7 @@
 //! ## Library Mode
 //!
 //! ```rust,ignore
-//! use bamboo_agent::{BambooServer, core::Config};
+//! use bamboo_agent::{BambooServer, Config};
 //!
 //! #[tokio::main]
 //! async fn main() {
@@ -63,38 +63,37 @@ pub mod error;
 // Placeholder modules (will be populated during migration)
 pub mod agent;
 pub mod commands;
-pub mod core;
-pub mod process;
-pub mod server;
 
-// Ergonomic module re-exports for the agent subsystem (keeps docs and external
-// imports stable without forcing callers through `bamboo_agent::agent::*`).
-pub use agent::{llm, skill, tools};
+// Server module is now a separate workspace crate
+pub use bamboo_server as server;
+
+// Ergonomic re-export: `bamboo_agent::tools` → `bamboo_application_tools` for backward compatibility.
+pub use bamboo_application_tools as tools;
+pub use agent::{Agent, AgentBuilder};
 
 // Re-export core Config as the primary configuration type
-pub use core::config::ServerConfig;
-pub use core::Config;
+pub use bamboo_infrastructure_config::config::ServerConfig;
+pub use bamboo_infrastructure_config::Config;
 pub use error::{BambooError, Result};
-pub use process::ProcessRegistry;
 
 /// Main Bamboo server instance
 pub struct BambooServer {
-    config: core::Config,
+    config: bamboo_infrastructure_config::Config,
     #[allow(dead_code)]
     data_dir: PathBuf,
 }
 
 impl BambooServer {
     /// Create a new Bamboo server with configuration
-    pub fn new(config: core::Config) -> Self {
+    pub fn new(config: bamboo_infrastructure_config::Config) -> Self {
         Self {
             config,
-            data_dir: core::paths::bamboo_dir(),
+            data_dir: bamboo_infrastructure_config::paths::bamboo_dir(),
         }
     }
 
     /// Create a new Bamboo server with an explicit data directory.
-    pub fn new_with_data_dir(config: core::Config, data_dir: PathBuf) -> Self {
+    pub fn new_with_data_dir(config: bamboo_infrastructure_config::Config, data_dir: PathBuf) -> Self {
         Self { config, data_dir }
     }
 
@@ -106,7 +105,7 @@ impl BambooServer {
     ///
     /// This method blocks until the server shuts down.
     pub async fn start(self) -> Result<()> {
-        core::paths::init_bamboo_dir(self.data_dir.clone());
+        bamboo_infrastructure_config::paths::init_bamboo_dir(self.data_dir.clone());
 
         let result = if self.config.server.static_dir.is_some() {
             server::run_with_bind_and_static(
@@ -154,7 +153,7 @@ impl BambooServer {
 ///     .unwrap();
 /// ```
 pub struct BambooBuilder {
-    config: core::Config,
+    config: bamboo_infrastructure_config::Config,
     data_dir: PathBuf,
 }
 
@@ -162,8 +161,8 @@ impl BambooBuilder {
     /// Create a new BambooBuilder with default configuration
     pub fn new() -> Self {
         Self {
-            config: core::Config::new(),
-            data_dir: core::paths::bamboo_dir(),
+            config: bamboo_infrastructure_config::Config::new(),
+            data_dir: bamboo_infrastructure_config::paths::bamboo_dir(),
         }
     }
 

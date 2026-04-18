@@ -7,7 +7,7 @@ use crate::agent::core::storage::{CleanupMode, CleanupResult};
 use crate::agent::core::Session;
 use crate::agent::tools::tools::workspace_state;
 use crate::server::app_state::AppState;
-use crate::server::services::auto_dream::{run_project_auto_dream_once, AutoDreamContext};
+use bamboo_application_memory::auto_dream::{run_project_auto_dream_once, AutoDreamContext};
 
 use super::super::types::CleanupRequest;
 

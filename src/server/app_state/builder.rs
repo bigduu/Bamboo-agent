@@ -171,8 +171,8 @@ impl AppState {
             config.clone(),
         );
 
-        crate::server::services::auto_dream::spawn_auto_dream_task(
-            crate::server::services::auto_dream::AutoDreamContext {
+        bamboo_application_memory::auto_dream::spawn_auto_dream_task(
+            bamboo_application_memory::auto_dream::AutoDreamContext {
                 session_store: session_store.clone(),
                 storage: storage.clone(),
                 provider: provider_handle.clone(),

@@ -1,4 +1,5 @@
-use bamboo_agent::core::{OpenAIConfig, ReasoningEffort};
+use bamboo_infrastructure_config::config::OpenAIConfig;
+use bamboo_shared_types::reasoning::ReasoningEffort;
 
 mod crud;
 

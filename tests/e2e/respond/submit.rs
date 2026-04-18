@@ -1,5 +1,5 @@
 use super::*;
-use bamboo_agent::agent::core::{Message, Session};
+use bamboo_agent::agent::{Message, Session};
 
 #[actix_web::test]
 async fn test_submit_response_rejects_invalid_option_and_keeps_pending_question() {

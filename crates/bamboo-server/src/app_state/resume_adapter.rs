@@ -1,0 +1,101 @@
+//! Resume execution port adapter.
+//!
+//! Bridges the application-layer `ResumeExecutionPort` trait to server
+//! infrastructure (storage, runner lifecycle, agent spawning).
+//!
+//! `AppStateResumeRef` is a newtype wrapper around `Data<AppState>` to satisfy
+//! Rust's orphan rules (can't impl a foreign trait on a foreign type).
+
+use async_trait::async_trait;
+use bamboo_application_agent::AgentEvent;
+use bamboo_application_session::resume::{ResumeExecutionPort, ResumeSpawnRequest};
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+
+use super::runner_lifecycle::try_reserve_runner;
+use super::session_events::get_or_create_event_sender;
+use super::AppState;
+use crate::handlers::agent::execute::runtime::SpawnAgentExecution;
+use crate::handlers::agent::execute::{spawn_agent_execution, spawn_event_forwarder};
+
+/// Newtype wrapper that implements `ResumeExecutionPort`.
+///
+/// Needed because Rust's orphan rules prevent implementing
+/// `bamboo_application_session::resume::ResumeExecutionPort` directly on
+/// `actix_web::web::Data<AppState>`.
+pub struct AppStateResumeRef(pub actix_web::web::Data<AppState>);
+
+#[async_trait]
+impl ResumeExecutionPort for AppStateResumeRef {
+    async fn load_session(&self, session_id: &str) -> Option<bamboo_application_agent::Session> {
+        AppState::load_session(&self.0, session_id).await
+    }
+
+    async fn save_and_cache_session(&self, session: &bamboo_application_agent::Session) {
+        AppState::save_and_cache_session(&self.0, session).await;
+    }
+
+    async fn try_reserve_runner(
+        &self,
+        session_id: &str,
+        event_sender: &broadcast::Sender<AgentEvent>,
+    ) -> Option<CancellationToken> {
+        try_reserve_runner(&self.0.agent_runners, session_id, event_sender).await
+    }
+
+    async fn get_or_create_event_sender(
+        &self,
+        session_id: &str,
+    ) -> broadcast::Sender<AgentEvent> {
+        get_or_create_event_sender(&self.0.session_event_senders, session_id).await
+    }
+
+    async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
+        let ResumeSpawnRequest {
+            session_id,
+            session,
+            cancel_token,
+            event_sender,
+            config,
+        } = request;
+
+        let model = session.model.clone();
+        let is_child_session = session.kind == bamboo_application_agent::SessionKind::Child;
+        let reasoning_effort = session.reasoning_effort;
+        let reasoning_effort_source = session
+            .metadata
+            .get("reasoning_effort_source")
+            .cloned()
+            .unwrap_or_default();
+
+        let image_fallback = config.image_fallback.clone();
+
+        let (mpsc_tx, mpsc_rx) =
+            tokio::sync::mpsc::channel::<bamboo_application_agent::AgentEvent>(100);
+
+        let state = self.0.clone();
+        spawn_event_forwarder(
+            state.clone(),
+            session_id.clone(),
+            mpsc_rx,
+            event_sender,
+        );
+
+        spawn_agent_execution(SpawnAgentExecution {
+            state,
+            session_id,
+            session,
+            is_child_session,
+            provider_name: config.provider_name,
+            model,
+            fast_model: config.fast_model,
+            reasoning_effort,
+            reasoning_effort_source,
+            disabled_tools: config.disabled_tools,
+            disabled_skill_ids: config.disabled_skill_ids,
+            cancel_token,
+            mpsc_tx,
+            image_fallback,
+        });
+    }
+}

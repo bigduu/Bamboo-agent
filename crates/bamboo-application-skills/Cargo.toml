@@ -1,0 +1,22 @@
+[package]
+name = "bamboo-application-skills"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bamboo-application-tool-types = { path = "../bamboo-application-tool-types" }
+bamboo-infrastructure-config = { path = "../bamboo-infrastructure-config" }
+async-trait = "0.1"
+serde = { workspace = true }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+anyhow = "1"
+thiserror = "1"
+walkdir = "2"
+globset = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -13,7 +13,7 @@ mod tests {
         let config = Config::default();
         assert!(config.server.port > 0);
         assert!(!config.server.bind.is_empty());
-        assert!(!bamboo_agent::core::paths::bamboo_dir()
+        assert!(!bamboo_infrastructure_config::paths::bamboo_dir()
             .to_string_lossy()
             .is_empty());
     }
@@ -48,7 +48,7 @@ mod tests {
 
     #[test]
     fn test_bamboo_paths() {
-        use bamboo_agent::core::paths::*;
+        use bamboo_infrastructure_config::paths::*;
 
         let bamboo_home = bamboo_dir();
         assert!(bamboo_home.to_string_lossy().ends_with(".bamboo"));

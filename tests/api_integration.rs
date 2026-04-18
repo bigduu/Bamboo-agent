@@ -40,8 +40,8 @@ mod tests {
 
     #[test]
     fn test_tool_schema_structure() {
-        use bamboo_agent::agent::core::tools::FunctionSchema;
-        use bamboo_agent::agent::core::ToolSchema;
+        use bamboo_application_agent::tools::FunctionSchema;
+        use bamboo_application_agent::tools::ToolSchema;
         use serde_json::json;
 
         let schema = ToolSchema {
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn test_keyword_masking_config() {
-        use bamboo_agent::core::Config;
+        use bamboo_agent::Config;
 
         let temp_dir = tempfile::TempDir::new().unwrap();
 

@@ -1,3 +1,38 @@
+[workspace]
+members = [
+    ".",
+    "crates/bamboo-shared-types",
+    "crates/bamboo-domain-session",
+    "crates/bamboo-domain-schedule",
+    "crates/bamboo-domain-workflow",
+    "crates/bamboo-application-tool-types",
+    "crates/bamboo-infrastructure-config",
+    "crates/bamboo-infrastructure-llm",
+    "crates/bamboo-application-agent",
+    "crates/bamboo-infrastructure-process",
+    "crates/bamboo-application-metrics",
+    "crates/bamboo-application-memory",
+    "crates/bamboo-application-tools",
+    "crates/bamboo-infrastructure-mcp",
+    "crates/bamboo-application-skills",
+    "crates/bamboo-infrastructure-storage",
+    "crates/bamboo-application-runtime",
+    "crates/bamboo-application-schedule",
+    "crates/bamboo-application-session",
+    "crates/bamboo-cli",
+    "crates/bamboo-claude-runner",
+    "crates/bamboo-server",
+    "crates/bamboo-server-tools",
+]
+resolver = "2"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1"
+
 [package]
 name = "bamboo-agent"
 version = "2026.4.12"
@@ -28,6 +63,29 @@ include = [
 ]
 
 [dependencies]
+# Workspace crates
+bamboo-shared-types = { path = "crates/bamboo-shared-types" }
+bamboo-domain-session = { path = "crates/bamboo-domain-session" }
+bamboo-domain-schedule = { path = "crates/bamboo-domain-schedule" }
+bamboo-domain-workflow = { path = "crates/bamboo-domain-workflow" }
+bamboo-application-tool-types = { path = "crates/bamboo-application-tool-types" }
+bamboo-infrastructure-config = { path = "crates/bamboo-infrastructure-config" }
+bamboo-infrastructure-llm = { path = "crates/bamboo-infrastructure-llm" }
+bamboo-application-agent = { path = "crates/bamboo-application-agent" }
+bamboo-infrastructure-process = { path = "crates/bamboo-infrastructure-process" }
+bamboo-application-metrics = { path = "crates/bamboo-application-metrics" }
+bamboo-application-memory = { path = "crates/bamboo-application-memory" }
+bamboo-application-tools = { path = "crates/bamboo-application-tools" }
+bamboo-infrastructure-mcp = { path = "crates/bamboo-infrastructure-mcp" }
+bamboo-application-skills = { path = "crates/bamboo-application-skills" }
+bamboo-infrastructure-storage = { path = "crates/bamboo-infrastructure-storage" }
+bamboo-application-runtime = { path = "crates/bamboo-application-runtime" }
+bamboo-application-schedule = { path = "crates/bamboo-application-schedule" }
+bamboo-application-session = { path = "crates/bamboo-application-session" }
+bamboo-claude-runner = { path = "crates/bamboo-claude-runner" }
+bamboo-server-tools = { path = "crates/bamboo-server-tools" }
+bamboo-server = { path = "crates/bamboo-server" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
@@ -119,6 +177,17 @@ mockall = "0.13"
 http = "1"
 actix-rt = "2"
 serde_json = "1"
+bamboo-infrastructure-config = { path = "crates/bamboo-infrastructure-config", features = ["test-utils"] }
+bamboo-infrastructure-process = { path = "crates/bamboo-infrastructure-process", features = ["test-utils"] }
+bamboo-application-agent = { path = "crates/bamboo-application-agent" }
+bamboo-domain-session = { path = "crates/bamboo-domain-session" }
+bamboo-infrastructure-storage = { path = "crates/bamboo-infrastructure-storage" }
+bamboo-shared-types = { path = "crates/bamboo-shared-types" }
+bamboo-infrastructure-llm = { path = "crates/bamboo-infrastructure-llm" }
+bamboo-application-metrics = { path = "crates/bamboo-application-metrics" }
+bamboo-application-skills = { path = "crates/bamboo-application-skills" }
+bamboo-application-schedule = { path = "crates/bamboo-application-schedule" }
+bamboo-application-runtime = { path = "crates/bamboo-application-runtime" }
 
 [profile.release]
 opt-level = 3

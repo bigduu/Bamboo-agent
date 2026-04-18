@@ -1,7 +1,8 @@
 //! Regression tests for SessionStoreV2 index fields.
 
-use bamboo_agent::agent::core::storage::SessionStoreV2;
-use bamboo_agent::agent::core::{Session, Storage, TokenBudgetUsage};
+use bamboo_agent::agent::{Session, TokenBudgetUsage};
+use bamboo_application_agent::storage::Storage;
+use bamboo_infrastructure_storage::SessionStoreV2;
 
 mod common;
 

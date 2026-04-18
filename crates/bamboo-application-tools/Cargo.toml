@@ -1,0 +1,43 @@
+[package]
+name = "bamboo-application-tools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bamboo-application-agent = { path = "../bamboo-application-agent" }
+bamboo-application-memory = { path = "../bamboo-application-memory" }
+bamboo-infrastructure-llm = { path = "../bamboo-infrastructure-llm" }
+bamboo-shared-types = { path = "../bamboo-shared-types" }
+bamboo-domain-session = { path = "../bamboo-domain-session" }
+bamboo-infrastructure-config = { path = "../bamboo-infrastructure-config" }
+bamboo-application-tool-types = { path = "../bamboo-application-tool-types" }
+bamboo-infrastructure-process = { path = "../bamboo-infrastructure-process" }
+serde = { workspace = true }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full", "test-util"] }
+futures = "0.3"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+thiserror = "1"
+anyhow = "1"
+regex = "1"
+dashmap = "6"
+uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"
+globset = "0.4"
+base64 = "0.22"
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+parking_lot = "0.12"
+url = "2"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+toml = "0.8"
+dirs = "5"
+libc = "0.2"
+colored = "2"
+arboard = "3"
+
+[dev-dependencies]
+tempfile = "3"
+bamboo-infrastructure-process = { path = "../bamboo-infrastructure-process", features = ["test-utils"] }

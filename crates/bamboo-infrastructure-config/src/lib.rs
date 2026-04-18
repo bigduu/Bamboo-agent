@@ -1,0 +1,40 @@
+//! Runtime/platform configuration for Bamboo agent.
+//!
+//! **Not a business domain model.** This crate carries:
+//! - Provider / model mapping configuration
+//! - Proxy authentication
+//! - Environment variable hydration and encryption
+//! - Keyword masking
+//! - XDG-compliant path utilities
+//!
+//! Name: kept as `domain-config` for backward compatibility, but semantically
+//! this is infrastructure/runtime config rather than a stable business domain.
+
+pub mod config;
+pub mod encryption;
+pub mod keyword_masking;
+pub mod model_mapping;
+pub mod patch;
+pub mod paths;
+
+pub use config::*;
+pub use encryption::*;
+pub use keyword_masking::*;
+pub use model_mapping::*;
+pub use paths::*;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    pub(crate) fn env_cache_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    pub(crate) fn env_cache_lock_acquire() -> MutexGuard<'static, ()> {
+        env_cache_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}

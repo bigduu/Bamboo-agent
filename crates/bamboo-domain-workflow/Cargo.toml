@@ -1,0 +1,9 @@
+[package]
+name = "bamboo-domain-workflow"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bamboo-application-agent = { path = "../bamboo-application-agent" }
+serde = { workspace = true }
+serde_yaml = "0.9"

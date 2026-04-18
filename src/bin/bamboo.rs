@@ -2,7 +2,7 @@
 //!
 //! Standalone HTTP server for Bamboo
 
-use bamboo_agent::core::Config;
+use bamboo_infrastructure_config::Config;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -74,9 +74,9 @@ async fn main() {
         } => {
             let bamboo_home_dir = data_dir
                 .clone()
-                .unwrap_or_else(bamboo_agent::core::paths::resolve_bamboo_dir);
+                .unwrap_or_else(bamboo_infrastructure_config::paths::resolve_bamboo_dir);
             // Stabilize the data dir for the lifetime of this process.
-            bamboo_agent::core::paths::init_bamboo_dir(bamboo_home_dir.clone());
+            bamboo_infrastructure_config::paths::init_bamboo_dir(bamboo_home_dir.clone());
             // Keep runtime path resolution consistent: most helpers derive their base dir from
             // BAMBOO_DATA_DIR / `${HOME}/.bamboo` via `core::paths::bamboo_dir()`.
             // SAFETY: Called on the main thread before any async runtime work begins,
@@ -88,7 +88,7 @@ async fn main() {
             // Load config (with env var overrides already applied)
             // If --data-dir is specified, load from that directory.
             let mut config =
-                bamboo_agent::core::Config::from_data_dir(Some(bamboo_home_dir.clone()));
+                bamboo_infrastructure_config::Config::from_data_dir(Some(bamboo_home_dir.clone()));
 
             // Apply CLI argument overrides (highest priority)
             if let Some(p) = port {
@@ -142,7 +142,7 @@ async fn main() {
             if path {
                 println!(
                     "{}",
-                    bamboo_agent::core::paths::config_json_path().display()
+                    bamboo_infrastructure_config::paths::config_json_path().display()
                 );
             } else {
                 let mut config = Config::new();
@@ -186,10 +186,8 @@ fn serialize_config_for_cli(
 #[cfg(test)]
 mod tests {
     use super::serialize_config_for_cli;
-    use bamboo_agent::{
-        agent::mcp::{McpServerConfig, StdioConfig, TransportConfig},
-        core::{Config, OpenAIConfig, ProviderConfigs, ProxyAuth},
-    };
+    use bamboo_infrastructure_config::config::{Config, OpenAIConfig, ProviderConfigs, ProxyAuth};
+    use bamboo_infrastructure_mcp::{McpServerConfig, StdioConfig, TransportConfig};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
 

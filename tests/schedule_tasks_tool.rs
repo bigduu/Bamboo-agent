@@ -8,18 +8,18 @@ use futures::stream;
 use tokio::sync::{broadcast, Notify, RwLock};
 use tokio::time::{sleep, Duration};
 
-use bamboo_agent::agent::core::storage::{SessionStoreV2, Storage};
-use bamboo_agent::agent::core::tools::{Tool, ToolExecutionContext, ToolExecutor, ToolResult};
-use bamboo_agent::agent::core::{AgentEvent, Message, Session};
-use bamboo_agent::agent::llm::provider::Result as LLMResult;
-use bamboo_agent::agent::llm::provider::{LLMProvider, LLMStream};
-use bamboo_agent::agent::llm::LLMChunk;
-use bamboo_agent::agent::metrics::collector::MetricsCollector;
-use bamboo_agent::agent::metrics::storage::SqliteMetricsStorage;
-use bamboo_agent::agent::skill::SkillManager;
+use bamboo_agent::agent::{Agent, AgentBuilder, AgentEvent, Message, Session};
+use bamboo_agent::Config;
+use bamboo_application_agent::storage::Storage;
+use bamboo_application_agent::tools::{Tool, ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult, ToolSchema};
+use bamboo_application_agent::SessionKind;
+use bamboo_application_schedule::{ResolvedRunConfig, ScheduleContext};
+use bamboo_infrastructure_llm::provider::Result as LLMResult;
+use bamboo_infrastructure_llm::provider::{LLMProvider, LLMStream};
+use bamboo_infrastructure_llm::LLMChunk;
+use bamboo_infrastructure_storage::SessionStoreV2;
 use bamboo_agent::server::app_state::AgentRunner;
-use bamboo_agent::server::schedules::manager::ScheduleContext;
-use bamboo_agent::server::schedules::{ScheduleManager, ScheduleRunConfig, ScheduleStore};
+use bamboo_agent::server::schedules::{ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore};
 use bamboo_agent::server::tools::ScheduleTasksTool;
 
 mod common;
@@ -31,8 +31,8 @@ struct DummyProvider;
 impl LLMProvider for DummyProvider {
     async fn chat_stream(
         &self,
-        _messages: &[bamboo_agent::agent::core::Message],
-        _tools: &[bamboo_agent::agent::core::tools::ToolSchema],
+        _messages: &[Message],
+        _tools: &[ToolSchema],
         _max_output_tokens: Option<u32>,
         _model: &str,
     ) -> LLMResult<LLMStream> {
@@ -50,8 +50,8 @@ struct BlockingProvider {
 impl LLMProvider for BlockingProvider {
     async fn chat_stream(
         &self,
-        _messages: &[bamboo_agent::agent::core::Message],
-        _tools: &[bamboo_agent::agent::core::tools::ToolSchema],
+        _messages: &[Message],
+        _tools: &[ToolSchema],
         _max_output_tokens: Option<u32>,
         _model: &str,
     ) -> LLMResult<LLMStream> {
@@ -72,14 +72,14 @@ struct NoopTools;
 impl ToolExecutor for NoopTools {
     async fn execute(
         &self,
-        _call: &bamboo_agent::agent::core::tools::ToolCall,
-    ) -> std::result::Result<ToolResult, bamboo_agent::agent::core::tools::ToolError> {
-        Err(bamboo_agent::agent::core::tools::ToolError::NotFound(
+        _call: &ToolCall,
+    ) -> std::result::Result<ToolResult, ToolError> {
+        Err(ToolError::NotFound(
             "noop".to_string(),
         ))
     }
 
-    fn list_tools(&self) -> Vec<bamboo_agent::agent::core::tools::ToolSchema> {
+    fn list_tools(&self) -> Vec<ToolSchema> {
         vec![]
     }
 }
@@ -93,6 +93,59 @@ fn ctx_for_session<'a>(session_id: &'a str) -> ToolExecutionContext<'a> {
     }
 }
 
+/// Build an `Agent` and a `ScheduleManager` for tests using the new `ScheduleContext` API.
+fn build_manager(
+    dir: &std::path::Path,
+    schedule_store: Arc<ScheduleStore>,
+    store: Arc<SessionStoreV2>,
+    provider: Arc<dyn LLMProvider>,
+    config: Config,
+) -> (Arc<Agent>, Arc<ScheduleManager>) {
+    use bamboo_application_metrics::collector::MetricsCollector;
+    use bamboo_application_metrics::storage::SqliteMetricsStorage;
+    use bamboo_application_skills::SkillManager;
+
+    let metrics_storage = Arc::new(SqliteMetricsStorage::new(dir.join("metrics.db")));
+    let metrics = MetricsCollector::spawn(metrics_storage, 1);
+
+    let agent = AgentBuilder::new()
+        .storage(store.clone())
+        .attachment_reader(store.clone())
+        .skill_manager(Arc::new(SkillManager::new()))
+        .metrics_collector(metrics)
+        .config(Arc::new(RwLock::new(config)))
+        .provider(provider)
+        .default_tools(Arc::new(NoopTools))
+        .build()
+        .expect("build agent");
+
+    let agent = Arc::new(agent);
+    let resolve_run_config = Arc::new(|_job: &ScheduleRunJob| ResolvedRunConfig {
+        model: String::new(),
+        reasoning_effort: None,
+        system_prompt: String::new(),
+        base_system_prompt: String::new(),
+        workspace_path: None,
+    });
+
+    let ctx = ScheduleContext {
+        schedule_store,
+        agent: agent.clone(),
+        tools: Arc::new(NoopTools),
+        sessions_cache: Arc::new(RwLock::new(HashMap::new())),
+        agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
+        session_event_senders: Arc::new(RwLock::new(HashMap::<
+            String,
+            broadcast::Sender<AgentEvent>,
+        >::new())),
+        trigger_engine: bamboo_agent::server::schedules::default_trigger_engine(),
+        resolve_run_config,
+    };
+
+    let manager = Arc::new(ScheduleManager::new(ctx));
+    (agent, manager)
+}
+
 #[tokio::test]
 async fn schedule_tasks_requires_session_id() {
     common::init_test_env();
@@ -100,26 +153,13 @@ async fn schedule_tasks_requires_session_id() {
     let store = Arc::new(SessionStoreV2::new(dir.path().to_path_buf()).await.unwrap());
     let schedule_store = Arc::new(ScheduleStore::new(dir.path().to_path_buf()).await.unwrap());
 
-    let metrics_storage = Arc::new(SqliteMetricsStorage::new(dir.path().join("metrics.db")));
-    let metrics = MetricsCollector::spawn(metrics_storage, 1);
-
-    let manager = Arc::new(ScheduleManager::new(ScheduleContext {
-        schedule_store: schedule_store.clone(),
-        session_store: store.clone(),
-        storage: store.clone(),
-        provider: Arc::new(DummyProvider),
-        tools: Arc::new(NoopTools),
-        skill_manager: Arc::new(SkillManager::new()),
-        metrics_collector: metrics,
-        sessions_cache: Arc::new(RwLock::new(HashMap::new())),
-        agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
-        session_event_senders: Arc::new(RwLock::new(HashMap::<
-            String,
-            broadcast::Sender<AgentEvent>,
-        >::new())),
-        config: Arc::new(RwLock::new(bamboo_agent::core::Config::default())),
-        trigger_engine: bamboo_agent::server::schedules::default_trigger_engine(),
-    }));
+    let (_agent, manager) = build_manager(
+        dir.path(),
+        schedule_store.clone(),
+        store.clone(),
+        Arc::new(DummyProvider),
+        Config::default(),
+    );
 
     let tool = ScheduleTasksTool::new(schedule_store, manager, store.clone(), store);
 
@@ -141,31 +181,18 @@ async fn schedule_tasks_rejects_child_sessions() {
     let store = Arc::new(SessionStoreV2::new(dir.path().to_path_buf()).await.unwrap());
     let schedule_store = Arc::new(ScheduleStore::new(dir.path().to_path_buf()).await.unwrap());
 
-    let metrics_storage = Arc::new(SqliteMetricsStorage::new(dir.path().join("metrics.db")));
-    let metrics = MetricsCollector::spawn(metrics_storage, 1);
-
-    let manager = Arc::new(ScheduleManager::new(ScheduleContext {
-        schedule_store: schedule_store.clone(),
-        session_store: store.clone(),
-        storage: store.clone(),
-        provider: Arc::new(DummyProvider),
-        tools: Arc::new(NoopTools),
-        skill_manager: Arc::new(SkillManager::new()),
-        metrics_collector: metrics,
-        sessions_cache: Arc::new(RwLock::new(HashMap::new())),
-        agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
-        session_event_senders: Arc::new(RwLock::new(HashMap::<
-            String,
-            broadcast::Sender<AgentEvent>,
-        >::new())),
-        config: Arc::new(RwLock::new(bamboo_agent::core::Config::default())),
-        trigger_engine: bamboo_agent::server::schedules::default_trigger_engine(),
-    }));
+    let (_agent, manager) = build_manager(
+        dir.path(),
+        schedule_store.clone(),
+        store.clone(),
+        Arc::new(DummyProvider),
+        Config::default(),
+    );
 
     let tool = ScheduleTasksTool::new(schedule_store, manager, store.clone(), store.clone());
 
     let mut child = Session::new("child-session", "test-model");
-    child.kind = bamboo_agent::agent::core::SessionKind::Child;
+    child.kind = SessionKind::Child;
     child.parent_session_id = Some("root-session".to_string());
     child.root_session_id = "root-session".to_string();
     child.add_message(Message::user("hi".to_string()));
@@ -190,26 +217,13 @@ async fn schedule_tasks_rejects_invalid_create_arguments() {
     let store = Arc::new(SessionStoreV2::new(dir.path().to_path_buf()).await.unwrap());
     let schedule_store = Arc::new(ScheduleStore::new(dir.path().to_path_buf()).await.unwrap());
 
-    let metrics_storage = Arc::new(SqliteMetricsStorage::new(dir.path().join("metrics.db")));
-    let metrics = MetricsCollector::spawn(metrics_storage, 1);
-
-    let manager = Arc::new(ScheduleManager::new(ScheduleContext {
-        schedule_store: schedule_store.clone(),
-        session_store: store.clone(),
-        storage: store.clone(),
-        provider: Arc::new(DummyProvider),
-        tools: Arc::new(NoopTools),
-        skill_manager: Arc::new(SkillManager::new()),
-        metrics_collector: metrics,
-        sessions_cache: Arc::new(RwLock::new(HashMap::new())),
-        agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
-        session_event_senders: Arc::new(RwLock::new(HashMap::<
-            String,
-            broadcast::Sender<AgentEvent>,
-        >::new())),
-        config: Arc::new(RwLock::new(bamboo_agent::core::Config::default())),
-        trigger_engine: bamboo_agent::server::schedules::default_trigger_engine(),
-    }));
+    let (_agent, manager) = build_manager(
+        dir.path(),
+        schedule_store.clone(),
+        store.clone(),
+        Arc::new(DummyProvider),
+        Config::default(),
+    );
 
     let tool = ScheduleTasksTool::new(schedule_store, manager, store.clone(), store.clone());
 
@@ -269,26 +283,13 @@ async fn schedule_tasks_rejects_invalid_patch_arguments() {
     let store = Arc::new(SessionStoreV2::new(dir.path().to_path_buf()).await.unwrap());
     let schedule_store = Arc::new(ScheduleStore::new(dir.path().to_path_buf()).await.unwrap());
 
-    let metrics_storage = Arc::new(SqliteMetricsStorage::new(dir.path().join("metrics.db")));
-    let metrics = MetricsCollector::spawn(metrics_storage, 1);
-
-    let manager = Arc::new(ScheduleManager::new(ScheduleContext {
-        schedule_store: schedule_store.clone(),
-        session_store: store.clone(),
-        storage: store.clone(),
-        provider: Arc::new(DummyProvider),
-        tools: Arc::new(NoopTools),
-        skill_manager: Arc::new(SkillManager::new()),
-        metrics_collector: metrics,
-        sessions_cache: Arc::new(RwLock::new(HashMap::new())),
-        agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
-        session_event_senders: Arc::new(RwLock::new(HashMap::<
-            String,
-            broadcast::Sender<AgentEvent>,
-        >::new())),
-        config: Arc::new(RwLock::new(bamboo_agent::core::Config::default())),
-        trigger_engine: bamboo_agent::server::schedules::default_trigger_engine(),
-    }));
+    let (_agent, manager) = build_manager(
+        dir.path(),
+        schedule_store.clone(),
+        store.clone(),
+        Arc::new(DummyProvider),
+        Config::default(),
+    );
 
     let tool = ScheduleTasksTool::new(
         schedule_store.clone(),
@@ -354,26 +355,13 @@ async fn schedule_tasks_crud_and_list_sessions() {
     let store = Arc::new(SessionStoreV2::new(dir.path().to_path_buf()).await.unwrap());
     let schedule_store = Arc::new(ScheduleStore::new(dir.path().to_path_buf()).await.unwrap());
 
-    let metrics_storage = Arc::new(SqliteMetricsStorage::new(dir.path().join("metrics.db")));
-    let metrics = MetricsCollector::spawn(metrics_storage, 1);
-
-    let manager = Arc::new(ScheduleManager::new(ScheduleContext {
-        schedule_store: schedule_store.clone(),
-        session_store: store.clone(),
-        storage: store.clone(),
-        provider: Arc::new(DummyProvider),
-        tools: Arc::new(NoopTools),
-        skill_manager: Arc::new(SkillManager::new()),
-        metrics_collector: metrics,
-        sessions_cache: Arc::new(RwLock::new(HashMap::new())),
-        agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
-        session_event_senders: Arc::new(RwLock::new(HashMap::<
-            String,
-            broadcast::Sender<AgentEvent>,
-        >::new())),
-        config: Arc::new(RwLock::new(bamboo_agent::core::Config::default())),
-        trigger_engine: bamboo_agent::server::schedules::default_trigger_engine(),
-    }));
+    let (_agent, manager) = build_manager(
+        dir.path(),
+        schedule_store.clone(),
+        store.clone(),
+        Arc::new(DummyProvider),
+        Config::default(),
+    );
 
     let tool = ScheduleTasksTool::new(
         schedule_store.clone(),
@@ -555,26 +543,13 @@ async fn schedule_run_non_auto_execute_completes_with_success_accounting() {
         .await
         .unwrap();
 
-    let metrics_storage = Arc::new(SqliteMetricsStorage::new(dir.path().join("metrics.db")));
-    let metrics = MetricsCollector::spawn(metrics_storage, 1);
-
-    let manager = Arc::new(ScheduleManager::new(ScheduleContext {
-        schedule_store: schedule_store.clone(),
-        session_store: store.clone(),
-        storage: store.clone(),
-        provider: Arc::new(DummyProvider),
-        tools: Arc::new(NoopTools),
-        skill_manager: Arc::new(SkillManager::new()),
-        metrics_collector: metrics,
-        sessions_cache: Arc::new(RwLock::new(HashMap::new())),
-        agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
-        session_event_senders: Arc::new(RwLock::new(HashMap::<
-            String,
-            broadcast::Sender<AgentEvent>,
-        >::new())),
-        config: Arc::new(RwLock::new(bamboo_agent::core::Config::default())),
-        trigger_engine: bamboo_agent::server::schedules::default_trigger_engine(),
-    }));
+    let (_agent, manager) = build_manager(
+        dir.path(),
+        schedule_store.clone(),
+        store.clone(),
+        Arc::new(DummyProvider),
+        Config::default(),
+    );
 
     let claimed = schedule_store
         .create_run_now(&created.id)
@@ -582,7 +557,7 @@ async fn schedule_run_non_auto_execute_completes_with_success_accounting() {
         .unwrap()
         .expect("run job should be created");
     manager
-        .enqueue_run_now(bamboo_agent::server::schedules::ScheduleRunJob {
+        .enqueue_run_now(ScheduleRunJob {
             run_id: claimed.run_id.clone(),
             schedule_id: claimed.schedule_id.clone(),
             schedule_name: claimed.schedule_name.clone(),
@@ -642,33 +617,20 @@ async fn schedule_run_uses_config_get_model_fallback() {
         .await
         .unwrap();
 
-    let metrics_storage = Arc::new(SqliteMetricsStorage::new(dir.path().join("metrics.db")));
-    let metrics = MetricsCollector::spawn(metrics_storage, 1);
-
     // Copilot has a built-in get_model() fallback ("gpt-4o") even when not configured.
-    let mut cfg = bamboo_agent::core::Config::default();
+    let mut cfg = Config::default();
     cfg.provider = "copilot".to_string();
     let expected_model = cfg
         .get_model()
         .expect("copilot should always have a model fallback");
 
-    let manager = Arc::new(ScheduleManager::new(ScheduleContext {
-        schedule_store: schedule_store.clone(),
-        session_store: store.clone(),
-        storage: store.clone(),
-        provider: Arc::new(DummyProvider),
-        tools: Arc::new(NoopTools),
-        skill_manager: Arc::new(SkillManager::new()),
-        metrics_collector: metrics,
-        sessions_cache: Arc::new(RwLock::new(HashMap::new())),
-        agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
-        session_event_senders: Arc::new(RwLock::new(HashMap::<
-            String,
-            broadcast::Sender<AgentEvent>,
-        >::new())),
-        config: Arc::new(RwLock::new(cfg)),
-        trigger_engine: bamboo_agent::server::schedules::default_trigger_engine(),
-    }));
+    let (_agent, manager) = build_manager(
+        dir.path(),
+        schedule_store.clone(),
+        store.clone(),
+        Arc::new(DummyProvider),
+        cfg,
+    );
 
     let claimed = schedule_store
         .create_run_now(&created.id)
@@ -676,7 +638,7 @@ async fn schedule_run_uses_config_get_model_fallback() {
         .unwrap()
         .expect("run job should be created");
     manager
-        .enqueue_run_now(bamboo_agent::server::schedules::ScheduleRunJob {
+        .enqueue_run_now(ScheduleRunJob {
             run_id: claimed.run_id.clone(),
             schedule_id: claimed.schedule_id.clone(),
             schedule_name: claimed.schedule_name.clone(),
@@ -760,26 +722,13 @@ async fn schedule_auto_execute_keeps_running_until_background_completion() {
         release: release.clone(),
     });
 
-    let metrics_storage = Arc::new(SqliteMetricsStorage::new(dir.path().join("metrics.db")));
-    let metrics = MetricsCollector::spawn(metrics_storage, 1);
-
-    let manager = Arc::new(ScheduleManager::new(ScheduleContext {
-        schedule_store: schedule_store.clone(),
-        session_store: store.clone(),
-        storage: store.clone(),
+    let (_agent, manager) = build_manager(
+        dir.path(),
+        schedule_store.clone(),
+        store.clone(),
         provider,
-        tools: Arc::new(NoopTools),
-        skill_manager: Arc::new(SkillManager::new()),
-        metrics_collector: metrics,
-        sessions_cache: Arc::new(RwLock::new(HashMap::new())),
-        agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
-        session_event_senders: Arc::new(RwLock::new(HashMap::<
-            String,
-            broadcast::Sender<AgentEvent>,
-        >::new())),
-        config: Arc::new(RwLock::new(bamboo_agent::core::Config::default())),
-        trigger_engine: bamboo_agent::server::schedules::default_trigger_engine(),
-    }));
+        Config::default(),
+    );
 
     let claimed = schedule_store
         .create_run_now(&created.id)
@@ -787,7 +736,7 @@ async fn schedule_auto_execute_keeps_running_until_background_completion() {
         .unwrap()
         .expect("run job should be created");
     manager
-        .enqueue_run_now(bamboo_agent::server::schedules::ScheduleRunJob {
+        .enqueue_run_now(ScheduleRunJob {
             run_id: claimed.run_id.clone(),
             schedule_id: claimed.schedule_id.clone(),
             schedule_name: claimed.schedule_name.clone(),

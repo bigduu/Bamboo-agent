@@ -2,9 +2,11 @@
 
 use std::sync::Arc;
 
-use bamboo_agent::agent::core::storage::{SessionStoreV2, Storage};
-use bamboo_agent::agent::core::tools::{Tool, ToolExecutionContext};
-use bamboo_agent::agent::core::{Message, Session};
+use bamboo_agent::agent::{Message, Session};
+use bamboo_application_agent::storage::Storage;
+use bamboo_application_agent::tools::{Tool, ToolExecutionContext};
+use bamboo_application_agent::ConversationSummary;
+use bamboo_infrastructure_storage::SessionStoreV2;
 use bamboo_agent::server::tools::SessionInspectorTool;
 
 mod common;
@@ -157,7 +159,7 @@ async fn session_inspector_read_compressed_cache_reads_sqlite_cached_rows() {
     ));
     s.add_message(Message::user("latest user".to_string()));
     s.add_message(Message::assistant("latest assistant".to_string(), None));
-    s.conversation_summary = Some(bamboo_agent::agent::core::ConversationSummary::new(
+    s.conversation_summary = Some(ConversationSummary::new(
         "compressed summary snapshot",
         2,
         20,

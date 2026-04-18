@@ -1,7 +1,7 @@
 use super::*;
-use bamboo_agent::agent::core::agent::events::TokenBudgetUsage;
-use bamboo_agent::agent::core::tools::{FunctionCall, ToolCall};
-use bamboo_agent::agent::core::ConversationSummary;
+use bamboo_agent::agent::TokenBudgetUsage;
+use bamboo_application_agent::tools::{FunctionCall, ToolCall};
+use bamboo_application_agent::ConversationSummary;
 
 fn create_tool_call(id: &str) -> ToolCall {
     ToolCall {
