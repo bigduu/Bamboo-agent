@@ -69,6 +69,10 @@ pub use bamboo_server as server;
 
 // Ergonomic re-export: `bamboo_agent::tools` → `bamboo_tools` for backward compatibility.
 pub use bamboo_tools as tools;
+
+// Re-export infrastructure crate so consumers can access config, paths, encryption, etc.
+// via `bamboo_agent::infrastructure::...`
+pub use bamboo_infrastructure as infrastructure;
 pub use agent::{Agent, AgentBuilder};
 
 // Re-export core Config as the primary configuration type
