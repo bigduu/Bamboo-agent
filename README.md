@@ -113,7 +113,7 @@ Default local paths:
   "providers": {
     "anthropic": {
       "api_key": "sk-ant-...",
-      "model": "claude-3-5-sonnet-20241022"
+      "model": "claude-sonnet-4-20250514"
     }
   }
 }
@@ -132,13 +132,32 @@ Add skills, MCP integrations, workflows, and schedules on top of the runtime cor
 
 ## Documentation
 
-- [Documentation index](./docs/README.md)
 - [API reference](./docs/guides/API.md)
 - [Migration guide](./docs/guides/MIGRATION_GUIDE.md)
-- [Development and runtime research](./docs/development/README.md)
-- [CHANGELOG](./CHANGELOG.md)
 - [CONTRIBUTING](./CONTRIBUTING.md)
+- [CHANGELOG](./CHANGELOG.md)
 - [SECURITY](./SECURITY.md)
+
+## Development
+
+### Auto-publish
+
+Bamboo auto-publishes to crates.io when the version in `Cargo.toml` changes on `main`. To release:
+
+1. Update version in `Cargo.toml`
+2. Update `CHANGELOG.md`
+3. Commit and push — CI handles tagging, GitHub Release, and crates.io publish
+
+Requires `CARGO_REGISTRY_TOKEN` secret in GitHub repo settings.
+
+### Docker
+
+```bash
+cd docker && docker compose up -d --build
+curl http://localhost:9562/api/v1/health
+```
+
+Key env vars: `BAMBOO_DATA_DIR`, `BAMBOO_PORT`, `BAMBOO_BIND`, `BAMBOO_WORKERS`, `BAMBOO_CORS_ALLOW_ORIGINS`.
 
 ## When Bamboo is the right choice
 

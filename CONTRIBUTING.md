@@ -121,20 +121,40 @@ We follow standard Rust conventions:
 
 ### Project Structure
 
+Bamboo uses a Cargo workspace with the following crates under `crates/`:
+
 ```
 bamboo/
-├── src/
-│   ├── core/           # Core types and utilities
-│   ├── agent/          # Agent system
-│   ├── web_service/    # HTTP API layer
-│   ├── claude/         # Claude integration
-│   ├── commands/       # Commands & workflows
-│   ├── config/         # Configuration
-│   └── process/        # Process management
-├── tests/              # Integration tests
-├── Cargo.toml
+├── src/                    # Main crate (bamboo-agent root)
+│   └── bin/bamboo.rs       # CLI binary entry point
+├── crates/
+│   ├── bamboo-agent-core/  # Agent runtime core, composition, storage, tools
+│   ├── bamboo-cli/         # CLI binary wrapper
+│   ├── bamboo-compression/ # Context compression and summarization
+│   ├── bamboo-domain/      # Domain types: sessions, tools, workflows, schedules, MCP
+│   ├── bamboo-engine/      # Agent engine: MCP, metrics, runtime, skills
+│   ├── bamboo-infrastructure/ # Config, LLM providers, process management, storage
+│   ├── bamboo-memory/      # Memory system: durable memory, budget, Dream notebook
+│   ├── bamboo-server/      # HTTP server, handlers, routes, app state
+│   └── bamboo-tools/       # Tool registry, executor, orchestrator, built-in tools
+├── tests/                  # Integration tests
+├── Cargo.toml              # Workspace manifest
 └── README.md
 ```
+
+### Workspace Crate Responsibilities
+
+| Crate | Responsibility |
+|---|---|
+| `bamboo-agent-core` | Agent system composition, workspace state, core agent types |
+| `bamboo-cli` | CLI entry point and argument parsing |
+| `bamboo-compression` | Context compression, summarization, token limits |
+| `bamboo-domain` | Domain types for sessions, tools, workflows, schedules, MCP config |
+| `bamboo-engine` | Agent engine: MCP integration, metrics, runtime, skill execution |
+| `bamboo-infrastructure` | Configuration management, LLM providers, process management, SQLite storage |
+| `bamboo-memory` | Memory system, token budget management, Dream notebook |
+| `bamboo-server` | HTTP server, request handlers, routes, session app state |
+| `bamboo-tools` | Tool registry, executor, orchestrator, built-in tools, permission system |
 
 ### Module Guidelines
 
@@ -180,10 +200,54 @@ bamboo/
 - `help wanted` - Extra attention is needed
 - `wontfix` - This will not be worked on
 
+## CI/CD Setup
+
+### Existing Workflows
+
+Bamboo uses GitHub Actions for continuous integration and publishing:
+
+- **CI** (`.github/workflows/ci.yml`) -- Tests on Linux, macOS, and Windows. Runs `rustfmt` and `clippy`. Builds documentation. Runs `cargo-audit` for security.
+- **Publish** (`.github/workflows/publish.yml`) -- Publishes to crates.io on release. Builds release binaries for all platforms.
+- **Documentation** (`.github/workflows/docs.yml`) -- Builds documentation on every push to main. Deploys to GitHub Pages.
+
+### Badge URLs
+
+After workflows run, badges resolve to:
+
+- CI: `https://github.com/bigduu/Bamboo-agent/actions/workflows/ci.yml`
+- Documentation: `https://github.com/bigduu/Bamboo-agent/actions/workflows/docs.yml`
+- GitHub Pages: `https://bigduu.github.io/Bamboo-agent/`
+- docs.rs: `https://docs.rs/bamboo-agent` (built automatically after publishing to crates.io)
+
+### Setup Checklist
+
+1. Push changes to GitHub to trigger CI.
+2. Enable GitHub Pages: **Settings > Pages > Source** set to **GitHub Actions**.
+3. Add `CARGO_REGISTRY_TOKEN` secret under **Settings > Secrets and variables > Actions** for crates.io publishing.
+4. Verify badge status in README after pushing.
+
+## E2E Testing
+
+```bash
+# Run all e2e tests
+cargo test --test e2e
+
+# Run specific test
+cargo test --test e2e test_health_endpoint
+```
+
+Tests cover all API endpoints (chat, execute, events, sessions, tasks, respond, metrics, MCP, health). Each test is isolated using actix-web's in-memory test framework.
+
+### Adding E2E tests
+
+1. Create `tests/e2e/new_endpoint.rs`
+2. Use `create_test_app()` helper from `common`
+3. Add the module to `tests/e2e/mod.rs`
+
 ## Questions?
 
 Feel free to open an issue with the question label or start a discussion on GitHub.
 
 ---
 
-Thank you for contributing! 🎋
+Thank you for contributing!

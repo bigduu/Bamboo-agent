@@ -476,13 +476,13 @@ Bamboo follows a session-based architecture with unified server implementation:
 
 ### Server Architecture
 
-- **Unified `server/` module**: Single implementation instead of dual servers
-- **Explicit routing**: All routes registered in `routes.rs` (no routing macros)
+- **`bamboo-server` crate**: Unified HTTP server with explicit routing
+- **Explicit routing**: All routes registered in `crates/bamboo-server/src/routes/`
 - **Direct provider access**: No HTTP callbacks to self (eliminates proxy pattern)
-- **Handler organization**:
-  - Core agent handlers in `handlers/agent/`
-  - Provider handlers in `handlers/` (openai, anthropic, gemini, etc.)
-  - Feature handlers in `handlers/` (settings, workspace, tools, etc.)
+- **Handler organization** (`crates/bamboo-server/src/handlers/`):
+  - Core agent handlers in `handlers/agent/` (chat, execute, events, stop, history, respond, etc.)
+  - Provider handlers in `handlers/` (openai/, anthropic/, gemini/, copilot_auth/, agent_api.rs)
+  - Feature handlers in `handlers/` (settings/, tools/, workspace/, skill/, command/)
 
 ---
 
@@ -494,6 +494,5 @@ MIT License
 
 ## Support
 
-- GitHub Issues: https://github.com/your-org/bamboo/issues
-- Documentation: https://docs.bamboo.dev
-- API Reference: This document
+- GitHub Issues: https://github.com/bigduu/Bamboo-agent/issues
+- Documentation: https://docs.rs/bamboo-agent

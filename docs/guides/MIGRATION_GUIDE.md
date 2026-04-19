@@ -4,19 +4,19 @@ This guide helps you migrate from the old `agent-*` crates to the unified `bambo
 
 ## Overview
 
-Bamboo consolidates the following crates into a single, cohesive package:
+Bamboo is now organized as a Cargo workspace with the following crates under `crates/`:
 
-- `chat_core`
-- `agent-core`
-- `agent-llm`
-- `agent-tools`
-- `agent-metrics`
-- `agent-mcp`
-- `agent-loop`
-- `agent-server`
-- `agent-skill`
-- `agent-cli`
-- `web_service`
+- `bamboo-agent-core` -- Agent runtime core, composition, storage, tools
+- `bamboo-cli` -- CLI binary wrapper
+- `bamboo-compression` -- Context compression and summarization
+- `bamboo-domain` -- Domain types: sessions, tools, workflows, schedules, MCP
+- `bamboo-engine` -- Agent engine: MCP, metrics, runtime, skills
+- `bamboo-infrastructure` -- Config, LLM providers, process management, storage
+- `bamboo-memory` -- Memory system: durable memory, budget, Dream notebook
+- `bamboo-server` -- HTTP server, handlers, routes, app state
+- `bamboo-tools` -- Tool registry, executor, orchestrator, built-in tools
+
+These replace the earlier monolithic `bamboo-agent` crate with internal modules such as `chat_core`, `agent-core`, `agent-llm`, `agent-tools`, `agent-metrics`, `agent-mcp`, `agent-loop`, `agent-server`, `agent-skill`, `agent-cli`, and `web_service`.
 
 ## Migration Steps
 
@@ -35,7 +35,11 @@ web_service = { path = "../web_service" }
 **After:**
 ```toml
 [dependencies]
-bamboo-agent = "0.1"
+bamboo-agent = "2026.4"
+# Or use individual workspace crates:
+# bamboo-domain = { path = "../crates/bamboo-domain" }
+# bamboo-server = { path = "../crates/bamboo-server" }
+# bamboo-tools = { path = "../crates/bamboo-tools" }
 ```
 
 ### 2. Update Imports
@@ -51,9 +55,9 @@ use chat_core::keyword_masking::KeywordMaskingConfig;
 
 **After:**
 ```rust
-use bamboo::core::Config;
-use bamboo::core::paths::bamboo_dir;
-use bamboo::core::keyword_masking::KeywordMaskingConfig;
+use bamboo_infrastructure::config::Config;
+use bamboo_domain::paths::bamboo_dir;
+use bamboo_domain::keyword_masking::KeywordMaskingConfig;
 ```
 
 #### Agent Types
@@ -66,8 +70,8 @@ use agent_core::tools::{ToolCall, ToolResult, ToolExecutor};
 
 **After:**
 ```rust
-use bamboo::agent::{AgentError, Session, Message};
-use bamboo::agent::core::tools::{ToolCall, ToolResult, ToolExecutor};
+use bamboo_agent_core::agent::{AgentError, Session, Message};
+use bamboo_tools::{ToolCall, ToolResult, ToolExecutor};
 ```
 
 #### LLM Providers
@@ -81,9 +85,9 @@ use agent_llm::create_provider;
 
 **After:**
 ```rust
-use bamboo::agent::llm::{LLMProvider, LLMError};
-use bamboo::agent::llm::providers::{OpenAIProvider, AnthropicProvider};
-use bamboo::agent::llm::create_provider;
+use bamboo_infrastructure::llm::{LLMProvider, LLMError};
+use bamboo_infrastructure::llm::providers::{OpenAIProvider, AnthropicProvider};
+use bamboo_infrastructure::llm::create_provider;
 ```
 
 #### Tools
@@ -96,8 +100,8 @@ use agent_tools::tools::ReadFileTool;
 
 **After:**
 ```rust
-use bamboo::agent::tools::{BuiltinToolExecutor, ToolRegistry};
-use bamboo::agent::tools::tools::ReadFileTool;
+use bamboo_tools::{BuiltinToolExecutor, ToolRegistry};
+use bamboo_tools::tools::ReadFileTool;
 ```
 
 #### Metrics
@@ -109,7 +113,7 @@ use agent_metrics::{MetricsBus, MetricsWorker};
 
 **After:**
 ```rust
-use bamboo::agent::metrics::{MetricsBus, MetricsWorker};
+use bamboo_engine::metrics::{MetricsBus, MetricsWorker};
 ```
 
 #### Web Service
@@ -126,11 +130,11 @@ use bamboo::web_service::WebService;
 use bamboo::web_service::controllers::agent_controller;
 ```
 
-**Latest (v0.2.0+):**
+**Latest (v0.2.0+ / workspace):**
 ```rust
-use bamboo::server::WebService;
-use bamboo::server::handlers;  // Unified handlers
-// Note: controllers are now part of handlers module
+use bamboo_server::WebService;
+use bamboo_server::handlers;
+// Handlers are under crates/bamboo-server/src/handlers/
 ```
 
 #### Claude Integration
@@ -145,9 +149,9 @@ use crate::command::workflows::save_workflow;
 
 **After:**
 ```rust
-use bamboo::claude::find_claude_binary;
-use bamboo::commands::slash_commands::SlashCommand;
-use bamboo::commands::workflows::save_workflow;
+use bamboo_server::claude_runner::find_claude_binary;
+use bamboo_tools::slash_commands::SlashCommand;
+use bamboo_server::workflow::save_workflow;
 ```
 
 ### 3. Update Function Calls
@@ -163,7 +167,7 @@ let provider = agent_llm::create_provider(&config)?;
 
 **After:**
 ```rust
-let provider = bamboo::agent::llm::create_provider(&config)?;
+let provider = bamboo_infrastructure::llm::create_provider(&config)?;
 ```
 
 #### Tool Execution
@@ -176,7 +180,7 @@ let result = executor.execute(&tool_call).await;
 
 **After:**
 ```rust
-let executor = bamboo::agent::tools::BuiltinToolExecutor::new();
+let executor = bamboo_tools::BuiltinToolExecutor::new();
 let result = executor.execute(&tool_call).await;
 ```
 
@@ -192,14 +196,14 @@ let config_dir = dirs::home_dir().unwrap().join(".bamboo");
 
 **After:**
 ```rust
-let config_dir = bamboo::config::paths::bamboo_home();
-let data_dir = bamboo::config::paths::bamboo_home();
+let config_dir = bamboo_infrastructure::config::paths::bamboo_home();
+let data_dir = bamboo_infrastructure::config::paths::bamboo_home();
 ```
 
 You can also use the provided helper functions:
 
 ```rust
-use bamboo::core::paths;
+use bamboo_infrastructure::config::paths;
 
 let config_path = paths::config_json_path();
 let sessions_dir = paths::sessions_dir();
@@ -222,14 +226,22 @@ let server = WebService::new(
 
 **After:**
 ```rust
-use bamboo::{BambooBuilder, BambooConfig};
+use bamboo_server::WebService;
 
-let config = BambooConfig::default();
-let server = BambooBuilder::new()
-    .port(9562)
-    .bind("127.0.0.1")
-    .data_dir(data_dir)
-    .build()?;
+let server = WebService::new(
+    data_dir,
+    provider,
+    config,
+    metrics_bus,
+);
+```
+
+**Latest (workspace):**
+```rust
+use bamboo_server::app_state::AppState;
+use bamboo_server::routes;
+
+let app = bamboo_server::build_app(data_dir, config);
 ```
 
 ## API Changes
@@ -286,12 +298,10 @@ Create a prelude module to simplify imports:
 
 ```rust
 // src/prelude.rs
-pub use bamboo::agent::{
-    AgentError, Session, Message, Role,
-};
-pub use bamboo::agent::llm::LLMProvider;
-pub use bamboo::agent::tools::BuiltinToolExecutor;
-pub use bamboo::core::Config;
+pub use bamboo_domain::session::{Session, Message, Role};
+pub use bamboo_infrastructure::llm::LLMProvider;
+pub use bamboo_tools::BuiltinToolExecutor;
+pub use bamboo_infrastructure::config::Config;
 
 // In your code
 mod prelude;
@@ -303,9 +313,9 @@ use prelude::*;
 If you have many type references, create aliases:
 
 ```rust
-type Provider = bamboo::agent::llm::LLMProvider;
-type Executor = bamboo::agent::tools::BuiltinToolExecutor;
-type Result<T> = std::result::Result<T, bamboo::agent::AgentError>;
+type Provider = bamboo_infrastructure::llm::LLMProvider;
+type Executor = bamboo_tools::BuiltinToolExecutor;
+type Result<T> = std::result::Result<T, bamboo_agent_core::AgentError>;
 ```
 
 ### Pattern 3: Re-export Common Types
@@ -313,13 +323,10 @@ type Result<T> = std::result::Result<T, bamboo::agent::AgentError>;
 In your lib.rs:
 
 ```rust
-pub use bamboo::{
-    // Re-export commonly used types
-    BambooConfig,
-    BambooBuilder,
-    agent::{Session, Message, AgentError},
-    core::Config,
+pub use bamboo_agent_core::{
+    Session, Message, AgentError,
 };
+pub use bamboo_infrastructure::config::Config;
 ```
 
 ## Testing Your Migration
@@ -333,7 +340,7 @@ pub use bamboo::{
 
 ### Error: "cannot find type `Session` in crate `bamboo`"
 
-**Solution**: Update your import paths. `Session` is now at `bamboo::agent::Session`.
+**Solution**: Update your import paths. `Session` is now at `bamboo_domain::session::Session`.
 
 ### Error: "no field `name` on type `ToolSchema`"
 
@@ -341,26 +348,26 @@ pub use bamboo::{
 
 ### Error: "unresolved import `chat_core`"
 
-**Solution**: Replace all `chat_core` imports with `bamboo::core`.
+**Solution**: Replace all `chat_core` imports with `bamboo_domain` (domain types) or `bamboo_infrastructure` (config, llm).
 
 ### Error: "no module named `agent_loop`"
 
-**Solution**: The loop module is now `bamboo::agent::loop_module` (renamed to avoid keyword conflict).
+**Solution**: The loop module is now `bamboo_engine::runtime` (the engine crate handles agent runtime and execution).
 
 ## Additional Resources
 
-- [API Documentation](https://docs.rs/bamboo)
-- [Examples Repository](https://github.com/bamboo-ai/bamboo/tree/main/examples)
-- [GitHub Issues](https://github.com/bamboo-ai/bamboo/issues)
+- [API Documentation](https://docs.rs/bamboo-agent)
+- [Repository](https://github.com/bigduu/Bamboo-agent)
+- [GitHub Issues](https://github.com/bigduu/Bamboo-agent/issues)
 
 ## Getting Help
 
 If you encounter issues during migration:
 
-1. Check the [API documentation](https://docs.rs/bamboo)
-2. Search [existing issues](https://github.com/bamboo-ai/bamboo/issues)
+1. Check the [API documentation](https://docs.rs/bamboo-agent)
+2. Search [existing issues](https://github.com/bigduu/Bamboo-agent/issues)
 3. Open a new issue with the "migration" label
-4. Start a [discussion](https://github.com/bamboo-ai/bamboo/discussions)
+4. Start a [discussion](https://github.com/bigduu/Bamboo-agent/discussions)
 
 ## Changelog
 
@@ -372,9 +379,9 @@ Version 0.2.0 introduces a major refactoring that consolidates the dual server a
 
 ### Key Changes
 
-1. **Unified server module**: `web_service` and `agent::server` → `server`
-2. **Explicit routing**: All routes now explicitly registered in `routes.rs` (~120 routes)
-3. **Unified handlers**: Controllers and handlers merged into `server::handlers`
+1. **Workspace crates**: Monolithic `bamboo-agent` crate split into `crates/bamboo-server`, `crates/bamboo-domain`, etc.
+2. **Explicit routing**: All routes registered in `crates/bamboo-server/src/routes/`
+3. **Unified handlers**: Controllers and handlers merged into `bamboo_server::handlers`
 4. **Direct provider access**: Eliminated proxy pattern with HTTP callbacks
 
 ### Migration from v0.1.x to v0.2.0
@@ -390,21 +397,21 @@ use bamboo::web_service::WebService;
 use bamboo::web_service::controllers::*;
 ```
 
-**After (v0.2.0+):**
+**After (v0.2.0+ / workspace):**
 ```rust
-use bamboo::server::AppState;
-use bamboo::server::handlers;
-use bamboo::server::WebService;
+use bamboo_server::app_state::AppState;
+use bamboo_server::handlers;
+use bamboo_server::WebService;
 // Note: controllers::* → handlers::*
 ```
 
 #### Handler Organization
 
-**Agent handlers** (moved to `handlers/agent/`):
+**Agent handlers** (under `crates/bamboo-server/src/handlers/agent/`):
 - `chat`, `execute`, `events`, `stream`, `stop`, `history`, `respond`, `delete`, `health`, `metrics`, `todo`, `mcp`
 
-**Provider handlers** (moved to `handlers/`):
-- `openai`, `anthropic`, `gemini`, `copilot_auth`, `agent_api`, `command`, `settings`, `skill`, `tools`, `workspace`
+**Provider handlers** (under `crates/bamboo-server/src/handlers/`):
+- `openai/`, `anthropic/`, `gemini/`, `copilot_auth/`, `agent_api.rs`, `command/`, `settings/`, `skill/`, `tools/`, `workspace/`
 
 ### Backward Compatibility
 Legacy import paths were deprecated in v0.2.0 and removed in v0.2.8.
@@ -415,23 +422,23 @@ Legacy import paths were deprecated in v0.2.0 and removed in v0.2.8.
 // use bamboo::web_service::WebService;
 // use bamboo::server::controllers::agent_api;
 
-// New (recommended)
-use bamboo::server::AppState;
-use bamboo::server::WebService;
-use bamboo::server::handlers::agent_api;
+// Current (workspace crates)
+use bamboo_server::app_state::AppState;
+use bamboo_server::WebService;
+use bamboo_server::handlers::agent_api;
 ```
 
 ### Benefits
 
 - ✅ **No route duplication**: Single source of truth for all routes
-- ✅ **Clearer architecture**: One unified server module
+- ✅ **Clearer architecture**: Workspace crate separation with clear boundaries
 - ✅ **Better performance**: Direct provider access (no HTTP callbacks)
-- ✅ **Easier maintenance**: All routes visible in `routes.rs`
+- **Easier maintenance**: All routes visible in `crates/bamboo-server/src/routes/`
 - ✅ **-430 lines of code**: Cleaner, more maintainable codebase
 
 ### For More Details
 
-See [MIGRATION.md](../../MIGRATION.md) for comprehensive migration documentation.
+See [CHANGELOG.md](../../CHANGELOG.md) for the full change history.
 
 ---
 
