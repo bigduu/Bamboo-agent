@@ -228,6 +228,7 @@ impl SmartCodeReviewTool {
     }
 
     /// Perform quick review
+    #[allow(clippy::collapsible_match)]
     fn quick_review(&self, content: &str, lang: &LanguageInfo) -> Vec<String> {
         let mut issues = Vec::new();
 
@@ -259,6 +260,7 @@ impl SmartCodeReviewTool {
     }
 
     /// Perform standard review
+    #[allow(clippy::collapsible_match)]
     fn standard_review(&self, content: &str, lang: &LanguageInfo) -> Vec<String> {
         let mut issues = self.quick_review(content, lang);
 
@@ -352,6 +354,7 @@ impl SmartCodeReviewTool {
     }
 
     /// Check for basic security issues
+    #[allow(clippy::collapsible_match)]
     fn check_security_issues(&self, content: &str, lang: &LanguageInfo) -> Vec<String> {
         let mut issues = Vec::new();
 
