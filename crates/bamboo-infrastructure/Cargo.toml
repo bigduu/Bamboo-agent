@@ -18,7 +18,6 @@ reqwest-middleware = { version = "0.4", features = ["json"] }
 reqwest-retry = "0.7"
 reqwest-eventsource = "0.6"
 eventsource-stream = "0.2"
-eventsource-client = "0.12"
 uuid = { workspace = true }
 chrono = { workspace = true }
 lazy_static = "1"

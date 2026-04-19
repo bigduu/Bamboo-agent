@@ -571,6 +571,7 @@ impl CopilotProvider {
         unreachable!("loop always returns or errors")
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn chat_stream_via_responses(
         &self,
         token: &str,

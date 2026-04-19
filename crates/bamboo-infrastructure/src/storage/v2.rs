@@ -225,7 +225,7 @@ impl SessionStoreV2 {
     pub async fn list_index_entries(&self) -> Vec<SessionIndexEntry> {
         let index = self.index.read().await;
         let mut items: Vec<_> = index.sessions.values().cloned().collect();
-        items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        items.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         items
     }
 

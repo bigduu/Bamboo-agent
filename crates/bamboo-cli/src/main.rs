@@ -7,8 +7,9 @@
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use eventsource_client::Client;
+use eventsource_client::{Client, SSE};
 use futures::StreamExt;
+use launchdarkly_sdk_transport::HyperTransport;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::time::Instant;
@@ -326,7 +327,9 @@ async fn stream_message(
         );
     }
 
-    let sse_client = eventsource_client::ClientBuilder::for_url(&stream_url)?.build();
+    let transport = HyperTransport::builder().build_https()?;
+    let sse_client =
+        eventsource_client::ClientBuilder::for_url(&stream_url)?.build_with_transport(transport);
 
     let mut stream = sse_client.stream();
     let mut content_buffer = String::new();
@@ -335,7 +338,7 @@ async fn stream_message(
 
     while let Some(event) = stream.next().await {
         match event {
-            Ok(eventsource_client::SSE::Event(event)) => {
+            Ok(SSE::Event(event)) => {
                 event_count += 1;
 
                 if debug {
@@ -444,9 +447,14 @@ async fn stream_message(
                     );
                 }
             }
-            Ok(eventsource_client::SSE::Comment(comment)) => {
+            Ok(SSE::Comment(comment)) => {
                 if debug {
                     eprintln!("{}", format!("[DEBUG] SSE Comment: {}", comment).dimmed());
+                }
+            }
+            Ok(SSE::Connected(_)) => {
+                if debug {
+                    eprintln!("{}", "[DEBUG] SSE Connected".dimmed());
                 }
             }
             Err(e) => {

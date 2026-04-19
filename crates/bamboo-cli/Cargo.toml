@@ -21,7 +21,8 @@ clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
 # SSE client
-eventsource-client = "0.12"
+eventsource-client = "0.17"
+launchdarkly-sdk-transport = { version = "0.1", features = ["hyper-rustls-native-roots"] }
 
 # Async utilities
 futures = "0.3"

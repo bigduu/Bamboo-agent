@@ -148,6 +148,7 @@ impl OpenAIProvider {
         mentions_reasoning && mentions_unsupported
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn chat_stream_via_responses(
         &self,
         messages: &[Message],

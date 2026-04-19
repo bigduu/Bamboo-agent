@@ -103,7 +103,7 @@ async-stream = "0.3"
 tokio-stream = "0.1"
 tokio-util = "0.7"
 eventsource-stream = "0.2"
-eventsource-client = "0.12"
+eventsource-client = "0.17"
 bytes = "1"
 
 # Concurrency utilities
