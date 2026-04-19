@@ -19,7 +19,7 @@ impl AppState {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use bamboo_agent::server::app_state::AppState;
+    /// use bamboo_server::app_state::AppState;
     /// use std::path::PathBuf;
     ///
     /// #[tokio::main]
@@ -32,7 +32,7 @@ impl AppState {
     ///     state.reload_provider().await.expect("Provider reload failed");
     /// }
     /// ```
-    pub async fn reload_provider(&self) -> Result<(), bamboo_infrastructure_llm::LLMError> {
+    pub async fn reload_provider(&self) -> Result<(), bamboo_infrastructure::LLMError> {
         let config = self.config.read().await.clone();
 
         let configured_model = match config.provider.as_str() {
@@ -66,7 +66,7 @@ impl AppState {
         );
 
         let new_provider =
-            bamboo_infrastructure_llm::create_provider_with_dir(&config, self.app_data_dir.clone()).await?;
+            bamboo_infrastructure::create_provider_with_dir(&config, self.app_data_dir.clone()).await?;
 
         let mut provider = self.provider.write().await;
         *provider = new_provider;
@@ -88,7 +88,7 @@ impl AppState {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use bamboo_agent::server::app_state::AppState;
+    /// use bamboo_server::app_state::AppState;
     /// use std::path::PathBuf;
     ///
     /// #[tokio::main]

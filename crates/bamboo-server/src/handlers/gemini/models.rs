@@ -2,7 +2,7 @@ use actix_web::{web, HttpResponse};
 use anyhow::anyhow;
 use serde_json::json;
 
-use bamboo_application_metrics::types::ForwardStatus;
+use bamboo_engine::metrics::types::ForwardStatus;
 use crate::{app_state::AppState, error::AppError};
 
 /// List available models.

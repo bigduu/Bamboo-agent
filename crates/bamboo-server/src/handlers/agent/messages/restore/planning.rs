@@ -1,4 +1,4 @@
-use bamboo_application_agent::agent::{Message, Role};
+use bamboo_agent_core::agent::{Message, Role};
 
 use super::models::{FileChangePayload, FileRestoreAction, FileRestoreError};
 

@@ -1,7 +1,7 @@
 use futures::{Stream, StreamExt};
 
-use bamboo_application_agent::ToolCall;
-use bamboo_infrastructure_llm::LLMChunk;
+use bamboo_agent_core::ToolCall;
+use bamboo_infrastructure::LLMChunk;
 
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct CollectedResponse {

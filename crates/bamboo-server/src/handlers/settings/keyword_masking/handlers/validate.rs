@@ -1,4 +1,4 @@
-use bamboo_infrastructure_config::keyword_masking::KeywordEntry;
+use bamboo_infrastructure::keyword_masking::KeywordEntry;
 use crate::error::AppError;
 use actix_web::{web, HttpResponse};
 
@@ -20,7 +20,7 @@ pub async fn validate_keyword_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_infrastructure_config::keyword_masking::{KeywordEntry, MatchType};
+    use bamboo_infrastructure::keyword_masking::{KeywordEntry, MatchType};
     use actix_web::{test, web, App};
 
     #[actix_web::test]

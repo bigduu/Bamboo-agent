@@ -27,6 +27,12 @@ pub enum TransportConfigApi {
         headers: Vec<HeaderConfigApi>,
         connect_timeout_ms: u64,
     },
+    StreamableHttp {
+        url: String,
+        #[serde(default)]
+        headers: Vec<HeaderConfigApi>,
+        connect_timeout_ms: u64,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -44,7 +50,7 @@ pub struct McpServerConfigApi {
     pub transport: TransportConfigApi,
     pub request_timeout_ms: u64,
     pub healthcheck_interval_ms: u64,
-    pub reconnect: bamboo_infrastructure_mcp::ReconnectConfig,
+    pub reconnect: bamboo_engine::ReconnectConfig,
     #[serde(default)]
     pub allowed_tools: Vec<String>,
     #[serde(default)]
@@ -73,7 +79,7 @@ pub struct McpServerApiRecord {
     /// Persisted server config (secrets are encrypted / redacted by serde attrs)
     pub config: McpServerConfigApi,
     /// Runtime info (status, timestamps, tool_count, etc.)
-    pub runtime: bamboo_infrastructure_mcp::RuntimeInfo,
+    pub runtime: bamboo_engine::RuntimeInfo,
 }
 
 /// Response for listing MCP tools

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use bamboo_application_skills::SkillDefinition;
+use bamboo_engine::SkillDefinition;
 use crate::app_state::AppState;
 use crate::error::AppError;
 

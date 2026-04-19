@@ -1,11 +1,11 @@
 //! Message preflight hooks.
 //!
 //! These hooks run before we forward requests upstream (proxy endpoints) and before we
-//! enter the agent loop. They operate on internal `bamboo_application_agent::Message` so the
+//! enter the agent loop. They operate on internal `bamboo_agent_core::Message` so the
 //! same behavior applies across OpenAI-compatible, Anthropic, Gemini, and agent routes.
 
-use bamboo_application_agent::{Message, MessagePart};
-use bamboo_infrastructure_config::Config;
+use bamboo_agent_core::{Message, MessagePart};
+use bamboo_infrastructure::Config;
 use crate::app_state::AppState;
 
 #[cfg(windows)]
@@ -381,7 +381,7 @@ fn parse_data_url_base64(url: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_infrastructure_llm::models::{ContentPart, ImageUrl};
+    use bamboo_infrastructure::models::{ContentPart, ImageUrl};
     use tempfile::TempDir;
 
     fn base_config(mode: &str) -> Config {

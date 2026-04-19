@@ -1,5 +1,5 @@
 use super::terminal::terminal_event_for_status;
-use bamboo_application_agent::AgentEvent;
+use bamboo_agent_core::AgentEvent;
 use crate::app_state::AgentStatus;
 
 #[test]

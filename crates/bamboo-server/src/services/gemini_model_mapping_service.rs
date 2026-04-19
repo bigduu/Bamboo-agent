@@ -1,4 +1,4 @@
-use bamboo_infrastructure_config::model_mapping::GeminiModelMapping;
+use bamboo_infrastructure::model_mapping::GeminiModelMapping;
 
 /// Resolve a Gemini model name to the actual backend model.
 ///

@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use actix_web::{test, web, App};
 use async_trait::async_trait;
 use bamboo_agent::agent::{Message, Role};
-use bamboo_application_agent::tools::ToolSchema;
-use bamboo_infrastructure_llm::{LLMChunk, LLMProvider, LLMStream};
+use bamboo_agent_core::tools::ToolSchema;
+use bamboo_infrastructure::{LLMChunk, LLMProvider, LLMStream};
 use bamboo_agent::server::handlers::gemini;
 use futures::stream;
 use serde_json::json;
@@ -43,7 +43,7 @@ impl LLMProvider for RecordingProvider {
         _tools: &[ToolSchema],
         _max_output_tokens: Option<u32>,
         model: &str,
-    ) -> bamboo_infrastructure_llm::provider::Result<LLMStream> {
+    ) -> bamboo_infrastructure::provider::Result<LLMStream> {
         self.calls
             .lock()
             .expect("recording provider lock poisoned")
@@ -58,7 +58,7 @@ impl LLMProvider for RecordingProvider {
         ])))
     }
 
-    async fn list_models(&self) -> bamboo_infrastructure_llm::provider::Result<Vec<String>> {
+    async fn list_models(&self) -> bamboo_infrastructure::provider::Result<Vec<String>> {
         Ok(vec!["gemini-2.0-flash-exp".to_string()])
     }
 }

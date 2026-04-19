@@ -3,7 +3,7 @@ use actix_web::{test, web, App};
 use tempfile::tempdir;
 
 use super::{configure_routes, configure_routes_with_rate_limiting};
-use bamboo_infrastructure_config::AccessControlConfig;
+use bamboo_infrastructure::AccessControlConfig;
 use crate::AppState;
 
 #[actix_web::test]
@@ -167,11 +167,11 @@ async fn verified_cookie_allows_remote_request_through_middleware() {
 #[actix_web::test]
 async fn system_prompt_snapshot_route_returns_project_dream_over_http() {
     let data_dir = tempdir().unwrap();
-    bamboo_infrastructure_config::paths::init_bamboo_dir(data_dir.path().to_path_buf());
+    bamboo_infrastructure::paths::init_bamboo_dir(data_dir.path().to_path_buf());
     let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
 
-    let mut session = bamboo_application_agent::Session::new("session-http-project-dream", "gpt-5");
-    session.add_message(bamboo_application_agent::Message::system(
+    let mut session = bamboo_agent_core::Session::new("session-http-project-dream", "gpt-5");
+    session.add_message(bamboo_agent_core::Message::system(
         "Base prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\n### Project Dream Summary\n````md\nHTTP project dream content\n````\n\n### Session Memory Note (markdown)\n````md\nHTTP session note content\n````\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->",
     ));
     app_state

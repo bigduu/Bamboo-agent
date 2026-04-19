@@ -1,8 +1,8 @@
 // Helper function to extract default model from config
 // This should be used instead of hardcoding "gpt-4o-mini" or "default"
 
-use bamboo_infrastructure_llm::LLMError;
-use bamboo_infrastructure_config::Config;
+use bamboo_infrastructure::LLMError;
+use bamboo_infrastructure::Config;
 
 /// Get the default model for the current provider from config
 /// Returns an error if no model is configured
@@ -86,7 +86,7 @@ pub fn get_vision_model_from_config(config: &Config) -> Result<String, LLMError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_infrastructure_config::{CopilotConfig, OpenAIConfig, ProviderConfigs};
+    use bamboo_infrastructure::{CopilotConfig, OpenAIConfig, ProviderConfigs};
 
     #[test]
     fn test_get_model_from_openai_config() {

@@ -1,7 +1,7 @@
-use bamboo_application_agent::tools::ToolSchema;
-use bamboo_application_agent::Message;
-use bamboo_infrastructure_llm::protocol::gemini::{GeminiContent, GeminiTool};
-use bamboo_infrastructure_llm::protocol::FromProvider;
+use bamboo_agent_core::tools::ToolSchema;
+use bamboo_agent_core::Message;
+use bamboo_infrastructure::protocol::gemini::{GeminiContent, GeminiTool};
+use bamboo_infrastructure::protocol::FromProvider;
 use crate::error::AppError;
 
 /// Convert Gemini contents to internal messages.
@@ -29,7 +29,7 @@ pub(super) fn convert_gemini_tools(
                 for function_declaration in &tool.function_declarations {
                     let schema = ToolSchema {
                         schema_type: "function".to_string(),
-                        function: bamboo_application_agent::tools::FunctionSchema {
+                        function: bamboo_agent_core::tools::FunctionSchema {
                             name: function_declaration.name.clone(),
                             description: function_declaration
                                 .description

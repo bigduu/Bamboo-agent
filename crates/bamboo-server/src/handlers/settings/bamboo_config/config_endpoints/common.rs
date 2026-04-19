@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use bamboo_application_memory::budget::limits::ModelLimit;
-use bamboo_infrastructure_config::Config;
+use bamboo_compression::limits::ModelLimit;
+use bamboo_infrastructure::Config;
 use crate::error::AppError;
 use serde_json::{Map, Value};
 

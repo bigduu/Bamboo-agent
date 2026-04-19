@@ -7,7 +7,7 @@
 //! - compute which runtime side-effects should run (reload provider / reconcile MCP)
 //!
 //! Pure domain logic (domain types, sanitization, merge) lives in
-//! `bamboo_infrastructure_config::patch`. This module keeps the infrastructure-coupled
+//! `bamboo_infrastructure::patch`. This module keeps the infrastructure-coupled
 //! orchestration functions.
 //!
 //! Important design note:
@@ -19,12 +19,12 @@
 
 use serde_json::{Map, Value};
 
-use bamboo_infrastructure_config::Config;
+use bamboo_infrastructure::Config;
 use crate::error::AppError;
 
 // Re-export pure domain logic from the config crate so server consumers
 // can import through `config_manager`.
-pub use bamboo_infrastructure_config::patch::{
+pub use bamboo_infrastructure::patch::{
     deep_merge_json, domains_for_root_patch, effects_for_root_patch, is_masked_api_key,
     preserve_masked_provider_api_keys, provider_api_key_intents, sanitize_root_patch,
     DomainChanges, PatchEffects, ReloadMode,
@@ -42,7 +42,7 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                     openai.api_key_encrypted = if api_key.is_empty() {
                         None
                     } else {
-                        Some(bamboo_infrastructure_config::encryption::encrypt(api_key).map_err(|e| {
+                        Some(bamboo_infrastructure::encryption::encrypt(api_key).map_err(|e| {
                             AppError::InternalError(anyhow::anyhow!(
                                 "Failed to encrypt OpenAI api_key: {e}"
                             ))
@@ -56,7 +56,7 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                     anthropic.api_key_encrypted = if api_key.is_empty() {
                         None
                     } else {
-                        Some(bamboo_infrastructure_config::encryption::encrypt(api_key).map_err(|e| {
+                        Some(bamboo_infrastructure::encryption::encrypt(api_key).map_err(|e| {
                             AppError::InternalError(anyhow::anyhow!(
                                 "Failed to encrypt Anthropic api_key: {e}"
                             ))
@@ -70,7 +70,7 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                     gemini.api_key_encrypted = if api_key.is_empty() {
                         None
                     } else {
-                        Some(bamboo_infrastructure_config::encryption::encrypt(api_key).map_err(|e| {
+                        Some(bamboo_infrastructure::encryption::encrypt(api_key).map_err(|e| {
                             AppError::InternalError(anyhow::anyhow!(
                                 "Failed to encrypt Gemini api_key: {e}"
                             ))

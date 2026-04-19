@@ -13,15 +13,15 @@
 use super::*;
 
 #[async_trait::async_trait]
-impl bamboo_application_session::repository::SessionAccess for AppState {
+impl crate::session_app::repository::SessionAccess for AppState {
     async fn load_session(
         &self,
         id: &str,
-    ) -> Result<Option<bamboo_application_agent::Session>, bamboo_application_session::errors::SessionLoadError>
+    ) -> Result<Option<bamboo_agent_core::Session>, crate::session_app::errors::SessionLoadError>
     {
         match AppState::load_session(self, id).await {
             Some(session) => Ok(Some(session)),
-            None => Err(bamboo_application_session::errors::SessionLoadError::NotFound(
+            None => Err(crate::session_app::errors::SessionLoadError::NotFound(
                 id.to_string(),
             )),
         }
@@ -31,24 +31,24 @@ impl bamboo_application_session::repository::SessionAccess for AppState {
         &self,
         id: &str,
         model: &str,
-    ) -> Result<bamboo_application_agent::Session, bamboo_application_session::errors::SessionLoadError> {
+    ) -> Result<bamboo_agent_core::Session, crate::session_app::errors::SessionLoadError> {
         Ok(AppState::load_or_create_session(self, id, model).await)
     }
 
     async fn save_session(
         &self,
-        session: &bamboo_application_agent::Session,
-    ) -> Result<(), bamboo_application_session::errors::SessionSaveError> {
+        session: &bamboo_agent_core::Session,
+    ) -> Result<(), crate::session_app::errors::SessionSaveError> {
         self.storage
             .save_session(session)
             .await
-            .map_err(|e| bamboo_application_session::errors::SessionSaveError::StorageError(e.to_string()))
+            .map_err(|e| crate::session_app::errors::SessionSaveError::StorageError(e.to_string()))
     }
 
     async fn save_and_cache(
         &self,
-        session: &bamboo_application_agent::Session,
-    ) -> Result<(), bamboo_application_session::errors::SessionSaveError> {
+        session: &bamboo_agent_core::Session,
+    ) -> Result<(), crate::session_app::errors::SessionSaveError> {
         AppState::save_and_cache_session(self, session).await;
         Ok(())
     }
@@ -56,7 +56,7 @@ impl bamboo_application_session::repository::SessionAccess for AppState {
     async fn load_merged(
         &self,
         id: &str,
-    ) -> Result<Option<bamboo_application_agent::Session>, bamboo_application_session::errors::SessionLoadError>
+    ) -> Result<Option<bamboo_agent_core::Session>, crate::session_app::errors::SessionLoadError>
     {
         Ok(AppState::load_session_merged(self, id).await)
     }
@@ -66,7 +66,7 @@ impl AppState {
     /// Load a session from memory cache, falling back to persistent storage.
     ///
     /// Returns `None` if the session does not exist in either tier.
-    pub async fn load_session(&self, session_id: &str) -> Option<bamboo_application_agent::Session> {
+    pub async fn load_session(&self, session_id: &str) -> Option<bamboo_agent_core::Session> {
         let memory_session = {
             let sessions = self.sessions.read().await;
             sessions.get(session_id).cloned()
@@ -93,11 +93,11 @@ impl AppState {
         &self,
         session_id: &str,
         model: &str,
-    ) -> bamboo_application_agent::Session {
+    ) -> bamboo_agent_core::Session {
         if let Some(session) = self.load_session(session_id).await {
             return session;
         }
-        bamboo_application_agent::Session::new(session_id.to_string(), model.to_string())
+        bamboo_agent_core::Session::new(session_id.to_string(), model.to_string())
     }
 
     /// Load a session, merging memory and storage using a preference heuristic.
@@ -108,7 +108,7 @@ impl AppState {
     pub async fn load_session_merged(
         &self,
         session_id: &str,
-    ) -> Option<bamboo_application_agent::Session> {
+    ) -> Option<bamboo_agent_core::Session> {
         let memory_session = {
             let sessions = self.sessions.read().await;
             sessions.get(session_id).cloned()
@@ -138,7 +138,7 @@ impl AppState {
     }
 
     /// Persist session to storage and update the in-memory cache.
-    pub async fn save_and_cache_session(&self, session: &bamboo_application_agent::Session) {
+    pub async fn save_and_cache_session(&self, session: &bamboo_agent_core::Session) {
         if let Err(error) = self.storage.save_session(session).await {
             tracing::warn!(
                 "[{}] Failed to save session: {}",
@@ -152,8 +152,8 @@ impl AppState {
 }
 
 fn should_prefer_storage(
-    memory_session: &bamboo_application_agent::Session,
-    storage_session: &bamboo_application_agent::Session,
+    memory_session: &bamboo_agent_core::Session,
+    storage_session: &bamboo_agent_core::Session,
 ) -> bool {
     if memory_session.pending_question.is_none() && storage_session.pending_question.is_some() {
         return true;
@@ -173,7 +173,7 @@ mod tests {
             .expect("app state");
 
         let session_id = "session-memory-first";
-        let session = bamboo_application_agent::Session::new(session_id.to_string(), "test-model");
+        let session = bamboo_agent_core::Session::new(session_id.to_string(), "test-model");
 
         // Seed memory cache.
         {
@@ -194,7 +194,7 @@ mod tests {
             .expect("app state");
 
         let session_id = "session-storage-fallback";
-        let session = bamboo_application_agent::Session::new(session_id.to_string(), "test-model");
+        let session = bamboo_agent_core::Session::new(session_id.to_string(), "test-model");
 
         // Seed storage only.
         state.storage.save_session(&session).await;
@@ -235,7 +235,7 @@ mod tests {
             .expect("app state");
 
         let session_id = "session-merge-pending";
-        let memory_session = bamboo_application_agent::Session::new(session_id.to_string(), "test-model");
+        let memory_session = bamboo_agent_core::Session::new(session_id.to_string(), "test-model");
         let mut storage_session = memory_session.clone();
         storage_session.set_pending_question(
             "tool-call-1".to_string(),
@@ -263,7 +263,7 @@ mod tests {
             .expect("app state");
 
         let session_id = "session-save-cache";
-        let mut session = bamboo_application_agent::Session::new(session_id.to_string(), "test-model");
+        let mut session = bamboo_agent_core::Session::new(session_id.to_string(), "test-model");
         session.title = "test-title".to_string();
 
         state.save_and_cache_session(&session).await;

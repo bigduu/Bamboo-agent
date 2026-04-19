@@ -22,7 +22,7 @@
 //!
 //! ```no_run
 //! use std::path::PathBuf;
-//! use bamboo_agent::server::run;
+//! use bamboo_server::run;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), String> {
@@ -41,7 +41,7 @@
 //!
 //! ```no_run
 //! use std::path::PathBuf;
-//! use bamboo_agent::server::run;
+//! use bamboo_server::run;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), String> {
@@ -56,7 +56,7 @@
 //!
 //! ```no_run
 //! use std::path::PathBuf;
-//! use bamboo_agent::server::run_with_bind;
+//! use bamboo_server::run_with_bind;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), String> {
@@ -71,7 +71,7 @@
 //!
 //! ```no_run
 //! use std::path::PathBuf;
-//! use bamboo_agent::server::run_with_bind_and_static;
+//! use bamboo_server::run_with_bind_and_static;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), String> {
@@ -105,6 +105,7 @@
 //! Google Gemini API compatible endpoints.
 
 pub mod app_state;
+pub mod claude_runner;
 pub mod config;
 pub mod config_manager;
 pub mod error;
@@ -117,9 +118,12 @@ pub mod prompt_defaults;
 pub mod reloadable_provider;
 pub mod request_hooks;
 pub mod routes;
+pub mod schedule_app;
 pub mod schedules;
 pub mod server;
+pub mod server_tools;
 pub mod services;
+pub mod session_app;
 pub mod spawn_scheduler;
 pub mod tools;
 pub mod workflow;

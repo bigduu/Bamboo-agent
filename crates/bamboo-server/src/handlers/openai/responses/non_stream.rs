@@ -1,8 +1,8 @@
 use actix_web::{web, HttpResponse};
 use futures::StreamExt;
 
-use bamboo_infrastructure_llm::LLMRequestOptions;
-use bamboo_application_metrics::types::ForwardStatus;
+use bamboo_infrastructure::LLMRequestOptions;
+use bamboo_engine::metrics::types::ForwardStatus;
 use crate::{app_state::AppState, error::AppError};
 
 use super::super::helpers::now_unix_ts;
@@ -42,19 +42,19 @@ pub(super) async fn handle_non_streaming_response(
         .map_err(map_provider_error)?;
 
     let mut content = String::new();
-    let mut tool_calls: Vec<bamboo_application_agent::tools::ToolCall> = Vec::new();
+    let mut tool_calls: Vec<bamboo_agent_core::tools::ToolCall> = Vec::new();
     let mut upstream_response_id: Option<String> = None;
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::ResponseId(response_id)) => {
+            Ok(bamboo_infrastructure::types::LLMChunk::ResponseId(response_id)) => {
                 upstream_response_id = Some(response_id);
             }
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::Token(text)) => content.push_str(&text),
+            Ok(bamboo_infrastructure::types::LLMChunk::Token(text)) => content.push_str(&text),
             // Keep parity with streaming behavior: expose reasoning narration as text.
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::ReasoningToken(text)) => content.push_str(&text),
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::ToolCalls(calls)) => tool_calls.extend(calls),
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::Done) => break,
+            Ok(bamboo_infrastructure::types::LLMChunk::ReasoningToken(text)) => content.push_str(&text),
+            Ok(bamboo_infrastructure::types::LLMChunk::ToolCalls(calls)) => tool_calls.extend(calls),
+            Ok(bamboo_infrastructure::types::LLMChunk::Done) => break,
             Err(error) => {
                 app_state.metrics_service.collector().forward_completed(
                     forward_id,

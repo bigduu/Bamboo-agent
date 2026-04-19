@@ -1,4 +1,4 @@
-use bamboo_infrastructure_config::keyword_masking::{KeywordEntry, KeywordMaskingConfig};
+use bamboo_infrastructure::keyword_masking::{KeywordEntry, KeywordMaskingConfig};
 use crate::error::AppError;
 
 use super::{
@@ -55,7 +55,7 @@ fn validate_entry_limits(entries: &[KeywordEntry]) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_infrastructure_config::keyword_masking::MatchType;
+    use bamboo_infrastructure::keyword_masking::MatchType;
 
     #[test]
     fn test_validate_entries_with_empty_list() {

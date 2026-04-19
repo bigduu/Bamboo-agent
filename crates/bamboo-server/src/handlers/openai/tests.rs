@@ -1,7 +1,7 @@
 use actix_web::http::StatusCode;
 use actix_web::{web, App};
 
-use bamboo_infrastructure_llm::api::models::{Content, ContentPart, FunctionCall, Role, ToolCall};
+use bamboo_infrastructure::api::models::{Content, ContentPart, FunctionCall, Role, ToolCall};
 
 use super::helpers::{build_completion_response, responses_input_to_chat_messages};
 

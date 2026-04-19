@@ -3,8 +3,8 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-use bamboo_application_session::child_session::{self, ChildSessionPort};
-use bamboo_application_agent::tools::{Tool, ToolError, ToolResult, ToolExecutionContext};
+use crate::session_app::child_session::{self, ChildSessionPort};
+use bamboo_agent_core::tools::{Tool, ToolError, ToolResult, ToolExecutionContext};
 use crate::tools::child_session_adapter::{
     ChildSessionAdapter, tool_error_from_child_session,
 };
@@ -209,13 +209,13 @@ mod tests {
     use tokio::time::Duration;
     use uuid::Uuid;
 
-    use bamboo_infrastructure_storage::{JsonlStorage, SessionStoreV2};
-    use bamboo_application_agent::storage::Storage;
-    use bamboo_application_agent::tools::{ToolExecutionContext, ToolExecutor, ToolSchema};
-    use bamboo_application_agent::{AgentEvent, Message, Role, Session};
-    use bamboo_infrastructure_llm::{LLMError, LLMProvider, LLMStream};
-    use bamboo_application_metrics::{MetricsCollector, SqliteMetricsStorage};
-    use bamboo_application_skills::SkillManager;
+    use bamboo_infrastructure::{JsonlStorage, SessionStoreV2};
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::tools::{ToolExecutionContext, ToolExecutor, ToolSchema};
+    use bamboo_agent_core::{AgentEvent, Message, Role, Session};
+    use bamboo_infrastructure::{LLMError, LLMProvider, LLMStream};
+    use bamboo_engine::{MetricsCollector, SqliteMetricsStorage};
+    use bamboo_engine::SkillManager;
     use crate::app_state::{AgentRunner, AgentStatus};
     use crate::spawn_scheduler::{SpawnContext, SpawnScheduler};
 
@@ -240,7 +240,7 @@ mod tests {
     impl ToolExecutor for NoopToolExecutor {
         async fn execute(
             &self,
-            _call: &bamboo_application_agent::tools::ToolCall,
+            _call: &bamboo_agent_core::tools::ToolCall,
         ) -> std::result::Result<ToolResult, ToolError> {
             Err(ToolError::NotFound("noop".to_string()))
         }
@@ -311,12 +311,12 @@ mod tests {
         storage.save_session(&child).await.unwrap();
 
         let agent_runtime = Arc::new(
-            bamboo_application_runtime::Agent::builder()
+            bamboo_engine::Agent::builder()
                 .storage(storage.clone())
                 .attachment_reader(session_store.clone())
                 .skill_manager(Arc::new(SkillManager::new()))
                 .metrics_collector(metrics_collector)
-                .config(Arc::new(RwLock::new(bamboo_infrastructure_config::Config::default())))
+                .config(Arc::new(RwLock::new(bamboo_infrastructure::Config::default())))
                 .provider(Arc::new(NoopProvider))
                 .default_tools(Arc::new(NoopToolExecutor))
                 .build()

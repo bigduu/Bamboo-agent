@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::json;
 
-use bamboo_infrastructure_mcp::{McpServerConfig, StdioConfig, TransportConfig};
-use bamboo_infrastructure_config::{Config, OpenAIConfig, ProviderConfigs};
+use bamboo_engine::{McpServerConfig, StdioConfig, TransportConfig};
+use bamboo_infrastructure::{Config, OpenAIConfig, ProviderConfigs};
 
 use super::{redact_config_for_api, redact_providers_for_api};
 

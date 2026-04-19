@@ -7,20 +7,20 @@ mod responses_options;
 mod stream_utils;
 
 pub(super) fn convert_messages(
-    messages: Vec<bamboo_infrastructure_llm::api::models::ChatMessage>,
-) -> Result<Vec<bamboo_application_agent::Message>, crate::error::AppError> {
+    messages: Vec<bamboo_infrastructure::api::models::ChatMessage>,
+) -> Result<Vec<bamboo_agent_core::Message>, crate::error::AppError> {
     conversion::convert_messages(messages)
 }
 
 pub(super) fn convert_tools(
-    tools: Option<Vec<bamboo_infrastructure_llm::api::models::Tool>>,
-) -> Result<Vec<bamboo_application_agent::tools::ToolSchema>, crate::error::AppError> {
+    tools: Option<Vec<bamboo_infrastructure::api::models::Tool>>,
+) -> Result<Vec<bamboo_agent_core::tools::ToolSchema>, crate::error::AppError> {
     conversion::convert_tools(tools)
 }
 
 pub(super) fn responses_input_to_chat_messages(
     input: serde_json::Value,
-) -> Result<Vec<bamboo_infrastructure_llm::api::models::ChatMessage>, crate::error::AppError> {
+) -> Result<Vec<bamboo_infrastructure::api::models::ChatMessage>, crate::error::AppError> {
     responses_input::responses_input_to_chat_messages(input)
 }
 
@@ -29,23 +29,23 @@ pub(super) fn now_unix_ts() -> u64 {
 }
 
 pub(super) fn convert_chunk_to_openai(
-    chunk: bamboo_infrastructure_llm::types::LLMChunk,
+    chunk: bamboo_infrastructure::types::LLMChunk,
     model: &str,
-) -> Option<bamboo_infrastructure_llm::api::models::ChatCompletionStreamChunk> {
+) -> Option<bamboo_infrastructure::api::models::ChatCompletionStreamChunk> {
     stream_utils::convert_chunk_to_openai(chunk, model)
 }
 
 pub(super) fn build_completion_response(
     content: String,
-    tool_calls: Option<Vec<bamboo_infrastructure_llm::api::models::ToolCall>>,
+    tool_calls: Option<Vec<bamboo_infrastructure::api::models::ToolCall>>,
     model: &str,
-) -> bamboo_infrastructure_llm::api::models::ChatCompletionResponse {
+) -> bamboo_infrastructure::api::models::ChatCompletionResponse {
     completion::build_completion_response(content, tool_calls, model)
 }
 
 pub(crate) fn parse_reasoning_effort(
     parameters: &std::collections::HashMap<String, serde_json::Value>,
-) -> Option<bamboo_shared_types::reasoning::ReasoningEffort> {
+) -> Option<bamboo_domain::reasoning::ReasoningEffort> {
     reasoning::parse_reasoning_effort(parameters)
 }
 
@@ -57,6 +57,6 @@ pub(crate) fn parse_parallel_tool_calls(
 
 pub(crate) fn parse_responses_request_options(
     parameters: &std::collections::HashMap<String, serde_json::Value>,
-) -> bamboo_infrastructure_llm::provider::ResponsesRequestOptions {
+) -> bamboo_infrastructure::provider::ResponsesRequestOptions {
     responses_options::parse_responses_request_options(parameters)
 }

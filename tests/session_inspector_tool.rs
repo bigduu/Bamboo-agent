@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use bamboo_agent::agent::{Message, Session};
-use bamboo_application_agent::storage::Storage;
-use bamboo_application_agent::tools::{Tool, ToolExecutionContext};
-use bamboo_application_agent::ConversationSummary;
-use bamboo_infrastructure_storage::SessionStoreV2;
+use bamboo_agent_core::storage::Storage;
+use bamboo_agent_core::tools::{Tool, ToolExecutionContext};
+use bamboo_agent_core::ConversationSummary;
+use bamboo_infrastructure::SessionStoreV2;
 use bamboo_agent::server::tools::SessionInspectorTool;
 
 mod common;

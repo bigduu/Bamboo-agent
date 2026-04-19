@@ -25,16 +25,16 @@ fn chat_request_deserialization_without_model() {
 
 #[test]
 fn session_stores_model_in_dedicated_field() {
-    let mut session = bamboo_application_agent::Session::new("test-session", "initial-model");
+    let mut session = bamboo_agent_core::Session::new("test-session", "initial-model");
     session.model = "gpt-4o-mini".to_string();
     assert_eq!(session.model, "gpt-4o-mini");
 }
 
 #[test]
 fn session_model_round_trip() {
-    let session = bamboo_application_agent::Session::new("test-session", "gpt-5");
+    let session = bamboo_agent_core::Session::new("test-session", "gpt-5");
     let json = serde_json::to_string(&session).expect("session should serialize");
-    let deserialized: bamboo_application_agent::Session =
+    let deserialized: bamboo_agent_core::Session =
         serde_json::from_str(&json).expect("session should deserialize");
     assert_eq!(deserialized.model, "gpt-5");
 }
@@ -69,7 +69,7 @@ fn chat_request_empty_model_fails_validation() {
 
 #[test]
 fn session_model_is_for_recording_only() {
-    let mut session = bamboo_application_agent::Session::new("test-123", "initial-model");
+    let mut session = bamboo_agent_core::Session::new("test-123", "initial-model");
     assert_eq!(session.model, "initial-model");
     session.model = "updated-model".to_string();
     assert_eq!(session.model, "updated-model");

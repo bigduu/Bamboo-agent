@@ -1,10 +1,10 @@
 use actix_web::{web, HttpResponse};
 
-use bamboo_infrastructure_llm::providers::anthropic::{
+use bamboo_infrastructure::providers::anthropic::{
     api_types::{AnthropicListModelsResponse, AnthropicModel},
     format_model_display_name,
 };
-use bamboo_application_metrics::types::ForwardStatus;
+use bamboo_engine::metrics::types::ForwardStatus;
 use crate::{app_state::AppState, error::AppError};
 
 pub async fn get_models(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {

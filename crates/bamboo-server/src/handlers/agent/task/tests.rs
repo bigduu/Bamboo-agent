@@ -1,5 +1,5 @@
 use super::types::{completion_percentage, task_status_label};
-use bamboo_domain_session::TaskItemStatus;
+use bamboo_domain::TaskItemStatus;
 
 #[test]
 fn completion_percentage_returns_zero_for_empty_list() {

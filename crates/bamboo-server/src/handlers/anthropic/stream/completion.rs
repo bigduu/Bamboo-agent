@@ -1,4 +1,4 @@
-use bamboo_infrastructure_llm::api::models::ChatCompletionStreamChunk;
+use bamboo_infrastructure::api::models::ChatCompletionStreamChunk;
 use serde_json::{json, Value};
 
 use super::super::conversion::map_stop_reason_complete;

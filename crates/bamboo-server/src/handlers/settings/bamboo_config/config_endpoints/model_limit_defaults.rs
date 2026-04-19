@@ -1,7 +1,7 @@
 use actix_web::HttpResponse;
 use serde::{Deserialize, Serialize};
 
-use bamboo_application_memory::budget::limits::{DEFAULT_SAFETY_MARGIN, KNOWN_MODEL_LIMITS};
+use bamboo_compression::limits::{DEFAULT_SAFETY_MARGIN, KNOWN_MODEL_LIMITS};
 use crate::error::AppError;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -70,7 +70,7 @@ pub async fn get_model_limit_defaults() -> Result<HttpResponse, AppError> {
 mod tests {
     use actix_web::{test, web, App};
 
-    use bamboo_application_memory::budget::limits::KNOWN_MODEL_LIMITS;
+    use bamboo_compression::limits::KNOWN_MODEL_LIMITS;
 
     use super::{get_model_limit_defaults, ModelLimitDefaultsResponse};
 

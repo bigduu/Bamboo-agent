@@ -49,7 +49,7 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Res
 
     // Best-effort pre-cancellation of the session (and its children if this is a root session).
     let ids_to_cancel: Vec<String> = match state.session_store.get_index_entry(&session_id).await {
-        Some(entry) if matches!(entry.kind, bamboo_application_agent::SessionKind::Root) => state
+        Some(entry) if matches!(entry.kind, bamboo_agent_core::SessionKind::Root) => state
             .session_store
             .list_index_entries()
             .await

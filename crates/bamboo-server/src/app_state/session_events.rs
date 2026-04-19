@@ -3,7 +3,7 @@
 //! Re-exports the shared `get_or_create_event_sender` function from the runtime crate.
 //! The `impl AppState` method delegates to the re-exported function.
 
-pub use bamboo_application_runtime::execution::session_events::get_or_create_event_sender;
+pub use bamboo_engine::execution::session_events::get_or_create_event_sender;
 
 impl super::AppState {
     /// Get (or create) a long-lived session event sender for a session id.
@@ -13,7 +13,7 @@ impl super::AppState {
     pub async fn get_session_event_sender(
         &self,
         session_id: &str,
-    ) -> tokio::sync::broadcast::Sender<bamboo_application_agent::AgentEvent> {
+    ) -> tokio::sync::broadcast::Sender<bamboo_agent_core::AgentEvent> {
         get_or_create_event_sender(&self.session_event_senders, session_id).await
     }
 }

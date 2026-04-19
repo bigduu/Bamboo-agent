@@ -4,7 +4,7 @@
 
 #[cfg(test)]
 mod tests {
-    use bamboo_infrastructure_config::paths::workflows_dir;
+    use bamboo_infrastructure::paths::workflows_dir;
     use std::sync::Mutex;
     use tempfile::TempDir;
 

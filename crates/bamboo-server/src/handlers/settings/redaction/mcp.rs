@@ -1,4 +1,4 @@
-use bamboo_infrastructure_config::Config;
+use bamboo_infrastructure::Config;
 use serde_json::{Map, Value};
 
 use super::constants::masked_secret_value;
@@ -131,7 +131,7 @@ fn redact_legacy_stdio_transport(
             .iter()
             .find(|server| server.id == server_id)
         {
-            if let bamboo_infrastructure_mcp::TransportConfig::Stdio(stdio) = &cfg_server.transport {
+            if let bamboo_engine::TransportConfig::Stdio(stdio) = &cfg_server.transport {
                 keys = stdio.env.keys().cloned().collect();
             }
         }

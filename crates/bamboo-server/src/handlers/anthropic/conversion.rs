@@ -1,11 +1,11 @@
-use bamboo_application_agent::tools::ToolSchema;
-use bamboo_application_agent::Message;
-use bamboo_infrastructure_llm::api::models::{
+use bamboo_agent_core::tools::ToolSchema;
+use bamboo_agent_core::Message;
+use bamboo_infrastructure::api::models::{
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamChunk, StreamChoice,
     StreamDelta, StreamFunctionCall, StreamToolCall,
 };
-use bamboo_infrastructure_llm::protocol::FromProvider;
-use bamboo_infrastructure_llm::providers::anthropic::{
+use bamboo_infrastructure::protocol::FromProvider;
+use bamboo_infrastructure::providers::anthropic::{
     api_types::{
         AnthropicCompleteRequest, AnthropicCompleteResponse, AnthropicMessagesRequest,
         AnthropicMessagesResponse,
@@ -65,7 +65,7 @@ pub(super) fn map_stop_reason_complete(reason: Option<&str>) -> String {
 
 /// Convert OpenAI chat messages to internal messages.
 pub(super) fn convert_messages(
-    chat_messages: Vec<bamboo_infrastructure_llm::api::models::ChatMessage>,
+    chat_messages: Vec<bamboo_infrastructure::api::models::ChatMessage>,
 ) -> Result<Vec<Message>, AppError> {
     chat_messages
         .into_iter()
@@ -79,7 +79,7 @@ pub(super) fn convert_messages(
 
 /// Convert OpenAI tools to internal tool schemas.
 pub(super) fn convert_tools(
-    tools: Option<Vec<bamboo_infrastructure_llm::api::models::Tool>>,
+    tools: Option<Vec<bamboo_infrastructure::api::models::Tool>>,
 ) -> Result<Vec<ToolSchema>, AppError> {
     match tools {
         Some(tools) => tools
@@ -96,12 +96,12 @@ pub(super) fn convert_tools(
 
 /// Convert LLMChunk to OpenAI stream format.
 pub(super) fn convert_llm_chunk_to_openai(
-    chunk: bamboo_infrastructure_llm::types::LLMChunk,
+    chunk: bamboo_infrastructure::types::LLMChunk,
     model: &str,
 ) -> Option<ChatCompletionStreamChunk> {
     match chunk {
-        bamboo_infrastructure_llm::types::LLMChunk::ResponseId(_) => None,
-        bamboo_infrastructure_llm::types::LLMChunk::Token(text) => Some(ChatCompletionStreamChunk {
+        bamboo_infrastructure::types::LLMChunk::ResponseId(_) => None,
+        bamboo_infrastructure::types::LLMChunk::Token(text) => Some(ChatCompletionStreamChunk {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             object: Some("chat.completion.chunk".to_string()),
             created: chrono::Utc::now().timestamp() as u64,
@@ -117,7 +117,7 @@ pub(super) fn convert_llm_chunk_to_openai(
             }],
             usage: None,
         }),
-        bamboo_infrastructure_llm::types::LLMChunk::ToolCalls(tool_calls) => {
+        bamboo_infrastructure::types::LLMChunk::ToolCalls(tool_calls) => {
             let stream_tool_calls: Vec<StreamToolCall> = tool_calls
                 .into_iter()
                 .enumerate()
@@ -149,8 +149,8 @@ pub(super) fn convert_llm_chunk_to_openai(
                 usage: None,
             })
         }
-        bamboo_infrastructure_llm::types::LLMChunk::ReasoningToken(_) => None,
-        bamboo_infrastructure_llm::types::LLMChunk::Done => Some(ChatCompletionStreamChunk {
+        bamboo_infrastructure::types::LLMChunk::ReasoningToken(_) => None,
+        bamboo_infrastructure::types::LLMChunk::Done => Some(ChatCompletionStreamChunk {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             object: Some("chat.completion.chunk".to_string()),
             created: chrono::Utc::now().timestamp() as u64,

@@ -2,7 +2,7 @@
 //!
 //! Converts server-side `SpawnAgentExecution` args into the crate-agnostic
 //! `SessionExecutionArgs` and delegates to
-//! `bamboo_application_runtime::execution::spawn_session_execution`.
+//! `bamboo_engine::execution::spawn_session_execution`.
 
 use std::collections::BTreeSet;
 
@@ -12,25 +12,25 @@ use tokio_util::sync::CancellationToken;
 use crate::app_state::AppState;
 use crate::tools::ToolSurface;
 
-use bamboo_application_runtime::ImageFallbackConfig;
-use bamboo_application_runtime::execution::agent_spawn::SessionExecutionArgs;
+use bamboo_engine::ImageFallbackConfig;
+use bamboo_engine::execution::agent_spawn::SessionExecutionArgs;
 
 use super::session_state;
 
 pub(crate) struct SpawnAgentExecution {
     pub(crate) state: actix_web::web::Data<AppState>,
     pub(crate) session_id: String,
-    pub(crate) session: bamboo_application_agent::Session,
+    pub(crate) session: bamboo_agent_core::Session,
     pub(crate) is_child_session: bool,
     pub(crate) provider_name: String,
     pub(crate) model: String,
     pub(crate) fast_model: Option<String>,
-    pub(crate) reasoning_effort: Option<bamboo_shared_types::reasoning::ReasoningEffort>,
+    pub(crate) reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
     pub(crate) reasoning_effort_source: String,
     pub(crate) disabled_tools: BTreeSet<String>,
     pub(crate) disabled_skill_ids: BTreeSet<String>,
     pub(crate) cancel_token: CancellationToken,
-    pub(crate) mpsc_tx: mpsc::Sender<bamboo_application_agent::AgentEvent>,
+    pub(crate) mpsc_tx: mpsc::Sender<bamboo_agent_core::AgentEvent>,
     pub(crate) image_fallback: Option<ImageFallbackConfig>,
 }
 
@@ -46,7 +46,7 @@ pub(crate) fn spawn_agent_execution(
     let selected_skill_ids = session_state::selected_skill_ids_for_session(&args.session);
     let selected_skill_mode = session_state::selected_skill_mode_for_session(&args.session);
 
-    bamboo_application_runtime::execution::spawn_session_execution(SessionExecutionArgs {
+    bamboo_engine::execution::spawn_session_execution(SessionExecutionArgs {
         agent: args.state.agent.clone(),
         session_id: args.session_id,
         session: args.session,

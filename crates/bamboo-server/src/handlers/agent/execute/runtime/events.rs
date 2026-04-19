@@ -1,7 +1,7 @@
 use tokio::sync::mpsc;
 use tracing::Instrument;
 
-use bamboo_application_agent::AgentEvent;
+use bamboo_agent_core::AgentEvent;
 use crate::app_state::AppState;
 
 pub(crate) fn spawn_event_forwarder(

@@ -1,4 +1,4 @@
-use bamboo_infrastructure_config::Config;
+use bamboo_infrastructure::Config;
 use crate::{app_state::AppState, error::AppError};
 use serde_json::Value;
 
@@ -12,7 +12,7 @@ pub(super) fn provider_type_from_payload<'a>(payload: &'a Value, fallback: &'a s
 }
 
 pub(super) fn build_proxy_aware_http_client(config: &Config) -> Result<reqwest::Client, AppError> {
-    bamboo_infrastructure_llm::http_client::build_http_client(config).map_err(|error| {
+    bamboo_infrastructure::http_client::build_http_client(config).map_err(|error| {
         AppError::InternalError(anyhow::anyhow!("Failed to build HTTP client: {error}"))
     })
 }

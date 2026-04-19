@@ -20,7 +20,7 @@ pub async fn import_servers(
     let mode = if replace { "replace" } else { "merge" }.to_string();
 
     // Deduplicate by id (last one wins).
-    let mut incoming_by_id: HashMap<String, bamboo_infrastructure_mcp::McpServerConfig> = HashMap::new();
+    let mut incoming_by_id: HashMap<String, bamboo_engine::McpServerConfig> = HashMap::new();
     for server in incoming.mcp_servers.servers {
         incoming_by_id.insert(server.id.clone(), server);
     }

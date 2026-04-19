@@ -6,7 +6,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{app_state::AppState, error::AppError};
 
 use super::PreparedChatRequest;
-use bamboo_infrastructure_llm::LLMRequestOptions;
+use bamboo_infrastructure::LLMRequestOptions;
 use sse::wrap_sse_data;
 use worker::{spawn_stream_worker, StreamWorkerArgs};
 

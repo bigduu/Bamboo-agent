@@ -1,4 +1,4 @@
-use bamboo_infrastructure_llm::api::models::ChatCompletionStreamChunk;
+use bamboo_infrastructure::api::models::ChatCompletionStreamChunk;
 use serde_json::json;
 
 use super::super::format::format_sse_event;

@@ -1,4 +1,4 @@
-use bamboo_application_agent::tools::{FunctionCall, ToolCall};
+use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 
 use super::sse::{
     done_chunk_bytes, parse_tool_call_arguments, token_chunk_bytes, tool_call_chunk_bytes,

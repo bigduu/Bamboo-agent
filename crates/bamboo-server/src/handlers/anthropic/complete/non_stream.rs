@@ -1,9 +1,9 @@
-use bamboo_infrastructure_llm::api::models::{
+use bamboo_infrastructure::api::models::{
     ChatCompletionResponse, ChatMessage, Content, FunctionCall, ResponseChoice, Role, ToolCall,
     Usage,
 };
-use bamboo_infrastructure_llm::LLMRequestOptions;
-use bamboo_application_metrics::types::ForwardStatus;
+use bamboo_infrastructure::LLMRequestOptions;
+use bamboo_engine::metrics::types::ForwardStatus;
 use crate::{app_state::AppState, error::AppError};
 use actix_web::{web, HttpResponse};
 
@@ -72,15 +72,15 @@ pub(super) async fn handle_non_streaming_complete(
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::ResponseId(_)) => {}
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::Token(text)) => {
+            Ok(bamboo_infrastructure::types::LLMChunk::ResponseId(_)) => {}
+            Ok(bamboo_infrastructure::types::LLMChunk::Token(text)) => {
                 content.push_str(&text);
             }
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::ReasoningToken(_)) => {}
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::ToolCalls(calls)) => {
+            Ok(bamboo_infrastructure::types::LLMChunk::ReasoningToken(_)) => {}
+            Ok(bamboo_infrastructure::types::LLMChunk::ToolCalls(calls)) => {
                 tool_calls = Some(convert_tool_calls(calls));
             }
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::Done) => break,
+            Ok(bamboo_infrastructure::types::LLMChunk::Done) => break,
             Err(error) => {
                 app_state.metrics_service.collector().forward_completed(
                     forward_id.clone(),
@@ -155,11 +155,11 @@ pub(super) async fn handle_non_streaming_complete(
 }
 
 fn convert_tool_calls(
-    calls: Vec<bamboo_application_agent::tools::ToolCall>,
-) -> Vec<bamboo_infrastructure_llm::api::models::ToolCall> {
+    calls: Vec<bamboo_agent_core::tools::ToolCall>,
+) -> Vec<bamboo_infrastructure::api::models::ToolCall> {
     calls
         .into_iter()
-        .map(|tool_call| bamboo_infrastructure_llm::api::models::ToolCall {
+        .map(|tool_call| bamboo_infrastructure::api::models::ToolCall {
             id: tool_call.id,
             tool_type: tool_call.tool_type,
             function: FunctionCall {

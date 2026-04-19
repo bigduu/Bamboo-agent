@@ -1,5 +1,5 @@
 use super::*;
-use bamboo_domain_session::MessagePart;
+use bamboo_domain::MessagePart;
 
 #[actix_web::test]
 async fn test_gemini_generate_content_passes_image_parts_through_when_hook_disabled() {

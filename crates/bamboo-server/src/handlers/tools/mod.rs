@@ -37,7 +37,7 @@ mod tests;
 
 use actix_web::{web, HttpResponse};
 
-use bamboo_application_agent::tools::ToolExecutionContext;
+use bamboo_agent_core::tools::ToolExecutionContext;
 
 use crate::app_state::AppState;
 use crate::error::AppError;

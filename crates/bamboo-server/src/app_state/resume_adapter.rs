@@ -7,8 +7,8 @@
 //! Rust's orphan rules (can't impl a foreign trait on a foreign type).
 
 use async_trait::async_trait;
-use bamboo_application_agent::AgentEvent;
-use bamboo_application_session::resume::{ResumeExecutionPort, ResumeSpawnRequest};
+use bamboo_agent_core::AgentEvent;
+use crate::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -21,17 +21,17 @@ use crate::handlers::agent::execute::{spawn_agent_execution, spawn_event_forward
 /// Newtype wrapper that implements `ResumeExecutionPort`.
 ///
 /// Needed because Rust's orphan rules prevent implementing
-/// `bamboo_application_session::resume::ResumeExecutionPort` directly on
+/// `crate::session_app::resume::ResumeExecutionPort` directly on
 /// `actix_web::web::Data<AppState>`.
 pub struct AppStateResumeRef(pub actix_web::web::Data<AppState>);
 
 #[async_trait]
 impl ResumeExecutionPort for AppStateResumeRef {
-    async fn load_session(&self, session_id: &str) -> Option<bamboo_application_agent::Session> {
+    async fn load_session(&self, session_id: &str) -> Option<bamboo_agent_core::Session> {
         AppState::load_session(&self.0, session_id).await
     }
 
-    async fn save_and_cache_session(&self, session: &bamboo_application_agent::Session) {
+    async fn save_and_cache_session(&self, session: &bamboo_agent_core::Session) {
         AppState::save_and_cache_session(&self.0, session).await;
     }
 
@@ -60,7 +60,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
         } = request;
 
         let model = session.model.clone();
-        let is_child_session = session.kind == bamboo_application_agent::SessionKind::Child;
+        let is_child_session = session.kind == bamboo_agent_core::SessionKind::Child;
         let reasoning_effort = session.reasoning_effort;
         let reasoning_effort_source = session
             .metadata
@@ -71,7 +71,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
         let image_fallback = config.image_fallback.clone();
 
         let (mpsc_tx, mpsc_rx) =
-            tokio::sync::mpsc::channel::<bamboo_application_agent::AgentEvent>(100);
+            tokio::sync::mpsc::channel::<bamboo_agent_core::AgentEvent>(100);
 
         let state = self.0.clone();
         spawn_event_forwarder(

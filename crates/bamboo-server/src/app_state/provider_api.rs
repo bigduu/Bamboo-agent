@@ -15,7 +15,7 @@ impl AppState {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use bamboo_agent::server::app_state::AppState;
+    /// use bamboo_server::app_state::AppState;
     /// use std::path::PathBuf;
     ///
     /// #[tokio::main]
@@ -52,7 +52,7 @@ impl AppState {
     ///
     /// Use [`ToolSurface::Root`] for primary sessions,
     /// [`ToolSurface::Child`] for child sessions, etc.
-    pub fn tools_for(&self, surface: ToolSurface) -> Arc<dyn bamboo_application_agent::tools::ToolExecutor> {
+    pub fn tools_for(&self, surface: ToolSurface) -> Arc<dyn bamboo_agent_core::tools::ToolExecutor> {
         self.tool_factory.get(surface)
     }
 
@@ -64,7 +64,7 @@ impl AppState {
     /// # Returns
     ///
     /// Vector of tool schemas in Anthropic's tool definition format.
-    pub fn get_all_tool_schemas(&self) -> Vec<bamboo_application_agent::tools::ToolSchema> {
+    pub fn get_all_tool_schemas(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
         self.tool_factory.get(ToolSurface::Root).list_tools()
     }
 }

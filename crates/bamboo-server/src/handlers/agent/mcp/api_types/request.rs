@@ -5,7 +5,7 @@ use std::collections::HashMap;
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum ServerRequest {
-    Internal(bamboo_infrastructure_mcp::McpServerConfig),
+    Internal(bamboo_engine::McpServerConfig),
     Mainstream(MainstreamServerRequest),
 }
 
@@ -40,7 +40,7 @@ pub struct MainstreamServerRequest {
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
-    pub headers: Vec<bamboo_infrastructure_mcp::HeaderConfig>,
+    pub headers: Vec<bamboo_engine::HeaderConfig>,
     #[serde(default)]
     pub connect_timeout_ms: Option<u64>,
 
@@ -50,7 +50,7 @@ pub struct MainstreamServerRequest {
     #[serde(default)]
     pub healthcheck_interval_ms: Option<u64>,
     #[serde(default)]
-    pub reconnect: Option<bamboo_infrastructure_mcp::ReconnectConfig>,
+    pub reconnect: Option<bamboo_engine::ReconnectConfig>,
     #[serde(default)]
     pub allowed_tools: Vec<String>,
     #[serde(default)]
@@ -61,7 +61,7 @@ impl MainstreamServerRequest {
     pub fn into_internal(
         mut self,
         id_override: Option<String>,
-    ) -> Result<bamboo_infrastructure_mcp::McpServerConfig, String> {
+    ) -> Result<bamboo_engine::McpServerConfig, String> {
         if let Some(id) = id_override {
             self.id = id;
         }
@@ -69,15 +69,15 @@ impl MainstreamServerRequest {
         let enabled = self.enabled.unwrap_or(!self.disabled);
         let request_timeout_ms = self
             .request_timeout_ms
-            .unwrap_or(bamboo_infrastructure_mcp::config::default_request_timeout());
+            .unwrap_or(bamboo_engine::mcp::config::default_request_timeout());
         let healthcheck_interval_ms = self
             .healthcheck_interval_ms
-            .unwrap_or(bamboo_infrastructure_mcp::config::default_healthcheck_interval());
+            .unwrap_or(bamboo_engine::mcp::config::default_healthcheck_interval());
         let reconnect = self.reconnect.unwrap_or_default();
 
         let transport = match (self.command, self.url) {
             (Some(command), None) => {
-                bamboo_infrastructure_mcp::TransportConfig::Stdio(bamboo_infrastructure_mcp::StdioConfig {
+                bamboo_engine::TransportConfig::Stdio(bamboo_engine::StdioConfig {
                     command,
                     args: self.args,
                     cwd: self.cwd,
@@ -85,16 +85,16 @@ impl MainstreamServerRequest {
                     env_encrypted: self.env_encrypted,
                     startup_timeout_ms: self
                         .startup_timeout_ms
-                        .unwrap_or(bamboo_infrastructure_mcp::config::default_startup_timeout()),
+                        .unwrap_or(bamboo_engine::mcp::config::default_startup_timeout()),
                 })
             }
             (None, Some(url)) => {
-                bamboo_infrastructure_mcp::TransportConfig::Sse(bamboo_infrastructure_mcp::SseConfig {
+                bamboo_engine::TransportConfig::Sse(bamboo_engine::SseConfig {
                     url,
                     headers: self.headers,
                     connect_timeout_ms: self
                         .connect_timeout_ms
-                        .unwrap_or(bamboo_infrastructure_mcp::config::default_connect_timeout()),
+                        .unwrap_or(bamboo_engine::mcp::config::default_connect_timeout()),
                 })
             }
             (Some(_), Some(_)) => {
@@ -108,7 +108,7 @@ impl MainstreamServerRequest {
             }
         };
 
-        Ok(bamboo_infrastructure_mcp::McpServerConfig {
+        Ok(bamboo_engine::McpServerConfig {
             id: self.id,
             name: self.name,
             enabled,
@@ -125,7 +125,7 @@ impl MainstreamServerRequest {
 #[derive(Debug, Deserialize)]
 pub struct ImportServersRequest {
     #[serde(rename = "mcpServers")]
-    pub mcp_servers: bamboo_infrastructure_mcp::McpConfig,
+    pub mcp_servers: bamboo_engine::mcp::config::McpConfig,
     /// Import mode: "merge" (default) or "replace"
     #[serde(default)]
     pub mode: Option<String>,

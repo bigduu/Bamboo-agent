@@ -1,5 +1,5 @@
 use actix_web::{test, web, App};
-use bamboo_shared_types::reasoning::ReasoningEffort;
+use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_agent::server::handlers::agent::sessions;
 use serde_json::json;
 

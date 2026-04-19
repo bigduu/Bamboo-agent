@@ -46,7 +46,7 @@
 //! # Usage Example
 //!
 //! ```rust,no_run
-//! use bamboo_agent::server::app_state::AppState;
+//! use bamboo_server::app_state::AppState;
 //! use std::path::PathBuf;
 //!
 //! #[tokio::main]
@@ -75,22 +75,22 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use bamboo_infrastructure_storage::SessionStoreV2;
-use bamboo_application_agent::storage::Storage;
-use bamboo_application_agent::AgentEvent;
-use bamboo_application_agent::{tools::ToolSchema, Message};
-use bamboo_infrastructure_llm::{LLMError, LLMProvider, LLMStream};
-use bamboo_infrastructure_mcp::McpServerManager;
-use bamboo_application_skills::SkillManager;
-use bamboo_infrastructure_config::Config;
-use bamboo_infrastructure_process::registry::ProcessRegistry;
+use bamboo_infrastructure::SessionStoreV2;
+use bamboo_agent_core::storage::Storage;
+use bamboo_agent_core::AgentEvent;
+use bamboo_agent_core::{tools::ToolSchema, Message};
+use bamboo_infrastructure::{LLMError, LLMProvider, LLMStream};
+use bamboo_engine::McpServerManager;
+use bamboo_engine::SkillManager;
+use bamboo_infrastructure::Config;
+use bamboo_infrastructure::registry::ProcessRegistry;
 use crate::error::AppError;
 use crate::metrics_service::MetricsService;
 use crate::schedules::{ScheduleManager, ScheduleStore};
 use crate::spawn_scheduler::SpawnScheduler;
 
 // Context functions moved to bamboo-agent-runtime::context
-pub use bamboo_application_runtime::context::{
+pub use bamboo_engine::context::{
     DEFAULT_BASE_PROMPT, WORKSPACE_CONTEXT_START_MARKER, WORKSPACE_CONTEXT_END_MARKER,
     WORKSPACE_CONTEXT_PREFIX, ENV_CONTEXT_START_MARKER, ENV_CONTEXT_END_MARKER,
     build_env_prompt_context, build_workspace_prompt_context, workspace_prompt_guidance,
@@ -112,14 +112,14 @@ impl LLMProvider for UnconfiguredProvider {
         _tools: &[ToolSchema],
         _max_output_tokens: Option<u32>,
         _model: &str,
-    ) -> bamboo_infrastructure_llm::provider::Result<LLMStream> {
+    ) -> bamboo_infrastructure::provider::Result<LLMStream> {
         Err(LLMError::Auth(format!(
             "LLM provider is not configured: {}",
             self.message
         )))
     }
 
-    async fn list_models(&self) -> bamboo_infrastructure_llm::provider::Result<Vec<String>> {
+    async fn list_models(&self) -> bamboo_infrastructure::provider::Result<Vec<String>> {
         Err(LLMError::Auth(format!(
             "LLM provider is not configured: {}",
             self.message
@@ -128,7 +128,7 @@ impl LLMProvider for UnconfiguredProvider {
 }
 
 // Re-export execution types from the runtime crate.
-pub use bamboo_application_runtime::execution::runner_state::{AgentRunner, AgentStatus};
+pub use bamboo_engine::execution::runner_state::{AgentRunner, AgentStatus};
 
 /// Unified application state consolidating web_service and agent/server state
 ///
@@ -179,7 +179,7 @@ pub struct AppState {
     ///
     /// Maps session IDs to Session objects. Persisted to storage
     /// via the `storage` field.
-    pub sessions: Arc<RwLock<HashMap<String, bamboo_application_agent::Session>>>,
+    pub sessions: Arc<RwLock<HashMap<String, bamboo_agent_core::Session>>>,
 
     /// Persistent storage backend for sessions (V2).
     ///
@@ -249,10 +249,10 @@ pub struct AppState {
     ///
     /// When enabled, allows subscribing to metrics events
     /// in real-time.
-    pub metrics_bus: Option<bamboo_application_metrics::MetricsBus>,
+    pub metrics_bus: Option<bamboo_engine::metrics::bus::MetricsBus>,
 
     /// Unified agent execution runtime holding shared resources.
-    pub agent: Arc<bamboo_application_runtime::Agent>,
+    pub agent: Arc<bamboo_engine::Agent>,
 }
 
 mod builder;

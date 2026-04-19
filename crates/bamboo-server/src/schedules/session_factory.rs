@@ -1,3 +1,3 @@
 //! Session factory — re-exported from bamboo-application-schedule.
 
-pub use bamboo_application_schedule::session_factory::*;
+pub use crate::schedule_app::session_factory::*;

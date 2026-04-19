@@ -1,4 +1,4 @@
-use bamboo_infrastructure_config::Config;
+use bamboo_infrastructure::Config;
 use serde_json::Value;
 
 mod constants;

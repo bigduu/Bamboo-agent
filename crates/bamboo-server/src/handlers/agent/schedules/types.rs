@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::schedules::{
-    MisfirePolicy, OverlapPolicy, ScheduleEntry, ScheduleRunConfig, ScheduleRunRecord,
+    MisFirePolicy, OverlapPolicy, ScheduleEntry, ScheduleRunConfig, ScheduleRunRecord,
     ScheduleRunStatus, ScheduleSpec, ScheduleState, ScheduleTrigger,
 };
 
@@ -18,7 +18,7 @@ pub struct ScheduleView {
     pub start_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_at: Option<DateTime<Utc>>,
-    pub misfire_policy: MisfirePolicy,
+    pub misfire_policy: MisFirePolicy,
     pub overlap_policy: OverlapPolicy,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -68,7 +68,7 @@ pub struct CreateScheduleRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_at: Option<DateTime<Utc>>,
     #[serde(default)]
-    pub misfire_policy: Option<MisfirePolicy>,
+    pub misfire_policy: Option<MisFirePolicy>,
     #[serde(default)]
     pub overlap_policy: Option<OverlapPolicy>,
     #[serde(default)]
@@ -92,7 +92,7 @@ pub struct PatchScheduleRequest {
     #[serde(default)]
     pub end_at: Option<DateTime<Utc>>,
     #[serde(default)]
-    pub misfire_policy: Option<MisfirePolicy>,
+    pub misfire_policy: Option<MisFirePolicy>,
     #[serde(default)]
     pub overlap_policy: Option<OverlapPolicy>,
     #[serde(default)]
@@ -170,7 +170,7 @@ mod tests {
             timezone: Some("Asia/Shanghai".to_string()),
             start_at: None,
             end_at: None,
-            misfire_policy: MisfirePolicy::default(),
+            misfire_policy: MisFirePolicy::default(),
             overlap_policy: OverlapPolicy::default(),
             created_at: Utc::now(),
             updated_at: Utc::now(),

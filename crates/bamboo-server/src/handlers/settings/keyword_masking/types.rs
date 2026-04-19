@@ -1,4 +1,4 @@
-use bamboo_infrastructure_config::keyword_masking::KeywordEntry;
+use bamboo_infrastructure::keyword_masking::KeywordEntry;
 use serde::{Deserialize, Serialize};
 
 /// Response for keyword masking configuration.
@@ -33,7 +33,7 @@ pub(super) fn map_validation_errors(errors: Vec<(usize, String)>) -> Vec<Validat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_infrastructure_config::keyword_masking::{KeywordEntry, MatchType};
+    use bamboo_infrastructure::keyword_masking::{KeywordEntry, MatchType};
 
     fn create_test_entry(pattern: &str) -> KeywordEntry {
         KeywordEntry {

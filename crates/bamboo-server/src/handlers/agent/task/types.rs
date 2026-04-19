@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use bamboo_domain_session::{TaskItem, TaskItemStatus, TaskList};
+use bamboo_domain::{TaskItem, TaskItemStatus, TaskList};
 
 /// Task item response for frontend
 #[derive(Serialize)]
@@ -87,7 +87,7 @@ impl TaskItemResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_domain_session::TaskItemStatus;
+    use bamboo_domain::TaskItemStatus;
 
     #[test]
     fn test_task_item_response_serialization() {

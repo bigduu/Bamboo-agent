@@ -1,7 +1,7 @@
 use actix_web::{web, HttpResponse};
 
-use bamboo_application_agent::Session;
-use bamboo_infrastructure_llm::models::{ContentPart, ImageUrl};
+use bamboo_agent_core::Session;
+use bamboo_infrastructure::models::{ContentPart, ImageUrl};
 use crate::app_state::AppState;
 
 use super::super::ChatImage;
@@ -39,12 +39,12 @@ pub(super) async fn append_user_message(
             });
         }
 
-        session.add_message(bamboo_application_agent::Message::user_with_parts(
+        session.add_message(bamboo_agent_core::Message::user_with_parts(
             message.to_string(),
             parts.into_iter().map(Into::into).collect(),
         ));
     } else {
-        session.add_message(bamboo_application_agent::Message::user(message.to_string()));
+        session.add_message(bamboo_agent_core::Message::user(message.to_string()));
     }
 
     Ok(())

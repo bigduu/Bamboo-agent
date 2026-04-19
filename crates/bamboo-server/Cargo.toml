@@ -5,25 +5,13 @@ edition = "2021"
 
 [dependencies]
 # Workspace crates
-bamboo-server-tools = { path = "../bamboo-server-tools" }
-bamboo-application-runtime = { path = "../bamboo-application-runtime" }
-bamboo-application-agent = { path = "../bamboo-application-agent" }
-bamboo-application-session = { path = "../bamboo-application-session" }
-bamboo-application-schedule = { path = "../bamboo-application-schedule" }
-bamboo-application-memory = { path = "../bamboo-application-memory" }
-bamboo-application-tools = { path = "../bamboo-application-tools" }
-bamboo-application-skills = { path = "../bamboo-application-skills" }
-bamboo-application-metrics = { path = "../bamboo-application-metrics" }
-bamboo-infrastructure-llm = { path = "../bamboo-infrastructure-llm" }
-bamboo-infrastructure-mcp = { path = "../bamboo-infrastructure-mcp" }
-bamboo-infrastructure-storage = { path = "../bamboo-infrastructure-storage" }
-bamboo-infrastructure-config = { path = "../bamboo-infrastructure-config" }
-bamboo-infrastructure-process = { path = "../bamboo-infrastructure-process" }
-bamboo-domain-session = { path = "../bamboo-domain-session" }
-bamboo-domain-schedule = { path = "../bamboo-domain-schedule" }
-bamboo-domain-workflow = { path = "../bamboo-domain-workflow" }
-bamboo-shared-types = { path = "../bamboo-shared-types" }
-bamboo-claude-runner = { path = "../bamboo-claude-runner" }
+bamboo-engine = { path = "../bamboo-engine" }
+bamboo-memory = { path = "../bamboo-memory" }
+bamboo-compression = { path = "../bamboo-compression" }
+bamboo-agent-core = { path = "../bamboo-agent-core" }
+bamboo-tools = { path = "../bamboo-tools" }
+bamboo-infrastructure = { path = "../bamboo-infrastructure" }
+bamboo-domain = { path = "../bamboo-domain" }
 
 # Web framework
 actix-web = "4"
@@ -48,6 +36,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+cron = "0.15"
 regex = "1"
 futures = "0.3"
 thiserror = "1"
@@ -75,3 +65,4 @@ tokio-test = "0.4"
 mockall = "0.13"
 http = "1"
 actix-rt = "2"
+bamboo-infrastructure = { path = "../bamboo-infrastructure", features = ["test-utils"] }

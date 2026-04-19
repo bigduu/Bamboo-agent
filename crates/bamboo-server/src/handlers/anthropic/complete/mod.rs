@@ -3,8 +3,8 @@ mod stream;
 
 use actix_web::{http::StatusCode, web, HttpResponse};
 
-use bamboo_application_agent::{tools::ToolSchema, Message};
-use bamboo_infrastructure_llm::{api::models::StreamOptions, providers::anthropic::api_types::AnthropicCompleteRequest};
+use bamboo_agent_core::{tools::ToolSchema, Message};
+use bamboo_infrastructure::{api::models::StreamOptions, providers::anthropic::api_types::AnthropicCompleteRequest};
 use crate::{app_state::AppState, error::AppError};
 
 use super::conversion::{convert_complete_request, convert_messages, convert_tools};
@@ -89,6 +89,6 @@ struct PreparedCompleteRequest {
     internal_messages: Vec<Message>,
     internal_tools: Vec<ToolSchema>,
     max_tokens: Option<u32>,
-    reasoning_effort: Option<bamboo_shared_types::reasoning::ReasoningEffort>,
+    reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
     estimated_prompt_tokens: u64,
 }

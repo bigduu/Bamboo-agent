@@ -1,8 +1,8 @@
 use actix_web::{web, HttpResponse};
 
-use bamboo_infrastructure_llm::api::models::{FunctionCall, ToolCall};
-use bamboo_infrastructure_llm::LLMRequestOptions;
-use bamboo_application_metrics::types::ForwardStatus;
+use bamboo_infrastructure::api::models::{FunctionCall, ToolCall};
+use bamboo_infrastructure::LLMRequestOptions;
+use bamboo_engine::metrics::types::ForwardStatus;
 use crate::{app_state::AppState, error::AppError};
 
 use super::{map_provider_error, PreparedChatRequest};
@@ -58,15 +58,15 @@ pub(super) async fn handle_non_streaming_chat(
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::ResponseId(_)) => {}
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::Token(text)) => {
+            Ok(bamboo_infrastructure::types::LLMChunk::ResponseId(_)) => {}
+            Ok(bamboo_infrastructure::types::LLMChunk::Token(text)) => {
                 content.push_str(&text);
             }
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::ReasoningToken(_)) => {}
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::ToolCalls(calls)) => {
+            Ok(bamboo_infrastructure::types::LLMChunk::ReasoningToken(_)) => {}
+            Ok(bamboo_infrastructure::types::LLMChunk::ToolCalls(calls)) => {
                 tool_calls = Some(convert_tool_calls(calls));
             }
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::Done) => break,
+            Ok(bamboo_infrastructure::types::LLMChunk::Done) => break,
             Err(error) => {
                 app_state.metrics_service.collector().forward_completed(
                     forward_id,
@@ -98,7 +98,7 @@ pub(super) async fn handle_non_streaming_chat(
     Ok(HttpResponse::Ok().json(response))
 }
 
-fn convert_tool_calls(calls: Vec<bamboo_application_agent::tools::ToolCall>) -> Vec<ToolCall> {
+fn convert_tool_calls(calls: Vec<bamboo_agent_core::tools::ToolCall>) -> Vec<ToolCall> {
     calls
         .into_iter()
         .map(|tool_call| ToolCall {

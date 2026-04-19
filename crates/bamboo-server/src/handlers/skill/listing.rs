@@ -1,4 +1,4 @@
-use bamboo_application_skills::SkillFilter;
+use bamboo_engine::SkillFilter;
 use actix_web::{web, HttpResponse};
 
 use crate::app_state::AppState;

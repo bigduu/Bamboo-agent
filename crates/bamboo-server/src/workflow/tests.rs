@@ -1,5 +1,5 @@
 use super::{WorkflowDefinition, WorkflowLoadError, WorkflowLoader};
-use bamboo_application_agent::composition::ToolExpr;
+use bamboo_agent_core::composition::ToolExpr;
 use std::fs;
 use std::path::{Path, PathBuf};
 

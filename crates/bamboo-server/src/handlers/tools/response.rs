@@ -1,4 +1,4 @@
-use bamboo_application_agent::tools::ToolResult;
+use bamboo_agent_core::tools::ToolResult;
 use crate::error::AppError;
 
 use super::models::{ToolExecutionResponse, ToolExecutionResultPayload};
@@ -25,7 +25,7 @@ pub(super) fn build_execution_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_application_agent::tools::ToolResult;
+    use bamboo_agent_core::tools::ToolResult;
 
     fn create_tool_result(result: &str, display_preference: Option<&str>) -> ToolResult {
         ToolResult {

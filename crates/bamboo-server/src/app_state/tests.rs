@@ -1,7 +1,7 @@
 use super::{AppState, DEFAULT_BASE_PROMPT};
-use bamboo_application_agent::tools::{FunctionCall, ToolCall, ToolError};
-use bamboo_application_tools::permission::config::{PermissionConfig, PermissionRule, PermissionType};
-use bamboo_application_tools::permission::storage::PermissionStorage;
+use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolError};
+use bamboo_tools::permission::config::{PermissionConfig, PermissionRule, PermissionType};
+use bamboo_tools::permission::storage::PermissionStorage;
 use crate::tools::ToolSurface;
 use serde_json::json;
 
@@ -74,7 +74,7 @@ async fn default_first_round_tool_surface_is_smaller_than_full_root_tool_catalog
     let full = state.get_all_tool_schemas();
     let visible: Vec<_> = full
         .iter()
-        .filter(|schema| bamboo_application_tools::exposure::is_core_tool(&schema.function.name))
+        .filter(|schema| bamboo_tools::exposure::is_core_tool(&schema.function.name))
         .collect();
     let visible_names: std::collections::HashSet<&str> = visible
         .iter()
@@ -173,12 +173,12 @@ async fn overlay_tools_require_session_context() {
 #[tokio::test]
 async fn memory_tool_merge_action_updates_existing_project_memory() {
     let temp_dir = tempfile::tempdir().unwrap();
-    bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+    bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
         .expect("app state should initialize");
 
-    bamboo_application_tools::tools::workspace_state::ensure_session_workspace(
+    bamboo_tools::tools::workspace_state::ensure_session_workspace(
         "session-merge",
         Some(temp_dir.path().to_path_buf()),
     );
@@ -198,7 +198,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
         .tools_for(ToolSurface::Root)
         .execute_with_context(
             &write_target,
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-merge"),
                 tool_call_id: "tool-call-write-target",
                 event_tx: None,
@@ -225,7 +225,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
         .tools_for(ToolSurface::Root)
         .execute_with_context(
             &write_source,
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-merge"),
                 tool_call_id: "tool-call-write-source",
                 event_tx: None,
@@ -251,7 +251,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
         .tools_for(ToolSurface::Root)
         .execute_with_context(
             &merge_call,
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-merge"),
                 tool_call_id: "tool-call-merge",
                 event_tx: None,
@@ -272,12 +272,12 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
 #[tokio::test]
 async fn memory_tool_write_merges_heuristically_similar_memory_when_enabled() {
     let temp_dir = tempfile::tempdir().unwrap();
-    bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+    bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
         .expect("app state should initialize");
 
-    bamboo_application_tools::tools::workspace_state::ensure_session_workspace(
+    bamboo_tools::tools::workspace_state::ensure_session_workspace(
         "session-heuristic-merge",
         Some(temp_dir.path().to_path_buf()),
     );
@@ -297,7 +297,7 @@ async fn memory_tool_write_merges_heuristically_similar_memory_when_enabled() {
                     "options": { "allow_merge_if_similar": false }
                 }),
             ),
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-heuristic-merge"),
                 tool_call_id: "tool-call-write-heuristic-original",
                 event_tx: None,
@@ -324,7 +324,7 @@ async fn memory_tool_write_merges_heuristically_similar_memory_when_enabled() {
                     "options": { "allow_merge_if_similar": true }
                 }),
             ),
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-heuristic-merge"),
                 tool_call_id: "tool-call-write-heuristic-merge",
                 event_tx: None,
@@ -347,7 +347,7 @@ async fn memory_tool_write_merges_heuristically_similar_memory_when_enabled() {
                     "scope": "project"
                 }),
             ),
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-heuristic-merge"),
                 tool_call_id: "tool-call-inspect-heuristic-merge",
                 event_tx: None,
@@ -363,12 +363,12 @@ async fn memory_tool_write_merges_heuristically_similar_memory_when_enabled() {
 #[tokio::test]
 async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
     let temp_dir = tempfile::tempdir().unwrap();
-    bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+    bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
         .expect("app state should initialize");
 
-    bamboo_application_tools::tools::workspace_state::ensure_session_workspace(
+    bamboo_tools::tools::workspace_state::ensure_session_workspace(
         "session-contradict",
         Some(temp_dir.path().to_path_buf()),
     );
@@ -386,7 +386,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
                     "content": "Freeze begins on Tuesday."
                 }),
             ),
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-contradict"),
                 tool_call_id: "tool-call-write-contradict-target",
                 event_tx: None,
@@ -411,7 +411,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
                     "content": "Freeze is postponed."
                 }),
             ),
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-contradict"),
                 tool_call_id: "tool-call-write-contradict-source",
                 event_tx: None,
@@ -437,7 +437,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
                     "source_memory_ids": [source_id]
                 }),
             ),
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-contradict"),
                 tool_call_id: "tool-call-contradict",
                 event_tx: None,
@@ -460,12 +460,12 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
 #[tokio::test]
 async fn memory_tool_batch_purge_archives_filtered_items() {
     let temp_dir = tempfile::tempdir().unwrap();
-    bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+    bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
         .expect("app state should initialize");
 
-    bamboo_application_tools::tools::workspace_state::ensure_session_workspace(
+    bamboo_tools::tools::workspace_state::ensure_session_workspace(
         "session-batch-purge",
         Some(temp_dir.path().to_path_buf()),
     );
@@ -483,7 +483,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                     "content": "Legacy dashboard."
                 }),
             ),
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-batch-purge"),
                 tool_call_id: "tool-call-write-stale",
                 event_tx: None,
@@ -507,7 +507,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                     "reason": "mark stale first"
                 }),
             ),
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-batch-purge"),
                 tool_call_id: "tool-call-mark-stale",
                 event_tx: None,
@@ -530,7 +530,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                     "content": "Current dashboard."
                 }),
             ),
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-batch-purge"),
                 tool_call_id: "tool-call-write-active",
                 event_tx: None,
@@ -556,7 +556,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                     }
                 }),
             ),
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-batch-purge"),
                 tool_call_id: "tool-call-batch-purge",
                 event_tx: None,
@@ -573,12 +573,12 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
 #[tokio::test]
 async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
     let temp_dir = tempfile::tempdir().unwrap();
-    bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+    bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
         .expect("app state should initialize");
 
-    bamboo_application_tools::tools::workspace_state::ensure_session_workspace(
+    bamboo_tools::tools::workspace_state::ensure_session_workspace(
         "session-inspect",
         Some(temp_dir.path().to_path_buf()),
     );
@@ -596,7 +596,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
                     "content": "Legacy dashboard."
                 }),
             ),
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-inspect"),
                 tool_call_id: "tool-call-write-inspect",
                 event_tx: None,
@@ -616,7 +616,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
                     "scope": "project"
                 }),
             ),
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-inspect"),
                 tool_call_id: "tool-call-inspect",
                 event_tx: None,
@@ -643,7 +643,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
                     "scope": "project"
                 }),
             ),
-            bamboo_application_agent::tools::ToolExecutionContext {
+            bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-inspect"),
                 tool_call_id: "tool-call-rebuild",
                 event_tx: None,

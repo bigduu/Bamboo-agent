@@ -10,6 +10,6 @@ pub use response::{
     McpServerConfigApi, ServerListResponse, ToolInfo, ToolListResponse, TransportConfigApi,
 };
 
-pub(super) fn to_api_config(server: &bamboo_infrastructure_mcp::McpServerConfig) -> McpServerConfigApi {
+pub(super) fn to_api_config(server: &bamboo_engine::McpServerConfig) -> McpServerConfigApi {
     config_map::to_api_config(server)
 }

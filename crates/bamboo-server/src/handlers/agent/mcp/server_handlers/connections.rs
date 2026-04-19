@@ -12,7 +12,7 @@ pub async fn connect_server(state: web::Data<AppState>, path: web::Path<String>)
     let server_id = path.into_inner();
 
     // Enable + start using the stored config.
-    let mut server_cfg: Option<bamboo_infrastructure_mcp::McpServerConfig> = None;
+    let mut server_cfg: Option<bamboo_engine::McpServerConfig> = None;
     if let Err(e) = state
         .update_config(
             |root| {

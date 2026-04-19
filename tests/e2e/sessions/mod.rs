@@ -1,5 +1,5 @@
-use bamboo_infrastructure_config::config::OpenAIConfig;
-use bamboo_shared_types::reasoning::ReasoningEffort;
+use bamboo_infrastructure::config::OpenAIConfig;
+use bamboo_domain::reasoning::ReasoningEffort;
 
 mod crud;
 

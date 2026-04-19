@@ -6,7 +6,7 @@ use crate::handlers::agent::schedules::types::{
     CreateScheduleRequest, PatchScheduleRequest,
 };
 use crate::model_config_helper::get_default_model_from_config;
-use crate::schedules::{MisfirePolicy, OverlapPolicy, ScheduleRunConfig, ScheduleTrigger};
+use crate::schedules::{MisFirePolicy, OverlapPolicy, ScheduleRunConfig, ScheduleTrigger};
 
 pub(super) fn validate_schedule_name(name: &str) -> Result<String, HttpResponse> {
     let trimmed = name.trim();
@@ -98,7 +98,7 @@ pub(super) fn validate_trigger_api_fields(
     timezone: Option<&str>,
     start_at: Option<DateTime<Utc>>,
     end_at: Option<DateTime<Utc>>,
-    misfire_policy: Option<MisfirePolicy>,
+    misfire_policy: Option<MisFirePolicy>,
     overlap_policy: Option<OverlapPolicy>,
 ) -> Result<(), HttpResponse> {
     if let Some(trigger) = trigger {

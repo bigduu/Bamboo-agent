@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use bamboo_infrastructure_config::Config;
+use bamboo_infrastructure::Config;
 
 /// Setup status response.
 #[derive(Serialize)]

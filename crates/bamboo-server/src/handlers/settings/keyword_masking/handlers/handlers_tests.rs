@@ -5,7 +5,7 @@ use crate::handlers::settings::keyword_masking::handlers::{
 };
 use crate::handlers::settings::keyword_masking::types::KeywordMaskingResponse;
 use crate::app_state::AppState;
-use bamboo_infrastructure_config::Config;
+use bamboo_infrastructure::Config;
 use actix_web::{test, web, App};
 use serde_json::json;
 use std::sync::Arc;

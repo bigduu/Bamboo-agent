@@ -1,5 +1,5 @@
 use super::ExecuteRequest;
-use bamboo_shared_types::reasoning::ReasoningEffort;
+use bamboo_domain::reasoning::ReasoningEffort;
 use crate::app_state::{AgentRunner, AgentStatus};
 
 #[test]

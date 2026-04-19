@@ -8,12 +8,12 @@ use super::super::{
     internal_error, MemoryMetricsQuery, MemoryMetricsSummary, MemoryTimelinePoint,
     PromptMemoryMetricsSummary,
 };
-use bamboo_application_memory::memory_store::{
+use bamboo_memory::memory_store::{
     DurableMemoryDocument, MemoryInspectResult, MemoryScope, MemoryStore,
 };
-use bamboo_infrastructure_storage::SessionStoreV2;
-use bamboo_application_agent::storage::Storage;
-use bamboo_application_agent::PromptMemoryObservability;
+use bamboo_infrastructure::SessionStoreV2;
+use bamboo_agent_core::storage::Storage;
+use bamboo_agent_core::PromptMemoryObservability;
 use crate::app_state::AppState;
 use crate::handlers::agent::metrics::core_handlers::filters::{
     normalize_days, resolve_timeline_granularity, TimelineGranularity,
@@ -486,9 +486,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use bamboo_application_memory::memory_store::DurableMemoryType;
-    use bamboo_infrastructure_storage::SessionStoreV2;
-    use bamboo_application_agent::storage::Storage;
+    use bamboo_memory::memory_store::DurableMemoryType;
+    use bamboo_infrastructure::SessionStoreV2;
+    use bamboo_agent_core::storage::Storage;
 
     async fn create_session_storage(
         dir: &std::path::Path,
@@ -655,7 +655,7 @@ mod tests {
             .await
             .expect("write project memory");
 
-        let mut session_a = bamboo_application_agent::Session::new("session-metrics-a", "test-model");
+        let mut session_a = bamboo_agent_core::Session::new("session-metrics-a", "test-model");
         session_a.metadata.insert(
             "runtime_prompt_memory_observability".to_string(),
             serde_json::to_string(&PromptMemoryObservability {
@@ -689,7 +689,7 @@ mod tests {
             .await
             .expect("save session a");
 
-        let mut session_b = bamboo_application_agent::Session::new("session-metrics-b", "test-model");
+        let mut session_b = bamboo_agent_core::Session::new("session-metrics-b", "test-model");
         session_b.metadata.insert(
             "runtime_prompt_memory_observability".to_string(),
             serde_json::to_string(&PromptMemoryObservability {

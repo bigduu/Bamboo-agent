@@ -1,10 +1,10 @@
-use bamboo_application_agent::Session;
+use bamboo_agent_core::Session;
 
 pub(crate) fn selected_skill_ids_for_session(session: &Session) -> Option<Vec<String>> {
     session
         .metadata
         .get("selected_skill_ids")
-        .and_then(|raw| bamboo_application_skills::selection::parse_selected_skill_ids_metadata(raw))
+        .and_then(|raw| bamboo_engine::selection::parse_selected_skill_ids_metadata(raw))
 }
 
 pub(crate) fn selected_skill_mode_for_session(session: &Session) -> Option<String> {

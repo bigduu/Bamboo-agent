@@ -8,9 +8,9 @@
 //! - Conversation summaries
 
 use bamboo_agent::agent::{Message, Role, Session};
-use bamboo_application_agent::agent::types::{CompressionEvent, ConversationSummary, SessionKind};
-use bamboo_application_agent::tools::{FunctionCall, ToolCall};
-use bamboo_domain_session::{TaskItem, TaskItemStatus, TaskList};
+use bamboo_agent_core::agent::types::{CompressionEvent, ConversationSummary, SessionKind};
+use bamboo_agent_core::tools::{FunctionCall, ToolCall};
+use bamboo_domain::{TaskItem, TaskItemStatus, TaskList};
 use chrono::Utc;
 
 #[test]

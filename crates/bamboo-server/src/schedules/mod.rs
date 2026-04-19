@@ -11,8 +11,8 @@ pub mod session_factory;
 pub mod store;
 pub mod trigger_engine;
 
-pub use bamboo_domain_schedule::{
-    MisfirePolicy, OverlapPolicy, ScheduleRunConfig, ScheduleRunRecord, ScheduleRunStatus,
+pub use bamboo_domain::{
+    MisFirePolicy, OverlapPolicy, ScheduleRunConfig, ScheduleRunRecord, ScheduleRunStatus,
     ScheduleSpec, ScheduleState, ScheduleTrigger, ScheduleWeekday, ScheduleWindow,
 };
 pub use manager::{ScheduleManager, ScheduleRunJob};

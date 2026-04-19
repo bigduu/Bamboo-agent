@@ -1,5 +1,5 @@
-use bamboo_application_runtime::{ImageFallbackConfig, ImageFallbackMode};
-use bamboo_infrastructure_config::Config;
+use bamboo_engine::{ImageFallbackConfig, ImageFallbackMode};
+use bamboo_infrastructure::Config;
 
 pub(crate) fn resolve_image_fallback(
     config_snapshot: &Config,

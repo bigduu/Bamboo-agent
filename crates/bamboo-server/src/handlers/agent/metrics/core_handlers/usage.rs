@@ -7,7 +7,7 @@ use super::super::{
     internal_error, McpServerUsageItem, McpToolUsageItem, MetricsUsageBreakdownResponse,
     MetricsUsageQuery, SkillUsageItem, UsageCountItem,
 };
-use bamboo_application_tools::exposure::canonical_tool_name;
+use bamboo_tools::exposure::canonical_tool_name;
 use crate::app_state::AppState;
 
 #[derive(Debug, Clone)]

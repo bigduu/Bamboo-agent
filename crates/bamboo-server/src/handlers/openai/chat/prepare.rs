@@ -1,6 +1,6 @@
 use actix_web::web;
 
-use bamboo_infrastructure_llm::api::models::ChatCompletionRequest;
+use bamboo_infrastructure::api::models::ChatCompletionRequest;
 use crate::{app_state::AppState, error::AppError};
 
 use super::PreparedChatRequest;

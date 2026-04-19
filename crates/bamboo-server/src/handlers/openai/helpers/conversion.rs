@@ -1,15 +1,15 @@
-use bamboo_application_agent::tools::ToolSchema;
-use bamboo_infrastructure_llm::api::models::ChatMessage;
-use bamboo_infrastructure_llm::protocol::FromProvider;
+use bamboo_agent_core::tools::ToolSchema;
+use bamboo_infrastructure::api::models::ChatMessage;
+use bamboo_infrastructure::protocol::FromProvider;
 use crate::error::AppError;
 
 pub(super) fn convert_messages(
     messages: Vec<ChatMessage>,
-) -> Result<Vec<bamboo_application_agent::Message>, AppError> {
+) -> Result<Vec<bamboo_agent_core::Message>, AppError> {
     messages
         .into_iter()
         .map(|message| {
-            bamboo_application_agent::Message::from_provider(message).map_err(|error| {
+            bamboo_agent_core::Message::from_provider(message).map_err(|error| {
                 AppError::InternalError(anyhow::anyhow!("Failed to convert message: {}", error))
             })
         })
@@ -17,7 +17,7 @@ pub(super) fn convert_messages(
 }
 
 pub(super) fn convert_tools(
-    tools: Option<Vec<bamboo_infrastructure_llm::api::models::Tool>>,
+    tools: Option<Vec<bamboo_infrastructure::api::models::Tool>>,
 ) -> Result<Vec<ToolSchema>, AppError> {
     match tools {
         Some(tools) => tools

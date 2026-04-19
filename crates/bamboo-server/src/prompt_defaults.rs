@@ -23,7 +23,7 @@ pub struct GlobalSystemPromptTemplate {
 }
 
 fn bamboo_system_prompt_file_path() -> PathBuf {
-    bamboo_infrastructure_config::paths::bamboo_dir().join(SYSTEM_PROMPT_FILE_NAME)
+    bamboo_infrastructure::paths::bamboo_dir().join(SYSTEM_PROMPT_FILE_NAME)
 }
 
 fn read_non_empty_prompt_file(path: &Path) -> Option<String> {

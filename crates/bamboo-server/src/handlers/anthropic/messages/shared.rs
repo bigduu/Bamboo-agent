@@ -1,8 +1,8 @@
 use actix_web::{http::StatusCode, web, HttpResponse};
 
-use bamboo_application_agent::tools::ToolSchema;
-use bamboo_application_agent::Message;
-use bamboo_infrastructure_llm::api::models::ChatCompletionRequest;
+use bamboo_agent_core::tools::ToolSchema;
+use bamboo_agent_core::Message;
+use bamboo_infrastructure::api::models::ChatCompletionRequest;
 use crate::{app_state::AppState, error::AppError};
 
 use super::super::conversion::{convert_messages, convert_tools};
@@ -13,7 +13,7 @@ pub(super) struct PreparedInternalExecution {
     pub(super) internal_messages: Vec<Message>,
     pub(super) internal_tools: Vec<ToolSchema>,
     pub(super) max_tokens: Option<u32>,
-    pub(super) reasoning_effort: Option<bamboo_shared_types::reasoning::ReasoningEffort>,
+    pub(super) reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
     pub(super) estimated_prompt_tokens: u64,
 }
 
@@ -76,14 +76,14 @@ pub(super) fn map_prepare_error(err: PrepareInternalError) -> Result<HttpRespons
 }
 
 pub(super) fn map_tool_calls(
-    calls: Vec<bamboo_application_agent::tools::ToolCall>,
-) -> Vec<bamboo_infrastructure_llm::api::models::ToolCall> {
+    calls: Vec<bamboo_agent_core::tools::ToolCall>,
+) -> Vec<bamboo_infrastructure::api::models::ToolCall> {
     calls
         .into_iter()
-        .map(|tool_call| bamboo_infrastructure_llm::api::models::ToolCall {
+        .map(|tool_call| bamboo_infrastructure::api::models::ToolCall {
             id: tool_call.id,
             tool_type: tool_call.tool_type,
-            function: bamboo_infrastructure_llm::api::models::FunctionCall {
+            function: bamboo_infrastructure::api::models::FunctionCall {
                 name: tool_call.function.name,
                 arguments: tool_call.function.arguments,
             },

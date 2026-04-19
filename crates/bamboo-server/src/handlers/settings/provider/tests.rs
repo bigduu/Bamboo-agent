@@ -1,6 +1,6 @@
-use bamboo_infrastructure_mcp::{HeaderConfig, McpServerConfig, SseConfig, StdioConfig, TransportConfig};
-use bamboo_infrastructure_config::encryption::set_test_encryption_key;
-use bamboo_infrastructure_config::{Config, OpenAIConfig, ProviderConfigs};
+use bamboo_engine::{HeaderConfig, McpServerConfig, SseConfig, StdioConfig, TransportConfig};
+use bamboo_infrastructure::config::encryption::set_test_encryption_key;
+use bamboo_infrastructure::{Config, OpenAIConfig, ProviderConfigs};
 use std::collections::HashMap;
 
 fn deep_merge_json(dst: &mut serde_json::Value, src: serde_json::Value) {

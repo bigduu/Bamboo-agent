@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use bamboo_infrastructure_llm::provider::ResponsesRequestOptions;
+use bamboo_infrastructure::provider::ResponsesRequestOptions;
 
 fn parse_reasoning_summary(parameters: &HashMap<String, Value>) -> Option<String> {
     parameters

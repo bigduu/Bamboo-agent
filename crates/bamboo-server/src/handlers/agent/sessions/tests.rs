@@ -1,8 +1,8 @@
 use super::SessionSummary;
 
-use bamboo_infrastructure_storage::SessionIndexEntry;
-use bamboo_application_agent::SessionKind;
-use bamboo_shared_types::reasoning::ReasoningEffort;
+use bamboo_infrastructure::SessionIndexEntry;
+use bamboo_agent_core::SessionKind;
+use bamboo_domain::reasoning::ReasoningEffort;
 use chrono::Utc;
 
 #[test]

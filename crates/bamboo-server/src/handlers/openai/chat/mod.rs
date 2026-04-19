@@ -4,8 +4,8 @@ mod stream;
 
 use actix_web::{web, HttpResponse};
 
-use bamboo_application_agent::{tools::ToolSchema, Message};
-use bamboo_infrastructure_llm::api::models::ChatCompletionRequest;
+use bamboo_agent_core::{tools::ToolSchema, Message};
+use bamboo_infrastructure::api::models::ChatCompletionRequest;
 use crate::{app_state::AppState, error::AppError};
 
 pub async fn chat_completions(
@@ -37,7 +37,7 @@ pub(super) struct PreparedChatRequest {
     pub(super) internal_messages: Vec<Message>,
     pub(super) internal_tools: Vec<ToolSchema>,
     pub(super) max_tokens: Option<u32>,
-    pub(super) reasoning_effort: Option<bamboo_shared_types::reasoning::ReasoningEffort>,
+    pub(super) reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
     pub(super) parallel_tool_calls: Option<bool>,
     pub(super) estimated_prompt_tokens: u64,
 }

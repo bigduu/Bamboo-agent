@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use bamboo_infrastructure_llm::types::LLMChunk;
+use bamboo_infrastructure::types::LLMChunk;
 
 use super::super::super::helpers::convert_chunk_to_openai;
 

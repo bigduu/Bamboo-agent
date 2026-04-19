@@ -1,4 +1,4 @@
-use bamboo_application_skills::SkillDefinition;
+use bamboo_engine::SkillDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

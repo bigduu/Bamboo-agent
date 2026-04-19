@@ -1,0 +1,21 @@
+[package]
+name = "bamboo-compression"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bamboo-agent-core = { path = "../bamboo-agent-core" }
+bamboo-infrastructure = { path = "../bamboo-infrastructure" }
+bamboo-domain = { path = "../bamboo-domain" }
+serde = { workspace = true }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+thiserror = "1"
+tiktoken-rs = "0.11"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,4 +1,4 @@
-use bamboo_shared_types::reasoning::ReasoningEffort;
+use bamboo_domain::reasoning::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 
 /// Stable reasons explaining why the frontend must resynchronize before execute.

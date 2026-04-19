@@ -1,8 +1,8 @@
 use super::request::{optional_non_empty, resolve_session_id, validate_and_normalize_model};
 use super::sync_runtime_workspace;
-use bamboo_application_agent::Session;
+use bamboo_agent_core::Session;
 
-use bamboo_application_session::chat::{
+use crate::session_app::chat::{
     resolve_base_prompt, resolve_enhance_prompt,
     resolve_copilot_conclusion_with_options_enhancement,
     resolve_selected_skill_ids, clear_skill_runtime_state, resolve_workspace_path,
@@ -58,7 +58,7 @@ fn resolve_base_prompt_falls_back_to_existing_metadata() {
 #[test]
 fn resolve_base_prompt_falls_back_to_existing_system_message_before_global_default() {
     let mut session = Session::new("session-1", "model");
-    session.add_message(bamboo_application_agent::Message::system("Existing system"));
+    session.add_message(bamboo_agent_core::Message::system("Existing system"));
 
     let base_prompt = resolve_base_prompt(&mut session, None, "", "global default");
     assert_eq!(base_prompt, "Existing system");
@@ -112,7 +112,7 @@ fn resolve_workspace_path_falls_back_to_default_work_area_config() {
 
     let mut session = Session::new("session-1", "model");
     let resolved = resolve_workspace_path(&mut session, None, Some(temp_dir.path()));
-    let expected = bamboo_infrastructure_config::paths::path_to_display_string(&workspace);
+    let expected = bamboo_infrastructure::paths::path_to_display_string(&workspace);
     assert_eq!(resolved.as_deref(), Some(expected.as_str()));
 
     if let Some(value) = original {
@@ -131,7 +131,7 @@ fn sync_runtime_workspace_persists_workspace_for_tools() {
 
     sync_runtime_workspace(session_id, Some(workspace.to_string_lossy().as_ref()));
 
-    let resolved = bamboo_application_tools::tools::workspace_state::get_workspace(session_id)
+    let resolved = bamboo_tools::tools::workspace_state::get_workspace(session_id)
         .expect("workspace should be stored");
     assert_eq!(resolved, workspace.canonicalize().unwrap_or(workspace));
 }

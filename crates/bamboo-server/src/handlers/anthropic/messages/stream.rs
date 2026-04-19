@@ -3,9 +3,9 @@ use async_stream::stream;
 use bytes::Bytes;
 use serde_json::json;
 
-use bamboo_infrastructure_llm::api::models::ChatCompletionRequest;
-use bamboo_infrastructure_llm::LLMRequestOptions;
-use bamboo_application_metrics::types::ForwardStatus;
+use bamboo_infrastructure::api::models::ChatCompletionRequest;
+use bamboo_infrastructure::LLMRequestOptions;
+use bamboo_engine::metrics::types::ForwardStatus;
 use crate::{app_state::AppState, error::AppError};
 
 use super::super::conversion::convert_llm_chunk_to_openai;
@@ -84,7 +84,7 @@ pub(super) async fn handle_streaming_messages(
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
-                    if let bamboo_infrastructure_llm::types::LLMChunk::Token(text) = &chunk {
+                    if let bamboo_infrastructure::types::LLMChunk::Token(text) = &chunk {
                         completion_text.push_str(text);
                     }
                     // Convert LLMChunk to ChatCompletionStreamChunk.

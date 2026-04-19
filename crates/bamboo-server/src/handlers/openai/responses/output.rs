@@ -1,4 +1,4 @@
-use bamboo_application_agent::tools::ToolCall;
+use bamboo_agent_core::tools::ToolCall;
 
 use super::super::types::{
     ResponsesCreateResponse, ResponsesFunctionCallOutputItem, ResponsesMessageOutputItem,

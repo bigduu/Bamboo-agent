@@ -3,10 +3,10 @@ use serde_json::json;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use bamboo_application_session::child_session::{
+use crate::session_app::child_session::{
     create_child_action, ChildSessionPort, CreateChildInput,
 };
-use bamboo_application_agent::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use crate::tools::child_session_adapter::{
     ChildSessionAdapter, tool_error_from_child_session,
 };
@@ -200,15 +200,15 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::{broadcast, RwLock};
 
-    use bamboo_application_session::child_session::format_child_assignment;
-    use bamboo_application_agent::tools::{ToolCall, ToolExecutor, ToolSchema};
-    use bamboo_application_agent::storage::Storage;
-    use bamboo_application_agent::{AgentEvent, Message, Session};
-    use bamboo_infrastructure_llm::{LLMError, LLMProvider, LLMStream};
-    use bamboo_infrastructure_storage::SessionStoreV2;
-    use bamboo_application_metrics::storage::SqliteMetricsStorage;
-    use bamboo_application_metrics::MetricsCollector;
-    use bamboo_application_skills::SkillManager;
+    use crate::session_app::child_session::format_child_assignment;
+    use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::{AgentEvent, Message, Session};
+    use bamboo_infrastructure::{LLMError, LLMProvider, LLMStream};
+    use bamboo_infrastructure::SessionStoreV2;
+    use bamboo_engine::metrics::storage::SqliteMetricsStorage;
+    use bamboo_engine::MetricsCollector;
+    use bamboo_engine::SkillManager;
     use crate::spawn_scheduler::{SpawnContext, SpawnScheduler};
 
     #[test]
@@ -328,7 +328,7 @@ mod tests {
         let session_store = Arc::new(SessionStoreV2::new(bamboo_home.clone()).await.unwrap());
         let storage_dir = bamboo_home.join("storage");
         tokio::fs::create_dir_all(&storage_dir).await.unwrap();
-        let jsonl = bamboo_infrastructure_storage::JsonlStorage::new(&storage_dir);
+        let jsonl = bamboo_infrastructure::JsonlStorage::new(&storage_dir);
         jsonl.init().await.unwrap();
         let storage: Arc<dyn Storage> = Arc::new(jsonl);
 
@@ -336,16 +336,16 @@ mod tests {
         let metrics_collector = MetricsCollector::spawn(metrics_storage, 7);
         let session_event_senders = Arc::new(RwLock::new(HashMap::<
             String,
-            broadcast::Sender<bamboo_application_agent::AgentEvent>,
+            broadcast::Sender<bamboo_agent_core::AgentEvent>,
         >::new()));
 
         let agent_runtime = Arc::new(
-            bamboo_application_runtime::Agent::builder()
+            bamboo_engine::Agent::builder()
                 .storage(storage.clone())
                 .attachment_reader(session_store.clone())
                 .skill_manager(Arc::new(SkillManager::new()))
                 .metrics_collector(metrics_collector)
-                .config(Arc::new(RwLock::new(bamboo_infrastructure_config::Config::default())))
+                .config(Arc::new(RwLock::new(bamboo_infrastructure::Config::default())))
                 .provider(Arc::new(NoopProvider))
                 .default_tools(Arc::new(NoopToolExecutor))
                 .build()
@@ -398,7 +398,7 @@ mod tests {
         let session_store = Arc::new(SessionStoreV2::new(bamboo_home.clone()).await.unwrap());
         let storage_dir = bamboo_home.join("storage");
         tokio::fs::create_dir_all(&storage_dir).await.unwrap();
-        let jsonl = bamboo_infrastructure_storage::JsonlStorage::new(&storage_dir);
+        let jsonl = bamboo_infrastructure::JsonlStorage::new(&storage_dir);
         jsonl.init().await.unwrap();
         let storage: Arc<dyn Storage> = Arc::new(jsonl);
 
@@ -413,7 +413,7 @@ mod tests {
         let (parent_tx, mut parent_rx) = broadcast::channel(1000);
         let session_event_senders = Arc::new(RwLock::new(HashMap::<
             String,
-            broadcast::Sender<bamboo_application_agent::AgentEvent>,
+            broadcast::Sender<bamboo_agent_core::AgentEvent>,
         >::new()));
         {
             let mut senders = session_event_senders.write().await;
@@ -421,12 +421,12 @@ mod tests {
         }
 
         let agent_runtime = Arc::new(
-            bamboo_application_runtime::Agent::builder()
+            bamboo_engine::Agent::builder()
                 .storage(storage.clone())
                 .attachment_reader(session_store.clone())
                 .skill_manager(Arc::new(SkillManager::new()))
                 .metrics_collector(metrics_collector)
-                .config(Arc::new(RwLock::new(bamboo_infrastructure_config::Config::default())))
+                .config(Arc::new(RwLock::new(bamboo_infrastructure::Config::default())))
                 .provider(Arc::new(NoopProvider))
                 .default_tools(Arc::new(NoopToolExecutor))
                 .build()

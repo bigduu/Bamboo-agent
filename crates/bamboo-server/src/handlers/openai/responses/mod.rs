@@ -11,12 +11,12 @@ use super::types::ResponsesCreateRequest;
 
 pub(super) struct PreparedResponsesRequest {
     pub(super) resolved_model: String,
-    pub(super) internal_messages: Vec<bamboo_application_agent::Message>,
-    pub(super) internal_tools: Vec<bamboo_application_agent::tools::ToolSchema>,
+    pub(super) internal_messages: Vec<bamboo_agent_core::Message>,
+    pub(super) internal_tools: Vec<bamboo_agent_core::tools::ToolSchema>,
     pub(super) max_tokens: Option<u32>,
-    pub(super) reasoning_effort: Option<bamboo_shared_types::reasoning::ReasoningEffort>,
+    pub(super) reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
     pub(super) parallel_tool_calls: Option<bool>,
-    pub(super) responses_options: bamboo_infrastructure_llm::provider::ResponsesRequestOptions,
+    pub(super) responses_options: bamboo_infrastructure::provider::ResponsesRequestOptions,
     pub(super) estimated_prompt_tokens: u64,
 }
 

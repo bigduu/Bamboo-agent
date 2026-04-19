@@ -8,7 +8,7 @@ impl AppState {
     /// # Arguments
     ///
     /// * `session` - Session object to save
-    pub async fn save_session(&self, session: &bamboo_application_agent::Session) {
+    pub async fn save_session(&self, session: &bamboo_agent_core::Session) {
         let _ = self.storage.save_session(session).await;
     }
 }

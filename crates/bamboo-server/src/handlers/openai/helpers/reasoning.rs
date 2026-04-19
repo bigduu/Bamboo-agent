@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use bamboo_shared_types::reasoning::ReasoningEffort;
+use bamboo_domain::reasoning::ReasoningEffort;
 
 pub(super) fn parse_reasoning_effort(
     parameters: &HashMap<String, Value>,
@@ -42,7 +42,7 @@ mod tests {
     use serde_json::json;
 
     use super::parse_reasoning_effort;
-    use bamboo_shared_types::reasoning::ReasoningEffort;
+    use bamboo_domain::reasoning::ReasoningEffort;
 
     fn params(value: serde_json::Value) -> HashMap<String, serde_json::Value> {
         serde_json::from_value(value).expect("valid parameters")

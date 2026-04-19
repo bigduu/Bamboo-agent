@@ -10,14 +10,14 @@ use tokio::time::{sleep, Duration};
 
 use bamboo_agent::agent::{Agent, AgentBuilder, AgentEvent, Message, Session};
 use bamboo_agent::Config;
-use bamboo_application_agent::storage::Storage;
-use bamboo_application_agent::tools::{Tool, ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult, ToolSchema};
-use bamboo_application_agent::SessionKind;
-use bamboo_application_schedule::{ResolvedRunConfig, ScheduleContext};
-use bamboo_infrastructure_llm::provider::Result as LLMResult;
-use bamboo_infrastructure_llm::provider::{LLMProvider, LLMStream};
-use bamboo_infrastructure_llm::LLMChunk;
-use bamboo_infrastructure_storage::SessionStoreV2;
+use bamboo_agent_core::storage::Storage;
+use bamboo_agent_core::tools::{Tool, ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult, ToolSchema};
+use bamboo_agent_core::SessionKind;
+use bamboo_agent::server::schedule_app::{ResolvedRunConfig, ScheduleContext};
+use bamboo_infrastructure::provider::Result as LLMResult;
+use bamboo_infrastructure::provider::{LLMProvider, LLMStream};
+use bamboo_infrastructure::LLMChunk;
+use bamboo_infrastructure::SessionStoreV2;
 use bamboo_agent::server::app_state::AgentRunner;
 use bamboo_agent::server::schedules::{ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore};
 use bamboo_agent::server::tools::ScheduleTasksTool;
@@ -101,9 +101,9 @@ fn build_manager(
     provider: Arc<dyn LLMProvider>,
     config: Config,
 ) -> (Arc<Agent>, Arc<ScheduleManager>) {
-    use bamboo_application_metrics::collector::MetricsCollector;
-    use bamboo_application_metrics::storage::SqliteMetricsStorage;
-    use bamboo_application_skills::SkillManager;
+    use bamboo_engine::metrics::collector::MetricsCollector;
+    use bamboo_engine::metrics::storage::SqliteMetricsStorage;
+    use bamboo_engine::SkillManager;
 
     let metrics_storage = Arc::new(SqliteMetricsStorage::new(dir.join("metrics.db")));
     let metrics = MetricsCollector::spawn(metrics_storage, 1);
@@ -113,19 +113,26 @@ fn build_manager(
         .attachment_reader(store.clone())
         .skill_manager(Arc::new(SkillManager::new()))
         .metrics_collector(metrics)
-        .config(Arc::new(RwLock::new(config)))
+        .config(Arc::new(RwLock::new(config.clone())))
         .provider(provider)
         .default_tools(Arc::new(NoopTools))
         .build()
         .expect("build agent");
 
     let agent = Arc::new(agent);
-    let resolve_run_config = Arc::new(|_job: &ScheduleRunJob| ResolvedRunConfig {
-        model: String::new(),
-        reasoning_effort: None,
-        system_prompt: String::new(),
-        base_system_prompt: String::new(),
-        workspace_path: None,
+    let resolve_run_config = Arc::new(move |_job: &ScheduleRunJob| {
+        let model = config
+            .get_model()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "test-model".to_string());
+        ResolvedRunConfig {
+            model,
+            reasoning_effort: None,
+            system_prompt: String::new(),
+            base_system_prompt: String::new(),
+            workspace_path: None,
+        }
     });
 
     let ctx = ScheduleContext {

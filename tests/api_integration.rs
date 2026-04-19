@@ -40,8 +40,8 @@ mod tests {
 
     #[test]
     fn test_tool_schema_structure() {
-        use bamboo_application_agent::tools::FunctionSchema;
-        use bamboo_application_agent::tools::ToolSchema;
+        use bamboo_agent_core::tools::FunctionSchema;
+        use bamboo_agent_core::tools::ToolSchema;
         use serde_json::json;
 
         let schema = ToolSchema {

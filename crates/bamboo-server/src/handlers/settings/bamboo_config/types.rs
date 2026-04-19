@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use bamboo_infrastructure_config::ProxyAuth;
+use bamboo_infrastructure::ProxyAuth;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]

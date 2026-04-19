@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use bamboo_infrastructure_llm::api::models::{
+use bamboo_infrastructure::api::models::{
     ChatCompletionStreamChunk, StreamChoice, StreamDelta, StreamFunctionCall, StreamToolCall,
 };
 
@@ -12,12 +12,12 @@ pub(super) fn now_unix_ts() -> u64 {
 }
 
 pub(super) fn convert_chunk_to_openai(
-    chunk: bamboo_infrastructure_llm::types::LLMChunk,
+    chunk: bamboo_infrastructure::types::LLMChunk,
     model: &str,
 ) -> Option<ChatCompletionStreamChunk> {
     match chunk {
-        bamboo_infrastructure_llm::types::LLMChunk::ResponseId(_) => None,
-        bamboo_infrastructure_llm::types::LLMChunk::Token(text) => Some(ChatCompletionStreamChunk {
+        bamboo_infrastructure::types::LLMChunk::ResponseId(_) => None,
+        bamboo_infrastructure::types::LLMChunk::Token(text) => Some(ChatCompletionStreamChunk {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             object: Some("chat.completion.chunk".to_string()),
             created: chrono::Utc::now().timestamp() as u64,
@@ -33,7 +33,7 @@ pub(super) fn convert_chunk_to_openai(
             }],
             usage: None,
         }),
-        bamboo_infrastructure_llm::types::LLMChunk::ToolCalls(tool_calls) => {
+        bamboo_infrastructure::types::LLMChunk::ToolCalls(tool_calls) => {
             let stream_tool_calls: Vec<StreamToolCall> = tool_calls
                 .into_iter()
                 .enumerate()
@@ -65,8 +65,8 @@ pub(super) fn convert_chunk_to_openai(
                 usage: None,
             })
         }
-        bamboo_infrastructure_llm::types::LLMChunk::ReasoningToken(_) => None,
-        bamboo_infrastructure_llm::types::LLMChunk::Done => Some(ChatCompletionStreamChunk {
+        bamboo_infrastructure::types::LLMChunk::ReasoningToken(_) => None,
+        bamboo_infrastructure::types::LLMChunk::Done => Some(ChatCompletionStreamChunk {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             object: Some("chat.completion.chunk".to_string()),
             created: chrono::Utc::now().timestamp() as u64,
@@ -88,8 +88,8 @@ pub(super) fn convert_chunk_to_openai(
 #[cfg(test)]
 mod tests {
     use super::{convert_chunk_to_openai, now_unix_ts};
-    use bamboo_application_agent::tools::{FunctionCall, ToolCall};
-    use bamboo_infrastructure_llm::types::LLMChunk;
+    use bamboo_agent_core::tools::{FunctionCall, ToolCall};
+    use bamboo_infrastructure::types::LLMChunk;
 
     fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
         ToolCall {

@@ -2,8 +2,8 @@ use actix_web::Error as ActixError;
 use bytes::Bytes;
 use serde_json::Value;
 
-use bamboo_application_agent::tools::ToolCall;
-use bamboo_infrastructure_llm::protocol::gemini::{
+use bamboo_agent_core::tools::ToolCall;
+use bamboo_infrastructure::protocol::gemini::{
     GeminiCandidate, GeminiContent, GeminiFunctionCall, GeminiPart, GeminiResponse,
 };
 

@@ -1,4 +1,4 @@
-use bamboo_application_agent::tools::ToolResult;
+use bamboo_agent_core::tools::ToolResult;
 use crate::error::AppError;
 
 use super::{

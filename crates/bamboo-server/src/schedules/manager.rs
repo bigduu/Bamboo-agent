@@ -4,7 +4,7 @@
 //! provides [`build_schedule_context`] to construct a `ScheduleContext`
 //! with server-specific Config resolution baked in.
 
-pub use bamboo_application_schedule::{ResolvedRunConfig, ScheduleContext, ScheduleManager, ScheduleRunJob};
+pub use crate::schedule_app::{ResolvedRunConfig, ScheduleContext, ScheduleManager, ScheduleRunJob};
 
 /// Build a [`ScheduleContext`] with server-specific config resolution.
 ///
@@ -13,7 +13,7 @@ pub use bamboo_application_schedule::{ResolvedRunConfig, ScheduleContext, Schedu
 /// prompt defaults.
 pub fn build_schedule_context(
     base: ScheduleContext,
-    config: std::sync::Arc<tokio::sync::RwLock<bamboo_infrastructure_config::Config>>,
+    config: std::sync::Arc<tokio::sync::RwLock<bamboo_infrastructure::Config>>,
 ) -> ScheduleContext {
     ScheduleContext {
         schedule_store: base.schedule_store,
@@ -31,7 +31,7 @@ pub fn build_schedule_context(
 
 fn resolve_run_config_from_config(
     job: &ScheduleRunJob,
-    config: &std::sync::Arc<tokio::sync::RwLock<bamboo_infrastructure_config::Config>>,
+    config: &std::sync::Arc<tokio::sync::RwLock<bamboo_infrastructure::Config>>,
 ) -> ResolvedRunConfig {
     let config_snapshot = config.try_read().map(|g| g.clone()).unwrap_or_default();
 
@@ -76,7 +76,7 @@ fn resolve_run_config_from_config(
         .or_else(|| {
             config_snapshot
                 .get_default_work_area_path()
-                .map(|path| bamboo_infrastructure_config::paths::path_to_display_string(&path))
+                .map(|path| bamboo_infrastructure::paths::path_to_display_string(&path))
         });
 
     let enhance_prompt = job
@@ -86,7 +86,7 @@ fn resolve_run_config_from_config(
         .map(str::trim)
         .filter(|v| !v.is_empty());
 
-    let system_prompt = bamboo_application_runtime::context::assemble_system_prompt(
+    let system_prompt = bamboo_engine::context::assemble_system_prompt(
         base_system_prompt,
         enhance_prompt,
         workspace_path.as_deref(),

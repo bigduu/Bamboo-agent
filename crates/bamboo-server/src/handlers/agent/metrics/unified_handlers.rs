@@ -4,7 +4,7 @@ use super::{
     internal_error, CombinedSummary, MemoryMetricsQuery, MetricsDailyQuery, MetricsSummaryQuery,
     UnifiedSummary, UnifiedTimelinePoint,
 };
-use bamboo_application_memory::memory_store::MemoryStore;
+use bamboo_memory::memory_store::MemoryStore;
 use crate::app_state::AppState;
 
 use super::core_handlers::memory::build_memory_summary;
@@ -24,7 +24,7 @@ pub async fn v2_unified_summary(
 
     let forward_result = state
         .metrics_service
-        .forward_summary(bamboo_application_metrics::ForwardMetricsFilter {
+        .forward_summary(bamboo_engine::ForwardMetricsFilter {
             start_date: query.start_date,
             end_date: query.end_date,
             endpoint: None,
@@ -99,7 +99,7 @@ pub async fn v2_unified_timeline(
     let chat_result = state.metrics_service.daily(days, query.end_date).await;
     let forward_result = state
         .metrics_service
-        .forward_daily(bamboo_application_metrics::ForwardMetricsFilter {
+        .forward_daily(bamboo_engine::ForwardMetricsFilter {
             start_date: None,
             end_date: query.end_date,
             endpoint: None,
@@ -111,12 +111,12 @@ pub async fn v2_unified_timeline(
     match (chat_result, forward_result) {
         (Ok(chat_daily), Ok(forward_daily)) => {
             // Build maps for efficient lookup.
-            let chat_map: std::collections::HashMap<String, &bamboo_application_metrics::DailyMetrics> =
+            let chat_map: std::collections::HashMap<String, &bamboo_engine::DailyMetrics> =
                 chat_daily.iter().map(|d| (d.date.to_string(), d)).collect();
 
             let forward_map: std::collections::HashMap<
                 String,
-                &bamboo_application_metrics::DailyMetrics,
+                &bamboo_engine::DailyMetrics,
             > = forward_daily
                 .iter()
                 .map(|d| (d.date.to_string(), d))

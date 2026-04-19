@@ -7,7 +7,7 @@
 //! `bamboo-server-tools` crate. This module re-exports them for convenience.
 
 // Re-export framework-agnostic tools from crate
-pub use bamboo_server_tools::{
+pub use crate::server_tools::{
     MemoryTool, OverlayToolExecutor, SessionInspectorTool, LoadSkillTool, ReadSkillResourceTool,
     ToolSurface, ToolSurfaceFactory,
 };

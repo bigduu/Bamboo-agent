@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use bamboo_infrastructure_config::Config;
+use bamboo_infrastructure::Config;
 use crate::error::AppError;
 
 pub(super) fn set_setup_complete(

@@ -1,5 +1,5 @@
-use bamboo_application_agent::tools::ToolSchema;
-use bamboo_application_tools::BuiltinToolExecutor;
+use bamboo_agent_core::tools::ToolSchema;
+use bamboo_tools::BuiltinToolExecutor;
 use actix_web::{web, HttpResponse};
 use tracing::{debug, info};
 
@@ -77,7 +77,7 @@ async fn selected_skill_ids_for_session(
     session
         .metadata
         .get("selected_skill_ids")
-        .and_then(|raw| bamboo_application_skills::selection::parse_selected_skill_ids_metadata(raw))
+        .and_then(|raw| bamboo_engine::selection::parse_selected_skill_ids_metadata(raw))
 }
 
 async fn selected_skill_mode_for_session(

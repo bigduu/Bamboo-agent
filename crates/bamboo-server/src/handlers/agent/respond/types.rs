@@ -1,4 +1,4 @@
-use bamboo_shared_types::reasoning::ReasoningEffort;
+use bamboo_domain::reasoning::ReasoningEffort;
 use serde::Deserialize;
 
 /// Request payload for submitting a user response.
@@ -87,7 +87,7 @@ mod tests {
         assert_eq!(req.model.as_deref(), Some("gpt-5-mini"));
         assert_eq!(
             req.reasoning_effort,
-            Some(bamboo_shared_types::reasoning::ReasoningEffort::High)
+            Some(bamboo_domain::reasoning::ReasoningEffort::High)
         );
     }
 

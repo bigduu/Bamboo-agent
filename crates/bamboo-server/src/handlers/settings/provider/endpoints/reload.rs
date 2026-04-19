@@ -8,7 +8,7 @@ pub(super) async fn handle_reload_provider_config(
     // Reload config from disk first.
     let new_config = app_state.reload_config().await;
 
-    if let Err(error) = bamboo_infrastructure_llm::validate_provider_config(&new_config) {
+    if let Err(error) = bamboo_infrastructure::validate_provider_config(&new_config) {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
             "success": false,
             "error": error.to_string()

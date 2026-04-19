@@ -12,14 +12,14 @@ use std::time::Duration;
 use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
 
-use bamboo_infrastructure_storage::SessionStoreV2;
-use bamboo_application_agent::storage::Storage;
-use bamboo_application_agent::{AgentEvent, Session};
-use bamboo_infrastructure_mcp::McpServerManager;
-use bamboo_application_runtime::Agent;
-use bamboo_application_skills::{SkillManager, SkillStoreConfig};
-use bamboo_infrastructure_config::Config;
-use bamboo_infrastructure_llm::LLMProvider;
+use bamboo_infrastructure::SessionStoreV2;
+use bamboo_agent_core::storage::Storage;
+use bamboo_agent_core::{AgentEvent, Session};
+use bamboo_engine::McpServerManager;
+use bamboo_engine::Agent;
+use bamboo_engine::{SkillManager, SkillStoreConfig};
+use bamboo_infrastructure::Config;
+use bamboo_infrastructure::LLMProvider;
 
 use crate::error::AppError;
 use crate::metrics_service::MetricsService;
@@ -31,7 +31,7 @@ use crate::spawn_scheduler::{SpawnContext, SpawnScheduler};
 use super::{AgentRunner, AgentStatus};
 
 /// Type alias for the permission checker trait object.
-pub(super) type PermissionChecker = dyn bamboo_application_tools::permission::PermissionChecker;
+pub(super) type PermissionChecker = dyn bamboo_tools::permission::PermissionChecker;
 
 /// Type alias for the provider lock + handle pair returned by [`build_provider_handles`].
 type ProviderHandles = (Arc<RwLock<Arc<dyn LLMProvider>>>, Arc<dyn LLMProvider>);
@@ -138,24 +138,24 @@ pub fn build_provider_handles(
 /// Falls back to disabled permissions if no config exists or loading fails.
 pub async fn load_permission_checker(bamboo_home_dir: &Path) -> Arc<PermissionChecker> {
     let storage =
-        bamboo_application_tools::permission::storage::PermissionStorage::new(bamboo_home_dir);
+        bamboo_tools::permission::storage::PermissionStorage::new(bamboo_home_dir);
     let permission_config = match storage.load().await {
         Ok(Some(config)) => config,
         Ok(None) => {
-            let cfg = bamboo_application_tools::permission::PermissionConfig::new();
+            let cfg = bamboo_tools::permission::PermissionConfig::new();
             cfg.set_enabled(false);
             cfg
         }
         Err(error) => {
             tracing::warn!("Failed to load permission config; defaulting to disabled: {error}");
-            let cfg = bamboo_application_tools::permission::PermissionConfig::new();
+            let cfg = bamboo_tools::permission::PermissionConfig::new();
             cfg.set_enabled(false);
             cfg
         }
     };
     permission_config.cleanup_expired_grants();
     Arc::new(
-        bamboo_application_tools::permission::ConfigPermissionChecker::new(Arc::new(permission_config)),
+        bamboo_tools::permission::ConfigPermissionChecker::new(Arc::new(permission_config)),
     )
 }
 
@@ -244,7 +244,7 @@ pub async fn init_schedule_store(data_dir: &PathBuf) -> Result<Arc<ScheduleStore
 /// Build sub-session spawn scheduler.
 pub fn build_spawn_scheduler(
     agent: Arc<Agent>,
-    child_tools: Arc<dyn bamboo_application_agent::tools::ToolExecutor>,
+    child_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
@@ -262,7 +262,7 @@ pub fn build_spawn_scheduler(
 pub fn build_schedule_manager(
     schedule_store: Arc<ScheduleStore>,
     agent: Arc<Agent>,
-    tools_for_schedules: Arc<dyn bamboo_application_agent::tools::ToolExecutor>,
+    tools_for_schedules: Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,

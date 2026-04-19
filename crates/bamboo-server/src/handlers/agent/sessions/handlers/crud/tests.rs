@@ -1,9 +1,9 @@
-use bamboo_application_session::session_create::{
+use crate::session_app::session_create::{
     build_new_session, resolve_model, resolve_reasoning_effort, CreateSessionConfig,
     CreateSessionInput,
 };
-use bamboo_infrastructure_config::{Config, ProviderConfigs};
-use bamboo_shared_types::reasoning::ReasoningEffort;
+use bamboo_infrastructure::{Config, ProviderConfigs};
+use bamboo_domain::reasoning::ReasoningEffort;
 
 const BUILTIN_FALLBACK: &str = crate::app_state::DEFAULT_BASE_PROMPT;
 
@@ -62,7 +62,7 @@ fn build_new_session_applies_title_and_system_prompt_metadata() {
     assert_eq!(session.reasoning_effort, Some(ReasoningEffort::High));
     assert!(matches!(
         session.messages.first().map(|message| &message.role),
-        Some(bamboo_application_agent::Role::System)
+        Some(bamboo_agent_core::Role::System)
     ));
     assert_eq!(
         session
@@ -71,7 +71,7 @@ fn build_new_session_applies_title_and_system_prompt_metadata() {
             .map(|message| message.content.as_str()),
         Some("You are helpful")
     );
-    let snapshot = bamboo_application_runtime::runner::read_prompt_snapshot(&session)
+    let snapshot = bamboo_engine::runner::read_prompt_snapshot(&session)
         .expect("prompt snapshot should exist for explicit prompt session");
     assert_eq!(snapshot.base_system_prompt, "You are helpful");
     assert_eq!(snapshot.effective_system_prompt, "You are helpful");

@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use tokio::sync::RwLock;
 
-use bamboo_application_memory::auto_dream::{
+use bamboo_memory::auto_dream::{
     ConsolidationSessionInfo, DreamCandidateInfo, DreamGenerationMode,
     build_consolidation_prompt, build_extraction_prompt, build_rebuild_consolidation_prompt,
     build_refine_consolidation_prompt, derive_session_outline,
@@ -15,12 +15,12 @@ use bamboo_application_memory::auto_dream::{
     parse_extraction_candidates, parse_last_consolidated_at, parse_last_full_rebuild_at,
     should_force_full_rebuild, should_use_dream_refine_mode, truncate_chars,
 };
-use bamboo_application_memory::memory_store::{MemoryScope, MemoryStore};
-use bamboo_infrastructure_storage::{SessionIndexEntry, SessionStoreV2};
-use bamboo_application_agent::{Message, SessionKind};
-use bamboo_infrastructure_llm::{LLMChunk, LLMProvider, LLMRequestOptions};
-use bamboo_infrastructure_config::Config;
-use bamboo_shared_types::reasoning::ReasoningEffort;
+use bamboo_memory::memory_store::{MemoryScope, MemoryStore};
+use bamboo_infrastructure::{SessionIndexEntry, SessionStoreV2};
+use bamboo_agent_core::{Message, SessionKind};
+use bamboo_infrastructure::{LLMChunk, LLMProvider, LLMRequestOptions};
+use bamboo_infrastructure::Config;
+use bamboo_domain::reasoning::ReasoningEffort;
 
 const DREAM_RUNTIME_SESSION_ID: &str = "__dream__";
 const DREAM_TRACING_TARGET: &str = "bamboo.auto_dream";
@@ -50,7 +50,7 @@ fn to_consolidation_sessions(entries: &[(SessionIndexEntry, Option<String>)]) ->
 #[derive(Clone)]
 pub struct AutoDreamContext {
     pub session_store: Arc<SessionStoreV2>,
-    pub storage: Arc<dyn bamboo_application_agent::storage::Storage>,
+    pub storage: Arc<dyn bamboo_agent_core::storage::Storage>,
     pub provider: Arc<dyn LLMProvider>,
     pub config: Arc<RwLock<Config>>,
 }
@@ -133,7 +133,7 @@ async fn resolve_session_project_key(
         .flatten()
         .and_then(|session| session.metadata.get("workspace_path").cloned())
         .map(std::path::PathBuf::from)
-        .map(|path| bamboo_application_memory::memory_store::project_key_from_path(&path))
+        .map(|path| bamboo_memory::memory_store::project_key_from_path(&path))
         .or_else(|| memory.project_key_for_session(Some(session_id)))
 }
 
@@ -794,8 +794,8 @@ mod tests {
     use async_trait::async_trait;
     use futures::stream;
 
-    use bamboo_application_agent::storage::Storage;
-    use bamboo_infrastructure_llm::{LLMError, LLMStream};
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_infrastructure::{LLMError, LLMStream};
 
     #[derive(Debug, Clone)]
     enum SequenceStep {
@@ -831,7 +831,7 @@ mod tests {
         async fn chat_stream(
             &self,
             messages: &[Message],
-            _tools: &[bamboo_application_agent::tools::ToolSchema],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
             _max_output_tokens: Option<u32>,
             _model: &str,
         ) -> Result<LLMStream, LLMError> {
@@ -868,7 +868,7 @@ mod tests {
     #[tokio::test]
     async fn extract_and_persist_durable_candidates_writes_memory_and_marks_session() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -880,15 +880,15 @@ mod tests {
             "{\"candidates\":[{\"title\":\"User prefers terse responses\",\"type\":\"feedback\",\"scope\":\"project\",\"content\":\"The user prefers terse responses and no recap.\",\"tags\":[\"preference\",\"style\"],\"session_id\":\"session-auto\",\"confidence\":\"high\"}]}".to_string(),
         ]));
         let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_infrastructure_config::config::MemoryConfig {
+            memory: Some(bamboo_infrastructure::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
-                ..bamboo_infrastructure_config::config::MemoryConfig::default()
+                ..bamboo_infrastructure::config::MemoryConfig::default()
             }),
             ..Config::default()
         }));
 
-        let mut session = bamboo_application_agent::Session::new("session-auto", "model");
+        let mut session = bamboo_agent_core::Session::new("session-auto", "model");
         session.title = "Auto memory test".to_string();
         session.metadata.insert(
             "workspace_path".to_string(),
@@ -898,7 +898,7 @@ mod tests {
                 .to_string_lossy()
                 .to_string(),
         );
-        session.conversation_summary = Some(bamboo_application_agent::ConversationSummary::new(
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
             "User confirmed a stable response preference.",
             3,
             128,
@@ -932,7 +932,7 @@ mod tests {
                 .expect("extraction should succeed");
         assert_eq!(writes, 1);
 
-        let project_key = bamboo_application_memory::memory_store::project_key_from_path(
+        let project_key = bamboo_memory::memory_store::project_key_from_path(
             &temp_dir.path().join("workspace-a"),
         );
         let results = memory
@@ -942,7 +942,7 @@ mod tests {
                 Some("terse recap"),
                 None,
                 None,
-                &bamboo_application_memory::memory_store::MemoryQueryOptions {
+                &bamboo_memory::memory_store::MemoryQueryOptions {
                     limit: Some(5),
                     max_chars: Some(2000),
                     cursor: None,
@@ -964,7 +964,7 @@ mod tests {
     #[tokio::test]
     async fn extract_and_persist_durable_candidates_ignores_empty_candidate_lists() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -976,15 +976,15 @@ mod tests {
             "{\"candidates\":[]}".to_string(),
         ]));
         let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_infrastructure_config::config::MemoryConfig {
+            memory: Some(bamboo_infrastructure::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
-                ..bamboo_infrastructure_config::config::MemoryConfig::default()
+                ..bamboo_infrastructure::config::MemoryConfig::default()
             }),
             ..Config::default()
         }));
 
-        let mut session = bamboo_application_agent::Session::new("session-empty", "model");
+        let mut session = bamboo_agent_core::Session::new("session-empty", "model");
         session.metadata.insert(
             "workspace_path".to_string(),
             temp_dir.path().to_string_lossy().to_string(),
@@ -1026,7 +1026,7 @@ mod tests {
     #[tokio::test]
     async fn run_auto_dream_once_updates_dream_and_persists_candidates() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -1039,15 +1039,15 @@ mod tests {
             "{\"candidates\":[{\"title\":\"User prefers concise answers\",\"type\":\"feedback\",\"scope\":\"project\",\"content\":\"The user prefers concise answers and minimal recap.\",\"tags\":[\"preference\"],\"session_id\":\"session-dream-run\"}]}".to_string(),
         ]));
         let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_infrastructure_config::config::MemoryConfig {
+            memory: Some(bamboo_infrastructure::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
-                ..bamboo_infrastructure_config::config::MemoryConfig::default()
+                ..bamboo_infrastructure::config::MemoryConfig::default()
             }),
             ..Config::default()
         }));
 
-        let mut session = bamboo_application_agent::Session::new("session-dream-run", "model");
+        let mut session = bamboo_agent_core::Session::new("session-dream-run", "model");
         session.title = "Dream run test".to_string();
         session.metadata.insert(
             "workspace_path".to_string(),
@@ -1057,7 +1057,7 @@ mod tests {
                 .to_string_lossy()
                 .to_string(),
         );
-        session.conversation_summary = Some(bamboo_application_agent::ConversationSummary::new(
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
             "Stable user preference discussed.",
             4,
             200,
@@ -1096,7 +1096,7 @@ mod tests {
         assert!(dream.contains("Bamboo Dream Notebook"));
         assert!(dream.contains("Durable signal found"));
 
-        let project_key = bamboo_application_memory::memory_store::project_key_from_path(
+        let project_key = bamboo_memory::memory_store::project_key_from_path(
             &temp_dir.path().join("workspace-run"),
         );
         let results = memory
@@ -1106,7 +1106,7 @@ mod tests {
                 Some("concise answers"),
                 None,
                 None,
-                &bamboo_application_memory::memory_store::MemoryQueryOptions {
+                &bamboo_memory::memory_store::MemoryQueryOptions {
                     limit: Some(5),
                     max_chars: Some(2000),
                     cursor: None,
@@ -1122,13 +1122,13 @@ mod tests {
     #[tokio::test]
     async fn run_project_auto_dream_once_filters_sessions_by_project_and_writes_project_dream() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
         let workspace_a = temp_dir.path().join("workspace-a");
         let workspace_b = temp_dir.path().join("workspace-b");
         std::fs::create_dir_all(&workspace_a).expect("workspace a");
         std::fs::create_dir_all(&workspace_b).expect("workspace b");
-        let project_key_a = bamboo_application_memory::memory_store::project_key_from_path(&workspace_a);
+        let project_key_a = bamboo_memory::memory_store::project_key_from_path(&workspace_a);
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -1141,21 +1141,21 @@ mod tests {
             "{\"candidates\":[{\"title\":\"Project A prefers concise planning\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"Project A plans should stay concise and scoped.\",\"tags\":[\"planning\"],\"session_id\":\"session-project-a\"}]}".to_string(),
         ]));
         let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_infrastructure_config::config::MemoryConfig {
+            memory: Some(bamboo_infrastructure::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
-                ..bamboo_infrastructure_config::config::MemoryConfig::default()
+                ..bamboo_infrastructure::config::MemoryConfig::default()
             }),
             ..Config::default()
         }));
 
-        let mut session_a = bamboo_application_agent::Session::new("session-project-a", "model");
+        let mut session_a = bamboo_agent_core::Session::new("session-project-a", "model");
         session_a.title = "Project A session".to_string();
         session_a.metadata.insert(
             "workspace_path".to_string(),
             workspace_a.to_string_lossy().to_string(),
         );
-        session_a.conversation_summary = Some(bamboo_application_agent::ConversationSummary::new(
+        session_a.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
             "Project A stable direction.",
             4,
             160,
@@ -1166,13 +1166,13 @@ mod tests {
             .await
             .expect("save session a");
 
-        let mut session_b = bamboo_application_agent::Session::new("session-project-b", "model");
+        let mut session_b = bamboo_agent_core::Session::new("session-project-b", "model");
         session_b.title = "Project B session".to_string();
         session_b.metadata.insert(
             "workspace_path".to_string(),
             workspace_b.to_string_lossy().to_string(),
         );
-        session_b.conversation_summary = Some(bamboo_application_agent::ConversationSummary::new(
+        session_b.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
             "Project B unrelated direction.",
             4,
             160,
@@ -1235,7 +1235,7 @@ mod tests {
                 Some("concise planning"),
                 None,
                 None,
-                &bamboo_application_memory::memory_store::MemoryQueryOptions {
+                &bamboo_memory::memory_store::MemoryQueryOptions {
                     limit: Some(5),
                     max_chars: Some(2000),
                     cursor: None,
@@ -1252,14 +1252,14 @@ mod tests {
     async fn run_project_auto_dream_once_returns_none_without_target_project_sessions_and_preserves_existing_dream(
     ) {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
         let workspace_other = temp_dir.path().join("workspace-other");
         let workspace_target = temp_dir.path().join("workspace-target");
         std::fs::create_dir_all(&workspace_other).expect("workspace other");
         std::fs::create_dir_all(&workspace_target).expect("workspace target");
         let target_project_key =
-            bamboo_application_memory::memory_store::project_key_from_path(&workspace_target);
+            bamboo_memory::memory_store::project_key_from_path(&workspace_target);
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -1269,21 +1269,21 @@ mod tests {
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![]));
         let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_infrastructure_config::config::MemoryConfig {
+            memory: Some(bamboo_infrastructure::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
-                ..bamboo_infrastructure_config::config::MemoryConfig::default()
+                ..bamboo_infrastructure::config::MemoryConfig::default()
             }),
             ..Config::default()
         }));
 
-        let mut other_session = bamboo_application_agent::Session::new("session-other-project", "model");
+        let mut other_session = bamboo_agent_core::Session::new("session-other-project", "model");
         other_session.title = "Other project session".to_string();
         other_session.metadata.insert(
             "workspace_path".to_string(),
             workspace_other.to_string_lossy().to_string(),
         );
-        other_session.conversation_summary = Some(bamboo_application_agent::ConversationSummary::new(
+        other_session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
             "Other project only.",
             2,
             80,
@@ -1325,11 +1325,11 @@ mod tests {
     #[tokio::test]
     async fn run_project_auto_dream_once_still_runs_when_auto_background_dream_is_disabled() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
         let workspace = temp_dir.path().join("workspace-manual-project-dream");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let project_key = bamboo_application_memory::memory_store::project_key_from_path(&workspace);
+        let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -1342,20 +1342,20 @@ mod tests {
             "{\"candidates\":[]}".to_string(),
         ]));
         let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_infrastructure_config::config::MemoryConfig {
+            memory: Some(bamboo_infrastructure::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
-                ..bamboo_infrastructure_config::config::MemoryConfig::default()
+                ..bamboo_infrastructure::config::MemoryConfig::default()
             }),
             ..Config::default()
         }));
 
-        let mut session = bamboo_application_agent::Session::new("session-manual-project-dream", "model");
+        let mut session = bamboo_agent_core::Session::new("session-manual-project-dream", "model");
         session.title = "Manual project dream session".to_string();
         session.metadata.insert(
             "workspace_path".to_string(),
             workspace.to_string_lossy().to_string(),
         );
-        session.conversation_summary = Some(bamboo_application_agent::ConversationSummary::new(
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
             "Manual project dream summary.",
             3,
             100,
@@ -1398,7 +1398,7 @@ mod tests {
     #[tokio::test]
     async fn run_auto_dream_once_refine_mode_includes_existing_dream_in_prompt() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -1412,11 +1412,11 @@ mod tests {
         ]);
         let provider_handle: Arc<dyn LLMProvider> = Arc::new(provider.clone());
         let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_infrastructure_config::config::MemoryConfig {
+            memory: Some(bamboo_infrastructure::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
                 dream_refine_mode: true,
-                ..bamboo_infrastructure_config::config::MemoryConfig::default()
+                ..bamboo_infrastructure::config::MemoryConfig::default()
             }),
             ..Config::default()
         }));
@@ -1424,13 +1424,13 @@ mod tests {
         let workspace = temp_dir.path().join("workspace-refine-mode");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
 
-        let mut session = bamboo_application_agent::Session::new("session-refine-mode", "model");
+        let mut session = bamboo_agent_core::Session::new("session-refine-mode", "model");
         session.title = "Refine mode test".to_string();
         session.metadata.insert(
             "workspace_path".to_string(),
             workspace.to_string_lossy().to_string(),
         );
-        session.conversation_summary = Some(bamboo_application_agent::ConversationSummary::new(
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
             "Recent session summary for refine mode.",
             3,
             120,
@@ -1474,7 +1474,7 @@ mod tests {
     #[tokio::test]
     async fn run_auto_dream_once_refine_mode_includes_recent_durable_memory_in_prompt() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -1488,26 +1488,26 @@ mod tests {
         ]);
         let provider_handle: Arc<dyn LLMProvider> = Arc::new(provider.clone());
         let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_infrastructure_config::config::MemoryConfig {
+            memory: Some(bamboo_infrastructure::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
                 dream_refine_mode: true,
-                ..bamboo_infrastructure_config::config::MemoryConfig::default()
+                ..bamboo_infrastructure::config::MemoryConfig::default()
             }),
             ..Config::default()
         }));
 
         let workspace = temp_dir.path().join("workspace-refine-recent-memory");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let project_key = bamboo_application_memory::memory_store::project_key_from_path(&workspace);
+        let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
 
-        let mut session = bamboo_application_agent::Session::new("session-refine-recent-memory", "model");
+        let mut session = bamboo_agent_core::Session::new("session-refine-recent-memory", "model");
         session.title = "Refine recent memory test".to_string();
         session.metadata.insert(
             "workspace_path".to_string(),
             workspace.to_string_lossy().to_string(),
         );
-        session.conversation_summary = Some(bamboo_application_agent::ConversationSummary::new(
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
             "Recent session summary for refine recent memory.",
             3,
             120,
@@ -1529,7 +1529,7 @@ mod tests {
             .write_memory(
                 MemoryScope::Project,
                 Some(&project_key),
-                bamboo_application_memory::memory_store::DurableMemoryType::Project,
+                bamboo_memory::memory_store::DurableMemoryType::Project,
                 "Release freeze rule",
                 "The release freeze starts on Tuesday for mobile.",
                 &["release".to_string(), "freeze".to_string()],
@@ -1562,7 +1562,7 @@ mod tests {
     #[tokio::test]
     async fn run_auto_dream_once_forces_periodic_full_rebuild_using_memory_index() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -1576,26 +1576,26 @@ mod tests {
         ]);
         let provider_handle: Arc<dyn LLMProvider> = Arc::new(provider.clone());
         let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_infrastructure_config::config::MemoryConfig {
+            memory: Some(bamboo_infrastructure::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
                 dream_refine_mode: true,
-                ..bamboo_infrastructure_config::config::MemoryConfig::default()
+                ..bamboo_infrastructure::config::MemoryConfig::default()
             }),
             ..Config::default()
         }));
 
         let workspace = temp_dir.path().join("workspace-rebuild-mode");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let project_key = bamboo_application_memory::memory_store::project_key_from_path(&workspace);
+        let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
 
-        let mut session = bamboo_application_agent::Session::new("session-rebuild-mode", "model");
+        let mut session = bamboo_agent_core::Session::new("session-rebuild-mode", "model");
         session.title = "Rebuild mode test".to_string();
         session.metadata.insert(
             "workspace_path".to_string(),
             workspace.to_string_lossy().to_string(),
         );
-        session.conversation_summary = Some(bamboo_application_agent::ConversationSummary::new(
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
             "Recent session summary for rebuild mode.",
             3,
             120,
@@ -1617,7 +1617,7 @@ mod tests {
             .write_memory(
                 MemoryScope::Project,
                 Some(&project_key),
-                bamboo_application_memory::memory_store::DurableMemoryType::Project,
+                bamboo_memory::memory_store::DurableMemoryType::Project,
                 "Canonical release decision",
                 "Release freeze starts Tuesday and all mobile changes require review.",
                 &["release".to_string(), "mobile".to_string()],
@@ -1693,7 +1693,7 @@ Model: gpt-5-mini
     #[tokio::test]
     async fn run_auto_dream_once_refine_mode_normalizes_nested_notebook_output() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -1707,11 +1707,11 @@ Model: gpt-5-mini
         ]);
         let provider_handle: Arc<dyn LLMProvider> = Arc::new(provider.clone());
         let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_infrastructure_config::config::MemoryConfig {
+            memory: Some(bamboo_infrastructure::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
                 dream_refine_mode: true,
-                ..bamboo_infrastructure_config::config::MemoryConfig::default()
+                ..bamboo_infrastructure::config::MemoryConfig::default()
             }),
             ..Config::default()
         }));
@@ -1719,13 +1719,13 @@ Model: gpt-5-mini
         let workspace = temp_dir.path().join("workspace-refine-normalize");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
 
-        let mut session = bamboo_application_agent::Session::new("session-refine-normalize", "model");
+        let mut session = bamboo_agent_core::Session::new("session-refine-normalize", "model");
         session.title = "Refine normalize test".to_string();
         session.metadata.insert(
             "workspace_path".to_string(),
             workspace.to_string_lossy().to_string(),
         );
-        session.conversation_summary = Some(bamboo_application_agent::ConversationSummary::new(
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
             "Recent session summary for refine normalization.",
             3,
             120,
@@ -1775,7 +1775,7 @@ Model: gpt-5-mini
     #[tokio::test]
     async fn run_auto_dream_once_refine_mode_falls_back_to_legacy_prompt_on_failure() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -1792,11 +1792,11 @@ Model: gpt-5-mini
         ]);
         let provider_handle: Arc<dyn LLMProvider> = Arc::new(provider.clone());
         let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_infrastructure_config::config::MemoryConfig {
+            memory: Some(bamboo_infrastructure::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
                 dream_refine_mode: true,
-                ..bamboo_infrastructure_config::config::MemoryConfig::default()
+                ..bamboo_infrastructure::config::MemoryConfig::default()
             }),
             ..Config::default()
         }));
@@ -1804,13 +1804,13 @@ Model: gpt-5-mini
         let workspace = temp_dir.path().join("workspace-refine-fallback");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
 
-        let mut session = bamboo_application_agent::Session::new("session-refine-fallback", "model");
+        let mut session = bamboo_agent_core::Session::new("session-refine-fallback", "model");
         session.title = "Refine fallback test".to_string();
         session.metadata.insert(
             "workspace_path".to_string(),
             workspace.to_string_lossy().to_string(),
         );
-        session.conversation_summary = Some(bamboo_application_agent::ConversationSummary::new(
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
             "Recent summary for fallback mode.",
             3,
             120,
@@ -1860,7 +1860,7 @@ Model: gpt-5-mini
     #[tokio::test]
     async fn run_auto_dream_once_returns_none_when_disabled() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -1870,9 +1870,9 @@ Model: gpt-5-mini
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![]));
         let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_infrastructure_config::config::MemoryConfig {
+            memory: Some(bamboo_infrastructure::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
-                ..bamboo_infrastructure_config::config::MemoryConfig::default()
+                ..bamboo_infrastructure::config::MemoryConfig::default()
             }),
             ..Config::default()
         }));
@@ -1892,7 +1892,7 @@ Model: gpt-5-mini
     #[tokio::test]
     async fn run_auto_dream_once_returns_none_without_candidate_sessions() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -1902,10 +1902,10 @@ Model: gpt-5-mini
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![]));
         let config = Arc::new(RwLock::new(Config {
-            memory: Some(bamboo_infrastructure_config::config::MemoryConfig {
+            memory: Some(bamboo_infrastructure::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
                 auto_dream_enabled: true,
-                ..bamboo_infrastructure_config::config::MemoryConfig::default()
+                ..bamboo_infrastructure::config::MemoryConfig::default()
             }),
             ..Config::default()
         }));

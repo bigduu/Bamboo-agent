@@ -4,8 +4,8 @@ mod stream;
 
 use actix_web::{http::StatusCode, web, HttpResponse};
 
-use bamboo_infrastructure_llm::api::models::StreamOptions;
-use bamboo_infrastructure_llm::providers::anthropic::api_types::AnthropicMessagesRequest;
+use bamboo_infrastructure::api::models::StreamOptions;
+use bamboo_infrastructure::providers::anthropic::api_types::AnthropicMessagesRequest;
 use crate::{app_state::AppState, error::AppError};
 
 use super::conversion::convert_messages_request;

@@ -1,8 +1,8 @@
 use futures::stream;
 
-use bamboo_application_agent::tools::FunctionCall;
-use bamboo_application_agent::ToolCall;
-use bamboo_infrastructure_llm::LLMChunk;
+use bamboo_agent_core::tools::FunctionCall;
+use bamboo_agent_core::ToolCall;
+use bamboo_infrastructure::LLMChunk;
 
 use super::collect::collect_response_chunks;
 use super::response::build_gemini_response;

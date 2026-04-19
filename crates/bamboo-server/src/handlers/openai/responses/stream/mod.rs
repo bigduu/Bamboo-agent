@@ -3,7 +3,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use bamboo_infrastructure_llm::LLMRequestOptions;
+use bamboo_infrastructure::LLMRequestOptions;
 use crate::{app_state::AppState, error::AppError};
 
 use super::super::helpers::now_unix_ts;

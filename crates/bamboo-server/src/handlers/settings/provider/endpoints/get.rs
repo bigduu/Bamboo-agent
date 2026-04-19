@@ -1,6 +1,6 @@
 use actix_web::{web, HttpResponse};
 
-use bamboo_infrastructure_llm::AVAILABLE_PROVIDERS;
+use bamboo_infrastructure::AVAILABLE_PROVIDERS;
 use crate::{app_state::AppState, error::AppError};
 
 use super::super::super::redaction::redact_providers_for_api;

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use bamboo_infrastructure_mcp::{
+use bamboo_engine::{
     HeaderConfig, McpServerConfig, ReconnectConfig, SseConfig, StdioConfig, TransportConfig,
 };
 

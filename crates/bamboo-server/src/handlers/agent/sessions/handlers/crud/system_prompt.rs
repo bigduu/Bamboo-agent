@@ -38,7 +38,7 @@ pub async fn get_system_prompt_snapshot(
     };
 
     let default_prompt = crate::prompt_defaults::read_global_default_system_prompt_template();
-    let snapshot = bamboo_application_session::system_prompt::build_system_prompt_snapshot(
+    let snapshot = crate::session_app::system_prompt::build_system_prompt_snapshot(
         &session,
         &default_prompt,
     );
@@ -68,19 +68,19 @@ pub async fn get_system_prompt_snapshot(
 #[cfg(test)]
 mod tests {
     use super::get_system_prompt_snapshot;
-    use bamboo_application_agent::{Message, Session};
+    use bamboo_agent_core::{Message, Session};
     use actix_web::{body::to_bytes, http::StatusCode, web};
 
     fn publish_test_env_context() {
-        let config = bamboo_infrastructure_config::Config {
-            env_vars: vec![bamboo_infrastructure_config::EnvVarEntry {
+        let config = bamboo_infrastructure::Config {
+            env_vars: vec![bamboo_infrastructure::EnvVarEntry {
                 name: "TEST_TOOL_TOKEN".to_string(),
                 value: "hidden-value".to_string(),
                 secret: true,
                 value_encrypted: None,
                 description: Some("Snapshot test token".to_string()),
             }],
-            ..bamboo_infrastructure_config::Config::default()
+            ..bamboo_infrastructure::Config::default()
         };
         config.publish_env_vars();
     }
@@ -88,7 +88,7 @@ mod tests {
     #[actix_web::test]
     async fn handler_returns_project_dream_snapshot_from_persisted_session() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
         let state = crate::app_state::AppState::new(temp_dir.path().to_path_buf())
             .await
             .expect("app state should initialize");
@@ -161,7 +161,7 @@ mod tests {
         )
         .expect("workspace context");
         let instruction_context =
-            bamboo_application_runtime::context::instruction::build_instruction_prompt_context(
+            bamboo_engine::context::instruction::build_instruction_prompt_context(
                 workspace.to_string_lossy().as_ref(),
             )
             .expect("instruction context");
@@ -182,7 +182,7 @@ mod tests {
         )));
 
         let default_prompt = crate::prompt_defaults::read_global_default_system_prompt_template();
-        let snapshot = bamboo_application_session::system_prompt::build_system_prompt_snapshot(
+        let snapshot = crate::session_app::system_prompt::build_system_prompt_snapshot(
             &session,
             &default_prompt,
         );
@@ -236,7 +236,7 @@ mod tests {
         )));
 
         let default_prompt = crate::prompt_defaults::read_global_default_system_prompt_template();
-        let snapshot = bamboo_application_session::system_prompt::build_system_prompt_snapshot(
+        let snapshot = crate::session_app::system_prompt::build_system_prompt_snapshot(
             &session,
             &default_prompt,
         );

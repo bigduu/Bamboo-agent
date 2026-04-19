@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use super::sse::{done_marker_bytes, openai_chunk_bytes, wrap_sse_data};
-use bamboo_infrastructure_llm::types::LLMChunk;
+use bamboo_infrastructure::types::LLMChunk;
 
 fn decode_json(bytes: bytes::Bytes) -> Value {
     serde_json::from_slice(&bytes).expect("chunk should be valid json")

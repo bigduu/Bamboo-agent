@@ -1,4 +1,4 @@
-use bamboo_infrastructure_llm::api::models::ChatCompletionStreamChunk;
+use bamboo_infrastructure::api::models::ChatCompletionStreamChunk;
 use std::collections::HashMap;
 
 mod finish;

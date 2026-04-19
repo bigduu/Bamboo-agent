@@ -13,7 +13,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use bamboo_infrastructure_config::{AccessControlConfig, Config};
+use bamboo_infrastructure::{AccessControlConfig, Config};
 use crate::{
     app_state::{AppState, ConfigUpdateEffects},
     error::AppError,

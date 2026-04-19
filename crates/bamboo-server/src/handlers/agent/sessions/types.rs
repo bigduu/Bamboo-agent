@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use bamboo_infrastructure_storage::SessionIndexEntry;
-use bamboo_shared_types::reasoning::ReasoningEffort;
+use bamboo_infrastructure::SessionIndexEntry;
+use bamboo_domain::reasoning::ReasoningEffort;
 
 #[derive(Debug, Serialize)]
 pub struct SessionSummary {
     pub id: String,
-    pub kind: bamboo_application_agent::SessionKind,
+    pub kind: bamboo_agent_core::SessionKind,
     pub title: String,
     pub pinned: bool,
     pub parent_session_id: Option<String>,
@@ -30,7 +30,7 @@ pub struct SessionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_usage: Option<bamboo_application_agent::TokenBudgetUsage>,
+    pub token_usage: Option<bamboo_agent_core::TokenBudgetUsage>,
 }
 
 impl SessionSummary {
@@ -116,7 +116,7 @@ pub struct SessionSystemPromptResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub global_dream_fallback: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_memory_observability: Option<bamboo_application_agent::PromptMemoryObservability>,
+    pub prompt_memory_observability: Option<bamboo_agent_core::PromptMemoryObservability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_memory: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -252,7 +252,7 @@ mod tests {
     fn test_create_session_response_serialization() {
         let summary = SessionSummary {
             id: "test-id".to_string(),
-            kind: bamboo_application_agent::SessionKind::Root,
+            kind: bamboo_agent_core::SessionKind::Root,
             title: "Test".to_string(),
             pinned: false,
             parent_session_id: None,
@@ -284,7 +284,7 @@ mod tests {
     fn test_get_session_response_serialization() {
         let summary = SessionSummary {
             id: "session-123".to_string(),
-            kind: bamboo_application_agent::SessionKind::Child,
+            kind: bamboo_agent_core::SessionKind::Child,
             title: "My Session".to_string(),
             pinned: true,
             parent_session_id: Some("parent-id".to_string()),
@@ -359,7 +359,7 @@ mod tests {
             relevant_durable_memories: Some("Relevant memories".to_string()),
             project_dream: Some("Project dream".to_string()),
             global_dream_fallback: Some("Global fallback".to_string()),
-            prompt_memory_observability: Some(bamboo_application_agent::PromptMemoryObservability {
+            prompt_memory_observability: Some(bamboo_agent_core::PromptMemoryObservability {
                 project_prompt_injection_enabled: true,
                 relevant_recall_enabled: true,
                 relevant_recall_rerank_enabled: false,
@@ -403,7 +403,7 @@ mod tests {
     fn test_session_summary_debug() {
         let summary = SessionSummary {
             id: "test".to_string(),
-            kind: bamboo_application_agent::SessionKind::Root,
+            kind: bamboo_agent_core::SessionKind::Root,
             title: "Test".to_string(),
             pinned: false,
             parent_session_id: None,

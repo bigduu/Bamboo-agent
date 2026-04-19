@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use bamboo_infrastructure_config::{Config, OpenAIConfig, ProviderConfigs};
+use bamboo_infrastructure::{Config, OpenAIConfig, ProviderConfigs};
 
 use super::types::ProxyAuthPayload;
 use super::validation::provider_validation_issue;

@@ -14,7 +14,7 @@ fn sync_runtime_workspace(session_id: &str, workspace_path: Option<&str>) {
         .map(std::path::PathBuf::from)
         .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)))
         .filter(|path| path.is_dir());
-    let _ = bamboo_application_tools::tools::workspace_state::ensure_session_workspace(
+    let _ = bamboo_tools::tools::workspace_state::ensure_session_workspace(
         session_id, preferred,
     );
 }
@@ -72,7 +72,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
             .filter(|s| !s.is_empty()),
     );
 
-    let input = bamboo_application_session::types::ChatTurnInput {
+    let input = crate::session_app::types::ChatTurnInput {
         session_id: session_id.clone(),
         model: model.clone(),
         message: req.message.clone(),
@@ -84,7 +84,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         data_dir,
     };
 
-    let mut session = match bamboo_application_session::chat::prepare_chat_turn(
+    let mut session = match crate::session_app::chat::prepare_chat_turn(
         state.as_ref(),
         input,
         global_default_prompt.as_str(),

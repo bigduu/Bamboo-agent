@@ -38,7 +38,7 @@ pub async fn handler(
     let disabled_tools_vec: Vec<String> = config_snapshot.disabled_tool_names().into_iter().collect();
     let disabled_skill_ids_vec: Vec<String> = config_snapshot.disabled_skill_ids().into_iter().collect();
 
-    let config = bamboo_application_session::types::ExecutionConfigSnapshot {
+    let config = crate::session_app::types::ExecutionConfigSnapshot {
         default_model: config_snapshot.get_model(),
         default_reasoning_effort: config_snapshot.get_reasoning_effort(),
         disabled_tools: disabled_tools_vec.clone(),
@@ -48,7 +48,7 @@ pub async fn handler(
         image_fallback: image_fallback.clone(),
     };
 
-    let input = bamboo_application_session::types::ExecuteInput {
+    let input = crate::session_app::types::ExecuteInput {
         session_id: session_id.clone(),
         request_model: req.model.clone(),
         request_reasoning_effort: req.reasoning_effort,
@@ -56,7 +56,7 @@ pub async fn handler(
         client_sync: req
             .client_sync
             .as_ref()
-            .map(|cs| bamboo_application_session::types::ExecuteClientSync {
+            .map(|cs| crate::session_app::types::ExecuteClientSync {
                 client_message_count: cs.client_message_count,
                 client_last_message_id: cs.client_last_message_id.clone(),
                 client_has_pending_question: cs.client_has_pending_question,
@@ -64,7 +64,7 @@ pub async fn handler(
             }),
     };
 
-    let outcome = match bamboo_application_session::execute::prepare_execute(
+    let outcome = match crate::session_app::execute::prepare_execute(
         state.as_ref(),
         config,
         input,
@@ -74,14 +74,14 @@ pub async fn handler(
         Ok(outcome) => outcome,
         Err(error) => {
             return match error {
-                bamboo_application_session::errors::ExecutePreparationError::NotFound(_) => {
+                crate::session_app::errors::ExecutePreparationError::NotFound(_) => {
                     tracing::warn!("[{session_id}] Execute session not found");
                     HttpResponse::NotFound().json(serde_json::json!({
                         "error": "Session not found",
                         "session_id": session_id
                     }))
                 }
-                bamboo_application_session::errors::ExecutePreparationError::LoadFailed(load_err) => {
+                crate::session_app::errors::ExecutePreparationError::LoadFailed(load_err) => {
                     let err_msg = load_err.to_string();
                     tracing::error!("[{session_id}] Execute session load error: {err_msg}");
                     HttpResponse::InternalServerError().json(serde_json::json!({
@@ -94,7 +94,7 @@ pub async fn handler(
     };
 
     match outcome {
-        bamboo_application_session::types::ExecutePreparationOutcome::Ready {
+        crate::session_app::types::ExecutePreparationOutcome::Ready {
             session,
             effective_model,
             effective_reasoning_effort,
@@ -136,13 +136,13 @@ pub async fn handler(
                 effective_model,
                 model_source,
                 effective_reasoning_effort
-                    .map(bamboo_shared_types::reasoning::ReasoningEffort::as_str)
+                    .map(bamboo_domain::reasoning::ReasoningEffort::as_str)
                     .unwrap_or("none"),
                 reasoning_source
             );
 
             // Create mpsc channel for agent loop.
-            let (mpsc_tx, mpsc_rx) = mpsc::channel::<bamboo_application_agent::AgentEvent>(100);
+            let (mpsc_tx, mpsc_rx) = mpsc::channel::<bamboo_agent_core::AgentEvent>(100);
 
             spawn_event_forwarder(
                 state.clone(),
@@ -170,14 +170,14 @@ pub async fn handler(
             started_response(&session_id, sync_info)
         }
 
-        bamboo_application_session::types::ExecutePreparationOutcome::AlreadyRunning {
+        crate::session_app::types::ExecutePreparationOutcome::AlreadyRunning {
             server_snapshot,
         } => {
             let sync_info = server_snapshot_to_sync_info(&server_snapshot, None);
             already_running_response(&session_id, sync_info)
         }
 
-        bamboo_application_session::types::ExecutePreparationOutcome::NoPendingMessage {
+        crate::session_app::types::ExecutePreparationOutcome::NoPendingMessage {
             server_snapshot,
         } => {
             tracing::debug!(
@@ -188,7 +188,7 @@ pub async fn handler(
             completed_response(&session_id, sync_info)
         }
 
-        bamboo_application_session::types::ExecutePreparationOutcome::SyncMismatch {
+        crate::session_app::types::ExecutePreparationOutcome::SyncMismatch {
             reason,
             server_snapshot,
         } => {
@@ -200,34 +200,34 @@ pub async fn handler(
             completed_response(&session_id, sync_info)
         }
 
-        bamboo_application_session::types::ExecutePreparationOutcome::ModelRequired => {
+        crate::session_app::types::ExecutePreparationOutcome::ModelRequired => {
             bad_request_error_response("no model configured for session or provider")
         }
 
-        bamboo_application_session::types::ExecutePreparationOutcome::ImageFallbackError(error) => {
+        crate::session_app::types::ExecutePreparationOutcome::ImageFallbackError(error) => {
             bad_request_error_response(error)
         }
     }
 }
 
 /// Convert a crate's `ExecuteSyncReason` to the handler's `ExecuteSyncReason`.
-fn crate_sync_reason_to_handler(reason: bamboo_application_session::types::ExecuteSyncReason) -> ExecuteSyncReason {
+fn crate_sync_reason_to_handler(reason: crate::session_app::types::ExecuteSyncReason) -> ExecuteSyncReason {
     match reason {
-        bamboo_application_session::types::ExecuteSyncReason::PendingQuestionMismatch => {
+        crate::session_app::types::ExecuteSyncReason::PendingQuestionMismatch => {
             ExecuteSyncReason::PendingQuestionMismatch
         }
-        bamboo_application_session::types::ExecuteSyncReason::MessageCountMismatch => {
+        crate::session_app::types::ExecuteSyncReason::MessageCountMismatch => {
             ExecuteSyncReason::MessageCountMismatch
         }
-        bamboo_application_session::types::ExecuteSyncReason::LastMessageIdMismatch => {
+        crate::session_app::types::ExecuteSyncReason::LastMessageIdMismatch => {
             ExecuteSyncReason::LastMessageIdMismatch
         }
     }
 }
 
 fn server_snapshot_to_sync_info(
-    server_snapshot: &bamboo_application_session::types::ServerExecuteSnapshot,
-    reason: Option<bamboo_application_session::types::ExecuteSyncReason>,
+    server_snapshot: &crate::session_app::types::ServerExecuteSnapshot,
+    reason: Option<crate::session_app::types::ExecuteSyncReason>,
 ) -> ExecuteSyncInfo {
     ExecuteSyncInfo {
         need_sync: reason.is_some(),
@@ -241,7 +241,7 @@ fn server_snapshot_to_sync_info(
 }
 
 fn build_sync_info_from_session(
-    session: &bamboo_application_agent::Session,
+    session: &bamboo_agent_core::Session,
     reason: Option<ExecuteSyncReason>,
 ) -> ExecuteSyncInfo {
     ExecuteSyncInfo {

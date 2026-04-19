@@ -1,4 +1,4 @@
-use bamboo_application_agent::agent::Message;
+use bamboo_agent_core::agent::Message;
 
 use super::{
     models::FileRestoreAction,

@@ -1,8 +1,8 @@
 use actix_web::{web, HttpResponse};
 
-use bamboo_infrastructure_llm::api::models::{ChatCompletionRequest, ChatCompletionResponse};
-use bamboo_infrastructure_llm::LLMRequestOptions;
-use bamboo_application_metrics::types::ForwardStatus;
+use bamboo_infrastructure::api::models::{ChatCompletionRequest, ChatCompletionResponse};
+use bamboo_infrastructure::LLMRequestOptions;
+use bamboo_engine::metrics::types::ForwardStatus;
 use crate::{app_state::AppState, error::AppError};
 
 use super::super::conversion::convert_messages_response;
@@ -67,19 +67,19 @@ pub(super) async fn handle_non_streaming_messages(
     // Collect stream into a response.
     use futures::StreamExt;
     let mut content = String::new();
-    let mut tool_calls: Option<Vec<bamboo_infrastructure_llm::api::models::ToolCall>> = None;
+    let mut tool_calls: Option<Vec<bamboo_infrastructure::api::models::ToolCall>> = None;
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::ResponseId(_)) => {}
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::Token(text)) => {
+            Ok(bamboo_infrastructure::types::LLMChunk::ResponseId(_)) => {}
+            Ok(bamboo_infrastructure::types::LLMChunk::Token(text)) => {
                 content.push_str(&text);
             }
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::ReasoningToken(_)) => {}
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::ToolCalls(calls)) => {
+            Ok(bamboo_infrastructure::types::LLMChunk::ReasoningToken(_)) => {}
+            Ok(bamboo_infrastructure::types::LLMChunk::ToolCalls(calls)) => {
                 tool_calls = Some(map_tool_calls(calls));
             }
-            Ok(bamboo_infrastructure_llm::types::LLMChunk::Done) => break,
+            Ok(bamboo_infrastructure::types::LLMChunk::Done) => break,
             Err(error) => {
                 app_state.metrics_service.collector().forward_completed(
                     forward_id.clone(),
@@ -103,18 +103,18 @@ pub(super) async fn handle_non_streaming_messages(
         object: Some("chat.completion".to_string()),
         created: Some(chrono::Utc::now().timestamp() as u64),
         model: Some(openai_request.model.clone()),
-        choices: vec![bamboo_infrastructure_llm::api::models::ResponseChoice {
+        choices: vec![bamboo_infrastructure::api::models::ResponseChoice {
             index: 0,
-            message: bamboo_infrastructure_llm::api::models::ChatMessage {
-                role: bamboo_infrastructure_llm::api::models::Role::Assistant,
-                content: bamboo_infrastructure_llm::api::models::Content::Text(content),
+            message: bamboo_infrastructure::api::models::ChatMessage {
+                role: bamboo_infrastructure::api::models::Role::Assistant,
+                content: bamboo_infrastructure::api::models::Content::Text(content),
                 phase: None,
                 tool_calls,
                 tool_call_id: None,
             },
             finish_reason: Some("stop".to_string()),
         }],
-        usage: Some(bamboo_infrastructure_llm::api::models::Usage {
+        usage: Some(bamboo_infrastructure::api::models::Usage {
             prompt_tokens: 0,
             completion_tokens: 0,
             total_tokens: 0,

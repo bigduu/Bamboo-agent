@@ -12,13 +12,13 @@ use std::sync::Arc;
 
 use tokio::sync::{broadcast, RwLock};
 
-use bamboo_infrastructure_storage::SessionStoreV2;
-use bamboo_application_agent::storage::Storage;
-use bamboo_application_agent::tools::ToolExecutor;
-use bamboo_application_agent::Session;
-use bamboo_infrastructure_mcp::McpServerManager;
-use bamboo_application_skills::SkillManager;
-use bamboo_infrastructure_config::Config;
+use bamboo_infrastructure::SessionStoreV2;
+use bamboo_agent_core::storage::Storage;
+use bamboo_agent_core::tools::ToolExecutor;
+use bamboo_agent_core::Session;
+use bamboo_engine::McpServerManager;
+use bamboo_engine::SkillManager;
+use bamboo_infrastructure::Config;
 
 use super::init::PermissionChecker;
 use super::{AgentRunner, ScheduleManager, ScheduleStore, SpawnScheduler};
@@ -36,7 +36,7 @@ pub(super) fn build_base_tools(
     // If no permission config has been persisted yet, keep checks disabled for backward
     // compatibility and opt-in behavior.
     let builtin_executor = Arc::new(
-        bamboo_application_tools::BuiltinToolExecutor::new_with_config_and_permissions(
+        bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
             config.clone(),
             permission_checker,
         ),
@@ -44,12 +44,12 @@ pub(super) fn build_base_tools(
     let builtin_tools: Arc<dyn ToolExecutor> = builtin_executor;
 
     // Create composite tool executor (builtin + MCP)
-    let mcp_tools = Arc::new(bamboo_infrastructure_mcp::McpToolExecutor::new(
+    let mcp_tools = Arc::new(bamboo_engine::McpToolExecutor::new(
         mcp_manager.clone(),
         mcp_manager.tool_index(),
     ));
 
-    let base: Arc<dyn ToolExecutor> = Arc::new(bamboo_infrastructure_mcp::CompositeToolExecutor::new(
+    let base: Arc<dyn ToolExecutor> = Arc::new(bamboo_engine::CompositeToolExecutor::new(
         builtin_tools,
         mcp_tools,
     ));
@@ -94,7 +94,7 @@ pub(super) fn build_root_tools(
     spawn_scheduler: Arc<SpawnScheduler>,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
-    session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<bamboo_application_agent::AgentEvent>>>>,
+    session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<bamboo_agent_core::AgentEvent>>>>,
 ) -> Arc<dyn ToolExecutor> {
     // Shared adapter for both child session tools.
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {

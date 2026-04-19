@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use actix_web::{web, HttpResponse};
 use serde_json::Value;
 
-use bamboo_infrastructure_config::Config;
+use bamboo_infrastructure::Config;
 use crate::config_manager;
 use crate::{app_state::AppState, error::AppError};
 
@@ -41,13 +41,13 @@ pub async fn validate_bamboo_config_patch(
     };
 
     if domains.proxy {
-        if let Err(err) = bamboo_infrastructure_llm::http_client::build_proxy(&merged) {
+        if let Err(err) = bamboo_infrastructure::http_client::build_proxy(&merged) {
             push_error("proxy", "http_proxy/https_proxy", err.to_string());
         }
     }
 
     if domains.provider {
-        if let Err(err) = bamboo_infrastructure_llm::validate_provider_config(&merged) {
+        if let Err(err) = bamboo_infrastructure::validate_provider_config(&merged) {
             let (path, message) = provider_validation_issue(&merged, err.to_string());
             push_error("provider", path, message);
         }

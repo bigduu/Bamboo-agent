@@ -1,8 +1,8 @@
 use actix_web::web;
 
-use bamboo_application_agent::agent::events::TokenUsage;
-use bamboo_application_agent::agent::Role;
-use bamboo_application_agent::{AgentEvent, SessionKind};
+use bamboo_agent_core::agent::events::TokenUsage;
+use bamboo_agent_core::agent::Role;
+use bamboo_agent_core::{AgentEvent, SessionKind};
 use crate::app_state::{AgentStatus, AppState};
 
 pub(super) async fn terminal_event_if_ready(

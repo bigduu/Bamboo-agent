@@ -3,10 +3,10 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-use bamboo_infrastructure_storage::SessionStoreV2;
-use bamboo_application_agent::storage::Storage;
-use bamboo_application_agent::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
-use bamboo_application_agent::{Session, SessionKind};
+use bamboo_infrastructure::SessionStoreV2;
+use bamboo_agent_core::storage::Storage;
+use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::{Session, SessionKind};
 use crate::handlers::agent::schedules::ScheduleView;
 use crate::schedules::{
     ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore, ScheduleTrigger,
@@ -65,7 +65,7 @@ enum ScheduleTasksArgs {
         #[serde(default)]
         end_at: Option<chrono::DateTime<chrono::Utc>>,
         #[serde(default)]
-        misfire_policy: Option<crate::schedules::MisfirePolicy>,
+        misfire_policy: Option<crate::schedules::MisFirePolicy>,
         #[serde(default)]
         overlap_policy: Option<crate::schedules::OverlapPolicy>,
         #[serde(default)]
@@ -88,7 +88,7 @@ enum ScheduleTasksArgs {
         #[serde(default)]
         end_at: Option<chrono::DateTime<chrono::Utc>>,
         #[serde(default)]
-        misfire_policy: Option<crate::schedules::MisfirePolicy>,
+        misfire_policy: Option<crate::schedules::MisFirePolicy>,
         #[serde(default)]
         overlap_policy: Option<crate::schedules::OverlapPolicy>,
         #[serde(default)]

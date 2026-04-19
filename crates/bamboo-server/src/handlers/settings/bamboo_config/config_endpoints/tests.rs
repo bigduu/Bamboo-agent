@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use tempfile::tempdir;
 
-use bamboo_infrastructure_config::{Config, OpenAIConfig};
+use bamboo_infrastructure::{Config, OpenAIConfig};
 
 use super::common::{
     config_file_path, model_limits_file_path, redacted_config_json, write_model_limits_file,

@@ -1,9 +1,0 @@
-[package]
-name = "bamboo-domain-schedule"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-bamboo-shared-types = { path = "../bamboo-shared-types" }
-serde = { workspace = true }
-chrono = { workspace = true }

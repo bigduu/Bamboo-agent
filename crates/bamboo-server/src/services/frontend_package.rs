@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
-use bamboo_infrastructure_config::paths::bamboo_dir;
+use bamboo_infrastructure::paths::bamboo_dir;
 
 include!(concat!(env!("OUT_DIR"), "/frontend_package_embedded.rs"));
 
@@ -412,7 +412,7 @@ mod tests {
         write_test_zip(&package_path, &manifest);
 
         let data_temp = tempdir().unwrap();
-        bamboo_infrastructure_config::paths::init_bamboo_dir(data_temp.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(data_temp.path().to_path_buf());
 
         let status = ensure_current_frontend_dir(Some(&package_path))
             .expect("frontend extraction should succeed");

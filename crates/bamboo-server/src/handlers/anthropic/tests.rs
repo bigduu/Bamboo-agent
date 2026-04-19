@@ -2,14 +2,14 @@ use actix_web::http::StatusCode;
 use serde_json::json;
 use std::collections::HashMap;
 
-use bamboo_infrastructure_llm::api::models::{
+use bamboo_infrastructure::api::models::{
     ChatCompletionResponse, ChatMessage, Content, ResponseChoice, Role, Usage,
 };
-use bamboo_infrastructure_llm::providers::anthropic::api_types::{
+use bamboo_infrastructure::providers::anthropic::api_types::{
     AnthropicContent, AnthropicMessage, AnthropicMessagesRequest, AnthropicRole,
     AnthropicToolChoice,
 };
-use bamboo_infrastructure_llm::providers::anthropic::conversion::AnthropicConversionError;
+use bamboo_infrastructure::providers::anthropic::conversion::AnthropicConversionError;
 
 use super::conversion::{convert_messages_request, convert_messages_response};
 use super::errors::map_conversion_error;

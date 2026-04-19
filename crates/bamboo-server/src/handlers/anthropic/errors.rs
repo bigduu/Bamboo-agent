@@ -1,4 +1,4 @@
-use bamboo_infrastructure_llm::providers::anthropic::{
+use bamboo_infrastructure::providers::anthropic::{
     api_types::{AnthropicErrorDetail, AnthropicErrorEnvelope},
     conversion::AnthropicConversionError,
 };

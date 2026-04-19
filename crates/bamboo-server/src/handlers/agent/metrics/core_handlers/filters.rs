@@ -9,8 +9,8 @@ pub(super) enum TimelineGranularity {
 
 pub(super) fn build_sessions_filter(
     query: &MetricsSessionsQuery,
-) -> bamboo_application_metrics::SessionMetricsFilter {
-    bamboo_application_metrics::SessionMetricsFilter {
+) -> bamboo_engine::SessionMetricsFilter {
+    bamboo_engine::SessionMetricsFilter {
         start_date: query.start_date,
         end_date: query.end_date,
         model: query.model.clone(),
@@ -20,8 +20,8 @@ pub(super) fn build_sessions_filter(
 
 pub(super) fn build_forward_filter(
     query: &ForwardMetricsQuery,
-) -> bamboo_application_metrics::ForwardMetricsFilter {
-    bamboo_application_metrics::ForwardMetricsFilter {
+) -> bamboo_engine::ForwardMetricsFilter {
+    bamboo_engine::ForwardMetricsFilter {
         start_date: query.start_date,
         end_date: query.end_date,
         endpoint: query.endpoint.clone(),
@@ -32,8 +32,8 @@ pub(super) fn build_forward_filter(
 
 pub(super) fn build_forward_grouped_filter(
     query: &ForwardMetricsQuery,
-) -> bamboo_application_metrics::ForwardMetricsFilter {
-    bamboo_application_metrics::ForwardMetricsFilter {
+) -> bamboo_engine::ForwardMetricsFilter {
+    bamboo_engine::ForwardMetricsFilter {
         start_date: query.start_date,
         end_date: query.end_date,
         endpoint: None,

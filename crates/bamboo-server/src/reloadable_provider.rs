@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use bamboo_application_agent::{tools::ToolSchema, Message};
-use bamboo_infrastructure_llm::provider::{LLMProvider, LLMRequestOptions, Result};
-use bamboo_infrastructure_llm::LLMStream;
+use bamboo_agent_core::{tools::ToolSchema, Message};
+use bamboo_infrastructure::provider::{LLMProvider, LLMRequestOptions, Result};
+use bamboo_infrastructure::LLMStream;
 
 /// An `LLMProvider` wrapper that always delegates to the latest provider stored in a shared lock.
 ///

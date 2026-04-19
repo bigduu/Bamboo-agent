@@ -14,7 +14,7 @@ pub async fn get_anthropic_model_mapping(
 
 pub async fn set_anthropic_model_mapping(
     app_state: web::Data<AppState>,
-    payload: web::Json<bamboo_infrastructure_config::model_mapping::AnthropicModelMapping>,
+    payload: web::Json<bamboo_infrastructure::model_mapping::AnthropicModelMapping>,
 ) -> Result<HttpResponse, AppError> {
     let mapping = payload.into_inner();
     app_state

@@ -39,7 +39,7 @@ pub struct EnvVarsListResponse {
 const SECRET_MASK: &str = "****...****";
 
 impl EnvVarResponse {
-    pub fn from_entry(entry: &bamboo_infrastructure_config::EnvVarEntry) -> Self {
+    pub fn from_entry(entry: &bamboo_infrastructure::EnvVarEntry) -> Self {
         let has_value = !entry.value.trim().is_empty();
         let display_value = if entry.secret {
             SECRET_MASK.to_string()
@@ -59,7 +59,7 @@ impl EnvVarResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_infrastructure_config::EnvVarEntry;
+    use bamboo_infrastructure::EnvVarEntry;
 
     fn plain_entry() -> EnvVarEntry {
         EnvVarEntry {

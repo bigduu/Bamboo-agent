@@ -1,6 +1,6 @@
-use bamboo_application_agent::tools::{FunctionCall, ToolCall};
+use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 use crate::error::AppError;
-use bamboo_application_tools::normalize_tool_ref;
+use bamboo_tools::normalize_tool_ref;
 use serde_json::Value;
 
 use super::models::ToolParameter;

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::SystemTime;
 
-use bamboo_domain_workflow::{WorkflowDefinition, WorkflowLoadError};
+use bamboo_domain::{WorkflowDefinition, WorkflowLoadError};
 
 #[derive(Debug, Clone)]
 pub(crate) struct CachedWorkflow {
@@ -33,7 +33,7 @@ pub struct WorkflowLoader {
 impl WorkflowLoader {
     pub fn new() -> Self {
         Self {
-            workflows_dir: bamboo_infrastructure_config::paths::workflows_dir(),
+            workflows_dir: bamboo_infrastructure::paths::workflows_dir(),
             cache: RwLock::new(HashMap::new()),
         }
     }

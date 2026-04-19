@@ -2,28 +2,28 @@ use super::response::execute_response_payload;
 use super::validation::validate_and_normalize_model;
 use crate::handlers::agent::execute::{ExecuteClientSync, ExecuteSyncInfo, ExecuteSyncReason};
 
-use bamboo_application_session::types::ServerExecuteSnapshot;
+use crate::session_app::types::ServerExecuteSnapshot;
 
 fn evaluate_client_sync_adapter(
     client_sync: Option<&ExecuteClientSync>,
     server_snapshot: &ServerExecuteSnapshot,
 ) -> Option<ExecuteSyncReason> {
-    let crate_sync = client_sync.map(|cs| bamboo_application_session::types::ExecuteClientSync {
+    let crate_sync = client_sync.map(|cs| crate::session_app::types::ExecuteClientSync {
         client_message_count: cs.client_message_count,
         client_last_message_id: cs.client_last_message_id.clone(),
         client_has_pending_question: cs.client_has_pending_question,
         client_pending_question_tool_call_id: cs.client_pending_question_tool_call_id.clone(),
     });
 
-    bamboo_application_session::execute::evaluate_client_sync(crate_sync.as_ref(), server_snapshot)
+    crate::session_app::execute::evaluate_client_sync(crate_sync.as_ref(), server_snapshot)
         .map(|reason| match reason {
-            bamboo_application_session::types::ExecuteSyncReason::PendingQuestionMismatch => {
+            crate::session_app::types::ExecuteSyncReason::PendingQuestionMismatch => {
                 ExecuteSyncReason::PendingQuestionMismatch
             }
-            bamboo_application_session::types::ExecuteSyncReason::MessageCountMismatch => {
+            crate::session_app::types::ExecuteSyncReason::MessageCountMismatch => {
                 ExecuteSyncReason::MessageCountMismatch
             }
-            bamboo_application_session::types::ExecuteSyncReason::LastMessageIdMismatch => {
+            crate::session_app::types::ExecuteSyncReason::LastMessageIdMismatch => {
                 ExecuteSyncReason::LastMessageIdMismatch
             }
         })

@@ -2,9 +2,9 @@ use bytes::Bytes;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use bamboo_infrastructure_llm::provider::LLMStream;
-use bamboo_infrastructure_llm::types::LLMChunk;
-use bamboo_application_metrics::{types::ForwardStatus, MetricsCollector};
+use bamboo_infrastructure::provider::LLMStream;
+use bamboo_infrastructure::types::LLMChunk;
+use bamboo_engine::{ForwardStatus, MetricsCollector};
 
 use super::super::super::usage::{build_estimated_usage, estimate_completion_tokens};
 use super::super::output::{build_completed_response, build_output_items};
@@ -33,7 +33,7 @@ pub(super) fn spawn_stream_worker(args: StreamWorkerArgs) {
 async fn run_stream_worker(mut args: StreamWorkerArgs) {
     let mut had_error = false;
     let mut content = String::new();
-    let mut tool_calls: Vec<bamboo_application_agent::tools::ToolCall> = Vec::new();
+    let mut tool_calls: Vec<bamboo_agent_core::tools::ToolCall> = Vec::new();
     let mut response_id: Option<String> = None;
     let mut created_sent = false;
 

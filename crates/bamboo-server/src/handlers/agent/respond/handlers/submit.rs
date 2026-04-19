@@ -23,14 +23,14 @@ pub async fn submit_response(
 
     tracing::info!("[{}] Received user response: {}", session_id, user_response);
 
-    let input = bamboo_application_session::types::RespondInput {
+    let input = crate::session_app::types::RespondInput {
         session_id: session_id.clone(),
         user_response: user_response.clone(),
         model: req.model.clone(),
         reasoning_effort: req.reasoning_effort,
     };
 
-    let (_session, user_response) = match bamboo_application_session::respond::submit_pending_response(
+    let (_session, user_response) = match crate::session_app::respond::submit_pending_response(
         state.as_ref(),
         input,
     )
@@ -39,17 +39,17 @@ pub async fn submit_response(
         Ok(result) => result,
         Err(error) => {
             return match error {
-                bamboo_application_session::errors::RespondError::NotFound(_) => {
+                crate::session_app::errors::RespondError::NotFound(_) => {
                     Ok(HttpResponse::NotFound().json(serde_json::json!({
                         "error": "Session not found"
                     })))
                 }
-                bamboo_application_session::errors::RespondError::NoPendingQuestion => {
+                crate::session_app::errors::RespondError::NoPendingQuestion => {
                     Ok(HttpResponse::BadRequest().json(serde_json::json!({
                         "error": "No pending question waiting for response"
                     })))
                 }
-                bamboo_application_session::errors::RespondError::InvalidResponse(msg) => {
+                crate::session_app::errors::RespondError::InvalidResponse(msg) => {
                     Ok(HttpResponse::BadRequest().json(serde_json::json!({
                         "error": "Invalid response",
                         "message": msg,
@@ -69,7 +69,7 @@ pub async fn submit_response(
 
     // Build resume config snapshot from server config.
     let config_snapshot = state.config.read().await.clone();
-    let resume_config = bamboo_application_session::types::ResumeConfigSnapshot {
+    let resume_config = crate::session_app::types::ResumeConfigSnapshot {
         provider_name: config_snapshot.provider.clone(),
         fast_model: config_snapshot.get_memory_background_model(),
         disabled_tools: config_snapshot.disabled_tool_names(),
@@ -78,7 +78,7 @@ pub async fn submit_response(
     };
 
     let auto_resume_outcome =
-        bamboo_application_session::resume::resume_session_execution(
+        crate::session_app::resume::resume_session_execution(
             &crate::app_state::resume_adapter::AppStateResumeRef(state),
             &session_id,
             resume_config,

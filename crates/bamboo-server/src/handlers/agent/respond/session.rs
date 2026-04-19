@@ -6,7 +6,7 @@
 #[cfg(test)]
 mod tests {
     use actix_web::web;
-    use bamboo_application_agent::Session;
+    use bamboo_agent_core::Session;
     use crate::app_state::AppState;
 
     #[tokio::test]

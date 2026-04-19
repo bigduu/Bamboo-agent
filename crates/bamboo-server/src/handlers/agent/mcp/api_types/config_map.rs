@@ -4,9 +4,9 @@ fn mask() -> String {
     "****...****".to_string()
 }
 
-pub(super) fn to_api_config(server: &bamboo_infrastructure_mcp::McpServerConfig) -> McpServerConfigApi {
+pub(super) fn to_api_config(server: &bamboo_engine::McpServerConfig) -> McpServerConfigApi {
     let transport = match &server.transport {
-        bamboo_infrastructure_mcp::TransportConfig::Stdio(stdio) => {
+        bamboo_engine::TransportConfig::Stdio(stdio) => {
             // Never return plaintext; only return keys so users can see which env vars exist.
             let mut keys: Vec<String> = stdio.env_encrypted.keys().cloned().collect();
             keys.extend(stdio.env.keys().cloned());
@@ -23,7 +23,7 @@ pub(super) fn to_api_config(server: &bamboo_infrastructure_mcp::McpServerConfig)
                 startup_timeout_ms: stdio.startup_timeout_ms,
             }
         }
-        bamboo_infrastructure_mcp::TransportConfig::Sse(sse) => TransportConfigApi::Sse {
+        bamboo_engine::TransportConfig::Sse(sse) => TransportConfigApi::Sse {
             url: sse.url.clone(),
             headers: sse
                 .headers
@@ -34,6 +34,18 @@ pub(super) fn to_api_config(server: &bamboo_infrastructure_mcp::McpServerConfig)
                 })
                 .collect(),
             connect_timeout_ms: sse.connect_timeout_ms,
+        },
+        bamboo_engine::TransportConfig::StreamableHttp(sh) => TransportConfigApi::StreamableHttp {
+            url: sh.url.clone(),
+            headers: sh
+                .headers
+                .iter()
+                .map(|header| HeaderConfigApi {
+                    name: header.name.clone(),
+                    value: mask(),
+                })
+                .collect(),
+            connect_timeout_ms: sh.connect_timeout_ms,
         },
     };
 

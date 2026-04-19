@@ -1,4 +1,4 @@
-use bamboo_infrastructure_llm::api::models::Tool;
+use bamboo_infrastructure::api::models::Tool;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

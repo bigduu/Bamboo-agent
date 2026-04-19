@@ -1,5 +1,5 @@
-use bamboo_application_agent::ToolCall;
-use bamboo_infrastructure_llm::protocol::gemini::{
+use bamboo_agent_core::ToolCall;
+use bamboo_infrastructure::protocol::gemini::{
     GeminiCandidate, GeminiContent, GeminiFunctionCall, GeminiPart, GeminiResponse,
 };
 

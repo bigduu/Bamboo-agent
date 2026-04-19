@@ -1,4 +1,4 @@
-use bamboo_infrastructure_llm::api::models::{ChatCompletionStreamChunk, StreamChoice, StreamDelta};
+use bamboo_infrastructure::api::models::{ChatCompletionStreamChunk, StreamChoice, StreamDelta};
 
 use super::{map_completion_stream_chunk, AnthropicStreamState};
 

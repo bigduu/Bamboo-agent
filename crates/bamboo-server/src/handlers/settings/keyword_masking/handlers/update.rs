@@ -1,4 +1,4 @@
-use bamboo_infrastructure_config::keyword_masking::KeywordEntry;
+use bamboo_infrastructure::keyword_masking::KeywordEntry;
 use crate::{
     app_state::{AppState, ConfigUpdateEffects},
     error::AppError,

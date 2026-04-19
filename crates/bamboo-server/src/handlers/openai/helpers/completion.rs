@@ -1,4 +1,4 @@
-use bamboo_infrastructure_llm::api::models::{
+use bamboo_infrastructure::api::models::{
     ChatCompletionResponse, ChatMessage, Content, ResponseChoice, Role, ToolCall, Usage,
 };
 

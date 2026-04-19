@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
-use bamboo_application_memory::memory_store::MemoryScope;
+use bamboo_memory::memory_store::MemoryScope;
 
 /// Query parameters for metrics summary requests
 #[derive(Debug, Deserialize)]
@@ -223,9 +223,9 @@ pub struct MemoryTimelinePoint {
 #[derive(Debug, Serialize)]
 pub struct UnifiedSummary {
     /// Chat session metrics
-    pub chat: bamboo_application_metrics::MetricsSummary,
+    pub chat: bamboo_engine::MetricsSummary,
     /// Forward proxy metrics
-    pub forward: bamboo_application_metrics::ForwardMetricsSummary,
+    pub forward: bamboo_engine::ForwardMetricsSummary,
     /// Combined aggregate metrics
     pub combined: CombinedSummary,
     /// Current durable memory summary for dashboard display.

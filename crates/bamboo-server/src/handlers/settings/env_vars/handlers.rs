@@ -1,6 +1,6 @@
 use actix_web::{web, HttpResponse};
 
-use bamboo_infrastructure_config::config::EnvVarEntry;
+use bamboo_infrastructure::config::EnvVarEntry;
 use crate::{
     app_state::{AppState, ConfigUpdateEffects},
     error::AppError,

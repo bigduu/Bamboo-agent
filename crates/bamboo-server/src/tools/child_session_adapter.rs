@@ -10,13 +10,13 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 
-use bamboo_application_session::child_session::{
+use crate::session_app::child_session::{
     ChildSessionEntry, ChildSessionError, ChildSessionPort, DeleteChildResult,
 };
-use bamboo_infrastructure_storage::{SessionIndexEntry, SessionStoreV2};
-use bamboo_application_agent::storage::Storage;
-use bamboo_application_agent::tools::ToolError;
-use bamboo_application_agent::{AgentEvent, Session, SessionKind};
+use bamboo_infrastructure::{SessionIndexEntry, SessionStoreV2};
+use bamboo_agent_core::storage::Storage;
+use bamboo_agent_core::tools::ToolError;
+use bamboo_agent_core::{AgentEvent, Session, SessionKind};
 use crate::app_state::session_events::get_or_create_event_sender;
 use crate::app_state::{AgentRunner, AgentStatus};
 use crate::spawn_scheduler::{SpawnJob, SpawnScheduler};

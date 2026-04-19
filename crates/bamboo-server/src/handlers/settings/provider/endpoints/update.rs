@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use actix_web::{web, HttpResponse};
 use serde_json::Value;
 
-use bamboo_infrastructure_config::Config;
+use bamboo_infrastructure::Config;
 use crate::config_manager;
 use crate::{
     app_state::{AppState, ConfigUpdateEffects},
@@ -78,7 +78,7 @@ fn apply_provider_patch(
 }
 
 fn validate_provider_config(config: &Config) -> Result<(), AppError> {
-    if let Err(error) = bamboo_infrastructure_llm::validate_provider_config(config) {
+    if let Err(error) = bamboo_infrastructure::validate_provider_config(config) {
         return Err(AppError::BadRequest(format!(
             "Invalid configuration: {error}"
         )));

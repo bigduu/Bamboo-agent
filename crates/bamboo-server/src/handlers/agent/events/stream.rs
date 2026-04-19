@@ -3,7 +3,7 @@ use actix_web::{web, HttpResponse};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-use bamboo_application_agent::AgentEvent;
+use bamboo_agent_core::AgentEvent;
 
 pub(super) fn terminal_response(
     budget_event_to_replay: Option<AgentEvent>,

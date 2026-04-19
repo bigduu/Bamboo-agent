@@ -463,27 +463,12 @@ dependencies = [
  "arboard",
  "async-stream",
  "async-trait",
- "bamboo-application-agent",
- "bamboo-application-memory",
- "bamboo-application-metrics",
- "bamboo-application-runtime",
- "bamboo-application-schedule",
- "bamboo-application-session",
- "bamboo-application-skills",
- "bamboo-application-tool-types",
- "bamboo-application-tools",
- "bamboo-claude-runner",
- "bamboo-domain-schedule",
- "bamboo-domain-session",
- "bamboo-domain-workflow",
- "bamboo-infrastructure-config",
- "bamboo-infrastructure-llm",
- "bamboo-infrastructure-mcp",
- "bamboo-infrastructure-process",
- "bamboo-infrastructure-storage",
+ "bamboo-agent-core",
+ "bamboo-domain",
+ "bamboo-engine",
+ "bamboo-infrastructure",
  "bamboo-server",
- "bamboo-server-tools",
- "bamboo-shared-types",
+ "bamboo-tools",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -534,15 +519,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "bamboo-application-agent"
+name = "bamboo-agent-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "bamboo-application-tool-types",
- "bamboo-domain-session",
- "bamboo-infrastructure-config",
- "bamboo-shared-types",
+ "bamboo-domain",
+ "bamboo-infrastructure",
  "base64 0.22.1",
  "chrono",
  "dashmap",
@@ -556,211 +539,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "bamboo-application-memory"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bamboo-application-agent",
- "bamboo-domain-session",
- "bamboo-infrastructure-config",
- "bamboo-infrastructure-llm",
- "bamboo-infrastructure-storage",
- "bamboo-shared-types",
- "chrono",
- "dashmap",
- "futures",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "bamboo-application-metrics"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bamboo-application-agent",
- "bamboo-shared-types",
- "chrono",
- "dashmap",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "bamboo-application-runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bamboo-application-agent",
- "bamboo-application-memory",
- "bamboo-application-metrics",
- "bamboo-application-skills",
- "bamboo-application-tools",
- "bamboo-domain-session",
- "bamboo-infrastructure-config",
- "bamboo-infrastructure-llm",
- "bamboo-shared-types",
- "base64 0.22.1",
- "chrono",
- "dashmap",
- "futures",
- "lazy_static",
- "mockall",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "bamboo-application-schedule"
-version = "0.1.0"
-dependencies = [
- "bamboo-application-agent",
- "bamboo-application-runtime",
- "bamboo-application-tools",
- "bamboo-domain-schedule",
- "bamboo-domain-session",
- "bamboo-shared-types",
- "chrono",
- "chrono-tz",
- "cron",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "bamboo-application-session"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bamboo-application-agent",
- "bamboo-application-runtime",
- "bamboo-application-skills",
- "bamboo-application-tools",
- "bamboo-domain-session",
- "bamboo-infrastructure-config",
- "bamboo-shared-types",
- "chrono",
- "serde_json",
- "sha2",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "bamboo-application-skills"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bamboo-application-tool-types",
- "bamboo-infrastructure-config",
- "chrono",
- "globset",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "walkdir",
-]
-
-[[package]]
-name = "bamboo-application-tool-types"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "bamboo-application-tools"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arboard",
- "async-trait",
- "bamboo-application-agent",
- "bamboo-application-memory",
- "bamboo-application-tool-types",
- "bamboo-domain-session",
- "bamboo-infrastructure-config",
- "bamboo-infrastructure-llm",
- "bamboo-infrastructure-process",
- "bamboo-shared-types",
- "base64 0.22.1",
- "chrono",
- "colored",
- "dashmap",
- "dirs",
- "futures",
- "globset",
- "libc",
- "parking_lot 0.12.5",
- "regex",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "toml",
- "tracing",
- "url",
- "uuid",
- "walkdir",
-]
-
-[[package]]
-name = "bamboo-claude-runner"
-version = "0.1.0"
-dependencies = [
- "bamboo-application-agent",
- "bamboo-infrastructure-process",
- "regex",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -780,142 +558,155 @@ dependencies = [
 ]
 
 [[package]]
-name = "bamboo-domain-schedule"
+name = "bamboo-compression"
 version = "0.1.0"
 dependencies = [
- "bamboo-shared-types",
+ "async-trait",
+ "bamboo-agent-core",
+ "bamboo-domain",
+ "bamboo-infrastructure",
  "chrono",
- "serde",
-]
-
-[[package]]
-name = "bamboo-domain-session"
-version = "0.1.0"
-dependencies = [
- "bamboo-shared-types",
- "chrono",
+ "futures",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
- "uuid",
+ "tiktoken-rs",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
-name = "bamboo-domain-workflow"
+name = "bamboo-domain"
 version = "0.1.0"
 dependencies = [
- "bamboo-application-agent",
- "serde",
- "serde_yaml",
-]
-
-[[package]]
-name = "bamboo-infrastructure-config"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "bamboo-application-tool-types",
- "bamboo-shared-types",
- "dirs",
- "hex",
- "rand 0.8.5",
+ "async-trait",
+ "chrono",
  "regex",
  "serde",
  "serde_json",
- "sha2",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "bamboo-infrastructure-llm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bamboo-application-tool-types",
- "bamboo-domain-session",
- "bamboo-infrastructure-config",
- "bamboo-shared-types",
- "chrono",
- "eventsource-stream",
- "futures",
- "http 1.4.0",
- "lazy_static",
- "reqwest",
- "reqwest-middleware",
- "reqwest-retry",
- "serde",
- "serde_json",
- "tempfile",
+ "serde_yaml",
  "thiserror 1.0.69",
- "tokio",
- "tracing",
  "uuid",
 ]
 
 [[package]]
-name = "bamboo-infrastructure-mcp"
+name = "bamboo-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "async-trait",
- "bamboo-application-agent",
- "bamboo-application-tool-types",
- "bamboo-infrastructure-config",
- "bamboo-infrastructure-llm",
- "bamboo-infrastructure-process",
+ "bamboo-agent-core",
+ "bamboo-compression",
+ "bamboo-domain",
+ "bamboo-infrastructure",
+ "bamboo-memory",
+ "bamboo-tools",
+ "base64 0.22.1",
+ "bytes",
  "chrono",
+ "colored",
  "dashmap",
+ "dirs",
  "eventsource-stream",
  "futures",
+ "globset",
  "hex",
+ "http 1.4.0",
+ "lazy_static",
+ "libc",
  "mockall",
  "parking_lot 0.12.5",
+ "rand 0.8.5",
+ "regex",
  "reqwest",
  "reqwest-eventsource",
+ "rusqlite",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
+ "sysinfo",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
+ "tokio-test",
+ "tokio-util",
+ "toml",
  "tracing",
+ "tracing-subscriber",
+ "url",
  "uuid",
+ "walkdir",
+ "wiremock",
 ]
 
 [[package]]
-name = "bamboo-infrastructure-process"
+name = "bamboo-infrastructure"
 version = "0.1.0"
 dependencies = [
- "chrono",
- "libc",
- "serde",
- "sysinfo",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "bamboo-infrastructure-storage"
-version = "0.1.0"
-dependencies = [
+ "aes-gcm",
+ "anyhow",
  "async-trait",
- "bamboo-application-agent",
- "bamboo-domain-session",
- "bamboo-shared-types",
+ "bamboo-domain",
  "base64 0.22.1",
  "chrono",
+ "dashmap",
+ "dirs",
+ "eventsource-client",
+ "eventsource-stream",
+ "futures",
+ "hex",
+ "http 1.4.0",
+ "lazy_static",
+ "libc",
+ "mockall",
+ "parking_lot 0.12.5",
+ "rand 0.8.5",
+ "regex",
+ "reqwest",
+ "reqwest-eventsource",
+ "reqwest-middleware",
+ "reqwest-retry",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
+ "sysinfo",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
+ "tokio-test",
  "tracing",
  "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "bamboo-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bamboo-agent-core",
+ "bamboo-compression",
+ "bamboo-domain",
+ "bamboo-infrastructure",
+ "chrono",
+ "dashmap",
+ "futures",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -929,27 +720,17 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
- "bamboo-application-agent",
- "bamboo-application-memory",
- "bamboo-application-metrics",
- "bamboo-application-runtime",
- "bamboo-application-schedule",
- "bamboo-application-session",
- "bamboo-application-skills",
- "bamboo-application-tools",
- "bamboo-claude-runner",
- "bamboo-domain-schedule",
- "bamboo-domain-session",
- "bamboo-domain-workflow",
- "bamboo-infrastructure-config",
- "bamboo-infrastructure-llm",
- "bamboo-infrastructure-mcp",
- "bamboo-infrastructure-process",
- "bamboo-infrastructure-storage",
- "bamboo-server-tools",
- "bamboo-shared-types",
+ "bamboo-agent-core",
+ "bamboo-compression",
+ "bamboo-domain",
+ "bamboo-engine",
+ "bamboo-infrastructure",
+ "bamboo-memory",
+ "bamboo-tools",
  "bytes",
  "chrono",
+ "chrono-tz",
+ "cron",
  "dashmap",
  "futures",
  "globset",
@@ -983,29 +764,40 @@ dependencies = [
 ]
 
 [[package]]
-name = "bamboo-server-tools"
+name = "bamboo-tools"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "arboard",
  "async-trait",
- "bamboo-application-agent",
- "bamboo-application-memory",
- "bamboo-application-skills",
- "bamboo-application-tools",
- "bamboo-infrastructure-config",
- "bamboo-infrastructure-storage",
+ "bamboo-agent-core",
+ "bamboo-compression",
+ "bamboo-domain",
+ "bamboo-infrastructure",
+ "bamboo-memory",
+ "base64 0.22.1",
+ "chrono",
+ "colored",
+ "dashmap",
+ "dirs",
+ "futures",
+ "globset",
+ "libc",
+ "parking_lot 0.12.5",
+ "regex",
+ "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
+ "toml",
  "tracing",
-]
-
-[[package]]
-name = "bamboo-shared-types"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
+ "url",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]
@@ -1019,6 +811,21 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "bit-set"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
+dependencies = [
+ "bit-vec",
+]
+
+[[package]]
+name = "bit-vec"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bitflags"
@@ -1069,6 +876,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63044e1ae8e69f3b5a92c736ca6269b8d12fa7efe39bf34ddb06d102cf0e2cab"
 dependencies = [
  "memchr",
+ "regex-automata",
  "serde",
 ]
 
@@ -1556,6 +1364,17 @@ name = "fallible-streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
+name = "fancy-regex"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72cf461f865c862bb7dc573f643dd6a2b6842f7c30b07882b56bd148cc2761b8"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
 
 [[package]]
 name = "fastrand"
@@ -3295,6 +3114,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3812,6 +3637,21 @@ dependencies = [
  "quick-error",
  "weezl",
  "zune-jpeg",
+]
+
+[[package]]
+name = "tiktoken-rs"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fac4a168cfc1d8ed65bf17a6ee0843ad9a68f863c63c0fb2fa7eab67838782ee"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bstr",
+ "fancy-regex",
+ "lazy_static",
+ "regex",
+ "rustc-hash",
 ]
 
 [[package]]

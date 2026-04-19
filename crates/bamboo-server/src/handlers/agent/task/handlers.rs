@@ -1,7 +1,7 @@
 use actix_web::{web, HttpResponse, Result};
 
 use super::types::to_task_list_response;
-use bamboo_application_agent::SessionKind;
+use bamboo_agent_core::SessionKind;
 use crate::app_state::AppState;
 
 /// Get task list for a session.

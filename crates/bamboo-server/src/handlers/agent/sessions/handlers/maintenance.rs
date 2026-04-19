@@ -2,10 +2,10 @@ use std::path::Path;
 
 use actix_web::{web, HttpResponse, Result};
 
-use bamboo_application_memory::memory_store::MemoryStore;
-use bamboo_infrastructure_storage::{CleanupMode, CleanupResult};
-use bamboo_application_agent::Session;
-use bamboo_application_tools::tools::workspace_state;
+use bamboo_memory::memory_store::MemoryStore;
+use bamboo_infrastructure::{CleanupMode, CleanupResult};
+use bamboo_agent_core::Session;
+use bamboo_tools::tools::workspace_state;
 use crate::app_state::AppState;
 use crate::services::auto_dream::{run_project_auto_dream_once, AutoDreamContext};
 
@@ -204,9 +204,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use bamboo_application_agent::{ConversationSummary, Message};
-    use bamboo_infrastructure_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
-    use bamboo_infrastructure_config::Config;
+    use bamboo_agent_core::{ConversationSummary, Message};
+    use bamboo_infrastructure::{LLMChunk, LLMError, LLMProvider, LLMStream};
+    use bamboo_infrastructure::Config;
     use crate::routes::configure_routes;
     use crate::AppState;
 
@@ -228,7 +228,7 @@ mod tests {
         async fn chat_stream(
             &self,
             _messages: &[Message],
-            _tools: &[bamboo_application_agent::tools::ToolSchema],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
             _max_output_tokens: Option<u32>,
             _model: &str,
         ) -> Result<LLMStream, LLMError> {
@@ -245,9 +245,9 @@ mod tests {
         provider: Arc<dyn LLMProvider>,
     ) -> web::Data<AppState> {
         let config = Config {
-            memory: Some(bamboo_infrastructure_config::config::MemoryConfig {
+            memory: Some(bamboo_infrastructure::config::MemoryConfig {
                 background_model: Some("fast-model".to_string()),
-                ..bamboo_infrastructure_config::config::MemoryConfig::default()
+                ..bamboo_infrastructure::config::MemoryConfig::default()
             }),
             ..Config::default()
         };
@@ -261,11 +261,11 @@ mod tests {
     #[actix_web::test]
     async fn run_project_dream_endpoint_generates_project_dream_for_session_project() {
         let temp_dir = tempdir().expect("tempdir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
         let workspace = temp_dir.path().join("workspace-http-project-dream");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let project_key = bamboo_application_memory::memory_store::project_key_from_path(&workspace);
+        let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
 
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
             "## Current durable context\n- HTTP project dream generated\n\n## Cross-session patterns\n- None\n\n## Active threads to remember\n- None\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None".to_string(),
@@ -273,7 +273,7 @@ mod tests {
         ]));
         let app_state = build_test_app_state(temp_dir.path().to_path_buf(), provider).await;
 
-        let mut session = bamboo_application_agent::Session::new("session-http-project-dream", "model");
+        let mut session = bamboo_agent_core::Session::new("session-http-project-dream", "model");
         session.title = "HTTP Project Dream".to_string();
         session.metadata.insert(
             "workspace_path".to_string(),
@@ -333,12 +333,12 @@ mod tests {
     #[actix_web::test]
     async fn run_project_dream_endpoint_returns_bad_request_when_project_scope_is_unavailable() {
         let temp_dir = tempdir().expect("tempdir");
-        bamboo_infrastructure_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![]));
         let app_state = build_test_app_state(temp_dir.path().to_path_buf(), provider).await;
 
-        let mut session = bamboo_application_agent::Session::new("session-no-project-scope", "model");
+        let mut session = bamboo_agent_core::Session::new("session-no-project-scope", "model");
         session.title = "No Project Scope".to_string();
         session.conversation_summary =
             Some(ConversationSummary::new("No workspace metadata.", 1, 40));

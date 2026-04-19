@@ -6,7 +6,7 @@
 //! - Error handling
 //! - Edge cases (empty strings, unicode, large data)
 
-use bamboo_infrastructure_config::encryption;
+use bamboo_infrastructure::encryption;
 use std::ffi::OsString;
 use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;
@@ -257,17 +257,21 @@ fn test_encryption_key_caching() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let _key = EnvVarGuard::unset("BAMBOO_CONFIG_ENCRYPTION_KEY");
 
+    // In test mode there is no KEY_CACHE; use set_test_encryption_key to
+    // exercise the same "first-wins, later env changes are ignored" behaviour.
+    let initial_key = [17u8; 32];
+    let guard = encryption::set_test_encryption_key(initial_key);
     let key1 = encryption::get_encryption_key();
 
-    // In the runtime build, the key is cached after first resolution; later
-    // env changes should not alter it during the same process.
     let _override = EnvVarGuard::set(
         "BAMBOO_CONFIG_ENCRYPTION_KEY",
-        "1111111111111111111111111111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222222222222222222222222222",
     );
     let key2 = encryption::get_encryption_key();
 
     assert_eq!(key1, key2);
+    assert_eq!(key1, initial_key.to_vec());
+    drop(guard);
 }
 
 #[test]

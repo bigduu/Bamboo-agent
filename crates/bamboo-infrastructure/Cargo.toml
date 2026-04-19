@@ -1,0 +1,47 @@
+[package]
+name = "bamboo-infrastructure"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bamboo-domain = { path = "../bamboo-domain" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = "1"
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+tracing = "0.1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest-middleware = { version = "0.4", features = ["json"] }
+reqwest-retry = "0.7"
+reqwest-eventsource = "0.6"
+eventsource-stream = "0.2"
+eventsource-client = "0.12"
+uuid = { workspace = true }
+chrono = { workspace = true }
+lazy_static = "1"
+regex = "1"
+dirs = "5"
+aes-gcm = "0.10"
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+dashmap = "6"
+parking_lot = "0.12"
+tokio-stream = "0.1"
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+sysinfo = "0.33"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+http = "1"
+mockall = "0.13"
+wiremock = "0.6"
+tokio-test = "0.4"
+
+[features]
+test-utils = []

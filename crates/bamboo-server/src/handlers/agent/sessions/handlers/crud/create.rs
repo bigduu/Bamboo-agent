@@ -1,7 +1,7 @@
 use actix_web::{web, HttpResponse, Result};
 use uuid::Uuid;
 
-use bamboo_application_agent::Session;
+use bamboo_agent_core::Session;
 use crate::app_state::AppState;
 
 use super::super::super::types::{CreateSessionRequest, CreateSessionResponse, SessionSummary};
@@ -46,9 +46,9 @@ fn build_new_session(
     id: &str,
     req: &CreateSessionRequest,
     global_default_prompt: &str,
-    config: &bamboo_infrastructure_config::Config,
+    config: &bamboo_infrastructure::Config,
 ) -> Session {
-    use bamboo_application_session::session_create::{
+    use crate::session_app::session_create::{
         build_new_session as crate_build, CreateSessionConfig, CreateSessionInput,
     };
 

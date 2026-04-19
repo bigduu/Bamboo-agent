@@ -1,5 +1,5 @@
 use super::conversion::convert_gemini_tools;
-use bamboo_infrastructure_llm::protocol::gemini::{GeminiFunctionDeclaration, GeminiTool};
+use bamboo_infrastructure::protocol::gemini::{GeminiFunctionDeclaration, GeminiTool};
 
 #[test]
 fn convert_gemini_tools_returns_empty_for_none() {

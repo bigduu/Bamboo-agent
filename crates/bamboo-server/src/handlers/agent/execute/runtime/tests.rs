@@ -1,10 +1,10 @@
-use bamboo_application_agent::{AgentEvent, Message, Session};
+use bamboo_agent_core::{AgentEvent, Message, Session};
 use crate::app_state::AgentStatus;
 
-use bamboo_application_runtime::execution::agent_spawn::{
+use bamboo_engine::execution::agent_spawn::{
     preserve_concurrent_session_overrides, terminal_error_event_for_result,
 };
-use bamboo_application_session::execute::{
+use crate::session_app::execute::{
     consume_pending_conclusion_with_options_resume, has_pending_user_message,
 };
 

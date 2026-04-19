@@ -3,8 +3,8 @@ use async_stream::stream;
 use bytes::Bytes;
 use serde_json::json;
 
-use bamboo_infrastructure_llm::LLMRequestOptions;
-use bamboo_application_metrics::types::ForwardStatus;
+use bamboo_infrastructure::LLMRequestOptions;
+use bamboo_engine::metrics::types::ForwardStatus;
 use crate::{app_state::AppState, error::AppError};
 
 use super::PreparedCompleteRequest;
@@ -84,7 +84,7 @@ pub(super) async fn handle_streaming_complete(
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
-                    if let bamboo_infrastructure_llm::types::LLMChunk::Token(text) = &chunk {
+                    if let bamboo_infrastructure::types::LLMChunk::Token(text) = &chunk {
                         completion_text.push_str(text);
                     }
                     if let Some(openai_chunk) = convert_llm_chunk_to_openai(chunk, &response_model) {

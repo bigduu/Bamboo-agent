@@ -1,7 +1,7 @@
 use actix_web::{web, HttpResponse};
 use anyhow::anyhow;
 
-use bamboo_application_metrics::types::ForwardStatus;
+use bamboo_engine::metrics::types::ForwardStatus;
 use crate::services::gemini_model_mapping_service::resolve_model;
 use crate::{app_state::AppState, error::AppError};
 
@@ -12,7 +12,7 @@ use super::runtime::{build_gemini_event_stream, StreamRuntimeContext};
 /// Stream generate content.
 pub async fn stream_generate_content(
     path: web::Path<String>,
-    request: web::Json<bamboo_infrastructure_llm::protocol::gemini::GeminiRequest>,
+    request: web::Json<bamboo_infrastructure::protocol::gemini::GeminiRequest>,
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
     let forward_id = uuid::Uuid::new_v4().to_string();

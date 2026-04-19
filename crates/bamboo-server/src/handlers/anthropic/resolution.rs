@@ -1,4 +1,4 @@
-use bamboo_infrastructure_config::model_mapping::AnthropicModelMapping;
+use bamboo_infrastructure::model_mapping::AnthropicModelMapping;
 
 pub(super) struct ModelResolution {
     pub(super) mapped_model: String,

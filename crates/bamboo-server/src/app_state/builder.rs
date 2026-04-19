@@ -29,7 +29,7 @@ impl AppState {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use bamboo_agent::server::app_state::AppState;
+    /// use bamboo_server::app_state::AppState;
     /// use std::path::PathBuf;
     ///
     /// #[tokio::main]
@@ -44,14 +44,14 @@ impl AppState {
     pub async fn new(bamboo_home_dir: PathBuf) -> Result<Self, AppError> {
         // Ensure all helpers that rely on `core::paths::bamboo_dir()` see the same
         // directory as the server runtime.
-        bamboo_infrastructure_config::paths::init_bamboo_dir(bamboo_home_dir.clone());
+        bamboo_infrastructure::paths::init_bamboo_dir(bamboo_home_dir.clone());
 
         // Load config from the specified data directory
         let config = Config::from_data_dir(Some(bamboo_home_dir.clone()));
 
         // Create provider with direct access (no HTTP proxy)
         let provider =
-            match bamboo_infrastructure_llm::create_provider_with_dir(&config, bamboo_home_dir.clone())
+            match bamboo_infrastructure::create_provider_with_dir(&config, bamboo_home_dir.clone())
                 .await
             {
                 Ok(p) => p,
@@ -91,7 +91,7 @@ impl AppState {
         let (session_store, storage) = init_storage(&data_dir).await?;
 
         // In-memory session cache (shared across handlers and background jobs).
-        let sessions: Arc<RwLock<HashMap<String, bamboo_application_agent::Session>>> =
+        let sessions: Arc<RwLock<HashMap<String, bamboo_agent_core::Session>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
         let config = Arc::new(RwLock::new(config));
@@ -123,14 +123,14 @@ impl AppState {
             Arc::new(RwLock::new(HashMap::new()));
 
         // Child tools intentionally do not expose `SubSession` (no nested child spawns).
-        let child_tools: Arc<dyn bamboo_application_agent::tools::ToolExecutor> = base_tools.clone();
+        let child_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = base_tools.clone();
 
         // Unified agent runtime (shared resources for all execution paths).
         // default_tools = base_tools (builtin + MCP + memory + skills).
         // Root sessions use runtime default (no override);
         // child sessions override via ExecuteRequest with ToolSurface::Child.
         let agent = Arc::new(
-            bamboo_application_runtime::Agent::builder()
+            bamboo_engine::Agent::builder()
                 .storage(storage.clone())
                 .attachment_reader(session_store.clone())
                 .skill_manager(skill_manager.clone())

@@ -1,4 +1,4 @@
-use bamboo_infrastructure_config::Config;
+use bamboo_infrastructure::Config;
 use crate::error::AppError;
 
 use super::{
