@@ -238,15 +238,11 @@ impl SmartCodeReviewTool {
 
         // Language-specific quick checks
         match lang.language.as_str() {
-            "rust" => {
-                if !content.contains("///") && !content.contains("//") {
-                    issues.push("⚠️ No documentation comments found".to_string());
-                }
+            "rust" if !content.contains("///") && !content.contains("//") => {
+                issues.push("⚠️ No documentation comments found".to_string());
             }
-            "python" => {
-                if !content.contains("\"\"\"") && !content.contains("#") {
-                    issues.push("⚠️ No docstrings or comments found".to_string());
-                }
+            "python" if !content.contains("\"\"\"") && !content.contains("#") => {
+                issues.push("⚠️ No docstrings or comments found".to_string());
             }
             _ => {}
         }
@@ -301,10 +297,8 @@ impl SmartCodeReviewTool {
                     issues.push("⚠️ Found panic! macro - ensure these are justified".to_string());
                 }
             }
-            "python" => {
-                if content.contains("except:") && !content.contains("except ") {
-                    issues.push("⚠️ Found bare except: - use specific exceptions".to_string());
-                }
+            "python" if content.contains("except:") && !content.contains("except ") => {
+                issues.push("⚠️ Found bare except: - use specific exceptions".to_string());
             }
             _ => {}
         }
@@ -356,14 +350,12 @@ impl SmartCodeReviewTool {
         let mut issues = Vec::new();
 
         match lang.language.as_str() {
-            "rust" => {
-                if content.contains("unsafe ") {
-                    let unsafe_count = content.matches("unsafe ").count();
-                    issues.push(format!(
-                        "🚨 Found {} unsafe blocks - ensure memory safety is maintained",
-                        unsafe_count
-                    ));
-                }
+            "rust" if content.contains("unsafe ") => {
+                let unsafe_count = content.matches("unsafe ").count();
+                issues.push(format!(
+                    "🚨 Found {} unsafe blocks - ensure memory safety is maintained",
+                    unsafe_count
+                ));
             }
             "python" => {
                 if content.contains("eval(") {
