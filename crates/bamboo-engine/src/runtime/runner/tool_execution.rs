@@ -5,12 +5,12 @@ use std::sync::Arc;
 use futures::future::join_all;
 use tokio::sync::mpsc;
 
+use crate::metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
+use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_infrastructure::LLMProvider;
-use crate::runtime::config::AgentLoopConfig;
-use crate::runtime::task_context::TaskLoopContext;
-use crate::metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 
 mod clarification;
 mod events;
@@ -344,12 +344,14 @@ pub(crate) async fn execute_round_tool_calls(
                             }),
                         )
                         .await
-                        .unwrap_or_else(|_| per_call::ToolExecutionOutcome {
-                            result: Err(format!(
-                                "Tool '{}' timed out after {:?}",
-                                batch_call.function.name, per_tool_timeout
-                            )),
-                            tool_duration: per_tool_timeout,
+                        .unwrap_or_else(|_| {
+                            per_call::ToolExecutionOutcome {
+                                result: Err(format!(
+                                    "Tool '{}' timed out after {:?}",
+                                    batch_call.function.name, per_tool_timeout
+                                )),
+                                tool_duration: per_tool_timeout,
+                            }
                         })
                     }
                 })),
@@ -358,7 +360,9 @@ pub(crate) async fn execute_round_tool_calls(
             .unwrap_or_else(|_| {
                 tracing::warn!(
                     "[{}][round:{}] Parallel batch timed out after {:?}",
-                    session_id, round, batch_timeout
+                    session_id,
+                    round,
+                    batch_timeout
                 );
                 batch
                     .iter()
@@ -396,19 +400,16 @@ pub(crate) async fn execute_round_tool_calls(
             );
 
             // Compress all outcomes in parallel before applying sequentially.
-            let compressed: Vec<_> = join_all(
-                batch
-                    .iter()
-                    .zip(outcomes.into_iter())
-                    .map(|(batch_call, outcome)| {
-                        let tool_name = batch_call.function.name.clone();
-                        let args = batch_call.function.arguments.clone();
-                        let sid = session_id.to_string();
-                        async move {
-                            output_compressor::maybe_compress(&tool_name, &args, &sid, outcome).await
-                        }
-                    }),
-            )
+            let compressed: Vec<_> = join_all(batch.iter().zip(outcomes.into_iter()).map(
+                |(batch_call, outcome)| {
+                    let tool_name = batch_call.function.name.clone();
+                    let args = batch_call.function.arguments.clone();
+                    let sid = session_id.to_string();
+                    async move {
+                        output_compressor::maybe_compress(&tool_name, &args, &sid, outcome).await
+                    }
+                },
+            ))
             .await;
 
             for (batch_call, outcome) in batch.iter().zip(compressed.into_iter()) {

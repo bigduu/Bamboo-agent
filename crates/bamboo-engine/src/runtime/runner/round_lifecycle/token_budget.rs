@@ -1,8 +1,8 @@
+use crate::runtime::config::AgentLoopConfig;
+use bamboo_agent_core::Session;
 use bamboo_compression::limits::{load_model_limits_from_unified_config, ModelLimit};
 use bamboo_compression::{ModelLimitsRegistry, TokenBudget};
-use bamboo_agent_core::Session;
 use bamboo_infrastructure::provider::LLMProvider;
-use crate::runtime::config::AgentLoopConfig;
 
 pub(super) async fn resolve_token_budget(
     session: &Session,

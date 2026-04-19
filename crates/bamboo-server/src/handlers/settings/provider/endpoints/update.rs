@@ -3,12 +3,12 @@ use std::collections::BTreeSet;
 use actix_web::{web, HttpResponse};
 use serde_json::Value;
 
-use bamboo_infrastructure::Config;
 use crate::config_manager;
 use crate::{
     app_state::{AppState, ConfigUpdateEffects},
     error::AppError,
 };
+use bamboo_infrastructure::Config;
 
 use super::super::types::UpdateProviderRequest;
 

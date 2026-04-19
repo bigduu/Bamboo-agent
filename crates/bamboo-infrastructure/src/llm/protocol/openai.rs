@@ -1,14 +1,14 @@
 //! OpenAI protocol conversion implementation.
 
-use bamboo_domain::{FunctionCall, ToolCall};
-use bamboo_domain::{FunctionSchema, ToolSchema};
-use bamboo_domain::{Message, MessagePart, MessagePhase, Role};
 use crate::llm::api::models::{
     ChatMessage as OpenAIChatMessage, Content as OpenAIContent, ContentPart as OpenAIContentPart,
     Role as OpenAIRole, Tool, ToolCall as OpenAIToolCall,
 };
 use crate::llm::models::ContentPart;
 use crate::llm::protocol::{FromProvider, ProtocolResult, ToProvider};
+use bamboo_domain::{FunctionCall, ToolCall};
+use bamboo_domain::{FunctionSchema, ToolSchema};
+use bamboo_domain::{Message, MessagePart, MessagePhase, Role};
 
 /// OpenAI protocol converter.
 pub struct OpenAIProtocol;
@@ -33,8 +33,7 @@ impl FromProvider<OpenAIChatMessage> for Message {
                     })
                     .collect::<Vec<_>>()
                     .join("");
-                let message_parts: Vec<MessagePart> =
-                    parts.into_iter().map(Into::into).collect();
+                let message_parts: Vec<MessagePart> = parts.into_iter().map(Into::into).collect();
                 (text, Some(message_parts))
             }
         };
@@ -103,7 +102,9 @@ impl ToProvider<OpenAIChatMessage> for Message {
         let role = convert_internal_role_to_openai(&self.role);
 
         let content = match self.content_parts.as_ref() {
-            Some(parts) => OpenAIContent::Parts(parts.iter().cloned().map(ContentPart::from).collect()),
+            Some(parts) => {
+                OpenAIContent::Parts(parts.iter().cloned().map(ContentPart::from).collect())
+            }
             None => OpenAIContent::Text(self.content.clone()),
         };
 
@@ -207,9 +208,9 @@ impl OpenAIExt for Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::api::models::{FunctionCall as OpenAIFunctionCall, Role as OpenAIRole};
     use bamboo_domain::FunctionCall;
     use bamboo_domain::Role;
-    use crate::llm::api::models::{FunctionCall as OpenAIFunctionCall, Role as OpenAIRole};
 
     #[test]
     fn test_openai_to_internal_simple_message() {

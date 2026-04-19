@@ -6,13 +6,13 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
 
+use bamboo_agent_core::storage::Storage;
+use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::Session;
 use bamboo_memory::memory_store::{
     DurableMemoryStatus, DurableMemoryType, MemoryQueryOptions, MemoryScope, MemoryStore,
     MAX_MAX_CHARS, MAX_QUERY_LIMIT,
 };
-use bamboo_agent_core::storage::Storage;
-use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
-use bamboo_agent_core::Session;
 use bamboo_tools::tools::session_memory::{
     execute_session_memory_action, SessionMemoryAction, MEMORY_SESSION_ACTION_NAMES,
 };
@@ -119,9 +119,7 @@ impl MemoryTool {
         }
     }
 
-    fn parse_query_filters(
-        filters: Option<&QueryFilters>,
-    ) -> Result<FilterTypeSet, ToolError> {
+    fn parse_query_filters(filters: Option<&QueryFilters>) -> Result<FilterTypeSet, ToolError> {
         let filter_types = filters
             .map(|value| {
                 value

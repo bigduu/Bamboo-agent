@@ -1,32 +1,31 @@
 //! Bamboo engine — runtime, skills, metrics, MCP.
 
+pub mod mcp;
+pub mod metrics;
 pub mod runtime;
 pub mod skills;
-pub mod metrics;
-pub mod mcp;
 
 // Re-export commonly used types from agent (via dependency)
 pub use bamboo_agent_core::{
-    AgentError, AgentEvent, AgentHook, TokenUsage,
-    Session, Message, Role, MessagePart, MessageContent, MessagePhase,
-    PromptSnapshot, ToolCall, ToolResult, ToolExecutor, ToolError, ToolSchema,
-    FunctionCall, FunctionSchema, ToolRegistry, Tool, ToolExecutionContext,
+    AgentError, AgentEvent, AgentHook, FunctionCall, FunctionSchema, Message, MessageContent,
+    MessagePart, MessagePhase, PromptSnapshot, Role, Session, TokenUsage, Tool, ToolCall,
+    ToolError, ToolExecutionContext, ToolExecutor, ToolRegistry, ToolResult, ToolSchema,
 };
 
 // Re-export from runtime
-pub use runtime::runner::run_agent_loop_with_config;
-pub use runtime::runtime::{AgentRuntime, AgentRuntimeBuilder, ExecuteRequest};
-pub use runtime::config::AgentLoopConfig;
-pub use runtime::Agent;
 pub use runtime::agent::AgentBuilder;
+pub use runtime::config::AgentLoopConfig;
 pub use runtime::config::{ImageFallbackConfig, ImageFallbackMode};
 pub use runtime::execution::runner_state::{AgentRunner, AgentStatus};
 pub use runtime::hooks::HookRunner;
 pub use runtime::managers::{
     LifecycleManager, LlmManager, MemoryManager, MiniLoopExecutor, PromptManager, ToolManager,
 };
+pub use runtime::runner::run_agent_loop_with_config;
+pub use runtime::runtime::{AgentRuntime, AgentRuntimeBuilder, ExecuteRequest};
 pub use runtime::task_context::TaskLoopContext;
 pub use runtime::task_evaluation::{evaluate_task_progress, TaskEvaluationResult};
+pub use runtime::Agent;
 
 // Sub-module re-exports for backward compatibility
 pub mod runner {
@@ -80,22 +79,22 @@ pub mod session_port {
 pub mod store {
     pub use crate::skills::store::*;
 }
+pub use skills::types::{SkillDefinition, SkillFilter, SkillStoreConfig};
 pub use skills::SkillManager;
 pub use skills::SkillStore;
-pub use skills::types::{SkillDefinition, SkillStoreConfig, SkillFilter};
 pub use skills::SkillUpdate;
 
 // Re-export from metrics
-pub use metrics::collector::MetricsCollector;
-pub use metrics::events::MetricsEvent;
-pub use metrics::types::*;
-pub use metrics::storage::{MetricsError, MetricsResult, MetricsStorage, SqliteMetricsStorage};
 pub use metrics::aggregator::{aggregate_monthly, aggregate_weekly, PeriodMetrics};
 pub use metrics::bus::MetricsBus;
+pub use metrics::collector::MetricsCollector;
+pub use metrics::events::MetricsEvent;
+pub use metrics::storage::{MetricsError, MetricsResult, MetricsStorage, SqliteMetricsStorage};
+pub use metrics::types::*;
 pub use metrics::worker::MetricsWorker;
 
 // Re-export from MCP
+pub use mcp::config::*;
 pub use mcp::executor::{CompositeToolExecutor, McpToolExecutor};
 pub use mcp::manager::McpServerManager;
-pub use mcp::config::*;
 pub use mcp::types::*;

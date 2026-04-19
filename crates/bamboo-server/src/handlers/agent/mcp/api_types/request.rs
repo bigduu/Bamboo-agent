@@ -88,15 +88,13 @@ impl MainstreamServerRequest {
                         .unwrap_or(bamboo_engine::mcp::config::default_startup_timeout()),
                 })
             }
-            (None, Some(url)) => {
-                bamboo_engine::TransportConfig::Sse(bamboo_engine::SseConfig {
-                    url,
-                    headers: self.headers,
-                    connect_timeout_ms: self
-                        .connect_timeout_ms
-                        .unwrap_or(bamboo_engine::mcp::config::default_connect_timeout()),
-                })
-            }
+            (None, Some(url)) => bamboo_engine::TransportConfig::Sse(bamboo_engine::SseConfig {
+                url,
+                headers: self.headers,
+                connect_timeout_ms: self
+                    .connect_timeout_ms
+                    .unwrap_or(bamboo_engine::mcp::config::default_connect_timeout()),
+            }),
             (Some(_), Some(_)) => {
                 return Err("MCP server config cannot contain both 'command' and 'url'".to_string());
             }

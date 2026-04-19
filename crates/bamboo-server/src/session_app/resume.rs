@@ -39,10 +39,7 @@ pub trait ResumeExecutionPort: Send + Sync {
     ) -> Option<CancellationToken>;
 
     /// Get or create the long-lived broadcast sender for session events.
-    async fn get_or_create_event_sender(
-        &self,
-        session_id: &str,
-    ) -> broadcast::Sender<AgentEvent>;
+    async fn get_or_create_event_sender(&self, session_id: &str) -> broadcast::Sender<AgentEvent>;
 
     /// Spawn the resume execution loop in the background.
     ///

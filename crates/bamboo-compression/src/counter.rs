@@ -321,7 +321,11 @@ mod tests {
         let counter = TiktokenTokenCounter::default();
         // CJK text: each character is typically 1-2 tokens
         let tokens = counter.count_text("你好世界");
-        assert!(tokens >= 2 && tokens <= 8, "Expected 2-8 tokens, got {}", tokens);
+        assert!(
+            tokens >= 2 && tokens <= 8,
+            "Expected 2-8 tokens, got {}",
+            tokens
+        );
     }
 
     #[test]

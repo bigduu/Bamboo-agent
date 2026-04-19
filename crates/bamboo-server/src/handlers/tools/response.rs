@@ -1,5 +1,5 @@
-use bamboo_agent_core::tools::ToolResult;
 use crate::error::AppError;
+use bamboo_agent_core::tools::ToolResult;
 
 use super::models::{ToolExecutionResponse, ToolExecutionResultPayload};
 

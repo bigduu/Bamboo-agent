@@ -1,8 +1,8 @@
 use actix_web::{web, HttpResponse};
 
+use crate::app_state::AppState;
 use bamboo_agent_core::Session;
 use bamboo_infrastructure::models::{ContentPart, ImageUrl};
-use crate::app_state::AppState;
 
 use super::super::ChatImage;
 

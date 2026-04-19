@@ -1,9 +1,9 @@
 //! Anthropic protocol conversion implementation.
 
-use bamboo_domain::{FunctionSchema, ToolSchema};
-use bamboo_domain::{Message, Role};
 use crate::llm::protocol::{FromProvider, ProtocolError, ProtocolResult, ToProvider};
 use crate::llm::providers::anthropic::api_types::*;
+use bamboo_domain::{FunctionSchema, ToolSchema};
+use bamboo_domain::{Message, Role};
 use serde_json::Value;
 
 #[cfg(test)]

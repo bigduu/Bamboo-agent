@@ -3,9 +3,11 @@ mod stream;
 
 use actix_web::{http::StatusCode, web, HttpResponse};
 
-use bamboo_agent_core::{tools::ToolSchema, Message};
-use bamboo_infrastructure::{api::models::StreamOptions, providers::anthropic::api_types::AnthropicCompleteRequest};
 use crate::{app_state::AppState, error::AppError};
+use bamboo_agent_core::{tools::ToolSchema, Message};
+use bamboo_infrastructure::{
+    api::models::StreamOptions, providers::anthropic::api_types::AnthropicCompleteRequest,
+};
 
 use super::conversion::{convert_complete_request, convert_messages, convert_tools};
 use super::errors::{anthropic_error_response, AnthropicError};
@@ -61,9 +63,8 @@ pub async fn complete(
         .get("max_tokens")
         .and_then(|value| value.as_u64())
         .map(|value| value as u32);
-    let reasoning_effort = crate::handlers::openai::helpers::parse_reasoning_effort(
-        &openai_request.parameters,
-    );
+    let reasoning_effort =
+        crate::handlers::openai::helpers::parse_reasoning_effort(&openai_request.parameters);
     let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
 
     let prepared = PreparedCompleteRequest {

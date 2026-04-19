@@ -1,12 +1,12 @@
 use super::{apply_image_fallback_to_llm_messages, persistable_image_urls};
-use bamboo_agent_core::tools::ToolSchema;
-use bamboo_agent_core::{AgentError, Message, Session};
-use bamboo_infrastructure::models::{ContentPart, ImageUrl};
-use bamboo_infrastructure::provider::{LLMError, LLMProvider, LLMStream};
-use bamboo_domain::MessagePart;
-use bamboo_infrastructure::types::LLMChunk;
 use crate::runtime::config::{ImageFallbackConfig, ImageFallbackMode};
 use async_trait::async_trait;
+use bamboo_agent_core::tools::ToolSchema;
+use bamboo_agent_core::{AgentError, Message, Session};
+use bamboo_domain::MessagePart;
+use bamboo_infrastructure::models::{ContentPart, ImageUrl};
+use bamboo_infrastructure::provider::{LLMError, LLMProvider, LLMStream};
+use bamboo_infrastructure::types::LLMChunk;
 use futures::stream;
 use std::sync::{Arc, Mutex};
 
@@ -55,7 +55,10 @@ fn persistable_image_urls_filters_out_data_urls() {
     ];
 
     let urls = persistable_image_urls(
-        &parts.into_iter().map(Into::into).collect::<Vec<MessagePart>>(),
+        &parts
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<MessagePart>>(),
     );
     assert_eq!(urls, vec!["bamboo-attachment://s1/a1".to_string()]);
 }
@@ -75,9 +78,10 @@ async fn image_fallback_placeholder_does_not_mutate_persisted_session_messages()
     ];
 
     let mut session = Session::new("s1", "m");
-    session
-        .messages
-        .push(Message::user_with_parts("这个内容有什么", parts.into_iter().map(Into::into).collect()));
+    session.messages.push(Message::user_with_parts(
+        "这个内容有什么",
+        parts.into_iter().map(Into::into).collect(),
+    ));
 
     let mut llm_messages = session.messages.clone();
     apply_image_fallback_to_llm_messages(

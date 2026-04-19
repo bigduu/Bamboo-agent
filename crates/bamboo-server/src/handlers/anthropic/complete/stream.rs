@@ -3,9 +3,9 @@ use async_stream::stream;
 use bytes::Bytes;
 use serde_json::json;
 
-use bamboo_infrastructure::LLMRequestOptions;
-use bamboo_engine::metrics::types::ForwardStatus;
 use crate::{app_state::AppState, error::AppError};
+use bamboo_engine::metrics::types::ForwardStatus;
+use bamboo_infrastructure::LLMRequestOptions;
 
 use super::PreparedCompleteRequest;
 use crate::handlers::anthropic::{

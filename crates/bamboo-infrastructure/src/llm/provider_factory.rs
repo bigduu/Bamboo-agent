@@ -2,13 +2,11 @@
 //!
 //! Creates LLM providers based on configuration.
 
-use crate::llm::provider::{LLMError, LLMProvider};
-use crate::llm::providers::common::MaskingProviderDecorator;
-use crate::llm::providers::{
-    AnthropicProvider, CopilotProvider, GeminiProvider, OpenAIProvider,
-};
 use crate::config::paths::bamboo_dir;
 use crate::config::Config;
+use crate::llm::provider::{LLMError, LLMProvider};
+use crate::llm::providers::common::MaskingProviderDecorator;
+use crate::llm::providers::{AnthropicProvider, CopilotProvider, GeminiProvider, OpenAIProvider};
 use reqwest::Client;
 use std::sync::Arc;
 

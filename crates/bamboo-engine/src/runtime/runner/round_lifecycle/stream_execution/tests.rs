@@ -6,8 +6,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::execute_llm_stream;
-use bamboo_compression::{PreparedContext, TokenUsageBreakdown};
 use bamboo_agent_core::{AgentEvent, Message, Role, Session};
+use bamboo_compression::{PreparedContext, TokenUsageBreakdown};
 use bamboo_infrastructure::{LLMChunk, LLMProvider, LLMRequestOptions, LLMStream};
 
 struct MockLlmProvider {
@@ -294,12 +294,11 @@ async fn execute_llm_stream_keeps_previous_response_id_when_local_summary_or_com
         "responses.previous_response_id".to_string(),
         "resp_prev".to_string(),
     );
-    session.conversation_summary =
-        Some(bamboo_agent_core::agent::types::ConversationSummary::new(
-            "Older work has been summarized locally.",
-            6,
-            42,
-        ));
+    session.conversation_summary = Some(bamboo_agent_core::agent::types::ConversationSummary::new(
+        "Older work has been summarized locally.",
+        6,
+        42,
+    ));
 
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
     let prepared_context = PreparedContext {

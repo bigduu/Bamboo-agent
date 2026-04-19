@@ -5,13 +5,13 @@
 //! events into [`LLMChunk`] so the rest of Bamboo can stay provider-agnostic.
 
 use super::tool_schema::sanitize_openai_function_parameters_schema;
-use bamboo_domain::{Role, Message, MessagePhase};
-use bamboo_domain::{ToolSchema};
-use bamboo_domain::MessagePart;
 use crate::llm::provider::ResponsesRequestOptions;
 use crate::llm::provider::Result;
 use crate::llm::types::LLMChunk;
+use bamboo_domain::MessagePart;
 use bamboo_domain::ReasoningEffort;
+use bamboo_domain::ToolSchema;
+use bamboo_domain::{Message, MessagePhase, Role};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -1234,10 +1234,11 @@ impl ResponsesSseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_domain::{FunctionCall, ToolCall};
-    use bamboo_domain::{FunctionSchema, ToolSchema};    use bamboo_domain::MessagePhase;
     use crate::llm::models::{ContentPart, ImageUrl};
     use bamboo_domain::MessagePart;
+    use bamboo_domain::MessagePhase;
+    use bamboo_domain::{FunctionCall, ToolCall};
+    use bamboo_domain::{FunctionSchema, ToolSchema};
 
     #[test]
     fn build_responses_body_includes_input_and_stream() {

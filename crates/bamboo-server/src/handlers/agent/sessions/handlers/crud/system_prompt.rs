@@ -38,10 +38,8 @@ pub async fn get_system_prompt_snapshot(
     };
 
     let default_prompt = crate::prompt_defaults::read_global_default_system_prompt_template();
-    let snapshot = crate::session_app::system_prompt::build_system_prompt_snapshot(
-        &session,
-        &default_prompt,
-    );
+    let snapshot =
+        crate::session_app::system_prompt::build_system_prompt_snapshot(&session, &default_prompt);
 
     Ok(HttpResponse::Ok().json(SessionSystemPromptResponse {
         session_id: session_id.to_string(),
@@ -68,8 +66,8 @@ pub async fn get_system_prompt_snapshot(
 #[cfg(test)]
 mod tests {
     use super::get_system_prompt_snapshot;
-    use bamboo_agent_core::{Message, Session};
     use actix_web::{body::to_bytes, http::StatusCode, web};
+    use bamboo_agent_core::{Message, Session};
 
     fn publish_test_env_context() {
         let config = bamboo_infrastructure::Config {
@@ -156,10 +154,9 @@ mod tests {
             workspace.to_string_lossy().to_string(),
         );
 
-        let workspace_context = crate::app_state::build_workspace_prompt_context(
-            workspace.to_string_lossy().as_ref(),
-        )
-        .expect("workspace context");
+        let workspace_context =
+            crate::app_state::build_workspace_prompt_context(workspace.to_string_lossy().as_ref())
+                .expect("workspace context");
         let instruction_context =
             bamboo_engine::context::instruction::build_instruction_prompt_context(
                 workspace.to_string_lossy().as_ref(),

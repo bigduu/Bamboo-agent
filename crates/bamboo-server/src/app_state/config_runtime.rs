@@ -66,7 +66,8 @@ impl AppState {
         );
 
         let new_provider =
-            bamboo_infrastructure::create_provider_with_dir(&config, self.app_data_dir.clone()).await?;
+            bamboo_infrastructure::create_provider_with_dir(&config, self.app_data_dir.clone())
+                .await?;
 
         let mut provider = self.provider.write().await;
         *provider = new_provider;

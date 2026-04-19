@@ -1,7 +1,7 @@
 use actix_web::{web, HttpResponse};
 
-use bamboo_engine::metrics::types::ForwardStatus;
 use crate::{app_state::AppState, error::AppError};
+use bamboo_engine::metrics::types::ForwardStatus;
 
 use super::types::{ListModelsResponse, Model};
 

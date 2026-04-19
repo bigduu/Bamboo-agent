@@ -20,7 +20,11 @@ fn hide_window_for_std_command(command: &mut Command) {
 }
 
 /// Trace a command invocation. No-op in this crate.
-fn trace_windows_command<S: AsRef<str>, I: IntoIterator<Item = S>>(_scope: &str, _program: &str, _args: I) {
+fn trace_windows_command<S: AsRef<str>, I: IntoIterator<Item = S>>(
+    _scope: &str,
+    _program: &str,
+    _args: I,
+) {
     // No-op
 }
 

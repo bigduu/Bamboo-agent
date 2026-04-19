@@ -43,9 +43,13 @@ pub async fn submit_pending_response(
     );
 
     // ---- Update or append tool result message ----
-    let found = update_or_append_tool_result_message(&mut session, &tool_call_id, &input.user_response);
+    let found =
+        update_or_append_tool_result_message(&mut session, &tool_call_id, &input.user_response);
     if found {
-        tracing::info!("[{}] Updated existing tool result message", input.session_id);
+        tracing::info!(
+            "[{}] Updated existing tool result message",
+            input.session_id
+        );
     } else {
         tracing::warn!(
             "[{}] Tool result message not found for tool_call_id: {}, added fallback message",
@@ -85,7 +89,10 @@ pub async fn submit_pending_response(
 
 // ---- Internal helpers ----
 
-pub fn validate_pending_response(pending: &PendingQuestion, user_response: &str) -> Result<(), String> {
+pub fn validate_pending_response(
+    pending: &PendingQuestion,
+    user_response: &str,
+) -> Result<(), String> {
     if pending.allow_custom {
         return Ok(());
     }

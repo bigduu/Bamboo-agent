@@ -12,11 +12,11 @@
 use async_trait::async_trait;
 use serde_json::json;
 
-use bamboo_memory::memory_store::MemoryStore;
-use bamboo_agent_core::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use crate::tools::session_memory::{
     execute_session_memory_action, parse_session_note_action, SESSION_NOTE_ACTION_NAMES,
 };
+use bamboo_agent_core::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_memory::memory_store::MemoryStore;
 
 const TOOL_NAME: &str = "session_note";
 const TOOL_DESCRIPTION: &str = "Read or update the persistent session-scoped note (markdown). Use this for durable local context, user preferences, constraints, and compression-resistant reminders within the current session/workstream. Do not use it as the primary long-term knowledge base. Hard limit: 12000 characters; compress before append/replace if needed.";
@@ -78,10 +78,7 @@ impl Tool for SessionNoteTool {
     }
 
     fn call_concurrency_safe(&self, args: &serde_json::Value) -> bool {
-        matches!(
-            self.call_mutability(args),
-            crate::ToolMutability::ReadOnly
-        )
+        matches!(self.call_mutability(args), crate::ToolMutability::ReadOnly)
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

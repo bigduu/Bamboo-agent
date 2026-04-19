@@ -1,8 +1,8 @@
 use actix_web::{web, HttpResponse, Result};
 
 use super::types::to_task_list_response;
-use bamboo_agent_core::SessionKind;
 use crate::app_state::AppState;
+use bamboo_agent_core::SessionKind;
 
 /// Get task list for a session.
 pub async fn get_task_list(
@@ -17,7 +17,8 @@ pub async fn get_task_list(
     };
 
     let shared_session = if session.kind == SessionKind::Child {
-        state.load_session(&session.root_session_id)
+        state
+            .load_session(&session.root_session_id)
             .await
             .unwrap_or_else(|| session.clone())
     } else {
@@ -53,7 +54,8 @@ pub async fn has_task_list(
     };
 
     let shared_session = if session.kind == SessionKind::Child {
-        state.load_session(&session.root_session_id)
+        state
+            .load_session(&session.root_session_id)
             .await
             .unwrap_or_else(|| session.clone())
     } else {

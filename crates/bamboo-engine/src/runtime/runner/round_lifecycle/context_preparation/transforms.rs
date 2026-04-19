@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use bamboo_compression::PreparedContext;
-use bamboo_agent_core::{AgentError, Message, Role};
-use bamboo_infrastructure::LLMProvider;
 use crate::runtime::config::AgentLoopConfig;
+use bamboo_agent_core::{AgentError, Message, Role};
+use bamboo_compression::PreparedContext;
+use bamboo_infrastructure::LLMProvider;
 
 use super::super::super::image_fallback::{
     apply_image_fallback_to_llm_messages, resolve_bamboo_attachments_for_llm,

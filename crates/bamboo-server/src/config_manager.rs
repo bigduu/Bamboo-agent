@@ -19,8 +19,8 @@
 
 use serde_json::{Map, Value};
 
-use bamboo_infrastructure::Config;
 use crate::error::AppError;
+use bamboo_infrastructure::Config;
 
 // Re-export pure domain logic from the config crate so server consumers
 // can import through `config_manager`.
@@ -42,11 +42,13 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                     openai.api_key_encrypted = if api_key.is_empty() {
                         None
                     } else {
-                        Some(bamboo_infrastructure::encryption::encrypt(api_key).map_err(|e| {
-                            AppError::InternalError(anyhow::anyhow!(
-                                "Failed to encrypt OpenAI api_key: {e}"
-                            ))
-                        })?)
+                        Some(
+                            bamboo_infrastructure::encryption::encrypt(api_key).map_err(|e| {
+                                AppError::InternalError(anyhow::anyhow!(
+                                    "Failed to encrypt OpenAI api_key: {e}"
+                                ))
+                            })?,
+                        )
                     };
                 }
             }
@@ -56,11 +58,13 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                     anthropic.api_key_encrypted = if api_key.is_empty() {
                         None
                     } else {
-                        Some(bamboo_infrastructure::encryption::encrypt(api_key).map_err(|e| {
-                            AppError::InternalError(anyhow::anyhow!(
-                                "Failed to encrypt Anthropic api_key: {e}"
-                            ))
-                        })?)
+                        Some(
+                            bamboo_infrastructure::encryption::encrypt(api_key).map_err(|e| {
+                                AppError::InternalError(anyhow::anyhow!(
+                                    "Failed to encrypt Anthropic api_key: {e}"
+                                ))
+                            })?,
+                        )
                     };
                 }
             }
@@ -70,11 +74,13 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                     gemini.api_key_encrypted = if api_key.is_empty() {
                         None
                     } else {
-                        Some(bamboo_infrastructure::encryption::encrypt(api_key).map_err(|e| {
-                            AppError::InternalError(anyhow::anyhow!(
-                                "Failed to encrypt Gemini api_key: {e}"
-                            ))
-                        })?)
+                        Some(
+                            bamboo_infrastructure::encryption::encrypt(api_key).map_err(|e| {
+                                AppError::InternalError(anyhow::anyhow!(
+                                    "Failed to encrypt Gemini api_key: {e}"
+                                ))
+                            })?,
+                        )
                     };
                 }
             }

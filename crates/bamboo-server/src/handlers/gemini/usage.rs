@@ -1,5 +1,5 @@
-use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
 use bamboo_agent_core::Message;
+use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
 use bamboo_engine::metrics::types::TokenUsage as MetricsTokenUsage;
 
 pub(super) fn estimate_prompt_tokens(messages: &[Message]) -> u64 {

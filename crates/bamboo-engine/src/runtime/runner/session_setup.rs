@@ -2,16 +2,16 @@
 
 use chrono::Utc;
 
-use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{Message, Session};
+use crate::metrics::MetricsCollector;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
-use crate::metrics::MetricsCollector;
 use crate::skills::runtime_metadata::{
     SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY, SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY,
     SKILL_RUNTIME_SELECTION_COUNT_KEY, SKILL_RUNTIME_SELECTION_SOURCE_KEY,
     SKILL_RUNTIME_SELECTION_TRACE_KEY,
 };
+use bamboo_agent_core::tools::ToolExecutor;
+use bamboo_agent_core::{Message, Session};
 
 use super::logging::DebugLogger;
 

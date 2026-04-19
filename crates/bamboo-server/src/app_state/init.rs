@@ -12,14 +12,14 @@ use std::time::Duration;
 use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
 
-use bamboo_infrastructure::SessionStoreV2;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::{AgentEvent, Session};
-use bamboo_engine::McpServerManager;
 use bamboo_engine::Agent;
+use bamboo_engine::McpServerManager;
 use bamboo_engine::{SkillManager, SkillStoreConfig};
 use bamboo_infrastructure::Config;
 use bamboo_infrastructure::LLMProvider;
+use bamboo_infrastructure::SessionStoreV2;
 
 use crate::error::AppError;
 use crate::metrics_service::MetricsService;
@@ -43,18 +43,16 @@ pub async fn init_storage(
     data_dir: &Path,
 ) -> Result<(Arc<SessionStoreV2>, Arc<dyn Storage>), AppError> {
     tracing::info!("Initializing session store V2 at: {:?}", data_dir);
-    let session_store = Arc::new(
-        SessionStoreV2::new(data_dir.to_path_buf())
-            .await
-            .map_err(|error| {
-                tracing::error!(
-                    "Failed to initialize SessionStoreV2 at {:?}: {}",
-                    data_dir,
-                    error
-                );
-                AppError::StorageError(error)
-            })?,
-    );
+    let session_store = Arc::new(SessionStoreV2::new(data_dir.to_path_buf()).await.map_err(
+        |error| {
+            tracing::error!(
+                "Failed to initialize SessionStoreV2 at {:?}: {}",
+                data_dir,
+                error
+            );
+            AppError::StorageError(error)
+        },
+    )?);
     let session_store_for_rebuild = session_store.clone();
     tokio::spawn(async move {
         let purged_rows = match session_store_for_rebuild
@@ -123,9 +121,7 @@ pub async fn init_skill_manager(data_dir: &Path) -> Arc<SkillManager> {
 /// Returns `(provider_lock, provider_handle)` where `provider_lock` is the
 /// hot-reloadable `RwLock` and `provider_handle` is a stable `ReloadableProvider`
 /// that always delegates to the latest value in the lock.
-pub fn build_provider_handles(
-    provider: Arc<dyn LLMProvider>,
-) -> ProviderHandles {
+pub fn build_provider_handles(provider: Arc<dyn LLMProvider>) -> ProviderHandles {
     let provider_lock: Arc<RwLock<Arc<dyn LLMProvider>>> = Arc::new(RwLock::new(provider));
     let provider_handle: Arc<dyn LLMProvider> = Arc::new(
         crate::reloadable_provider::ReloadableProvider::new(provider_lock.clone()),
@@ -137,8 +133,7 @@ pub fn build_provider_handles(
 ///
 /// Falls back to disabled permissions if no config exists or loading fails.
 pub async fn load_permission_checker(bamboo_home_dir: &Path) -> Arc<PermissionChecker> {
-    let storage =
-        bamboo_tools::permission::storage::PermissionStorage::new(bamboo_home_dir);
+    let storage = bamboo_tools::permission::storage::PermissionStorage::new(bamboo_home_dir);
     let permission_config = match storage.load().await {
         Ok(Some(config)) => config,
         Ok(None) => {
@@ -154,9 +149,9 @@ pub async fn load_permission_checker(bamboo_home_dir: &Path) -> Arc<PermissionCh
         }
     };
     permission_config.cleanup_expired_grants();
-    Arc::new(
-        bamboo_tools::permission::ConfigPermissionChecker::new(Arc::new(permission_config)),
-    )
+    Arc::new(bamboo_tools::permission::ConfigPermissionChecker::new(
+        Arc::new(permission_config),
+    ))
 }
 
 /// Initialize MCP server manager with background server initialization.
@@ -278,5 +273,7 @@ pub fn build_schedule_manager(
         trigger_engine: crate::schedules::default_trigger_engine(),
         resolve_run_config: Arc::new(|_| unimplemented!("replaced by build_schedule_context")),
     };
-    Arc::new(ScheduleManager::new(build_schedule_context(base_ctx, config)))
+    Arc::new(ScheduleManager::new(build_schedule_context(
+        base_ctx, config,
+    )))
 }

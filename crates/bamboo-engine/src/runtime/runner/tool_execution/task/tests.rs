@@ -1,12 +1,12 @@
 use tokio::sync::mpsc;
 
 use super::maybe_handle_taskwrite;
+use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolResult};
 use bamboo_agent_core::AgentEvent;
 use bamboo_agent_core::Session;
 use bamboo_domain::TaskItemStatus;
-use crate::runtime::config::AgentLoopConfig;
-use crate::runtime::task_context::TaskLoopContext;
 
 #[tokio::test]
 async fn maybe_handle_taskwrite_handles_task_tool_updates_session_and_context() {

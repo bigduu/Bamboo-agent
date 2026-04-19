@@ -4,10 +4,8 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::session_app::child_session::{self, ChildSessionPort};
-use bamboo_agent_core::tools::{Tool, ToolError, ToolResult, ToolExecutionContext};
-use crate::tools::child_session_adapter::{
-    ChildSessionAdapter, tool_error_from_child_session,
-};
+use crate::tools::child_session_adapter::{tool_error_from_child_session, ChildSessionAdapter};
+use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -115,7 +113,12 @@ impl Tool for SubSessionManagerTool {
                 "sub_session_manager requires a session_id in tool context".to_string(),
             )
         })?;
-        let parent = self.adapter.as_ref().load_root_session(parent_session_id).await.map_err(tool_error_from_child_session)?;
+        let parent = self
+            .adapter
+            .as_ref()
+            .load_root_session(parent_session_id)
+            .await
+            .map_err(tool_error_from_child_session)?;
 
         let parsed: SubSessionManagerArgs = serde_json::from_value(args).map_err(|error| {
             ToolError::InvalidArguments(format!("Invalid sub_session_manager args: {error}"))
@@ -123,13 +126,18 @@ impl Tool for SubSessionManagerTool {
 
         match parsed {
             SubSessionManagerArgs::List => {
-                let result = child_session::list_children_action(self.adapter.as_ref(), &parent.id).await;
+                let result =
+                    child_session::list_children_action(self.adapter.as_ref(), &parent.id).await;
                 tool_result(result)
             }
             SubSessionManagerArgs::Get { child_session_id } => {
-                let result = child_session::get_child_action(self.adapter.as_ref(), &parent.id, child_session_id)
-                    .await
-                    .map_err(tool_error_from_child_session)?;
+                let result = child_session::get_child_action(
+                    self.adapter.as_ref(),
+                    &parent.id,
+                    child_session_id,
+                )
+                .await
+                .map_err(tool_error_from_child_session)?;
                 tool_result(result)
             }
             SubSessionManagerArgs::Update {
@@ -209,15 +217,15 @@ mod tests {
     use tokio::time::Duration;
     use uuid::Uuid;
 
-    use bamboo_infrastructure::{JsonlStorage, SessionStoreV2};
+    use crate::app_state::{AgentRunner, AgentStatus};
+    use crate::spawn_scheduler::{SpawnContext, SpawnScheduler};
     use bamboo_agent_core::storage::Storage;
     use bamboo_agent_core::tools::{ToolExecutionContext, ToolExecutor, ToolSchema};
     use bamboo_agent_core::{AgentEvent, Message, Role, Session};
-    use bamboo_infrastructure::{LLMError, LLMProvider, LLMStream};
-    use bamboo_engine::{MetricsCollector, SqliteMetricsStorage};
     use bamboo_engine::SkillManager;
-    use crate::app_state::{AgentRunner, AgentStatus};
-    use crate::spawn_scheduler::{SpawnContext, SpawnScheduler};
+    use bamboo_engine::{MetricsCollector, SqliteMetricsStorage};
+    use bamboo_infrastructure::{JsonlStorage, SessionStoreV2};
+    use bamboo_infrastructure::{LLMError, LLMProvider, LLMStream};
 
     struct NoopProvider;
 
@@ -316,7 +324,9 @@ mod tests {
                 .attachment_reader(session_store.clone())
                 .skill_manager(Arc::new(SkillManager::new()))
                 .metrics_collector(metrics_collector)
-                .config(Arc::new(RwLock::new(bamboo_infrastructure::Config::default())))
+                .config(Arc::new(RwLock::new(
+                    bamboo_infrastructure::Config::default(),
+                )))
                 .provider(Arc::new(NoopProvider))
                 .default_tools(Arc::new(NoopToolExecutor))
                 .build()

@@ -35,8 +35,10 @@ pub async fn handler(
         Err(error) => return internal_server_error_response(error),
     };
 
-    let disabled_tools_vec: Vec<String> = config_snapshot.disabled_tool_names().into_iter().collect();
-    let disabled_skill_ids_vec: Vec<String> = config_snapshot.disabled_skill_ids().into_iter().collect();
+    let disabled_tools_vec: Vec<String> =
+        config_snapshot.disabled_tool_names().into_iter().collect();
+    let disabled_skill_ids_vec: Vec<String> =
+        config_snapshot.disabled_skill_ids().into_iter().collect();
 
     let config = crate::session_app::types::ExecutionConfigSnapshot {
         default_model: config_snapshot.get_model(),
@@ -53,23 +55,20 @@ pub async fn handler(
         request_model: req.model.clone(),
         request_reasoning_effort: req.reasoning_effort,
         request_skill_mode: req.skill_mode.clone(),
-        client_sync: req
-            .client_sync
-            .as_ref()
-            .map(|cs| crate::session_app::types::ExecuteClientSync {
+        client_sync: req.client_sync.as_ref().map(|cs| {
+            crate::session_app::types::ExecuteClientSync {
                 client_message_count: cs.client_message_count,
                 client_last_message_id: cs.client_last_message_id.clone(),
                 client_has_pending_question: cs.client_has_pending_question,
-                client_pending_question_tool_call_id: cs.client_pending_question_tool_call_id.clone(),
-            }),
+                client_pending_question_tool_call_id: cs
+                    .client_pending_question_tool_call_id
+                    .clone(),
+            }
+        }),
     };
 
-    let outcome = match crate::session_app::execute::prepare_execute(
-        state.as_ref(),
-        config,
-        input,
-    )
-    .await
+    let outcome = match crate::session_app::execute::prepare_execute(state.as_ref(), config, input)
+        .await
     {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -104,7 +103,8 @@ pub async fn handler(
         } => {
             // ---- Reserve runner ----
             let session_tx = state.get_session_event_sender(&session_id).await;
-            let cancel_token = match reserve_runner(state.get_ref(), &session_id, &session_tx).await {
+            let cancel_token = match reserve_runner(state.get_ref(), &session_id, &session_tx).await
+            {
                 RunnerReservation::Started(token) => token,
                 RunnerReservation::AlreadyRunning => {
                     let sync_info = build_sync_info_from_session(&session, None);
@@ -211,7 +211,9 @@ pub async fn handler(
 }
 
 /// Convert a crate's `ExecuteSyncReason` to the handler's `ExecuteSyncReason`.
-fn crate_sync_reason_to_handler(reason: crate::session_app::types::ExecuteSyncReason) -> ExecuteSyncReason {
+fn crate_sync_reason_to_handler(
+    reason: crate::session_app::types::ExecuteSyncReason,
+) -> ExecuteSyncReason {
     match reason {
         crate::session_app::types::ExecuteSyncReason::PendingQuestionMismatch => {
             ExecuteSyncReason::PendingQuestionMismatch
@@ -250,7 +252,10 @@ fn build_sync_info_from_session(
         server_message_count: session.messages.len(),
         server_last_message_id: session.messages.last().map(|m| m.id.clone()),
         has_pending_question: session.pending_question.is_some(),
-        pending_question_tool_call_id: session.pending_question.as_ref().map(|p| p.tool_call_id.clone()),
+        pending_question_tool_call_id: session
+            .pending_question
+            .as_ref()
+            .map(|p| p.tool_call_id.clone()),
         has_pending_user_message: false,
     }
 }

@@ -8,6 +8,6 @@ mod condition;
 mod expr;
 mod parallel;
 
-pub use condition::{Condition, evaluate_condition};
+pub use condition::{evaluate_condition, Condition};
 pub use expr::ToolExpr;
 pub use parallel::ParallelWait;

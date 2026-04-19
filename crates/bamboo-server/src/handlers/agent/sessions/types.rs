@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use bamboo_infrastructure::SessionIndexEntry;
 use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_infrastructure::SessionIndexEntry;
 
 #[derive(Debug, Serialize)]
 pub struct SessionSummary {

@@ -2,8 +2,8 @@ use actix_web::{web, HttpResponse};
 use anyhow::anyhow;
 use serde_json::json;
 
-use bamboo_engine::metrics::types::ForwardStatus;
 use crate::{app_state::AppState, error::AppError};
+use bamboo_engine::metrics::types::ForwardStatus;
 
 /// List available models.
 pub async fn list_models(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {

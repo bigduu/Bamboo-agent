@@ -1,9 +1,9 @@
 use tokio::sync::mpsc;
 
+use crate::metrics::MetricsCollector;
+use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::{ToolCall, ToolResult};
 use bamboo_agent_core::{AgentEvent, Session};
-use crate::runtime::config::AgentLoopConfig;
-use crate::metrics::MetricsCollector;
 
 use super::events::send_event_with_metrics;
 

@@ -9,18 +9,22 @@ use tokio::sync::{broadcast, Notify, RwLock};
 use tokio::time::{sleep, Duration};
 
 use bamboo_agent::agent::{Agent, AgentBuilder, AgentEvent, Message, Session};
+use bamboo_agent::server::app_state::AgentRunner;
+use bamboo_agent::server::schedule_app::{ResolvedRunConfig, ScheduleContext};
+use bamboo_agent::server::schedules::{
+    ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore,
+};
+use bamboo_agent::server::tools::ScheduleTasksTool;
 use bamboo_agent::Config;
 use bamboo_agent_core::storage::Storage;
-use bamboo_agent_core::tools::{Tool, ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult, ToolSchema};
+use bamboo_agent_core::tools::{
+    Tool, ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult, ToolSchema,
+};
 use bamboo_agent_core::SessionKind;
-use bamboo_agent::server::schedule_app::{ResolvedRunConfig, ScheduleContext};
 use bamboo_infrastructure::provider::Result as LLMResult;
 use bamboo_infrastructure::provider::{LLMProvider, LLMStream};
 use bamboo_infrastructure::LLMChunk;
 use bamboo_infrastructure::SessionStoreV2;
-use bamboo_agent::server::app_state::AgentRunner;
-use bamboo_agent::server::schedules::{ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore};
-use bamboo_agent::server::tools::ScheduleTasksTool;
 
 mod common;
 
@@ -70,13 +74,8 @@ struct NoopTools;
 
 #[async_trait]
 impl ToolExecutor for NoopTools {
-    async fn execute(
-        &self,
-        _call: &ToolCall,
-    ) -> std::result::Result<ToolResult, ToolError> {
-        Err(ToolError::NotFound(
-            "noop".to_string(),
-        ))
+    async fn execute(&self, _call: &ToolCall) -> std::result::Result<ToolResult, ToolError> {
+        Err(ToolError::NotFound("noop".to_string()))
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {

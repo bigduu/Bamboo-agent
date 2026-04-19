@@ -93,10 +93,7 @@ pub(super) fn slugify_name(name: &str) -> String {
 
     let trimmed = slug.trim_matches('_');
     if trimmed.is_empty() {
-        format!(
-            "prompt_{}",
-            &Uuid::new_v4().simple().to_string()[..8]
-        )
+        format!("prompt_{}", &Uuid::new_v4().simple().to_string()[..8])
     } else {
         trimmed.chars().take(MAX_PRESET_ID_LEN).collect()
     }

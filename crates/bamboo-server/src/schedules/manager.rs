@@ -4,7 +4,9 @@
 //! provides [`build_schedule_context`] to construct a `ScheduleContext`
 //! with server-specific Config resolution baked in.
 
-pub use crate::schedule_app::{ResolvedRunConfig, ScheduleContext, ScheduleManager, ScheduleRunJob};
+pub use crate::schedule_app::{
+    ResolvedRunConfig, ScheduleContext, ScheduleManager, ScheduleRunJob,
+};
 
 /// Build a [`ScheduleContext`] with server-specific config resolution.
 ///

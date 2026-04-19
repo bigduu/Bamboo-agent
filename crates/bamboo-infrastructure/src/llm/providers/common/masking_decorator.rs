@@ -1,13 +1,11 @@
 use async_trait::async_trait;
 
-use bamboo_domain::{Message};
-use bamboo_domain::{ToolSchema};
-use bamboo_domain::MessagePart;
 use crate::config::KeywordMaskingConfig;
+use bamboo_domain::Message;
+use bamboo_domain::MessagePart;
+use bamboo_domain::ToolSchema;
 
-use crate::llm::provider::{
-    LLMProvider, LLMRequestOptions, LLMStream, ProviderModelInfo, Result,
-};
+use crate::llm::provider::{LLMProvider, LLMRequestOptions, LLMStream, ProviderModelInfo, Result};
 
 /// Decorates an [`LLMProvider`] by applying keyword masking to outgoing messages.
 ///

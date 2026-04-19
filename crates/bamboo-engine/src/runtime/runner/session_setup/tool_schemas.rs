@@ -1,9 +1,7 @@
+use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::{ToolExecutor, ToolSchema};
 use bamboo_agent_core::Session;
-use crate::runtime::config::AgentLoopConfig;
-use bamboo_tools::exposure::{
-    activated_discoverable_tools, canonical_tool_name, is_core_tool,
-};
+use bamboo_tools::exposure::{activated_discoverable_tools, canonical_tool_name, is_core_tool};
 
 const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str =
     "copilot_conclusion_with_options_enhancement_enabled";

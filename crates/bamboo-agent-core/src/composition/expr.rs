@@ -8,9 +8,7 @@
 use crate::tools::ToolError;
 
 // Re-export domain types
-pub use bamboo_domain::composition::{
-    Condition, ParallelWait, ToolExpr,
-};
+pub use bamboo_domain::composition::{Condition, ParallelWait, ToolExpr};
 
 /// Composition error types
 #[derive(Debug, Clone)]

@@ -1,7 +1,7 @@
+use crate::metrics::MetricsCollector;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ToolCall, ToolSchema};
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
-use crate::metrics::MetricsCollector;
 use tokio::sync::mpsc;
 
 use crate::runtime::config::AgentLoopConfig;
@@ -19,11 +19,7 @@ pub struct ToolRoundResult {
 #[async_trait]
 pub trait ToolManager: Send + Sync {
     /// Resolve available tool schemas for the session.
-    fn resolve_tool_schemas(
-        &self,
-        config: &AgentLoopConfig,
-        session: &Session,
-    ) -> Vec<ToolSchema>;
+    fn resolve_tool_schemas(&self, config: &AgentLoopConfig, session: &Session) -> Vec<ToolSchema>;
 
     /// Execute tool calls for a round.
     #[allow(clippy::too_many_arguments)]

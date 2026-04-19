@@ -60,9 +60,7 @@ impl FromProviderBatch<crate::llm::api::models::ChatMessage> for Message {
 }
 
 impl ToProviderBatch<crate::llm::api::models::ChatMessage> for Vec<Message> {
-    fn to_provider_batch(
-        &self,
-    ) -> ProtocolResult<Vec<crate::llm::api::models::ChatMessage>> {
+    fn to_provider_batch(&self) -> ProtocolResult<Vec<crate::llm::api::models::ChatMessage>> {
         self.iter().map(|msg| msg.to_provider()).collect()
     }
 }

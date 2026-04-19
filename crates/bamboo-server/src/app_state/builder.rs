@@ -1,10 +1,10 @@
-use super::*;
 use super::init::{
     build_provider_handles, build_schedule_manager, build_spawn_scheduler, init_mcp_manager,
     init_metrics_service, init_schedule_store, init_skill_manager, init_storage,
     load_permission_checker, spawn_runner_cleanup_task,
 };
 use super::tools::{build_base_tools, build_root_tools};
+use super::*;
 
 impl AppState {
     /// Create unified app state with direct provider access
@@ -185,11 +185,8 @@ impl AppState {
             session_event_senders.clone(),
         );
 
-        let tool_factory = crate::tools::ToolSurfaceFactory::new(
-            base_tools,
-            tools_with_task,
-            tools,
-        );
+        let tool_factory =
+            crate::tools::ToolSurfaceFactory::new(base_tools, tools_with_task, tools);
 
         Ok(Self {
             app_data_dir: bamboo_home_dir,

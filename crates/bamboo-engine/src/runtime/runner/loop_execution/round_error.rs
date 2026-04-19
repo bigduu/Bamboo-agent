@@ -1,7 +1,7 @@
-use bamboo_agent_core::AgentError;
 use crate::metrics::{
     MetricsCollector, RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
 };
+use bamboo_agent_core::AgentError;
 
 fn map_round_error_status(error: &AgentError) -> (MetricsRoundStatus, MetricsSessionStatus) {
     if matches!(error, AgentError::Cancelled) {

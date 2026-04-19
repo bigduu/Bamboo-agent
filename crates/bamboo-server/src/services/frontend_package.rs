@@ -180,11 +180,8 @@ pub fn ensure_current_frontend_dir_in(
     let local_manifest_path = duplicate_frontend_manifest_path_in(bamboo_home_dir);
     let local_manifest = read_local_manifest(&local_manifest_path)?;
 
-    let refresh_needed = should_refresh_frontend(
-        &bundled_manifest,
-        local_manifest.as_ref(),
-        &frontend_dir,
-    );
+    let refresh_needed =
+        should_refresh_frontend(&bundled_manifest, local_manifest.as_ref(), &frontend_dir);
 
     if refresh_needed {
         refresh_frontend_dir(package_path.as_deref(), &bundled_manifest, &frontend_dir)?;
@@ -258,7 +255,10 @@ fn refresh_frontend_dir(
     Ok(())
 }
 
-fn extract_frontend_zip(package_path: &Path, target_dir: &Path) -> Result<(), FrontendPackageError> {
+fn extract_frontend_zip(
+    package_path: &Path,
+    target_dir: &Path,
+) -> Result<(), FrontendPackageError> {
     let file = File::open(package_path).map_err(FrontendPackageError::Io)?;
     let mut archive = ZipArchive::new(file).map_err(FrontendPackageError::Zip)?;
     extract_archive_entries(&mut archive, target_dir)
@@ -314,7 +314,11 @@ impl std::fmt::Display for FrontendPackageError {
         match self {
             Self::PackageNotFound => write!(f, "duplicate frontend package not found"),
             Self::InvalidTarget(path) => {
-                write!(f, "invalid duplicate frontend target path: {}", path.display())
+                write!(
+                    f,
+                    "invalid duplicate frontend target path: {}",
+                    path.display()
+                )
             }
             Self::MissingEntry(path) => {
                 write!(f, "missing extracted frontend entry: {}", path.display())
@@ -401,7 +405,11 @@ mod tests {
         let bundled = manifest_fixture();
         let temp = tempdir().unwrap();
         std::fs::write(temp.path().join("index.html"), "ok").unwrap();
-        assert!(!should_refresh_frontend(&bundled, Some(&bundled), temp.path()));
+        assert!(!should_refresh_frontend(
+            &bundled,
+            Some(&bundled),
+            temp.path()
+        ));
     }
 
     #[test]
@@ -429,7 +437,13 @@ mod tests {
         let local_manifest = read_local_manifest(&status.local_manifest_path)
             .expect("local manifest should read")
             .expect("local manifest should exist");
-        assert_eq!(local_manifest.frontend_version, status.bundled_manifest.frontend_version);
-        assert_eq!(local_manifest.bundle_hash, status.bundled_manifest.bundle_hash);
+        assert_eq!(
+            local_manifest.frontend_version,
+            status.bundled_manifest.frontend_version
+        );
+        assert_eq!(
+            local_manifest.bundle_hash,
+            status.bundled_manifest.bundle_hash
+        );
     }
 }

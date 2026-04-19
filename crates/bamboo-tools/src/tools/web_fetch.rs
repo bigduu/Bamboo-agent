@@ -1,5 +1,5 @@
-use bamboo_agent_core::{Tool, ToolError, ToolResult};
 use async_trait::async_trait;
+use bamboo_agent_core::{Tool, ToolError, ToolResult};
 use futures::StreamExt;
 use regex::Regex;
 use serde::Deserialize;

@@ -1,7 +1,7 @@
 use actix_web::{test, web, App};
 use bamboo_agent::agent::{Message, Session};
-use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 use bamboo_agent::server::handlers;
+use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 
 #[actix_web::test]
 async fn test_metrics_usage_breakdown_endpoint() {

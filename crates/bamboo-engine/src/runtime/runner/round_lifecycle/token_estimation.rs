@@ -1,6 +1,6 @@
-use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
 use bamboo_agent_core::tools::ToolCall;
 use bamboo_agent_core::Message;
+use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
 
 pub(super) fn estimate_prompt_tokens(messages: &[Message]) -> u64 {
     let counter = TiktokenTokenCounter::default();

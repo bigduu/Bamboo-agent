@@ -1,7 +1,7 @@
 use tokio_util::sync::CancellationToken;
 
-use bamboo_agent_core::AgentError;
 use crate::metrics::MetricsCollector;
+use bamboo_agent_core::AgentError;
 
 pub(super) fn ensure_not_cancelled(
     cancel_token: &CancellationToken,

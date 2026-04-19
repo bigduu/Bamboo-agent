@@ -21,9 +21,9 @@ mod tests {
 
     #[test]
     fn test_message_conversion() {
+        use bamboo_agent::agent::Message;
         use bamboo_infrastructure::api::models::ChatMessage as OpenAIChatMessage;
         use bamboo_infrastructure::protocol::ToProvider;
-        use bamboo_agent::agent::Message;
 
         let msg = Message::user("Test message");
         let openai_msg: OpenAIChatMessage = msg.to_provider().unwrap();
@@ -106,12 +106,10 @@ mod tests {
 
     #[test]
     fn test_protocol_enums() {
-        let openai_type =
-            std::any::type_name::<bamboo_infrastructure::protocol::OpenAIProtocol>();
+        let openai_type = std::any::type_name::<bamboo_infrastructure::protocol::OpenAIProtocol>();
         let anthropic_type =
             std::any::type_name::<bamboo_infrastructure::protocol::AnthropicProtocol>();
-        let gemini_type =
-            std::any::type_name::<bamboo_infrastructure::protocol::GeminiProtocol>();
+        let gemini_type = std::any::type_name::<bamboo_infrastructure::protocol::GeminiProtocol>();
 
         assert!(openai_type.ends_with("OpenAIProtocol"));
         assert!(anthropic_type.ends_with("AnthropicProtocol"));

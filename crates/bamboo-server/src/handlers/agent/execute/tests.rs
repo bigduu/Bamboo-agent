@@ -1,6 +1,6 @@
 use super::ExecuteRequest;
-use bamboo_domain::reasoning::ReasoningEffort;
 use crate::app_state::{AgentRunner, AgentStatus};
+use bamboo_domain::reasoning::ReasoningEffort;
 
 #[test]
 fn test_agent_status_running_blocks_restart() {

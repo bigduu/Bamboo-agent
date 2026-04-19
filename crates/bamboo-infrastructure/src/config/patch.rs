@@ -16,7 +16,9 @@ pub fn is_masked_api_key(value: &str) -> bool {
 
 /// Extract provider names from a config patch that intend to set a new API key.
 /// Masked placeholders are ignored — they signal "keep existing key".
-pub fn provider_api_key_intents(patch_obj: &Map<String, Value>) -> std::collections::BTreeSet<String> {
+pub fn provider_api_key_intents(
+    patch_obj: &Map<String, Value>,
+) -> std::collections::BTreeSet<String> {
     let mut providers = std::collections::BTreeSet::new();
     let Some(root) = patch_obj.get("providers").and_then(|v| v.as_object()) else {
         return providers;

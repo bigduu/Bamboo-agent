@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
+use crate::runtime::config::{ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::storage::AttachmentReader;
-use bamboo_agent_core::{AgentError, Message};
 use bamboo_agent_core::MessagePart;
+use bamboo_agent_core::{AgentError, Message};
 use bamboo_infrastructure::models::ContentPart;
 use bamboo_infrastructure::LLMProvider;
-use crate::runtime::config::{ImageFallbackConfig, ImageFallbackMode};
 use futures::StreamExt;
 
 #[cfg(windows)]

@@ -5,4 +5,4 @@
 
 pub mod definition;
 
-pub use definition::{WorkflowDefinition, WorkflowLoadError, validate_expr, validate_required};
+pub use definition::{validate_expr, validate_required, WorkflowDefinition, WorkflowLoadError};

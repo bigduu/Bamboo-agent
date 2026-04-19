@@ -5,11 +5,11 @@
 //! compatibility and keeps the `pub(crate)` helpers that depend on facade internals.
 
 // Re-export domain types from crate
-pub use bamboo_domain::types::*;
-pub use bamboo_domain::message_part::*;
-pub use bamboo_domain::tool_types::*;
 pub use bamboo_domain::budget_types::*;
+pub use bamboo_domain::message_part::*;
 pub use bamboo_domain::task::*;
+pub use bamboo_domain::tool_types::*;
+pub use bamboo_domain::types::*;
 
 // ─── pub(crate) helpers that stay in the facade ────────────────────────
 // These reference facade internals and cannot live in the domain crate.

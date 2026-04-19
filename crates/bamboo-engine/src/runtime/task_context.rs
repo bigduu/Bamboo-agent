@@ -3,9 +3,7 @@
 //! This module provides TaskLoopContext which integrates TaskList
 //! as a first-class citizen in the Agent Loop, similar to Token Budget.
 
-use bamboo_domain::task::{
-    TaskBlocker, TaskEvidence, TaskPhase, TaskPriority, TaskTransition,
-};
+use bamboo_domain::task::{TaskBlocker, TaskEvidence, TaskPhase, TaskPriority, TaskTransition};
 use bamboo_domain::TaskItemStatus;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

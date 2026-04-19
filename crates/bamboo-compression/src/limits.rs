@@ -319,10 +319,7 @@ pub fn load_model_limits_from_unified_config(
 /// Create a token budget for a specific model.
 ///
 /// This is a convenience function that creates a budget with appropriate defaults.
-pub fn create_budget_for_model(
-    model: &str,
-    strategy: crate::BudgetStrategy,
-) -> crate::TokenBudget {
+pub fn create_budget_for_model(model: &str, strategy: crate::BudgetStrategy) -> crate::TokenBudget {
     let registry = ModelLimitsRegistry::default();
     let limit = registry.get_or_default(model);
 
@@ -439,7 +436,8 @@ mod tests {
     #[test]
     fn unified_config_loader_returns_none_when_absent() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let config = bamboo_infrastructure::Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
+        let config =
+            bamboo_infrastructure::Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
         let loaded = load_model_limits_from_unified_config(&config).expect("should parse");
         assert!(loaded.is_none());
     }
@@ -447,7 +445,8 @@ mod tests {
     #[test]
     fn unified_config_loader_reads_valid_model_limits() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let mut config = bamboo_infrastructure::Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
+        let mut config =
+            bamboo_infrastructure::Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
         config.extra.insert(
             "model_limits".to_string(),
             serde_json::json!([
@@ -473,7 +472,8 @@ mod tests {
     #[test]
     fn unified_config_loader_errors_on_invalid_shape() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let mut config = bamboo_infrastructure::Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
+        let mut config =
+            bamboo_infrastructure::Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
         config.extra.insert(
             "model_limits".to_string(),
             serde_json::json!({"unexpected": true}),

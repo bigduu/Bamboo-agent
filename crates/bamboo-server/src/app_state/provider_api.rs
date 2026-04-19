@@ -52,7 +52,10 @@ impl AppState {
     ///
     /// Use [`ToolSurface::Root`] for primary sessions,
     /// [`ToolSurface::Child`] for child sessions, etc.
-    pub fn tools_for(&self, surface: ToolSurface) -> Arc<dyn bamboo_agent_core::tools::ToolExecutor> {
+    pub fn tools_for(
+        &self,
+        surface: ToolSurface,
+    ) -> Arc<dyn bamboo_agent_core::tools::ToolExecutor> {
         self.tool_factory.get(surface)
     }
 

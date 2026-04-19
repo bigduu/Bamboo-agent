@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
+use crate::metrics::MetricsCollector;
+use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{
     parse_tool_args_best_effort, ToolCall, ToolExecutionContext, ToolExecutor, ToolResult,
 };
 use bamboo_agent_core::{AgentEvent, Session};
-use crate::runtime::config::AgentLoopConfig;
-use crate::runtime::task_context::TaskLoopContext;
-use crate::metrics::MetricsCollector;
 
 use super::execution_paths;
 use super::loop_state::RoundExecutionState;
@@ -126,7 +126,8 @@ pub(super) async fn execute_tool_call_only(
     if let Err(e) = ctx.event_tx.send(begin_event.into_agent_event()).await {
         tracing::warn!(
             "[{}] tool lifecycle begin event send failed: {}",
-            ctx.session_id, e
+            ctx.session_id,
+            e
         );
     }
 
@@ -159,7 +160,8 @@ pub(super) async fn execute_tool_call_only(
     if let Err(e) = ctx.event_tx.send(end_event.into_agent_event()).await {
         tracing::warn!(
             "[{}] tool lifecycle end event send failed: {}",
-            ctx.session_id, e
+            ctx.session_id,
+            e
         );
     }
 

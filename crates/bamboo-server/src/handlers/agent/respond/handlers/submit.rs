@@ -30,37 +30,33 @@ pub async fn submit_response(
         reasoning_effort: req.reasoning_effort,
     };
 
-    let (_session, user_response) = match crate::session_app::respond::submit_pending_response(
-        state.as_ref(),
-        input,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            return match error {
-                crate::session_app::errors::RespondError::NotFound(_) => {
-                    Ok(HttpResponse::NotFound().json(serde_json::json!({
-                        "error": "Session not found"
-                    })))
-                }
-                crate::session_app::errors::RespondError::NoPendingQuestion => {
-                    Ok(HttpResponse::BadRequest().json(serde_json::json!({
-                        "error": "No pending question waiting for response"
-                    })))
-                }
-                crate::session_app::errors::RespondError::InvalidResponse(msg) => {
-                    Ok(HttpResponse::BadRequest().json(serde_json::json!({
-                        "error": "Invalid response",
-                        "message": msg,
-                    })))
-                }
-                _ => Ok(HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": format!("Response submission failed: {error}")
-                }))),
-            };
-        }
-    };
+    let (_session, user_response) =
+        match crate::session_app::respond::submit_pending_response(state.as_ref(), input).await {
+            Ok(result) => result,
+            Err(error) => {
+                return match error {
+                    crate::session_app::errors::RespondError::NotFound(_) => {
+                        Ok(HttpResponse::NotFound().json(serde_json::json!({
+                            "error": "Session not found"
+                        })))
+                    }
+                    crate::session_app::errors::RespondError::NoPendingQuestion => {
+                        Ok(HttpResponse::BadRequest().json(serde_json::json!({
+                            "error": "No pending question waiting for response"
+                        })))
+                    }
+                    crate::session_app::errors::RespondError::InvalidResponse(msg) => {
+                        Ok(HttpResponse::BadRequest().json(serde_json::json!({
+                            "error": "Invalid response",
+                            "message": msg,
+                        })))
+                    }
+                    _ => Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                        "error": format!("Response submission failed: {error}")
+                    }))),
+                };
+            }
+        };
 
     tracing::info!(
         "[{}] Response processed successfully, agent loop can resume",
@@ -74,16 +70,19 @@ pub async fn submit_response(
         fast_model: config_snapshot.get_memory_background_model(),
         disabled_tools: config_snapshot.disabled_tool_names(),
         disabled_skill_ids: config_snapshot.disabled_skill_ids(),
-        image_fallback: crate::handlers::agent::execute::image_fallback::resolve_image_fallback(&config_snapshot).ok().flatten(),
+        image_fallback: crate::handlers::agent::execute::image_fallback::resolve_image_fallback(
+            &config_snapshot,
+        )
+        .ok()
+        .flatten(),
     };
 
-    let auto_resume_outcome =
-        crate::session_app::resume::resume_session_execution(
-            &crate::app_state::resume_adapter::AppStateResumeRef(state),
-            &session_id,
-            resume_config,
-        )
-        .await;
+    let auto_resume_outcome = crate::session_app::resume::resume_session_execution(
+        &crate::app_state::resume_adapter::AppStateResumeRef(state),
+        &session_id,
+        resume_config,
+    )
+    .await;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,

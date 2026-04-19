@@ -4,9 +4,9 @@
 //! structured sections (workspace, instruction, env, skill, tool guide,
 //! external memory, task list) for observability and diagnostics.
 
-use bamboo_agent_core::{Session, parse_prompt_external_memory_sections};
-use bamboo_engine::runner::read_prompt_snapshot;
+use bamboo_agent_core::{parse_prompt_external_memory_sections, Session};
 use bamboo_domain::types::PromptSnapshot;
+use bamboo_engine::runner::read_prompt_snapshot;
 
 // ---------------------------------------------------------------------------
 // Markers
@@ -23,12 +23,9 @@ const TASK_LIST_END_MARKER: &str = "<!-- BAMBOO_TASK_LIST_END -->";
 const LEGACY_TODO_LIST_START_MARKER: &str = "<!-- BAMBOO_TODO_LIST_START -->";
 const LEGACY_TODO_LIST_END_MARKER: &str = "<!-- BAMBOO_TODO_LIST_END -->";
 
-const WORKSPACE_CONTEXT_START_MARKER: &str =
-    bamboo_engine::context::WORKSPACE_CONTEXT_START_MARKER;
-const WORKSPACE_CONTEXT_END_MARKER: &str =
-    bamboo_engine::context::WORKSPACE_CONTEXT_END_MARKER;
-const WORKSPACE_CONTEXT_PREFIX: &str =
-    bamboo_engine::context::WORKSPACE_CONTEXT_PREFIX;
+const WORKSPACE_CONTEXT_START_MARKER: &str = bamboo_engine::context::WORKSPACE_CONTEXT_START_MARKER;
+const WORKSPACE_CONTEXT_END_MARKER: &str = bamboo_engine::context::WORKSPACE_CONTEXT_END_MARKER;
+const WORKSPACE_CONTEXT_PREFIX: &str = bamboo_engine::context::WORKSPACE_CONTEXT_PREFIX;
 
 const INSTRUCTION_CONTEXT_START_MARKER: &str =
     bamboo_engine::context::instruction::INSTRUCTION_CONTEXT_START_MARKER;
@@ -73,8 +70,7 @@ pub fn build_system_prompt_snapshot(session: &Session, default_prompt: &str) -> 
         EXTERNAL_MEMORY_START_MARKER,
         EXTERNAL_MEMORY_END_MARKER,
     );
-    let external_memory_parts =
-        parse_prompt_external_memory_sections(external_memory.as_deref());
+    let external_memory_parts = parse_prompt_external_memory_sections(external_memory.as_deref());
     let task_list = extract_wrapped_section(
         &effective_system_prompt,
         TASK_LIST_START_MARKER,
@@ -115,9 +111,7 @@ pub fn build_system_prompt_snapshot(session: &Session, default_prompt: &str) -> 
     let instruction_context = metadata_value(session, "workspace_path")
         .as_deref()
         .and_then(|workspace_path| {
-            bamboo_engine::context::instruction::build_instruction_prompt_context(
-                workspace_path,
-            )
+            bamboo_engine::context::instruction::build_instruction_prompt_context(workspace_path)
         })
         .or(instruction_from_prompt);
 
@@ -222,7 +216,11 @@ fn strip_generated_sections(prompt: &str) -> String {
         LEGACY_TODO_LIST_START_MARKER,
         LEGACY_TODO_LIST_END_MARKER,
     );
-    let prompt = strip_wrapped_sections(&prompt, SKILL_CONTEXT_START_MARKER, SKILL_CONTEXT_END_MARKER);
+    let prompt = strip_wrapped_sections(
+        &prompt,
+        SKILL_CONTEXT_START_MARKER,
+        SKILL_CONTEXT_END_MARKER,
+    );
     let prompt = strip_wrapped_sections(&prompt, TOOL_GUIDE_START_MARKER, TOOL_GUIDE_END_MARKER);
     strip_wrapped_sections(
         &prompt,

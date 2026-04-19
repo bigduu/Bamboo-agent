@@ -1,5 +1,5 @@
-use bamboo_infrastructure::keyword_masking::KeywordEntry;
 use crate::error::AppError;
+use bamboo_infrastructure::keyword_masking::KeywordEntry;
 
 use super::{
     constants::{MAX_ENTRIES, MAX_PATTERN_LENGTH},

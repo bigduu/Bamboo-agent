@@ -1,8 +1,8 @@
 //! Execute use case: prepare a session for agent execution.
 
 use bamboo_agent_core::Role;
-use bamboo_domain::Session;
 use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_domain::Session;
 
 use super::errors::ExecutePreparationError;
 use super::repository::SessionAccess;
@@ -217,12 +217,7 @@ fn validate_image_fallback_for_session(
             .iter()
             .filter_map(|message| message.content_parts.as_ref())
             .flat_map(|parts| parts.iter())
-            .filter(|part| {
-                matches!(
-                    part,
-                    bamboo_agent_core::MessagePart::ImageUrl { .. }
-                )
-            })
+            .filter(|part| matches!(part, bamboo_agent_core::MessagePart::ImageUrl { .. }))
             .count();
 
         if images_seen > 0 {

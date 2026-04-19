@@ -1,5 +1,5 @@
-use bamboo_agent_core::Session;
 use crate::runtime::config::AgentLoopConfig;
+use bamboo_agent_core::Session;
 
 #[cfg(windows)]
 use super::super::super::image_fallback::ensure_session_image_ocr_cached;

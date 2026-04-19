@@ -8,11 +8,11 @@ use bamboo_infrastructure::LLMProvider;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::metrics::MetricsCollector;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::managers::lifecycle::LifecycleManager;
 use crate::runtime::runner::state_bridge;
 use crate::runtime::task_context::TaskLoopContext;
-use crate::metrics::MetricsCollector;
 
 /// Default lifecycle manager that delegates to existing runner functions.
 pub struct DefaultLifecycleManager {
@@ -27,11 +27,7 @@ impl DefaultLifecycleManager {
 
 #[async_trait]
 impl LifecycleManager for DefaultLifecycleManager {
-    fn initialize_run(
-        &self,
-        session: &Session,
-        config: &AgentLoopConfig,
-    ) -> AgentRuntimeState {
+    fn initialize_run(&self, session: &Session, config: &AgentLoopConfig) -> AgentRuntimeState {
         let mut state = AgentRuntimeState::new(&session.id);
         state.llm.model_name = config.model_name.clone();
         state.llm.provider_name = config.provider_name.clone();

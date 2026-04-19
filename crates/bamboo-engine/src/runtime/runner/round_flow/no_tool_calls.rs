@@ -1,9 +1,9 @@
 use tokio::sync::mpsc;
 
-use bamboo_agent_core::{AgentEvent, Message, Session};
 use crate::metrics::{
     MetricsCollector, RoundStatus as MetricsRoundStatus, TokenUsage as MetricsTokenUsage,
 };
+use bamboo_agent_core::{AgentEvent, Message, Session};
 
 use super::super::{metrics_lifecycle, to_event_token_usage};
 use super::RoundFlowOutcome;
@@ -55,8 +55,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::handle_no_tool_calls;
-    use bamboo_agent_core::{AgentEvent, Role, Session};
     use crate::metrics::TokenUsage as MetricsTokenUsage;
+    use bamboo_agent_core::{AgentEvent, Role, Session};
 
     fn token_usage() -> MetricsTokenUsage {
         MetricsTokenUsage {

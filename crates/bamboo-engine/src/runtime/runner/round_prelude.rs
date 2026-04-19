@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::metrics::MetricsCollector;
+use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentError, Session};
 use bamboo_infrastructure::LLMProvider;
-use crate::runtime::config::AgentLoopConfig;
-use crate::runtime::task_context::TaskLoopContext;
-use crate::metrics::MetricsCollector;
 
 mod cancellation;
 mod prompt_updates;

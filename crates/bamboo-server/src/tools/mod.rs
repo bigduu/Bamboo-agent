@@ -8,7 +8,7 @@
 
 // Re-export framework-agnostic tools from crate
 pub use crate::server_tools::{
-    MemoryTool, OverlayToolExecutor, SessionInspectorTool, LoadSkillTool, ReadSkillResourceTool,
+    LoadSkillTool, MemoryTool, OverlayToolExecutor, ReadSkillResourceTool, SessionInspectorTool,
     ToolSurface, ToolSurfaceFactory,
 };
 

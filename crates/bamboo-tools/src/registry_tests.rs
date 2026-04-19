@@ -2,8 +2,8 @@
 
 #[cfg(test)]
 mod tests {
-    use bamboo_agent_core::{RegistryError, Tool, ToolError, ToolRegistry, ToolResult};
     use async_trait::async_trait;
+    use bamboo_agent_core::{RegistryError, Tool, ToolError, ToolRegistry, ToolResult};
     use serde_json::json;
 
     // Test tool implementations

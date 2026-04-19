@@ -2,8 +2,8 @@ use actix_web::Error as ActixError;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
-use bamboo_infrastructure::{provider::LLMStream, LLMChunk};
 use bamboo_engine::{ForwardStatus, MetricsCollector};
+use bamboo_infrastructure::{provider::LLMStream, LLMChunk};
 
 use super::super::usage::{build_estimated_usage, estimate_completion_tokens};
 use super::sse;

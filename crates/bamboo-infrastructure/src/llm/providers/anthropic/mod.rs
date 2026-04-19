@@ -16,17 +16,17 @@ pub use stream::{
 
 use std::collections::{HashMap, HashSet};
 
-use bamboo_domain::{Role, Message, MessagePart};
-use bamboo_domain::{ToolSchema};
 use async_trait::async_trait;
+use bamboo_domain::ToolSchema;
+use bamboo_domain::{Message, MessagePart, Role};
 use reqwest::{header::HeaderMap, Client};
 use serde_json::{json, Value};
 
+use crate::config::RequestOverridesConfig;
 use crate::llm::provider::LLMRequestOptions;
 use crate::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
 use crate::llm::providers::common::request_overrides;
 use crate::llm::types::LLMChunk;
-use crate::config::RequestOverridesConfig;
 use bamboo_domain::ReasoningEffort;
 
 /// Anthropic Messages API provider.
@@ -760,16 +760,14 @@ pub fn parse_anthropic_sse_event(
                 name
             );
 
-            Ok(Some(LLMChunk::ToolCalls(vec![
-                bamboo_domain::ToolCall {
-                    id: id.to_string(),
-                    tool_type: "function".to_string(),
-                    function: bamboo_domain::FunctionCall {
-                        name: name.to_string(),
-                        arguments: String::new(),
-                    },
+            Ok(Some(LLMChunk::ToolCalls(vec![bamboo_domain::ToolCall {
+                id: id.to_string(),
+                tool_type: "function".to_string(),
+                function: bamboo_domain::FunctionCall {
+                    name: name.to_string(),
+                    arguments: String::new(),
                 },
-            ])))
+            }])))
         }
         "content_block_delta" => {
             if data.is_empty() {
@@ -819,16 +817,14 @@ pub fn parse_anthropic_sse_event(
                         partial.len()
                     );
 
-                    Ok(Some(LLMChunk::ToolCalls(vec![
-                        bamboo_domain::ToolCall {
-                            id: id.clone(),
-                            tool_type: "function".to_string(),
-                            function: bamboo_domain::FunctionCall {
-                                name: name.clone(),
-                                arguments: partial.to_string(),
-                            },
+                    Ok(Some(LLMChunk::ToolCalls(vec![bamboo_domain::ToolCall {
+                        id: id.clone(),
+                        tool_type: "function".to_string(),
+                        function: bamboo_domain::FunctionCall {
+                            name: name.clone(),
+                            arguments: partial.to_string(),
                         },
-                    ])))
+                    }])))
                 }
                 "thinking_delta" => {
                     let Some(index) = v.get("index").and_then(|i| i.as_u64()) else {
@@ -891,11 +887,11 @@ pub fn parse_anthropic_sse_event(
 
 #[cfg(test)]
 mod anthropic_request_building {
+    use crate::models::{ContentPart, ImageUrl};
+    use bamboo_domain::Message;
+    use bamboo_domain::MessagePart;
     use bamboo_domain::{FunctionCall, ToolCall};
     use bamboo_domain::{FunctionSchema, ToolSchema};
-    use bamboo_domain::Message;
-    use crate::models::{ContentPart, ImageUrl};
-    use bamboo_domain::MessagePart;
 
     #[test]
     fn system_messages_are_extracted_into_top_level_system_field() {

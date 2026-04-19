@@ -1,9 +1,9 @@
 use actix_web::{http::StatusCode, web, HttpResponse};
 
+use crate::{app_state::AppState, error::AppError};
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::Message;
 use bamboo_infrastructure::api::models::ChatCompletionRequest;
-use crate::{app_state::AppState, error::AppError};
 
 use super::super::conversion::{convert_messages, convert_tools};
 use super::super::errors::{anthropic_error_response, AnthropicError};
@@ -50,9 +50,8 @@ pub(super) async fn prepare_internal_execution(
         .get("max_tokens")
         .and_then(|value| value.as_u64())
         .map(|value| value as u32);
-    let reasoning_effort = crate::handlers::openai::helpers::parse_reasoning_effort(
-        &openai_request.parameters,
-    );
+    let reasoning_effort =
+        crate::handlers::openai::helpers::parse_reasoning_effort(&openai_request.parameters);
     let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
 
     Ok(PreparedInternalExecution {

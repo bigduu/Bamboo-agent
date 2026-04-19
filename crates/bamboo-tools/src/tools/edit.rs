@@ -1,5 +1,5 @@
-use bamboo_agent_core::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use async_trait::async_trait;
+use bamboo_agent_core::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;

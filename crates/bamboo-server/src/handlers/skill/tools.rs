@@ -1,6 +1,6 @@
+use actix_web::{web, HttpResponse};
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_tools::BuiltinToolExecutor;
-use actix_web::{web, HttpResponse};
 use tracing::{debug, info};
 
 use crate::app_state::AppState;

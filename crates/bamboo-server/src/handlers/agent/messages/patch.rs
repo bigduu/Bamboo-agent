@@ -5,8 +5,8 @@ use super::shared::{
     save_and_cache_session,
 };
 use super::types::PatchMessageRequest;
-use bamboo_agent_core::Role;
 use crate::app_state::AppState;
+use bamboo_agent_core::Role;
 
 /// `PATCH /api/v1/sessions/{session_id}/messages/{message_id}`
 pub async fn patch_message(

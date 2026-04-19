@@ -72,8 +72,8 @@ pub use bamboo_tools as tools;
 
 // Re-export infrastructure crate so consumers can access config, paths, encryption, etc.
 // via `bamboo_agent::infrastructure::...`
-pub use bamboo_infrastructure as infrastructure;
 pub use agent::{Agent, AgentBuilder};
+pub use bamboo_infrastructure as infrastructure;
 
 // Re-export core Config as the primary configuration type
 pub use bamboo_infrastructure::config::ServerConfig;

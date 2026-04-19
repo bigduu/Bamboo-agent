@@ -3,11 +3,11 @@
 //! This module defines the interface for LLM (Large Language Model) providers,
 //! enabling support for multiple LLM backends through a common trait.
 
-use bamboo_domain::{Message};
-use bamboo_domain::{ToolSchema};
 use crate::llm::types::LLMChunk;
-use bamboo_domain::ReasoningEffort;
 use async_trait::async_trait;
+use bamboo_domain::Message;
+use bamboo_domain::ReasoningEffort;
+use bamboo_domain::ToolSchema;
 use futures::Stream;
 use std::pin::Pin;
 use thiserror::Error;

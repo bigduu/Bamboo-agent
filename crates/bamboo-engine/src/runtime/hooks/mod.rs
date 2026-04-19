@@ -15,9 +15,7 @@ pub struct HookRunner {
 
 impl HookRunner {
     pub fn new() -> Self {
-        Self {
-            hooks: Vec::new(),
-        }
+        Self { hooks: Vec::new() }
     }
 
     /// Register a hook. Hooks are sorted by priority (lower runs first).

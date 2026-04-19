@@ -1,8 +1,8 @@
 //! Helper for creating sessions from schedule run jobs.
 
-use bamboo_engine::runner;
-use bamboo_domain::{Message, Session};
 use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_domain::{Message, Session};
+use bamboo_engine::runner;
 
 use super::manager::ScheduleRunJob;
 
@@ -18,7 +18,11 @@ pub fn create_schedule_session(
     reasoning_effort: Option<ReasoningEffort>,
 ) -> Session {
     let session_id = uuid::Uuid::new_v4().to_string();
-    let title = format!("{} ({})", job.schedule_name, chrono::Utc::now().to_rfc3339());
+    let title = format!(
+        "{} ({})",
+        job.schedule_name,
+        chrono::Utc::now().to_rfc3339()
+    );
 
     let mut session = Session::new(session_id.clone(), model.to_string());
     session.title = title;

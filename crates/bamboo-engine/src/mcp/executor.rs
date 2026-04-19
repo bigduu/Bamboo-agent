@@ -1,8 +1,8 @@
+use async_trait::async_trait;
 use bamboo_agent_core::{
     parse_tool_args_best_effort, ToolCall, ToolError, ToolExecutionContext, ToolExecutor,
     ToolResult, ToolSchema,
 };
-use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
@@ -209,8 +209,8 @@ impl ToolExecutor for CompositeToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_agent_core::{FunctionCall, FunctionSchema};
     use crate::mcp::types::McpContentItem;
+    use bamboo_agent_core::{FunctionCall, FunctionSchema};
     use mockall::mock;
     use mockall::predicate::*;
 

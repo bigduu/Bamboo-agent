@@ -28,8 +28,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bamboo_agent_core::ToolSchema;
 use crate::exposure::{canonical_tool_name, is_core_tool};
+use bamboo_agent_core::ToolSchema;
 use serde::{Deserialize, Serialize};
 
 pub mod builtin_guides;
@@ -675,11 +675,11 @@ mod tests {
 
     use serde_json::json;
 
-    use bamboo_agent_core::{FunctionSchema, ToolExecutor, ToolSchema};
     use crate::{
         tools::{ReadTool, ToolRegistry},
         BuiltinToolExecutor,
     };
+    use bamboo_agent_core::{FunctionSchema, ToolExecutor, ToolSchema};
 
     use super::{
         context::GuideBuildContext, context::GuideLanguage, EnhancedPromptBuilder, ToolCategory,
@@ -821,9 +821,7 @@ mod tests {
     fn build_summarizes_discoverable_tools() {
         let registry = ToolRegistry::new();
         registry.register(ReadTool::new()).unwrap();
-        registry
-            .register(crate::tools::SleepTool::new())
-            .unwrap();
+        registry.register(crate::tools::SleepTool::new()).unwrap();
 
         let schemas = registry.list_tools();
         let prompt =

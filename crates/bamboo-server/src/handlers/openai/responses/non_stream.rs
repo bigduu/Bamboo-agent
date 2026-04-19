@@ -1,9 +1,9 @@
 use actix_web::{web, HttpResponse};
 use futures::StreamExt;
 
-use bamboo_infrastructure::LLMRequestOptions;
-use bamboo_engine::metrics::types::ForwardStatus;
 use crate::{app_state::AppState, error::AppError};
+use bamboo_engine::metrics::types::ForwardStatus;
+use bamboo_infrastructure::LLMRequestOptions;
 
 use super::super::helpers::now_unix_ts;
 use super::super::usage::{build_estimated_usage, estimate_completion_tokens};
@@ -52,8 +52,12 @@ pub(super) async fn handle_non_streaming_response(
             }
             Ok(bamboo_infrastructure::types::LLMChunk::Token(text)) => content.push_str(&text),
             // Keep parity with streaming behavior: expose reasoning narration as text.
-            Ok(bamboo_infrastructure::types::LLMChunk::ReasoningToken(text)) => content.push_str(&text),
-            Ok(bamboo_infrastructure::types::LLMChunk::ToolCalls(calls)) => tool_calls.extend(calls),
+            Ok(bamboo_infrastructure::types::LLMChunk::ReasoningToken(text)) => {
+                content.push_str(&text)
+            }
+            Ok(bamboo_infrastructure::types::LLMChunk::ToolCalls(calls)) => {
+                tool_calls.extend(calls)
+            }
             Ok(bamboo_infrastructure::types::LLMChunk::Done) => break,
             Err(error) => {
                 app_state.metrics_service.collector().forward_completed(

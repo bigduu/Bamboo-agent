@@ -73,10 +73,7 @@ impl LlmManager for DefaultLlmManager {
         session_id: &str,
         event_tx: &mpsc::Sender<AgentEvent>,
     ) -> Result<bool, AgentError> {
-        let model_name = config
-            .model_name
-            .as_deref()
-            .unwrap_or("unknown");
+        let model_name = config.model_name.as_deref().unwrap_or("unknown");
 
         crate::runtime::runner::round_lifecycle::force_overflow_context_recovery(
             session,

@@ -10,14 +10,14 @@ use reqwest::{
 };
 use serde_json::Value;
 
-use bamboo_domain::{Message};
-use bamboo_domain::{ToolSchema};
+use crate::config::RequestOverridesConfig;
 use crate::llm::provider::{
     LLMError, LLMProvider, LLMRequestOptions, LLMStream, ResponsesRequestOptions, Result,
 };
 use crate::llm::types::LLMChunk;
-use crate::config::RequestOverridesConfig;
+use bamboo_domain::Message;
 use bamboo_domain::ReasoningEffort;
+use bamboo_domain::ToolSchema;
 
 use super::common::openai_compat::{build_openai_compat_body, parse_openai_compat_sse_data_strict};
 use super::common::openai_responses::{build_responses_body, ResponsesSseParser};
@@ -564,7 +564,8 @@ impl LLMProvider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_domain::{FunctionSchema, ToolSchema};    use bamboo_domain::Message;
+    use bamboo_domain::Message;
+    use bamboo_domain::{FunctionSchema, ToolSchema};
 
     // ===== Basic Tests (5 tests) =====
 

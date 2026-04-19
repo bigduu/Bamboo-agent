@@ -1,19 +1,19 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bamboo_agent_core::{
     normalize_tool_name, parse_tool_args_best_effort, Tool, ToolCall, ToolError,
     ToolExecutionContext, ToolExecutor, ToolResult, ToolSchema,
 };
 use bamboo_domain::tool_names::{normalize_builtin_alias, resolve_alias};
-use async_trait::async_trait;
 
 use crate::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
 use crate::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::tools::{
     BashOutputTool, BashTool, ConclusionWithOptionsTool, EditTool, ExitPlanModeTool,
     GetFileInfoTool, GlobTool, GrepTool, JsReplTool, KillShellTool, NotebookEditTool, ReadTool,
-    RequestPermissionsTool, SessionNoteTool, SleepTool, TaskTool, ToolRegistry,
-    WebFetchTool, WebSearchTool, WorkspaceTool, WriteTool,
+    RequestPermissionsTool, SessionNoteTool, SleepTool, TaskTool, ToolRegistry, WebFetchTool,
+    WebSearchTool, WorkspaceTool, WriteTool,
 };
 use bamboo_infrastructure::Config;
 use tokio::sync::RwLock;
@@ -309,8 +309,7 @@ impl ToolExecutor for BuiltinToolExecutor {
 
     fn call_mutability(&self, call: &ToolCall) -> crate::ToolMutability {
         let canonical = resolve_registered_tool_name(&self.registry, call.function.name.trim());
-        let args =
-            bamboo_agent_core::parse_tool_args_best_effort(&call.function.arguments).0;
+        let args = bamboo_agent_core::parse_tool_args_best_effort(&call.function.arguments).0;
         self.registry
             .get(&canonical)
             .map(|tool| tool.call_mutability(&args))
@@ -322,15 +321,12 @@ impl ToolExecutor for BuiltinToolExecutor {
         self.registry
             .get(&canonical)
             .map(|tool| tool.concurrency_safe())
-            .unwrap_or_else(|| {
-                self.tool_mutability(&canonical) == crate::ToolMutability::ReadOnly
-            })
+            .unwrap_or_else(|| self.tool_mutability(&canonical) == crate::ToolMutability::ReadOnly)
     }
 
     fn call_concurrency_safe(&self, call: &ToolCall) -> bool {
         let canonical = resolve_registered_tool_name(&self.registry, call.function.name.trim());
-        let args =
-            bamboo_agent_core::parse_tool_args_best_effort(&call.function.arguments).0;
+        let args = bamboo_agent_core::parse_tool_args_best_effort(&call.function.arguments).0;
         self.registry
             .get(&canonical)
             .map(|tool| tool.call_concurrency_safe(&args))
@@ -418,9 +414,9 @@ impl Default for BuiltinToolExecutorBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bamboo_agent_core::AgentEvent;
     use bamboo_agent_core::FunctionCall;
     use bamboo_agent_core::ToolExecutionContext;
-    use bamboo_agent_core::AgentEvent;
     use bamboo_domain::tool_names::{normalize_tool_ref, BUILTIN_TOOL_NAMES};
     use serde_json::json;
     use std::sync::Arc;

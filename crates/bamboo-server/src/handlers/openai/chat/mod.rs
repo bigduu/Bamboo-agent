@@ -4,9 +4,9 @@ mod stream;
 
 use actix_web::{web, HttpResponse};
 
+use crate::{app_state::AppState, error::AppError};
 use bamboo_agent_core::{tools::ToolSchema, Message};
 use bamboo_infrastructure::api::models::ChatCompletionRequest;
-use crate::{app_state::AppState, error::AppError};
 
 pub async fn chat_completions(
     app_state: web::Data<AppState>,

@@ -1,9 +1,9 @@
+use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
     parse_prompt_external_memory_sections, Message, PromptMemoryObservability, PromptSnapshot,
     Session,
 };
-use crate::runtime::config::AgentLoopConfig;
 use bamboo_tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder};
 
 use super::super::prompt_context::merge_system_prompt_with_contexts;

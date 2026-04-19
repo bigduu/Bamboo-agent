@@ -75,25 +75,25 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use bamboo_infrastructure::SessionStoreV2;
-use bamboo_agent_core::storage::Storage;
-use bamboo_agent_core::AgentEvent;
-use bamboo_agent_core::{tools::ToolSchema, Message};
-use bamboo_infrastructure::{LLMError, LLMProvider, LLMStream};
-use bamboo_engine::McpServerManager;
-use bamboo_engine::SkillManager;
-use bamboo_infrastructure::Config;
-use bamboo_infrastructure::registry::ProcessRegistry;
 use crate::error::AppError;
 use crate::metrics_service::MetricsService;
 use crate::schedules::{ScheduleManager, ScheduleStore};
 use crate::spawn_scheduler::SpawnScheduler;
+use bamboo_agent_core::storage::Storage;
+use bamboo_agent_core::AgentEvent;
+use bamboo_agent_core::{tools::ToolSchema, Message};
+use bamboo_engine::McpServerManager;
+use bamboo_engine::SkillManager;
+use bamboo_infrastructure::registry::ProcessRegistry;
+use bamboo_infrastructure::Config;
+use bamboo_infrastructure::SessionStoreV2;
+use bamboo_infrastructure::{LLMError, LLMProvider, LLMStream};
 
 // Context functions moved to bamboo-agent-runtime::context
 pub use bamboo_engine::context::{
-    DEFAULT_BASE_PROMPT, WORKSPACE_CONTEXT_START_MARKER, WORKSPACE_CONTEXT_END_MARKER,
-    WORKSPACE_CONTEXT_PREFIX, ENV_CONTEXT_START_MARKER, ENV_CONTEXT_END_MARKER,
     build_env_prompt_context, build_workspace_prompt_context, workspace_prompt_guidance,
+    DEFAULT_BASE_PROMPT, ENV_CONTEXT_END_MARKER, ENV_CONTEXT_START_MARKER,
+    WORKSPACE_CONTEXT_END_MARKER, WORKSPACE_CONTEXT_PREFIX, WORKSPACE_CONTEXT_START_MARKER,
 };
 
 /// Placeholder provider used when the configured provider cannot be initialized.

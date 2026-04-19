@@ -1,6 +1,6 @@
-use bamboo_infrastructure::keyword_masking::KeywordEntry;
 use crate::error::AppError;
 use actix_web::{web, HttpResponse};
+use bamboo_infrastructure::keyword_masking::KeywordEntry;
 
 use super::super::validation::validate_entries_only;
 use super::payload::{validation_error_payload, validation_success_payload};
@@ -20,8 +20,8 @@ pub async fn validate_keyword_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_infrastructure::keyword_masking::{KeywordEntry, MatchType};
     use actix_web::{test, web, App};
+    use bamboo_infrastructure::keyword_masking::{KeywordEntry, MatchType};
 
     #[actix_web::test]
     async fn test_validate_empty_entries() {

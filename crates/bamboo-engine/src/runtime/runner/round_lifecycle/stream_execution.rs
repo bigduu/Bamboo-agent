@@ -5,12 +5,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::agent::events::TokenBudgetUsage;
-use bamboo_compression::PreparedContext;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
+use bamboo_compression::PreparedContext;
+use bamboo_domain::ReasoningEffort;
 use bamboo_infrastructure::provider::ResponsesRequestOptions;
 use bamboo_infrastructure::{LLMProvider, LLMRequestOptions};
-use bamboo_domain::ReasoningEffort;
 
 const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
 
@@ -100,7 +100,9 @@ fn format_reqwest_transport_error(error: &reqwest::Error) -> String {
 
 fn format_provider_error(error: bamboo_infrastructure::provider::LLMError) -> String {
     match error {
-        bamboo_infrastructure::provider::LLMError::Http(http) => format_reqwest_transport_error(&http),
+        bamboo_infrastructure::provider::LLMError::Http(http) => {
+            format_reqwest_transport_error(&http)
+        }
         other => other.to_string(),
     }
 }
@@ -143,13 +145,7 @@ pub(super) async fn execute_llm_stream(
     provider_name: Option<&str>,
     reasoning_effort: Option<ReasoningEffort>,
     session_id: &str,
-) -> Result<
-    (
-        crate::runtime::stream::handler::StreamHandlingOutput,
-        u128,
-    ),
-    AgentError,
-> {
+) -> Result<(crate::runtime::stream::handler::StreamHandlingOutput, u128), AgentError> {
     let llm_started_at = std::time::Instant::now();
     let supports_previous_response_id = provider_supports_previous_response_id(provider_name);
     let previous_response_id = if supports_previous_response_id {

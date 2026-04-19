@@ -183,9 +183,18 @@ pub async fn mark_skill_loaded(
     .to_string();
 
     let updates = vec![
-        (LOADED_SKILL_IDS_METADATA_KEY.to_string(), Some(serialized_ids)),
-        (LAST_LOADED_SKILL_ID_METADATA_KEY.to_string(), Some(skill_id.to_string())),
-        (LAST_LOADED_SKILL_SUMMARY_METADATA_KEY.to_string(), Some(summary)),
+        (
+            LOADED_SKILL_IDS_METADATA_KEY.to_string(),
+            Some(serialized_ids),
+        ),
+        (
+            LAST_LOADED_SKILL_ID_METADATA_KEY.to_string(),
+            Some(skill_id.to_string()),
+        ),
+        (
+            LAST_LOADED_SKILL_SUMMARY_METADATA_KEY.to_string(),
+            Some(summary),
+        ),
     ];
 
     port.save_metadata_updates(session_id, &updates)
@@ -240,10 +249,7 @@ mod tests {
         ids.insert("skill-b".to_string());
         ids.insert("skill-a".to_string());
 
-        assert_eq!(
-            serialize_loaded_skill_ids(&ids),
-            r#"["skill-a","skill-b"]"#
-        );
+        assert_eq!(serialize_loaded_skill_ids(&ids), r#"["skill-a","skill-b"]"#);
     }
 
     #[test]

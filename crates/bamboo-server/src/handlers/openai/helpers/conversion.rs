@@ -1,7 +1,7 @@
+use crate::error::AppError;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_infrastructure::api::models::ChatMessage;
 use bamboo_infrastructure::protocol::FromProvider;
-use crate::error::AppError;
 
 pub(super) fn convert_messages(
     messages: Vec<ChatMessage>,

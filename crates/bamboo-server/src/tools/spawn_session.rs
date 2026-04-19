@@ -3,13 +3,9 @@ use serde_json::json;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::session_app::child_session::{
-    create_child_action, ChildSessionPort, CreateChildInput,
-};
+use crate::session_app::child_session::{create_child_action, ChildSessionPort, CreateChildInput};
+use crate::tools::child_session_adapter::{tool_error_from_child_session, ChildSessionAdapter};
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
-use crate::tools::child_session_adapter::{
-    ChildSessionAdapter, tool_error_from_child_session,
-};
 
 #[derive(Debug, serde::Deserialize)]
 struct SpawnSessionArgsRaw {
@@ -167,10 +163,17 @@ impl Tool for SpawnSessionTool {
         .map_err(tool_error_from_child_session)?;
 
         // Ensure index entry is visible immediately (best-effort).
-        let _ = self.adapter.session_store.get_index_entry(&result.child_session_id).await;
-
-        ctx.emit_tool_token(format!("Spawned child session: {}", result.child_session_id))
+        let _ = self
+            .adapter
+            .session_store
+            .get_index_entry(&result.child_session_id)
             .await;
+
+        ctx.emit_tool_token(format!(
+            "Spawned child session: {}",
+            result.child_session_id
+        ))
+        .await;
 
         Ok(ToolResult {
             success: true,
@@ -201,15 +204,15 @@ mod tests {
     use tokio::sync::{broadcast, RwLock};
 
     use crate::session_app::child_session::format_child_assignment;
-    use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
+    use crate::spawn_scheduler::{SpawnContext, SpawnScheduler};
     use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
     use bamboo_agent_core::{AgentEvent, Message, Session};
-    use bamboo_infrastructure::{LLMError, LLMProvider, LLMStream};
-    use bamboo_infrastructure::SessionStoreV2;
     use bamboo_engine::metrics::storage::SqliteMetricsStorage;
     use bamboo_engine::MetricsCollector;
     use bamboo_engine::SkillManager;
-    use crate::spawn_scheduler::{SpawnContext, SpawnScheduler};
+    use bamboo_infrastructure::SessionStoreV2;
+    use bamboo_infrastructure::{LLMError, LLMProvider, LLMStream};
 
     #[test]
     fn normalize_spawn_session_args_accepts_legacy_description() {
@@ -345,7 +348,9 @@ mod tests {
                 .attachment_reader(session_store.clone())
                 .skill_manager(Arc::new(SkillManager::new()))
                 .metrics_collector(metrics_collector)
-                .config(Arc::new(RwLock::new(bamboo_infrastructure::Config::default())))
+                .config(Arc::new(RwLock::new(
+                    bamboo_infrastructure::Config::default(),
+                )))
                 .provider(Arc::new(NoopProvider))
                 .default_tools(Arc::new(NoopToolExecutor))
                 .build()
@@ -426,7 +431,9 @@ mod tests {
                 .attachment_reader(session_store.clone())
                 .skill_manager(Arc::new(SkillManager::new()))
                 .metrics_collector(metrics_collector)
-                .config(Arc::new(RwLock::new(bamboo_infrastructure::Config::default())))
+                .config(Arc::new(RwLock::new(
+                    bamboo_infrastructure::Config::default(),
+                )))
                 .provider(Arc::new(NoopProvider))
                 .default_tools(Arc::new(NoopToolExecutor))
                 .build()

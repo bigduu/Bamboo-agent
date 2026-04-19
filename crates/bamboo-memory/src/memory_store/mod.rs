@@ -308,9 +308,9 @@ pub fn project_key_from_path(path: &Path) -> String {
 
     if let Some(name) = canonical.file_name().and_then(|value| value.to_str()) {
         let mut key = sanitize_component(name);
-        if let Some(hash) =
-            short_stable_hash(&bamboo_infrastructure::paths::path_to_display_string(&canonical))
-        {
+        if let Some(hash) = short_stable_hash(
+            &bamboo_infrastructure::paths::path_to_display_string(&canonical),
+        ) {
             key.push('-');
             key.push_str(&hash);
         }

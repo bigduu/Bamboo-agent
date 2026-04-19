@@ -4,8 +4,8 @@
 //! with OpenAI's chat completions API. These helpers build a "compat" JSON body without leaking
 //! internal `bamboo_domain::Message` fields (like `id` / `created_at`).
 
-use bamboo_domain::{Role, Message};
-use bamboo_domain::{ToolSchema};
+use bamboo_domain::ToolSchema;
+use bamboo_domain::{Message, Role};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -232,9 +232,10 @@ pub fn parse_openai_compat_sse_data_lenient(data: &str) -> Result<LLMChunk> {
 
 #[cfg(test)]
 mod tests {
-    use bamboo_domain::{FunctionCall, ToolCall};
-    use bamboo_domain::{FunctionSchema, ToolSchema};    use bamboo_domain::Message;
     use crate::llm::types::LLMChunk;
+    use bamboo_domain::Message;
+    use bamboo_domain::{FunctionCall, ToolCall};
+    use bamboo_domain::{FunctionSchema, ToolSchema};
 
     #[test]
     fn messages_to_openai_compat_json_omits_internal_fields() {

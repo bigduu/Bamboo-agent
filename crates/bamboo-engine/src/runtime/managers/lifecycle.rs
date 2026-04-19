@@ -13,11 +13,7 @@ use crate::runtime::task_context::TaskLoopContext;
 #[async_trait]
 pub trait LifecycleManager: Send + Sync {
     /// Initialize runtime state for a new agent run.
-    fn initialize_run(
-        &self,
-        session: &Session,
-        config: &AgentLoopConfig,
-    ) -> AgentRuntimeState;
+    fn initialize_run(&self, session: &Session, config: &AgentLoopConfig) -> AgentRuntimeState;
 
     /// Prepare for a new round. Returns the round ID.
     #[allow(clippy::too_many_arguments)]

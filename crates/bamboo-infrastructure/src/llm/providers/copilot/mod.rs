@@ -7,16 +7,16 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 pub mod auth;
-use bamboo_domain::{Message};
-use bamboo_domain::{ToolSchema};
+use crate::config::RequestOverridesConfig;
 use crate::llm::provider::{
     LLMError, LLMProvider, LLMRequestOptions, LLMStream, ProviderModelInfo,
     ResponsesRequestOptions, Result,
 };
 use crate::llm::types::LLMChunk;
-use crate::config::RequestOverridesConfig;
-use bamboo_domain::ReasoningEffort;
 use auth::{CopilotAuthHandler, DeviceCodeResponse};
+use bamboo_domain::Message;
+use bamboo_domain::ReasoningEffort;
+use bamboo_domain::ToolSchema;
 
 use super::common::openai_compat::{
     messages_to_openai_compat_json, parse_openai_compat_sse_data_lenient,
@@ -313,8 +313,7 @@ impl CopilotProvider {
             .find(|message| !matches!(message.role, bamboo_domain::Role::System))
             .map(|message| match message.role {
                 bamboo_domain::Role::User => "user",
-                bamboo_domain::Role::Assistant
-                | bamboo_domain::Role::Tool => "agent",
+                bamboo_domain::Role::Assistant | bamboo_domain::Role::Tool => "agent",
                 bamboo_domain::Role::System => "user",
             })
             .unwrap_or("user")

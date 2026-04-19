@@ -3,11 +3,11 @@
 //! When conversations are truncated due to token limits, a summary preserves
 //! key information from earlier context.
 
-use bamboo_agent_core::{Message, Role};
-use bamboo_infrastructure::{LLMProvider, LLMRequestOptions};
-use bamboo_infrastructure::LLMChunk;
-use bamboo_domain::ReasoningEffort;
 use async_trait::async_trait;
+use bamboo_agent_core::{Message, Role};
+use bamboo_domain::ReasoningEffort;
+use bamboo_infrastructure::LLMChunk;
+use bamboo_infrastructure::{LLMProvider, LLMRequestOptions};
 use futures::StreamExt;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -18,10 +18,7 @@ pub trait Summarizer: Send + Sync {
     /// Generate a summary of the given messages.
     ///
     /// Returns a string containing the summary.
-    async fn summarize(
-        &self,
-        messages: &[Message],
-    ) -> Result<String, crate::types::BudgetError>;
+    async fn summarize(&self, messages: &[Message]) -> Result<String, crate::types::BudgetError>;
 
     /// Get the estimated token count of the summary.
     ///
@@ -104,10 +101,7 @@ impl HeuristicSummarizer {
 
 #[async_trait]
 impl Summarizer for HeuristicSummarizer {
-    async fn summarize(
-        &self,
-        messages: &[Message],
-    ) -> Result<String, crate::types::BudgetError> {
+    async fn summarize(&self, messages: &[Message]) -> Result<String, crate::types::BudgetError> {
         if messages.is_empty() {
             return Ok("No conversation history.".to_string());
         }
@@ -384,12 +378,10 @@ Guidelines:
                     if !content.is_empty() {
                         break;
                     }
-                    return Err(
-                        crate::types::BudgetError::TokenCountError(format!(
-                            "LLM summarization stream failed: {}",
-                            e
-                        )),
-                    );
+                    return Err(crate::types::BudgetError::TokenCountError(format!(
+                        "LLM summarization stream failed: {}",
+                        e
+                    )));
                 }
             }
         }
@@ -409,10 +401,7 @@ impl std::fmt::Debug for LlmSummarizer {
 
 #[async_trait]
 impl Summarizer for LlmSummarizer {
-    async fn summarize(
-        &self,
-        messages: &[Message],
-    ) -> Result<String, crate::types::BudgetError> {
+    async fn summarize(&self, messages: &[Message]) -> Result<String, crate::types::BudgetError> {
         if messages.is_empty() {
             return Ok("No conversation history to summarize.".to_string());
         }
@@ -456,9 +445,9 @@ impl Summarizer for LlmSummarizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_infrastructure::{LLMChunk, LLMError, LLMRequestOptions, LLMStream};
-    use bamboo_domain::ReasoningEffort;
     use async_trait::async_trait;
+    use bamboo_domain::ReasoningEffort;
+    use bamboo_infrastructure::{LLMChunk, LLMError, LLMRequestOptions, LLMStream};
     use futures::stream;
     use std::sync::Mutex;
 

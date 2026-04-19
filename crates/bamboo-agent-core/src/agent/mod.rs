@@ -19,6 +19,7 @@ pub use error::AgentError;
 pub use events::{AgentEvent, TokenUsage};
 pub use hooks::AgentHook;
 pub use types::{
-    Message, MessageContent, MessagePhase, PromptMemoryObservability, PromptSnapshot, Role,
-    Session, SessionKind, parse_prompt_external_memory_sections, PromptSnapshotExternalMemoryParts,
+    parse_prompt_external_memory_sections, Message, MessageContent, MessagePhase,
+    PromptMemoryObservability, PromptSnapshot, PromptSnapshotExternalMemoryParts, Role, Session,
+    SessionKind,
 };

@@ -1,15 +1,15 @@
 use std::sync::{Arc, Mutex};
 
 use super::{maybe_apply_host_context_compression, prepare_round_context};
-use bamboo_compression::{BudgetStrategy, TokenBudget};
+use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 use bamboo_agent_core::TokenBudgetUsage;
 use bamboo_agent_core::{Message, Role, Session};
-use bamboo_infrastructure::models::{ContentPart, ImageUrl};
+use bamboo_compression::{BudgetStrategy, TokenBudget};
 use bamboo_domain::MessagePart;
+use bamboo_infrastructure::models::{ContentPart, ImageUrl};
 use bamboo_infrastructure::provider::{LLMProvider, LLMStream};
 use bamboo_infrastructure::{LLMChunk, LLMError};
-use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use futures::stream;
 
 /// A no-op LLM provider for tests that returns an empty stream.

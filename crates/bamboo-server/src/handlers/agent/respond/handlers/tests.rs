@@ -1,6 +1,6 @@
+use bamboo_agent_core::Message;
 use bamboo_agent_core::PendingQuestion;
 use bamboo_agent_core::Session;
-use bamboo_agent_core::Message;
 
 use crate::session_app::respond::{
     update_or_append_tool_result_message, validate_pending_response,

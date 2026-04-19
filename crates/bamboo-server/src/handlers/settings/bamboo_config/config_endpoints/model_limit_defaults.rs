@@ -1,8 +1,8 @@
 use actix_web::HttpResponse;
 use serde::{Deserialize, Serialize};
 
-use bamboo_compression::limits::{DEFAULT_SAFETY_MARGIN, KNOWN_MODEL_LIMITS};
 use crate::error::AppError;
+use bamboo_compression::limits::{DEFAULT_SAFETY_MARGIN, KNOWN_MODEL_LIMITS};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ModelLimitDefault {

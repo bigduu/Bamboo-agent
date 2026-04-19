@@ -141,7 +141,11 @@ impl TokenBudget {
 
     pub fn for_model(max_context_tokens: u32) -> Self {
         let max_output_tokens = calculate_max_output_tokens(max_context_tokens);
-        Self::new(max_context_tokens, max_output_tokens, BudgetStrategy::default())
+        Self::new(
+            max_context_tokens,
+            max_output_tokens,
+            BudgetStrategy::default(),
+        )
     }
 }
 
@@ -182,7 +186,9 @@ impl Default for TokenBudget {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetStrategy {
-    Window { size: usize },
+    Window {
+        size: usize,
+    },
     Hybrid {
         window_size: usize,
         enable_summarization: bool,

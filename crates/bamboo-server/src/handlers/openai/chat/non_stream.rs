@@ -1,9 +1,9 @@
 use actix_web::{web, HttpResponse};
 
+use crate::{app_state::AppState, error::AppError};
+use bamboo_engine::metrics::types::ForwardStatus;
 use bamboo_infrastructure::api::models::{FunctionCall, ToolCall};
 use bamboo_infrastructure::LLMRequestOptions;
-use bamboo_engine::metrics::types::ForwardStatus;
-use crate::{app_state::AppState, error::AppError};
 
 use super::{map_provider_error, PreparedChatRequest};
 use crate::handlers::openai::{

@@ -4,10 +4,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_infrastructure::LLMProvider;
-use crate::runtime::config::AgentLoopConfig;
 
 mod round_error;
 mod rounds;

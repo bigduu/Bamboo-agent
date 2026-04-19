@@ -1,5 +1,5 @@
-use bamboo_agent_core::Session;
 use crate::metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus, TokenUsage};
+use bamboo_agent_core::Session;
 
 use super::super::super::metrics_lifecycle;
 use super::super::RoundFlowContext;

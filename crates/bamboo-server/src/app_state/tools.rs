@@ -12,13 +12,13 @@ use std::sync::Arc;
 
 use tokio::sync::{broadcast, RwLock};
 
-use bamboo_infrastructure::SessionStoreV2;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::Session;
 use bamboo_engine::McpServerManager;
 use bamboo_engine::SkillManager;
 use bamboo_infrastructure::Config;
+use bamboo_infrastructure::SessionStoreV2;
 
 use super::init::PermissionChecker;
 use super::{AgentRunner, ScheduleManager, ScheduleStore, SpawnScheduler};
@@ -59,9 +59,8 @@ pub(super) fn build_base_tools(
         storage.clone(),
         app_data_dir.clone(),
     ));
-    let with_memory: Arc<dyn ToolExecutor> = Arc::new(
-        crate::tools::OverlayToolExecutor::new(base, memory_tool),
-    );
+    let with_memory: Arc<dyn ToolExecutor> =
+        Arc::new(crate::tools::OverlayToolExecutor::new(base, memory_tool));
 
     let load_skill_tool = Arc::new(crate::tools::LoadSkillTool::new(
         skill_manager.clone(),
@@ -69,9 +68,10 @@ pub(super) fn build_base_tools(
         sessions.clone(),
         storage.clone(),
     ));
-    let with_load_skill: Arc<dyn ToolExecutor> = Arc::new(
-        crate::tools::OverlayToolExecutor::new(with_memory, load_skill_tool),
-    );
+    let with_load_skill: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
+        with_memory,
+        load_skill_tool,
+    ));
 
     let read_skill_resource_tool = Arc::new(crate::tools::ReadSkillResourceTool::new(
         skill_manager,
@@ -94,7 +94,9 @@ pub(super) fn build_root_tools(
     spawn_scheduler: Arc<SpawnScheduler>,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
-    session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<bamboo_agent_core::AgentEvent>>>>,
+    session_event_senders: Arc<
+        RwLock<HashMap<String, broadcast::Sender<bamboo_agent_core::AgentEvent>>>,
+    >,
 ) -> Arc<dyn ToolExecutor> {
     // Shared adapter for both child session tools.
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {
@@ -108,9 +110,9 @@ pub(super) fn build_root_tools(
 
     // Root sessions can spawn child sessions.
     let spawn_tool = Arc::new(crate::tools::SpawnSessionTool::new(adapter.clone()));
-    let tools_with_spawn: Arc<dyn ToolExecutor> = Arc::new(
-        crate::tools::OverlayToolExecutor::new(base_tools, spawn_tool),
-    );
+    let tools_with_spawn: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
+        base_tools, spawn_tool,
+    ));
 
     // Root sessions can manage schedules via `scheduler`.
     // Background schedule runs intentionally use `tools_for_schedules` above and therefore
@@ -126,11 +128,9 @@ pub(super) fn build_root_tools(
     );
 
     let sub_session_manager_tool = Arc::new(crate::tools::SubSessionManagerTool::new(adapter));
-    let tools_with_sub_session_manager: Arc<dyn ToolExecutor> =
-        Arc::new(crate::tools::OverlayToolExecutor::new(
-            tools_with_schedule,
-            sub_session_manager_tool,
-        ));
+    let tools_with_sub_session_manager: Arc<dyn ToolExecutor> = Arc::new(
+        crate::tools::OverlayToolExecutor::new(tools_with_schedule, sub_session_manager_tool),
+    );
 
     let session_inspector_tool = Arc::new(crate::tools::SessionInspectorTool::new(
         session_store,

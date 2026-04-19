@@ -1,5 +1,5 @@
-use bamboo_agent_core::Session;
 use crate::metrics::MetricsCollector;
+use bamboo_agent_core::Session;
 
 pub(super) fn record_session_resolution(
     metrics_collector: Option<&MetricsCollector>,

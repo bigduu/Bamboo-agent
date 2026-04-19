@@ -1,7 +1,7 @@
 use tokio::sync::mpsc;
 
-use bamboo_agent_core::TokenUsage;
 use bamboo_agent_core::AgentEvent;
+use bamboo_agent_core::TokenUsage;
 
 pub(super) async fn send_complete_event_if_needed(
     event_tx: &mpsc::Sender<AgentEvent>,

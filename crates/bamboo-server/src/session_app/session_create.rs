@@ -31,10 +31,8 @@ pub struct CreateSessionConfig {
 pub fn build_new_session(input: &CreateSessionInput, config: &CreateSessionConfig) -> Session {
     let model = resolve_model(input.model.as_deref(), config.default_model.as_deref());
     let mut session = Session::new(input.id.clone(), model);
-    session.reasoning_effort = resolve_reasoning_effort(
-        input.reasoning_effort,
-        config.default_reasoning_effort,
-    );
+    session.reasoning_effort =
+        resolve_reasoning_effort(input.reasoning_effort, config.default_reasoning_effort);
 
     if let Some(title) = trimmed_non_empty(input.title.as_deref()) {
         session.title = title;
@@ -148,7 +146,10 @@ mod tests {
 
         assert_eq!(session.title, "Sprint Session");
         assert_eq!(
-            session.metadata.get("base_system_prompt").map(String::as_str),
+            session
+                .metadata
+                .get("base_system_prompt")
+                .map(String::as_str),
             Some("You are helpful")
         );
         assert_eq!(session.reasoning_effort, Some(ReasoningEffort::High));
@@ -170,7 +171,10 @@ mod tests {
         let session = build_new_session(&input, &default_config());
 
         assert_eq!(
-            session.metadata.get("base_system_prompt").map(String::as_str),
+            session
+                .metadata
+                .get("base_system_prompt")
+                .map(String::as_str),
             Some("Global fallback")
         );
         assert!(session.messages.is_empty());
@@ -192,7 +196,10 @@ mod tests {
         let session = build_new_session(&input, &config);
 
         assert_eq!(
-            session.metadata.get("base_system_prompt").map(String::as_str),
+            session
+                .metadata
+                .get("base_system_prompt")
+                .map(String::as_str),
             Some(BUILTIN_FALLBACK)
         );
     }
@@ -208,9 +215,8 @@ mod tests {
         };
         let session = build_new_session(&input, &default_config());
 
-        let snapshot =
-            bamboo_engine::runner::read_prompt_snapshot(&session)
-                .expect("prompt snapshot should exist");
+        let snapshot = bamboo_engine::runner::read_prompt_snapshot(&session)
+            .expect("prompt snapshot should exist");
         assert_eq!(snapshot.base_system_prompt, "Custom prompt");
         assert_eq!(snapshot.effective_system_prompt, "Custom prompt");
     }

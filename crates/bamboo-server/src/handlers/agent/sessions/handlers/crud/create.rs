@@ -1,8 +1,8 @@
 use actix_web::{web, HttpResponse, Result};
 use uuid::Uuid;
 
-use bamboo_agent_core::Session;
 use crate::app_state::AppState;
+use bamboo_agent_core::Session;
 
 use super::super::super::types::{CreateSessionRequest, CreateSessionResponse, SessionSummary};
 

@@ -14,15 +14,12 @@ const METADATA_KEY: &str = "agent.runtime.state";
 ///
 /// Tries the structured field first, falls back to the metadata key.
 pub fn read_runtime_state(session: &Session) -> Option<AgentRuntimeState> {
-    session
-        .agent_runtime_state
-        .clone()
-        .or_else(|| {
-            session
-                .metadata
-                .get(METADATA_KEY)
-                .and_then(|raw| serde_json::from_str::<AgentRuntimeState>(raw).ok())
-        })
+    session.agent_runtime_state.clone().or_else(|| {
+        session
+            .metadata
+            .get(METADATA_KEY)
+            .and_then(|raw| serde_json::from_str::<AgentRuntimeState>(raw).ok())
+    })
 }
 
 /// Write `AgentRuntimeState` to session.
@@ -109,9 +106,10 @@ mod tests {
     fn read_from_metadata_fallback() {
         let mut session = test_session();
         let state = AgentRuntimeState::new("run-2");
-        session
-            .metadata
-            .insert(METADATA_KEY.to_string(), serde_json::to_string(&state).unwrap());
+        session.metadata.insert(
+            METADATA_KEY.to_string(),
+            serde_json::to_string(&state).unwrap(),
+        );
 
         let read = read_runtime_state(&session).unwrap();
         assert_eq!(read.run_id, "run-2");
@@ -126,9 +124,10 @@ mod tests {
 
         let mut state2 = AgentRuntimeState::new("from-metadata");
         state2.status = AgentStatusState::Completed;
-        session
-            .metadata
-            .insert(METADATA_KEY.to_string(), serde_json::to_string(&state2).unwrap());
+        session.metadata.insert(
+            METADATA_KEY.to_string(),
+            serde_json::to_string(&state2).unwrap(),
+        );
 
         let read = read_runtime_state(&session).unwrap();
         assert_eq!(read.run_id, "from-field");

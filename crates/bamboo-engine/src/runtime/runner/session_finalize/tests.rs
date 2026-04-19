@@ -2,10 +2,10 @@ use chrono::Utc;
 use tokio::sync::mpsc;
 
 use super::finalize_session;
-use bamboo_agent_core::{AgentEvent, Session};
-use bamboo_domain::{AgentRuntimeState, TaskItem, TaskItemStatus, TaskList};
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
+use bamboo_agent_core::{AgentEvent, Session};
+use bamboo_domain::{AgentRuntimeState, TaskItem, TaskItemStatus, TaskList};
 
 fn completed_task_list(session_id: &str) -> TaskList {
     TaskList {

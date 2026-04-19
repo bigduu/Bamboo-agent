@@ -4,10 +4,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_infrastructure::LLMProvider;
-use crate::runtime::config::AgentLoopConfig;
 
 use super::round_error::record_round_failure;
 use super::startup::LoopRunState;
@@ -282,11 +282,11 @@ pub(super) async fn run_rounds(
         }
 
         let Some(round_flow_outcome) = round_flow_outcome else {
-            let error =
-                bamboo_agent_core::AgentError::LLM(format!(
-                    "[{}] round {} completed without outcome",
-                    state.session_id, round + 1
-                ));
+            let error = bamboo_agent_core::AgentError::LLM(format!(
+                "[{}] round {} completed without outcome",
+                state.session_id,
+                round + 1
+            ));
             record_round_failure(
                 state.metrics_collector.as_ref(),
                 &round_id,
@@ -301,8 +301,10 @@ pub(super) async fn run_rounds(
             state.overflow_recovery.reset_after_stable_round();
         }
 
-        state.runtime_state.memory.overflow_recovery_total = state.overflow_recovery.total_recoveries as u32;
-        state.runtime_state.memory.overflow_recovery_consecutive = state.overflow_recovery.consecutive_recoveries as u32;
+        state.runtime_state.memory.overflow_recovery_total =
+            state.overflow_recovery.total_recoveries as u32;
+        state.runtime_state.memory.overflow_recovery_consecutive =
+            state.overflow_recovery.consecutive_recoveries as u32;
         state_bridge::write_runtime_state(session, &state.runtime_state);
 
         sent_complete = sent_complete || round_flow_outcome.sent_complete;
@@ -317,8 +319,8 @@ pub(super) async fn run_rounds(
 #[cfg(test)]
 mod tests {
     use super::{is_overflow_recoverable, should_retry_round_error};
-    use bamboo_agent_core::AgentError;
     use crate::runtime::runner::loop_execution::startup::OverflowRecoveryState;
+    use bamboo_agent_core::AgentError;
 
     #[test]
     fn retries_transient_llm_errors() {

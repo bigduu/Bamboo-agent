@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use crate::metrics::MetricsCollector;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
-use crate::metrics::MetricsCollector;
 use bamboo_infrastructure::LLMProvider;
 use tokio::sync::mpsc;
 
@@ -25,11 +25,7 @@ impl DefaultToolManager {
 
 #[async_trait]
 impl ToolManager for DefaultToolManager {
-    fn resolve_tool_schemas(
-        &self,
-        config: &AgentLoopConfig,
-        session: &Session,
-    ) -> Vec<ToolSchema> {
+    fn resolve_tool_schemas(&self, config: &AgentLoopConfig, session: &Session) -> Vec<ToolSchema> {
         crate::runtime::runner::session_setup::tool_schemas::resolve_available_tool_schemas_for_session(
             config,
             self.tools.as_ref(),

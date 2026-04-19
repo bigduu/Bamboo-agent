@@ -1,8 +1,8 @@
 use super::{AppState, DEFAULT_BASE_PROMPT};
+use crate::tools::ToolSurface;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolError};
 use bamboo_tools::permission::config::{PermissionConfig, PermissionRule, PermissionType};
 use bamboo_tools::permission::storage::PermissionStorage;
-use crate::tools::ToolSurface;
 use serde_json::json;
 
 fn make_tool_call(name: &str, args: serde_json::Value) -> ToolCall {

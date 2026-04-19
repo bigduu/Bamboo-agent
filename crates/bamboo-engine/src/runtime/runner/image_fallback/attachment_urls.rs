@@ -1,8 +1,8 @@
 use base64::Engine;
 
 use bamboo_agent_core::storage::AttachmentReader;
-use bamboo_agent_core::{AgentError, Message};
 use bamboo_agent_core::MessagePart;
+use bamboo_agent_core::{AgentError, Message};
 
 pub(super) fn parse_bamboo_attachment_url(url: &str) -> Option<(&str, &str)> {
     let trimmed = url.trim();

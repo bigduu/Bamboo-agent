@@ -1,11 +1,11 @@
 use actix_web::{web, HttpResponse};
 
+use crate::{app_state::AppState, error::AppError};
+use bamboo_engine::metrics::types::ForwardStatus;
 use bamboo_infrastructure::providers::anthropic::{
     api_types::{AnthropicListModelsResponse, AnthropicModel},
     format_model_display_name,
 };
-use bamboo_engine::metrics::types::ForwardStatus;
-use crate::{app_state::AppState, error::AppError};
 
 pub async fn get_models(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let forward_id = uuid::Uuid::new_v4().to_string();

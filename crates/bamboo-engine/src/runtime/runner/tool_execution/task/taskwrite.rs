@@ -1,9 +1,9 @@
 use tokio::sync::mpsc;
 
-use bamboo_agent_core::tools::{ToolCall, ToolResult};
-use bamboo_agent_core::{AgentEvent, Session, SessionKind};
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
+use bamboo_agent_core::tools::{ToolCall, ToolResult};
+use bamboo_agent_core::{AgentEvent, Session, SessionKind};
 use bamboo_tools::TaskTool;
 
 pub(super) async fn maybe_handle_taskwrite(

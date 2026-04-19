@@ -14,23 +14,13 @@ pub enum Condition {
     /// Check if the result was successful
     Success,
     /// Check if JSON path contains a specific value
-    Contains {
-        path: String,
-        value: String,
-    },
+    Contains { path: String, value: String },
     /// Check if value at JSON path matches a regex pattern
-    Matches {
-        path: String,
-        pattern: String,
-    },
+    Matches { path: String, pattern: String },
     /// All conditions must be true
-    And {
-        conditions: Vec<Condition>,
-    },
+    And { conditions: Vec<Condition> },
     /// At least one condition must be true
-    Or {
-        conditions: Vec<Condition>,
-    },
+    Or { conditions: Vec<Condition> },
 }
 
 /// Evaluate condition against a (success, result_json) pair.

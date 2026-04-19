@@ -2,10 +2,7 @@
 
 use std::sync::Arc;
 
-use bamboo_agent_core::{
-    RegistryError, SharedTool,
-    Tool, ToolSchema,
-};
+use bamboo_agent_core::{RegistryError, SharedTool, Tool, ToolSchema};
 use dashmap::DashMap;
 
 use crate::guide::{ToolGuide, ToolGuideSpec};

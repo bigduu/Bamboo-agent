@@ -5,9 +5,9 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::app_state::AppState;
     use actix_web::web;
     use bamboo_agent_core::Session;
-    use crate::app_state::AppState;
 
     #[tokio::test]
     async fn prefers_storage_when_memory_lacks_pending_question() {
@@ -37,7 +37,8 @@ mod tests {
             .await
             .expect("storage save should succeed");
 
-        let loaded = state.load_session_merged(session_id)
+        let loaded = state
+            .load_session_merged(session_id)
             .await
             .expect("session should load");
 

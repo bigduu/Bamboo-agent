@@ -7,16 +7,16 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Message, Role, Session};
+use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_engine::execution::{
     create_event_forwarder, finalize_runner, get_or_create_event_sender, try_reserve_runner,
     AgentRunner,
 };
 use bamboo_engine::ExecuteRequest;
-use bamboo_domain::reasoning::ReasoningEffort;
 
-use bamboo_domain::{ScheduleRunConfig, ScheduleRunStatus};
 use super::store::{ClaimedScheduleRun, ScheduleStore};
 use super::trigger_engine::DynTriggerEngine;
+use bamboo_domain::{ScheduleRunConfig, ScheduleRunStatus};
 
 #[derive(Debug, Clone)]
 pub struct ScheduleRunJob {
@@ -229,7 +229,8 @@ async fn run_schedule_job(
     let session_id = session.id.clone();
 
     // Persist session and index entry.
-    ctx.agent.storage()
+    ctx.agent
+        .storage()
         .save_session(&session)
         .await
         .map_err(|e| format!("failed to save scheduled session: {e}"))?;
@@ -296,7 +297,8 @@ async fn run_schedule_job(
     let run_id_for_log = job.run_id.clone();
 
     // Insert runner status (for cancellation/status introspection).
-    let Some(cancel_token) = try_reserve_runner(&ctx.agent_runners, &session_id, &session_tx).await else {
+    let Some(cancel_token) = try_reserve_runner(&ctx.agent_runners, &session_id, &session_tx).await
+    else {
         return Ok(ScheduleRunLifecycleResult::Terminal(
             ScheduleRunStatus::Skipped,
         ));

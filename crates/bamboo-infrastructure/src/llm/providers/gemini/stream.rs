@@ -9,9 +9,9 @@
 //! data: [DONE]
 //! ```
 
-use bamboo_domain::{FunctionCall, ToolCall};
 use crate::llm::provider::{LLMError, Result};
 use crate::llm::types::LLMChunk;
+use bamboo_domain::{FunctionCall, ToolCall};
 use serde_json::Value;
 
 /// Stateful parser for Gemini SSE streaming events.

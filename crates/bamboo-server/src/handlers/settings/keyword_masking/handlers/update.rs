@@ -1,9 +1,9 @@
-use bamboo_infrastructure::keyword_masking::KeywordEntry;
 use crate::{
     app_state::{AppState, ConfigUpdateEffects},
     error::AppError,
 };
 use actix_web::{web, HttpResponse};
+use bamboo_infrastructure::keyword_masking::KeywordEntry;
 
 use super::super::{types::KeywordMaskingResponse, validation::build_validated_config};
 

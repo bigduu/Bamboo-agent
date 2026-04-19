@@ -1,14 +1,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::runtime::config::PromptMemoryFlags;
+use bamboo_agent_core::{PromptMemoryObservability, Session};
+use bamboo_infrastructure::LLMProvider;
 use bamboo_memory::memory_store::{
     project_key_from_path, render_memory_freshness_note, select_relevant_memories,
     truncate_chars as memory_truncate_chars, FreshnessKind, MemoryRecallCandidate,
     MemoryRecallOptions, MemoryRecallRerankContext, MemoryRecallStrategy, MemoryScope, MemoryStore,
 };
-use bamboo_agent_core::{PromptMemoryObservability, Session};
-use bamboo_infrastructure::LLMProvider;
-use crate::runtime::config::PromptMemoryFlags;
 use bamboo_tools::tools::workspace_state;
 
 use super::system_sections::strip_existing_prompt_block;

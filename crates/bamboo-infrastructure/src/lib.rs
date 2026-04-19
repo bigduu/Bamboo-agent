@@ -2,8 +2,8 @@
 
 pub mod config;
 pub mod llm;
-pub mod storage;
 pub mod process;
+pub mod storage;
 
 // Flat re-exports for backward compatibility
 pub use config::*;
@@ -35,27 +35,26 @@ pub mod error {
 }
 
 pub use llm::api;
-pub use llm::{LLMProvider, LLMError, LLMRequestOptions, LLMStream, LLMChunk};
-pub use llm::{
-    AnthropicProtocol, FromProvider, GeminiProtocol, OpenAIProtocol, ProtocolError, ProtocolResult,
-    ToProvider, ProxyAuthRequiredError,
-};
 pub use llm::{
     create_provider, create_provider_with_dir, validate_provider_config, AVAILABLE_PROVIDERS,
 };
+pub use llm::{
+    AnthropicProtocol, FromProvider, GeminiProtocol, OpenAIProtocol, ProtocolError, ProtocolResult,
+    ProxyAuthRequiredError, ToProvider,
+};
 pub use llm::{AnthropicProvider, CopilotProvider, GeminiProvider, OpenAIProvider};
-pub use storage::{JsonlStorage, SessionSearchIndex, SessionSearchMatch};
-pub use storage::{CleanupMode, CleanupResult, SessionIndexEntry, SessionStoreV2, SessionsIndex};
+pub use llm::{LLMChunk, LLMError, LLMProvider, LLMRequestOptions, LLMStream};
+pub use process::process_utils::{
+    build_command_environment, decode_process_line_lossy, hide_window_for_std_command,
+    hide_window_for_tokio_command, preferred_bash_shell, render_command_line,
+    trace_windows_command, windows_command_trace_enabled, CommandEnvironmentDiagnostics,
+    CommandEnvironmentSource, PreparedCommandEnvironment, PythonDiscoveryDiagnostics, ShellCommand,
+};
 pub use process::{
     ProcessHandle, ProcessInfo, ProcessRegistrationConfig, ProcessRegistry, ProcessType,
 };
-pub use process::process_utils::{
-    ShellCommand, CommandEnvironmentSource, PythonDiscoveryDiagnostics,
-    CommandEnvironmentDiagnostics, PreparedCommandEnvironment,
-    build_command_environment, render_command_line, windows_command_trace_enabled,
-    trace_windows_command, decode_process_line_lossy, preferred_bash_shell,
-    hide_window_for_std_command, hide_window_for_tokio_command,
-};
+pub use storage::{CleanupMode, CleanupResult, SessionIndexEntry, SessionStoreV2, SessionsIndex};
+pub use storage::{JsonlStorage, SessionSearchIndex, SessionSearchMatch};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use process::process_utils::{

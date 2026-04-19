@@ -1,7 +1,7 @@
+use crate::error::AppError;
 use bamboo_infrastructure::api::models::{
     ChatMessage, Content, ContentPart, FunctionCall, ImageUrl, Role, ToolCall,
 };
-use crate::error::AppError;
 
 pub(super) fn role_str_to_openai_role(role: &str) -> Role {
     match role {

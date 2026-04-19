@@ -4,9 +4,9 @@
 //! enter the agent loop. They operate on internal `bamboo_agent_core::Message` so the
 //! same behavior applies across OpenAI-compatible, Anthropic, Gemini, and agent routes.
 
+use crate::app_state::AppState;
 use bamboo_agent_core::{Message, MessagePart};
 use bamboo_infrastructure::Config;
-use crate::app_state::AppState;
 
 #[cfg(windows)]
 use base64::Engine;

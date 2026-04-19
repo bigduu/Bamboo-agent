@@ -5,12 +5,12 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::metrics::TokenUsage as MetricsTokenUsage;
+use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::stream::handler::StreamHandlingOutput;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_infrastructure::LLMProvider;
-use crate::runtime::config::AgentLoopConfig;
-use crate::runtime::stream::handler::StreamHandlingOutput;
-use crate::metrics::TokenUsage as MetricsTokenUsage;
 
 use token_estimation::{estimate_completion_tokens, estimate_prompt_tokens};
 

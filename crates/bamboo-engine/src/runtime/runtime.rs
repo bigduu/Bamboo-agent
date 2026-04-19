@@ -12,18 +12,20 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use crate::metrics::MetricsCollector;
+use crate::skills::SkillManager;
 use bamboo_agent_core::storage::{AttachmentReader, Storage};
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Role, Session};
-use crate::metrics::MetricsCollector;
-use crate::skills::SkillManager;
-use bamboo_infrastructure::Config;
 use bamboo_domain::ReasoningEffort;
+use bamboo_infrastructure::Config;
 use bamboo_infrastructure::LLMProvider;
 
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, PromptMemoryFlags};
 use crate::runtime::hooks::HookRunner;
-use crate::runtime::managers::{LifecycleManager, LlmManager, MemoryManager, PromptManager, ToolManager};
+use crate::runtime::managers::{
+    LifecycleManager, LlmManager, MemoryManager, PromptManager, ToolManager,
+};
 use crate::runtime::runner::run_agent_loop_with_config;
 
 // ---------------------------------------------------------------------------
@@ -311,9 +313,7 @@ impl AgentRuntime {
             background_model_name: req
                 .background_model
                 .or_else(|| config.get_memory_background_model()),
-            provider_name: Some(
-                req.provider_name.unwrap_or_else(|| config.provider.clone()),
-            ),
+            provider_name: Some(req.provider_name.unwrap_or_else(|| config.provider.clone())),
             reasoning_effort: req.reasoning_effort,
             disabled_tools: req
                 .disabled_tools

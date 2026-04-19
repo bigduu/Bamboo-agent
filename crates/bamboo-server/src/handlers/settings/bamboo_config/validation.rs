@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use actix_web::{web, HttpResponse};
 use serde_json::Value;
 
-use bamboo_infrastructure::Config;
 use crate::config_manager;
 use crate::{app_state::AppState, error::AppError};
+use bamboo_infrastructure::Config;
 
 use super::types::{ValidateConfigResponse, ValidationIssue};
 

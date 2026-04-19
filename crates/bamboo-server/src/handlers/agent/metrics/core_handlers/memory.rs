@@ -8,15 +8,15 @@ use super::super::{
     internal_error, MemoryMetricsQuery, MemoryMetricsSummary, MemoryTimelinePoint,
     PromptMemoryMetricsSummary,
 };
-use bamboo_memory::memory_store::{
-    DurableMemoryDocument, MemoryInspectResult, MemoryScope, MemoryStore,
-};
-use bamboo_infrastructure::SessionStoreV2;
-use bamboo_agent_core::storage::Storage;
-use bamboo_agent_core::PromptMemoryObservability;
 use crate::app_state::AppState;
 use crate::handlers::agent::metrics::core_handlers::filters::{
     normalize_days, resolve_timeline_granularity, TimelineGranularity,
+};
+use bamboo_agent_core::storage::Storage;
+use bamboo_agent_core::PromptMemoryObservability;
+use bamboo_infrastructure::SessionStoreV2;
+use bamboo_memory::memory_store::{
+    DurableMemoryDocument, MemoryInspectResult, MemoryScope, MemoryStore,
 };
 
 fn merge_breakdown(target: &mut BTreeMap<String, u64>, source: &BTreeMap<String, usize>) {
@@ -486,9 +486,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use bamboo_memory::memory_store::DurableMemoryType;
-    use bamboo_infrastructure::SessionStoreV2;
     use bamboo_agent_core::storage::Storage;
+    use bamboo_infrastructure::SessionStoreV2;
+    use bamboo_memory::memory_store::DurableMemoryType;
 
     async fn create_session_storage(
         dir: &std::path::Path,

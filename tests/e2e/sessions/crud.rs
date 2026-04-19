@@ -1,6 +1,6 @@
 use actix_web::{test, web, App};
-use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_agent::server::handlers::agent::sessions;
+use bamboo_domain::reasoning::ReasoningEffort;
 use serde_json::json;
 
 #[actix_web::test]

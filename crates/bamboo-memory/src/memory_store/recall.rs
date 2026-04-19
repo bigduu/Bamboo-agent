@@ -7,8 +7,8 @@ use futures::StreamExt;
 use serde::Deserialize;
 
 use bamboo_agent_core::Message;
-use bamboo_infrastructure::{LLMChunk, LLMProvider, LLMRequestOptions};
 use bamboo_domain::ReasoningEffort;
+use bamboo_infrastructure::{LLMChunk, LLMProvider, LLMRequestOptions};
 
 use super::{
     extract_keywords, parse_rfc3339, DurableMemoryStatus, LexicalIndexItem, MemoryScope,
@@ -378,26 +378,23 @@ async fn rerank_candidate_ids(
         .await
         .map_err(|error| format!("rerank provider call failed: {error}"))?;
 
-    let content = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        async {
-            let mut content = String::new();
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(LLMChunk::Token(text)) => content.push_str(&text),
-                    Ok(LLMChunk::Done) => break,
-                    Ok(_) => {}
-                    Err(error) => {
-                        if !content.trim().is_empty() {
-                            break;
-                        }
-                        return Err(format!("rerank stream failed: {error}"));
+    let content = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut content = String::new();
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok(LLMChunk::Token(text)) => content.push_str(&text),
+                Ok(LLMChunk::Done) => break,
+                Ok(_) => {}
+                Err(error) => {
+                    if !content.trim().is_empty() {
+                        break;
                     }
+                    return Err(format!("rerank stream failed: {error}"));
                 }
             }
-            Ok(content)
-        },
-    )
+        }
+        Ok(content)
+    })
     .await
     .unwrap_or_else(|_| Err("rerank timed out after 30s".to_string()))?;
 
@@ -517,8 +514,8 @@ fn extract_json_fragment(raw: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::memory_store::DurableMemoryType;
-    use bamboo_infrastructure::{LLMError, LLMStream};
     use async_trait::async_trait;
+    use bamboo_infrastructure::{LLMError, LLMStream};
     use futures::stream;
     use std::sync::Mutex;
     use tempfile::tempdir;

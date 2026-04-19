@@ -22,10 +22,10 @@
 //! }
 //! ```
 
+use crate::llm::protocol::{FromProvider, ProtocolError, ProtocolResult, ToProvider};
 use bamboo_domain::{FunctionCall, ToolCall};
 use bamboo_domain::{FunctionSchema, ToolSchema};
 use bamboo_domain::{Message, Role};
-use crate::llm::protocol::{FromProvider, ProtocolError, ProtocolResult, ToProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -456,9 +456,7 @@ impl ToProvider<Vec<GeminiTool>> for Vec<ToolSchema> {
     }
 }
 
-fn message_content_part_to_gemini_part(
-    part: &bamboo_domain::MessagePart,
-) -> Option<GeminiPart> {
+fn message_content_part_to_gemini_part(part: &bamboo_domain::MessagePart) -> Option<GeminiPart> {
     match part {
         bamboo_domain::MessagePart::Text { text } => Some(GeminiPart {
             text: Some(text.clone()),

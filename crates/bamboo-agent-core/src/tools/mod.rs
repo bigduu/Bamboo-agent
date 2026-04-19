@@ -104,11 +104,13 @@ pub use accumulator::{
 };
 pub use agentic::{
     convert_from_standard_result, convert_to_standard_result, AgenticContext, AgenticTool,
-    AgenticToolResult, Interaction, InteractionRole, AgenticToolExecutor, ToolGoal,
+    AgenticToolExecutor, AgenticToolResult, Interaction, InteractionRole, ToolGoal,
 };
 pub use context::ToolExecutionContext;
 pub use executor::{execute_tool_call, execute_tool_call_with_context, ToolError, ToolExecutor};
-pub use registry::{global_registry, normalize_tool_name, RegistryError, SharedTool, Tool, ToolRegistry};
+pub use registry::{
+    global_registry, normalize_tool_name, RegistryError, SharedTool, Tool, ToolRegistry,
+};
 pub use result_handler::{
     execute_sub_actions, handle_tool_result_with_agentic_support, parse_tool_args,
     parse_tool_args_best_effort, send_clarification_request, try_parse_agentic_result,

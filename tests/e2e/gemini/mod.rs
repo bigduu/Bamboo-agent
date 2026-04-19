@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 use actix_web::{test, web, App};
 use async_trait::async_trait;
 use bamboo_agent::agent::{Message, Role};
+use bamboo_agent::server::handlers::gemini;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_infrastructure::{LLMChunk, LLMProvider, LLMStream};
-use bamboo_agent::server::handlers::gemini;
 use futures::stream;
 use serde_json::json;
 

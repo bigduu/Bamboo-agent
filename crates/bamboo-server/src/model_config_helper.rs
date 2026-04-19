@@ -1,8 +1,8 @@
 // Helper function to extract default model from config
 // This should be used instead of hardcoding "gpt-4o-mini" or "default"
 
-use bamboo_infrastructure::LLMError;
 use bamboo_infrastructure::Config;
+use bamboo_infrastructure::LLMError;
 
 /// Get the default model for the current provider from config
 /// Returns an error if no model is configured

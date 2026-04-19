@@ -4,8 +4,8 @@ use super::{
     internal_error, CombinedSummary, MemoryMetricsQuery, MetricsDailyQuery, MetricsSummaryQuery,
     UnifiedSummary, UnifiedTimelinePoint,
 };
-use bamboo_memory::memory_store::MemoryStore;
 use crate::app_state::AppState;
+use bamboo_memory::memory_store::MemoryStore;
 
 use super::core_handlers::memory::build_memory_summary;
 
@@ -114,13 +114,11 @@ pub async fn v2_unified_timeline(
             let chat_map: std::collections::HashMap<String, &bamboo_engine::DailyMetrics> =
                 chat_daily.iter().map(|d| (d.date.to_string(), d)).collect();
 
-            let forward_map: std::collections::HashMap<
-                String,
-                &bamboo_engine::DailyMetrics,
-            > = forward_daily
-                .iter()
-                .map(|d| (d.date.to_string(), d))
-                .collect();
+            let forward_map: std::collections::HashMap<String, &bamboo_engine::DailyMetrics> =
+                forward_daily
+                    .iter()
+                    .map(|d| (d.date.to_string(), d))
+                    .collect();
 
             // Get all unique dates.
             let mut dates: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();

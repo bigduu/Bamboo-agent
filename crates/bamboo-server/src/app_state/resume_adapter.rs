@@ -6,9 +6,9 @@
 //! `AppStateResumeRef` is a newtype wrapper around `Data<AppState>` to satisfy
 //! Rust's orphan rules (can't impl a foreign trait on a foreign type).
 
+use crate::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
 use async_trait::async_trait;
 use bamboo_agent_core::AgentEvent;
-use crate::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -43,10 +43,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
         try_reserve_runner(&self.0.agent_runners, session_id, event_sender).await
     }
 
-    async fn get_or_create_event_sender(
-        &self,
-        session_id: &str,
-    ) -> broadcast::Sender<AgentEvent> {
+    async fn get_or_create_event_sender(&self, session_id: &str) -> broadcast::Sender<AgentEvent> {
         get_or_create_event_sender(&self.0.session_event_senders, session_id).await
     }
 
@@ -70,16 +67,10 @@ impl ResumeExecutionPort for AppStateResumeRef {
 
         let image_fallback = config.image_fallback.clone();
 
-        let (mpsc_tx, mpsc_rx) =
-            tokio::sync::mpsc::channel::<bamboo_agent_core::AgentEvent>(100);
+        let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel::<bamboo_agent_core::AgentEvent>(100);
 
         let state = self.0.clone();
-        spawn_event_forwarder(
-            state.clone(),
-            session_id.clone(),
-            mpsc_rx,
-            event_sender,
-        );
+        spawn_event_forwarder(state.clone(), session_id.clone(), mpsc_rx, event_sender);
 
         spawn_agent_execution(SpawnAgentExecution {
             state,

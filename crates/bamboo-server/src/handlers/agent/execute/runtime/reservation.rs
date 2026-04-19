@@ -1,7 +1,7 @@
 use tokio_util::sync::CancellationToken;
 
-use bamboo_agent_core::AgentEvent;
 use crate::app_state::{AgentRunner, AgentStatus, AppState};
+use bamboo_agent_core::AgentEvent;
 
 pub(in crate::handlers::agent::execute) enum RunnerReservation {
     Started(CancellationToken),

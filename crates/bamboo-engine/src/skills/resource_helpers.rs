@@ -26,9 +26,7 @@ pub fn normalize_relative_resource_path(raw: &str) -> Result<PathBuf, String> {
             Component::Normal(segment) => normalized.push(segment),
             Component::CurDir => {}
             Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
-                return Err(
-                    "resource_path cannot contain '..' or root/prefix segments".to_string(),
-                )
+                return Err("resource_path cannot contain '..' or root/prefix segments".to_string())
             }
         }
     }
@@ -137,7 +135,8 @@ mod tests {
 
     #[test]
     fn normalize_relative_resource_path_accepts_nested_file() {
-        let path = normalize_relative_resource_path("references/policy.md").expect("path should parse");
+        let path =
+            normalize_relative_resource_path("references/policy.md").expect("path should parse");
         assert_eq!(path, Path::new("references/policy.md"));
     }
 

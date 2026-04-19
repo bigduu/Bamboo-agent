@@ -9,11 +9,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use bamboo_agent_core::{ToolMutability, classify_tool};
-use bamboo_agent_core::{
-    ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult,
-};
 use crate::events::ToolEmitter;
+pub use bamboo_agent_core::{classify_tool, ToolMutability};
+use bamboo_agent_core::{ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult};
 
 /// Configuration for the orchestrator.
 #[derive(Debug, Clone)]
@@ -165,10 +163,10 @@ impl Default for ToolOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_agent_core::{FunctionCall, ToolSchema};
     use crate::events::ToolEventPhase;
     use crate::BuiltinToolExecutor;
     use async_trait::async_trait;
+    use bamboo_agent_core::{FunctionCall, ToolSchema};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -2,12 +2,12 @@ use std::path::Path;
 
 use actix_web::{web, HttpResponse, Result};
 
-use bamboo_memory::memory_store::MemoryStore;
-use bamboo_infrastructure::{CleanupMode, CleanupResult};
-use bamboo_agent_core::Session;
-use bamboo_tools::tools::workspace_state;
 use crate::app_state::AppState;
 use crate::services::auto_dream::{run_project_auto_dream_once, AutoDreamContext};
+use bamboo_agent_core::Session;
+use bamboo_infrastructure::{CleanupMode, CleanupResult};
+use bamboo_memory::memory_store::MemoryStore;
+use bamboo_tools::tools::workspace_state;
 
 use super::super::types::CleanupRequest;
 
@@ -204,11 +204,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use bamboo_agent_core::{ConversationSummary, Message};
-    use bamboo_infrastructure::{LLMChunk, LLMError, LLMProvider, LLMStream};
-    use bamboo_infrastructure::Config;
     use crate::routes::configure_routes;
     use crate::AppState;
+    use bamboo_agent_core::{ConversationSummary, Message};
+    use bamboo_infrastructure::Config;
+    use bamboo_infrastructure::{LLMChunk, LLMError, LLMProvider, LLMStream};
 
     #[derive(Clone)]
     struct SequenceProvider {

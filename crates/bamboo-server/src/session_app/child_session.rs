@@ -100,10 +100,7 @@ pub trait ChildSessionPort: Send + Sync {
         parent: &Session,
         child: &Session,
     ) -> Result<(), ChildSessionError>;
-    async fn cancel_child_run_and_wait(
-        &self,
-        child_id: &str,
-    ) -> Result<(), ChildSessionError>;
+    async fn cancel_child_run_and_wait(&self, child_id: &str) -> Result<(), ChildSessionError>;
     async fn delete_child_session(
         &self,
         parent_id: &str,
@@ -170,10 +167,7 @@ pub fn format_child_assignment(
     )
 }
 
-pub fn replace_or_append_last_user_message(
-    session: &mut Session,
-    content: String,
-) -> usize {
+pub fn replace_or_append_last_user_message(session: &mut Session, content: String) -> usize {
     use bamboo_agent_core::Role;
 
     if let Some(index) = session
@@ -246,17 +240,36 @@ pub async fn create_child_action(
         input.title.clone(),
     );
 
-    child.metadata.insert("spawned_by".to_string(), "SubSession".to_string());
-    child.metadata.insert("subagent_type".to_string(), input.subagent_type.clone());
-    child.metadata.insert("responsibility".to_string(), input.responsibility.clone());
-    child.metadata.insert("assignment_prompt".to_string(), input.assignment_prompt.clone());
-    child.metadata.insert("last_run_status".to_string(), "pending".to_string());
+    child
+        .metadata
+        .insert("spawned_by".to_string(), "SubSession".to_string());
+    child
+        .metadata
+        .insert("subagent_type".to_string(), input.subagent_type.clone());
+    child
+        .metadata
+        .insert("responsibility".to_string(), input.responsibility.clone());
+    child.metadata.insert(
+        "assignment_prompt".to_string(),
+        input.assignment_prompt.clone(),
+    );
+    child
+        .metadata
+        .insert("last_run_status".to_string(), "pending".to_string());
     child.metadata.remove("last_run_error");
-    child.metadata.insert("base_system_prompt".to_string(), CHILD_SYSTEM_PROMPT.to_string());
+    child.metadata.insert(
+        "base_system_prompt".to_string(),
+        CHILD_SYSTEM_PROMPT.to_string(),
+    );
 
     child.add_message(Message::system(CHILD_SYSTEM_PROMPT));
     refresh_prompt_snapshot(&mut child);
-    let assignment = format_child_assignment(&input.title, &input.responsibility, &input.subagent_type, &input.assignment_prompt);
+    let assignment = format_child_assignment(
+        &input.title,
+        &input.responsibility,
+        &input.subagent_type,
+        &input.assignment_prompt,
+    );
     child.add_message(Message::user(assignment));
 
     if let Some(parent_task_list) = input.parent_session.task_list.clone() {
@@ -265,7 +278,8 @@ pub async fn create_child_action(
 
     let model = child.model.clone();
     port.save_child_session(&child).await?;
-    port.enqueue_child_run(&input.parent_session, &child).await?;
+    port.enqueue_child_run(&input.parent_session, &child)
+        .await?;
 
     Ok(CreateChildResult {
         child_session_id: child.id,
@@ -290,7 +304,9 @@ pub async fn get_child_action(
     parent_id: &str,
     child_session_id: String,
 ) -> Result<serde_json::Value, ChildSessionError> {
-    let child = port.load_child_for_parent(parent_id, &child_session_id).await?;
+    let child = port
+        .load_child_for_parent(parent_id, &child_session_id)
+        .await?;
 
     Ok(json!({
         "child_session_id": child.id,
@@ -323,7 +339,9 @@ pub async fn update_child_action(
     subagent_type: Option<String>,
     reset_after_update: Option<bool>,
 ) -> Result<serde_json::Value, ChildSessionError> {
-    let mut child = port.load_child_for_parent(parent_id, &child_session_id).await?;
+    let mut child = port
+        .load_child_for_parent(parent_id, &child_session_id)
+        .await?;
 
     let title = normalize_non_empty_optional(title, "title")?;
     let responsibility = normalize_non_empty_optional(responsibility, "responsibility")?;
@@ -406,7 +424,9 @@ pub async fn run_child_action(
     child_session_id: String,
     reset_to_last_user: Option<bool>,
 ) -> Result<serde_json::Value, ChildSessionError> {
-    let mut child = port.load_child_for_parent(&parent.id, &child_session_id).await?;
+    let mut child = port
+        .load_child_for_parent(&parent.id, &child_session_id)
+        .await?;
 
     if port.is_child_running(&child.id).await {
         return Ok(json!({
@@ -446,7 +466,9 @@ pub async fn send_message_to_child_action(
     auto_run: Option<bool>,
     interrupt_running: Option<bool>,
 ) -> Result<serde_json::Value, ChildSessionError> {
-    let mut child = port.load_child_for_parent(&parent.id, &child_session_id).await?;
+    let mut child = port
+        .load_child_for_parent(&parent.id, &child_session_id)
+        .await?;
 
     if port.is_child_running(&child.id).await {
         if !interrupt_running.unwrap_or(false) {
@@ -456,7 +478,9 @@ pub async fn send_message_to_child_action(
         }
 
         port.cancel_child_run_and_wait(&child.id).await?;
-        child = port.load_child_for_parent(&parent.id, &child_session_id).await?;
+        child = port
+            .load_child_for_parent(&parent.id, &child_session_id)
+            .await?;
     }
 
     let message = normalize_required_text(Some(message), "message")?;
@@ -492,7 +516,9 @@ pub async fn delete_child_action(
     child_session_id: String,
 ) -> Result<serde_json::Value, ChildSessionError> {
     // Load child first to get its ID (port.delete_child_session handles cancellation + cleanup)
-    let child = port.load_child_for_parent(parent_id, &child_session_id).await?;
+    let child = port
+        .load_child_for_parent(parent_id, &child_session_id)
+        .await?;
     let result = port.delete_child_session(parent_id, &child.id).await?;
 
     if !result.deleted {
@@ -551,9 +577,7 @@ mod tests {
     fn normalize_non_empty_optional_rejects_blank_strings() {
         let err = normalize_non_empty_optional(Some("  ".to_string()), "prompt")
             .expect_err("blank should be rejected");
-        assert!(
-            matches!(err, ChildSessionError::InvalidArguments(msg) if msg.contains("prompt"))
-        );
+        assert!(matches!(err, ChildSessionError::InvalidArguments(msg) if msg.contains("prompt")));
     }
 
     #[test]

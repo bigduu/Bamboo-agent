@@ -689,16 +689,14 @@ fn build_fts_query(query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_domain::{Message, ConversationSummary};
+    use bamboo_domain::{ConversationSummary, Message};
     use tempfile::TempDir;
 
     fn sample_session() -> Session {
         let mut session = Session::new("session-1", "gpt-4o-mini");
         session.title = "Context Compression Investigation".to_string();
         session.add_message(Message::system("system"));
-        session.add_message(Message::user(
-            "Investigate SQLite FTS search integration",
-        ));
+        session.add_message(Message::user("Investigate SQLite FTS search integration"));
         session.add_message(Message::assistant(
             "Plan: index session history into SQLite and enable search recall.",
             None,
@@ -769,10 +767,7 @@ mod tests {
             30,
         ));
         session.add_message(Message::user("older user detail"));
-        session.add_message(Message::assistant(
-            "older assistant detail",
-            None,
-        ));
+        session.add_message(Message::assistant("older assistant detail", None));
         if let Some(message) = session.messages.get_mut(1) {
             message.compressed = true;
         }

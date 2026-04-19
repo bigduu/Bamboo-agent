@@ -1,8 +1,8 @@
+use actix_web::{http::StatusCode, HttpResponse};
 use bamboo_infrastructure::providers::anthropic::{
     api_types::{AnthropicErrorDetail, AnthropicErrorEnvelope},
     conversion::AnthropicConversionError,
 };
-use actix_web::{http::StatusCode, HttpResponse};
 
 #[derive(Clone, Debug)]
 pub(super) struct AnthropicError {

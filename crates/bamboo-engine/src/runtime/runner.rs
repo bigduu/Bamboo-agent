@@ -8,8 +8,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use bamboo_agent_core::TokenUsage;
 use bamboo_agent_core::tools::ToolExecutor;
+use bamboo_agent_core::TokenUsage;
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_infrastructure::LLMProvider;
 

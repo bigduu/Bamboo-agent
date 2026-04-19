@@ -1,8 +1,8 @@
 use tokio::sync::mpsc;
 use tracing::Instrument;
 
-use bamboo_agent_core::AgentEvent;
 use crate::app_state::AppState;
+use bamboo_agent_core::AgentEvent;
 
 pub(crate) fn spawn_event_forwarder(
     state: actix_web::web::Data<AppState>,

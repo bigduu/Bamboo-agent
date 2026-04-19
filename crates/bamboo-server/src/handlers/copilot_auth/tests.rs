@@ -1,6 +1,6 @@
+use actix_web::http::StatusCode;
 use bamboo_infrastructure::config::CopilotConfig;
 use bamboo_infrastructure::Config;
-use actix_web::http::StatusCode;
 
 use super::{client::resolve_headless_auth, status_logout::auth_status_from_token_content};
 

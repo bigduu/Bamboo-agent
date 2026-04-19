@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
+use crate::runtime::config::ImageFallbackConfig;
 use bamboo_agent_core::storage::AttachmentReader;
 use bamboo_agent_core::{AgentError, Message};
 use bamboo_infrastructure::LLMProvider;
-use crate::runtime::config::ImageFallbackConfig;
 
 mod attachment_urls;
 #[cfg(windows)]
@@ -29,9 +29,7 @@ pub(super) async fn resolve_bamboo_attachments_for_llm(
 }
 
 #[cfg(any(test, windows))]
-pub(super) fn persistable_image_urls(
-    parts: &[bamboo_domain::MessagePart],
-) -> Vec<String> {
+pub(super) fn persistable_image_urls(parts: &[bamboo_domain::MessagePart]) -> Vec<String> {
     placeholder::persistable_image_urls(parts)
 }
 

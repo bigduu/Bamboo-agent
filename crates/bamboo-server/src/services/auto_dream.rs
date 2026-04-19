@@ -6,21 +6,20 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use tokio::sync::RwLock;
 
+use bamboo_agent_core::{Message, SessionKind};
+use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_infrastructure::Config;
+use bamboo_infrastructure::{LLMChunk, LLMProvider, LLMRequestOptions};
+use bamboo_infrastructure::{SessionIndexEntry, SessionStoreV2};
 use bamboo_memory::auto_dream::{
-    ConsolidationSessionInfo, DreamCandidateInfo, DreamGenerationMode,
     build_consolidation_prompt, build_extraction_prompt, build_rebuild_consolidation_prompt,
-    build_refine_consolidation_prompt, derive_session_outline,
-    normalize_dream_notebook_body, normalize_existing_dream_for_prompt,
-    parse_candidate_scope, parse_candidate_type,
+    build_refine_consolidation_prompt, derive_session_outline, normalize_dream_notebook_body,
+    normalize_existing_dream_for_prompt, parse_candidate_scope, parse_candidate_type,
     parse_extraction_candidates, parse_last_consolidated_at, parse_last_full_rebuild_at,
     should_force_full_rebuild, should_use_dream_refine_mode, truncate_chars,
+    ConsolidationSessionInfo, DreamCandidateInfo, DreamGenerationMode,
 };
 use bamboo_memory::memory_store::{MemoryScope, MemoryStore};
-use bamboo_infrastructure::{SessionIndexEntry, SessionStoreV2};
-use bamboo_agent_core::{Message, SessionKind};
-use bamboo_infrastructure::{LLMChunk, LLMProvider, LLMRequestOptions};
-use bamboo_infrastructure::Config;
-use bamboo_domain::reasoning::ReasoningEffort;
 
 const DREAM_RUNTIME_SESSION_ID: &str = "__dream__";
 const DREAM_TRACING_TARGET: &str = "bamboo.auto_dream";
@@ -32,7 +31,9 @@ const EXTRACTION_MAX_TOPICS_PER_SESSION: usize = 4;
 const EXTRACTION_MAX_TOPIC_CHARS: usize = 1_500;
 const EXTRACTION_MAX_CANDIDATES: usize = 8;
 
-fn to_consolidation_sessions(entries: &[(SessionIndexEntry, Option<String>)]) -> Vec<ConsolidationSessionInfo> {
+fn to_consolidation_sessions(
+    entries: &[(SessionIndexEntry, Option<String>)],
+) -> Vec<ConsolidationSessionInfo> {
     entries
         .iter()
         .map(|(entry, summary)| ConsolidationSessionInfo {
@@ -455,50 +456,53 @@ async fn build_dream_notebook_body(
                 "Attempting refine-mode Dream synthesis"
             );
 
-            let existing_dream_for_prompt =
-                normalize_existing_dream_for_prompt(
-                    source_window.existing_dream.as_deref(),
-                    model,
-                    source_window.sessions.len(),
-                    DREAM_MAX_SUMMARY_CHARS,
-                );
+            let existing_dream_for_prompt = normalize_existing_dream_for_prompt(
+                source_window.existing_dream.as_deref(),
+                model,
+                source_window.sessions.len(),
+                DREAM_MAX_SUMMARY_CHARS,
+            );
             let refine_prompt = build_refine_consolidation_prompt(
                 existing_dream_for_prompt.as_deref(),
                 source_window.recent_durable_memory.as_deref(),
                 &to_consolidation_sessions(&source_window.sessions),
             );
             match collect_stream_text(ctx.provider.clone(), model, refine_prompt).await {
-                Ok(raw_body) => match normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS) {
-                    Ok(body) => {
-                        tracing::info!(
-                            target: DREAM_TRACING_TARGET,
-                            event = "refine_success",
-                            model = model,
-                            session_count = source_window.sessions.len(),
-                            notebook_body_chars = body.chars().count(),
-                            existing_dream_present = source_window.existing_dream.is_some(),
-                            recent_durable_memory_present = source_window.recent_durable_memory.is_some(),
-                            "Refine-mode Dream synthesis succeeded"
-                        );
-                        Ok(body)
+                Ok(raw_body) => {
+                    match normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS) {
+                        Ok(body) => {
+                            tracing::info!(
+                                target: DREAM_TRACING_TARGET,
+                                event = "refine_success",
+                                model = model,
+                                session_count = source_window.sessions.len(),
+                                notebook_body_chars = body.chars().count(),
+                                existing_dream_present = source_window.existing_dream.is_some(),
+                                recent_durable_memory_present = source_window.recent_durable_memory.is_some(),
+                                "Refine-mode Dream synthesis succeeded"
+                            );
+                            Ok(body)
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                target: DREAM_TRACING_TARGET,
+                                event = "refine_output_normalization_failed",
+                                model = model,
+                                session_count = source_window.sessions.len(),
+                                existing_dream_present = source_window.existing_dream.is_some(),
+                                recent_durable_memory_present = source_window.recent_durable_memory.is_some(),
+                                "[auto_dream] refine-mode Dream output normalization failed; falling back to incremental prompt: {}",
+                                error
+                            );
+                            let prompt = build_consolidation_prompt(&to_consolidation_sessions(
+                                &source_window.sessions,
+                            ));
+                            let raw_body =
+                                collect_stream_text(ctx.provider.clone(), model, prompt).await?;
+                            normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS)
+                        }
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            target: DREAM_TRACING_TARGET,
-                            event = "refine_output_normalization_failed",
-                            model = model,
-                            session_count = source_window.sessions.len(),
-                            existing_dream_present = source_window.existing_dream.is_some(),
-                            recent_durable_memory_present = source_window.recent_durable_memory.is_some(),
-                            "[auto_dream] refine-mode Dream output normalization failed; falling back to incremental prompt: {}",
-                            error
-                        );
-                        let prompt = build_consolidation_prompt(&to_consolidation_sessions(&source_window.sessions));
-                        let raw_body =
-                            collect_stream_text(ctx.provider.clone(), model, prompt).await?;
-                        normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS)
-                    }
-                },
+                }
                 Err(error) => {
                     tracing::warn!(
                         target: DREAM_TRACING_TARGET,
@@ -510,7 +514,9 @@ async fn build_dream_notebook_body(
                         "[auto_dream] refine-mode Dream synthesis failed; falling back to incremental prompt: {}",
                         error
                     );
-                    let prompt = build_consolidation_prompt(&to_consolidation_sessions(&source_window.sessions));
+                    let prompt = build_consolidation_prompt(&to_consolidation_sessions(
+                        &source_window.sessions,
+                    ));
                     let raw_body = collect_stream_text(ctx.provider.clone(), model, prompt).await?;
                     normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS)
                 }
@@ -533,7 +539,8 @@ async fn build_dream_notebook_body(
             normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS)
         }
         DreamGenerationMode::Incremental => {
-            let prompt = build_consolidation_prompt(&to_consolidation_sessions(&source_window.sessions));
+            let prompt =
+                build_consolidation_prompt(&to_consolidation_sessions(&source_window.sessions));
             let raw_body = collect_stream_text(ctx.provider.clone(), model, prompt).await?;
             normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS)
         }
@@ -586,7 +593,8 @@ async fn run_auto_dream_once_for_scope(
     let durable_memory_index =
         read_durable_memory_index_for_scope(memory, scope, project_key).await?;
     let last_full_rebuild_at = existing.as_deref().and_then(parse_last_full_rebuild_at);
-    let force_full_rebuild = should_force_full_rebuild(last_full_rebuild_at, now, DREAM_FULL_REBUILD_INTERVAL_SECS);
+    let force_full_rebuild =
+        should_force_full_rebuild(last_full_rebuild_at, now, DREAM_FULL_REBUILD_INTERVAL_SECS);
     let since = if force_full_rebuild {
         now - chrono::Duration::days(30)
     } else {
@@ -1683,7 +1691,8 @@ Model: gpt-5-mini
 ```
 "#;
 
-        let normalized = normalize_dream_notebook_body(raw, DREAM_MAX_SUMMARY_CHARS).expect("normalization should succeed");
+        let normalized = normalize_dream_notebook_body(raw, DREAM_MAX_SUMMARY_CHARS)
+            .expect("normalization should succeed");
         assert!(!normalized.contains("```md"));
         assert!(!normalized.contains("# Bamboo Dream Notebook"));
         assert!(normalized.contains("## Current durable context"));

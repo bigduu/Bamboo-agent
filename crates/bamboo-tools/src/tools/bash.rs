@@ -1,10 +1,10 @@
+use async_trait::async_trait;
 use bamboo_agent_core::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use bamboo_infrastructure::{
     build_command_environment, decode_process_line_lossy, hide_window_for_tokio_command,
     preferred_bash_shell, render_command_line, trace_windows_command,
     windows_command_trace_enabled, PreparedCommandEnvironment,
 };
-use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
@@ -684,7 +684,8 @@ mod tests {
             .unwrap();
 
         let payload: Value = serde_json::from_str(&result.result).unwrap();
-        let expected = bamboo_infrastructure::paths::path_to_display_string(&nested.canonicalize().unwrap());
+        let expected =
+            bamboo_infrastructure::paths::path_to_display_string(&nested.canonicalize().unwrap());
         assert_eq!(payload["cwd"].as_str().unwrap_or_default(), expected);
     }
 

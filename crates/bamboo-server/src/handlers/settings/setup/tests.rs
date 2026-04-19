@@ -1,5 +1,5 @@
-use bamboo_infrastructure::Config;
 use crate::error::AppError;
+use bamboo_infrastructure::Config;
 
 use super::{
     status::build_setup_status,

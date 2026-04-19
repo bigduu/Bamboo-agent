@@ -1,7 +1,7 @@
-use bamboo_domain::{TaskPhase, TaskPriority};
+use async_trait::async_trait;
 use bamboo_agent_core::{Tool, ToolError, ToolResult};
 use bamboo_domain::{TaskItem, TaskItemStatus, TaskList};
-use async_trait::async_trait;
+use bamboo_domain::{TaskPhase, TaskPriority};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;

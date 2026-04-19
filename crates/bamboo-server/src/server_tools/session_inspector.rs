@@ -3,11 +3,11 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-use bamboo_infrastructure::{SessionIndexEntry, SessionStoreV2};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
-use bamboo_agent_core::{Message, Role, SessionKind};
 use bamboo_agent_core::MessagePart;
+use bamboo_agent_core::{Message, Role, SessionKind};
+use bamboo_infrastructure::{SessionIndexEntry, SessionStoreV2};
 
 /// Server-only tool for inspecting V2 sessions stored under the Bamboo home dir.
 ///

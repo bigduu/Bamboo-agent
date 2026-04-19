@@ -21,7 +21,9 @@ impl TokenUsage {
     /// Accumulate another usage snapshot into this one.
     pub fn add_assign(&mut self, other: TokenUsage) {
         self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
-        self.completion_tokens = self.completion_tokens.saturating_add(other.completion_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
     }
 

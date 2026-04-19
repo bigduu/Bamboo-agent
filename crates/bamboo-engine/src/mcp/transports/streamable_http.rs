@@ -434,10 +434,7 @@ mod tests {
         let transport = StreamableHttpTransport::new(config);
         let headers = transport.build_headers(false).unwrap();
 
-        assert_eq!(
-            headers.get(reqwest::header::ACCEPT).unwrap(),
-            ACCEPT_HEADER
-        );
+        assert_eq!(headers.get(reqwest::header::ACCEPT).unwrap(), ACCEPT_HEADER);
         assert_eq!(
             headers.get(reqwest::header::CONTENT_TYPE).unwrap(),
             "application/json"

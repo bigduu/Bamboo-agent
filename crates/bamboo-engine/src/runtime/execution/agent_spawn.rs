@@ -17,8 +17,8 @@ use bamboo_domain::ReasoningEffort;
 use crate::runtime::config::ImageFallbackConfig;
 use crate::runtime::execution::runner_lifecycle::finalize_runner;
 use crate::runtime::execution::runner_state::AgentRunner;
-use crate::runtime::ExecuteRequest;
 use crate::runtime::Agent;
+use crate::runtime::ExecuteRequest;
 
 const SKILL_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_SKILL_CONTEXT_START -->";
 const TOOL_GUIDE_START_MARKER: &str = "<!-- BAMBOO_TOOL_GUIDE_START -->";
@@ -95,10 +95,10 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             let initial_pinned = session.pinned;
 
             let initial_message = initial_user_message_for_session(&session);
-            let selected_skill_ids = selected_skill_ids
-                .or_else(|| selected_skill_ids_for_session(&session));
-            let selected_skill_mode = selected_skill_mode
-                .or_else(|| selected_skill_mode_for_session(&session));
+            let selected_skill_ids =
+                selected_skill_ids.or_else(|| selected_skill_ids_for_session(&session));
+            let selected_skill_mode =
+                selected_skill_mode.or_else(|| selected_skill_mode_for_session(&session));
 
             tracing::info!(
                 "[{}] Using resolved session model: {}, reasoning_effort={}, reasoning_source={}",

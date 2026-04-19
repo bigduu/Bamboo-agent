@@ -16,10 +16,8 @@ use std::time::Instant;
 
 use tokio::sync::RwLock;
 
-use bamboo_agent_core::{
-    ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult,
-};
 use crate::orchestrator::ToolMutability;
+use bamboo_agent_core::{ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult};
 
 /// The parallel tool call runtime.
 ///
@@ -147,8 +145,8 @@ impl ToolCallRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_agent_core::{FunctionCall, ToolSchema};
     use async_trait::async_trait;
+    use bamboo_agent_core::{FunctionCall, ToolSchema};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 

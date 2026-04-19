@@ -1,7 +1,7 @@
 use tokio::sync::mpsc;
 
-use bamboo_agent_core::AgentEvent;
 use crate::runtime::stream::handler::StreamHandlingOutput;
+use bamboo_agent_core::AgentEvent;
 
 use super::super::token_estimation::estimate_completion_tokens;
 use super::super::update_parsing::{parse_item_updates_from_tool_calls, summarize_updates};

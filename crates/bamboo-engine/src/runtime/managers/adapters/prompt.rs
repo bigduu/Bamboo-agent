@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use bamboo_agent_core::Role;
 use bamboo_agent_core::tools::ToolExecutor;
+use bamboo_agent_core::Role;
 use bamboo_agent_core::Session;
 
 use crate::runtime::config::AgentLoopConfig;

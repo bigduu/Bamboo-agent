@@ -1,6 +1,6 @@
 use super::terminal::terminal_event_for_status;
-use bamboo_agent_core::AgentEvent;
 use crate::app_state::AgentStatus;
+use bamboo_agent_core::AgentEvent;
 
 #[test]
 fn terminal_event_for_cancelled_maps_to_error_event() {

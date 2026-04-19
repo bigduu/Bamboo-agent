@@ -3,9 +3,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
+use bamboo_domain::ReasoningEffort;
 use bamboo_domain::TaskItemStatus;
 use bamboo_infrastructure::{LLMProvider, LLMRequestOptions};
-use bamboo_domain::ReasoningEffort;
 
 use super::super::task_context::TaskLoopContext;
 use super::message_builder::build_task_evaluation_messages;

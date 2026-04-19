@@ -3,9 +3,9 @@ use super::sync_runtime_workspace;
 use bamboo_agent_core::Session;
 
 use crate::session_app::chat::{
-    resolve_base_prompt, resolve_enhance_prompt,
-    resolve_copilot_conclusion_with_options_enhancement,
-    resolve_selected_skill_ids, clear_skill_runtime_state, resolve_workspace_path,
+    clear_skill_runtime_state, resolve_base_prompt,
+    resolve_copilot_conclusion_with_options_enhancement, resolve_enhance_prompt,
+    resolve_selected_skill_ids, resolve_workspace_path,
 };
 
 #[test]
@@ -38,7 +38,10 @@ fn resolve_base_prompt_prefers_request_and_persists_metadata() {
     let base_prompt = resolve_base_prompt(&mut session, Some("request prompt"), "", "fallback");
     assert_eq!(base_prompt, "request prompt");
     assert_eq!(
-        session.metadata.get("base_system_prompt").map(String::as_str),
+        session
+            .metadata
+            .get("base_system_prompt")
+            .map(String::as_str),
         Some("request prompt")
     );
 }
@@ -63,7 +66,10 @@ fn resolve_base_prompt_falls_back_to_existing_system_message_before_global_defau
     let base_prompt = resolve_base_prompt(&mut session, None, "", "global default");
     assert_eq!(base_prompt, "Existing system");
     assert_eq!(
-        session.metadata.get("base_system_prompt").map(String::as_str),
+        session
+            .metadata
+            .get("base_system_prompt")
+            .map(String::as_str),
         Some("Existing system")
     );
 }
@@ -74,7 +80,10 @@ fn resolve_base_prompt_uses_global_default_when_missing_everywhere() {
     let base_prompt = resolve_base_prompt(&mut session, None, "", "global default");
     assert_eq!(base_prompt, "global default");
     assert_eq!(
-        session.metadata.get("base_system_prompt").map(String::as_str),
+        session
+            .metadata
+            .get("base_system_prompt")
+            .map(String::as_str),
         Some("global default")
     );
 }
@@ -156,18 +165,26 @@ fn resolve_copilot_conclusion_with_options_enhancement_enabled_stores_and_clears
 
     resolve_copilot_conclusion_with_options_enhancement(&mut session, Some(true));
     assert_eq!(
-        session.metadata.get("copilot_conclusion_with_options_enhancement_enabled").map(String::as_str),
+        session
+            .metadata
+            .get("copilot_conclusion_with_options_enhancement_enabled")
+            .map(String::as_str),
         Some("true")
     );
 
     resolve_copilot_conclusion_with_options_enhancement(&mut session, Some(false));
     assert_eq!(
-        session.metadata.get("copilot_conclusion_with_options_enhancement_enabled").map(String::as_str),
+        session
+            .metadata
+            .get("copilot_conclusion_with_options_enhancement_enabled")
+            .map(String::as_str),
         Some("false")
     );
 
     resolve_copilot_conclusion_with_options_enhancement(&mut session, None);
-    assert!(!session.metadata.contains_key("copilot_conclusion_with_options_enhancement_enabled"));
+    assert!(!session
+        .metadata
+        .contains_key("copilot_conclusion_with_options_enhancement_enabled"));
 }
 
 #[test]
@@ -175,11 +192,18 @@ fn resolve_selected_skill_ids_prefers_structured_request_and_persists_as_json() 
     let mut session = Session::new("session-1", "model");
     resolve_selected_skill_ids(
         &mut session,
-        Some(&["pdf".to_string(), "skill-creator".to_string(), "pdf".to_string()]),
+        Some(&[
+            "pdf".to_string(),
+            "skill-creator".to_string(),
+            "pdf".to_string(),
+        ]),
         "hello",
     );
 
-    let stored = session.metadata.get("selected_skill_ids").map(String::as_str);
+    let stored = session
+        .metadata
+        .get("selected_skill_ids")
+        .map(String::as_str);
     assert_eq!(stored, Some("[\"pdf\",\"skill-creator\"]"));
 }
 
@@ -192,14 +216,19 @@ fn resolve_selected_skill_ids_falls_back_to_legacy_hint_when_structured_field_ab
         "[User explicitly selected skill: PDF Skill (ID: pdf)]\n\nPlease parse this file",
     );
 
-    let stored = session.metadata.get("selected_skill_ids").map(String::as_str);
+    let stored = session
+        .metadata
+        .get("selected_skill_ids")
+        .map(String::as_str);
     assert_eq!(stored, Some("[\"pdf\"]"));
 }
 
 #[test]
 fn resolve_selected_skill_ids_clears_stale_metadata_when_no_selection_provided() {
     let mut session = Session::new("session-1", "model");
-    session.metadata.insert("selected_skill_ids".to_string(), "[\"pdf\"]".to_string());
+    session
+        .metadata
+        .insert("selected_skill_ids".to_string(), "[\"pdf\"]".to_string());
 
     resolve_selected_skill_ids(&mut session, None, "normal prompt");
     assert!(!session.metadata.contains_key("selected_skill_ids"));
@@ -208,11 +237,21 @@ fn resolve_selected_skill_ids_clears_stale_metadata_when_no_selection_provided()
 #[test]
 fn clear_skill_runtime_state_removes_loaded_skill_markers() {
     let mut session = Session::new("session-1", "model");
-    session.metadata.insert("skill_runtime_loaded_skill_ids".to_string(), r#"["demo"]"#.to_string());
-    session.metadata.insert("skill_runtime_last_loaded_skill_id".to_string(), "demo".to_string());
+    session.metadata.insert(
+        "skill_runtime_loaded_skill_ids".to_string(),
+        r#"["demo"]"#.to_string(),
+    );
+    session.metadata.insert(
+        "skill_runtime_last_loaded_skill_id".to_string(),
+        "demo".to_string(),
+    );
 
     clear_skill_runtime_state(&mut session);
 
-    assert!(!session.metadata.contains_key("skill_runtime_loaded_skill_ids"));
-    assert!(!session.metadata.contains_key("skill_runtime_last_loaded_skill_id"));
+    assert!(!session
+        .metadata
+        .contains_key("skill_runtime_loaded_skill_ids"));
+    assert!(!session
+        .metadata
+        .contains_key("skill_runtime_last_loaded_skill_id"));
 }

@@ -127,10 +127,7 @@ impl Message {
         }
     }
 
-    pub fn user_with_parts(
-        content: impl Into<String>,
-        parts: Vec<MessagePart>,
-    ) -> Self {
+    pub fn user_with_parts(content: impl Into<String>, parts: Vec<MessagePart>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             role: Role::User,
@@ -948,9 +945,10 @@ mod tests {
             token_count: 100,
         });
         session.compression_events = vec![CompressionEvent::new(1, 2, 50.0, 25.0, 10)];
-        session
-            .metadata
-            .insert("responses.previous_response_id".to_string(), "resp-123".to_string());
+        session.metadata.insert(
+            "responses.previous_response_id".to_string(),
+            "resp-123".to_string(),
+        );
         session.add_message(Message::system("hello"));
         session.messages[0].compressed = true;
         session.messages[0].compressed_by_event_id = Some("evt-1".to_string());

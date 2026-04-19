@@ -3,14 +3,14 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-use bamboo_infrastructure::SessionStoreV2;
-use bamboo_agent_core::storage::Storage;
-use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
-use bamboo_agent_core::{Session, SessionKind};
 use crate::handlers::agent::schedules::ScheduleView;
 use crate::schedules::{
     ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore, ScheduleTrigger,
 };
+use bamboo_agent_core::storage::Storage;
+use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_agent_core::{Session, SessionKind};
+use bamboo_infrastructure::SessionStoreV2;
 
 /// One tool for schedule CRUD + actions.
 ///
@@ -427,11 +427,7 @@ impl Tool for ScheduleTasksTool {
                     .await
                     .into_iter()
                     .filter(|e| e.created_by_schedule_id.as_deref() == Some(schedule_id.as_str()))
-                    .map(|e| {
-                        crate::handlers::agent::sessions::SessionSummary::from_entry(
-                            e, false,
-                        )
-                    })
+                    .map(|e| crate::handlers::agent::sessions::SessionSummary::from_entry(e, false))
                     .collect::<Vec<_>>();
 
                 Ok(ToolResult {

@@ -4,7 +4,7 @@
 //! This module provides an adapter that bridges `evaluate(&ToolResult)` to the
 //! domain-layer `evaluate_condition()` function.
 
-pub use bamboo_domain::composition::{Condition, evaluate_condition};
+pub use bamboo_domain::composition::{evaluate_condition, Condition};
 
 use crate::tools::ToolResult;
 

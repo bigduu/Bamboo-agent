@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Role, Session, SessionKind};
 
-use crate::runtime::ExecuteRequest;
 use crate::runtime::Agent;
+use crate::runtime::ExecuteRequest;
 
 use super::event_forwarder::create_event_forwarder;
 use super::runner_lifecycle::{finalize_runner, try_reserve_runner};
@@ -85,7 +85,12 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
     };
 
     // Load child session.
-    let mut session = match ctx.agent.storage().load_session(&job.child_session_id).await {
+    let mut session = match ctx
+        .agent
+        .storage()
+        .load_session(&job.child_session_id)
+        .await
+    {
         Ok(Some(s)) => s,
         Ok(None) => return Err(emit_error_completion("child session not found".to_string())),
         Err(e) => {

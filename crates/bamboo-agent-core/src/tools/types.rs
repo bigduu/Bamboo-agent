@@ -4,5 +4,5 @@
 //! ToolResult, ToolSchema, and FunctionSchema are re-exported from bamboo-domain-tool.
 
 // Re-exported from domain crate
-pub use bamboo_domain::tool_types::*;
 pub use bamboo_domain::session::tool_types::{FunctionCall, ToolCall};
+pub use bamboo_domain::tool_types::*;

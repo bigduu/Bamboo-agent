@@ -1,7 +1,7 @@
 use actix_web::web;
 
-use bamboo_infrastructure::api::models::ChatCompletionRequest;
 use crate::{app_state::AppState, error::AppError};
+use bamboo_infrastructure::api::models::ChatCompletionRequest;
 
 use super::PreparedChatRequest;
 use crate::handlers::openai::{
@@ -32,9 +32,7 @@ pub(super) async fn prepare_chat_request(
     )
     .await
     .map_err(|error| match error {
-        crate::message_hooks::HookError::Unsupported(message) => {
-            AppError::BadRequest(message)
-        }
+        crate::message_hooks::HookError::Unsupported(message) => AppError::BadRequest(message),
         crate::message_hooks::HookError::InvalidConfig(message) => {
             AppError::InternalError(anyhow::anyhow!(message))
         }

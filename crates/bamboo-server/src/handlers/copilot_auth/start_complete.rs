@@ -3,8 +3,8 @@ use std::time::Duration;
 use actix_web::{web, HttpResponse};
 use tokio::time::timeout;
 
-use bamboo_infrastructure::providers::copilot::auth::DeviceCodeResponse;
 use crate::{app_state::AppState, error::AppError};
+use bamboo_infrastructure::providers::copilot::auth::DeviceCodeResponse;
 
 use super::{
     client::build_auth_handler,

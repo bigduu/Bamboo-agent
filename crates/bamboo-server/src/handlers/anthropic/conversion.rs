@@ -1,3 +1,4 @@
+use crate::error::AppError;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::Message;
 use bamboo_infrastructure::api::models::{
@@ -12,7 +13,6 @@ use bamboo_infrastructure::providers::anthropic::{
     },
     conversion::{self as anthropic_conversion},
 };
-use crate::error::AppError;
 
 use super::errors::{map_conversion_error, AnthropicError};
 

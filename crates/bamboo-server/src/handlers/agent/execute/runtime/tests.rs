@@ -1,16 +1,14 @@
-use bamboo_agent_core::{AgentEvent, Message, Session};
 use crate::app_state::AgentStatus;
+use bamboo_agent_core::{AgentEvent, Message, Session};
 
-use bamboo_engine::execution::agent_spawn::{
-    preserve_concurrent_session_overrides, terminal_error_event_for_result,
-};
 use crate::session_app::execute::{
     consume_pending_conclusion_with_options_resume, has_pending_user_message,
 };
-
-use super::session_state::{
-    selected_skill_ids_for_session, selected_skill_mode_for_session,
+use bamboo_engine::execution::agent_spawn::{
+    preserve_concurrent_session_overrides, terminal_error_event_for_result,
 };
+
+use super::session_state::{selected_skill_ids_for_session, selected_skill_mode_for_session};
 use crate::app_state::runner_lifecycle::status_from_execution_result;
 
 #[test]

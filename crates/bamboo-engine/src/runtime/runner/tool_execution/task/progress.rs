@@ -1,9 +1,9 @@
 use tokio::sync::mpsc;
 
+use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{ToolCall, ToolResult};
 use bamboo_agent_core::AgentEvent;
 use bamboo_domain::TaskItemStatus;
-use crate::runtime::task_context::TaskLoopContext;
 
 pub(super) async fn track_task_progress(
     task_context: &mut Option<TaskLoopContext>,

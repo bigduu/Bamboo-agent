@@ -205,7 +205,10 @@ mod comprehensive_config_tests {
 
         let config = Config::new();
         assert_eq!(config.provider, "from_custom_dir");
-        assert_eq!(bamboo_infrastructure::paths::resolve_bamboo_dir(), temp.path);
+        assert_eq!(
+            bamboo_infrastructure::paths::resolve_bamboo_dir(),
+            temp.path
+        );
     }
 
     // === 2) Config File Loading and Saving ===

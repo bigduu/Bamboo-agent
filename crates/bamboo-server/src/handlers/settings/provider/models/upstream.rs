@@ -1,8 +1,8 @@
 use serde_json::Value;
 
+use crate::error::AppError;
 use bamboo_infrastructure::providers::common::request_overrides;
 use bamboo_infrastructure::RequestOverridesConfig;
-use crate::error::AppError;
 
 pub(super) async fn fetch_models_from_api(
     client: &reqwest::Client,

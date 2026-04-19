@@ -1,6 +1,6 @@
 use bamboo_agent_core::storage::AttachmentReader;
-use bamboo_agent_core::MessagePart;
 use bamboo_agent_core::ImageOcrResult;
+use bamboo_agent_core::MessagePart;
 
 pub(super) async fn rewrite_parts_to_ocr_text(
     attachment_reader: Option<&dyn AttachmentReader>,

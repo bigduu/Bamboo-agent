@@ -9,11 +9,7 @@ use crate::runtime::config::AgentLoopConfig;
 pub trait MemoryManager: Send + Sync {
     /// Recall relevant memories for the current context.
     /// Returns `true` if any memories were injected.
-    async fn recall_memories(
-        &self,
-        session: &mut Session,
-        config: &AgentLoopConfig,
-    ) -> bool;
+    async fn recall_memories(&self, session: &mut Session, config: &AgentLoopConfig) -> bool;
 
     /// Check if compression should be applied and apply it.
     /// Returns `true` if compression was performed.

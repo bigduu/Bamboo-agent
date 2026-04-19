@@ -186,8 +186,8 @@ fn serialize_config_for_cli(
 #[cfg(test)]
 mod tests {
     use super::serialize_config_for_cli;
-    use bamboo_infrastructure::config::{Config, OpenAIConfig, ProviderConfigs, ProxyAuth};
     use bamboo_engine::{McpServerConfig, StdioConfig, TransportConfig};
+    use bamboo_infrastructure::config::{Config, OpenAIConfig, ProviderConfigs, ProxyAuth};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
 

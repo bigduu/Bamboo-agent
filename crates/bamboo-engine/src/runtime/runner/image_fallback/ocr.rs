@@ -1,6 +1,6 @@
 use bamboo_agent_core::storage::AttachmentReader;
-use bamboo_agent_core::{ImageOcrResult, Session};
 use bamboo_agent_core::MessagePart;
+use bamboo_agent_core::{ImageOcrResult, Session};
 
 mod cache;
 #[cfg(windows)]

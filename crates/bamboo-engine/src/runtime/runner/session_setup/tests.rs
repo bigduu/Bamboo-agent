@@ -148,10 +148,7 @@ fn resolve_available_tool_schemas_includes_activated_discoverable_tools() {
         schemas: vec![schema("Read"), schema("Sleep"), schema("scheduler")],
     };
     let mut session = Session::new("session-1", "model");
-    bamboo_tools::exposure::activate_discoverable_tools(
-        &mut session,
-        ["Sleep", "scheduler"],
-    );
+    bamboo_tools::exposure::activate_discoverable_tools(&mut session, ["Sleep", "scheduler"]);
 
     let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
     let names: Vec<&str> = resolved

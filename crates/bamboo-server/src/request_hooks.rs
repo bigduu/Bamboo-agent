@@ -4,7 +4,9 @@
 //! internal message format. They allow us to inspect and rewrite requests (e.g. image
 //! fallback handling) in a single, easy-to-extend place.
 
-use bamboo_infrastructure::api::models::{ChatCompletionRequest, ChatMessage, Content, ContentPart};
+use bamboo_infrastructure::api::models::{
+    ChatCompletionRequest, ChatMessage, Content, ContentPart,
+};
 use bamboo_infrastructure::Config;
 
 #[derive(Debug, thiserror::Error)]

@@ -7,15 +7,13 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
 
+use bamboo_engine::access_control::{self, SkillAccessError, SkillSessionPort};
 use bamboo_engine::resource_helpers::{
     display_relative_path, list_skill_resource_paths, normalize_relative_resource_path,
     page_text_lines, truncate_text,
 };
-use bamboo_engine::SkillManager;
-use bamboo_engine::access_control::{
-    self, SkillAccessError, SkillSessionPort,
-};
 use bamboo_engine::runtime_metadata::LAST_RESOURCE_READ_SUMMARY_METADATA_KEY;
+use bamboo_engine::SkillManager;
 use bamboo_infrastructure::Config;
 
 use bamboo_agent_core::storage::Storage;
@@ -100,8 +98,7 @@ impl SkillSessionPort for SkillToolAccess {
                 .map_err(|e| e.to_string())?;
         }
 
-        let mut session = session
-            .ok_or_else(|| format!("Session '{session_id}' not found"))?;
+        let mut session = session.ok_or_else(|| format!("Session '{session_id}' not found"))?;
 
         for (key, value) in updates {
             if let Some(val) = value {
@@ -206,8 +203,7 @@ impl Tool for LoadSkillTool {
         access_control::ensure_skill_allowed(&self.access, skill_id, ctx.session_id)
             .await
             .map_err(skill_access_error_to_tool_error)?;
-        let skill_mode =
-            access_control::selected_skill_mode(&self.access, ctx.session_id).await;
+        let skill_mode = access_control::selected_skill_mode(&self.access, ctx.session_id).await;
 
         let skill = self
             .access
@@ -339,8 +335,7 @@ impl Tool for ReadSkillResourceTool {
         access_control::ensure_skill_loaded(&self.access, skill_id, ctx.session_id)
             .await
             .map_err(skill_access_error_to_tool_error)?;
-        let skill_mode =
-            access_control::selected_skill_mode(&self.access, ctx.session_id).await;
+        let skill_mode = access_control::selected_skill_mode(&self.access, ctx.session_id).await;
 
         let resource_path = normalize_relative_resource_path(&parsed.resource_path)
             .map_err(ToolError::InvalidArguments)?;
@@ -455,9 +450,7 @@ impl Tool for ReadSkillResourceTool {
 #[cfg(test)]
 mod tests {
     use super::{LoadSkillTool, ReadSkillResourceTool};
-    use bamboo_engine::access_control::{
-        parse_loaded_skill_ids, serialize_loaded_skill_ids,
-    };
+    use bamboo_engine::access_control::{parse_loaded_skill_ids, serialize_loaded_skill_ids};
     use bamboo_engine::runtime_metadata::{
         LAST_LOADED_SKILL_SUMMARY_METADATA_KEY, LAST_RESOURCE_READ_SUMMARY_METADATA_KEY,
     };
@@ -492,10 +485,7 @@ mod tests {
         ids.insert("skill-b".to_string());
         ids.insert("skill-a".to_string());
 
-        assert_eq!(
-            serialize_loaded_skill_ids(&ids),
-            r#"["skill-a","skill-b"]"#
-        );
+        assert_eq!(serialize_loaded_skill_ids(&ids), r#"["skill-a","skill-b"]"#);
     }
 
     #[derive(Default)]

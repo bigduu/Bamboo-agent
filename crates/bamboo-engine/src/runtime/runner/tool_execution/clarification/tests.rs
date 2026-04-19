@@ -1,9 +1,9 @@
 use tokio::sync::mpsc;
 
 use super::maybe_handle_user_question_tool;
+use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolResult};
 use bamboo_agent_core::{AgentEvent, Role, Session};
-use crate::runtime::config::AgentLoopConfig;
 
 #[tokio::test]
 async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events() {

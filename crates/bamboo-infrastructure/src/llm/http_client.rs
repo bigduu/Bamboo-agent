@@ -3,8 +3,8 @@
 //! We centralize proxy handling here so all code paths (server handlers,
 //! provider factory, auth flows) consistently respect `Config` proxy settings.
 
-use crate::llm::provider::LLMError;
 use crate::config::Config;
+use crate::llm::provider::LLMError;
 use reqwest::{Client, NoProxy, Proxy};
 
 pub fn build_proxy(config: &Config) -> Result<Option<Proxy>, LLMError> {

@@ -2,9 +2,7 @@ use actix_web::{web, HttpResponse};
 use chrono::{DateTime, Utc};
 
 use crate::app_state::AppState;
-use crate::handlers::agent::schedules::types::{
-    CreateScheduleRequest, PatchScheduleRequest,
-};
+use crate::handlers::agent::schedules::types::{CreateScheduleRequest, PatchScheduleRequest};
 use crate::model_config_helper::get_default_model_from_config;
 use crate::schedules::{MisFirePolicy, OverlapPolicy, ScheduleRunConfig, ScheduleTrigger};
 

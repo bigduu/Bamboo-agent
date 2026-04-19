@@ -2,8 +2,8 @@ use crate::session_app::session_create::{
     build_new_session, resolve_model, resolve_reasoning_effort, CreateSessionConfig,
     CreateSessionInput,
 };
-use bamboo_infrastructure::{Config, ProviderConfigs};
 use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_infrastructure::{Config, ProviderConfigs};
 
 const BUILTIN_FALLBACK: &str = crate::app_state::DEFAULT_BASE_PROMPT;
 
@@ -26,11 +26,11 @@ fn model_from_request_uses_provider_default_when_absent_or_blank() {
         .get_model()
         .expect("provider default model should exist");
 
+    assert_eq!(resolve_model(None, config.get_model().as_deref()), expected);
     assert_eq!(
-        resolve_model(None, config.get_model().as_deref()),
+        resolve_model(Some("   "), config.get_model().as_deref()),
         expected
     );
-    assert_eq!(resolve_model(Some("   "), config.get_model().as_deref()), expected);
 }
 
 #[test]

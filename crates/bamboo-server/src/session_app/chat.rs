@@ -1,12 +1,10 @@
 //! Chat use case: prepare a chat turn for execution.
 
 use bamboo_agent_core::{Role, Session};
-use bamboo_engine::context::{
-    build_env_prompt_context, build_workspace_prompt_context,
-};
+use bamboo_domain::Message;
+use bamboo_engine::context::{build_env_prompt_context, build_workspace_prompt_context};
 use bamboo_engine::runner::refresh_prompt_snapshot;
 use bamboo_engine::selection::normalize_selected_skill_ids;
-use bamboo_domain::Message;
 use bamboo_infrastructure::paths::path_to_display_string;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -43,9 +41,7 @@ pub async fn prepare_chat_turn(
     global_default_prompt: &str,
     builtin_fallback_prompt: &str,
 ) -> Result<Session, ChatError> {
-    let mut session = repo
-        .load_or_create(&input.session_id, &input.model)
-        .await?;
+    let mut session = repo.load_or_create(&input.session_id, &input.model).await?;
 
     // ---- Resolve base prompt ----
     let base_prompt = resolve_base_prompt(
@@ -72,7 +68,11 @@ pub async fn prepare_chat_turn(
     );
 
     // ---- Resolve selected skill IDs ----
-    resolve_selected_skill_ids(&mut session, input.selected_skill_ids.as_deref(), &input.message);
+    resolve_selected_skill_ids(
+        &mut session,
+        input.selected_skill_ids.as_deref(),
+        &input.message,
+    );
 
     // ---- Clear skill runtime state ----
     session.metadata.remove(SKILL_RUNTIME_LOADED_KEY);
@@ -103,9 +103,7 @@ pub async fn prepare_chat_turn(
     session
         .messages
         .retain(|message| !matches!(message.role, Role::System));
-    session
-        .messages
-        .insert(0, Message::system(system_prompt));
+    session.messages.insert(0, Message::system(system_prompt));
     refresh_prompt_snapshot(&mut session);
 
     // ---- Persist model ----

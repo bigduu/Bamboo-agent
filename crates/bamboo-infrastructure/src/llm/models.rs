@@ -306,9 +306,7 @@ impl From<bamboo_domain::MessagePart> for ContentPart {
     fn from(part: bamboo_domain::MessagePart) -> Self {
         match part {
             bamboo_domain::MessagePart::Text { text } => ContentPart::Text { text },
-            bamboo_domain::MessagePart::ImageUrl {
-                image_url: url_ref,
-            } => ContentPart::ImageUrl {
+            bamboo_domain::MessagePart::ImageUrl { image_url: url_ref } => ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: url_ref.url,
                     detail: url_ref.detail,

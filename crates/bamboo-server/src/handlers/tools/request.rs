@@ -1,5 +1,5 @@
-use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 use crate::error::AppError;
+use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 use bamboo_tools::normalize_tool_ref;
 use serde_json::Value;
 

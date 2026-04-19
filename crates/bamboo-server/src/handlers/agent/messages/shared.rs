@@ -1,8 +1,8 @@
 use actix_web::{error::ErrorInternalServerError, web, HttpResponse, Result};
 use chrono::Utc;
 
-use bamboo_agent_core::Session;
 use crate::app_state::{AgentStatus, AppState};
+use bamboo_agent_core::Session;
 
 pub(super) async fn ensure_session_not_running(
     state: &web::Data<AppState>,

@@ -3,9 +3,9 @@ use serde_json::json;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 
+use bamboo_agent_core::{ToolError, ToolResult};
 use bamboo_memory::memory::DEFAULT_TOPIC;
 use bamboo_memory::memory_store::{count_chars, truncate_chars, MemoryStore};
-use bamboo_agent_core::{ToolError, ToolResult};
 
 pub const MAX_SESSION_NOTE_CHARS: usize = 12_000;
 

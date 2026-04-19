@@ -1,5 +1,5 @@
-use bamboo_agent_core::Session;
 use crate::runtime::config::AgentLoopConfig;
+use bamboo_agent_core::Session;
 
 pub(crate) async fn compact_oversized_tool_messages(
     session: &mut Session,

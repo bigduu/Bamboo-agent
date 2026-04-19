@@ -55,9 +55,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-use bamboo_domain::tool_names::normalize_tool_ref;
 use crate::keyword_masking::KeywordMaskingConfig;
 use crate::model_mapping::{AnthropicModelMapping, GeminiModelMapping};
+use bamboo_domain::tool_names::normalize_tool_ref;
 use bamboo_domain::ReasoningEffort;
 
 /// A user-managed environment variable that is injected into Bash tool processes.
@@ -1364,7 +1364,8 @@ impl Config {
                             Ok(value) => header.value = value,
                             Err(e) => {
                                 tracing::warn!(
-                                    "Failed to decrypt MCP StreamableHTTP header value: {}", e
+                                    "Failed to decrypt MCP StreamableHTTP header value: {}",
+                                    e
                                 )
                             }
                         }
@@ -1380,10 +1381,9 @@ impl Config {
                 bamboo_domain::mcp_config::TransportConfig::Stdio(stdio) => {
                     stdio.env_encrypted.clear();
                     for (key, value) in &stdio.env {
-                        let encrypted =
-                            crate::encryption::encrypt(value).with_context(|| {
-                                format!("Failed to encrypt MCP stdio env var '{key}'")
-                            })?;
+                        let encrypted = crate::encryption::encrypt(value).with_context(|| {
+                            format!("Failed to encrypt MCP stdio env var '{key}'")
+                        })?;
                         stdio.env_encrypted.insert(key.clone(), encrypted);
                     }
                 }
@@ -1393,16 +1393,9 @@ impl Config {
                         header.value_encrypted = if !configured {
                             None
                         } else {
-                            Some(
-                                crate::encryption::encrypt(&header.value).with_context(
-                                    || {
-                                        format!(
-                                            "Failed to encrypt MCP SSE header '{}'",
-                                            header.name
-                                        )
-                                    },
-                                )?,
-                            )
+                            Some(crate::encryption::encrypt(&header.value).with_context(|| {
+                                format!("Failed to encrypt MCP SSE header '{}'", header.name)
+                            })?)
                         };
                     }
                 }
@@ -1412,16 +1405,12 @@ impl Config {
                         header.value_encrypted = if !configured {
                             None
                         } else {
-                            Some(
-                                crate::encryption::encrypt(&header.value).with_context(
-                                    || {
-                                        format!(
-                                            "Failed to encrypt MCP StreamableHTTP header '{}'",
-                                            header.name
-                                        )
-                                    },
-                                )?,
-                            )
+                            Some(crate::encryption::encrypt(&header.value).with_context(|| {
+                                format!(
+                                    "Failed to encrypt MCP StreamableHTTP header '{}'",
+                                    header.name
+                                )
+                            })?)
                         };
                     }
                 }
@@ -2353,15 +2342,17 @@ mod tests {
                 id: "sse-secret".to_string(),
                 name: None,
                 enabled: true,
-                transport: bamboo_domain::mcp_config::TransportConfig::Sse(bamboo_domain::mcp_config::SseConfig {
-                    url: "http://localhost:8080/sse".to_string(),
-                    headers: vec![bamboo_domain::mcp_config::HeaderConfig {
-                        name: "Authorization".to_string(),
-                        value: "Bearer token123".to_string(),
-                        value_encrypted: None,
-                    }],
-                    connect_timeout_ms: 5000,
-                }),
+                transport: bamboo_domain::mcp_config::TransportConfig::Sse(
+                    bamboo_domain::mcp_config::SseConfig {
+                        url: "http://localhost:8080/sse".to_string(),
+                        headers: vec![bamboo_domain::mcp_config::HeaderConfig {
+                            name: "Authorization".to_string(),
+                            value: "Bearer token123".to_string(),
+                            value_encrypted: None,
+                        }],
+                        connect_timeout_ms: 5000,
+                    },
+                ),
                 request_timeout_ms: 5000,
                 healthcheck_interval_ms: 1000,
                 reconnect: bamboo_domain::mcp_config::ReconnectConfig::default(),

@@ -15,8 +15,8 @@ fn evaluate_client_sync_adapter(
         client_pending_question_tool_call_id: cs.client_pending_question_tool_call_id.clone(),
     });
 
-    crate::session_app::execute::evaluate_client_sync(crate_sync.as_ref(), server_snapshot)
-        .map(|reason| match reason {
+    crate::session_app::execute::evaluate_client_sync(crate_sync.as_ref(), server_snapshot).map(
+        |reason| match reason {
             crate::session_app::types::ExecuteSyncReason::PendingQuestionMismatch => {
                 ExecuteSyncReason::PendingQuestionMismatch
             }
@@ -26,7 +26,8 @@ fn evaluate_client_sync_adapter(
             crate::session_app::types::ExecuteSyncReason::LastMessageIdMismatch => {
                 ExecuteSyncReason::LastMessageIdMismatch
             }
-        })
+        },
+    )
 }
 
 #[test]

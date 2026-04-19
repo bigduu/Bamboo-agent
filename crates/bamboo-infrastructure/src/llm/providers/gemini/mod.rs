@@ -11,15 +11,15 @@ use reqwest::{
 };
 use serde_json::json;
 
-use bamboo_domain::{Message};
-use bamboo_domain::{ToolSchema};
+use crate::config::RequestOverridesConfig;
 use crate::llm::protocol::gemini::GeminiRequest;
 use crate::llm::protocol::ToProvider;
 use crate::llm::provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, Result};
 use crate::llm::providers::common::request_overrides;
 use crate::llm::types::LLMChunk;
-use crate::config::RequestOverridesConfig;
+use bamboo_domain::Message;
 use bamboo_domain::ReasoningEffort;
+use bamboo_domain::ToolSchema;
 
 /// Google Gemini API provider.
 pub struct GeminiProvider {

@@ -1,5 +1,5 @@
-use bamboo_infrastructure::Config;
 use crate::{app_state::AppState, error::AppError};
+use bamboo_infrastructure::Config;
 use serde_json::Value;
 
 use super::upstream::fetch_models_from_api;

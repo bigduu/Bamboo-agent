@@ -1,5 +1,5 @@
-use bamboo_engine::SkillFilter;
 use actix_web::{web, HttpResponse};
+use bamboo_engine::SkillFilter;
 
 use crate::app_state::AppState;
 use crate::error::AppError;

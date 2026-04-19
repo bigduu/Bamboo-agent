@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
+use crate::metrics::MetricsCollector;
+use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_infrastructure::LLMProvider;
-use crate::runtime::config::AgentLoopConfig;
-use crate::runtime::task_context::TaskLoopContext;
-use crate::metrics::MetricsCollector;
 
 use super::round_lifecycle::RoundLlmExecutionOutput;
 

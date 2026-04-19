@@ -2,9 +2,9 @@
 
 use std::collections::BTreeSet;
 
-use bamboo_engine::ImageFallbackConfig;
-use bamboo_domain::Session;
 use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_domain::Session;
+use bamboo_engine::ImageFallbackConfig;
 
 /// Resolved configuration snapshot for execution.
 ///

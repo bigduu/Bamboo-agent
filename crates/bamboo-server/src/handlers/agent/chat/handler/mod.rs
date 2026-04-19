@@ -14,9 +14,7 @@ fn sync_runtime_workspace(session_id: &str, workspace_path: Option<&str>) {
         .map(std::path::PathBuf::from)
         .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)))
         .filter(|path| path.is_dir());
-    let _ = bamboo_tools::tools::workspace_state::ensure_session_workspace(
-        session_id, preferred,
-    );
+    let _ = bamboo_tools::tools::workspace_state::ensure_session_workspace(session_id, preferred);
 }
 
 #[cfg(test)]
@@ -67,9 +65,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     // Sync runtime workspace early so the directory exists before prompt building.
     sync_runtime_workspace(
         &session_id,
-        workspace_path
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
+        workspace_path.map(str::trim).filter(|s| !s.is_empty()),
     );
 
     let input = crate::session_app::types::ChatTurnInput {
@@ -77,10 +73,12 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         model: model.clone(),
         message: req.message.clone(),
         system_prompt: request::optional_non_empty(req.system_prompt.as_deref()).map(String::from),
-        enhance_prompt: request::optional_non_empty(req.enhance_prompt.as_deref()).map(String::from),
+        enhance_prompt: request::optional_non_empty(req.enhance_prompt.as_deref())
+            .map(String::from),
         workspace_path: workspace_path.map(String::from),
         selected_skill_ids: req.selected_skill_ids.clone(),
-        copilot_conclusion_with_options_enhancement_enabled: req.copilot_conclusion_with_options_enhancement_enabled,
+        copilot_conclusion_with_options_enhancement_enabled: req
+            .copilot_conclusion_with_options_enhancement_enabled,
         data_dir,
     };
 

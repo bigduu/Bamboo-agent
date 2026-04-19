@@ -1,6 +1,6 @@
-use bamboo_tools::BuiltinToolExecutor;
 use crate::{app_state::AppState, error::AppError};
 use actix_web::{body::to_bytes, http::StatusCode, web};
+use bamboo_tools::BuiltinToolExecutor;
 
 use super::tools::{resolve_session_identifier, select_tools_by_allowlist, to_openai_tools};
 use super::types::FilteredToolsQuery;

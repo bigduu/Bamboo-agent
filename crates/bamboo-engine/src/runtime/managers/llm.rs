@@ -1,7 +1,7 @@
+use crate::metrics::TokenUsage;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
-use crate::metrics::TokenUsage;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 

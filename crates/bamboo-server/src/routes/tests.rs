@@ -3,8 +3,8 @@ use actix_web::{test, web, App};
 use tempfile::tempdir;
 
 use super::{configure_routes, configure_routes_with_rate_limiting};
-use bamboo_infrastructure::AccessControlConfig;
 use crate::AppState;
+use bamboo_infrastructure::AccessControlConfig;
 
 #[actix_web::test]
 async fn configure_routes_registers_expected_api_prefixes() {

@@ -3,12 +3,12 @@
 //! Implements the hybrid context preparation algorithm that enforces token
 //! budgets while preserving tool-call chain atomicity.
 
-use bamboo_agent_core::{Role, Session};
 use crate::counter::TokenCounter;
 use crate::segmenter::{MessageSegment, MessageSegmenter};
 use crate::types::{
     BudgetError, BudgetStrategy, PreparedContext, TokenBudget, TokenUsageBreakdown,
 };
+use bamboo_agent_core::{Role, Session};
 use std::collections::{HashMap, HashSet};
 
 const PROMPT_CACHE_MAX_MIN_TOOL_OUTPUT_CHARS: usize = 200_000;
@@ -55,11 +55,10 @@ pub fn prepare_hybrid_context(
     counter: &dyn TokenCounter,
 ) -> Result<PreparedContext, BudgetError> {
     let segmenter = MessageSegmenter::new();
-    let summary_message = session.conversation_summary.as_ref().map(|summary| {
-        crate::compression_tooling::compression_summary_message(
-            &summary.content,
-        )
-    });
+    let summary_message = session
+        .conversation_summary
+        .as_ref()
+        .map(|summary| crate::compression_tooling::compression_summary_message(&summary.content));
     let summary_tokens = summary_message
         .as_ref()
         .map(|message| counter.count_messages(std::slice::from_ref(message)))
@@ -689,10 +688,10 @@ fn segment_contains_skill_tool_chain(segment: &MessageSegment) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_agent_core::{ConversationSummary, Message, Role};
     use crate::compression_summary_message;
     use crate::counter::TiktokenTokenCounter;
     use crate::counter::TokenCounter;
+    use bamboo_agent_core::{ConversationSummary, Message, Role};
     use bamboo_agent_core::{FunctionCall, ToolCall};
     use std::collections::HashMap;
 
@@ -1065,7 +1064,10 @@ mod tests {
         let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
 
         // The large message should be skipped, small message should be included
-        let has_large_message = prepared.messages.iter().any(|m| m.content.contains("sentence number"));
+        let has_large_message = prepared
+            .messages
+            .iter()
+            .any(|m| m.content.contains("sentence number"));
         let has_small_message = prepared
             .messages
             .iter()

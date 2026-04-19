@@ -1,7 +1,7 @@
+use crate::runtime::config::PromptMemoryFlags;
 use bamboo_agent_core::{
     parse_prompt_external_memory_sections, PromptMemoryObservability, Role, Session,
 };
-use crate::runtime::config::PromptMemoryFlags;
 
 use super::super::prompt_context::{
     inject_external_memory_into_system_message, inject_task_list_into_system_message,
@@ -141,9 +141,7 @@ fn persist_round_prompt_metadata(session: &mut Session, prompt: &str) {
 fn build_round_prompt_sections(
     prompt: &str,
 ) -> Vec<crate::runtime::runner::session_setup::prompt_setup::PromptSection> {
-    use crate::runtime::runner::session_setup::prompt_setup::{
-        PromptLayer, PromptSection,
-    };
+    use crate::runtime::runner::session_setup::prompt_setup::{PromptLayer, PromptSection};
 
     let external_memory = extract_wrapped_section(
         prompt,

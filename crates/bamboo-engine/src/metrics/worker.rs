@@ -313,9 +313,7 @@ mod tests {
         let db_path = dir.path().join("metrics.db");
         // Keep temp dir alive for the test
         std::mem::forget(dir);
-        let storage = Arc::new(crate::metrics::storage::SqliteMetricsStorage::new(
-            &db_path,
-        ));
+        let storage = Arc::new(crate::metrics::storage::SqliteMetricsStorage::new(&db_path));
         storage.init().await.expect("init storage");
         (storage, db_path)
     }

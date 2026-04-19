@@ -10,16 +10,16 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 
+use crate::app_state::session_events::get_or_create_event_sender;
+use crate::app_state::{AgentRunner, AgentStatus};
 use crate::session_app::child_session::{
     ChildSessionEntry, ChildSessionError, ChildSessionPort, DeleteChildResult,
 };
-use bamboo_infrastructure::{SessionIndexEntry, SessionStoreV2};
+use crate::spawn_scheduler::{SpawnJob, SpawnScheduler};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolError;
 use bamboo_agent_core::{AgentEvent, Session, SessionKind};
-use crate::app_state::session_events::get_or_create_event_sender;
-use crate::app_state::{AgentRunner, AgentStatus};
-use crate::spawn_scheduler::{SpawnJob, SpawnScheduler};
+use bamboo_infrastructure::{SessionIndexEntry, SessionStoreV2};
 
 /// Server-side adapter that bridges domain `ChildSessionPort` to infrastructure.
 ///
@@ -265,9 +265,7 @@ impl ChildSessionPort for ChildSessionAdapter {
 /// Map a `ChildSessionError` to a server `ToolError`.
 pub fn tool_error_from_child_session(error: ChildSessionError) -> ToolError {
     match error {
-        ChildSessionError::NotFound(id) => {
-            ToolError::Execution(format!("session not found: {id}"))
-        }
+        ChildSessionError::NotFound(id) => ToolError::Execution(format!("session not found: {id}")),
         ChildSessionError::NotRootSession(id) => {
             ToolError::Execution(format!("session is not a root session: {id}"))
         }

@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 use crate::app_state::AppState;
 use crate::tools::ToolSurface;
 
-use bamboo_engine::ImageFallbackConfig;
 use bamboo_engine::execution::agent_spawn::SessionExecutionArgs;
+use bamboo_engine::ImageFallbackConfig;
 
 use super::session_state;
 
@@ -34,9 +34,7 @@ pub(crate) struct SpawnAgentExecution {
     pub(crate) image_fallback: Option<ImageFallbackConfig>,
 }
 
-pub(crate) fn spawn_agent_execution(
-    args: SpawnAgentExecution,
-) {
+pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
     let tools_override = if args.is_child_session {
         Some(args.state.tools_for(ToolSurface::Child))
     } else {

@@ -1,16 +1,16 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use bamboo_compression::TokenBudget;
+use crate::metrics::MetricsCollector;
+use crate::skills::SkillManager;
 use bamboo_agent_core::composition::CompositionExecutor;
 use bamboo_agent_core::storage::AttachmentReader;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolSchema;
-use crate::metrics::MetricsCollector;
-use crate::skills::SkillManager;
-use bamboo_tools::ToolRegistry;
-use bamboo_infrastructure::MemoryConfig;
+use bamboo_compression::TokenBudget;
 use bamboo_domain::ReasoningEffort;
+use bamboo_infrastructure::MemoryConfig;
+use bamboo_tools::ToolRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFallbackMode {

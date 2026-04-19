@@ -114,7 +114,11 @@ impl AppState {
             sessions.get(session_id).cloned()
         };
 
-        let storage_session = self.storage.load_session(session_id).await.unwrap_or_default();
+        let storage_session = self
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap_or_default();
 
         match (memory_session, storage_session) {
             (Some(memory), Some(storage)) => {
@@ -140,11 +144,7 @@ impl AppState {
     /// Persist session to storage and update the in-memory cache.
     pub async fn save_and_cache_session(&self, session: &bamboo_agent_core::Session) {
         if let Err(error) = self.storage.save_session(session).await {
-            tracing::warn!(
-                "[{}] Failed to save session: {}",
-                session.id,
-                error
-            );
+            tracing::warn!("[{}] Failed to save session: {}", session.id, error);
         }
         let mut sessions = self.sessions.write().await;
         sessions.insert(session.id.clone(), session.clone());

@@ -69,7 +69,7 @@ fn write_builtin_skills_embed(manifest_dir: &Path, out_dir: &Path) -> io::Result
             relative = relative_unix
         )?;
     }
-    writeln!(file, "];" )?;
+    writeln!(file, "];")?;
 
     Ok(())
 }

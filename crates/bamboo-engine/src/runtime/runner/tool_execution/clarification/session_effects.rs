@@ -1,8 +1,8 @@
 use tokio::sync::mpsc;
 
+use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::ToolCall;
 use bamboo_agent_core::{AgentEvent, Session};
-use crate::runtime::config::AgentLoopConfig;
 
 use super::payload::UserQuestionPayload;
 
