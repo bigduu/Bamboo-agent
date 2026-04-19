@@ -529,6 +529,7 @@ impl MemoryStore {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn write_memory(
         &self,
         scope: MemoryScope,
@@ -893,6 +894,7 @@ impl MemoryStore {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn merge_memory(
         &self,
         id: &str,

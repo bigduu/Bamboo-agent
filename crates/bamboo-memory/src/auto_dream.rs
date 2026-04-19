@@ -625,7 +625,7 @@ async fn collect_candidate_sessions(
 ) -> Vec<(SessionIndexEntry, Option<String>)> {
     let mut items = ctx.session_store.list_index_entries().await;
     items.retain(|entry| session_is_candidate(entry, since));
-    items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    items.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
 
     let mut seen_roots = HashSet::new();
     let mut out = Vec::new();
