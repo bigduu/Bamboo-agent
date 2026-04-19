@@ -327,13 +327,13 @@ pub(crate) async fn execute_round_tool_calls(
             let batch_timeout = std::time::Duration::from_secs(config.parallel_batch_timeout_secs);
             let outcomes = tokio::time::timeout(
                 batch_timeout,
-                join_all(batch.iter().map(|batch_call| {
-                    let per_tool_timeout = per_tool_timeout;
+                join_all(batch.iter().map(|tool_call| {
+                    let timeout = per_tool_timeout;
                     async move {
                         tokio::time::timeout(
-                            per_tool_timeout,
+                            timeout,
                             per_call::execute_tool_call_only(per_call::ToolExecutionOnlyContext {
-                                tool_call: batch_call,
+                                tool_call,
                                 event_tx,
                                 metrics_collector,
                                 session_id,
@@ -348,9 +348,9 @@ pub(crate) async fn execute_round_tool_calls(
                             per_call::ToolExecutionOutcome {
                                 result: Err(format!(
                                     "Tool '{}' timed out after {:?}",
-                                    batch_call.function.name, per_tool_timeout
+                                    tool_call.function.name, timeout
                                 )),
-                                tool_duration: per_tool_timeout,
+                                tool_duration: timeout,
                             }
                         })
                     }
@@ -366,7 +366,7 @@ pub(crate) async fn execute_round_tool_calls(
                 );
                 batch
                     .iter()
-                    .map(|batch_call| per_call::ToolExecutionOutcome {
+                    .map(|_batch_call| per_call::ToolExecutionOutcome {
                         result: Err(format!(
                             "Parallel batch timed out after {:?}",
                             batch_timeout
@@ -400,7 +400,7 @@ pub(crate) async fn execute_round_tool_calls(
             );
 
             // Compress all outcomes in parallel before applying sequentially.
-            let compressed: Vec<_> = join_all(batch.iter().zip(outcomes.into_iter()).map(
+            let compressed: Vec<_> = join_all(batch.iter().zip(outcomes).map(
                 |(batch_call, outcome)| {
                     let tool_name = batch_call.function.name.clone();
                     let args = batch_call.function.arguments.clone();
@@ -412,7 +412,7 @@ pub(crate) async fn execute_round_tool_calls(
             ))
             .await;
 
-            for (batch_call, outcome) in batch.iter().zip(compressed.into_iter()) {
+            for (batch_call, outcome) in batch.iter().zip(compressed) {
                 policy_guard.observe_outcome(batch_call, &outcome.result);
 
                 let should_break = per_call::apply_tool_execution_outcome(
