@@ -2,32 +2,9 @@ use std::sync::Arc;
 
 use bamboo_agent_core::tools::{handle_tool_result_with_agentic_support, ToolHandlingOutcome};
 use bamboo_agent_core::AgentEvent;
-use bamboo_tools::exposure::activate_discoverable_tools;
 
 use super::super::{clarification, events, task, tool_error_collector};
 use super::{workspace, SuccessPathContext};
-
-fn maybe_activate_discoverable_tools_from_tool_search(
-    session: &mut bamboo_agent_core::Session,
-    tool_name: &str,
-    result: &bamboo_agent_core::tools::ToolResult,
-) {
-    if !result.success || !tool_name.eq_ignore_ascii_case("tool_search") {
-        return;
-    }
-
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&result.result) else {
-        return;
-    };
-    let Some(results) = value.get("results").and_then(serde_json::Value::as_array) else {
-        return;
-    };
-
-    let tool_names = results
-        .iter()
-        .filter_map(|item| item.get("name").and_then(serde_json::Value::as_str));
-    activate_discoverable_tools(session, tool_names);
-}
 
 pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -> bool {
     task::track_task_progress(
@@ -106,12 +83,6 @@ pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -
             "duration_ms": ctx.tool_duration.as_millis(),
             "success": ctx.result.success,
         })
-    );
-
-    maybe_activate_discoverable_tools_from_tool_search(
-        ctx.session,
-        &ctx.tool_call.function.name,
-        ctx.result,
     );
 
     let outcome = handle_tool_result_with_agentic_support(

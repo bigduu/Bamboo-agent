@@ -323,18 +323,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_orchestrator_auto_approves_tool_search() {
-        let executor: Arc<dyn ToolExecutor> = Arc::new(BuiltinToolExecutor::new());
-        let orch = ToolOrchestrator::new();
-        let call = make_call("tool_search", json!({"query": "read"}));
-        let ctx = ToolExecutionContext::none("test");
-
-        let result = orch.run(&call, &executor, ctx).await;
-        assert!(result.result.is_ok());
-        assert!(result.auto_approved);
-    }
-
-    #[tokio::test]
     async fn test_orchestrator_workspace_set_is_not_auto_approved() {
         let executor: Arc<dyn ToolExecutor> = Arc::new(BuiltinToolExecutor::new());
         let orch = ToolOrchestrator::new();

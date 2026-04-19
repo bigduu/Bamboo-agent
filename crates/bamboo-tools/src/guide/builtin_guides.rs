@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 20] = [
     "conclusion_with_options",
     "Bash",
     "BashOutput",
@@ -23,7 +23,6 @@ pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
     "request_permissions",
     "Sleep",
     "Task",
-    "tool_search",
     "WebFetch",
     "WebSearch",
     "Workspace",
@@ -254,18 +253,6 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Plan complete",
                 json!({"plan":"1. Do A\n2. Do B"}),
                 "Use after producing a concrete implementation plan.",
-            )],
-        )),
-        "tool_search" => Some(guide(
-            "tool_search",
-            ToolCategory::TaskManagement,
-            "Search for available tools by keyword query. Returns the most relevant tools ranked by BM25 relevance.",
-            "Do not use when you already know the exact tool name. Use for discovery only.",
-            &["load_skill"],
-            vec![example(
-                "Find file editing tools",
-                json!({"query":"edit file content"}),
-                "Use when unsure which tool handles a task.",
             )],
         )),
         // FileExists guide moved next to GetFileInfo (see below).

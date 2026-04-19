@@ -378,20 +378,28 @@ async fn rerank_candidate_ids(
         .await
         .map_err(|error| format!("rerank provider call failed: {error}"))?;
 
-    let mut content = String::new();
-    while let Some(chunk_result) = stream.next().await {
-        match chunk_result {
-            Ok(LLMChunk::Token(text)) => content.push_str(&text),
-            Ok(LLMChunk::Done) => break,
-            Ok(_) => {}
-            Err(error) => {
-                if !content.trim().is_empty() {
-                    break;
+    let content = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        async {
+            let mut content = String::new();
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(LLMChunk::Token(text)) => content.push_str(&text),
+                    Ok(LLMChunk::Done) => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        if !content.trim().is_empty() {
+                            break;
+                        }
+                        return Err(format!("rerank stream failed: {error}"));
+                    }
                 }
-                return Err(format!("rerank stream failed: {error}"));
             }
-        }
-    }
+            Ok(content)
+        },
+    )
+    .await
+    .unwrap_or_else(|_| Err("rerank timed out after 30s".to_string()))?;
 
     parse_reranked_ids(&content, candidates)
         .ok_or_else(|| format!("failed to parse rerank response: {}", content.trim()))

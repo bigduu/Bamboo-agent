@@ -189,6 +189,18 @@ pub(super) struct ToolPolicyGuard {
 }
 
 impl ToolPolicyGuard {
+    pub(super) fn new(
+        max_tool_calls_per_round: usize,
+        max_consecutive_failures_per_tool: usize,
+    ) -> Self {
+        Self {
+            max_tool_calls_per_round,
+            max_consecutive_failures_per_tool,
+            executed_calls: 0,
+            consecutive_failures: HashMap::new(),
+        }
+    }
+
     pub(super) fn check_before_execution(
         &self,
         tool_call: &ToolCall,
@@ -255,12 +267,7 @@ impl ToolPolicyGuard {
 
 impl Default for ToolPolicyGuard {
     fn default() -> Self {
-        Self {
-            max_tool_calls_per_round: MAX_TOOL_CALLS_PER_ROUND,
-            max_consecutive_failures_per_tool: MAX_CONSECUTIVE_FAILURES_PER_TOOL,
-            executed_calls: 0,
-            consecutive_failures: HashMap::new(),
-        }
+        Self::new(MAX_TOOL_CALLS_PER_ROUND, MAX_CONSECUTIVE_FAILURES_PER_TOOL)
     }
 }
 

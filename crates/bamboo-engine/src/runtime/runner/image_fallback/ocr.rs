@@ -1,10 +1,13 @@
 use bamboo_agent_core::storage::AttachmentReader;
 use bamboo_agent_core::{ImageOcrResult, Session};
-use bamboo_infrastructure::models::ContentPart;
+use bamboo_agent_core::MessagePart;
 
 mod cache;
+#[cfg(windows)]
 mod line_extraction;
+#[cfg(windows)]
 mod reader;
+#[cfg(windows)]
 mod rewrite;
 
 pub(super) async fn ensure_session_image_ocr_cached(
@@ -14,9 +17,10 @@ pub(super) async fn ensure_session_image_ocr_cached(
     cache::ensure_session_image_ocr_cached(session, attachment_reader).await
 }
 
+#[cfg(windows)]
 pub(super) async fn rewrite_parts_to_ocr_text(
     attachment_reader: Option<&dyn AttachmentReader>,
-    parts: &[ContentPart],
+    parts: &[MessagePart],
     cached: Option<&[ImageOcrResult]>,
 ) -> std::result::Result<String, String> {
     rewrite::rewrite_parts_to_ocr_text(attachment_reader, parts, cached).await

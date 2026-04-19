@@ -555,10 +555,6 @@ impl EnhancedPromptBuilder {
         for guide in sorted {
             output.push_str(&format!("- `{}`: {}\n", guide.tool_name, guide.when_to_use));
         }
-        output.push_str(&format!(
-            "Use `tool_search` {}\n",
-            discoverable_tools_call_to_action(context.language)
-        ));
         output
     }
 
@@ -654,14 +650,6 @@ fn discoverable_tools_description(language: GuideLanguage) -> &'static str {
         GuideLanguage::English => {
             "These lower-frequency tools are available but not fully expanded by default to save context."
         }
-    }
-}
-
-/// Returns the discoverable-tools call to action in the appropriate language
-fn discoverable_tools_call_to_action(language: GuideLanguage) -> &'static str {
-    match language {
-        GuideLanguage::Chinese => "to discover and choose the right one when needed.",
-        GuideLanguage::English => "to discover and choose the right one when needed.",
     }
 }
 
@@ -843,7 +831,6 @@ mod tests {
 
         assert!(prompt.contains("### Discoverable Tools"));
         assert!(prompt.contains("`Sleep`"));
-        assert!(prompt.contains("Use `tool_search`"));
         assert!(!prompt.contains("**Sleep**"));
     }
 

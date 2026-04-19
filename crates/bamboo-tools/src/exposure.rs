@@ -30,7 +30,8 @@ pub fn exposure_for_tool_name(name: &str) -> ToolExposure {
         | "scheduler"
         | "SubSession"
         | "sub_session_manager"
-        | "recall" => ToolExposure::Discoverable,
+        | "recall"
+        | "ExitPlanMode" => ToolExposure::Discoverable,
         _ => ToolExposure::Core,
     }
 }

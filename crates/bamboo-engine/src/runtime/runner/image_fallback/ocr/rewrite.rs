@@ -1,10 +1,10 @@
 use bamboo_agent_core::storage::AttachmentReader;
+use bamboo_agent_core::MessagePart;
 use bamboo_agent_core::ImageOcrResult;
-use bamboo_infrastructure::models::ContentPart;
 
 pub(super) async fn rewrite_parts_to_ocr_text(
     attachment_reader: Option<&dyn AttachmentReader>,
-    parts: &[ContentPart],
+    parts: &[MessagePart],
     cached: Option<&[ImageOcrResult]>,
 ) -> std::result::Result<String, String> {
     const OCR_COORDINATE_GUIDANCE: &str = "Coordinate format: (x,y,w,h) in pixels relative to the image top-left corner. Use spatial relationships (left/right/above/below/overlap) between boxes when interpreting the content.";
@@ -14,8 +14,8 @@ pub(super) async fn rewrite_parts_to_ocr_text(
 
     for part in parts {
         match part {
-            ContentPart::Text { text } => out.push_str(text),
-            ContentPart::ImageUrl { image_url } => {
+            MessagePart::Text { text } => out.push_str(text),
+            MessagePart::ImageUrl { image_url } => {
                 image_index += 1;
                 let summary = super::super::placeholder::summarize_image_url(&image_url.url);
 

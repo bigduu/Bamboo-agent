@@ -283,7 +283,10 @@ pub(super) async fn run_rounds(
 
         let Some(round_flow_outcome) = round_flow_outcome else {
             let error =
-                bamboo_agent_core::AgentError::LLM("round completed without outcome".to_string());
+                bamboo_agent_core::AgentError::LLM(format!(
+                    "[{}] round {} completed without outcome",
+                    state.session_id, round + 1
+                ));
             record_round_failure(
                 state.metrics_collector.as_ref(),
                 &round_id,

@@ -116,6 +116,16 @@ pub struct AgentLoopConfig {
     pub image_fallback: Option<ImageFallbackConfig>,
     /// Feature flags controlling prompt-time memory injection behavior.
     pub prompt_memory_flags: PromptMemoryFlags,
+    /// Maximum tool calls allowed per round (default: 80).
+    pub max_tool_calls_per_round: usize,
+    /// Maximum consecutive failures per tool before circuit breaker (default: 3).
+    pub max_consecutive_failures_per_tool: usize,
+    /// Tool names that require strict argument validation.
+    pub strict_argument_tool_names: Vec<String>,
+    /// Per-tool execution timeout in seconds (default: 120).
+    pub per_tool_timeout_secs: u64,
+    /// Parallel batch execution timeout in seconds (default: 300).
+    pub parallel_batch_timeout_secs: u64,
 }
 
 impl Default for AgentLoopConfig {
@@ -143,6 +153,23 @@ impl Default for AgentLoopConfig {
             token_budget: None,
             image_fallback: None,
             prompt_memory_flags: PromptMemoryFlags::default(),
+            max_tool_calls_per_round: 80,
+            max_consecutive_failures_per_tool: 3,
+            strict_argument_tool_names: vec![
+                "Write".into(),
+                "Edit".into(),
+                "NotebookEdit".into(),
+                "apply_patch".into(),
+                "Bash".into(),
+                "Task".into(),
+                "SubSession".into(),
+                "scheduler".into(),
+                "sub_session_manager".into(),
+                "session_note".into(),
+                "memory_note".into(),
+            ],
+            per_tool_timeout_secs: 120,
+            parallel_batch_timeout_secs: 300,
         }
     }
 }

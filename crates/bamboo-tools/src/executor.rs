@@ -12,7 +12,7 @@ use crate::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::tools::{
     BashOutputTool, BashTool, ConclusionWithOptionsTool, EditTool, ExitPlanModeTool,
     GetFileInfoTool, GlobTool, GrepTool, JsReplTool, KillShellTool, NotebookEditTool, ReadTool,
-    RequestPermissionsTool, SessionNoteTool, SleepTool, TaskTool, ToolRegistry, ToolSearchTool,
+    RequestPermissionsTool, SessionNoteTool, SleepTool, TaskTool, ToolRegistry,
     WebFetchTool, WebSearchTool, WorkspaceTool, WriteTool,
 };
 use bamboo_infrastructure::Config;
@@ -178,7 +178,6 @@ impl BuiltinToolExecutor {
         let _ = registry.register(RequestPermissionsTool::new());
         let _ = registry.register(SleepTool::new());
         let _ = registry.register(TaskTool::new());
-        let _ = registry.register(ToolSearchTool::new());
         let _ = registry.register(WebFetchTool::new());
         let _ = registry.register(WebSearchTool::new());
         // NOTE: GetCurrentDir + SetWorkspace are now aliases for Workspace.
@@ -619,18 +618,6 @@ mod tests {
         let result = executor.execute(&call).await.unwrap();
         assert!(result.success);
         assert!(result.result.contains("canonical-list.txt"));
-    }
-
-    #[test]
-    fn test_executor_marks_tool_search_as_readonly() {
-        let executor = BuiltinToolExecutor::new();
-        let call = make_tool_call("tool_search", json!({"query": "read file"}));
-
-        assert_eq!(
-            executor.call_mutability(&call),
-            crate::ToolMutability::ReadOnly
-        );
-        assert!(executor.call_concurrency_safe(&call));
     }
 
     #[test]

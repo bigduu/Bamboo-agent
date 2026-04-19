@@ -210,17 +210,25 @@ pub(crate) async fn execute_round_tool_calls(
     tool_schemas: &[ToolSchema],
 ) -> Result<RoundToolExecutionResult, AgentError> {
     let mut state = RoundExecutionState::default();
-    let mut policy_guard = policy::ToolPolicyGuard::default();
+    let mut policy_guard = policy::ToolPolicyGuard::new(
+        config.max_tool_calls_per_round,
+        config.max_consecutive_failures_per_tool,
+    );
+
+    // Pre-classify all tool calls to avoid repeated normalization.
+    let scheduling_modes: Vec<ToolSchedulingMode> = tool_calls
+        .iter()
+        .map(|tc| scheduling_mode_for_tool_call(tc, tools))
+        .collect();
 
     let mut next_index = 0usize;
     'tool_calls: while next_index < tool_calls.len() {
         let tool_call = &tool_calls[next_index];
 
-        if scheduling_mode_for_tool_call(tool_call, tools) == ToolSchedulingMode::ParallelSafe {
+        if scheduling_modes[next_index] == ToolSchedulingMode::ParallelSafe {
             let batch_start = next_index;
             while next_index < tool_calls.len()
-                && scheduling_mode_for_tool_call(&tool_calls[next_index], tools)
-                    == ToolSchedulingMode::ParallelSafe
+                && scheduling_modes[next_index] == ToolSchedulingMode::ParallelSafe
             {
                 next_index += 1;
             }
@@ -315,19 +323,54 @@ pub(crate) async fn execute_round_tool_calls(
             );
 
             let parallel_start = std::time::Instant::now();
-            let outcomes = join_all(batch.iter().map(|batch_call| {
-                per_call::execute_tool_call_only(per_call::ToolExecutionOnlyContext {
-                    tool_call: batch_call,
-                    event_tx,
-                    metrics_collector,
-                    session_id,
-                    round_id,
-                    round,
-                    tools,
-                    config,
-                })
-            }))
-            .await;
+            let per_tool_timeout = std::time::Duration::from_secs(config.per_tool_timeout_secs);
+            let batch_timeout = std::time::Duration::from_secs(config.parallel_batch_timeout_secs);
+            let outcomes = tokio::time::timeout(
+                batch_timeout,
+                join_all(batch.iter().map(|batch_call| {
+                    let per_tool_timeout = per_tool_timeout;
+                    async move {
+                        tokio::time::timeout(
+                            per_tool_timeout,
+                            per_call::execute_tool_call_only(per_call::ToolExecutionOnlyContext {
+                                tool_call: batch_call,
+                                event_tx,
+                                metrics_collector,
+                                session_id,
+                                round_id,
+                                round,
+                                tools,
+                                config,
+                            }),
+                        )
+                        .await
+                        .unwrap_or_else(|_| per_call::ToolExecutionOutcome {
+                            result: Err(format!(
+                                "Tool '{}' timed out after {:?}",
+                                batch_call.function.name, per_tool_timeout
+                            )),
+                            tool_duration: per_tool_timeout,
+                        })
+                    }
+                })),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    "[{}][round:{}] Parallel batch timed out after {:?}",
+                    session_id, round, batch_timeout
+                );
+                batch
+                    .iter()
+                    .map(|batch_call| per_call::ToolExecutionOutcome {
+                        result: Err(format!(
+                            "Parallel batch timed out after {:?}",
+                            batch_timeout
+                        )),
+                        tool_duration: batch_timeout,
+                    })
+                    .collect::<Vec<_>>()
+            });
             let parallel_elapsed = parallel_start.elapsed();
 
             // Log individual tool durations to confirm parallelism
@@ -352,17 +395,24 @@ pub(crate) async fn execute_round_tool_calls(
                 individual_durations.join(", ")
             );
 
-            for (batch_call, mut outcome) in batch.iter().zip(outcomes.into_iter()) {
-                policy_guard.observe_outcome(batch_call, &outcome.result);
+            // Compress all outcomes in parallel before applying sequentially.
+            let compressed: Vec<_> = join_all(
+                batch
+                    .iter()
+                    .zip(outcomes.into_iter())
+                    .map(|(batch_call, outcome)| {
+                        let tool_name = batch_call.function.name.clone();
+                        let args = batch_call.function.arguments.clone();
+                        let sid = session_id.to_string();
+                        async move {
+                            output_compressor::maybe_compress(&tool_name, &args, &sid, outcome).await
+                        }
+                    }),
+            )
+            .await;
 
-                // Compress tool output before applying
-                outcome = output_compressor::maybe_compress(
-                    &batch_call.function.name,
-                    &batch_call.function.arguments,
-                    session_id,
-                    outcome,
-                )
-                .await;
+            for (batch_call, outcome) in batch.iter().zip(compressed.into_iter()) {
+                policy_guard.observe_outcome(batch_call, &outcome.result);
 
                 let should_break = per_call::apply_tool_execution_outcome(
                     per_call::ToolExecutionApplyContext {
@@ -491,7 +541,6 @@ mod tests {
             "WebSearch",
             "Workspace",
             "BashOutput",
-            "tool_search",
             "recall",
             "Sleep",
         ];

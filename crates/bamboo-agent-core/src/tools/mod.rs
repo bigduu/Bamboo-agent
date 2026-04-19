@@ -134,7 +134,6 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "WebSearch",
     "Workspace",
     "BashOutput",
-    "tool_search",
     "session_note",
     "memory_note",
     "recall",

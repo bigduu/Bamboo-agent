@@ -123,7 +123,12 @@ pub(super) async fn execute_tool_call_only(
     emitter.set_auto_approved(!is_mutating);
     let begin_event = emitter.begin().clone();
     // Push lifecycle "begin" through the AgentEvent channel for UI visibility
-    let _ = ctx.event_tx.send(begin_event.into_agent_event()).await;
+    if let Err(e) = ctx.event_tx.send(begin_event.into_agent_event()).await {
+        tracing::warn!(
+            "[{}] tool lifecycle begin event send failed: {}",
+            ctx.session_id, e
+        );
+    }
 
     let tool_timer = std::time::Instant::now();
     let available_tool_schemas = ctx.tools.list_tools();
@@ -151,7 +156,12 @@ pub(super) async fn execute_tool_call_only(
             .clone(),
         Err(err) => emitter.error(format!("{}", err)).clone(),
     };
-    let _ = ctx.event_tx.send(end_event.into_agent_event()).await;
+    if let Err(e) = ctx.event_tx.send(end_event.into_agent_event()).await {
+        tracing::warn!(
+            "[{}] tool lifecycle end event send failed: {}",
+            ctx.session_id, e
+        );
+    }
 
     tracing::trace!(
         "[{}][round:{}] ToolEmitter: call_id={}, tool={}, events={}",
@@ -172,16 +182,6 @@ pub(super) async fn apply_tool_execution_outcome(
     ctx: ToolExecutionApplyContext<'_>,
     outcome: ToolExecutionOutcome,
 ) -> bool {
-    // ── Output compression pipeline ────────────────────────────────────
-    // Compress the tool result before it enters the session message list.
-    let outcome = super::output_compressor::maybe_compress(
-        &ctx.tool_call.function.name,
-        &ctx.tool_call.function.arguments,
-        ctx.session_id,
-        outcome,
-    )
-    .await;
-
     // Capture tool lifecycle metadata before the borrow-splitting match.
     let tool_name_for_meta = ctx.tool_call.function.name.clone();
     let tool_call_id_for_meta = ctx.tool_call.id.clone();

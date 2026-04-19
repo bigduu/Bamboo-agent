@@ -106,9 +106,10 @@ impl ModelLimit {
             .unwrap_or_else(|| (self.max_context_tokens / 4).min(4096))
     }
 
-    /// Get safety margin with default.
+    /// Get safety margin, scaling proportionally with context window.
     pub fn get_safety_margin(&self) -> u32 {
-        self.safety_margin.unwrap_or(DEFAULT_SAFETY_MARGIN)
+        self.safety_margin
+            .unwrap_or_else(|| (self.max_context_tokens / 100).max(DEFAULT_SAFETY_MARGIN))
     }
 }
 
@@ -331,7 +332,7 @@ pub fn create_budget_for_model(
         strategy,
         safety_margin: limit.get_safety_margin(),
         compression_trigger_percent: 85,
-        compression_target_percent: 40,
+        compression_target_percent: 65,
         prompt_cache_min_tool_output_chars: 1_200,
         prompt_cache_head_chars: 280,
         prompt_cache_tail_chars: 180,
@@ -480,5 +481,25 @@ mod tests {
 
         let error = load_model_limits_from_unified_config(&config).expect_err("should error");
         assert!(error.contains("expected array"));
+    }
+
+    #[test]
+    fn safety_margin_scales_with_context_window() {
+        // Small context → floor at DEFAULT_SAFETY_MARGIN (1000)
+        let small = ModelLimit::new("test", 8_192);
+        assert_eq!(small.get_safety_margin(), 1000);
+
+        // Medium context → proportional
+        let medium = ModelLimit::new("test", 200_000);
+        assert_eq!(medium.get_safety_margin(), 2000);
+
+        // Large context → proportional
+        let large = ModelLimit::new("test", 1_050_000);
+        assert_eq!(large.get_safety_margin(), 10_500);
+
+        // Explicit override takes precedence
+        let mut custom = ModelLimit::new("test", 200_000);
+        custom.safety_margin = Some(500);
+        assert_eq!(custom.get_safety_margin(), 500);
     }
 }
