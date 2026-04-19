@@ -41,10 +41,11 @@ pub enum AgentHookPoint {
 }
 
 /// Result of running a hook.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum HookResult {
     /// Continue with normal flow (no modifications).
+    #[default]
     Continue,
     /// State was mutated; downstream should re-read.
     Mutated,
@@ -52,12 +53,6 @@ pub enum HookResult {
     Suspend { reason: String },
     /// Abort the agent run.
     Abort { reason: String },
-}
-
-impl Default for HookResult {
-    fn default() -> Self {
-        Self::Continue
-    }
 }
 
 #[cfg(test)]
