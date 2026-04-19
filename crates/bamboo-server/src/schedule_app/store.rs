@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -420,24 +421,21 @@ fn compute_misfire_dispatch_count(entry: &ScheduleEntry, now: DateTime<Utc>) -> 
     match entry.misfire_policy {
         MisFirePolicy::RunOnce => 1,
         MisFirePolicy::Skip => 0,
-        MisFirePolicy::CatchUpAll => {
-            if interval_seconds == 0 {
-                1
-            } else {
-                (lateness_seconds / interval_seconds).saturating_add(1) as u32
-            }
-        }
+        MisFirePolicy::CatchUpAll => lateness_seconds
+            .checked_div(interval_seconds)
+            .map(|q| q.saturating_add(1) as u32)
+            .unwrap_or(1),
         MisFirePolicy::CatchUpWindow {
             max_catch_up_runs,
             max_lateness_seconds,
         } => {
             if lateness_seconds > max_lateness_seconds {
                 0
-            } else if interval_seconds == 0 {
-                1
             } else {
-                ((lateness_seconds / interval_seconds).saturating_add(1) as u32)
-                    .min(max_catch_up_runs.max(1))
+                lateness_seconds
+                    .checked_div(interval_seconds)
+                    .map(|q| (q.saturating_add(1) as u32).min(max_catch_up_runs.max(1)))
+                    .unwrap_or(1)
             }
         }
     }
@@ -724,7 +722,7 @@ impl ScheduleStore {
     pub async fn list_schedules(&self) -> Vec<ScheduleEntry> {
         let index = self.index.read().await;
         let mut items: Vec<_> = index.schedules.values().cloned().collect();
-        items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        items.sort_by_key(|e| Reverse(e.updated_at));
         items
     }
 
@@ -746,7 +744,7 @@ impl ScheduleStore {
             .filter(|record| record.schedule_id == schedule_id)
             .cloned()
             .collect::<Vec<_>>();
-        items.sort_by(|a, b| b.claimed_at.cmp(&a.claimed_at));
+        items.sort_by_key(|r| Reverse(r.claimed_at));
         items
     }
 

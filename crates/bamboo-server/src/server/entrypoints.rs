@@ -78,7 +78,7 @@ fn resolve_runtime_static_dir(
 ///
 /// # Arguments
 /// * `bamboo_home_dir` - Bamboo home directory containing all app data (config, sessions, skills, etc.)
-///                       Equivalent to `${HOME}/.bamboo` in standard installations.
+///   Equivalent to `${HOME}/.bamboo` in standard installations.
 /// * `port` - Port to listen on
 pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
     info!("Starting unified server in desktop mode...");
@@ -170,7 +170,7 @@ pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
 ///
 /// # Arguments
 /// * `bamboo_home_dir` - Bamboo home directory containing all app data (config, sessions, skills, etc.)
-///                       Equivalent to `${HOME}/.bamboo` in standard installations.
+///   Equivalent to `${HOME}/.bamboo` in standard installations.
 /// * `port` - Port to listen on
 /// * `bind` - Bind address (127.0.0.1, 0.0.0.0, or custom)
 pub async fn run_with_bind(bamboo_home_dir: PathBuf, port: u16, bind: &str) -> Result<(), String> {
@@ -185,7 +185,7 @@ pub async fn run_with_bind(bamboo_home_dir: PathBuf, port: u16, bind: &str) -> R
 ///
 /// # Arguments
 /// * `bamboo_home_dir` - Bamboo home directory containing all app data (config, sessions, skills, etc.)
-///                       Equivalent to `${HOME}/.bamboo` in standard installations.
+///   Equivalent to `${HOME}/.bamboo` in standard installations.
 /// * `port` - Port to listen on
 /// * `bind` - Bind address (127.0.0.1 for localhost, 0.0.0.0 for all interfaces)
 /// * `static_dir` - Optional directory containing built frontend files

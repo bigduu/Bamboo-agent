@@ -296,7 +296,7 @@ impl ToolRegistry {
             .iter()
             .map(|entry| entry.value().to_schema())
             .collect();
-        tools.sort_by(|left, right| left.function.name.cmp(&right.function.name));
+        tools.sort_by_key(|t| t.function.name.clone());
         tools
     }
 

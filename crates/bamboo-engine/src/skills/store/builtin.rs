@@ -81,7 +81,7 @@ pub fn load_builtin_skill_bundles() -> SkillResult<Vec<BuiltinSkillBundle>> {
         });
     }
 
-    bundles.sort_by(|left, right| left.skill.id.cmp(&right.skill.id));
+    bundles.sort_by_key(|b| b.skill.id.clone());
     Ok(bundles)
 }
 

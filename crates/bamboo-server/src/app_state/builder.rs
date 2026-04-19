@@ -15,13 +15,13 @@ impl AppState {
     /// # Arguments
     ///
     /// * `bamboo_home_dir` - Bamboo home directory containing all application data.
-    ///                        This is the root directory (e.g., `${HOME}/.bamboo`) that contains:
-    ///                        - config.json: Configuration file
-    ///                        - sessions/: Conversation history
-    ///                        - skills/: Skill definitions
-    ///                        - workflows/: Workflow definitions
-    ///                        - cache/: Cached data
-    ///                        - runtime/: Runtime files
+    ///   This is the root directory (e.g., `${HOME}/.bamboo`) that contains:
+    ///   - config.json: Configuration file
+    ///   - sessions/: Conversation history
+    ///   - skills/: Skill definitions
+    ///   - workflows/: Workflow definitions
+    ///   - cache/: Cached data
+    ///   - runtime/: Runtime files
     ///
     /// # Returns
     ///

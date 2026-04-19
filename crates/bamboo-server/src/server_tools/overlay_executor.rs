@@ -64,7 +64,7 @@ impl ToolExecutor for OverlayToolExecutor {
         tools.retain(|t| t.function.name != overlay_name);
         tools.push(overlay_schema);
 
-        tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        tools.sort_by_key(|t| t.function.name.clone());
         tools
     }
 }

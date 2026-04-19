@@ -85,7 +85,7 @@ fn shortlist_skills_for_context(
         .unwrap_or_default();
 
     if hint_tokens.is_empty() {
-        skills.sort_by(|left, right| left.id.cmp(&right.id));
+        skills.sort_by_key(|s| s.id.clone());
         skills.truncate(MAX_UNSELECTED_SKILLS_IN_CONTEXT);
         return skills;
     }
@@ -118,12 +118,12 @@ fn shortlist_skills_for_context(
             .map(|(_, skill)| skill)
             .filter(|skill| !selected_ids.contains(&skill.id))
             .collect();
-        fallback.sort_by(|left, right| left.id.cmp(&right.id));
+        fallback.sort_by_key(|s| s.id.clone());
         let remaining = MAX_UNSELECTED_SKILLS_IN_CONTEXT - selected.len();
         selected.extend(fallback.into_iter().take(remaining));
     }
 
-    selected.sort_by(|left, right| left.id.cmp(&right.id));
+    selected.sort_by_key(|s| s.id.clone());
     selected
 }
 

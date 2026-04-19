@@ -412,7 +412,7 @@ impl EnhancedPromptBuilder {
             }
 
             for guides in grouped.values_mut() {
-                guides.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+                guides.sort_by_key(|g| g.tool_name.clone());
             }
 
             for category in ToolCategory::ordered() {
@@ -529,7 +529,7 @@ impl EnhancedPromptBuilder {
             }
         }
 
-        guides.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+        guides.sort_by_key(|g| g.tool_name.clone());
         guides
     }
 
@@ -543,7 +543,7 @@ impl EnhancedPromptBuilder {
         }
 
         let mut sorted = guides.to_vec();
-        sorted.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+        sorted.sort_by_key(|g| g.tool_name.clone());
 
         let mut output = String::new();
         output.push_str(&format!(
@@ -578,7 +578,7 @@ impl EnhancedPromptBuilder {
         output.push('\n');
 
         let mut sorted = schemas.to_vec();
-        sorted.sort_by(|left, right| left.function.name.cmp(&right.function.name));
+        sorted.sort_by_key(|s| s.function.name.clone());
 
         for schema in sorted {
             output.push_str(&format!(
@@ -705,7 +705,7 @@ mod tests {
         }
 
         for guides in grouped.values_mut() {
-            guides.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+            guides.sort_by_key(|g| g.tool_name.clone());
         }
 
         for category in ToolCategory::ordered() {

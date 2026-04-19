@@ -446,7 +446,7 @@ impl SkillStore {
             .cloned()
             .collect();
 
-        result.sort_by(|left, right| left.name.cmp(&right.name));
+        result.sort_by_key(|s| s.name.clone());
         result
     }
 
@@ -476,7 +476,7 @@ impl SkillStore {
             })
             .cloned()
             .collect();
-        result.sort_by(|left, right| left.name.cmp(&right.name));
+        result.sort_by_key(|s| s.name.clone());
         result
     }
 
@@ -672,7 +672,7 @@ impl SkillStore {
     /// ```
     pub async fn get_all_skills(&self) -> Vec<SkillDefinition> {
         let mut skills: Vec<SkillDefinition> = self.skills.read().await.values().cloned().collect();
-        skills.sort_by(|left, right| left.name.cmp(&right.name));
+        skills.sort_by_key(|s| s.name.clone());
         skills
     }
 

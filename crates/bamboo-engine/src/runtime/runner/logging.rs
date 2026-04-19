@@ -1,13 +1,13 @@
-pub(super) struct DebugLogger {
-    pub(super) enabled: bool,
+pub(crate) struct DebugLogger {
+    pub(crate) enabled: bool,
 }
 
 impl DebugLogger {
-    pub(super) fn new(enabled: bool) -> Self {
+    pub(crate) fn new(enabled: bool) -> Self {
         Self { enabled }
     }
 
-    pub(super) fn log_event(&self, session_id: &str, event_type: &str, details: serde_json::Value) {
+    pub(crate) fn log_event(&self, session_id: &str, event_type: &str, details: serde_json::Value) {
         if !self.enabled {
             return;
         }
