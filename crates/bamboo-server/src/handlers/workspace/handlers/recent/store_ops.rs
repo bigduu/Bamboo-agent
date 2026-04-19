@@ -36,6 +36,6 @@ pub(super) fn upsert_recent_workspace(
 
     store
         .items
-        .sort_by(|left, right| right.last_opened.cmp(&left.last_opened));
+        .sort_by_key(|item| std::cmp::Reverse(item.last_opened));
     store.items.truncate(50);
 }

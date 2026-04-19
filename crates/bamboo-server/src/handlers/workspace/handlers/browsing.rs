@@ -45,7 +45,7 @@ pub async fn browse_folder(
             path: path.to_string_lossy().to_string(),
         });
     }
-    folders.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    folders.sort_by_key(|f| f.name.to_lowercase());
 
     let parent_path = target_path.parent().map(path_to_string);
     Ok(HttpResponse::Ok().json(BrowseFolderResponse {
