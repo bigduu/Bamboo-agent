@@ -400,17 +400,16 @@ pub(crate) async fn execute_round_tool_calls(
             );
 
             // Compress all outcomes in parallel before applying sequentially.
-            let compressed: Vec<_> = join_all(batch.iter().zip(outcomes).map(
-                |(batch_call, outcome)| {
+            let compressed: Vec<_> =
+                join_all(batch.iter().zip(outcomes).map(|(batch_call, outcome)| {
                     let tool_name = batch_call.function.name.clone();
                     let args = batch_call.function.arguments.clone();
                     let sid = session_id.to_string();
                     async move {
                         output_compressor::maybe_compress(&tool_name, &args, &sid, outcome).await
                     }
-                },
-            ))
-            .await;
+                }))
+                .await;
 
             for (batch_call, outcome) in batch.iter().zip(compressed) {
                 policy_guard.observe_outcome(batch_call, &outcome.result);

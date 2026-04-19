@@ -105,7 +105,7 @@ pub(super) fn build_root_tools(
         scheduler: spawn_scheduler,
         sessions_cache: sessions,
         agent_runners: agent_runners.clone(),
-        session_event_senders: session_event_senders,
+        session_event_senders,
     });
 
     // Root sessions can spawn child sessions.

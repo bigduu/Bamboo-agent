@@ -101,6 +101,7 @@ pub async fn handler(
             reasoning_source,
             is_child_session,
         } => {
+            let session = *session;
             // ---- Reserve runner ----
             let session_tx = state.get_session_event_sender(&session_id).await;
             let cancel_token = match reserve_runner(state.get_ref(), &session_id, &session_tx).await

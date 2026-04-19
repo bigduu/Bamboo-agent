@@ -81,7 +81,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-features -- -A deprecated -A clippy::doc_overindented_list_items -A clippy::module_inception -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args -A clippy::too-many-arguments -A clippy::collapsible-match -A clippy::unnecessary-sort-by -A clippy::while-let-loop -A clippy::private-interfaces -A dead-code -D warnings
+        run: cargo clippy --all-features -- -A deprecated -A clippy::doc_overindented_list_items -A clippy::module_inception -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args -A clippy::too-many-arguments -A clippy::collapsible-match -A clippy::unnecessary-sort-by -A clippy::while-let-loop -A private-interfaces -A dead-code -D warnings
 
   build:
     name: Build

@@ -131,7 +131,7 @@ pub async fn prepare_execute(
     consume_pending_conclusion_with_options_resume(&mut session);
 
     Ok(ExecutePreparationOutcome::Ready {
-        session,
+        session: Box::new(session),
         effective_model,
         effective_reasoning_effort,
         model_source,

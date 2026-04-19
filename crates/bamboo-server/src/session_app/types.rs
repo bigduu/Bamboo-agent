@@ -121,7 +121,7 @@ impl ServerExecuteSnapshot {
 pub enum ExecutePreparationOutcome {
     /// Session is ready for agent execution.
     Ready {
-        session: Session,
+        session: Box<Session>,
         effective_model: String,
         effective_reasoning_effort: Option<ReasoningEffort>,
         model_source: &'static str,
