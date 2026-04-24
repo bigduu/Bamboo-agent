@@ -153,6 +153,7 @@ impl MessageSegmenter {
                                 "Incomplete tool chain for tool calls: {:?}",
                                 pending_tool_calls
                             );
+                            pending_tool_calls.clear();
                         }
                         if let Some(seg) = current_segment.take() {
                             segments.push(seg);
@@ -188,6 +189,7 @@ impl MessageSegmenter {
                                     "Tool chain interrupted by assistant message: {:?}",
                                     pending_tool_calls
                                 );
+                                pending_tool_calls.clear();
                             }
                             segments.push(seg);
                         }
@@ -201,6 +203,7 @@ impl MessageSegmenter {
                                     "Tool chain interrupted by new tool call: {:?}",
                                     pending_tool_calls
                                 );
+                                pending_tool_calls.clear();
                             }
                             segments.push(seg);
                         }
@@ -229,6 +232,7 @@ impl MessageSegmenter {
                     "Session ended with incomplete tool chain: {:?}",
                     pending_tool_calls
                 );
+                pending_tool_calls.clear();
             }
             segments.push(seg);
         }
@@ -411,5 +415,111 @@ mod tests {
         let segmenter = MessageSegmenter::new();
         let segments = segmenter.segment(vec![]);
         assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn handles_incomplete_tool_chain_interrupted_by_user() {
+        let segmenter = MessageSegmenter::new();
+        let messages = vec![
+            Message::user("Search for something"),
+            Message::assistant(
+                "Let me search",
+                Some(vec![create_tool_call("call_1", "search", "{}")]),
+            ),
+            // No tool result for call_1 — user sends a follow-up instead
+            Message::user("Actually, never mind"),
+        ];
+
+        let segments = segmenter.segment(messages);
+
+        // Expected: user("Search..."), incomplete tool chain segment, user("Actually...")
+        assert_eq!(segments.len(), 3);
+        assert!(segments[1].is_tool_chain);
+        assert_eq!(segments[1].messages.len(), 1); // only assistant, no result
+        assert_eq!(segments[1].tool_call_ids.len(), 1);
+    }
+
+    #[test]
+    fn handles_tool_chain_interrupted_by_new_tool_call() {
+        let segmenter = MessageSegmenter::new();
+        let messages = vec![
+            Message::user("Task 1"),
+            Message::assistant(
+                "Doing task 1",
+                Some(vec![create_tool_call("call_1", "search", "{}")]),
+            ),
+            // No tool result for call_1 — assistant starts a new tool call
+            Message::assistant(
+                "Let me try a different approach",
+                Some(vec![create_tool_call("call_2", "read", "{}")]),
+            ),
+            Message::tool_result("call_2", "Result 2"),
+        ];
+
+        let segments = segmenter.segment(messages);
+
+        // Expected: user, interrupted segment(call_1), complete tool chain(call_2 + result)
+        assert_eq!(segments.len(), 3);
+        assert!(segments[1].is_tool_chain);
+        assert_eq!(segments[1].messages.len(), 1); // only assistant with call_1
+        assert!(segments[2].is_tool_chain);
+        assert_eq!(segments[2].messages.len(), 2); // assistant with call_2 + result
+    }
+
+    #[test]
+    fn handles_tool_chain_interrupted_by_assistant_text() {
+        let segmenter = MessageSegmenter::new();
+        let messages = vec![
+            Message::user("Search for something"),
+            Message::assistant(
+                "Let me search",
+                Some(vec![create_tool_call("call_1", "search", "{}")]),
+            ),
+            // No tool result — assistant sends plain text instead
+            Message::assistant("I changed my mind", None),
+        ];
+
+        let segments = segmenter.segment(messages);
+
+        assert_eq!(segments.len(), 3);
+        assert!(segments[1].is_tool_chain);
+        assert_eq!(segments[1].messages.len(), 1); // assistant with call_1
+        assert!(!segments[2].is_tool_chain); // plain text assistant
+    }
+
+    #[test]
+    fn pending_tool_calls_cleared_after_interruption() {
+        // This test verifies the fix: after an interruption, pending_tool_calls
+        // is cleared so that subsequent segments don't inherit stale IDs.
+        let segmenter = MessageSegmenter::new();
+        let messages = vec![
+            Message::user("Task 1"),
+            Message::assistant(
+                "Doing task 1",
+                Some(vec![create_tool_call("call_1", "search", "{}")]),
+            ),
+            // Interrupted by user
+            Message::user("Task 2"),
+            // New tool call with a different ID
+            Message::assistant(
+                "Doing task 2",
+                Some(vec![create_tool_call("call_2", "read", "{}")]),
+            ),
+            Message::tool_result("call_2", "Result 2"),
+        ];
+
+        let segments = segmenter.segment(messages);
+
+        assert_eq!(segments.len(), 4);
+        // Segment 1: interrupted call_1 chain
+        assert!(segments[1].is_tool_chain);
+        assert_eq!(segments[1].tool_call_ids.len(), 1);
+        assert!(segments[1].tool_call_ids.contains("call_1"));
+        // Segment 3: complete call_2 chain
+        assert!(segments[3].is_tool_chain);
+        assert_eq!(segments[3].tool_call_ids.len(), 1);
+        assert!(segments[3].tool_call_ids.contains("call_2"));
+        // call_1 should NOT leak into segment 3
+        assert!(!segments[3].tool_call_ids.contains("call_1"));
     }
 }
