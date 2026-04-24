@@ -256,6 +256,8 @@ impl FromProvider<GeminiContent> for Message {
             tool_success: None,
             compressed: false,
             compressed_by_event_id: None,
+            never_compress: false,
+            compression_level: 0,
             created_at: chrono::Utc::now(),
             metadata: None,
         })

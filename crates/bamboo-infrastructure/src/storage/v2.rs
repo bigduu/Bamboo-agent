@@ -22,6 +22,7 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use bamboo_domain::ReasoningEffort;
+use bamboo_domain::ProviderModelRef;
 use bamboo_domain::{Role, Session, SessionKind, TokenBudgetUsage};
 
 use crate::storage::search_index::{should_index_session, SessionSearchIndex};
@@ -56,6 +57,8 @@ pub struct SessionIndexEntry {
     pub spawn_depth: u32,
     #[serde(default)]
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<ProviderModelRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
     /// If the session was created by a schedule, store the schedule id here for fast filtering.
@@ -336,6 +339,7 @@ impl SessionStoreV2 {
                     root_session_id: session.root_session_id.clone(),
                     spawn_depth: session.spawn_depth,
                     model: session.model.clone(),
+                    model_ref: session.model_ref.clone(),
                     reasoning_effort: session.reasoning_effort,
                     created_by_schedule_id,
                     schedule_run_id,

@@ -16,12 +16,15 @@ pub mod keyword_masking;
 pub mod model_mapping;
 pub mod patch;
 pub mod paths;
+pub mod settings;
+pub mod settings_loader;
 
 pub use config::*;
 pub use encryption::*;
 pub use keyword_masking::*;
 pub use model_mapping::*;
 pub use paths::*;
+pub use settings::PermissionMode;
 
 #[cfg(test)]
 pub(crate) mod test_support {

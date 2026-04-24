@@ -6,12 +6,12 @@ use crate::config::paths::bamboo_dir;
 use crate::config::Config;
 use crate::llm::provider::{LLMError, LLMProvider};
 use crate::llm::providers::common::MaskingProviderDecorator;
-use crate::llm::providers::{AnthropicProvider, CopilotProvider, GeminiProvider, OpenAIProvider};
+use crate::llm::providers::{AnthropicProvider, BodhiProvider, CopilotProvider, GeminiProvider, OpenAIProvider};
 use reqwest::Client;
 use std::sync::Arc;
 
 /// Available provider types
-pub const AVAILABLE_PROVIDERS: &[&str] = &["copilot", "openai", "anthropic", "gemini"];
+pub const AVAILABLE_PROVIDERS: &[&str] = &["copilot", "openai", "anthropic", "gemini", "bodhi"];
 
 fn build_http_client(config: &Config) -> Result<Client, LLMError> {
     crate::llm::http_client::build_http_client(config)
@@ -28,11 +28,21 @@ pub async fn create_provider_with_dir(
     config: &Config,
     app_data_dir: std::path::PathBuf,
 ) -> Result<Arc<dyn LLMProvider>, LLMError> {
-    // Load masking config once (applies to all providers).
+    create_provider_by_name(config, &config.provider, app_data_dir).await
+}
+
+/// Create a single named provider.
+///
+/// The name must be one of [`AVAILABLE_PROVIDERS`].
+pub async fn create_provider_by_name(
+    config: &Config,
+    provider_name: &str,
+    app_data_dir: std::path::PathBuf,
+) -> Result<Arc<dyn LLMProvider>, LLMError> {
     let masking_config = config.keyword_masking.clone();
     let http_client = build_http_client(config)?;
 
-    match config.provider.as_str() {
+    match provider_name {
         "copilot" => {
             // Get headless_auth from providers.copilot config, with fallback to deprecated root field
             let headless_auth = config
@@ -172,9 +182,42 @@ pub async fn create_provider_with_dir(
             )))
         }
 
+        "bodhi" => {
+            let bodhi_config = config.providers.bodhi.as_ref().ok_or_else(|| {
+                LLMError::Auth("Bodhi configuration required".to_string())
+            })?;
+
+            if bodhi_config.api_key.is_empty() {
+                return Err(LLMError::Auth("Bodhi API key is required".to_string()));
+            }
+
+            let target_provider = bodhi_config
+                .target_provider
+                .as_deref()
+                .unwrap_or("openai");
+
+            let mut provider =
+                BodhiProvider::new(&bodhi_config.api_key).with_client(http_client.clone());
+
+            if let Some(base_url) = &bodhi_config.base_url {
+                if !base_url.is_empty() {
+                    provider = provider.with_base_url(base_url);
+                }
+            }
+
+            provider = provider
+                .with_target_provider(target_provider)
+                .with_reasoning_effort(bodhi_config.reasoning_effort);
+
+            Ok(Arc::new(MaskingProviderDecorator::new(
+                provider,
+                masking_config.clone(),
+            )))
+        }
+
         _ => Err(LLMError::Auth(format!(
             "Unknown provider: {}. Available providers: {}",
-            config.provider,
+            provider_name,
             AVAILABLE_PROVIDERS.join(", ")
         ))),
     }
@@ -221,6 +264,18 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
 
             if gemini_config.api_key.is_empty() {
                 return Err(LLMError::Auth("Gemini API key is required".to_string()));
+            }
+
+            Ok(())
+        }
+
+        "bodhi" => {
+            let bodhi_config = config.providers.bodhi.as_ref().ok_or_else(|| {
+                LLMError::Auth("Bodhi configuration required".to_string())
+            })?;
+
+            if bodhi_config.api_key.is_empty() {
+                return Err(LLMError::Auth("Bodhi API key is required".to_string()));
             }
 
             Ok(())

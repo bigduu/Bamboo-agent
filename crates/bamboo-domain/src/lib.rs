@@ -9,6 +9,10 @@ pub mod mcp_config;
 pub mod tool_names;
 pub mod tool_types;
 
+// Provider/Model first-class types
+pub mod provider_model_ref;
+pub mod provider_catalog;
+
 // From bamboo-domain-session (was root-level modules, now under session/)
 pub mod session;
 
@@ -23,6 +27,8 @@ pub mod storage;
 
 // Flat re-exports for backward-compatible access
 pub use mcp_config::*;
+pub use provider_catalog::*;
+pub use provider_model_ref::ProviderModelRef;
 pub use reasoning::ReasoningEffort;
 pub use schedule::*;
 pub use session::*;

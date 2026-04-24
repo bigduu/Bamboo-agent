@@ -6,6 +6,16 @@ pub enum LLMChunk {
     Token(String),
     ReasoningToken(String),
     ToolCalls(Vec<ToolCall>),
+    /// Anthropic prompt cache token usage from `message_start` or `message_delta`.
+    CacheUsage {
+        cache_creation_input_tokens: u64,
+        cache_read_input_tokens: u64,
+    },
+    /// Token usage summary at the end of an Anthropic response.
+    UsageSummary {
+        output_tokens: u64,
+        thinking_tokens: u64,
+    },
     Done,
 }
 

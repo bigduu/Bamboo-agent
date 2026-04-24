@@ -124,6 +124,51 @@ pub fn save_config_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(
     std::fs::write(path, content).map_err(|e| format!("Failed to write config: {e}"))
 }
 
+/// Get the user-level settings file path: `~/.bamboo/settings.json`
+pub fn user_settings_path() -> PathBuf {
+    bamboo_dir().join("settings.json")
+}
+
+/// Get the project-level settings directory: `<project>/.bamboo`
+pub fn project_settings_dir(project_dir: &Path) -> PathBuf {
+    project_dir.join(".bamboo")
+}
+
+/// Get the project-level settings file: `<project>/.bamboo/settings.json`
+pub fn project_settings_path(project_dir: &Path) -> PathBuf {
+    project_settings_dir(project_dir).join("settings.json")
+}
+
+/// Get the local project-level settings file: `<project>/.bamboo/settings.local.json`
+pub fn local_project_settings_path(project_dir: &Path) -> PathBuf {
+    project_settings_dir(project_dir).join("settings.local.json")
+}
+
+/// Get the managed (enterprise) settings path — highest priority, read-only.
+///
+/// Platform locations:
+/// - Linux: `/etc/bamboo/settings.json`
+/// - macOS: `/Library/Application Support/Bamboo/settings.json`
+/// - Windows: `C:\ProgramData\Bamboo\settings.json`
+pub fn managed_settings_path() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/etc/bamboo/settings.json")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/Library/Application Support/Bamboo/settings.json")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from("C:\\ProgramData\\Bamboo\\settings.json")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        PathBuf::from("/etc/bamboo/settings.json")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

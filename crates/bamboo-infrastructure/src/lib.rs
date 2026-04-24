@@ -15,6 +15,15 @@ pub mod models {
 pub mod provider {
     pub use crate::llm::provider::*;
 }
+pub mod provider_registry {
+    pub use crate::llm::provider_registry::*;
+}
+pub mod router {
+    pub use crate::llm::router::*;
+}
+pub mod model_catalog {
+    pub use crate::llm::model_catalog::*;
+}
 pub mod types {
     pub use crate::llm::types::*;
 }
@@ -44,6 +53,10 @@ pub use llm::{
 };
 pub use llm::{AnthropicProvider, CopilotProvider, GeminiProvider, OpenAIProvider};
 pub use llm::{LLMChunk, LLMError, LLMProvider, LLMRequestOptions, LLMStream};
+pub use llm::ModelCatalogService;
+pub use llm::ProviderModelRouter;
+pub use llm::ProviderRegistry;
+pub use llm::ResolvedModel;
 pub use process::process_utils::{
     build_command_environment, decode_process_line_lossy, hide_window_for_std_command,
     hide_window_for_tokio_command, preferred_bash_shell, render_command_line,
