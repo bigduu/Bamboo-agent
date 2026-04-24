@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Override crate version to publish (for example: 2026.3.11). Leave empty or 'latest' to use Cargo.toml."
+        description: "Override unified publish version (for example: 2026.3.11). Leave empty or 'latest' to use the root Cargo.toml version."
         required: false
         default: ""
         type: string
       dry_run:
-        description: "Run cargo publish --dry-run only"
+        description: "Validate manifest rewriting and workspace buildability without uploading (does not emulate crates.io propagation for internal crates)"
         required: false
         default: false
         type: boolean
@@ -37,16 +37,6 @@ jobs:
           test -f frontend_package/lotus-frontend.zip
           test -f frontend_package/frontend-manifest.json
 
-      - name: Set crate version (workflow override)
-        if: github.event.inputs.version != '' && github.event.inputs.version != 'latest'
-        shell: bash
-        run: |
-          TARGET_VERSION="${{ github.event.inputs.version }}"
-          sed -i.bak -E '0,/^version = "[^"]+"/s//version = "'"${TARGET_VERSION}"'"/' Cargo.toml
-          rm -f Cargo.toml.bak
-          echo "Using crate version override: ${TARGET_VERSION}"
-          grep '^version = ' Cargo.toml | head -1
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -56,43 +46,243 @@ jobs:
           shared-key: bamboo-publish-crate-${{ runner.os }}
           cache-on-failure: true
 
-      - name: Resolve crate version
+      - name: Resolve publish version
         id: version
+        shell: bash
         run: |
-          VERSION="$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')"
+          set -euo pipefail
+
+          if [ -n "${{ github.event.inputs.version }}" ] && [ "${{ github.event.inputs.version }}" != "latest" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')"
+          fi
+
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Resolved version: ${VERSION}"
 
-      - name: Publish dry run
-        if: github.event.inputs.dry_run == 'true'
+      - name: Prepare workspace manifests for publish
+        shell: bash
+        env:
+          TARGET_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          if [ "${{ github.event.inputs.version }}" != "" ] && [ "${{ github.event.inputs.version }}" != "latest" ]; then
-            cargo publish --dry-run --allow-dirty
-          else
-            cargo publish --dry-run
-          fi
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          import tomllib
+
+          root = Path(".")
+          target_version = os.environ["TARGET_VERSION"]
+          manifest_paths = [root / "Cargo.toml", *sorted((root / "crates").glob("*/Cargo.toml"))]
+
+          workspace_crates = {}
+          for path in manifest_paths:
+              data = tomllib.loads(path.read_text())
+              package = data.get("package", {})
+              name = package.get("name")
+              if name:
+                  workspace_crates[name] = path
+
+          dependency_section_suffixes = (
+              ".dependencies",
+              ".dev-dependencies",
+              ".build-dependencies",
+          )
+
+          for path in manifest_paths:
+              lines = path.read_text().splitlines()
+              current_section = None
+              package_version_done = False
+
+              for idx, line in enumerate(lines):
+                  stripped = line.strip()
+
+                  match = re.match(r"^\[(.+)\]\s*$", stripped)
+                  if match:
+                      current_section = match.group(1)
+                      continue
+
+                  if (
+                      current_section == "package"
+                      and not package_version_done
+                      and re.match(r'^version\s*=\s*"[^"]+"\s*$', stripped)
+                  ):
+                      lines[idx] = re.sub(
+                          r'version\s*=\s*"[^"]+"',
+                          f'version = "{target_version}"',
+                          line,
+                          count=1,
+                      )
+                      package_version_done = True
+                      continue
+
+                  is_dependency_section = current_section in {
+                      "dependencies",
+                      "dev-dependencies",
+                      "build-dependencies",
+                  } or (
+                      current_section is not None
+                      and current_section.endswith(dependency_section_suffixes)
+                  )
+                  if not is_dependency_section:
+                      continue
+
+                  match = re.match(r'^(\s*)([A-Za-z0-9_-]+)\s*=\s*\{(.*)\}\s*$', line)
+                  if not match:
+                      continue
+
+                  indent, dep_name, body = match.groups()
+                  if dep_name not in workspace_crates or "path" not in body:
+                      continue
+
+                  if re.search(r'\bversion\s*=\s*"[^"]+"', body):
+                      updated_body = re.sub(
+                          r'\bversion\s*=\s*"[^"]+"',
+                          f'version = "{target_version}"',
+                          body,
+                      )
+                  else:
+                      updated_body = body.rstrip()
+                      if updated_body and not updated_body.rstrip().endswith(","):
+                          updated_body += ","
+                      updated_body += f' version = "{target_version}"'
+
+                  lines[idx] = f"{indent}{dep_name} = {{{updated_body}}}"
+
+              path.write_text("\n".join(lines) + "\n")
+          PY
+
+          echo "Prepared Bamboo workspace manifests for version ${TARGET_VERSION}"
+          git diff -- Cargo.toml crates/*/Cargo.toml
+
+      - name: Validate publish plan
+        if: github.event.inputs.dry_run == 'true'
+        shell: bash
+        env:
+          TARGET_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          cargo metadata --format-version 1 >/dev/null
+          cargo check --workspace --all-targets
+
+          cat <<EOF
+          Dry-run validation completed for Bamboo ${TARGET_VERSION}.
+
+          Note: internal Bamboo crates are published sequentially during the real release.
+          A dry run cannot fully emulate crates.io index propagation, so this step validates:
+          - manifest rewriting to ${TARGET_VERSION}
+          - workspace dependency resolution
+          - workspace buildability
+
+          Real publish order:
+          1. bamboo-domain
+          2. bamboo-infrastructure
+          3. bamboo-agent-core
+          4. bamboo-compression
+          5. bamboo-memory
+          6. bamboo-tools
+          7. bamboo-engine
+          8. bamboo-server
+          9. bamboo-agent
+          EOF
 
       - name: Publish to crates.io
         if: github.event.inputs.dry_run != 'true'
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          TARGET_VERSION: ${{ steps.version.outputs.version }}
+          CRATES_IO_USER_AGENT: bamboo-publish-crate/1.0 (+https://github.com/${{ github.repository }})
         run: |
-          set +e
-          if [ "${{ github.event.inputs.version }}" != "" ] && [ "${{ github.event.inputs.version }}" != "latest" ]; then
-            OUTPUT="$(cargo publish --allow-dirty --token "${{ secrets.CARGO_REGISTRY_TOKEN }}" 2>&1)"
-          else
-            OUTPUT="$(cargo publish --token "${{ secrets.CARGO_REGISTRY_TOKEN }}" 2>&1)"
-          fi
-          STATUS=$?
-          set -e
-          echo "${OUTPUT}"
+          set -euo pipefail
 
-          if [ ${STATUS} -eq 0 ]; then
-            echo "Published bamboo-agent@${{ steps.version.outputs.version }} successfully."
-            exit 0
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "Missing CARGO_REGISTRY_TOKEN secret."
+            exit 1
           fi
 
-          if echo "${OUTPUT}" | grep -qi "already exists on crates.io index"; then
-            echo "bamboo-agent@${{ steps.version.outputs.version }} already published. Treating as success."
-            exit 0
-          fi
+          crate_exists() {
+            local crate="$1"
+            local version="$2"
+            local status
 
-          exit ${STATUS}
+            status="$(curl -sS -o /dev/null -w "%{http_code}" \
+              -H "User-Agent: ${CRATES_IO_USER_AGENT}" \
+              "https://crates.io/api/v1/crates/${crate}/${version}" || true)"
+
+            [ "${status}" = "200" ]
+          }
+
+          wait_for_crate() {
+            local crate="$1"
+            local version="$2"
+            local max_attempts=30
+            local attempt=1
+
+            echo "Waiting for ${crate}@${version} to appear on crates.io"
+            while [ "${attempt}" -le "${max_attempts}" ]; do
+              if crate_exists "${crate}" "${version}"; then
+                echo "Found ${crate}@${version} on crates.io"
+                return 0
+              fi
+
+              echo "Attempt ${attempt}/${max_attempts}: ${crate}@${version} not visible yet; retrying in 10s..."
+              attempt=$((attempt + 1))
+              sleep 10
+            done
+
+            echo "Timed out waiting for ${crate}@${version} on crates.io"
+            return 1
+          }
+
+          publish_one() {
+            local crate="$1"
+            local output
+            local status
+
+            if crate_exists "${crate}" "${TARGET_VERSION}"; then
+              echo "${crate}@${TARGET_VERSION} already exists on crates.io; skipping publish."
+              wait_for_crate "${crate}" "${TARGET_VERSION}"
+              return 0
+            fi
+
+            echo "Publishing ${crate}@${TARGET_VERSION}"
+            set +e
+            output="$(cargo publish --allow-dirty -p "${crate}" 2>&1)"
+            status=$?
+            set -e
+
+            echo "${output}"
+
+            if [ ${status} -ne 0 ]; then
+              if echo "${output}" | grep -qi "already exists on crates.io index"; then
+                echo "${crate}@${TARGET_VERSION} already exists on crates.io index; continuing."
+              else
+                return ${status}
+              fi
+            fi
+
+            wait_for_crate "${crate}" "${TARGET_VERSION}"
+          }
+
+          crates=(
+            bamboo-domain
+            bamboo-infrastructure
+            bamboo-agent-core
+            bamboo-compression
+            bamboo-memory
+            bamboo-tools
+            bamboo-engine
+            bamboo-server
+            bamboo-agent
+          )
+
+          for crate in "${crates[@]}"; do
+            publish_one "${crate}"
+          done
+
+          echo "Published Bamboo crates for version ${TARGET_VERSION}"
