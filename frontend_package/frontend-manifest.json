@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "frontend_name": "lotus",
-  "frontend_version": "2026.4.12",
-  "bundle_hash": "sha256:2b3429874d35fdd2f286443d01d12ade61b74f18ee3ca2be6db47ce0ade733af",
-  "built_at": "2026-04-23T16:49:47.139Z",
+  "frontend_version": "2026.4.24",
+  "bundle_hash": "sha256:7f280bf8fb5610ff33bac9ee774c7a10ac20ef198ac7a3e8cc142169a888dbe9",
+  "built_at": "2026-04-24T13:24:30.851Z",
   "entry": "index.html"
 }

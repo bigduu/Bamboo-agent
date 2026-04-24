@@ -23,7 +23,7 @@ thiserror = "1"
 
 [package]
 name = "bamboo-agent"
-version = "2026.4.12"
+version = "2026.4.24"
 edition = "2021"
 license = "MIT"
 authors = ["mugeng.du@gmail.com"]

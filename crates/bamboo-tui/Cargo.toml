@@ -1,6 +1,6 @@
 [package]
 name = "bamboo-tui"
-version = "2026.4.12"
+version = "2026.4.24"
 edition = "2021"
 license = "MIT"
 authors = ["mugeng.du@gmail.com"]
