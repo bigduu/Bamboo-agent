@@ -2,6 +2,8 @@
 name = "bamboo-memory"
 version = "0.1.0"
 edition = "2021"
+description = "Memory storage and retrieval components for the Bamboo agent framework"
+license = "MIT"
 
 [dependencies]
 bamboo-agent-core = { path = "../bamboo-agent-core" }

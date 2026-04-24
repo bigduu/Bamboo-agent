@@ -2,6 +2,8 @@
 name = "bamboo-engine"
 version = "0.1.0"
 edition = "2021"
+description = "Execution engine and orchestration for the Bamboo agent framework"
+license = "MIT"
 
 [dependencies]
 bamboo-domain = { path = "../bamboo-domain" }

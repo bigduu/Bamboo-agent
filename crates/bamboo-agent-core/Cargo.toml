@@ -2,6 +2,8 @@
 name = "bamboo-agent-core"
 version = "0.1.0"
 edition = "2021"
+description = "Core agent abstractions and execution primitives for the Bamboo agent framework"
+license = "MIT"
 
 [dependencies]
 bamboo-infrastructure = { path = "../bamboo-infrastructure" }

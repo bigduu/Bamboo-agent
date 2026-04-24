@@ -2,6 +2,8 @@
 name = "bamboo-compression"
 version = "0.1.0"
 edition = "2021"
+description = "Compression utilities for Bamboo sessions and memory workflows"
+license = "MIT"
 
 [dependencies]
 bamboo-agent-core = { path = "../bamboo-agent-core" }
