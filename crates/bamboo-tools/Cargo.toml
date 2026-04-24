@@ -25,6 +25,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
 globset = "0.4"
 base64 = "0.22"
+tree-sitter = "0.26"
+tree-sitter-bash = "0.25"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 parking_lot = "0.12"
 url = "2"

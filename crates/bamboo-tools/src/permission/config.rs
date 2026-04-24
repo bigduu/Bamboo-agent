@@ -5,12 +5,16 @@
 
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use tracing::warn;
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+
+// Re-export PermissionMode from the shared location in bamboo-infrastructure
+pub use bamboo_infrastructure::config::settings::PermissionMode;
 
 /// Types of permissions that can be granted
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -510,7 +514,7 @@ fn normalize_path_separators(path: &str) -> String {
 ///
 /// On Windows, backslashes are normalized to forward slashes for pattern matching,
 /// allowing patterns like `C:/Users/*` to match `C:\Users\file.txt`.
-fn match_glob_pattern(pattern: &str, resource: &str) -> bool {
+pub(crate) fn match_glob_pattern(pattern: &str, resource: &str) -> bool {
     // Normalize path separators for cross-platform matching
     let resource = normalize_path_separators(resource);
 
@@ -584,6 +588,8 @@ pub struct PermissionConfig {
     session_grant_duration: Duration,
     /// Whether permission checks are enabled
     enabled: AtomicBool,
+    /// Active permission mode controlling auto-approval behavior
+    mode: RwLock<PermissionMode>,
 }
 
 impl Default for PermissionConfig {
@@ -600,6 +606,7 @@ impl PermissionConfig {
             session_grants: DashMap::new(),
             session_grant_duration: Duration::from_secs(30 * 60), // 30 minutes
             enabled: AtomicBool::new(true),
+            mode: RwLock::new(PermissionMode::Default),
         }
     }
 
@@ -610,6 +617,7 @@ impl PermissionConfig {
             session_grants: DashMap::new(),
             session_grant_duration: session_duration,
             enabled: AtomicBool::new(enabled),
+            mode: RwLock::new(PermissionMode::Default),
         }
     }
 
@@ -621,6 +629,16 @@ impl PermissionConfig {
     /// Enable or disable permission checks
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Get the current permission mode
+    pub fn mode(&self) -> PermissionMode {
+        *self.mode.read().expect("mode lock poisoned")
+    }
+
+    /// Set the permission mode
+    pub fn set_mode(&self, mode: PermissionMode) {
+        *self.mode.write().expect("mode lock poisoned") = mode;
     }
 
     /// Get the session grant duration
@@ -752,6 +770,7 @@ impl PermissionConfig {
             whitelist: self.get_rules(),
             enabled: self.is_enabled(),
             session_grant_duration_secs: self.session_grant_duration.as_secs(),
+            mode: Some(self.mode()),
         }
     }
 
@@ -763,21 +782,62 @@ impl PermissionConfig {
             whitelist.insert(key, rule);
         }
 
+        let mode = config.mode.unwrap_or_default();
+
         Self {
             whitelist,
             session_grants: DashMap::new(),
             session_grant_duration: Duration::from_secs(config.session_grant_duration_secs),
             enabled: AtomicBool::new(config.enabled),
+            mode: RwLock::new(mode),
         }
     }
-}
 
-/// Serializable version of PermissionConfig for persistence
+    /// Merge `other` into this config, returning a new `PermissionConfig`.
+    ///
+    /// `other` has higher priority: its whitelist rules replace conflicting ones from `self`,
+    /// its mode overrides `self`'s, and its enabled flag takes precedence.
+    /// Both allow and deny rules from both configs are preserved (deduplicated).
+    pub fn merge(&self, other: &PermissionConfig) -> Self {
+        let merged = Self::new();
+
+        // Copy all rules from self (lower priority)
+        for rule in self.get_rules() {
+            let key = format!("{:?}:{}", rule.tool_type, rule.resource_pattern);
+            merged.whitelist.insert(key, rule);
+        }
+
+        // Override/add rules from other (higher priority)
+        for rule in other.get_rules() {
+            let key = format!("{:?}:{}", rule.tool_type, rule.resource_pattern);
+            merged.whitelist.insert(key, rule);
+        }
+
+        // Session grants from other (higher priority source)
+        for entry in other.session_grants.iter() {
+            let perm_type = entry.key();
+            let grants = entry.value();
+            merged
+                .session_grants
+                .insert(*perm_type, grants.clone());
+        }
+
+        // Mode from other takes precedence
+        merged.set_mode(other.mode());
+
+        // Enabled flag from other takes precedence
+        merged.set_enabled(other.is_enabled());
+
+        merged
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializablePermissionConfig {
     pub whitelist: Vec<PermissionRule>,
     pub enabled: bool,
     pub session_grant_duration_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<PermissionMode>,
 }
 
 impl Default for SerializablePermissionConfig {
@@ -786,6 +846,7 @@ impl Default for SerializablePermissionConfig {
             whitelist: Vec::new(),
             enabled: true,
             session_grant_duration_secs: 30 * 60, // 30 minutes
+            mode: None,
         }
     }
 }
@@ -1328,5 +1389,77 @@ mod integration_tests {
         // Command permission
         config.grant_session_permission(PermissionType::ExecuteCommand, "npm");
         assert!(!config.needs_confirmation(PermissionType::ExecuteCommand, "npm"));
+    }
+
+    #[test]
+    fn test_permission_mode_default_is_default() {
+        let config = PermissionConfig::new();
+        assert_eq!(config.mode(), PermissionMode::Default);
+    }
+
+    #[test]
+    fn test_permission_mode_set_and_get() {
+        let config = PermissionConfig::new();
+        config.set_mode(PermissionMode::Plan);
+        assert_eq!(config.mode(), PermissionMode::Plan);
+        config.set_mode(PermissionMode::BypassPermissions);
+        assert_eq!(config.mode(), PermissionMode::BypassPermissions);
+    }
+
+    #[test]
+    fn test_permission_mode_serialize_roundtrip() {
+        let mut serializable = SerializablePermissionConfig::default();
+        assert!(serializable.mode.is_none());
+
+        serializable.mode = Some(PermissionMode::Plan);
+        let json = serde_json::to_string(&serializable).unwrap();
+        assert!(json.contains("plan"));
+
+        let deserialized: SerializablePermissionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.mode, Some(PermissionMode::Plan));
+    }
+
+    #[test]
+    fn test_permission_mode_backward_compat_no_mode() {
+        // Old serialized format without mode field should deserialize to Default
+        let json = r#"{"whitelist":[],"enabled":true,"session_grant_duration_secs":1800}"#;
+        let deserialized: SerializablePermissionConfig = serde_json::from_str(json).unwrap();
+        assert!(deserialized.mode.is_none());
+
+        let config = PermissionConfig::from_serializable(deserialized);
+        assert_eq!(config.mode(), PermissionMode::Default);
+    }
+
+    #[test]
+    fn test_permission_config_merge() {
+        let user = PermissionConfig::new();
+        user.add_rule(PermissionRule::new(PermissionType::WriteFile, "/tmp/user/*", true));
+        user.set_mode(PermissionMode::Default);
+
+        let project = PermissionConfig::new();
+        project.add_rule(PermissionRule::new(PermissionType::WriteFile, "/tmp/project/*", true));
+        project.add_rule(PermissionRule::new(PermissionType::WriteFile, "/tmp/project/secret", false));
+        project.set_mode(PermissionMode::AcceptEdits);
+
+        let merged = user.merge(&project);
+
+        // Project mode takes precedence
+        assert_eq!(merged.mode(), PermissionMode::AcceptEdits);
+
+        // Both user and project allow rules are present
+        assert!(!merged.needs_confirmation(PermissionType::WriteFile, "/tmp/user/code.rs"));
+        assert!(!merged.needs_confirmation(PermissionType::WriteFile, "/tmp/project/code.rs"));
+
+        // Project deny rule overrides user allow
+        assert!(merged.needs_confirmation(PermissionType::WriteFile, "/tmp/project/secret"));
+    }
+
+    #[test]
+    fn test_permission_mode_description() {
+        assert!(!PermissionMode::Default.description().is_empty());
+        assert!(!PermissionMode::Plan.description().is_empty());
+        assert!(!PermissionMode::AcceptEdits.description().is_empty());
+        assert!(!PermissionMode::DontAsk.description().is_empty());
+        assert!(!PermissionMode::BypassPermissions.description().is_empty());
     }
 }

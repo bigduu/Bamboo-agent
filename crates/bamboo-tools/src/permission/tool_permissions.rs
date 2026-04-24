@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+use crate::permission::bash_security;
+use crate::permission::hierarchy::PermissionRuleSet;
 use crate::permission::{PermissionContext, PermissionError, PermissionType};
 
 const DELETE_COMMANDS: [&str; 7] = ["rm", "rmdir", "del", "erase", "unlink", "rd", "remove-item"];
@@ -33,6 +35,17 @@ pub fn check_permissions(
                 ));
             }
             let mut contexts = Vec::new();
+
+            // AST-based security analysis
+            let security = bash_security::analyze_command(command);
+            if security.is_dangerous() {
+                contexts.push(PermissionContext::new(
+                    PermissionType::ExecuteCommand,
+                    format!("SECURITY: {}", command),
+                    format!("Dangerous shell pattern detected: {}", security.summary()),
+                ));
+            }
+
             if is_delete_command(command) {
                 contexts.push(PermissionContext::new(
                     PermissionType::DeleteOperation,
@@ -40,11 +53,14 @@ pub fn check_permissions(
                     format!("Delete operation via shell: {}", command),
                 ));
             }
-            contexts.push(PermissionContext::new(
-                PermissionType::ExecuteCommand,
-                command,
-                format!("Execute command: {}", command),
-            ));
+
+            if !contexts.iter().any(|ctx| ctx.resource.starts_with("SECURITY:")) {
+                contexts.push(PermissionContext::new(
+                    PermissionType::ExecuteCommand,
+                    command,
+                    format!("Execute command: {}", command),
+                ));
+            }
             Ok(Some(contexts))
         }
         "session_note" | "memory_note" => {
@@ -302,4 +318,18 @@ mod tests {
         assert_eq!(contexts[0].permission_type, PermissionType::HttpRequest);
         assert_eq!(contexts[0].resource, "duckduckgo.com");
     }
+}
+
+/// Check tool rules against allowed and denied tool patterns.
+///
+/// Deny rules take precedence over allow rules.
+/// Returns `Some(true)` if allowed, `Some(false)` if denied, `None` if no rules match.
+pub fn check_tool_rules(
+    tool_name: &str,
+    args: &Value,
+    allowed_tools: &[String],
+    denied_tools: &[String],
+) -> Option<bool> {
+    let rule_set = PermissionRuleSet::from_rules(allowed_tools, denied_tools);
+    rule_set.match_tool_call(tool_name, args)
 }

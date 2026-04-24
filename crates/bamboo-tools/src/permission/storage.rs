@@ -179,6 +179,57 @@ impl PermissionStorage {
         self.config_path().exists()
     }
 
+    /// Load permission configuration with project-level overrides.
+    ///
+    /// Merges three sources in priority order (highest → lowest):
+    /// 1. Local project settings (`<project>/.bamboo/` config.json["permissions"])
+    /// 2. Project settings (`<project>/.bamboo/` config.json["permissions"])
+    /// 3. User settings (`self.config_dir` config.json["permissions"])
+    ///
+    /// Returns `Ok(None)` if none of the sources have a config file.
+    pub async fn load_with_project(
+        &self,
+        project_dir: &std::path::Path,
+    ) -> Result<Option<PermissionConfig>, PermissionStorageError> {
+        // Load user-level config (lowest priority)
+        let user_config = self.load().await.unwrap_or(None);
+
+        // Load project-level config
+        let project_storage = PermissionStorage::new(
+            project_dir.join(".bamboo"),
+        );
+        let project_config = project_storage.load().await.unwrap_or(None);
+
+        // Load local project-level config (highest priority)
+        let local_storage = PermissionStorage::new(
+            project_dir.join(".bamboo"),
+        );
+        let local_config = local_storage.load().await.unwrap_or(None);
+
+        // Track if any source was present before we consume the Options
+        let has_any = user_config.is_some()
+            || project_config.is_some()
+            || local_config.is_some();
+
+        // Merge: local > project > user
+        let mut result = match user_config {
+            Some(c) => c,
+            None => PermissionConfig::new(),
+        };
+        if let Some(proj) = project_config {
+            result = proj.merge(&result);
+        }
+        if let Some(loc) = local_config {
+            result = loc.merge(&result);
+        }
+
+        if !has_any {
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
+    }
+
     /// Delete the configuration file
     pub async fn delete(&self) -> Result<(), PermissionStorageError> {
         let path = self.config_path();

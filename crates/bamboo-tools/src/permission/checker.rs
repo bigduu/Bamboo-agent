@@ -8,7 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::config::{PermissionConfig, PermissionType, RiskLevel};
+use super::config::{PermissionConfig, PermissionMode, PermissionType, RiskLevel};
 
 /// Context for a permission request
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -286,6 +286,169 @@ impl PermissionChecker for DenyDangerousPermissionChecker {
     }
 }
 
+/// Shell commands that are considered safe for auto-approval in AcceptEdits mode.
+const SAFE_EDIT_COMMANDS: &[&str] = &[
+    "mkdir", "touch", "cp", "mv", "ls", "cat", "echo", "pwd", "chmod", "chown",
+    "git status", "git diff", "git log", "git add", "git commit",
+    "cargo check", "cargo build", "cargo test", "cargo clippy",
+    "npm run", "npm test", "npm install",
+];
+
+/// Command wrappers stripped before checking the base command.
+const COMMAND_WRAPPERS: &[&str] = &["time", "nohup", "timeout", "nice", "env"];
+
+/// Check if a command is safe for auto-approval in AcceptEdits mode.
+///
+/// Strips wrappers (time, nohup, timeout, nice, env), then checks against
+/// `SAFE_EDIT_COMMANDS` with prefix matching (e.g., `"git add"` matches `"git add file.txt"`).
+pub fn is_safe_edit_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.is_empty() {
+        return false;
+    }
+
+    // Strip wrappers and their arguments
+    let mut idx = 0;
+    while idx < tokens.len() {
+        let token = tokens[idx];
+        if !COMMAND_WRAPPERS.contains(&token) {
+            break;
+        }
+        idx += 1;
+        while idx < tokens.len() {
+            let next = tokens[idx];
+            if next.starts_with('-') {
+                idx += 1;
+                continue;
+            }
+            if COMMAND_WRAPPERS.contains(&next) {
+                break;
+            }
+            if ["timeout", "nice", "env"].contains(&token) {
+                idx += 1;
+            }
+            break;
+        }
+    }
+
+    if idx >= tokens.len() {
+        return false;
+    }
+
+    let cmd = tokens[idx..].join(" ");
+
+    for &safe_cmd in SAFE_EDIT_COMMANDS {
+        if cmd == safe_cmd {
+            return true;
+        }
+        if cmd.starts_with(safe_cmd) {
+            let after = &cmd[safe_cmd.len()..];
+            if after.is_empty() || after.starts_with(' ') {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// A permission checker that applies mode-specific logic on top of an inner checker.
+///
+/// The active `PermissionMode` is read from the shared `PermissionConfig` at check time,
+/// so mode changes take effect immediately.
+pub struct ModeAwarePermissionChecker {
+    inner: Arc<dyn PermissionChecker>,
+    config: Arc<PermissionConfig>,
+}
+
+impl std::fmt::Debug for ModeAwarePermissionChecker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModeAwarePermissionChecker")
+            .field("mode", &self.config.mode())
+            .finish()
+    }
+}
+
+impl ModeAwarePermissionChecker {
+    /// Create a new mode-aware checker wrapping `inner`, reading mode from `config`.
+    pub fn new(inner: Arc<dyn PermissionChecker>, config: Arc<PermissionConfig>) -> Self {
+        Self { inner, config }
+    }
+}
+
+#[async_trait]
+impl PermissionChecker for ModeAwarePermissionChecker {
+    async fn needs_confirmation(&self, perm_type: PermissionType, resource: &str) -> bool {
+        match self.config.mode() {
+            PermissionMode::BypassPermissions => false,
+            PermissionMode::Plan => {
+                // In plan mode, all non-low-risk operations require confirmation (= are blocked)
+                perm_type.risk_level() != RiskLevel::Low
+            }
+            PermissionMode::AcceptEdits => {
+                // Auto-approve file writes
+                if perm_type == PermissionType::WriteFile {
+                    return false;
+                }
+                // Auto-approve safe edit commands
+                if perm_type == PermissionType::ExecuteCommand
+                    && is_safe_edit_command(resource)
+                {
+                    return false;
+                }
+                self.inner.needs_confirmation(perm_type, resource).await
+            }
+            PermissionMode::DontAsk => {
+                // Only allow if explicitly whitelisted; otherwise deny (needs_confirmation=true)
+                match self.config.is_whitelist_allowed(perm_type, resource) {
+                    Some(true) => false,
+                    _ => true,
+                }
+            }
+            PermissionMode::Default => {
+                self.inner.needs_confirmation(perm_type, resource).await
+            }
+        }
+    }
+
+    async fn request_confirmation(&self, ctx: PermissionContext) -> Result<bool, PermissionError> {
+        match self.config.mode() {
+            PermissionMode::BypassPermissions => Ok(true),
+            PermissionMode::Plan => Err(PermissionError::Denied(format!(
+                "Plan mode: {} operation blocked for '{}'",
+                ctx.permission_type.description(),
+                ctx.resource
+            ))),
+            PermissionMode::DontAsk => Err(PermissionError::Denied(format!(
+                "Permission denied (dontAsk mode): {} on '{}'",
+                ctx.permission_type.description(),
+                ctx.resource
+            ))),
+            PermissionMode::AcceptEdits => {
+                if ctx.permission_type == PermissionType::WriteFile {
+                    Ok(true)
+                } else if ctx.permission_type == PermissionType::ExecuteCommand
+                    && is_safe_edit_command(&ctx.resource)
+                {
+                    Ok(true)
+                } else {
+                    self.inner.request_confirmation(ctx).await
+                }
+            }
+            PermissionMode::Default => self.inner.request_confirmation(ctx).await,
+        }
+    }
+
+    fn grant_session_permission(&self, perm_type: PermissionType, resource: String) {
+        self.inner.grant_session_permission(perm_type, resource);
+    }
+}
+
 /// Extension trait for PermissionChecker with convenience methods
 #[async_trait]
 pub trait PermissionCheckerExt: PermissionChecker {
@@ -404,6 +567,7 @@ impl<T: PermissionChecker + ?Sized> PermissionCheckerExt for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permission::PermissionRule;
 
     #[tokio::test]
     async fn test_allow_all_checker() {
@@ -477,5 +641,99 @@ mod tests {
         let message = ctx.format_request_message();
         assert!(message.contains("Medium Risk"));
         assert!(message.contains("/tmp/test.txt"));
+    }
+
+    // --- ModeAwarePermissionChecker tests ---
+
+    fn mode_aware_setup(mode: PermissionMode) -> ModeAwarePermissionChecker {
+        let config = Arc::new(PermissionConfig::new());
+        config.set_mode(mode);
+        let inner: Arc<dyn PermissionChecker> = Arc::new(ConfigPermissionChecker::new(config.clone()));
+        ModeAwarePermissionChecker::new(inner, config)
+    }
+
+    #[tokio::test]
+    async fn test_mode_default_delegates_to_inner() {
+        let checker = mode_aware_setup(PermissionMode::Default);
+        // Default mode: no whitelist rules, so everything needs confirmation
+        assert!(checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
+        assert!(checker.needs_confirmation(PermissionType::ExecuteCommand, "ls").await);
+    }
+
+    #[tokio::test]
+    async fn test_mode_bypass_allows_everything() {
+        let checker = mode_aware_setup(PermissionMode::BypassPermissions);
+        assert!(!checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
+        assert!(!checker.needs_confirmation(PermissionType::ExecuteCommand, "rm -rf /").await);
+        assert!(!checker.needs_confirmation(PermissionType::DeleteOperation, "/etc/passwd").await);
+
+        // request_confirmation should also succeed
+        let ctx = PermissionContext::new(PermissionType::ExecuteCommand, "rm -rf /", "dangerous");
+        assert!(checker.request_confirmation(ctx).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mode_plan_blocks_mutating() {
+        let checker = mode_aware_setup(PermissionMode::Plan);
+        // Plan mode: high/medium risk operations need confirmation (blocked)
+        assert!(checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
+        assert!(checker.needs_confirmation(PermissionType::ExecuteCommand, "ls").await);
+        assert!(checker.needs_confirmation(PermissionType::DeleteOperation, "/tmp/file").await);
+
+        // request_confirmation should deny with Plan mode message
+        let ctx = PermissionContext::new(PermissionType::WriteFile, "/tmp/test", "write");
+        let result = checker.request_confirmation(ctx).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Plan mode"));
+    }
+
+    #[tokio::test]
+    async fn test_mode_accept_edits_auto_approves_writes() {
+        let checker = mode_aware_setup(PermissionMode::AcceptEdits);
+        // WriteFile should be auto-approved
+        assert!(!checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
+        // ExecuteCommand should still need confirmation (delegated to inner)
+        assert!(checker.needs_confirmation(PermissionType::ExecuteCommand, "rm -rf /").await);
+    }
+
+    #[tokio::test]
+    async fn test_mode_dont_ask_denies_unless_whitelisted() {
+        let config = Arc::new(PermissionConfig::new());
+        config.set_mode(PermissionMode::DontAsk);
+        // Add a whitelist allow rule
+        config.add_rule(PermissionRule::new(PermissionType::WriteFile, "/safe/*", true));
+
+        let inner: Arc<dyn PermissionChecker> = Arc::new(ConfigPermissionChecker::new(config.clone()));
+        let checker = ModeAwarePermissionChecker::new(inner, config);
+
+        // Whitelisted path: allowed
+        assert!(!checker.needs_confirmation(PermissionType::WriteFile, "/safe/file.rs").await);
+        // Non-whitelisted path: denied (needs_confirmation=true)
+        assert!(checker.needs_confirmation(PermissionType::WriteFile, "/unsafe/file.rs").await);
+
+        // request_confirmation should deny
+        let ctx = PermissionContext::new(PermissionType::WriteFile, "/unsafe/file.rs", "write");
+        let result = checker.request_confirmation(ctx).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("dontAsk"));
+    }
+
+    #[tokio::test]
+    async fn test_mode_switches_at_runtime() {
+        let config = Arc::new(PermissionConfig::new());
+        let inner: Arc<dyn PermissionChecker> = Arc::new(ConfigPermissionChecker::new(config.clone()));
+        let checker = ModeAwarePermissionChecker::new(inner, config.clone());
+
+        // Start in Default mode
+        assert!(checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
+
+        // Switch to Bypass
+        config.set_mode(PermissionMode::BypassPermissions);
+        assert!(!checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
+
+        // Switch to Plan
+        config.set_mode(PermissionMode::Plan);
+        assert!(checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
     }
 }

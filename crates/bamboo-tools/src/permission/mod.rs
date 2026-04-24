@@ -30,8 +30,11 @@
 //! ```
 
 pub mod approval_store;
+pub mod bash_security;
 pub mod checker;
 pub mod config;
+pub mod hierarchy;
+pub mod rule_parser;
 pub mod storage;
 pub mod tool_permissions;
 
@@ -39,12 +42,14 @@ pub mod tool_permissions;
 pub use approval_store::{with_cached_approval, ApprovalDecision, ApprovalStore};
 pub use checker::{
     AllowAllPermissionChecker, ConfigPermissionChecker, DenyDangerousPermissionChecker,
-    LoggingPermissionChecker, PermissionChecker, PermissionCheckerExt, PermissionContext,
-    PermissionError, PermissionResult,
+    is_safe_edit_command, LoggingPermissionChecker, ModeAwarePermissionChecker, PermissionChecker,
+    PermissionCheckerExt, PermissionContext, PermissionError, PermissionResult,
 };
 pub use config::{
-    PermissionConfig, PermissionRule, PermissionType, RiskLevel, SerializablePermissionConfig,
-    SessionGrant,
+    PermissionConfig, PermissionMode, PermissionRule, PermissionType, RiskLevel,
+    SerializablePermissionConfig, SessionGrant,
 };
+pub use hierarchy::PermissionRuleSet;
+pub use rule_parser::ParsedRule;
 pub use storage::PermissionStorage;
-pub use tool_permissions::{check_permissions, is_delete_command};
+pub use tool_permissions::{check_permissions, check_tool_rules, is_delete_command};
