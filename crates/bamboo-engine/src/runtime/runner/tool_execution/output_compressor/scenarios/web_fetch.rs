@@ -10,6 +10,7 @@ use regex::Regex;
 
 use crate::runtime::runner::tool_execution::output_compressor::filters;
 use crate::runtime::runner::tool_execution::output_compressor::CompressionResult;
+use crate::runtime::runner::tool_execution::output_compressor::CompressionTier;
 
 /// Minimum result length (chars) before compression kicks in.
 const MIN_COMPRESS_LEN: usize = 6_000;
@@ -48,7 +49,8 @@ lazy_static::lazy_static! {
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
 
-pub(crate) fn compress(raw_result: &str) -> CompressionResult {
+pub(crate) fn compress(raw_result: &str, tier: CompressionTier) -> CompressionResult {
+    let _ = tier;
     if raw_result.len() < MIN_COMPRESS_LEN {
         return CompressionResult {
             compressed: raw_result.to_string(),
@@ -213,7 +215,7 @@ mod tests {
     #[test]
     fn short_output_not_compressed() {
         let input = "Hello World\nSome content\n";
-        let result = compress(input);
+        let result = compress(input, CompressionTier::Standard);
         assert!(!result.was_compressed);
     }
 
@@ -227,7 +229,7 @@ mod tests {
             "© 2024 All Rights Reserved.",
             "More useful content here about async/await in Rust."
         ));
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(!result.compressed.contains("Cookie Policy"));
         assert!(!result.compressed.contains("All Rights Reserved"));
@@ -246,7 +248,7 @@ mod tests {
             "\nThis is the actual important documentation content that spans a much longer line.\n",
         );
         let padded = pad(&input);
-        let result = compress(&padded);
+        let result = compress(&padded, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result
             .compressed
@@ -264,7 +266,7 @@ mod tests {
         }
         input.push_str("Content block 2\n");
         let padded = pad(&input);
-        let result = compress(&padded);
+        let result = compress(&padded, CompressionTier::Standard);
         assert!(result.was_compressed);
         // Should not have 20 blank lines anymore
         assert!(!result.compressed.contains("\n\n\n\n\n"));
@@ -280,7 +282,7 @@ mod tests {
                 )
             })
             .collect();
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         let line_count = result.compressed.lines().count();
         assert!(line_count <= MAX_LINES + 5);
@@ -294,7 +296,7 @@ mod tests {
             "This is the actual authentication documentation with details.",
             "Products › Security › OAuth2 Setup Guide"
         ));
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("authentication documentation"));
         assert!(result.compressed.contains("web noise"));
@@ -312,10 +314,83 @@ mod tests {
         input.push_str("## Response Format\n\n");
         input.push_str("All responses are JSON.\n");
         let padded = pad(&input);
-        let result = compress(&padded);
+        let result = compress(&padded, CompressionTier::Standard);
         // Good content should be preserved
         assert!(result.compressed.contains("API Documentation"));
         assert!(result.compressed.contains("Bearer tokens"));
         assert!(result.compressed.contains("curl"));
+    }
+
+    // ── Edge cases ──
+
+    #[test]
+    fn empty_input_not_compressed() {
+        let result = compress("", CompressionTier::Standard);
+        assert!(!result.was_compressed);
+    }
+
+    #[test]
+    fn short_content_not_compressed() {
+        let input = "Some short web page content\n";
+        let result = compress(input, CompressionTier::Standard);
+        assert!(!result.was_compressed);
+    }
+
+    #[test]
+    fn only_noise_lines() {
+        let mut input = String::new();
+        for _ in 0..200 {
+            input.push_str("Cookie Policy - We use cookies\n");
+        }
+        let padded = pad(&input);
+        let result = compress(&padded, CompressionTier::Standard);
+        assert!(result.was_compressed);
+        assert!(!result.compressed.contains("Cookie Policy"));
+        assert!(result.compressed.contains("web noise"));
+    }
+
+    #[test]
+    fn short_line_run_below_threshold() {
+        // 5 short lines → below MAX_SHORT_LINE_RUN → not collapsed
+        let mut input = String::new();
+        input.push_str("Header content\n\n");
+        for i in 0..5 {
+            input.push_str(&format!("Item {}\n", i));
+        }
+        input.push_str("Footer content\n");
+        let padded = pad(&input);
+        let result = compress(&padded, CompressionTier::Standard);
+        // Short lines should be preserved
+        assert!(result.compressed.contains("Item 0"));
+        assert!(result.compressed.contains("Item 4"));
+    }
+
+    #[test]
+    fn mixed_noise_and_content_preserves_content() {
+        let input = pad(&format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            "Important API endpoint documentation",
+            "Cookie Policy settings",
+            "Critical error handling guide",
+            "© 2024 All Rights Reserved",
+            "Terms of Service agreement",
+            "Actual useful troubleshooting content"
+        ));
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(result.was_compressed);
+        assert!(result.compressed.contains("API endpoint"));
+        assert!(result.compressed.contains("error handling"));
+        assert!(result.compressed.contains("troubleshooting"));
+        assert!(!result.compressed.contains("Cookie Policy"));
+        assert!(!result.compressed.contains("All Rights Reserved"));
+    }
+
+    #[test]
+    fn unicode_content_preserved() {
+        let input = pad("日本語のコンテンツ\n中文内容\n한국어 콘텐츠\nEmoji: 🎉🚀");
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(result.compressed.contains("日本語"));
+        assert!(result.compressed.contains("中文"));
+        assert!(result.compressed.contains("한국어"));
     }
 }

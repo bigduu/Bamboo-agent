@@ -2,6 +2,8 @@ const SKILL_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_SKILL_CONTEXT_START -->";
 const SKILL_CONTEXT_END_MARKER: &str = "<!-- BAMBOO_SKILL_CONTEXT_END -->";
 const TOOL_GUIDE_START_MARKER: &str = "<!-- BAMBOO_TOOL_GUIDE_START -->";
 const TOOL_GUIDE_END_MARKER: &str = "<!-- BAMBOO_TOOL_GUIDE_END -->";
+const ENV_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_ENV_CONTEXT_START -->";
+const ENV_CONTEXT_END_MARKER: &str = "<!-- BAMBOO_ENV_CONTEXT_END -->";
 
 pub(super) fn merge_system_prompt_with_contexts(
     base_prompt: &str,
@@ -48,6 +50,10 @@ pub(super) fn strip_existing_skill_context(prompt: &str) -> String {
 
 pub(super) fn strip_existing_tool_guide_context(prompt: &str) -> String {
     strip_existing_prompt_block(prompt, TOOL_GUIDE_START_MARKER, TOOL_GUIDE_END_MARKER)
+}
+
+pub(super) fn strip_existing_env_context(prompt: &str) -> String {
+    strip_existing_prompt_block(prompt, ENV_CONTEXT_START_MARKER, ENV_CONTEXT_END_MARKER)
 }
 
 fn wrap_generated_section(section: &str, start_marker: &str, end_marker: &str) -> Option<String> {

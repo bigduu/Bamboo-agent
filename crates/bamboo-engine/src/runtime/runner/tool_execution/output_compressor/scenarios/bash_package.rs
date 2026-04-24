@@ -9,6 +9,7 @@ use regex::Regex;
 
 use crate::runtime::runner::tool_execution::output_compressor::filters;
 use crate::runtime::runner::tool_execution::output_compressor::CompressionResult;
+use crate::runtime::runner::tool_execution::output_compressor::CompressionTier;
 
 /// Minimum result length (chars) before compression kicks in.
 const MIN_COMPRESS_LEN: usize = 1500;
@@ -123,7 +124,7 @@ lazy_static::lazy_static! {
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
 
-pub(crate) fn compress(raw_result: &str) -> CompressionResult {
+pub(crate) fn compress(raw_result: &str, tier: CompressionTier) -> CompressionResult {
     if raw_result.len() < MIN_COMPRESS_LEN {
         return CompressionResult {
             compressed: raw_result.to_string(),
@@ -219,7 +220,7 @@ pub(crate) fn compress(raw_result: &str) -> CompressionResult {
     }
 
     // Fallback: generic compression
-    super::bash_generic::compress(raw_result)
+    super::bash_generic::compress(raw_result, tier)
 }
 
 // ── npm ─────────────────────────────────────────────────────────────────────
@@ -697,7 +698,7 @@ added 150 packages, and audited 200 packages in 8s
 found 0 vulnerabilities
 ");
         let input = make_bash_json("npm install", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅"));
         assert!(result.compressed.contains("150 packages"));
@@ -712,7 +713,7 @@ added 100 packages in 5s
 found 5 vulnerabilities
 ");
         let input = make_bash_json("npm install", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅"));
         assert!(result.compressed.contains("100 packages"));
@@ -731,7 +732,7 @@ found 5 vulnerabilities
     Finished dev [unoptimized + debuginfo] target(s) in 12.34s
 ");
         let input = make_bash_json("cargo build", "", stderr, 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ cargo build"));
         assert!(result.compressed.contains("5 crates"));
@@ -751,7 +752,7 @@ Collecting urllib3<3,>=1.21.1
 Successfully installed certifi-2023.11.17 charset-normalizer-3.3.2 idna-3.6 requests-2.31.0 urllib3-2.1.0
 ");
         let input = make_bash_json("pip install requests", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ pip install"));
         assert!(result.compressed.contains("5 packages"));
@@ -770,7 +771,7 @@ yarn install v1.22.19
 Done in 3.5s.
 ");
         let input = make_bash_json("yarn install", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅"));
         assert!(result.compressed.contains("3.5s"));
@@ -781,7 +782,7 @@ Done in 3.5s.
     #[test]
     fn short_output_not_compressed() {
         let input = make_bash_json("npm install", "added 5 packages", "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(!result.was_compressed);
     }
 
@@ -795,7 +796,7 @@ npm ERR! Could not resolve dependency:
 npm ERR! peer react@\"^16.8.0\" from some-package@1.0.0
 ");
         let input = make_bash_json("npm install", "", stderr, 1);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("ERR!") || result.compressed.contains("ERESOLVE"));
     }
@@ -814,7 +815,7 @@ go: finding github.com/foo/bar v1.2.3
 go: extracting github.com/foo/bar v1.2.3
 ");
         let input = make_bash_json("go mod download", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ go mod:"));
         assert!(result.compressed.contains("modules downloaded"));
@@ -829,7 +830,7 @@ go: added github.com/dep/one v0.3.0
 go: added github.com/dep/two v0.7.1
 ");
         let input = make_bash_json("go get github.com/new/pkg", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ go mod:"));
         assert!(result.compressed.contains("added"));
@@ -854,7 +855,7 @@ Generating optimized autoload files
 Package manifest generated successfully.
 ");
         let input = make_bash_json("composer install", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result
             .compressed
@@ -881,7 +882,7 @@ Installing rails 7.1.3
 Bundle complete! 42 Gemfile dependencies, 120 gems now installed.
 ");
         let input = make_bash_json("bundle install", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result
             .compressed
@@ -902,7 +903,7 @@ Bundle complete! 42 Gemfile dependencies, 120 gems now installed.
 \\--- org.projectlombok:lombok:1.18.30
 ");
         let input = make_bash_json("gradle dependencies", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("Gradle dependency tree:"));
         assert!(result.compressed.contains("entries"));
@@ -919,7 +920,7 @@ Bundle complete! 42 Gemfile dependencies, 120 gems now installed.
   Restored /src/Tests/Tests.csproj (in 0.67 s).
 ");
         let input = make_bash_json("dotnet restore", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result
             .compressed

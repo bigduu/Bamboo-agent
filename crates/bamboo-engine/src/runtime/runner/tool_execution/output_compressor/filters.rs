@@ -130,6 +130,46 @@ pub(crate) fn collapse_blank_lines(input: &str) -> String {
     result
 }
 
+// ── Duplicate Line Collapse ──────────────────────────────────────────────────
+
+/// Collapse runs of identical consecutive lines into a single instance with a count.
+///
+/// When `window` or more identical lines appear consecutively, only the first
+/// occurrence is kept and a count annotation is added.
+pub(crate) fn collapse_duplicate_lines(input: &str, window: usize) -> String {
+    if window < 2 {
+        return input.to_string();
+    }
+
+    let lines: Vec<&str> = input.lines().collect();
+    let mut result = String::with_capacity(input.len());
+    let mut i = 0;
+
+    while i < lines.len() {
+        let current = lines[i];
+        let mut run_len = 1;
+
+        while i + run_len < lines.len() && lines[i + run_len] == current {
+            run_len += 1;
+        }
+
+        if run_len >= window {
+            result.push_str(current);
+            result.push('\n');
+            if run_len > 1 {
+                result.push_str(&format!("  ... ({} identical lines collapsed)\n", run_len - 1));
+            }
+            i += run_len;
+        } else {
+            result.push_str(current);
+            result.push('\n');
+            i += 1;
+        }
+    }
+
+    result
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -245,5 +285,111 @@ mod tests {
         let input = "a\nb\nc\n";
         let result = collapse_blank_lines(input);
         assert_eq!(result, "a\nb\nc\n");
+    }
+
+    // ── collapse_duplicate_lines ──
+
+    #[test]
+    fn collapse_duplicate_lines_basic() {
+        let input = "frame 1\nframe 1\nframe 1\nframe 2\n";
+        let result = collapse_duplicate_lines(&input, 3);
+        assert!(result.contains("2 identical lines collapsed"));
+        assert!(result.contains("frame 1\n"));
+        assert!(result.contains("frame 2"));
+    }
+
+    #[test]
+    fn collapse_duplicate_lines_below_window() {
+        let input = "a\na\nb\n";
+        let result = collapse_duplicate_lines(&input, 3);
+        assert!(!result.contains("collapsed"));
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn collapse_duplicate_lines_no_duplicates() {
+        let input = "a\nb\nc\n";
+        let result = collapse_duplicate_lines(input, 2);
+        assert!(!result.contains("collapsed"));
+    }
+
+    #[test]
+    fn collapse_duplicate_lines_stacked_frames() {
+        let mut input = String::new();
+        for _ in 0..50 {
+            input.push_str("    at foo::bar::baz (src/lib.rs:42)\n");
+        }
+        input.push_str("    at main (src/main.rs:10)\n");
+        let result = collapse_duplicate_lines(&input, 3);
+        assert!(result.contains("49 identical lines collapsed"));
+        assert!(result.contains("at main"));
+    }
+
+    // ── Edge cases ──
+
+    #[test]
+    fn collapse_duplicate_lines_empty_input() {
+        let result = collapse_duplicate_lines("", 3);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn collapse_duplicate_lines_single_line() {
+        let result = collapse_duplicate_lines("hello\n", 3);
+        assert_eq!(result, "hello\n");
+    }
+
+    #[test]
+    fn collapse_duplicate_lines_window_1() {
+        // Window < 2 is a no-op (guard clause)
+        let result = collapse_duplicate_lines("a\na\n", 1);
+        assert_eq!(result, "a\na\n");
+    }
+
+    #[test]
+    fn collapse_duplicate_lines_multiple_groups() {
+        let input = "x\nx\nx\ny\nz\nz\nz\n";
+        let result = collapse_duplicate_lines(&input, 3);
+        assert!(result.contains("2 identical lines collapsed"));
+        assert!(result.contains("x\n"));
+        assert!(result.contains("y"));
+        assert!(result.contains("z\n"));
+    }
+
+    #[test]
+    fn collapse_duplicate_lines_preserves_non_duplicate_content() {
+        let input = "line 1\nline 2\nline 3\nline 4\n";
+        let result = collapse_duplicate_lines(&input, 3);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn strip_ansi_empty() {
+        assert_eq!(strip_ansi(""), "");
+    }
+
+    #[test]
+    fn strip_ansi_no_ansi() {
+        assert_eq!(strip_ansi("plain text"), "plain text");
+    }
+
+    #[test]
+    fn strip_ansi_mixed_codes() {
+        let input = "\x1b[1;32;40mbold green on black\x1b[0m normal";
+        assert_eq!(strip_ansi(input), "bold green on black normal");
+    }
+
+    #[test]
+    fn cap_lines_empty() {
+        let (result, capped) = cap_lines("", 10);
+        assert!(!capped);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn cap_bytes_empty() {
+        let (result, capped) = cap_bytes("", 100);
+        assert!(!capped);
+        assert!(result.is_empty());
     }
 }

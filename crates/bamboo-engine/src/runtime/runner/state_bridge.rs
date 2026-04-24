@@ -13,6 +13,7 @@ const METADATA_KEY: &str = "agent.runtime.state";
 /// Read `AgentRuntimeState` from session.
 ///
 /// Tries the structured field first, falls back to the metadata key.
+#[allow(dead_code)]
 pub fn read_runtime_state(session: &Session) -> Option<AgentRuntimeState> {
     session.agent_runtime_state.clone().or_else(|| {
         session

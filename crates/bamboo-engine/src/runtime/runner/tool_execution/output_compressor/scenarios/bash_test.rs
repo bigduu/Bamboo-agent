@@ -8,6 +8,7 @@ use regex::Regex;
 
 use crate::runtime::runner::tool_execution::output_compressor::filters;
 use crate::runtime::runner::tool_execution::output_compressor::CompressionResult;
+use crate::runtime::runner::tool_execution::output_compressor::CompressionTier;
 
 type TestCompressorFn = fn(&str, &str, i64) -> Option<(String, String)>;
 
@@ -16,7 +17,8 @@ const MIN_COMPRESS_LEN: usize = 1500;
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
 
-pub(crate) fn compress(raw_result: &str) -> CompressionResult {
+pub(crate) fn compress(raw_result: &str, tier: CompressionTier) -> CompressionResult {
+    let _ = tier;
     if raw_result.len() < MIN_COMPRESS_LEN {
         return CompressionResult {
             compressed: raw_result.to_string(),
@@ -98,6 +100,11 @@ lazy_static::lazy_static! {
     static ref TEST_LINE_OK_RE: Regex = Regex::new(
         r"^test\s+\S+\s+\.\.\.\s+ok$"
     ).expect("test ok regex");
+
+    /// Captures test name from: `test some::module::name ... ok`
+    static ref TEST_NAME_OK_RE: Regex = Regex::new(
+        r"(?m)^test\s+(\S+)\s+\.\.\.\s+ok$"
+    ).expect("test name capture regex");
 
     /// Matches: `running N tests` or `running N test`
     static ref RUNNING_RE: Regex = Regex::new(
@@ -228,6 +235,25 @@ fn try_compress_cargo_test(stdout: &str, stderr: &str, exit_code: i64) -> Option
         }
         if !time_str.is_empty() {
             summary.push_str(&format!(" ({})", time_str));
+        }
+
+        // Append test names (comma-separated, capped at 200 chars)
+        let names: Vec<&str> = TEST_NAME_OK_RE
+            .captures_iter(&combined)
+            .filter_map(|c| c.get(1).map(|m| m.as_str()))
+            .collect();
+        if !names.is_empty() {
+            summary.push_str("\nTests: ");
+            let names_start = summary.len();
+            let max_len = 200;
+            for (idx, name) in names.iter().enumerate() {
+                let entry = if idx == 0 { name.to_string() } else { format!(", {}", name) };
+                if summary.len() + entry.len() - names_start > max_len {
+                    summary.push_str(&format!(", ... ({} more)", names.len() - idx));
+                    break;
+                }
+                summary.push_str(&entry);
+            }
         }
 
         // Keep only meaningful compiler warnings from stderr (drop test progress noise)
@@ -366,7 +392,7 @@ fn try_compress_pytest(stdout: &str, stderr: &str, exit_code: i64) -> Option<(St
     // Extract failure sections: keep everything between `_ test_name _` headers
     let mut in_failure = false;
     let mut failure_lines = 0u32;
-    let max_failure_lines: u32 = 50;
+    let max_failure_lines: u32 = 100;
 
     for line in combined.lines() {
         if PYTEST_FAILURE_HEADER_RE.is_match(line) {
@@ -786,13 +812,15 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
         let full_stdout = format!("{}{}", stdout, padding);
         let input = make_bash_json(&full_stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
 
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ 3 tests passed"));
         assert!(result.compressed.contains("0.15s"));
-        // Should NOT contain individual test lines
-        assert!(!result.compressed.contains("foo::bar"));
+        // Should contain test names in the summary
+        assert!(result.compressed.contains("foo::bar"));
+        assert!(result.compressed.contains("foo::baz"));
+        assert!(result.compressed.contains("foo::qux"));
     }
 
     #[test]
@@ -810,7 +838,7 @@ test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; fini
         let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
         let full_stdout = format!("{}{}", stdout, padding);
         let input = make_bash_json(&full_stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
 
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ 3 tests passed"));
@@ -841,7 +869,7 @@ test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
         let full_stdout = format!("{}{}", stdout, padding);
         let input = make_bash_json(&full_stdout, "", 1);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
 
         assert!(result.was_compressed);
         // Should keep FAILED lines and failure details
@@ -875,7 +903,7 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
         let full_stdout = format!("{}{}", stdout, padding);
         let input = make_bash_json(&full_stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
 
         assert!(result.was_compressed);
         // Should aggregate: 2 + 3 = 5 passed
@@ -886,7 +914,7 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     fn short_output_not_compressed() {
         let stdout = "running 1 test\ntest x ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
         let input = make_bash_json(stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
 
         // Below MIN_COMPRESS_LEN → no compression
         assert!(!result.was_compressed);
@@ -897,7 +925,7 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         // Output that doesn't look like cargo test at all — exceeds DEFAULT_MAX_LINES
         let big_stdout = "some random output\n".repeat(500);
         let input = make_bash_json(&big_stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
 
         // Should cap lines as fallback since no cargo test summary found
         assert!(result.was_compressed);
@@ -906,7 +934,7 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     #[test]
     fn invalid_json_passthrough() {
         let input = "not valid json at all but long enough to trigger ".repeat(50);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(!result.was_compressed);
     }
 
@@ -1023,7 +1051,7 @@ tests/test_utils.py::test_join PASSED
 ========================= 15 passed in 1.23s ==========================
 ");
         let input = make_bash_json_cmd("pytest", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ pytest: 15 passed"));
         assert!(result.compressed.contains("1.23s"));
@@ -1055,7 +1083,7 @@ FAILED tests/test_auth.py::test_token
 ========================= 1 failed, 2 passed in 0.45s =========================
 ");
         let input = make_bash_json_cmd("pytest", stdout, "", 1);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("❌ pytest: 1 failed, 2 passed"));
         assert!(result.compressed.contains("0.45s"));
@@ -1070,7 +1098,7 @@ FAILED tests/test_auth.py::test_token
 ========================= 8 passed, 3 skipped in 2.10s ==========================
 ");
         let input = make_bash_json_cmd("pytest -v", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ pytest: 8 passed, 3 skipped"));
     }
@@ -1090,7 +1118,7 @@ Snapshots:   0 total
 Time:        4.567 s
 ");
         let input = make_bash_json_cmd("npx jest", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ jest: 25 passed"));
         assert!(result.compressed.contains("4.567 s"));
@@ -1114,7 +1142,7 @@ Snapshots:   0 total
 Time:        5.123 s
 ");
         let input = make_bash_json_cmd("npm test", stdout, "", 1);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("❌ jest: 1 failed, 24 passed"));
         // Should keep failure details
@@ -1139,7 +1167,7 @@ ok      github.com/foo/mathlib      0.023s
 ok      github.com/foo/utils        0.015s
 ");
         let input = make_bash_json_cmd("go test ./...", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ go test: 4 passed"));
         assert!(result.compressed.contains("2 packages ok"));
@@ -1157,7 +1185,7 @@ FAIL    github.com/foo/mathlib      0.034s
 ok      github.com/foo/utils        0.015s
 ");
         let input = make_bash_json_cmd("go test ./...", stdout, "", 1);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("❌ go test: 1 failed, 1 passed"));
         // Should keep failure details
@@ -1184,7 +1212,7 @@ ok      github.com/foo/utils        0.015s
 Tests run: 23, Failures: 0, Errors: 0, Skipped: 2
 ");
         let input = make_bash_json_cmd("mvn test", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ surefire:"));
         // Sum: 15+8+23 run, but we should get aggregated totals
@@ -1209,7 +1237,7 @@ Tests in error:
 [INFO] BUILD FAILURE
 ");
         let input = make_bash_json_cmd("mvn test", stdout, "", 1);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("❌ surefire:"));
         assert!(result.compressed.contains("2 failures"));
@@ -1217,5 +1245,152 @@ Tests in error:
         // Should keep failure details
         assert!(result.compressed.contains("testLogin"));
         assert!(result.compressed.contains("testTimeout"));
+    }
+
+    // ── Edge cases ──
+
+    #[test]
+    fn empty_stdout_stderr() {
+        let input = make_bash_json("", "", 0);
+        let result = compress(&input, CompressionTier::Standard);
+        // Below MIN_COMPRESS_LEN → not compressed
+        assert!(!result.was_compressed);
+    }
+
+    #[test]
+    fn cargo_test_zero_tests() {
+        let stdout = "\
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+";
+        let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
+        let full_stdout = format!("{}{}", stdout, padding);
+        let input = make_bash_json(&full_stdout, "", 0);
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(result.was_compressed);
+        assert!(result.compressed.contains("0 tests passed"));
+    }
+
+    #[test]
+    fn cargo_test_many_names_truncated() {
+        let mut stdout = String::from("running 50 tests\n");
+        for i in 0..50 {
+            stdout.push_str(&format!("test module::test_case_name_{}_with_long_name ... ok\n", i));
+        }
+        stdout.push_str("\ntest result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n");
+        let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
+        let full_stdout = format!("{}{}", stdout, padding);
+        let input = make_bash_json(&full_stdout, "", 0);
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(result.was_compressed);
+        assert!(result.compressed.contains("50 tests passed"));
+        // Should have test names but truncated due to 200-char limit
+        assert!(result.compressed.contains("Tests:"));
+        assert!(result.compressed.contains("... (") || result.compressed.contains("more)"));
+    }
+
+    #[test]
+    fn cargo_test_all_ignored() {
+        let stdout = "\
+running 3 tests
+test a ... ignored
+test b ... ignored
+test c ... ignored
+
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+";
+        let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
+        let full_stdout = format!("{}{}", stdout, padding);
+        let input = make_bash_json(&full_stdout, "", 0);
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(result.was_compressed);
+        assert!(result.compressed.contains("0 tests passed"));
+        assert!(result.compressed.contains("3 ignored"));
+    }
+
+    #[test]
+    fn cargo_test_failure_without_failures_section() {
+        // Some failures have no "failures:" section (e.g. compile errors in tests)
+        let stdout = "\
+running 1 test
+test foo::bar ... FAILED
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+";
+        let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
+        let full_stdout = format!("{}{}", stdout, padding);
+        let input = make_bash_json(&full_stdout, "", 101);
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(result.was_compressed);
+        assert!(result.compressed.contains("FAILED"));
+    }
+
+    #[test]
+    fn multiple_test_binaries_mixed_pass_fail() {
+        let stdout = "\
+running 2 tests
+test lib_a::x ... ok
+test lib_a::y ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+running 2 tests
+test lib_b::a ... ok
+test lib_b::b ... FAILED
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+";
+        let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
+        let full_stdout = format!("{}{}", stdout, padding);
+        let input = make_bash_json(&full_stdout, "", 101);
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(result.was_compressed);
+        // Should show aggregated: 3 passed, 1 failed
+        assert!(result.compressed.contains("FAILED"));
+    }
+
+    #[test]
+    fn pytest_all_pass_no_test_lines() {
+        // pytest summary only, no individual test lines
+        let stdout = &pad("\
+========================= 5 passed in 0.12s ==========================
+");
+        let input = make_bash_json_cmd("pytest", stdout, "", 0);
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(result.was_compressed);
+        assert!(result.compressed.contains("✅ pytest: 5 passed"));
+    }
+
+    #[test]
+    fn jest_zero_tests() {
+        let stdout = &pad("\
+Test Suites: 0 total
+Tests:       0 total
+Snapshots:   0 total
+Time:        0.001 s
+");
+        let input = make_bash_json_cmd("npx jest", stdout, "", 0);
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(result.was_compressed);
+        assert!(result.compressed.contains("0 passed"));
+    }
+
+    #[test]
+    fn go_test_all_fail() {
+        let stdout = &pad("\
+=== RUN   TestFoo
+--- FAIL: TestFoo (0.00s)
+    foo_test.go:10: unexpected value
+=== RUN   TestBar
+--- FAIL: TestBar (0.00s)
+    bar_test.go:20: wrong result
+FAIL    github.com/example/pkg
+");
+        let input = make_bash_json_cmd("go test ./...", stdout, "", 1);
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(result.was_compressed);
+        assert!(result.compressed.contains("2 failed"));
+        assert!(result.compressed.contains("0 passed"));
     }
 }

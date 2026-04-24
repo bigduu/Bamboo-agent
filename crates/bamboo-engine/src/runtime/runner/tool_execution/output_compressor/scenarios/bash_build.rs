@@ -9,6 +9,7 @@ use regex::Regex;
 
 use crate::runtime::runner::tool_execution::output_compressor::filters;
 use crate::runtime::runner::tool_execution::output_compressor::CompressionResult;
+use crate::runtime::runner::tool_execution::output_compressor::CompressionTier;
 
 /// Minimum result length (chars) before compression kicks in.
 const MIN_COMPRESS_LEN: usize = 1500;
@@ -218,7 +219,7 @@ lazy_static::lazy_static! {
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
 
-pub(crate) fn compress(raw_result: &str) -> CompressionResult {
+pub(crate) fn compress(raw_result: &str, tier: CompressionTier) -> CompressionResult {
     if raw_result.len() < MIN_COMPRESS_LEN {
         return CompressionResult {
             compressed: raw_result.to_string(),
@@ -278,7 +279,7 @@ pub(crate) fn compress(raw_result: &str) -> CompressionResult {
     }
 
     // Fallback: use generic compression
-    super::bash_generic::compress(raw_result)
+    super::bash_generic::compress(raw_result, tier)
 }
 
 // ── Rust Build (cargo check / clippy) ───────────────────────────────────────
@@ -382,9 +383,8 @@ fn extract_rust_diagnostics(text: &str, severity: &str) -> String {
     result
 }
 
-/// Produce a brief summary of warnings (just counts, not full text).
+/// Produce a brief summary of warnings grouped by message with counts.
 fn count_rust_warnings(text: &str) -> String {
-    // Collect unique warning messages
     let warnings: Vec<String> = RUST_DIAG_RE
         .captures_iter(text)
         .filter(|c| &c[1] == "warning")
@@ -395,23 +395,25 @@ fn count_rust_warnings(text: &str) -> String {
         return String::new();
     }
 
-    if warnings.len() <= 5 {
-        let mut result = String::from("Warnings:\n");
-        for w in &warnings {
-            result.push_str(&format!("  ⚠️ {}\n", w));
+    // Group by message, count occurrences
+    let mut groups: Vec<(String, usize)> = Vec::new();
+    for w in &warnings {
+        if let Some(entry) = groups.iter_mut().find(|(msg, _)| msg == w) {
+            entry.1 += 1;
+        } else {
+            groups.push((w.clone(), 1));
         }
-        result
-    } else {
-        format!(
-            "Warnings: {} total (showing first 5)\n{}",
-            warnings.len(),
-            warnings[..5]
-                .iter()
-                .map(|w| format!("  ⚠️ {}", w))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
     }
+
+    let mut result = String::from("Warnings:\n");
+    for (msg, count) in &groups {
+        if *count > 1 {
+            result.push_str(&format!("  ⚠️ {} (×{})\n", msg, count));
+        } else {
+            result.push_str(&format!("  ⚠️ {}\n", msg));
+        }
+    }
+    result
 }
 
 // ── TypeScript (tsc) ────────────────────────────────────────────────────────
@@ -1135,7 +1137,7 @@ mod tests {
     fn rust_clean_build() {
         let stderr = &pad("   Compiling foo v0.1.0\n   Compiling bar v0.2.0\n    Checking baz v0.3.0\n    Finished dev [unoptimized + debuginfo] target(s) in 2.34s\n");
         let input = make_bash_json("", stderr, 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ Build clean"));
     }
@@ -1154,7 +1156,7 @@ warning: unused variable `x`
     Finished dev [unoptimized + debuginfo] target(s)
 ");
         let input = make_bash_json("", stderr, 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("⚠️"));
         assert!(result.compressed.contains("warning"));
@@ -1173,7 +1175,7 @@ error[E0308]: mismatched types
 error: could not compile `foo` (bin \"foo\") due to 1 previous error
 ");
         let input = make_bash_json("", stderr, 1);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("❌"));
         assert!(result.compressed.contains("error"));
@@ -1188,7 +1190,7 @@ error: could not compile `foo` (bin \"foo\") due to 1 previous error
         // But if there's enough volume to trigger compression:
         let stdout = &pad("");
         let input = make_bash_json(stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         // Below threshold or no tsc patterns → falls through to generic
         // This is expected behavior
         assert!(!result.compressed.is_empty());
@@ -1204,7 +1206,7 @@ src/utils.ts(3,1): error TS1005: ';' expected.
 Found 3 errors in 2 files.
 ");
         let input = make_bash_json(stdout, "", 1);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("❌ tsc: 3 errors"));
         assert!(result.compressed.contains("TS2304"));
@@ -1226,7 +1228,7 @@ Found 3 errors in 2 files.
 ✖ 3 problems (2 errors, 1 warning)
 ");
         let input = make_bash_json(stdout, "", 1);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("error"));
         assert!(result.compressed.contains("no-var") || result.compressed.contains("problems"));
@@ -1237,14 +1239,14 @@ Found 3 errors in 2 files.
     #[test]
     fn short_output_not_compressed() {
         let input = make_bash_json("ok", "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(!result.was_compressed);
     }
 
     #[test]
     fn plain_text_fallback() {
         let big = "error line\n".repeat(300);
-        let result = compress(&big);
+        let result = compress(&big, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("lines omitted"));
     }
@@ -1284,7 +1286,7 @@ Found 3 errors in 2 files.
 [INFO] ------------------------------------------------------------------------
 ");
         let input = make_bash_json_cmd("mvn clean install", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed, "Maven output should be compressed");
         assert!(result.compressed.contains("✅ Maven BUILD SUCCESS"));
         assert!(result.compressed.contains("12.345 s"));
@@ -1316,7 +1318,7 @@ Found 3 errors in 2 files.
 [INFO] Total time:  3.456 s
 ");
         let input = make_bash_json_cmd("mvn compile", stdout, "", 1);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("❌ Maven BUILD FAILURE"));
         assert!(result.compressed.contains("3.456 s"));
@@ -1349,7 +1351,7 @@ Found 3 errors in 2 files.
         stdout.push_str("[INFO] Total time:  45.678 s\n");
 
         let input = make_bash_json_cmd("mvn clean install", &stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ Maven BUILD SUCCESS"));
         assert!(result
@@ -1371,7 +1373,7 @@ Tests run: 35, Failures: 2, Errors: 1, Skipped: 0
 [ERROR] There are test failures.
 ");
         let input = make_bash_json_cmd("mvn test", stdout, "", 1);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("❌ Maven BUILD FAILURE"));
         // Aggregate test counts: 20+35=55 run, 0+2=2 failures, 0+1=1 errors, 1+0=1 skipped
@@ -1400,7 +1402,7 @@ BUILD SUCCESSFUL in 12s
 8 actionable tasks: 8 executed
 ");
         let input = make_bash_json_cmd("gradle build", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ Gradle BUILD SUCCESSFUL"));
         assert!(result.compressed.contains("12s"));
@@ -1422,7 +1424,7 @@ BUILD FAILED in 5s
 2 actionable tasks: 1 executed, 1 failed
 ");
         let input = make_bash_json_cmd("./gradlew build", stdout, "", 1);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("❌ Gradle BUILD FAILED"));
         // Errors should be kept
@@ -1444,7 +1446,7 @@ BUILD FAILED in 5s
         stdout.push_str("2 actionable tasks: 2 executed\n");
 
         let input = make_bash_json_cmd("gradle build", &stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ Gradle BUILD SUCCESSFUL"));
         assert!(result
@@ -1481,7 +1483,7 @@ Successfully built eee555fff666
 Successfully tagged myapp:latest
 ");
         let input = make_bash_json_cmd("docker build -t myapp:latest .", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result
             .compressed
@@ -1511,7 +1513,7 @@ Step 3/5 : RUN apt-get install -y missing-package
 The command '/bin/sh -c apt-get install -y missing-package' returned a non-zero code: 100
 ");
         let input = make_bash_json_cmd("docker build .", stdout, "", 1);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("❌ Docker build failed"));
         // Error details should be kept
@@ -1537,7 +1539,7 @@ Build succeeded.
 Time Elapsed 00:00:03.45
 ");
         let input = make_bash_json_cmd("dotnet build", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ dotnet build succeeded"));
         assert!(result.compressed.contains("NuGet restore lines stripped"));
@@ -1557,7 +1559,7 @@ Build FAILED.
     1 Error(s)
 ");
         let input = make_bash_json_cmd("dotnet build", stdout, "", 1);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("❌ dotnet build FAILED"));
         assert!(result.compressed.contains("1 warnings"));
@@ -1599,7 +1601,7 @@ Terraform will perform the following actions:
 Plan: 2 to add, 1 to change, 0 to destroy.
 ");
         let input = make_bash_json_cmd("terraform plan", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result
             .compressed
@@ -1629,7 +1631,7 @@ aws_s3_bucket.data: Creation complete after 2s [id=my-data-bucket]
 Apply complete! Resources: 2 added, 0 changed, 0 destroyed.
 ");
         let input = make_bash_json_cmd("terraform apply -auto-approve", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result
             .compressed
@@ -1644,8 +1646,101 @@ No changes. Your infrastructure matches the configuration.
 Plan: 0 to add, 0 to change, 0 to destroy.
 ");
         let input = make_bash_json_cmd("terraform plan", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅ Terraform plan: no changes"));
+    }
+
+    #[test]
+    fn warnings_grouped_by_message() {
+        let stderr = "\
+warning: unused variable `x`
+warning: unused variable `y`
+warning: unused variable `z`
+warning: dead code
+warning: dead code
+warning: dead code
+warning: dead code
+";
+        let result = count_rust_warnings(stderr);
+        assert!(result.contains("unused variable `x`"));
+        assert!(result.contains("dead code (×4)"));
+        // Each unique message should appear once with count
+        assert!(!result.contains("unused variable `x` (×"));
+    }
+
+    // ── Edge cases ──
+
+    #[test]
+    fn empty_build_output_not_compressed() {
+        let input = make_bash_json_cmd("cargo check", "", "", 0);
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(!result.was_compressed);
+    }
+
+    #[test]
+    fn build_no_warnings_no_errors_clean() {
+        let stderr = &pad("\
+   Compiling my-crate v0.1.0
+   Checking my-crate v0.1.0
+    Finished dev [unoptimized + debuginfo] target(s) in 2.34s
+");
+        let input = make_bash_json_cmd("cargo check", "", stderr, 0);
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(result.was_compressed);
+        assert!(result.compressed.contains("Build clean"));
+    }
+
+    #[test]
+    fn count_rust_warnings_empty() {
+        let result = count_rust_warnings("no warnings here");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn count_rust_warnings_single_warning() {
+        let result = count_rust_warnings("warning: unused variable `x`");
+        assert!(result.contains("unused variable `x`"));
+        // Single warning should NOT have (×N)
+        assert!(!result.contains("(×"));
+    }
+
+    #[test]
+    fn warnings_grouped_all_same() {
+        let stderr = "\
+warning: unused variable `x`
+warning: unused variable `x`
+warning: unused variable `x`
+warning: unused variable `x`
+warning: unused variable `x`
+";
+        let result = count_rust_warnings(stderr);
+        assert!(result.contains("unused variable `x` (×5)"));
+        // Should appear only once
+        assert_eq!(result.matches("unused variable").count(), 1);
+    }
+
+    #[test]
+    fn build_with_errors_preserves_error_context() {
+        let stderr = &pad("\
+error[E0425]: cannot find value `x` in this scope
+  --> src/main.rs:4:5
+   |
+4  |     x
+   |     ^ not found in this scope
+
+error: aborting due to 1 previous error
+");
+        let input = make_bash_json_cmd("cargo check", "", stderr, 1);
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(result.was_compressed);
+        let parsed: serde_json::Value = serde_json::from_str(&result.compressed).unwrap();
+        // The error summary is stored in the JSON envelope
+        let output = format!(
+            "{} {}",
+            parsed["stdout"].as_str().unwrap_or(""),
+            parsed["stderr"].as_str().unwrap_or("")
+        );
+        assert!(output.contains("error") || output.contains("Error") || output.contains("❌"));
     }
 }

@@ -232,6 +232,8 @@ pub(super) async fn execute_llm_stream(
         truncation_occurred: prepared_context.truncation_occurred,
         segments_removed: prepared_context.segments_removed,
         prompt_cached_tool_outputs: prepared_context.prompt_cached_tool_outputs,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
     };
 
     session.token_usage = Some(usage.clone());
@@ -252,6 +254,23 @@ pub(super) async fn execute_llm_stream(
         session_id,
     )
     .await?;
+
+    // Update session token usage with actual output/thinking/cache stats from the LLM response.
+    if let Some(ref mut usage) = session.token_usage {
+        usage.thinking_tokens = stream_output.thinking_tokens as u32;
+        usage.cache_read_input_tokens = stream_output.cache_read_input_tokens as u32;
+    }
+
+    if stream_output.cache_creation_input_tokens > 0 || stream_output.cache_read_input_tokens > 0 {
+        tracing::info!(
+            "[{}] Anthropic prompt cache: creation={}, read={}, output={}, thinking={}",
+            session_id,
+            stream_output.cache_creation_input_tokens,
+            stream_output.cache_read_input_tokens,
+            stream_output.output_tokens,
+            stream_output.thinking_tokens,
+        );
+    }
 
     if supports_previous_response_id {
         if let Some(response_id) = stream_output

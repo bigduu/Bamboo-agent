@@ -3,14 +3,14 @@ use std::sync::{Arc, Mutex};
 use super::{maybe_apply_host_context_compression, prepare_round_context};
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::tools::{FunctionCall, ToolCall};
-use bamboo_agent_core::TokenBudgetUsage;
-use bamboo_agent_core::{Message, Role, Session};
-use bamboo_compression::{BudgetStrategy, TokenBudget};
+use bamboo_agent_core::{AgentEvent, CompressionTriggerType, Message, Role, Session, TokenBudgetUsage};
+use bamboo_compression::{BudgetStrategy, TokenBudget, TokenCounter};
 use bamboo_domain::MessagePart;
 use bamboo_infrastructure::models::{ContentPart, ImageUrl};
 use bamboo_infrastructure::provider::{LLMProvider, LLMStream};
 use bamboo_infrastructure::{LLMChunk, LLMError};
 use futures::stream;
+use tokio::sync::mpsc;
 
 /// A no-op LLM provider for tests that returns an empty stream.
 struct NoopLlmProvider;
@@ -30,6 +30,15 @@ impl LLMProvider for NoopLlmProvider {
 
 fn noop_llm() -> Arc<dyn LLMProvider> {
     Arc::new(NoopLlmProvider)
+}
+
+fn system_prompt(session: &Session) -> String {
+    session
+        .messages
+        .iter()
+        .find(|m| matches!(m.role, Role::System))
+        .map(|m| m.content.clone())
+        .unwrap_or_default()
 }
 
 struct RecordingLlmProvider {
@@ -78,11 +87,14 @@ async fn maybe_apply_host_context_compression_uses_fast_model_for_summary_reques
         safety_margin: 0,
         compression_trigger_percent: 80,
         compression_target_percent: 50,
+        working_reserve_tokens: 0,
+        fallback_trigger_percent: 75,
         prompt_cache_min_tool_output_chars: 1_200,
         prompt_cache_head_chars: 280,
         prompt_cache_tail_chars: 180,
         prompt_cache_recent_user_turns: 2,
         prompt_cache_recent_tool_chains: 2,
+        max_tool_output_tokens: 0,
     });
     session.messages.push(Message::system("System prompt"));
     for index in 0..12 {
@@ -110,6 +122,8 @@ async fn maybe_apply_host_context_compression_uses_fast_model_for_summary_reques
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
     });
 
     let config = AgentLoopConfig {
@@ -169,6 +183,8 @@ async fn host_context_compression_skips_when_no_background_model_is_configured()
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
     });
 
     let config = AgentLoopConfig {
@@ -494,11 +510,14 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
         safety_margin: 0,
         compression_trigger_percent: 80,
         compression_target_percent: 50,
+        working_reserve_tokens: 0,
+        fallback_trigger_percent: 75,
         prompt_cache_min_tool_output_chars: 1_200,
         prompt_cache_head_chars: 280,
         prompt_cache_tail_chars: 180,
         prompt_cache_recent_user_turns: 2,
         prompt_cache_recent_tool_chains: 2,
+        max_tool_output_tokens: 0,
     });
     session.messages.push(Message::system("System prompt"));
     for index in 0..12 {
@@ -526,6 +545,8 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
     });
 
     let config = AgentLoopConfig {
@@ -574,11 +595,14 @@ async fn maybe_apply_host_context_compression_supports_mid_turn_phase() {
         safety_margin: 0,
         compression_trigger_percent: 80,
         compression_target_percent: 50,
+        working_reserve_tokens: 0,
+        fallback_trigger_percent: 75,
         prompt_cache_min_tool_output_chars: 1_200,
         prompt_cache_head_chars: 280,
         prompt_cache_tail_chars: 180,
         prompt_cache_recent_user_turns: 2,
         prompt_cache_recent_tool_chains: 2,
+        max_tool_output_tokens: 0,
     });
     session.messages.push(Message::system("System prompt"));
     for index in 0..12 {
@@ -606,6 +630,8 @@ async fn maybe_apply_host_context_compression_supports_mid_turn_phase() {
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
     });
 
     let config = AgentLoopConfig {
@@ -651,11 +677,14 @@ async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses
         safety_margin: 0,
         compression_trigger_percent: 80,
         compression_target_percent: 50,
+        working_reserve_tokens: 0,
+        fallback_trigger_percent: 75,
         prompt_cache_min_tool_output_chars: 1_200,
         prompt_cache_head_chars: 280,
         prompt_cache_tail_chars: 180,
         prompt_cache_recent_user_turns: 2,
         prompt_cache_recent_tool_chains: 2,
+        max_tool_output_tokens: 0,
     });
     session.messages.push(Message::system("System prompt"));
     for index in 0..12 {
@@ -685,6 +714,8 @@ async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
     });
 
     let config = AgentLoopConfig {
@@ -729,11 +760,14 @@ async fn prepare_round_context_skips_host_auto_compression_below_trigger() {
         safety_margin: 0,
         compression_trigger_percent: 80,
         compression_target_percent: 50,
+        working_reserve_tokens: 0,
+        fallback_trigger_percent: 75,
         prompt_cache_min_tool_output_chars: 1_200,
         prompt_cache_head_chars: 280,
         prompt_cache_tail_chars: 180,
         prompt_cache_recent_user_turns: 2,
         prompt_cache_recent_tool_chains: 2,
+        max_tool_output_tokens: 0,
     });
     session.messages.push(Message::system("System prompt"));
     for index in 0..4 {
@@ -757,6 +791,8 @@ async fn prepare_round_context_skips_host_auto_compression_below_trigger() {
         truncation_occurred: true,
         segments_removed: 4,
         prompt_cached_tool_outputs: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
     });
 
     let config = AgentLoopConfig {
@@ -800,11 +836,14 @@ async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
         safety_margin: 0,
         compression_trigger_percent: 95,
         compression_target_percent: 50,
+        working_reserve_tokens: 0,
+        fallback_trigger_percent: 75,
         prompt_cache_min_tool_output_chars: 1_200,
         prompt_cache_head_chars: 280,
         prompt_cache_tail_chars: 180,
         prompt_cache_recent_user_turns: 2,
         prompt_cache_recent_tool_chains: 2,
+        max_tool_output_tokens: 0,
     });
     session.messages.push(Message::system("System prompt"));
     for index in 0..12 {
@@ -832,6 +871,8 @@ async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
         truncation_occurred: false,
         segments_removed: 0,
         prompt_cached_tool_outputs: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
     });
 
     let config = AgentLoopConfig {
@@ -881,11 +922,14 @@ async fn multi_round_compression_cycle() {
         safety_margin: 0,
         compression_trigger_percent: 80,
         compression_target_percent: 50,
+        working_reserve_tokens: 0,
+        fallback_trigger_percent: 75,
         prompt_cache_min_tool_output_chars: 1_200,
         prompt_cache_head_chars: 280,
         prompt_cache_tail_chars: 180,
         prompt_cache_recent_user_turns: 2,
         prompt_cache_recent_tool_chains: 2,
+        max_tool_output_tokens: 0,
     };
     let mut session = Session::new("multi-round-compress", "test-model");
     session.token_budget = Some(budget.clone());
@@ -917,6 +961,8 @@ async fn multi_round_compression_cycle() {
         truncation_occurred: true,
         segments_removed: 3,
         prompt_cached_tool_outputs: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
     });
 
     let exposure1 = estimate_context_compression_exposure(
@@ -936,6 +982,7 @@ async fn multi_round_compression_cycle() {
         "test-model",
         session.token_budget.as_ref(),
         "Summary of rounds 0-7: user asked many questions, assistant analyzed files.".to_string(),
+        CompressionTriggerType::Auto,
     )
     .expect("first compression plan should succeed");
 
@@ -992,6 +1039,8 @@ async fn multi_round_compression_cycle() {
         truncation_occurred: true,
         segments_removed: 2,
         prompt_cached_tool_outputs: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
     });
 
     // ---- Compress round 2 (anchor_index == 0 or small) ----
@@ -1003,6 +1052,7 @@ async fn multi_round_compression_cycle() {
             "Updated summary: rounds 0-7 summarized earlier (user_count_after_first={}). Follow-up rounds 8-13 added.",
             user_count_after_1
         ),
+        CompressionTriggerType::Auto,
     )
     .expect("second compression plan should succeed (anchor_index fix)");
 
@@ -1018,5 +1068,315 @@ async fn multi_round_compression_cycle() {
     assert!(
         session.token_usage.is_some(),
         "token_usage should be preserved after second compression"
+    );
+}
+
+#[tokio::test]
+async fn five_level_degradation_strips_in_order() {
+    let mut session = Session::new("session-5-level-degrade", "test-model");
+    session.messages.push(Message::system(
+        "Base prompt\n\
+         <!-- BAMBOO_ENV_CONTEXT_START -->\nenv info\n<!-- BAMBOO_ENV_CONTEXT_END -->\n\
+         <!-- BAMBOO_TASK_LIST_START -->\ntask items\n<!-- BAMBOO_TASK_LIST_END -->\n\
+         <!-- BAMBOO_EXTERNAL_MEMORY_START -->\nmemory notes\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->\n\
+         <!-- BAMBOO_SKILL_CONTEXT_START -->\nskill details\n<!-- BAMBOO_SKILL_CONTEXT_END -->\n\
+         <!-- BAMBOO_TOOL_GUIDE_START -->\nguide details\n<!-- BAMBOO_TOOL_GUIDE_END -->"
+            .to_string(),
+    ));
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+    let llm = noop_llm();
+
+    // 1st call: strips tool_guide
+    let applied = super::force_overflow_context_recovery(
+        &mut session, &config, "test-model", "session-5-level-degrade", &llm, None,
+    )
+    .await
+    .expect("first degradation");
+    assert!(applied);
+    let prompt = system_prompt(&session);
+    assert!(!prompt.contains("BAMBOO_TOOL_GUIDE"));
+    assert!(prompt.contains("BAMBOO_SKILL_CONTEXT"));
+
+    // 2nd call: strips skill_context
+    let applied = super::force_overflow_context_recovery(
+        &mut session, &config, "test-model", "session-5-level-degrade", &llm, None,
+    )
+    .await
+    .expect("second degradation");
+    assert!(applied);
+    let prompt = system_prompt(&session);
+    assert!(!prompt.contains("BAMBOO_SKILL_CONTEXT"));
+    assert!(prompt.contains("BAMBOO_EXTERNAL_MEMORY"));
+
+    // 3rd call: strips external_memory
+    let applied = super::force_overflow_context_recovery(
+        &mut session, &config, "test-model", "session-5-level-degrade", &llm, None,
+    )
+    .await
+    .expect("third degradation");
+    assert!(applied);
+    let prompt = system_prompt(&session);
+    assert!(!prompt.contains("BAMBOO_EXTERNAL_MEMORY"));
+    assert!(prompt.contains("BAMBOO_TASK_LIST"));
+
+    // 4th call: strips task_list
+    let applied = super::force_overflow_context_recovery(
+        &mut session, &config, "test-model", "session-5-level-degrade", &llm, None,
+    )
+    .await
+    .expect("fourth degradation");
+    assert!(applied);
+    let prompt = system_prompt(&session);
+    assert!(!prompt.contains("BAMBOO_TASK_LIST"));
+    assert!(prompt.contains("BAMBOO_ENV_CONTEXT"));
+
+    // 5th call: strips env_context
+    let applied = super::force_overflow_context_recovery(
+        &mut session, &config, "test-model", "session-5-level-degrade", &llm, None,
+    )
+    .await
+    .expect("fifth degradation");
+    assert!(applied);
+    let prompt = system_prompt(&session);
+    assert!(!prompt.contains("BAMBOO_ENV_CONTEXT"));
+    assert!(prompt.contains("Base prompt"));
+}
+
+#[tokio::test]
+async fn degradation_returns_none_when_all_sections_already_stripped() {
+    let mut session = Session::new("session-degrade-none", "test-model");
+    session.messages.push(Message::system("Just base prompt".to_string()));
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+    let llm = noop_llm();
+
+    // All sections already absent — should fall through to LLM summarization path
+    // but with a small session it won't have enough messages, so it returns Ok(false).
+    let applied = super::force_overflow_context_recovery(
+        &mut session, &config, "test-model", "session-degrade-none", &llm, None,
+    )
+    .await
+    .expect("no degradation");
+    assert!(!applied);
+    assert_eq!(system_prompt(&session), "Just base prompt");
+}
+
+#[tokio::test]
+async fn degradation_skips_missing_sections() {
+    let mut session = Session::new("session-degrade-skip", "test-model");
+    // Only env_context present — tool_guide, skill, external_memory, task_list are absent
+    session.messages.push(Message::system(
+        "Base prompt\n\
+         <!-- BAMBOO_ENV_CONTEXT_START -->\nenv info\n<!-- BAMBOO_ENV_CONTEXT_END -->"
+            .to_string(),
+    ));
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+    let llm = noop_llm();
+
+    let applied = super::force_overflow_context_recovery(
+        &mut session, &config, "test-model", "session-degrade-skip", &llm, None,
+    )
+    .await
+    .expect("skip absent sections");
+    assert!(applied);
+    let prompt = system_prompt(&session);
+    assert!(!prompt.contains("BAMBOO_ENV_CONTEXT"));
+    assert!(prompt.contains("Base prompt"));
+}
+
+#[tokio::test]
+async fn pre_summarization_degradation_skips_llm_for_auto_triggered_compression() {
+    // When auto-triggered (non-critical, non-manual), degradation should skip
+    // the expensive LLM summarization if a section can be stripped.
+    // Use a large budget so actual token counting stays well below 98% critical.
+    let mut session = Session::new("session-presummarize-skip", "test-model");
+    session.token_budget = Some(TokenBudget {
+        max_context_tokens: 100_000,
+        max_output_tokens: 200,
+        strategy: BudgetStrategy::Hybrid {
+            window_size: 20,
+            enable_summarization: true,
+        },
+        safety_margin: 0,
+        compression_trigger_percent: 80,
+        compression_target_percent: 50,
+        working_reserve_tokens: 0,
+        fallback_trigger_percent: 75,
+        prompt_cache_min_tool_output_chars: 1_200,
+        prompt_cache_head_chars: 280,
+        prompt_cache_tail_chars: 180,
+        prompt_cache_recent_user_turns: 2,
+        prompt_cache_recent_tool_chains: 2,
+        max_tool_output_tokens: 0,
+    });
+    session.messages.push(Message::system(
+        "Base prompt\n\
+         <!-- BAMBOO_TOOL_GUIDE_START -->\nguide details\n<!-- BAMBOO_TOOL_GUIDE_END -->"
+            .to_string(),
+    ));
+    for index in 0..12 {
+        session.messages.push(Message::user(format!(
+            "User message {} {}",
+            index,
+            "alpha beta gamma delta epsilon zeta ".repeat(8)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "Assistant response {} {}",
+                index,
+                "analysis plan files checks and next steps ".repeat(8)
+            ),
+            None,
+        ));
+    }
+    // 85% usage with a large budget — triggers auto (80%) but NOT critical (98%).
+    // Real token count of 24 short messages is ~4-5K, well under 98K.
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: 100,
+        summary_tokens: 0,
+        window_tokens: 80_000,
+        total_tokens: 85_000,
+        max_context_tokens: 100_000,
+        budget_limit: 100_000,
+        truncation_occurred: true,
+        segments_removed: 8,
+        prompt_cached_tool_outputs: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
+    });
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+    let (llm, models) = recording_llm();
+
+    let applied = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "session-presummarize-skip",
+        &[],
+        &llm,
+        None,
+        "pre-turn",
+    )
+    .await
+    .expect("pre-summarization degradation");
+
+    assert!(applied, "degradation should succeed");
+    assert!(
+        !system_prompt(&session).contains("BAMBOO_TOOL_GUIDE"),
+        "tool guide should be stripped"
+    );
+    let recorded = models.lock().expect("models lock");
+    assert!(
+        recorded.is_empty(),
+        "LLM should NOT be called when degradation handles it"
+    );
+}
+
+#[tokio::test]
+async fn tokens_saved_is_computed_from_compressed_messages() {
+    let mut session = Session::new("session-tokens-saved", "test-model");
+    session.token_budget = Some(TokenBudget {
+        max_context_tokens: 100_000,
+        max_output_tokens: 200,
+        strategy: BudgetStrategy::Hybrid {
+            window_size: 20,
+            enable_summarization: true,
+        },
+        safety_margin: 0,
+        compression_trigger_percent: 80,
+        compression_target_percent: 50,
+        working_reserve_tokens: 0,
+        fallback_trigger_percent: 75,
+        prompt_cache_min_tool_output_chars: 1_200,
+        prompt_cache_head_chars: 280,
+        prompt_cache_tail_chars: 180,
+        prompt_cache_recent_user_turns: 2,
+        prompt_cache_recent_tool_chains: 2,
+        max_tool_output_tokens: 0,
+    });
+    session.messages.push(Message::system("System prompt"));
+    for index in 0..12 {
+        session.messages.push(Message::user(format!(
+            "User message {} {}",
+            index,
+            "alpha beta gamma delta epsilon zeta ".repeat(8)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "Assistant response {} {}",
+                index,
+                "analysis plan files checks and next steps ".repeat(8)
+            ),
+            None,
+        ));
+    }
+    session.token_usage = Some(bamboo_agent_core::TokenBudgetUsage {
+        system_tokens: 100,
+        summary_tokens: 0,
+        window_tokens: 80_000,
+        total_tokens: 85_000,
+        max_context_tokens: 100_000,
+        budget_limit: 100_000,
+        truncation_occurred: true,
+        segments_removed: 8,
+        prompt_cached_tool_outputs: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
+    });
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+
+    let (llm, _models) = recording_llm();
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+
+    let applied = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "session-tokens-saved",
+        &[],
+        &llm,
+        Some(&event_tx),
+        "pre-turn",
+    )
+    .await
+    .expect("compression");
+
+    assert!(applied, "compression should succeed");
+
+    // Collect events and find ContextSummarized
+    drop(event_tx);
+    let events: Vec<AgentEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+    let summarized = events.iter().find_map(|e| match e {
+        AgentEvent::ContextSummarized { tokens_saved, .. } => Some(*tokens_saved),
+        _ => None,
+    });
+    let tokens_saved = summarized.expect("should have ContextSummarized event");
+    assert!(
+        tokens_saved > 0,
+        "tokens_saved should be > 0, got {tokens_saved}"
     );
 }

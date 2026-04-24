@@ -10,6 +10,7 @@ use regex::Regex;
 
 use crate::runtime::runner::tool_execution::output_compressor::filters;
 use crate::runtime::runner::tool_execution::output_compressor::CompressionResult;
+use crate::runtime::runner::tool_execution::output_compressor::CompressionTier;
 
 /// Minimum result length (chars) before compression kicks in.
 const MIN_COMPRESS_LEN: usize = 1500;
@@ -64,7 +65,8 @@ lazy_static::lazy_static! {
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
 
-pub(crate) fn compress(raw_result: &str) -> CompressionResult {
+pub(crate) fn compress(raw_result: &str, tier: CompressionTier) -> CompressionResult {
+    let _ = tier;
     if raw_result.len() < MIN_COMPRESS_LEN {
         return CompressionResult {
             compressed: raw_result.to_string(),
@@ -394,7 +396,7 @@ mod tests {
     fn git_status_clean() {
         let stdout = &pad("On branch main\nnothing to commit, working tree clean\n");
         let input = make_bash_json("git status", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("✅"));
         assert!(result.compressed.contains("main"));
@@ -418,7 +420,7 @@ Untracked files:
 
 ");
         let input = make_bash_json("git status", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("feature/foo"));
         // Should have compact counts
@@ -435,7 +437,7 @@ Untracked files:
  2 files changed, 6 insertions(+), 9 deletions(-)
 ");
         let input = make_bash_json("git diff --stat", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(result.compressed.contains("files changed"));
     }
@@ -459,7 +461,7 @@ Untracked files:
 
         let stdout = &pad(&lines.join("\n"));
         let input = make_bash_json("git diff", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         // Should still contain the changes
         assert!(result.compressed.contains("+added line") || result.compressed.contains("added"));
@@ -478,7 +480,7 @@ Untracked files:
         }
         let stdout = &pad(&log);
         let input = make_bash_json("git log", stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
     }
 
@@ -487,7 +489,7 @@ Untracked files:
     #[test]
     fn short_output_not_compressed() {
         let input = make_bash_json("git status", "On branch main\nclean", "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(!result.was_compressed);
     }
 }

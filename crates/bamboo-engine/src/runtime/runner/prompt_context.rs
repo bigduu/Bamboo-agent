@@ -59,6 +59,10 @@ pub(super) fn strip_existing_tool_guide_context(prompt: &str) -> String {
     system_sections::strip_existing_tool_guide_context(prompt)
 }
 
+pub(super) fn strip_existing_env_context(prompt: &str) -> String {
+    system_sections::strip_existing_env_context(prompt)
+}
+
 pub(crate) fn inject_task_list_into_system_message(session: &mut bamboo_agent_core::Session) {
     task::inject_task_list_into_system_message(session);
 }

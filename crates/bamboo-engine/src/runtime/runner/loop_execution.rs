@@ -9,11 +9,10 @@ use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_infrastructure::LLMProvider;
 
-mod round_error;
-mod rounds;
+mod pipeline;
 mod startup;
 
-use rounds::run_rounds;
+use pipeline::run_pipeline;
 use startup::{initialize_loop_state, LoopRunState};
 
 /// Runs the agent loop with a custom configuration.
@@ -49,7 +48,7 @@ pub async fn run_agent_loop_with_config(
         let mut state: LoopRunState =
             initialize_loop_state(session, initial_message.as_str(), &config, tools.as_ref()).await;
 
-        let sent_complete = run_rounds(
+        let sent_complete = run_pipeline(
             session,
             &event_tx,
             llm,

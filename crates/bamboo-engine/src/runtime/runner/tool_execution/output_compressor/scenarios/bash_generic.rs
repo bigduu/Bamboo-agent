@@ -4,6 +4,7 @@
 
 use crate::runtime::runner::tool_execution::output_compressor::filters;
 use crate::runtime::runner::tool_execution::output_compressor::CompressionResult;
+use crate::runtime::runner::tool_execution::output_compressor::CompressionTier;
 
 /// Minimum result length (chars) before compression kicks in.
 const MIN_COMPRESS_LEN: usize = 1500;
@@ -14,7 +15,8 @@ const MAX_STDOUT_LINES: usize = 200;
 /// Max lines for stderr in generic mode.
 const MAX_STDERR_LINES: usize = 80;
 
-pub(crate) fn compress(raw_result: &str) -> CompressionResult {
+pub(crate) fn compress(raw_result: &str, tier: CompressionTier) -> CompressionResult {
+    let _ = tier;
     if raw_result.len() < MIN_COMPRESS_LEN {
         return CompressionResult {
             compressed: raw_result.to_string(),
@@ -42,9 +44,13 @@ pub(crate) fn compress(raw_result: &str) -> CompressionResult {
     let collapsed_stdout = filters::collapse_blank_lines(&clean_stdout);
     let collapsed_stderr = filters::collapse_blank_lines(&clean_stderr);
 
+    // Stage 2.5: Collapse duplicate lines (stack frames, repeated log lines)
+    let deduped_stdout = filters::collapse_duplicate_lines(&collapsed_stdout, 3);
+    let deduped_stderr = filters::collapse_duplicate_lines(&collapsed_stderr, 3);
+
     // Stage 3: Cap lines
-    let (capped_stdout, stdout_capped) = filters::cap_lines(&collapsed_stdout, MAX_STDOUT_LINES);
-    let (capped_stderr, stderr_capped) = filters::cap_lines(&collapsed_stderr, MAX_STDERR_LINES);
+    let (capped_stdout, stdout_capped) = filters::cap_lines(&deduped_stdout, MAX_STDOUT_LINES);
+    let (capped_stderr, stderr_capped) = filters::cap_lines(&deduped_stderr, MAX_STDERR_LINES);
 
     // Stage 4: Cap bytes (safety net for extremely long lines)
     let (final_stdout, stdout_byte_capped) =
@@ -56,6 +62,8 @@ pub(crate) fn compress(raw_result: &str) -> CompressionResult {
         || stderr_capped
         || stdout_byte_capped
         || stderr_byte_capped
+        || deduped_stdout.len() != collapsed_stdout.len()
+        || deduped_stderr.len() != collapsed_stderr.len()
         || final_stdout.len() != stdout.len()
         || final_stderr.len() != stderr.len();
 
@@ -91,10 +99,12 @@ pub(crate) fn compress(raw_result: &str) -> CompressionResult {
 fn compress_plain_text(text: &str) -> CompressionResult {
     let clean = filters::strip_ansi(text);
     let collapsed = filters::collapse_blank_lines(&clean);
-    let (capped, line_capped) = filters::cap_lines(&collapsed, MAX_STDOUT_LINES);
+    let deduped = filters::collapse_duplicate_lines(&collapsed, 3);
+    let (capped, line_capped) = filters::cap_lines(&deduped, MAX_STDOUT_LINES);
     let (final_text, byte_capped) = filters::cap_bytes(&capped, filters::DEFAULT_MAX_BYTES);
 
-    let any_change = line_capped || byte_capped || final_text.len() != text.len();
+    let any_change =
+        line_capped || byte_capped || deduped.len() != collapsed.len() || final_text.len() != text.len();
 
     CompressionResult {
         compressed: final_text,
@@ -124,7 +134,7 @@ mod tests {
     #[test]
     fn short_output_not_compressed() {
         let input = make_bash_json("hello world", "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(!result.was_compressed);
     }
 
@@ -136,7 +146,7 @@ mod tests {
             "a]long-line-of-text-with-color\n".repeat(100)
         );
         let input = make_bash_json(&noisy, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);
         assert!(!result.compressed.contains("\x1b["));
     }
@@ -148,7 +158,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let input = make_bash_json(&big_stdout, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
 
         assert!(result.was_compressed);
         assert!(result.compressed.contains("lines omitted"));
@@ -163,7 +173,7 @@ mod tests {
             "this-is-some-content-line-x\n".repeat(100)
         );
         let input = make_bash_json(&with_blanks, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
 
         assert!(result.was_compressed);
         // Consecutive blanks should be collapsed
@@ -173,9 +183,9 @@ mod tests {
     #[test]
     fn plain_text_fallback() {
         let big_text = "line\n".repeat(500);
-        let result = compress(&big_text);
+        let result = compress(&big_text, CompressionTier::Standard);
         assert!(result.was_compressed);
-        assert!(result.compressed.contains("lines omitted"));
+        assert!(result.compressed.contains("identical lines collapsed"));
     }
 
     #[test]
@@ -183,7 +193,7 @@ mod tests {
         // Create a line that's very long (no newlines)
         let long_line = "x".repeat(100_000);
         let input = make_bash_json(&long_line, "", 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
 
         assert!(result.was_compressed);
         assert!(result.compressed.len() < input.len());
@@ -196,9 +206,81 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let input = make_bash_json("ok", &big_stderr, 0);
-        let result = compress(&input);
+        let result = compress(&input, CompressionTier::Standard);
 
         assert!(result.was_compressed);
         assert!(result.compressed.contains("lines omitted"));
+    }
+
+    #[test]
+    fn duplicate_lines_collapsed() {
+        let big_stdout = "    at foo::bar::baz (src/lib.rs:42)\n".repeat(100);
+        let input = make_bash_json(&big_stdout, "", 0);
+        let result = compress(&input, CompressionTier::Standard);
+
+        assert!(result.was_compressed);
+        assert!(result.compressed.contains("identical lines collapsed"));
+    }
+
+    // ── Edge cases ──
+
+    #[test]
+    fn empty_json_not_compressed() {
+        let input = make_bash_json("", "", 0);
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(!result.was_compressed);
+    }
+
+    #[test]
+    fn invalid_json_uses_plain_text() {
+        let big_text = "some plain text\n".repeat(200);
+        let result = compress(&big_text, CompressionTier::Standard);
+        // Should compress as plain text
+        assert!(result.was_compressed);
+    }
+
+    #[test]
+    fn non_zero_exit_code_still_compressed() {
+        let big_stdout = (0..300)
+            .map(|i| format!("output line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let input = make_bash_json(&big_stdout, "", 1);
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(result.was_compressed);
+        // exit_code should be preserved
+        let parsed: serde_json::Value = serde_json::from_str(&result.compressed).unwrap();
+        assert_eq!(parsed["exit_code"], 1);
+    }
+
+    #[test]
+    fn stdout_and_stderr_both_long() {
+        let big_stdout = (0..300).map(|i| format!("out {}", i)).collect::<Vec<_>>().join("\n");
+        let big_stderr = (0..200).map(|i| format!("err {}", i)).collect::<Vec<_>>().join("\n");
+        let input = make_bash_json(&big_stdout, &big_stderr, 0);
+        let result = compress(&input, CompressionTier::Standard);
+        assert!(result.was_compressed);
+        let parsed: serde_json::Value = serde_json::from_str(&result.compressed).unwrap();
+        // Both should be capped
+        let stdout_lines = parsed["stdout"].as_str().unwrap().lines().count();
+        let stderr_lines = parsed["stderr"].as_str().unwrap().lines().count();
+        assert!(stdout_lines <= MAX_STDOUT_LINES + 5);
+        assert!(stderr_lines <= MAX_STDERR_LINES + 5);
+    }
+
+    #[test]
+    fn plain_text_ansi_and_duplicates() {
+        let mut text = String::new();
+        for _ in 0..100 {
+            text.push_str("\x1b[32mgreen line\x1b[0m\n");
+        }
+        text.push_str("\n\n\n\n\n\n");
+        for _ in 0..100 {
+            text.push_str("\x1b[32mgreen line\x1b[0m\n");
+        }
+        let result = compress(&text, CompressionTier::Standard);
+        assert!(result.was_compressed);
+        assert!(!result.compressed.contains("\x1b["));
+        assert!(!result.compressed.contains("\n\n\n\n"));
     }
 }

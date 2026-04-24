@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use bamboo_compression::TokenCounter;
 use bamboo_infrastructure::paths::bamboo_dir;
 
 /// Maximum length of the command slug in the filename.
@@ -32,10 +33,18 @@ pub(crate) async fn tee_save_if_needed(
     match tee_save(session_id, args_json, full_output).await {
         Ok(path) => {
             let display_path = bamboo_infrastructure::paths::path_to_display_string(&path);
+            let counter = bamboo_compression::TiktokenTokenCounter::default();
+            let tokens = counter.count_text(full_output);
+            let token_display = if tokens >= 1000 {
+                format!("{:.1}K", tokens as f64 / 1000.0)
+            } else {
+                tokens.to_string()
+            };
             Some(format!(
-                "[full output saved: {} ({} bytes)]",
+                "[full output saved: {} ({} bytes, ~{} tokens). Use Read tool to inspect details.]",
                 display_path,
-                full_output.len()
+                full_output.len(),
+                token_display,
             ))
         }
         Err(e) => {
@@ -145,5 +154,18 @@ mod tests {
         let result =
             tee_save_if_needed("test-session", r#"{"command":"echo"}"#, full, compressed).await;
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn tee_save_if_needed_includes_read_hint() {
+        let full = "x".repeat(2000);
+        let compressed = "y";
+        let result =
+            tee_save_if_needed("test-session", r#"{"command":"echo"}"#, &full, compressed).await;
+        assert!(result.is_some());
+        let note = result.unwrap();
+        assert!(note.contains("Use Read tool"));
+        assert!(note.contains("tokens"));
+        assert!(note.contains("bytes"));
     }
 }

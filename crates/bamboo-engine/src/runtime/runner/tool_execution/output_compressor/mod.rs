@@ -10,6 +10,147 @@ pub(crate) mod tee;
 
 use super::per_call::ToolExecutionOutcome;
 
+// ── Context Pressure ─────────────────────────────────────────────────────────
+
+/// Current context window pressure, used to adjust compression aggressiveness.
+pub(crate) struct ContextPressure {
+    /// Current token usage as percentage of compression trigger (0-100).
+    pub usage_percent: u8,
+    /// Remaining tokens before compression trigger.
+    pub remaining_tokens: u32,
+}
+
+// ── Compression Tier ────────────────────────────────────────────────────────
+
+/// Tier classification based on output token count.
+///
+/// Determines which compression strategy to apply:
+/// - `Passthrough`: output is small enough to keep as-is
+/// - `Light`: ANSI strip + blank collapse + duplicate line collapse
+/// - `Standard`: scenario-aware semantic compression
+/// - `Aggressive`: Standard + tighter line limits
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompressionTier {
+    Passthrough,
+    Light,
+    Standard,
+    Aggressive,
+}
+
+/// Token thresholds for tier classification.
+const TIER_LIGHT_TOKENS: u32 = 1_000;
+const TIER_STANDARD_TOKENS: u32 = 10_000;
+const TIER_AGGRESSIVE_TOKENS: u32 = 25_000;
+
+/// Classify output into a compression tier by token count.
+fn classify_tier(text: &str) -> CompressionTier {
+    use bamboo_compression::TokenCounter;
+    let counter = bamboo_compression::TiktokenTokenCounter::default();
+    let tokens = counter.count_text(text);
+
+    if tokens < TIER_LIGHT_TOKENS {
+        CompressionTier::Passthrough
+    } else if tokens < TIER_STANDARD_TOKENS {
+        CompressionTier::Light
+    } else if tokens < TIER_AGGRESSIVE_TOKENS {
+        CompressionTier::Standard
+    } else {
+        CompressionTier::Aggressive
+    }
+}
+
+/// Adjust compression tier based on context pressure.
+///
+/// - Low pressure (< 50%): only compress Standard and above
+/// - Normal pressure (50-80%): compress Light and above
+/// - High pressure (> 80%): compress everything, promote Light → Standard
+fn adjust_tier_for_pressure(tier: CompressionTier, pressure: Option<&ContextPressure>) -> CompressionTier {
+    let Some(p) = pressure else {
+        return tier; // no pressure info → use base tier
+    };
+
+    match p.usage_percent {
+        0..=49 => {
+            // Low pressure: skip Light tier (only compress Standard+)
+            match tier {
+                CompressionTier::Light => CompressionTier::Passthrough,
+                other => other,
+            }
+        }
+        50..=80 => {
+            // Normal pressure: use base tier as-is
+            tier
+        }
+        _ => {
+            // High pressure: promote Light → Standard for more aggressive compression
+            match tier {
+                CompressionTier::Light => CompressionTier::Standard,
+                other => other,
+            }
+        }
+    }
+}
+
+/// Apply light-weight compression (ANSI strip + blank collapse + dedup).
+fn apply_light_compression(raw_result: &str) -> CompressionResult {
+    // For JSON Bash envelopes, apply to stdout/stderr separately
+    let parsed: serde_json::Value = match serde_json::from_str(raw_result) {
+        Ok(v) => v,
+        Err(_) => {
+            // Plain text
+            let clean = filters::strip_ansi(raw_result);
+            let collapsed = filters::collapse_blank_lines(&clean);
+            let deduped = filters::collapse_duplicate_lines(&collapsed, 3);
+            let was_compressed = deduped.len() != raw_result.len();
+            return CompressionResult {
+                compressed: deduped,
+                was_compressed,
+            };
+        }
+    };
+
+    let stdout = parsed.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+    let stderr = parsed.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+
+    let clean_stdout = filters::strip_ansi(stdout);
+    let clean_stderr = filters::strip_ansi(stderr);
+    let collapsed_stdout = filters::collapse_blank_lines(&clean_stdout);
+    let collapsed_stderr = filters::collapse_blank_lines(&clean_stderr);
+    let deduped_stdout = filters::collapse_duplicate_lines(&collapsed_stdout, 3);
+    let deduped_stderr = filters::collapse_duplicate_lines(&collapsed_stderr, 3);
+
+    let was_compressed = deduped_stdout.len() != stdout.len()
+        || deduped_stderr.len() != stderr.len()
+        || clean_stdout.len() != stdout.len()
+        || clean_stderr.len() != stderr.len();
+
+    if !was_compressed {
+        return CompressionResult {
+            compressed: raw_result.to_string(),
+            was_compressed: false,
+        };
+    }
+
+    // Rebuild JSON
+    let mut obj = parsed.clone();
+    if let Some(map) = obj.as_object_mut() {
+        map.insert(
+            "stdout".to_string(),
+            serde_json::Value::String(deduped_stdout),
+        );
+        map.insert(
+            "stderr".to_string(),
+            serde_json::Value::String(deduped_stderr),
+        );
+    }
+    let compressed = serde_json::to_string(&obj).unwrap_or_else(|_| raw_result.to_string());
+
+    CompressionResult {
+        compressed,
+        was_compressed: true,
+    }
+}
+
 // ── Scenario Detection ──────────────────────────────────────────────────────
 
 /// High-level classification of a tool's output so the correct compression
@@ -227,6 +368,8 @@ pub(super) async fn maybe_compress(
     args_json: &str,
     session_id: &str,
     mut outcome: ToolExecutionOutcome,
+    max_tool_output_tokens: u32,
+    context_pressure: Option<ContextPressure>,
 ) -> ToolExecutionOutcome {
     let result = match outcome.result {
         Ok(ref mut result) => result,
@@ -234,28 +377,113 @@ pub(super) async fn maybe_compress(
     };
 
     let scenario = detect_scenario(tool_name, args_json);
-    if scenario == OutputScenario::PassThrough {
-        return outcome;
+    if scenario != OutputScenario::PassThrough {
+        let original = result.result.clone();
+        let base_tier = classify_tier(&original);
+        let tier = adjust_tier_for_pressure(base_tier, context_pressure.as_ref());
+
+        let compressed = match tier {
+            CompressionTier::Passthrough => CompressionResult {
+                compressed: original.clone(),
+                was_compressed: false,
+            },
+            CompressionTier::Light => apply_light_compression(&original),
+            CompressionTier::Standard | CompressionTier::Aggressive => {
+                compress_by_scenario(scenario, &original, args_json, tier)
+            }
+        };
+
+        if compressed.was_compressed {
+            // Tee-save full output when compression occurred.
+            let tee_note =
+                tee::tee_save_if_needed(session_id, args_json, &original, &compressed.compressed).await;
+
+            // Replace result with compressed version (+ optional tee note).
+            result.result = match tee_note {
+                Some(note) => format!("{}\n\n{}", compressed.compressed, note),
+                None => compressed.compressed,
+            };
+        }
     }
 
-    let original = result.result.clone();
-    let compressed = compress_by_scenario(scenario, &original, args_json);
-
-    if !compressed.was_compressed {
-        return outcome;
+    // Enforce hard token ceiling if configured.
+    if max_tool_output_tokens > 0 {
+        use bamboo_compression::TokenCounter;
+        let counter = bamboo_compression::TiktokenTokenCounter::default();
+        let tokens = counter.count_text(&result.result);
+        if tokens > max_tool_output_tokens as u32 {
+            let truncated = truncate_to_token_budget(
+                &result.result,
+                max_tool_output_tokens,
+                &counter,
+            );
+            tracing::info!(
+                "[{}] Tool output truncated: {} tokens > {} limit, {} chars → {} chars",
+                session_id,
+                tokens,
+                max_tool_output_tokens,
+                result.result.len(),
+                truncated.len(),
+            );
+            result.result = truncated;
+        }
     }
-
-    // Tee-save full output when compression occurred.
-    let tee_note =
-        tee::tee_save_if_needed(session_id, args_json, &original, &compressed.compressed).await;
-
-    // Replace result with compressed version (+ optional tee note).
-    result.result = match tee_note {
-        Some(note) => format!("{}\n\n{}", compressed.compressed, note),
-        None => compressed.compressed,
-    };
 
     outcome
+}
+
+/// Truncate text to fit within a token budget by keeping head + tail portions.
+fn truncate_to_token_budget(
+    text: &str,
+    max_tokens: u32,
+    counter: &bamboo_compression::TiktokenTokenCounter,
+) -> String {
+    use bamboo_compression::TokenCounter;
+    let head_tokens = (max_tokens as f64 * 0.7) as u32;
+    let tail_tokens = max_tokens.saturating_sub(head_tokens);
+
+    let head = find_prefix_within_tokens(text, head_tokens, counter);
+    let tail = find_suffix_within_tokens(text, tail_tokens, counter);
+
+    format!(
+        "{}\n\n[... tool output truncated: {} tokens → {} token budget ...]\n\n{}",
+        head,
+        counter.count_text(text),
+        max_tokens,
+        tail,
+    )
+}
+
+fn find_prefix_within_tokens(
+    text: &str,
+    max_tokens: u32,
+    counter: &bamboo_compression::TiktokenTokenCounter,
+) -> String {
+    use bamboo_compression::TokenCounter;
+    let mut end = text.len();
+    for (i, _) in text.char_indices() {
+        if counter.count_text(&text[..i]) > max_tokens {
+            end = i;
+            break;
+        }
+    }
+    text[..end].to_string()
+}
+
+fn find_suffix_within_tokens(
+    text: &str,
+    max_tokens: u32,
+    counter: &bamboo_compression::TiktokenTokenCounter,
+) -> String {
+    use bamboo_compression::TokenCounter;
+    let mut start = 0;
+    for (i, _) in text.char_indices().rev() {
+        if counter.count_text(&text[i..]) > max_tokens {
+            break;
+        }
+        start = i;
+    }
+    text[start..].to_string()
 }
 
 /// Dispatch to the appropriate scenario compressor.
@@ -263,16 +491,17 @@ fn compress_by_scenario(
     scenario: OutputScenario,
     raw_result: &str,
     _args_json: &str,
+    tier: CompressionTier,
 ) -> CompressionResult {
     match scenario {
-        OutputScenario::BashTest => scenarios::bash_test::compress(raw_result),
-        OutputScenario::BashBuild => scenarios::bash_build::compress(raw_result),
-        OutputScenario::BashGit => scenarios::bash_git::compress(raw_result),
-        OutputScenario::BashPackage => scenarios::bash_package::compress(raw_result),
-        OutputScenario::BashGeneric => scenarios::bash_generic::compress(raw_result),
-        OutputScenario::ReadCode => scenarios::read_code::compress(raw_result),
-        OutputScenario::GrepResults => scenarios::grep_results::compress(raw_result),
-        OutputScenario::WebFetchHtml => scenarios::web_fetch::compress(raw_result),
+        OutputScenario::BashTest => scenarios::bash_test::compress(raw_result, tier),
+        OutputScenario::BashBuild => scenarios::bash_build::compress(raw_result, tier),
+        OutputScenario::BashGit => scenarios::bash_git::compress(raw_result, tier),
+        OutputScenario::BashPackage => scenarios::bash_package::compress(raw_result, tier),
+        OutputScenario::BashGeneric => scenarios::bash_generic::compress(raw_result, tier),
+        OutputScenario::ReadCode => scenarios::read_code::compress(raw_result, tier),
+        OutputScenario::GrepResults => scenarios::grep_results::compress(raw_result, tier),
+        OutputScenario::WebFetchHtml => scenarios::web_fetch::compress(raw_result, tier),
         OutputScenario::PassThrough => CompressionResult {
             compressed: raw_result.to_string(),
             was_compressed: false,
@@ -483,5 +712,218 @@ mod tests {
     fn detect_poetry_install() {
         let args = r#"{"command": "poetry install"}"#;
         assert_eq!(detect_scenario("Bash", args), OutputScenario::BashPackage);
+    }
+
+    // ── Context pressure tests ──
+
+    #[test]
+    fn pressure_low_skips_light_tier() {
+        let pressure = ContextPressure { usage_percent: 30, remaining_tokens: 100_000 };
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
+            CompressionTier::Passthrough
+        );
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Standard, Some(&pressure)),
+            CompressionTier::Standard
+        );
+    }
+
+    #[test]
+    fn pressure_normal_uses_base_tier() {
+        let pressure = ContextPressure { usage_percent: 65, remaining_tokens: 50_000 };
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
+            CompressionTier::Light
+        );
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Standard, Some(&pressure)),
+            CompressionTier::Standard
+        );
+    }
+
+    #[test]
+    fn pressure_high_promotes_light_to_standard() {
+        let pressure = ContextPressure { usage_percent: 90, remaining_tokens: 5_000 };
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
+            CompressionTier::Standard
+        );
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Passthrough, Some(&pressure)),
+            CompressionTier::Passthrough
+        );
+    }
+
+    #[test]
+    fn pressure_none_uses_base_tier() {
+        assert_eq!(adjust_tier_for_pressure(CompressionTier::Light, None), CompressionTier::Light);
+        assert_eq!(adjust_tier_for_pressure(CompressionTier::Passthrough, None), CompressionTier::Passthrough);
+    }
+
+    // ── Tier classification edge cases ──
+
+    #[test]
+    fn classify_tier_empty_string() {
+        assert_eq!(classify_tier(""), CompressionTier::Passthrough);
+    }
+
+    #[test]
+    fn classify_tier_short_string() {
+        assert_eq!(classify_tier("hello world"), CompressionTier::Passthrough);
+    }
+
+    #[test]
+    fn classify_tier_aggressive_is_reachable() {
+        // Use real words for more accurate token count; each word ≈ 1 token
+        let words: Vec<String> = (0..30_000).map(|i| format!("word{}", i)).collect();
+        let big = words.join(" ");
+        let tier = classify_tier(&big);
+        assert_eq!(tier, CompressionTier::Aggressive);
+    }
+
+    // ── Pressure boundary edge cases ──
+
+    #[test]
+    fn pressure_boundary_50_percent() {
+        // Exactly 50% → normal range (50-80)
+        let pressure = ContextPressure { usage_percent: 50, remaining_tokens: 50_000 };
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
+            CompressionTier::Light
+        );
+    }
+
+    #[test]
+    fn pressure_boundary_80_percent() {
+        // Exactly 80% → normal range (50-80)
+        let pressure = ContextPressure { usage_percent: 80, remaining_tokens: 20_000 };
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
+            CompressionTier::Light
+        );
+    }
+
+    #[test]
+    fn pressure_boundary_81_percent() {
+        // 81% → high pressure range (>80)
+        let pressure = ContextPressure { usage_percent: 81, remaining_tokens: 19_000 };
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
+            CompressionTier::Standard
+        );
+    }
+
+    #[test]
+    fn pressure_boundary_49_percent() {
+        // 49% → low pressure range (<50)
+        let pressure = ContextPressure { usage_percent: 49, remaining_tokens: 51_000 };
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
+            CompressionTier::Passthrough
+        );
+    }
+
+    #[test]
+    fn pressure_does_not_change_aggressive() {
+        let low = ContextPressure { usage_percent: 10, remaining_tokens: 90_000 };
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Aggressive, Some(&low)),
+            CompressionTier::Aggressive
+        );
+    }
+
+    #[test]
+    fn pressure_does_not_change_standard_at_low() {
+        let low = ContextPressure { usage_percent: 10, remaining_tokens: 90_000 };
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Standard, Some(&low)),
+            CompressionTier::Standard
+        );
+    }
+
+    #[test]
+    fn pressure_zero_percent() {
+        let pressure = ContextPressure { usage_percent: 0, remaining_tokens: 200_000 };
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
+            CompressionTier::Passthrough
+        );
+    }
+
+    #[test]
+    fn pressure_100_percent() {
+        let pressure = ContextPressure { usage_percent: 100, remaining_tokens: 0 };
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
+            CompressionTier::Standard
+        );
+    }
+
+    // ── Light compression edge cases ──
+
+    #[test]
+    fn light_compression_plain_text_no_changes() {
+        let input = "hello\nworld\n";
+        let result = apply_light_compression(input);
+        assert!(!result.was_compressed);
+    }
+
+    #[test]
+    fn light_compression_strips_ansi_plain_text() {
+        let input = "\x1b[32mgreen text\x1b[0m\n";
+        let result = apply_light_compression(input);
+        assert!(result.was_compressed);
+        assert!(!result.compressed.contains("\x1b["));
+    }
+
+    #[test]
+    fn light_compression_json_envelope() {
+        let json = serde_json::json!({
+            "command": "echo",
+            "stdout": "\x1b[32mhello\x1b[0m",
+            "stderr": "",
+            "exit_code": 0,
+        }).to_string();
+        let result = apply_light_compression(&json);
+        assert!(result.was_compressed);
+        assert!(!result.compressed.contains("\x1b["));
+        // Should still be valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(&result.compressed).unwrap();
+        let stdout_val = parsed["stdout"].as_str().unwrap();
+        assert!(stdout_val.starts_with("hello"));
+    }
+
+    #[test]
+    fn light_compression_json_no_ansi_not_compressed() {
+        // Use content with trailing newline so collapse_blank_lines doesn't add one
+        let json = serde_json::json!({
+            "command": "echo",
+            "stdout": "clean output\n",
+            "stderr": "no ansi here\n",
+            "exit_code": 0,
+        }).to_string();
+        let result = apply_light_compression(&json);
+        assert!(!result.was_compressed);
+    }
+
+    // ── Scenario detection edge cases ──
+
+    #[test]
+    fn detect_piped_cargo_test() {
+        let args = r#"{"command": "cargo test 2>&1 | tee output.log"}"#;
+        assert_eq!(detect_scenario("Bash", args), OutputScenario::BashTest);
+    }
+
+    #[test]
+    fn detect_bashoutput_uses_bash_detection() {
+        let args = r#"{"command": "git status"}"#;
+        assert_eq!(detect_scenario("BashOutput", args), OutputScenario::BashGit);
+    }
+
+    #[test]
+    fn detect_command_with_env_prefix() {
+        let args = r#"{"command": "CI=true cargo test"}"#;
+        assert_eq!(detect_scenario("Bash", args), OutputScenario::BashTest);
     }
 }
