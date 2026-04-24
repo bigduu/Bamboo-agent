@@ -5,5 +5,6 @@ use bamboo_agent::server::handlers::tools;
 use serde_json::{json, Value};
 
 mod basic;
+mod compact;
 mod edit_flow;
 mod filesystem;

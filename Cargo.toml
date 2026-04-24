@@ -10,6 +10,7 @@ members = [
     "crates/bamboo-tools",
     "crates/bamboo-cli",
     "crates/bamboo-server",
+    "crates/bamboo-tui",
 ]
 resolver = "2"
 

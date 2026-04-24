@@ -8,7 +8,7 @@
 //! - Conversation summaries
 
 use bamboo_agent::agent::{Message, Role, Session};
-use bamboo_agent_core::agent::types::{CompressionEvent, ConversationSummary, SessionKind};
+use bamboo_agent_core::agent::types::{CompressionEvent, CompressionTriggerType, ConversationSummary, SessionKind};
 use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 use bamboo_domain::{TaskItem, TaskItemStatus, TaskList};
 use chrono::Utc;
@@ -494,7 +494,7 @@ fn test_conversation_summary_update() {
 
 #[test]
 fn test_compression_event_new() {
-    let event = CompressionEvent::new(15, 3, 96.2, 61.4, 128);
+    let event = CompressionEvent::new(15, 3, 96.2, 61.4, 128, CompressionTriggerType::Auto, 0.0, None, 0);
 
     assert!(!event.id.is_empty());
     assert_eq!(event.messages_compressed, 15);
