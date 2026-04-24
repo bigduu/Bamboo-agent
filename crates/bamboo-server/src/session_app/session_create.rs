@@ -6,6 +6,9 @@
 
 use bamboo_agent_core::{Message, Session};
 use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_domain::ProviderModelRef;
+
+use super::provider_model::{persist_model_ref, persist_legacy_model_provider};
 
 /// Request-level input for session creation.
 pub struct CreateSessionInput {
@@ -13,6 +16,7 @@ pub struct CreateSessionInput {
     pub title: Option<String>,
     pub system_prompt: Option<String>,
     pub model: Option<String>,
+    pub model_ref: Option<ProviderModelRef>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
@@ -29,8 +33,17 @@ pub struct CreateSessionConfig {
 
 /// Build a new session from request input and config defaults.
 pub fn build_new_session(input: &CreateSessionInput, config: &CreateSessionConfig) -> Session {
-    let model = resolve_model(input.model.as_deref(), config.default_model.as_deref());
+    let model = input
+        .model_ref
+        .as_ref()
+        .map(|model_ref| model_ref.model.clone())
+        .unwrap_or_else(|| resolve_model(input.model.as_deref(), config.default_model.as_deref()));
     let mut session = Session::new(input.id.clone(), model);
+    if let Some(model_ref) = input.model_ref.as_ref() {
+        persist_model_ref(&mut session, model_ref);
+    } else {
+        persist_legacy_model_provider(&mut session, input.model.as_deref(), None);
+    }
     session.reasoning_effort =
         resolve_reasoning_effort(input.reasoning_effort, config.default_reasoning_effort);
 
@@ -140,6 +153,7 @@ mod tests {
             title: Some("  Sprint Session  ".to_string()),
             system_prompt: Some("  You are helpful  ".to_string()),
             model: Some("gpt-5".to_string()),
+            model_ref: None,
             reasoning_effort: Some(ReasoningEffort::High),
         };
         let session = build_new_session(&input, &default_config());
@@ -166,6 +180,7 @@ mod tests {
             title: None,
             system_prompt: None,
             model: Some("gpt-5".to_string()),
+            model_ref: None,
             reasoning_effort: None,
         };
         let session = build_new_session(&input, &default_config());
@@ -191,6 +206,7 @@ mod tests {
             title: None,
             system_prompt: None,
             model: Some("gpt-5".to_string()),
+            model_ref: None,
             reasoning_effort: None,
         };
         let session = build_new_session(&input, &config);
@@ -211,6 +227,7 @@ mod tests {
             title: None,
             system_prompt: Some("Custom prompt".to_string()),
             model: Some("gpt-5".to_string()),
+            model_ref: None,
             reasoning_effort: None,
         };
         let session = build_new_session(&input, &default_config());
@@ -219,5 +236,28 @@ mod tests {
             .expect("prompt snapshot should exist");
         assert_eq!(snapshot.base_system_prompt, "Custom prompt");
         assert_eq!(snapshot.effective_system_prompt, "Custom prompt");
+    }
+
+    #[test]
+    fn build_new_session_with_model_ref_persists_bare_model_and_provider_metadata() {
+        let input = CreateSessionInput {
+            id: "session-5".to_string(),
+            title: None,
+            system_prompt: None,
+            model: Some("ignored-compat-model".to_string()),
+            model_ref: Some(ProviderModelRef::new("anthropic", "claude-3-7-sonnet")),
+            reasoning_effort: None,
+        };
+        let session = build_new_session(&input, &default_config());
+
+        assert_eq!(session.model, "claude-3-7-sonnet");
+        assert_eq!(
+            session.model_ref,
+            Some(ProviderModelRef::new("anthropic", "claude-3-7-sonnet"))
+        );
+        assert_eq!(
+            session.metadata.get("provider_name").map(String::as_str),
+            Some("anthropic")
+        );
     }
 }

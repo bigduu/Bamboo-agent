@@ -11,6 +11,7 @@ use bamboo_agent_core::{Message, SessionKind};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_infrastructure::Config;
 use bamboo_infrastructure::{LLMChunk, LLMProvider, LLMRequestOptions};
+use bamboo_infrastructure::{ProviderModelRouter, ProviderRegistry};
 use bamboo_infrastructure::{SessionIndexEntry, SessionStoreV2};
 use bamboo_memory::auto_dream::{
     build_consolidation_prompt, build_extraction_prompt, build_rebuild_consolidation_prompt,
@@ -55,6 +56,7 @@ pub struct AutoDreamContext {
     pub storage: Arc<dyn bamboo_agent_core::storage::Storage>,
     pub provider: Arc<dyn LLMProvider>,
     pub config: Arc<RwLock<Config>>,
+    pub provider_registry: Arc<ProviderRegistry>,
 }
 
 fn memory_store_for_context(ctx: &AutoDreamContext) -> MemoryStore {
@@ -226,7 +228,7 @@ async fn collect_candidate_session_contexts_for_project(
 }
 
 async fn extract_and_persist_durable_candidates(
-    ctx: &AutoDreamContext,
+    provider: &Arc<dyn LLMProvider>,
     memory: &MemoryStore,
     model: &str,
     sessions: &[CandidateSessionContext],
@@ -247,7 +249,7 @@ async fn extract_and_persist_durable_candidates(
         })
         .collect();
     let prompt = build_extraction_prompt(&candidates_info);
-    let raw = collect_stream_text(ctx.provider.clone(), model, prompt).await?;
+    let raw = collect_stream_text(provider.clone(), model, prompt).await?;
     let candidates = parse_extraction_candidates(&raw)?;
     if candidates.is_empty() {
         return Ok(0);
@@ -440,7 +442,7 @@ async fn write_dream_for_scope(
 }
 
 async fn build_dream_notebook_body(
-    ctx: &AutoDreamContext,
+    provider: &Arc<dyn LLMProvider>,
     model: &str,
     source_window: &DreamSourceWindow,
     generation_mode: DreamGenerationMode,
@@ -468,7 +470,7 @@ async fn build_dream_notebook_body(
                 source_window.recent_durable_memory.as_deref(),
                 &to_consolidation_sessions(&source_window.sessions),
             );
-            match collect_stream_text(ctx.provider.clone(), model, refine_prompt).await {
+            match collect_stream_text(provider.clone(), model, refine_prompt).await {
                 Ok(raw_body) => {
                     match normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS) {
                         Ok(body) => {
@@ -499,7 +501,7 @@ async fn build_dream_notebook_body(
                                 &source_window.sessions,
                             ));
                             let raw_body =
-                                collect_stream_text(ctx.provider.clone(), model, prompt).await?;
+                                collect_stream_text(provider.clone(), model, prompt).await?;
                             normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS)
                         }
                     }
@@ -518,7 +520,7 @@ async fn build_dream_notebook_body(
                     let prompt = build_consolidation_prompt(&to_consolidation_sessions(
                         &source_window.sessions,
                     ));
-                    let raw_body = collect_stream_text(ctx.provider.clone(), model, prompt).await?;
+                    let raw_body = collect_stream_text(provider.clone(), model, prompt).await?;
                     normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS)
                 }
             }
@@ -536,13 +538,13 @@ async fn build_dream_notebook_body(
                 source_window.durable_memory_index.as_deref(),
                 &to_consolidation_sessions(&source_window.sessions),
             );
-            let raw_body = collect_stream_text(ctx.provider.clone(), model, prompt).await?;
+            let raw_body = collect_stream_text(provider.clone(), model, prompt).await?;
             normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS)
         }
         DreamGenerationMode::Incremental => {
             let prompt =
                 build_consolidation_prompt(&to_consolidation_sessions(&source_window.sessions));
-            let raw_body = collect_stream_text(ctx.provider.clone(), model, prompt).await?;
+            let raw_body = collect_stream_text(provider.clone(), model, prompt).await?;
             normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS)
         }
     }
@@ -575,16 +577,45 @@ async fn run_auto_dream_once_for_scope(
         return Ok(None);
     }
 
-    let Some(model) = config_snapshot.get_memory_background_model() else {
-        tracing::warn!(
+    // Resolve background model (and provider when using ProviderModelRef).
+    let provider_ref_enabled = config_snapshot.features.provider_model_ref;
+    let model_ref = if provider_ref_enabled {
+        config_snapshot
+            .defaults
+            .as_ref()
+            .and_then(|d| d.memory_background.as_ref())
+            .or_else(|| config_snapshot.defaults.as_ref().and_then(|d| d.fast.as_ref()))
+    } else {
+        None
+    };
+
+    let (bg_provider, model): (Arc<dyn LLMProvider>, String) = if let Some(ref mr) = model_ref {
+        let router = ProviderModelRouter::new(ctx.provider_registry.clone());
+        let routed = router.route(mr).map_err(|e| {
+            format!(
+                "[auto_dream] failed to route background model ref '{}': {}",
+                mr, e
+            )
+        })?;
+        tracing::debug!(
             target: DREAM_TRACING_TARGET,
-            event = "run_skip",
-            reason = "no_background_model",
-            scope = scope_label,
-            project_key = project_key.unwrap_or(""),
-            "[auto_dream] skipped: no memory.background_model / provider.fast_model configured"
+            model_ref = %mr,
+            "Resolved background model via ProviderModelRef"
         );
-        return Ok(None);
+        (routed, mr.model.clone())
+    } else {
+        let Some(model) = config_snapshot.get_memory_background_model() else {
+            tracing::warn!(
+                target: DREAM_TRACING_TARGET,
+                event = "run_skip",
+                reason = "no_background_model",
+                scope = scope_label,
+                project_key = project_key.unwrap_or(""),
+                "[auto_dream] skipped: no memory.background_model / provider.fast_model configured"
+            );
+            return Ok(None);
+        };
+        (ctx.provider.clone(), model)
     };
 
     let now = Utc::now();
@@ -665,7 +696,7 @@ async fn run_auto_dream_once_for_scope(
         sessions,
     };
     let notebook_body =
-        build_dream_notebook_body(ctx, &model, &source_window, generation_mode).await?;
+        build_dream_notebook_body(&bg_provider, &model, &source_window, generation_mode).await?;
     let last_full_rebuild_line = if matches!(generation_mode, DreamGenerationMode::Rebuild) {
         format!("Last full rebuild at: {}\n", now.to_rfc3339())
     } else if let Some(existing_rebuild_at) = last_full_rebuild_at {
@@ -711,7 +742,7 @@ async fn run_auto_dream_once_for_scope(
         MemoryScope::Session => unreachable!("session scope handled above"),
     };
     let extracted_count =
-        extract_and_persist_durable_candidates(ctx, memory, &model, &extraction_sessions).await?;
+        extract_and_persist_durable_candidates(&bg_provider, memory, &model, &extraction_sessions).await?;
     let notebook_chars = final_note.chars().count();
 
     tracing::info!(
@@ -798,6 +829,7 @@ pub fn spawn_auto_dream_task(ctx: AutoDreamContext) {
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -805,6 +837,10 @@ mod tests {
 
     use bamboo_agent_core::storage::Storage;
     use bamboo_infrastructure::{LLMError, LLMStream};
+
+    fn test_registry() -> Arc<ProviderRegistry> {
+        Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()))
+    }
 
     #[derive(Debug, Clone)]
     enum SequenceStep {
@@ -926,6 +962,7 @@ mod tests {
             storage: storage.clone(),
             provider: provider.clone(),
             config: config.clone(),
+            provider_registry: test_registry(),
         };
         let contexts = collect_candidate_session_contexts(
             &context,
@@ -936,7 +973,7 @@ mod tests {
         assert_eq!(contexts.len(), 1);
 
         let writes =
-            extract_and_persist_durable_candidates(&context, &memory, "fast-model", &contexts)
+            extract_and_persist_durable_candidates(&provider, &memory, "fast-model", &contexts)
                 .await
                 .expect("extraction should succeed");
         assert_eq!(writes, 1);
@@ -1012,6 +1049,7 @@ mod tests {
             storage,
             provider,
             config,
+            provider_registry: test_registry(),
         };
         let sessions = collect_candidate_session_contexts(
             &context,
@@ -1020,7 +1058,7 @@ mod tests {
         )
         .await;
         let writes =
-            extract_and_persist_durable_candidates(&context, &memory, "fast-model", &sessions)
+            extract_and_persist_durable_candidates(&context.provider, &memory, "fast-model", &sessions)
                 .await
                 .expect("empty extraction should succeed");
         assert_eq!(writes, 0);
@@ -1089,6 +1127,7 @@ mod tests {
             storage,
             provider,
             config,
+            provider_registry: test_registry(),
         };
         let result = run_auto_dream_once_with_store(&context, &memory)
             .await
@@ -1215,6 +1254,7 @@ mod tests {
             storage,
             provider,
             config,
+            provider_registry: test_registry(),
         };
         let result = run_project_auto_dream_once_with_store(&context, &memory, &project_key_a)
             .await
@@ -1317,6 +1357,7 @@ mod tests {
             storage,
             provider,
             config,
+            provider_registry: test_registry(),
         };
         let result = run_project_auto_dream_once_with_store(&context, &memory, &target_project_key)
             .await
@@ -1387,6 +1428,7 @@ mod tests {
             storage,
             provider,
             config,
+            provider_registry: test_registry(),
         };
         let result = run_project_auto_dream_once_with_store(&context, &memory, &project_key)
             .await
@@ -1464,6 +1506,7 @@ mod tests {
             storage,
             provider: provider_handle,
             config,
+            provider_registry: test_registry(),
         };
 
         let result = run_auto_dream_once_with_store(&context, &memory)
@@ -1554,6 +1597,7 @@ mod tests {
             storage,
             provider: provider_handle,
             config,
+            provider_registry: test_registry(),
         };
 
         let _ = run_project_auto_dream_once_with_store(&context, &memory, &project_key)
@@ -1642,6 +1686,7 @@ mod tests {
             storage,
             provider: provider_handle,
             config,
+            provider_registry: test_registry(),
         };
 
         let result = run_project_auto_dream_once_with_store(&context, &memory, &project_key)
@@ -1764,6 +1809,7 @@ Model: gpt-5-mini
             storage,
             provider: provider_handle,
             config,
+            provider_registry: test_registry(),
         };
 
         let result = run_auto_dream_once_with_store(&context, &memory)
@@ -1845,6 +1891,7 @@ Model: gpt-5-mini
             storage,
             provider: provider_handle,
             config,
+            provider_registry: test_registry(),
         };
 
         let result = run_auto_dream_once_with_store(&context, &memory)
@@ -1892,6 +1939,7 @@ Model: gpt-5-mini
             storage,
             provider,
             config,
+            provider_registry: test_registry(),
         };
         let result = run_auto_dream_once(&context)
             .await
@@ -1925,6 +1973,7 @@ Model: gpt-5-mini
             storage,
             provider,
             config,
+            provider_registry: test_registry(),
         };
         let result = run_auto_dream_once(&context)
             .await

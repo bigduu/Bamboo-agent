@@ -3,6 +3,7 @@
 use bamboo_agent_core::{PendingQuestion, Session};
 
 use super::errors::RespondError;
+use super::provider_model::{derive_model_ref, persist_legacy_model_provider, persist_model_ref};
 use super::repository::SessionAccess;
 use super::types::RespondInput;
 
@@ -66,11 +67,15 @@ pub async fn submit_pending_response(
     );
 
     // ---- Merge model/reasoning from request ----
-    if let Some(model) = input.model.as_deref() {
-        let trimmed = model.trim();
-        if !trimmed.is_empty() && trimmed != "unknown" {
-            session.model = trimmed.to_string();
-        }
+    let request_model_ref = derive_model_ref(
+        input.model_ref.as_ref(),
+        input.provider.as_deref(),
+        input.model.as_deref(),
+    );
+    if let Some(model_ref) = request_model_ref.as_ref() {
+        persist_model_ref(&mut session, model_ref);
+    } else {
+        persist_legacy_model_provider(&mut session, input.model.as_deref(), input.provider.as_deref());
     }
     if let Some(reasoning_effort) = input.reasoning_effort {
         session.reasoning_effort = Some(reasoning_effort);

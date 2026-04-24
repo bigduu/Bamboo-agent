@@ -1,10 +1,13 @@
 //! Value types for session use cases.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_domain::ProviderModelRef;
 use bamboo_domain::Session;
 use bamboo_engine::ImageFallbackConfig;
+use bamboo_infrastructure::LLMProvider;
 
 /// Resolved configuration snapshot for execution.
 ///
@@ -13,12 +16,15 @@ use bamboo_engine::ImageFallbackConfig;
 #[derive(Clone, Default)]
 pub struct ExecutionConfigSnapshot {
     pub default_model: Option<String>,
+    pub default_model_ref: Option<ProviderModelRef>,
     pub default_reasoning_effort: Option<ReasoningEffort>,
     pub disabled_tools: Vec<String>,
     pub disabled_skill_ids: Vec<String>,
     pub provider_name: String,
     pub fast_model: Option<String>,
+    pub fast_model_ref: Option<ProviderModelRef>,
     pub image_fallback: Option<ImageFallbackConfig>,
+    pub provider_model_ref_enabled: bool,
 }
 
 // ---- Chat types ----
@@ -27,6 +33,8 @@ pub struct ExecutionConfigSnapshot {
 pub struct ChatTurnInput {
     pub session_id: String,
     pub model: String,
+    pub model_ref: Option<ProviderModelRef>,
+    pub provider: Option<String>,
     pub message: String,
     pub system_prompt: Option<String>,
     pub enhance_prompt: Option<String>,
@@ -49,6 +57,8 @@ pub struct PreparedChatTurn {
 pub struct ExecuteInput {
     pub session_id: String,
     pub request_model: Option<String>,
+    pub request_model_ref: Option<ProviderModelRef>,
+    pub request_provider: Option<String>,
     pub request_reasoning_effort: Option<ReasoningEffort>,
     pub request_skill_mode: Option<String>,
     pub client_sync: Option<ExecuteClientSync>,
@@ -154,6 +164,8 @@ pub struct RespondInput {
     pub session_id: String,
     pub user_response: String,
     pub model: Option<String>,
+    pub model_ref: Option<ProviderModelRef>,
+    pub provider: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
@@ -173,6 +185,8 @@ pub struct SubmitResponseOutcome {
 pub struct ResumeConfigSnapshot {
     pub provider_name: String,
     pub fast_model: Option<String>,
+    pub fast_model_ref: Option<ProviderModelRef>,
+    pub background_model_provider: Option<Arc<dyn LLMProvider>>,
     pub disabled_tools: BTreeSet<String>,
     pub disabled_skill_ids: BTreeSet<String>,
     pub image_fallback: Option<ImageFallbackConfig>,

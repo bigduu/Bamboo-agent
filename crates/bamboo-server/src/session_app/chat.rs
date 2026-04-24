@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 use super::errors::ChatError;
+use super::provider_model::{derive_model_ref, persist_legacy_model_provider, persist_model_ref};
 use super::repository::SessionAccess;
 use super::types::ChatTurnInput;
 
@@ -106,8 +107,21 @@ pub async fn prepare_chat_turn(
     session.messages.insert(0, Message::system(system_prompt));
     refresh_prompt_snapshot(&mut session);
 
-    // ---- Persist model ----
-    session.model = input.model;
+    // ---- Persist model/provider selection ----
+    let request_model_ref = derive_model_ref(
+        input.model_ref.as_ref(),
+        input.provider.as_deref(),
+        Some(input.model.as_str()),
+    );
+    if let Some(model_ref) = request_model_ref.as_ref() {
+        persist_model_ref(&mut session, model_ref);
+    } else {
+        persist_legacy_model_provider(
+            &mut session,
+            Some(input.model.as_str()),
+            input.provider.as_deref(),
+        );
+    }
 
     // ---- Save ----
     repo.save_and_cache(&session).await?;

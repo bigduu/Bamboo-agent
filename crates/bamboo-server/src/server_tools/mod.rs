@@ -1,11 +1,13 @@
 //! Server-side tool implementations.
 
+pub mod compact;
 pub mod memory;
 pub mod overlay_executor;
 pub mod session_inspector;
 pub mod skill_runtime;
 pub mod surface;
 
+pub use compact::CompactContextTool;
 pub use memory::MemoryTool;
 pub use overlay_executor::OverlayToolExecutor;
 pub use session_inspector::SessionInspectorTool;

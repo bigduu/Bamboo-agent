@@ -8,8 +8,8 @@
 
 // Re-export framework-agnostic tools from crate
 pub use crate::server_tools::{
-    LoadSkillTool, MemoryTool, OverlayToolExecutor, ReadSkillResourceTool, SessionInspectorTool,
-    ToolSurface, ToolSurfaceFactory,
+    CompactContextTool, LoadSkillTool, MemoryTool, OverlayToolExecutor, ReadSkillResourceTool,
+    SessionInspectorTool, ToolSurface, ToolSurfaceFactory,
 };
 
 pub mod child_session_adapter;

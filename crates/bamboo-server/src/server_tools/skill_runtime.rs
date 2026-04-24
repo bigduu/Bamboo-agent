@@ -455,7 +455,6 @@ mod tests {
         LAST_LOADED_SKILL_SUMMARY_METADATA_KEY, LAST_RESOURCE_READ_SUMMARY_METADATA_KEY,
     };
     use std::collections::{HashMap, HashSet};
-    use std::path::Path;
     use std::sync::Arc;
 
     use tokio::sync::RwLock;

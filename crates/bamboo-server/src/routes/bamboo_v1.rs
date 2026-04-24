@@ -176,6 +176,15 @@ fn bamboo_v1_scope() -> impl HttpServiceFactory {
             "/bamboo/copilot/logout",
             web::post().to(copilot_auth::logout_copilot),
         )
+        // Provider catalog routes
+        .route(
+            "/bamboo/provider-catalog",
+            web::get().to(settings::get_provider_catalog),
+        )
+        .route(
+            "/bamboo/provider-catalog/fetch-models",
+            web::post().to(settings::fetch_catalog_models),
+        )
 }
 
 /// Configure Bamboo internal `/v1/*` routes.
