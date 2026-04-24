@@ -22,3 +22,6 @@ pub use memory::MemoryManager;
 pub use mini_loop::MiniLoopExecutor;
 pub use prompt::PromptManager;
 pub use tool::ToolManager;
+
+// Re-export concrete implementations from adapters.
+pub use adapters::LLMMiniLoopExecutor;

@@ -10,6 +10,8 @@ use bamboo_agent_core::tools::ToolSchema;
 use bamboo_compression::TokenBudget;
 use bamboo_domain::ReasoningEffort;
 use bamboo_infrastructure::MemoryConfig;
+use bamboo_infrastructure::config::PermissionMode;
+use bamboo_infrastructure::LLMProvider;
 use bamboo_tools::ToolRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +103,24 @@ pub struct AgentLoopConfig {
     /// Unlike `fast_model_name`, this must not silently fall back to the main
     /// interaction model.
     pub background_model_name: Option<String>,
+    /// Model for planning/coordination tasks (task decomposition, architecture).
+    /// Falls back to `model_name` when unset.
+    pub planning_model_name: Option<String>,
+    /// Model for search/navigation tasks (grep, file listing, symbol resolution).
+    /// Falls back to `fast_model_name` when unset.
+    pub search_model_name: Option<String>,
+    /// Custom instructions for conversation summarization, injected into the
+    /// LLM summary prompt. Lets users control what the summary focuses on.
+    ///
+    /// Resolution order: session-level > config-level > built-in defaults.
+    pub compression_instructions: Option<String>,
+    /// Dedicated model for summarization. Falls back to `background_model_name`.
+    pub summarization_model_name: Option<String>,
+    /// Optional provider override for background/fast model LLM calls.
+    ///
+    /// When set, context compression, summarization, and other background
+    /// model calls use this provider instead of the shared agent loop provider.
+    pub background_model_provider: Option<Arc<dyn LLMProvider>>,
     /// Provider name used for provider-specific request behavior.
     pub provider_name: Option<String>,
     /// Optional request-time reasoning effort override.
@@ -126,6 +146,12 @@ pub struct AgentLoopConfig {
     pub per_tool_timeout_secs: u64,
     /// Parallel batch execution timeout in seconds (default: 300).
     pub parallel_batch_timeout_secs: u64,
+    /// Permission mode for this execution (default: None = use PermissionConfig's mode).
+    pub permission_mode: Option<PermissionMode>,
+    /// Enable dynamic per-round model routing based on task complexity.
+    /// When true, the pipeline classifies complexity at each round end and
+    /// stores the result in session metadata.
+    pub features_dynamic_model_routing: bool,
 }
 
 impl Default for AgentLoopConfig {
@@ -147,6 +173,11 @@ impl Default for AgentLoopConfig {
             model_name: None,
             fast_model_name: None,
             background_model_name: None,
+            planning_model_name: None,
+            search_model_name: None,
+            compression_instructions: None,
+            summarization_model_name: None,
+            background_model_provider: None,
             provider_name: None,
             reasoning_effort: None,
             disabled_tools: BTreeSet::new(),
@@ -170,6 +201,8 @@ impl Default for AgentLoopConfig {
             ],
             per_tool_timeout_secs: 120,
             parallel_batch_timeout_secs: 300,
+            permission_mode: None,
+            features_dynamic_model_routing: false,
         }
     }
 }

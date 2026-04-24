@@ -248,12 +248,18 @@ pub struct ExecuteRequest {
     /// Override runtime's `default_tools`.  When `None`, uses the runtime's
     /// default tool executor.
     pub tools: Option<Arc<dyn ToolExecutor>>,
+    /// Override the LLM provider for this execution. When `None`, uses the
+    /// runtime's shared provider handle.
+    pub provider_override: Option<Arc<dyn LLMProvider>>,
 
     // -- Optional overrides (None → config defaults) ----------------------
     pub model: Option<String>,
     pub provider_name: Option<String>,
     /// When `None`, falls back to `Config::get_memory_background_model()`.
     pub background_model: Option<String>,
+    /// Optional provider override for background/fast model calls.
+    /// When set, compression/summarization use this provider instead of the shared `llm`.
+    pub background_model_provider: Option<Arc<dyn LLMProvider>>,
     pub reasoning_effort: Option<ReasoningEffort>,
     /// When `None`, falls back to `Config::disabled_tool_names()`.
     pub disabled_tools: Option<BTreeSet<String>>,
@@ -293,37 +299,57 @@ impl AgentRuntime {
     ) -> crate::runtime::runner::Result<()> {
         let system_prompt = extract_system_prompt(session);
         let config = self.config.read().await;
-        let tools = req.tools.unwrap_or_else(|| self.default_tools.clone());
+        let ExecuteRequest {
+            initial_message,
+            event_tx,
+            cancel_token,
+            tools,
+            provider_override,
+            model,
+            provider_name,
+            background_model,
+            background_model_provider,
+            reasoning_effort,
+            disabled_tools,
+            disabled_skill_ids,
+            selected_skill_ids,
+            selected_skill_mode,
+            image_fallback,
+        } = req;
+        let tools = tools.unwrap_or_else(|| self.default_tools.clone());
+        let llm = provider_override.unwrap_or_else(|| self.provider.clone());
 
         let loop_config = AgentLoopConfig {
             max_rounds: 200,
             system_prompt,
-            disabled_skill_ids: req
-                .disabled_skill_ids
-                .unwrap_or_else(|| config.disabled_skill_ids()),
-            selected_skill_ids: req.selected_skill_ids,
-            selected_skill_mode: req.selected_skill_mode,
+            disabled_skill_ids: disabled_skill_ids.unwrap_or_else(|| config.disabled_skill_ids()),
+            selected_skill_ids,
+            selected_skill_mode,
             skill_manager: Some(self.skill_manager.clone()),
             skip_initial_user_message: true,
             storage: Some(self.storage.clone()),
             attachment_reader: Some(self.attachment_reader.clone()),
             metrics_collector: Some(self.metrics_collector.clone()),
-            model_name: req.model,
+            model_name: model,
             fast_model_name: config.get_fast_model(),
-            background_model_name: req
-                .background_model
-                .or_else(|| config.get_memory_background_model()),
-            provider_name: Some(req.provider_name.unwrap_or_else(|| config.provider.clone())),
-            reasoning_effort: req.reasoning_effort,
-            disabled_tools: req
-                .disabled_tools
-                .unwrap_or_else(|| config.disabled_tool_names()),
-            image_fallback: req.image_fallback,
+            background_model_name: background_model.or_else(|| config.get_memory_background_model()),
+            background_model_provider,
+            planning_model_name: config.defaults.as_ref().and_then(|d| d.planning.as_ref()).map(|r| r.model.clone()),
+            search_model_name: config
+                .defaults
+                .as_ref()
+                .and_then(|d| d.search.as_ref().or(d.fast.as_ref()))
+                .map(|r| r.model.clone()),
+            provider_name: Some(provider_name.unwrap_or_else(|| config.provider.clone())),
+            reasoning_effort,
+            disabled_tools: disabled_tools.unwrap_or_else(|| config.disabled_tool_names()),
+            image_fallback,
             prompt_memory_flags: config
                 .memory
                 .as_ref()
                 .map(PromptMemoryFlags::from)
                 .unwrap_or_default(),
+            features_dynamic_model_routing: config.features.dynamic_model_routing,
             ..Default::default()
         };
 
@@ -331,11 +357,11 @@ impl AgentRuntime {
 
         run_agent_loop_with_config(
             session,
-            req.initial_message,
-            req.event_tx,
-            self.provider.clone(),
+            initial_message,
+            event_tx,
+            llm,
             tools,
-            req.cancel_token,
+            cancel_token,
             loop_config,
         )
         .await
