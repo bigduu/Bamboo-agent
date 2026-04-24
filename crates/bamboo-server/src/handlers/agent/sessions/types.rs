@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_domain::ProviderModelRef;
 use bamboo_infrastructure::SessionIndexEntry;
 
 #[derive(Debug, Serialize)]
@@ -13,6 +14,10 @@ pub struct SessionSummary {
     pub root_session_id: String,
     pub spawn_depth: u32,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<ProviderModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -44,6 +49,8 @@ impl SessionSummary {
             root_session_id: entry.root_session_id,
             spawn_depth: entry.spawn_depth,
             model: entry.model,
+            model_ref: entry.model_ref,
+            provider: None,
             reasoning_effort: entry.reasoning_effort,
             created_by_schedule_id: entry.created_by_schedule_id,
             schedule_run_id: entry.schedule_run_id,
@@ -73,6 +80,10 @@ pub struct CreateSessionRequest {
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model_ref: Option<ProviderModelRef>,
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
 }
@@ -134,6 +145,10 @@ pub struct PatchSessionRequest {
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model_ref: Option<ProviderModelRef>,
+    #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     pub clear_reasoning_effort: Option<bool>,
@@ -179,6 +194,8 @@ mod tests {
             title: Some("Test".to_string()),
             system_prompt: None,
             model: None,
+            provider: None,
+            model_ref: None,
             reasoning_effort: None,
         };
 
@@ -259,6 +276,8 @@ mod tests {
             root_session_id: "root-id".to_string(),
             spawn_depth: 0,
             model: "gpt-4".to_string(),
+            model_ref: None,
+            provider: None,
             reasoning_effort: Some(ReasoningEffort::Medium),
             created_by_schedule_id: None,
             schedule_run_id: None,
@@ -291,6 +310,8 @@ mod tests {
             root_session_id: "root-id".to_string(),
             spawn_depth: 1,
             model: "gpt-4.1".to_string(),
+            model_ref: None,
+            provider: None,
             reasoning_effort: None,
             created_by_schedule_id: None,
             schedule_run_id: None,
@@ -410,6 +431,8 @@ mod tests {
             root_session_id: "root".to_string(),
             spawn_depth: 0,
             model: "gpt-4o".to_string(),
+            model_ref: None,
+            provider: None,
             reasoning_effort: Some(ReasoningEffort::Low),
             created_by_schedule_id: None,
             schedule_run_id: None,

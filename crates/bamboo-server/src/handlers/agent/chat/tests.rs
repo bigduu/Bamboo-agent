@@ -62,6 +62,8 @@ fn chat_request_empty_model_fails_validation() {
         selected_skill_ids: None,
         images: None,
         model: "   ".to_string(),
+        provider: None,
+        model_ref: None,
     };
     let model = request.model.trim();
     assert!(model.is_empty(), "Empty model should fail validation");

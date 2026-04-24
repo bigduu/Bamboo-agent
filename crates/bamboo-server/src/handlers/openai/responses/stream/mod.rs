@@ -21,15 +21,26 @@ pub(super) async fn handle_streaming_response(
     prepared: PreparedResponsesRequest,
     forward_id: String,
 ) -> Result<HttpResponse, AppError> {
+    let display_model = prepared.provider_name
+        .as_ref()
+        .map(|p| format!("{}/{}", p, prepared.resolved_model))
+        .unwrap_or_else(|| prepared.resolved_model.clone());
+
     app_state.metrics_service.collector().forward_started(
         forward_id.clone(),
         "openai.responses",
-        prepared.resolved_model.clone(),
+        display_model.clone(),
         true,
         chrono::Utc::now(),
     );
 
-    let provider = app_state.get_provider().await;
+    let provider = match &prepared.provider_name {
+        Some(name) => {
+            let model_ref = bamboo_domain::ProviderModelRef::new(name, &prepared.resolved_model);
+            app_state.get_provider_for_model_ref(&model_ref)?
+        }
+        None => app_state.get_provider().await,
+    };
     let request_options = LLMRequestOptions {
         session_id: None,
         reasoning_effort: prepared.reasoning_effort,
@@ -60,7 +71,7 @@ pub(super) async fn handle_streaming_response(
         fallback_response_id: format!("resp_{}", uuid::Uuid::new_v4()),
         message_id,
         created_at,
-        resolved_model: prepared.resolved_model,
+        resolved_model: display_model,
         estimated_prompt_tokens: prepared.estimated_prompt_tokens,
     });
 

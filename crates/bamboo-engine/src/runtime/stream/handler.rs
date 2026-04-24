@@ -15,6 +15,10 @@ pub struct StreamHandlingOutput {
     pub reasoning_content: String,
     pub token_count: usize,
     pub tool_calls: Vec<ToolCall>,
+    pub output_tokens: u64,
+    pub thinking_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
 }
 
 pub async fn consume_llm_stream(

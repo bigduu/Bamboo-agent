@@ -10,6 +10,8 @@ pub(super) struct ProviderConfigResponse {
     pub(super) available_providers: Vec<String>,
     /// Provider-specific configurations (API keys masked).
     pub(super) providers: Value,
+    /// Feature flags from server config.
+    pub(super) features: bamboo_infrastructure::FeatureFlags,
 }
 
 /// Request body for updating provider configuration.
@@ -32,6 +34,7 @@ mod tests {
             provider: "anthropic".to_string(),
             available_providers: vec!["anthropic".to_string(), "openai".to_string()],
             providers: serde_json::json!({"anthropic": {"api_key": "***"}}),
+            features: Default::default(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -45,6 +48,7 @@ mod tests {
             provider: "openai".to_string(),
             available_providers: vec!["openai".to_string()],
             providers: serde_json::json!({"openai": {"model": "gpt-4"}}),
+            features: Default::default(),
         };
 
         let json = serde_json::to_string(&response).unwrap();

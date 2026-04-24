@@ -57,6 +57,7 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                     }
                 }
             }
+            Ok(LLMChunk::CacheUsage { .. }) | Ok(LLMChunk::UsageSummary { .. }) => {}
             Err(error) => {
                 tracing::error!("Stream error: {}", error);
                 had_error = true;

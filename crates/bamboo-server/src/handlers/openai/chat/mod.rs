@@ -33,7 +33,10 @@ pub(super) fn map_provider_error(error: impl std::fmt::Display) -> AppError {
 
 pub(super) struct PreparedChatRequest {
     pub(super) stream: bool,
+    /// Raw model string — may be "provider/model" or plain "model".
     pub(super) resolved_model: String,
+    /// Parsed provider name when model is in "provider/model" format.
+    pub(super) provider_name: Option<String>,
     pub(super) internal_messages: Vec<Message>,
     pub(super) internal_tools: Vec<ToolSchema>,
     pub(super) max_tokens: Option<u32>,

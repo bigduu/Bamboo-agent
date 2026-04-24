@@ -13,6 +13,7 @@ use tracing::Instrument;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_domain::ReasoningEffort;
+use bamboo_infrastructure::LLMProvider;
 
 use crate::runtime::config::ImageFallbackConfig;
 use crate::runtime::execution::runner_lifecycle::finalize_runner;
@@ -38,9 +39,12 @@ pub struct SessionExecutionArgs {
 
     // Execution parameters.
     pub tools_override: Option<Arc<dyn ToolExecutor>>,
+    pub provider_override: Option<Arc<dyn LLMProvider>>,
     pub provider_name: Option<String>,
     pub model: String,
     pub fast_model: Option<String>,
+    /// Optional provider override for background/fast model calls.
+    pub background_model_provider: Option<Arc<dyn LLMProvider>>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub reasoning_effort_source: String,
     pub disabled_tools: Option<BTreeSet<String>>,
@@ -76,9 +80,11 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 session_id,
                 mut session,
                 tools_override,
+                provider_override,
                 provider_name,
                 model,
                 fast_model,
+                background_model_provider,
                 reasoning_effort,
                 reasoning_effort_source,
                 disabled_tools,
@@ -125,9 +131,11 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                         event_tx: mpsc_tx.clone(),
                         cancel_token,
                         tools: tools_override,
+                        provider_override,
                         model: Some(model),
                         provider_name,
                         background_model: fast_model,
+                        background_model_provider,
                         reasoning_effort,
                         disabled_tools,
                         disabled_skill_ids,

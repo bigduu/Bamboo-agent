@@ -11,6 +11,7 @@ use super::types::ResponsesCreateRequest;
 
 pub(super) struct PreparedResponsesRequest {
     pub(super) resolved_model: String,
+    pub(super) provider_name: Option<String>,
     pub(super) internal_messages: Vec<bamboo_agent_core::Message>,
     pub(super) internal_tools: Vec<bamboo_agent_core::tools::ToolSchema>,
     pub(super) max_tokens: Option<u32>,

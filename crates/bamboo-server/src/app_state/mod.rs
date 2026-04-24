@@ -253,6 +253,15 @@ pub struct AppState {
 
     /// Unified agent execution runtime holding shared resources.
     pub agent: Arc<bamboo_engine::Agent>,
+
+    /// Multi-provider registry (used when features.provider_model_ref is enabled).
+    pub provider_registry: Arc<bamboo_infrastructure::ProviderRegistry>,
+
+    /// Provider/model router (used when features.provider_model_ref is enabled).
+    pub provider_router: Arc<bamboo_infrastructure::ProviderModelRouter>,
+
+    /// Unified model catalog service (used when features.provider_model_ref is enabled).
+    pub model_catalog: Arc<bamboo_infrastructure::ModelCatalogService>,
 }
 
 mod builder;

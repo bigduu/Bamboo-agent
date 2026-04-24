@@ -207,6 +207,10 @@ pub struct Config {
     #[serde(default = "default_provider")]
     pub provider: String,
 
+    /// Default model assignments (used when features.provider_model_ref is enabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defaults: Option<DefaultsConfig>,
+
     /// Provider-specific configurations
     #[serde(default)]
     pub providers: ProviderConfigs,
@@ -267,6 +271,10 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_control: Option<AccessControlConfig>,
 
+    /// Feature flags for incremental rollout.
+    #[serde(default)]
+    pub features: FeatureFlags,
+
     /// Memory/background summarization settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryConfig>,
@@ -305,10 +313,55 @@ pub struct ProviderConfigs {
     /// GitHub Copilot provider configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub copilot: Option<CopilotConfig>,
+    /// Bodhi proxy provider configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bodhi: Option<BodhiConfig>,
 
     /// Preserve unknown provider keys (forward compatibility).
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Feature flags for incremental rollout of new subsystems.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FeatureFlags {
+    /// Enable the ProviderModelRef system (multi-provider + unified model selection).
+    #[serde(default)]
+    pub provider_model_ref: bool,
+    /// Enable MiniLoop-based complexity evaluation and dynamic per-round model switching.
+    #[serde(default)]
+    pub dynamic_model_routing: bool,
+}
+
+/// Default model assignments for specific capabilities.
+///
+/// Used when `features.provider_model_ref` is enabled.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DefaultsConfig {
+    pub chat: bamboo_domain::ProviderModelRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bamboo_domain::ProviderModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bamboo_domain::ProviderModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_background: Option<bamboo_domain::ProviderModelRef>,
+    /// Model for planning/coordination tasks (task decomposition, architecture).
+    /// Falls back to `chat` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning: Option<bamboo_domain::ProviderModelRef>,
+    /// Model for search/navigation tasks (grep, file listing, symbol resolution).
+    /// Falls back to `fast` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<bamboo_domain::ProviderModelRef>,
+    /// Model for code review tasks.
+    /// Falls back to `chat` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_review: Option<bamboo_domain::ProviderModelRef>,
+    /// Per-subagent-type model overrides.
+    /// Key = subagent_type (e.g. "researcher", "coder"), Value = ProviderModelRef.
+    /// Falls back to `chat` when no match is found for a given type.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub subagent_models: HashMap<String, bamboo_domain::ProviderModelRef>,
 }
 
 /// Request hook configuration.
@@ -696,6 +749,33 @@ pub struct CopilotConfig {
     pub request_overrides: Option<RequestOverridesConfig>,
 
     /// Preserve unknown keys under `providers.copilot`.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Bodhi proxy provider configuration.
+///
+/// Routes LLM requests through a bodhi-server instance so that raw provider
+/// API keys never reach the client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BodhiConfig {
+    /// Bodhi server API key (e.g. "bhi_sk_xxx").  In-memory only.
+    #[serde(default, skip_serializing)]
+    pub api_key: String,
+    /// Encrypted form of the API key stored on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_encrypted: Option<String>,
+    /// Bodhi server base URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Which upstream provider to route through bodhi ("openai", "anthropic", "gemini").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_provider: Option<String>,
+    /// Default reasoning effort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+
+    /// Preserve unknown keys.
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -1267,6 +1347,17 @@ impl Config {
                 }
             }
         }
+
+        if let Some(bodhi) = self.providers.bodhi.as_mut() {
+            if bodhi.api_key.trim().is_empty() {
+                if let Some(encrypted) = bodhi.api_key_encrypted.as_deref() {
+                    match crate::encryption::decrypt(encrypted) {
+                        Ok(value) => bodhi.api_key = value,
+                        Err(e) => tracing::warn!("Failed to decrypt Bodhi api_key: {}", e),
+                    }
+                }
+            }
+        }
     }
 
     pub fn refresh_provider_api_keys_encrypted(&mut self) -> Result<()> {
@@ -1302,6 +1393,18 @@ impl Config {
                 Some(
                     crate::encryption::encrypt(api_key)
                         .context("Failed to encrypt Gemini api_key")?,
+                )
+            };
+        }
+
+        if let Some(bodhi) = self.providers.bodhi.as_mut() {
+            let api_key = bodhi.api_key.trim();
+            bodhi.api_key_encrypted = if api_key.is_empty() {
+                None
+            } else {
+                Some(
+                    crate::encryption::encrypt(api_key)
+                        .context("Failed to encrypt Bodhi api_key")?,
                 )
             };
         }
@@ -1542,6 +1645,8 @@ impl Config {
             env_vars: Vec::new(),
             default_work_area: None,
             access_control: None,
+            features: FeatureFlags::default(),
+            defaults: None,
             memory: None,
             mcp: bamboo_domain::mcp_config::McpConfig::default(),
             extra: BTreeMap::new(),

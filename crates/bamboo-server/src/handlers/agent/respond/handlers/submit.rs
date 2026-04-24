@@ -1,6 +1,7 @@
 use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
+use crate::session_app::provider_model::session_effective_model_ref;
 
 use super::super::types::RespondRequest;
 
@@ -27,6 +28,8 @@ pub async fn submit_response(
         session_id: session_id.clone(),
         user_response: user_response.clone(),
         model: req.model.clone(),
+        model_ref: req.model_ref.clone(),
+        provider: req.provider.clone(),
         reasoning_effort: req.reasoning_effort,
     };
 
@@ -65,9 +68,19 @@ pub async fn submit_response(
 
     // Build resume config snapshot from server config.
     let config_snapshot = state.config.read().await.clone();
+    let resolved_provider_name = session_effective_model_ref(&_session)
+        .map(|model_ref| model_ref.provider)
+        .unwrap_or_else(|| config_snapshot.provider.clone());
+    let resolved_bg = crate::model_config_helper::resolve_background_model(
+        &config_snapshot,
+        &resolved_provider_name,
+        &state.provider_registry,
+    );
     let resume_config = crate::session_app::types::ResumeConfigSnapshot {
-        provider_name: config_snapshot.provider.clone(),
-        fast_model: config_snapshot.get_memory_background_model(),
+        provider_name: resolved_provider_name.clone(),
+        fast_model: resolved_bg.as_ref().map(|m| m.model_name.clone()),
+        fast_model_ref: None,
+        background_model_provider: resolved_bg.map(|m| m.provider),
         disabled_tools: config_snapshot.disabled_tool_names(),
         disabled_skill_ids: config_snapshot.disabled_skill_ids(),
         image_fallback: crate::handlers::agent::execute::image_fallback::resolve_image_fallback(

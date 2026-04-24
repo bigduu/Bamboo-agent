@@ -82,6 +82,8 @@ pub(super) fn convert_chunk_to_openai(
             }],
             usage: None,
         }),
+        bamboo_infrastructure::types::LLMChunk::CacheUsage { .. }
+        | bamboo_infrastructure::types::LLMChunk::UsageSummary { .. } => None,
     }
 }
 

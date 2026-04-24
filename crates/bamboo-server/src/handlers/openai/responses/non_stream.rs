@@ -15,15 +15,26 @@ pub(super) async fn handle_non_streaming_response(
     prepared: PreparedResponsesRequest,
     forward_id: String,
 ) -> Result<HttpResponse, AppError> {
+    let display_model = prepared.provider_name
+        .as_ref()
+        .map(|p| format!("{}/{}", p, prepared.resolved_model))
+        .unwrap_or_else(|| prepared.resolved_model.clone());
+
     app_state.metrics_service.collector().forward_started(
         forward_id.clone(),
         "openai.responses",
-        prepared.resolved_model.clone(),
+        display_model.clone(),
         false,
         chrono::Utc::now(),
     );
 
-    let provider = app_state.get_provider().await;
+    let provider = match &prepared.provider_name {
+        Some(name) => {
+            let model_ref = bamboo_domain::ProviderModelRef::new(name, &prepared.resolved_model);
+            app_state.get_provider_for_model_ref(&model_ref)?
+        }
+        None => app_state.get_provider().await,
+    };
     let request_options = LLMRequestOptions {
         session_id: None,
         reasoning_effort: prepared.reasoning_effort,
@@ -59,6 +70,8 @@ pub(super) async fn handle_non_streaming_response(
                 tool_calls.extend(calls)
             }
             Ok(bamboo_infrastructure::types::LLMChunk::Done) => break,
+            Ok(bamboo_infrastructure::types::LLMChunk::CacheUsage { .. })
+            | Ok(bamboo_infrastructure::types::LLMChunk::UsageSummary { .. }) => {}
             Err(error) => {
                 app_state.metrics_service.collector().forward_completed(
                     forward_id,
@@ -83,7 +96,7 @@ pub(super) async fn handle_non_streaming_response(
     let created_at = now_unix_ts();
 
     let output = build_output_items(&message_id, content, tool_calls);
-    let resp = build_completed_response(response_id, created_at, prepared.resolved_model, output);
+    let resp = build_completed_response(response_id, created_at, display_model, output);
 
     app_state.metrics_service.collector().forward_completed(
         forward_id,

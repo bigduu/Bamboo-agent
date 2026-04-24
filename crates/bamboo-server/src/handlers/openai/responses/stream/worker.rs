@@ -103,6 +103,7 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                 tool_calls.extend(calls)
             }
             Ok(LLMChunk::Done) => break,
+            Ok(LLMChunk::CacheUsage { .. }) | Ok(LLMChunk::UsageSummary { .. }) => {}
             Err(error) => {
                 had_error = true;
                 tracing::error!("Stream error: {}", error);

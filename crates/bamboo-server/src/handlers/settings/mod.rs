@@ -26,8 +26,8 @@ pub use keyword_masking::{
     get_keyword_masking_config, update_keyword_masking_config, validate_keyword_entries,
 };
 pub use provider::{
-    fetch_provider_models, get_provider_config, reload_provider_config, update_provider_config,
-    UpdateProviderRequest,
+    fetch_catalog_models, fetch_provider_models, get_provider_catalog, get_provider_config,
+    reload_provider_config, update_provider_config, UpdateProviderRequest,
 };
 pub use redaction::{redact_config_for_api, redact_providers_for_api};
 pub use setup::{get_setup_status, mark_setup_complete, mark_setup_incomplete};

@@ -1,4 +1,5 @@
 use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_domain::ProviderModelRef;
 use serde::Deserialize;
 
 /// Request payload for submitting a user response.
@@ -12,6 +13,12 @@ pub struct RespondRequest {
     pub response: String,
     /// Optional model to auto-resume execution after recording response.
     pub model: Option<String>,
+    /// Optional provider name for model resolution.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Optional provider+model reference (takes priority when present).
+    #[serde(default)]
+    pub model_ref: Option<ProviderModelRef>,
     /// Optional reasoning effort to use when auto-resuming execution.
     /// Falls back to the value stored in session metadata if not provided.
     #[serde(default)]
@@ -58,6 +65,8 @@ mod tests {
         let req = RespondRequest {
             response: "test response".to_string(),
             model: None,
+            provider: None,
+            model_ref: None,
             reasoning_effort: None,
         };
         let debug_str = format!("{:?}", req);

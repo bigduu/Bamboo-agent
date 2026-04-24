@@ -70,6 +70,8 @@ fn execute_request_allows_missing_model() {
 fn execute_request_empty_model_normalizes_to_compat_absent() {
     let request = ExecuteRequest {
         model: Some("   ".to_string()),
+        provider: None,
+        model_ref: None,
         skill_mode: None,
         reasoning_effort: None,
         client_sync: None,

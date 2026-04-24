@@ -57,6 +57,7 @@ fn build_new_session(
         title: req.title.clone(),
         system_prompt: req.system_prompt.clone(),
         model: req.model.clone(),
+        model_ref: req.model_ref.clone(),
         reasoning_effort: req.reasoning_effort,
     };
     let create_config = CreateSessionConfig {

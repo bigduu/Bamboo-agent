@@ -1,6 +1,9 @@
 use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
+use crate::session_app::provider_model::{
+    derive_model_ref, persist_legacy_model_provider, persist_model_ref,
+};
 
 use super::super::super::types::PatchSessionRequest;
 use super::query::get_session;
@@ -33,11 +36,15 @@ pub async fn patch_session(
     if let Some(pinned) = req.pinned {
         session.pinned = pinned;
     }
-    if let Some(model) = req.model.as_ref() {
-        let trimmed = model.trim();
-        if !trimmed.is_empty() {
-            session.model = trimmed.to_string();
-        }
+    let request_model_ref = derive_model_ref(
+        req.model_ref.as_ref(),
+        req.provider.as_deref(),
+        req.model.as_deref(),
+    );
+    if let Some(model_ref) = request_model_ref.as_ref() {
+        persist_model_ref(&mut session, model_ref);
+    } else {
+        persist_legacy_model_provider(&mut session, req.model.as_deref(), req.provider.as_deref());
     }
     if req.clear_reasoning_effort.unwrap_or(false) {
         session.reasoning_effort = None;

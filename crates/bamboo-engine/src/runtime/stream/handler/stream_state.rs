@@ -8,6 +8,10 @@ pub(super) struct StreamAccumulationState {
     reasoning_content: String,
     token_count: usize,
     tool_calls: ToolCallAccumulator,
+    output_tokens: u64,
+    thinking_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
 }
 
 impl StreamAccumulationState {
@@ -18,6 +22,10 @@ impl StreamAccumulationState {
             reasoning_content: String::new(),
             token_count: 0,
             tool_calls: ToolCallAccumulator::new(),
+            output_tokens: 0,
+            thinking_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         }
     }
 
@@ -41,6 +49,16 @@ impl StreamAccumulationState {
         self.tool_calls.extend(partial_calls);
     }
 
+    pub(super) fn record_usage(&mut self, output_tokens: u64, thinking_tokens: u64) {
+        self.output_tokens = output_tokens;
+        self.thinking_tokens = thinking_tokens;
+    }
+
+    pub(super) fn record_cache(&mut self, creation: u64, read: u64) {
+        self.cache_creation_input_tokens = self.cache_creation_input_tokens.saturating_add(creation);
+        self.cache_read_input_tokens = self.cache_read_input_tokens.saturating_add(read);
+    }
+
     pub(super) fn into_output(self) -> StreamHandlingOutput {
         StreamHandlingOutput {
             response_id: self.response_id,
@@ -48,6 +66,10 @@ impl StreamAccumulationState {
             reasoning_content: self.reasoning_content,
             token_count: self.token_count,
             tool_calls: self.tool_calls.finalize(),
+            output_tokens: self.output_tokens,
+            thinking_tokens: self.thinking_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+            cache_read_input_tokens: self.cache_read_input_tokens,
         }
     }
 }

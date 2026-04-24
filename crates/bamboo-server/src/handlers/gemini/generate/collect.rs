@@ -23,6 +23,7 @@ where
             LLMChunk::Done => break,
             // Keep the last tool call batch, matching the original behavior.
             LLMChunk::ToolCalls(calls) => collected.tool_calls = Some(calls),
+            LLMChunk::CacheUsage { .. } | LLMChunk::UsageSummary { .. } => {}
         }
     }
 

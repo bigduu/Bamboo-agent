@@ -20,7 +20,7 @@ pub(super) async fn handle_streaming_messages(
     response_model: String,
     forward_id: String,
 ) -> Result<HttpResponse, AppError> {
-    let provider = app_state.get_provider().await;
+    let provider = app_state.get_provider_for_endpoint("anthropic").await?;
     let model = response_model;
 
     let prepared = match prepare_internal_execution(&app_state, &openai_request).await {

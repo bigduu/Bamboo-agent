@@ -1,3 +1,4 @@
+use bamboo_domain::ProviderModelRef;
 use serde::{Deserialize, Serialize};
 
 /// Request payload for creating a new chat message.
@@ -30,6 +31,10 @@ pub struct ChatRequest {
     #[serde(default)]
     pub images: Option<Vec<ChatImage>>,
     pub model: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model_ref: Option<ProviderModelRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +151,8 @@ mod tests {
             selected_skill_ids: None,
             images: None,
             model: "gpt-4".to_string(),
+            provider: None,
+            model_ref: None,
         };
         let debug_str = format!("{:?}", req);
         assert!(debug_str.contains("ChatRequest"));

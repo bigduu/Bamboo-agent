@@ -1,4 +1,5 @@
 use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_domain::ProviderModelRef;
 use serde::{Deserialize, Serialize};
 
 /// Stable reasons explaining why the frontend must resynchronize before execute.
@@ -105,6 +106,12 @@ pub struct ExecuteRequest {
     /// Optional model compatibility fallback for execution.
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional provider name (used with provider_model_ref feature).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Optional provider+model reference (takes priority when present).
+    #[serde(default)]
+    pub model_ref: Option<ProviderModelRef>,
     /// Optional per-execution skill mode override (for example: "code", "ask").
     ///
     /// When provided, skill discovery prefers `skills-<mode>` directories.

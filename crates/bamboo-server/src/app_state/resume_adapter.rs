@@ -6,6 +6,8 @@
 //! `AppStateResumeRef` is a newtype wrapper around `Data<AppState>` to satisfy
 //! Rust's orphan rules (can't impl a foreign trait on a foreign type).
 
+use crate::model_config_helper::get_memory_background_model_for_provider;
+use crate::session_app::provider_model::session_effective_model_ref;
 use crate::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
 use async_trait::async_trait;
 use bamboo_agent_core::AgentEvent;
@@ -57,6 +59,14 @@ impl ResumeExecutionPort for AppStateResumeRef {
         } = request;
 
         let model = session.model.clone();
+        let resolved_provider_name = session_effective_model_ref(&session)
+            .map(|model_ref| model_ref.provider)
+            .unwrap_or(config.provider_name);
+        let resolved_bg_provider = config.background_model_provider.clone();
+        let resolved_fast_model = config.fast_model.or_else(|| {
+            let config_snapshot = self.0.config.blocking_read().clone();
+            get_memory_background_model_for_provider(&config_snapshot, &resolved_provider_name)
+        });
         let is_child_session = session.kind == bamboo_agent_core::SessionKind::Child;
         let reasoning_effort = session.reasoning_effort;
         let reasoning_effort_source = session
@@ -77,9 +87,11 @@ impl ResumeExecutionPort for AppStateResumeRef {
             session_id,
             session,
             is_child_session,
-            provider_name: config.provider_name,
+            provider_name: resolved_provider_name,
+            provider_override: None,
             model,
-            fast_model: config.fast_model,
+            fast_model: resolved_fast_model,
+            background_model_provider: resolved_bg_provider,
             reasoning_effort,
             reasoning_effort_source,
             disabled_tools: config.disabled_tools,

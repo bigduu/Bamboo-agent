@@ -81,6 +81,8 @@ pub(super) async fn handle_non_streaming_complete(
                 tool_calls = Some(convert_tool_calls(calls));
             }
             Ok(bamboo_infrastructure::types::LLMChunk::Done) => break,
+            Ok(bamboo_infrastructure::types::LLMChunk::CacheUsage { .. })
+            | Ok(bamboo_infrastructure::types::LLMChunk::UsageSummary { .. }) => {}
             Err(error) => {
                 app_state.metrics_service.collector().forward_completed(
                     forward_id.clone(),

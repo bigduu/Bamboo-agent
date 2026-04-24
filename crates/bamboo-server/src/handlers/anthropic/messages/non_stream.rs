@@ -16,7 +16,7 @@ pub(super) async fn handle_non_streaming_messages(
     response_model: String,
     forward_id: String,
 ) -> Result<HttpResponse, AppError> {
-    let provider = app_state.get_provider().await;
+    let provider = app_state.get_provider_for_endpoint("anthropic").await?;
 
     let prepared = match prepare_internal_execution(&app_state, &openai_request).await {
         Ok(prepared) => prepared,
@@ -80,6 +80,8 @@ pub(super) async fn handle_non_streaming_messages(
                 tool_calls = Some(map_tool_calls(calls));
             }
             Ok(bamboo_infrastructure::types::LLMChunk::Done) => break,
+            Ok(bamboo_infrastructure::types::LLMChunk::CacheUsage { .. })
+            | Ok(bamboo_infrastructure::types::LLMChunk::UsageSummary { .. }) => {}
             Err(error) => {
                 app_state.metrics_service.collector().forward_completed(
                     forward_id.clone(),

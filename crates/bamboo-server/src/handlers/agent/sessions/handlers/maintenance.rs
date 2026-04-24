@@ -100,6 +100,7 @@ pub async fn run_project_dream(
         storage: state.storage.clone(),
         provider: state.get_provider().await,
         config: state.config.clone(),
+        provider_registry: state.provider_registry.clone(),
     };
 
     let result = run_project_auto_dream_once(&ctx, &project_key)

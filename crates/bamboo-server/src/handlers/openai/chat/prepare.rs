@@ -20,7 +20,12 @@ pub(super) async fn prepare_chat_request(
             "model is required (do not use 'default')".to_string(),
         ));
     }
-    let resolved_model = requested_model;
+
+    // Parse "provider/model" format for cross-provider routing.
+    let (provider_name, resolved_model) = match requested_model.split_once('/') {
+        Some((p, m)) if !p.is_empty() && !m.is_empty() => (Some(p.to_string()), m.to_string()),
+        _ => (None, requested_model),
+    };
 
     let mut internal_messages = convert_messages(request.messages)?;
     let config_snapshot = app_state.config.read().await.clone();
@@ -51,6 +56,7 @@ pub(super) async fn prepare_chat_request(
     Ok(PreparedChatRequest {
         stream,
         resolved_model,
+        provider_name,
         internal_messages,
         internal_tools,
         max_tokens,

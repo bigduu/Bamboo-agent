@@ -20,7 +20,12 @@ pub(super) async fn prepare_request(
             "model is required (do not use 'default')".to_string(),
         ));
     }
-    let resolved_model = requested_model;
+
+    // Parse "provider/model" format for cross-provider routing.
+    let (provider_name, resolved_model) = match requested_model.split_once('/') {
+        Some((p, m)) if !p.is_empty() && !m.is_empty() => (Some(p.to_string()), m.to_string()),
+        _ => (None, requested_model),
+    };
 
     let instructions = request
         .instructions
@@ -76,6 +81,7 @@ pub(super) async fn prepare_request(
 
     Ok(PreparedResponsesRequest {
         resolved_model,
+        provider_name,
         internal_messages,
         internal_tools,
         max_tokens,

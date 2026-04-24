@@ -17,6 +17,7 @@ fn session_summary_from_entry_includes_last_run_fields() {
         root_session_id: "root".to_string(),
         spawn_depth: 1,
         model: "gpt-4o".to_string(),
+        model_ref: None,
         reasoning_effort: Some(ReasoningEffort::High),
         created_by_schedule_id: None,
         schedule_run_id: Some("run-123".to_string()),

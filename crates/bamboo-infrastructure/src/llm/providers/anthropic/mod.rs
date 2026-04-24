@@ -307,18 +307,34 @@ pub fn build_anthropic_request(
     reasoning_effort: Option<ReasoningEffort>,
     parallel_tool_calls: Option<bool>,
 ) -> Value {
-    let (system, anthropic_messages) = messages_to_anthropic_json(messages);
+    let (system, mut anthropic_messages) = messages_to_anthropic_json(messages);
+
+    // Add cache_control to conversation summary message blocks.
+    add_cache_control_to_summary_blocks(&mut anthropic_messages);
+
+    let mut tools_json = tools_to_anthropic_json(tools);
+    // Add cache_control to the last tool definition so tool definitions
+    // are cached across turns.
+    if let Some(last_tool) = tools_json.last_mut() {
+        last_tool
+            .as_object_mut()
+            .expect("tool definition is always a JSON object")
+            .insert(
+                "cache_control".to_string(),
+                json!({"type": "ephemeral"}),
+            );
+    }
 
     let mut body = json!({
         "model": model,
         "max_tokens": max_tokens,
         "stream": stream,
         "messages": anthropic_messages,
-        "tools": tools_to_anthropic_json(tools),
+        "tools": tools_json,
     });
 
     if let Some(system) = system {
-        body["system"] = json!(system);
+        body["system"] = system;
     }
 
     if let Some(thinking) = anthropic_thinking_from_effort(reasoning_effort, max_tokens) {
@@ -335,6 +351,42 @@ pub fn build_anthropic_request(
     }
 
     body
+}
+
+/// Find messages whose text content contains the conversation summary marker and
+/// add `cache_control: {"type": "ephemeral"}` to their text blocks.
+fn add_cache_control_to_summary_blocks(messages: &mut [Value]) {
+    for msg in messages.iter_mut() {
+        let content = msg.get("content");
+        let Some(content) = content else { continue };
+        // Check if any text block in this message contains a summary marker.
+        let has_summary = if content.is_array() {
+            content
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|block| block.get("text").and_then(|t| t.as_str()).is_some_and(|t| t.contains("CONVERSATION_SUMMARY_START")))
+        } else {
+            content.as_str().is_some_and(|t| t.contains("CONVERSATION_SUMMARY_START"))
+        };
+        if !has_summary {
+            continue;
+        }
+        // Add cache_control to text blocks in this message.
+        if let Some(blocks) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+            for block in blocks.iter_mut() {
+                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    block
+                        .as_object_mut()
+                        .expect("content block is always a JSON object")
+                        .insert(
+                            "cache_control".to_string(),
+                            json!({"type": "ephemeral"}),
+                        );
+                }
+            }
+        }
+    }
 }
 
 fn anthropic_thinking_from_effort(
@@ -361,7 +413,7 @@ fn anthropic_thinking_from_effort(
     }))
 }
 
-fn messages_to_anthropic_json(messages: &[Message]) -> (Option<String>, Vec<Value>) {
+fn messages_to_anthropic_json(messages: &[Message]) -> (Option<Value>, Vec<Value>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut out: Vec<Value> = Vec::new();
 
@@ -375,7 +427,22 @@ fn messages_to_anthropic_json(messages: &[Message]) -> (Option<String>, Vec<Valu
     let system = if system_parts.is_empty() {
         None
     } else {
-        Some(system_parts.join("\n\n"))
+        let joined = system_parts.join("\n\n");
+        let mut blocks: Vec<Value> = vec![json!({
+            "type": "text",
+            "text": joined,
+        })];
+        // Mark the last system block as a cache breakpoint so the system prompt
+        // benefits from Anthropic's prompt caching.
+        if let Some(last) = blocks.last_mut() {
+            last.as_object_mut()
+                .expect("system block is always a JSON object")
+                .insert(
+                    "cache_control".to_string(),
+                    json!({"type": "ephemeral"}),
+                );
+        }
+        Some(json!(blocks))
     };
 
     (system, out)
@@ -606,7 +673,38 @@ pub fn parse_anthropic_sse_event(
     data: &str,
 ) -> Result<Option<LLMChunk>> {
     match event_type {
-        "ping" | "message_start" => Ok(None),
+        "ping" => Ok(None),
+        "message_start" => {
+            if !data.is_empty() {
+                if let Ok(v) = serde_json::from_str::<Value>(data) {
+                    if let Some(usage) = v.get("message")
+                        .and_then(|m| m.get("usage"))
+                        .or_else(|| v.get("usage"))
+                        .and_then(|u| u.as_object())
+                    {
+                        let cache_creation = usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let cache_read = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if cache_creation > 0 || cache_read > 0 {
+                            tracing::info!(
+                                "Anthropic stream message_start cache_creation={} cache_read={}",
+                                cache_creation, cache_read,
+                            );
+                            return Ok(Some(LLMChunk::CacheUsage {
+                                cache_creation_input_tokens: cache_creation,
+                                cache_read_input_tokens: cache_read,
+                            }));
+                        }
+                    }
+                }
+            }
+            Ok(None)
+        }
         "message_delta" => {
             if !data.is_empty() {
                 match serde_json::from_str::<Value>(data) {
@@ -636,6 +734,14 @@ pub fn parse_anthropic_sse_event(
                                         .get("reasoning_tokens")
                                         .and_then(|value| value.as_u64())
                                 });
+                            let cache_creation = usage
+                                .get("cache_creation_input_tokens")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0);
+                            let cache_read = usage
+                                .get("cache_read_input_tokens")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0);
 
                             if let Some(thinking_tokens) = thinking_tokens {
                                 state.saw_thinking_signal = true;
@@ -648,6 +754,22 @@ pub fn parse_anthropic_sse_event(
                                 tracing::debug!(
                                     "Anthropic stream usage output_tokens={output_tokens}"
                                 );
+                            }
+
+                            // Emit CacheUsage if any cache activity.
+                            if cache_creation > 0 || cache_read > 0 {
+                                return Ok(Some(LLMChunk::CacheUsage {
+                                    cache_creation_input_tokens: cache_creation,
+                                    cache_read_input_tokens: cache_read,
+                                }));
+                            }
+
+                            // Emit UsageSummary with output/thinking tokens.
+                            if let Some(output_tokens) = output_tokens {
+                                return Ok(Some(LLMChunk::UsageSummary {
+                                    output_tokens,
+                                    thinking_tokens: thinking_tokens.unwrap_or(0),
+                                }));
                             }
                         }
                     }
@@ -894,7 +1016,7 @@ mod anthropic_request_building {
     use bamboo_domain::{FunctionSchema, ToolSchema};
 
     #[test]
-    fn system_messages_are_extracted_into_top_level_system_field() {
+    fn system_messages_are_extracted_into_blocks_with_cache_control() {
         let messages = vec![
             Message::system("You are helpful."),
             Message::user("Hi"),
@@ -905,8 +1027,22 @@ mod anthropic_request_building {
         let out =
             super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
-        assert_eq!(out["system"], "You are helpful.\n\nBe concise.");
+        let system = out["system"].as_array().expect("system should be an array of blocks");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["type"], "text");
+        assert_eq!(system[0]["text"], "You are helpful.\n\nBe concise.");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
         assert_eq!(out["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn system_field_absent_when_no_system_messages() {
+        let messages = vec![Message::user("Hi")];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        assert!(out.get("system").is_none());
     }
 
     #[test]
@@ -1023,6 +1159,90 @@ mod anthropic_request_building {
                 }),
             },
         }]
+    }
+
+    #[test]
+    fn last_tool_definition_has_cache_control() {
+        let messages = vec![Message::user("Hi")];
+        let tools = vec![
+            ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: "read".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                },
+            },
+            ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: "write".to_string(),
+                    description: "Write a file".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                },
+            },
+        ];
+
+        let out = super::build_anthropic_request(
+            &messages, &tools, "claude-test", 64, false, None, None,
+        );
+
+        let tools_arr = out["tools"].as_array().unwrap();
+        assert_eq!(tools_arr.len(), 2);
+        // First tool has no cache_control.
+        assert!(
+            tools_arr[0].get("cache_control").is_none(),
+            "first tool should not have cache_control"
+        );
+        // Last tool has cache_control.
+        assert_eq!(tools_arr[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn conversation_summary_message_gets_cache_control() {
+        let messages = vec![
+            Message::user("Hi"),
+            Message::user("<!-- CONVERSATION_SUMMARY_START -->\nOld context here\n<!-- CONVERSATION_SUMMARY_END -->"),
+            Message::assistant("Got it", None),
+        ];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        let msgs = out["messages"].as_array().unwrap();
+        // First message (Hi) has no cache_control on its text block.
+        let first_content = msgs[0]["content"].as_array().unwrap();
+        assert!(first_content[0].get("cache_control").is_none());
+
+        // Second message (summary) has cache_control on text blocks.
+        let second_content = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(second_content[0]["cache_control"]["type"], "ephemeral");
+
+        // Third message (assistant) is not affected.
+        assert!(msgs[2]["content"].as_array().unwrap()[0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn non_summary_messages_do_not_get_cache_control() {
+        let messages = vec![
+            Message::user("Hello"),
+            Message::assistant("Hi there", None),
+            Message::user("How are you?"),
+        ];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        for msg in out["messages"].as_array().unwrap() {
+            if let Some(blocks) = msg["content"].as_array() {
+                for block in blocks {
+                    assert!(
+                        block.get("cache_control").is_none(),
+                        "non-summary message should not have cache_control"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1301,7 +1521,8 @@ mod anthropic_request_building_edge_cases {
         let out =
             super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
-        assert_eq!(out["system"], "Be helpful");
+        let system = out["system"].as_array().expect("system should be blocks");
+        assert_eq!(system[0]["text"], "Be helpful");
         assert_eq!(out["messages"].as_array().unwrap().len(), 0);
     }
 
@@ -1315,7 +1536,8 @@ mod anthropic_request_building_edge_cases {
         let out =
             super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
-        assert_eq!(out["system"], "Be helpful\n\nBe concise\n\nBe safe");
+        let system = out["system"].as_array().expect("system should be blocks");
+        assert_eq!(system[0]["text"], "Be helpful\n\nBe concise\n\nBe safe");
     }
 
     #[test]

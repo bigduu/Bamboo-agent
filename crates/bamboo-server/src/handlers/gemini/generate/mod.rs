@@ -70,7 +70,7 @@ pub async fn generate_content(
         chrono::Utc::now(),
     );
 
-    let provider = state.get_provider().await;
+    let provider = state.get_provider_for_endpoint("gemini").await?;
     let mut stream = match provider
         .chat_stream(
             &internal_messages,
