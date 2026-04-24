@@ -348,6 +348,7 @@ mod tests {
             sessions_cache,
             agent_runners: agent_runners.clone(),
             session_event_senders,
+            subagent_model_resolver: None,
         });
         let tool = SubSessionManagerTool::new(adapter);
 

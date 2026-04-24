@@ -108,6 +108,36 @@ impl AppState {
         let process_registry = Arc::new(ProcessRegistry::new());
         let (provider_lock, provider_handle) = build_provider_handles(provider);
 
+        // Initialize multi-provider registry (for features.provider_model_ref).
+        let config_snapshot = config.read().await;
+        let provider_registry = match bamboo_infrastructure::ProviderRegistry::from_config(
+            &config_snapshot,
+            bamboo_home_dir.clone(),
+        )
+        .await
+        {
+            Ok(registry) => Arc::new(registry),
+            Err(e) => {
+                tracing::error!("Failed to create provider registry: {}", e);
+                Arc::new(
+                    bamboo_infrastructure::ProviderRegistry::from_config(
+                        &Config::default(),
+                        bamboo_home_dir.clone(),
+                    )
+                    .await
+                    .expect("Cannot create even an empty provider registry"),
+                )
+            }
+        };
+        drop(config_snapshot);
+
+        let provider_router = Arc::new(bamboo_infrastructure::ProviderModelRouter::new(
+            provider_registry.clone(),
+        ));
+        let model_catalog = Arc::new(bamboo_infrastructure::ModelCatalogService::new(
+            provider_registry.clone(),
+        ));
+
         let base_tools = build_base_tools(
             config.clone(),
             permission_checker,
@@ -170,8 +200,29 @@ impl AppState {
                 storage: storage.clone(),
                 provider: provider_handle.clone(),
                 config: config.clone(),
+                provider_registry: provider_registry.clone(),
             },
         );
+
+        let config_for_resolver = config.clone();
+        let subagent_model_resolver: Option<Arc<dyn Fn(&str) -> Option<String> + Send + Sync>> = {
+            let config_snap = config.read().await.clone();
+            let registry = provider_registry.clone();
+            if config_snap.features.provider_model_ref && config_snap.defaults.is_some() {
+                Some(Arc::new(move |subagent_type: &str| -> Option<String> {
+                    let config_snap = config_for_resolver.blocking_read().clone();
+                    crate::model_config_helper::resolve_subagent_model(
+                        &config_snap,
+                        &config_snap.provider,
+                        &registry,
+                        subagent_type,
+                    )
+                    .map(|m| m.model_name)
+                }))
+            } else {
+                None
+            }
+        };
 
         let tools = build_root_tools(
             tools_with_task.clone(),
@@ -183,6 +234,7 @@ impl AppState {
             sessions.clone(),
             agent_runners.clone(),
             session_event_senders.clone(),
+            subagent_model_resolver,
         );
 
         let tool_factory =
@@ -209,6 +261,9 @@ impl AppState {
             process_registry,
             metrics_bus: None, // Will be set by server if needed
             agent,
+            provider_registry,
+            provider_router,
+            model_catalog,
         })
     }
 }

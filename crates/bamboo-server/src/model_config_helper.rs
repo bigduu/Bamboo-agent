@@ -1,15 +1,19 @@
 // Helper function to extract default model from config
 // This should be used instead of hardcoding "gpt-4o-mini" or "default"
 
-use bamboo_infrastructure::Config;
-use bamboo_infrastructure::LLMError;
+use std::sync::Arc;
 
-/// Get the default model for the current provider from config
-/// Returns an error if no model is configured
-pub fn get_default_model_from_config(config: &Config) -> Result<String, LLMError> {
-    match config.provider.as_str() {
+use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_infrastructure::{LLMError, ProviderModelRouter, ProviderRegistry, ResolvedModel};
+use bamboo_infrastructure::Config;
+
+/// Get the default model for a specific provider from config.
+pub fn get_default_model_for_provider(
+    config: &Config,
+    provider_name: &str,
+) -> Result<String, LLMError> {
+    match provider_name.trim() {
         "copilot" => {
-            // Copilot supports multiple upstream model IDs; prefer provider-specific config.
             let provider_model = config
                 .providers
                 .copilot
@@ -50,10 +54,91 @@ pub fn get_default_model_from_config(config: &Config) -> Result<String, LLMError
                 LLMError::Auth("Gemini model must be specified in config".to_string())
             })
         }
-        _ => Err(LLMError::Auth(format!(
-            "Unknown provider: {}",
-            config.provider
-        ))),
+        other => Err(LLMError::Auth(format!("Unknown provider: {}", other))),
+    }
+}
+
+/// Get the default model for the current provider from config.
+/// Returns an error if no model is configured.
+pub fn get_default_model_from_config(config: &Config) -> Result<String, LLMError> {
+    get_default_model_for_provider(config, config.provider.as_str())
+}
+
+/// Get the fast/cheap model for a specific provider from config.
+pub fn get_fast_model_for_provider(config: &Config, provider_name: &str) -> Option<String> {
+    let fast = match provider_name.trim() {
+        "openai" => config
+            .providers
+            .openai
+            .as_ref()
+            .and_then(|c| c.fast_model.clone()),
+        "anthropic" => config
+            .providers
+            .anthropic
+            .as_ref()
+            .and_then(|c| c.fast_model.clone()),
+        "gemini" => config
+            .providers
+            .gemini
+            .as_ref()
+            .and_then(|c| c.fast_model.clone()),
+        "copilot" => config
+            .providers
+            .copilot
+            .as_ref()
+            .and_then(|c| c.fast_model.clone()),
+        _ => None,
+    };
+
+    fast.or_else(|| get_default_model_for_provider(config, provider_name).ok())
+}
+
+/// Get the memory/background model for a specific provider from config.
+///
+/// This uses provider-local fast model fallback and intentionally avoids coupling
+/// to the globally active provider.
+pub fn get_memory_background_model_for_provider(
+    config: &Config,
+    provider_name: &str,
+) -> Option<String> {
+    let configured = config
+        .memory
+        .as_ref()
+        .and_then(|memory| memory.background_model.as_ref())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    configured.or_else(|| get_fast_model_for_provider(config, provider_name))
+}
+
+/// Get the default reasoning effort for a specific provider from config.
+pub fn get_reasoning_effort_for_provider(
+    config: &Config,
+    provider_name: &str,
+) -> Option<ReasoningEffort> {
+    match provider_name.trim() {
+        "openai" => config
+            .providers
+            .openai
+            .as_ref()
+            .and_then(|c| c.reasoning_effort),
+        "anthropic" => config
+            .providers
+            .anthropic
+            .as_ref()
+            .and_then(|c| c.reasoning_effort),
+        "gemini" => config
+            .providers
+            .gemini
+            .as_ref()
+            .and_then(|c| c.reasoning_effort),
+        "copilot" => config
+            .providers
+            .copilot
+            .as_ref()
+            .and_then(|c| c.reasoning_effort),
+        _ => None,
     }
 }
 
@@ -81,6 +166,193 @@ pub fn get_vision_model_from_config(config: &Config) -> Result<String, LLMError>
             config.provider
         ))
     })
+}
+
+/// Resolve the background/fast summarization model considering both
+/// `DefaultsConfig` (ProviderModelRef) and legacy provider config paths.
+///
+/// Resolution order:
+/// 1. `defaults.memory_background` (ProviderModelRef, routed via registry)
+/// 2. `defaults.fast` (ProviderModelRef, routed via registry)
+/// 3. Legacy: `memory.background_model` / provider `fast_model` string + registry lookup
+pub fn resolve_background_model(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Option<ResolvedModel> {
+    if config.features.provider_model_ref {
+        if let Some(ref model_ref) = config
+            .defaults
+            .as_ref()
+            .and_then(|d| d.memory_background.as_ref())
+            .or_else(|| config.defaults.as_ref().and_then(|d| d.fast.as_ref()))
+        {
+            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+                return Some(ResolvedModel {
+                    provider,
+                    model_name: model_ref.model.clone(),
+                });
+            }
+        }
+    }
+    let model_name = get_memory_background_model_for_provider(config, provider_name)?;
+    let provider = provider_registry.get(provider_name)?;
+    Some(ResolvedModel { provider, model_name })
+}
+
+/// Resolve the fast model for lightweight tasks like title generation.
+pub fn resolve_fast_model(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Option<ResolvedModel> {
+    if config.features.provider_model_ref {
+        if let Some(ref model_ref) = config.defaults.as_ref().and_then(|d| d.fast.as_ref()) {
+            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+                return Some(ResolvedModel {
+                    provider,
+                    model_name: model_ref.model.clone(),
+                });
+            }
+        }
+    }
+    let model_name = get_fast_model_for_provider(config, provider_name)?;
+    let provider = provider_registry.get(provider_name)?;
+    Some(ResolvedModel { provider, model_name })
+}
+
+/// Resolve the vision-capable model for image understanding.
+pub fn resolve_vision_model(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Option<ResolvedModel> {
+    if config.features.provider_model_ref {
+        if let Some(ref model_ref) = config.defaults.as_ref().and_then(|d| d.vision.as_ref()) {
+            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+                return Some(ResolvedModel {
+                    provider,
+                    model_name: model_ref.model.clone(),
+                });
+            }
+        }
+    }
+    let model_name = config.get_vision_model()?;
+    let provider = provider_registry.get(provider_name)?;
+    Some(ResolvedModel { provider, model_name })
+}
+
+/// Resolve the planning/coordination model for architecture and task decomposition.
+///
+/// Fallback chain: `defaults.planning` → `defaults.chat`.
+pub fn resolve_planning_model(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Option<ResolvedModel> {
+    if config.features.provider_model_ref {
+        if let Some(ref model_ref) = config.defaults.as_ref().and_then(|d| d.planning.as_ref()) {
+            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+                return Some(ResolvedModel {
+                    provider,
+                    model_name: model_ref.model.clone(),
+                });
+            }
+        }
+    }
+    resolve_default_chat_model(config, provider_name, provider_registry)
+}
+
+/// Resolve the search/navigation model for grep, file listing, and symbol resolution.
+///
+/// Fallback chain: `defaults.search` → `defaults.fast` → legacy fast model → default chat model.
+pub fn resolve_search_model(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Option<ResolvedModel> {
+    if config.features.provider_model_ref {
+        if let Some(ref model_ref) = config.defaults.as_ref().and_then(|d| d.search.as_ref()) {
+            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+                return Some(ResolvedModel {
+                    provider,
+                    model_name: model_ref.model.clone(),
+                });
+            }
+        }
+    }
+    resolve_fast_model(config, provider_name, provider_registry)
+        .or_else(|| resolve_default_chat_model(config, provider_name, provider_registry))
+}
+
+/// Resolve the code review model for PR and code analysis tasks.
+///
+/// Fallback chain: `defaults.code_review` → `defaults.chat`.
+pub fn resolve_code_review_model(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Option<ResolvedModel> {
+    if config.features.provider_model_ref {
+        if let Some(ref model_ref) = config.defaults.as_ref().and_then(|d| d.code_review.as_ref()) {
+            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+                return Some(ResolvedModel {
+                    provider,
+                    model_name: model_ref.model.clone(),
+                });
+            }
+        }
+    }
+    resolve_default_chat_model(config, provider_name, provider_registry)
+}
+
+/// Resolve the model for a specific subagent type.
+///
+/// Fallback chain: `defaults.subagent_models[type]` → `defaults.chat`.
+pub fn resolve_subagent_model(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+    subagent_type: &str,
+) -> Option<ResolvedModel> {
+    if config.features.provider_model_ref {
+        if let Some(ref model_ref) = config
+            .defaults
+            .as_ref()
+            .and_then(|d| d.subagent_models.get(subagent_type))
+        {
+            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+                return Some(ResolvedModel {
+                    provider,
+                    model_name: model_ref.model.clone(),
+                });
+            }
+        }
+    }
+    resolve_default_chat_model(config, provider_name, provider_registry)
+}
+
+/// Resolve the default chat model from config.
+///
+/// This is the terminal fallback for capability-specific model resolvers.
+fn resolve_default_chat_model(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Option<ResolvedModel> {
+    if config.features.provider_model_ref {
+        if let Some(ref model_ref) = config.defaults.as_ref().map(|d| &d.chat) {
+            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+                return Some(ResolvedModel {
+                    provider,
+                    model_name: model_ref.model.clone(),
+                });
+            }
+        }
+    }
+    let model_name = get_default_model_for_provider(config, provider_name).ok()?;
+    let provider = provider_registry.get(provider_name)?;
+    Some(ResolvedModel { provider, model_name })
 }
 
 #[cfg(test)]
@@ -182,5 +454,87 @@ mod tests {
         let result = get_default_model_from_config(&config);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "gpt-4o");
+    }
+
+    #[test]
+    fn test_get_default_model_for_specific_provider() {
+        let config = Config {
+            provider: "anthropic".to_string(),
+            providers: ProviderConfigs {
+                openai: Some(OpenAIConfig {
+                    api_key: "test".to_string(),
+                    api_key_encrypted: None,
+                    base_url: None,
+                    model: Some("gpt-4o".to_string()),
+                    fast_model: Some("gpt-4o-mini".to_string()),
+                    vision_model: None,
+                    reasoning_effort: Some(ReasoningEffort::Medium),
+                    responses_only_models: vec![],
+                    request_overrides: None,
+                    extra: Default::default(),
+                }),
+                ..ProviderConfigs::default()
+            },
+            ..Config::default()
+        };
+
+        let result = get_default_model_for_provider(&config, "openai").expect("openai config");
+        assert_eq!(result, "gpt-4o");
+    }
+
+    #[test]
+    fn test_get_fast_model_for_specific_provider() {
+        let config = Config {
+            provider: "anthropic".to_string(),
+            providers: ProviderConfigs {
+                openai: Some(OpenAIConfig {
+                    api_key: "test".to_string(),
+                    api_key_encrypted: None,
+                    base_url: None,
+                    model: Some("gpt-4o".to_string()),
+                    fast_model: Some("gpt-4o-mini".to_string()),
+                    vision_model: None,
+                    reasoning_effort: Some(ReasoningEffort::Medium),
+                    responses_only_models: vec![],
+                    request_overrides: None,
+                    extra: Default::default(),
+                }),
+                ..ProviderConfigs::default()
+            },
+            ..Config::default()
+        };
+
+        assert_eq!(
+            get_fast_model_for_provider(&config, "openai").as_deref(),
+            Some("gpt-4o-mini")
+        );
+    }
+
+    #[test]
+    fn test_get_reasoning_effort_for_specific_provider() {
+        let config = Config {
+            provider: "anthropic".to_string(),
+            providers: ProviderConfigs {
+                openai: Some(OpenAIConfig {
+                    api_key: "test".to_string(),
+                    api_key_encrypted: None,
+                    base_url: None,
+                    model: Some("gpt-4o".to_string()),
+                    fast_model: Some("gpt-4o-mini".to_string()),
+                    vision_model: None,
+                    reasoning_effort: Some(ReasoningEffort::Medium),
+                    responses_only_models: vec![],
+                    request_overrides: None,
+                    extra: Default::default(),
+                }),
+                ..ProviderConfigs::default()
+            },
+            ..Config::default()
+        };
+
+        assert_eq!(
+            get_reasoning_effort_for_provider(&config, "openai"),
+            Some(ReasoningEffort::Medium)
+        );
     }
 }

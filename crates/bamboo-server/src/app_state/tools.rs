@@ -79,9 +79,16 @@ pub(super) fn build_base_tools(
         sessions,
         storage,
     ));
-    Arc::new(crate::tools::OverlayToolExecutor::new(
+    let with_skills: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_load_skill,
         read_skill_resource_tool,
+    ));
+
+    // compact_context is available to all sessions for manual compression.
+    let compact_tool = Arc::new(crate::tools::CompactContextTool);
+    Arc::new(crate::tools::OverlayToolExecutor::new(
+        with_skills,
+        compact_tool,
     ))
 }
 
@@ -97,6 +104,7 @@ pub(super) fn build_root_tools(
     session_event_senders: Arc<
         RwLock<HashMap<String, broadcast::Sender<bamboo_agent_core::AgentEvent>>>,
     >,
+    subagent_model_resolver: Option<Arc<dyn Fn(&str) -> Option<String> + Send + Sync>>,
 ) -> Arc<dyn ToolExecutor> {
     // Shared adapter for both child session tools.
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {
@@ -106,6 +114,7 @@ pub(super) fn build_root_tools(
         sessions_cache: sessions,
         agent_runners: agent_runners.clone(),
         session_event_senders,
+        subagent_model_resolver,
     });
 
     // Root sessions can spawn child sessions.

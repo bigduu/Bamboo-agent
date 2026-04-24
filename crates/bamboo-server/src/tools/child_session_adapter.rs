@@ -32,6 +32,17 @@ pub struct ChildSessionAdapter {
     pub(crate) sessions_cache: Arc<RwLock<HashMap<String, Session>>>,
     pub(crate) agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub(crate) session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
+    /// Optional subagent model resolver: maps subagent_type → model name.
+    pub(crate) subagent_model_resolver: Option<Arc<dyn Fn(&str) -> Option<String> + Send + Sync>>,
+}
+
+impl ChildSessionAdapter {
+    /// Resolve the model for a given subagent_type using the configured resolver.
+    pub fn resolve_subagent_model(&self, subagent_type: &str) -> Option<String> {
+        self.subagent_model_resolver
+            .as_ref()
+            .and_then(|resolver| resolver(subagent_type))
+    }
 }
 
 fn map_index_entry_to_child_entry(entry: &SessionIndexEntry) -> ChildSessionEntry {

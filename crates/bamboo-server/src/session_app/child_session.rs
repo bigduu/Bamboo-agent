@@ -71,6 +71,9 @@ pub struct CreateChildInput {
     pub responsibility: String,
     pub assignment_prompt: String,
     pub subagent_type: String,
+    /// Optional model override resolved from subagent_type routing.
+    /// When `None`, the child inherits the parent session's model.
+    pub model_override: Option<String>,
 }
 
 /// Result of creating a child session.
@@ -236,7 +239,8 @@ pub async fn create_child_action(
     let mut child = Session::new_child(
         input.child_id.clone(),
         input.parent_session.id.clone(),
-        input.parent_session.model.clone(),
+        input.model_override.clone()
+            .unwrap_or_else(|| input.parent_session.model.clone()),
         input.title.clone(),
     );
 
@@ -263,6 +267,17 @@ pub async fn create_child_action(
     );
 
     child.add_message(Message::system(CHILD_SYSTEM_PROMPT));
+
+    // Child sessions get more aggressive compression: trigger at 70% instead
+    // of the default 85%, target 35% instead of 40%. This prevents long child
+    // tasks from exhausting the context window before the parent can intervene.
+    if let Some(ref parent_budget) = input.parent_session.token_budget {
+        let mut child_budget = parent_budget.clone();
+        child_budget.compression_trigger_percent = 70;
+        child_budget.compression_target_percent = 35;
+        child.token_budget = Some(child_budget);
+    }
+
     refresh_prompt_snapshot(&mut child);
     let assignment = format_child_assignment(
         &input.title,

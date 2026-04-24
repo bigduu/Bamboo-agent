@@ -148,6 +148,9 @@ impl Tool for SpawnSessionTool {
 
         let child_id = Uuid::new_v4().to_string();
 
+        // Resolve model via subagent_type routing table (if configured).
+        let model_override = self.adapter.resolve_subagent_model(&parsed.subagent_type);
+
         let result = create_child_action(
             self.adapter.as_ref(),
             CreateChildInput {
@@ -157,6 +160,7 @@ impl Tool for SpawnSessionTool {
                 responsibility: parsed.responsibility.clone(),
                 assignment_prompt: parsed.prompt.clone(),
                 subagent_type: parsed.subagent_type.clone(),
+                model_override,
             },
         )
         .await
@@ -204,7 +208,7 @@ mod tests {
     use tokio::sync::{broadcast, RwLock};
 
     use crate::session_app::child_session::format_child_assignment;
-    use crate::spawn_scheduler::{SpawnContext, SpawnScheduler};
+    use crate::spawn_scheduler::SpawnScheduler;
     use bamboo_agent_core::storage::Storage;
     use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
     use bamboo_agent_core::{AgentEvent, Message, Session};
@@ -372,6 +376,7 @@ mod tests {
             sessions_cache: Arc::new(RwLock::new(HashMap::new())),
             agent_runners: Arc::new(RwLock::new(HashMap::new())),
             session_event_senders: session_event_senders.clone(),
+            subagent_model_resolver: None,
         });
         let tool = SpawnSessionTool::new(adapter);
 
@@ -455,6 +460,7 @@ mod tests {
             sessions_cache: Arc::new(RwLock::new(HashMap::new())),
             agent_runners: Arc::new(RwLock::new(HashMap::new())),
             session_event_senders: session_event_senders.clone(),
+            subagent_model_resolver: None,
         });
         let tool = SpawnSessionTool::new(adapter);
 

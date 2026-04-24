@@ -9,6 +9,11 @@ use super::runtime::{
 };
 use super::{ExecuteRequest, ExecuteSyncInfo, ExecuteSyncReason};
 use crate::app_state::AppState;
+use crate::model_config_helper::{
+    get_default_model_for_provider, get_memory_background_model_for_provider,
+    get_reasoning_effort_for_provider,
+};
+use crate::session_app::provider_model::session_effective_model_ref;
 
 use self::response::{
     already_running_response, bad_request_error_response, completed_response,
@@ -39,20 +44,31 @@ pub async fn handler(
         config_snapshot.disabled_tool_names().into_iter().collect();
     let disabled_skill_ids_vec: Vec<String> =
         config_snapshot.disabled_skill_ids().into_iter().collect();
+    let requested_provider = req
+        .model_ref
+        .as_ref()
+        .map(|model_ref| model_ref.provider.as_str())
+        .or(req.provider.as_deref())
+        .unwrap_or(config_snapshot.provider.as_str());
 
     let config = crate::session_app::types::ExecutionConfigSnapshot {
-        default_model: config_snapshot.get_model(),
-        default_reasoning_effort: config_snapshot.get_reasoning_effort(),
+        default_model: get_default_model_for_provider(&config_snapshot, requested_provider).ok(),
+        default_model_ref: config_snapshot.defaults.as_ref().map(|d| d.chat.clone()),
+        default_reasoning_effort: get_reasoning_effort_for_provider(&config_snapshot, requested_provider),
         disabled_tools: disabled_tools_vec.clone(),
         disabled_skill_ids: disabled_skill_ids_vec.clone(),
-        provider_name: config_snapshot.provider.clone(),
-        fast_model: config_snapshot.get_memory_background_model(),
+        provider_name: requested_provider.to_string(),
+        fast_model: get_memory_background_model_for_provider(&config_snapshot, requested_provider),
+        fast_model_ref: config_snapshot.defaults.as_ref().and_then(|d| d.fast.clone()),
         image_fallback: image_fallback.clone(),
+        provider_model_ref_enabled: config_snapshot.features.provider_model_ref,
     };
 
     let input = crate::session_app::types::ExecuteInput {
         session_id: session_id.clone(),
         request_model: req.model.clone(),
+        request_model_ref: req.model_ref.clone(),
+        request_provider: req.provider.clone(),
         request_reasoning_effort: req.reasoning_effort,
         request_skill_mode: req.skill_mode.clone(),
         client_sync: req.client_sync.as_ref().map(|cs| {
@@ -67,7 +83,7 @@ pub async fn handler(
         }),
     };
 
-    let outcome = match crate::session_app::execute::prepare_execute(state.as_ref(), config, input)
+    let outcome = match crate::session_app::execute::prepare_execute(state.as_ref(), config.clone(), input)
         .await
     {
         Ok(outcome) => outcome,
@@ -127,13 +143,24 @@ pub async fn handler(
 
             let disabled_tools: BTreeSet<String> = disabled_tools_vec.into_iter().collect();
             let disabled_skill_ids: BTreeSet<String> = disabled_skill_ids_vec.into_iter().collect();
+            let resolved_provider_name = session_effective_model_ref(&session)
+                .map(|model_ref| model_ref.provider)
+                .unwrap_or_else(|| config.provider_name.clone());
+            let resolved_bg = crate::model_config_helper::resolve_background_model(
+                &config_snapshot,
+                &resolved_provider_name,
+                &state.provider_registry,
+            );
+            let resolved_background_model = resolved_bg.as_ref().map(|m| m.model_name.clone());
+            let resolved_bg_provider = resolved_bg.map(|m| m.provider);
 
             // Build sync info before moving session into SpawnAgentExecution.
             let sync_info = build_sync_info_from_session(&session, None);
 
             tracing::info!(
-                "[{}] Starting agent execution with model={}, model_source={}, reasoning_effort={}, reasoning_source={}",
+                "[{}] Starting agent execution with provider={}, model={}, model_source={}, reasoning_effort={}, reasoning_source={}",
                 session_id,
+                resolved_provider_name,
                 effective_model,
                 model_source,
                 effective_reasoning_effort
@@ -156,9 +183,11 @@ pub async fn handler(
                 session_id: session_id.clone(),
                 session,
                 is_child_session,
-                provider_name: config_snapshot.provider.clone(),
+                provider_name: resolved_provider_name,
+                provider_override: None,
                 model: effective_model,
-                fast_model: config_snapshot.get_memory_background_model(),
+                fast_model: resolved_background_model,
+                background_model_provider: resolved_bg_provider,
                 reasoning_effort: effective_reasoning_effort,
                 reasoning_effort_source: reasoning_source.to_string(),
                 disabled_tools,
