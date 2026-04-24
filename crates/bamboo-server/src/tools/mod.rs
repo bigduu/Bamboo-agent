@@ -17,6 +17,8 @@ pub mod schedule_tasks;
 pub mod spawn_session;
 pub mod sub_session_manager;
 
+pub type SubagentModelResolver = std::sync::Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 // Re-export server-specific tool types for convenience
 pub use child_session_adapter::ChildSessionAdapter;
 pub use schedule_tasks::ScheduleTasksTool;

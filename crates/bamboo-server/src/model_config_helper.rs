@@ -181,7 +181,7 @@ pub fn resolve_background_model(
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(ref model_ref) = config
+        if let Some(model_ref) = config
             .defaults
             .as_ref()
             .and_then(|d| d.memory_background.as_ref())
@@ -212,7 +212,7 @@ pub fn resolve_fast_model(
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(ref model_ref) = config.defaults.as_ref().and_then(|d| d.fast.as_ref()) {
+        if let Some(model_ref) = config.defaults.as_ref().and_then(|d| d.fast.as_ref()) {
             if let Ok(provider) =
                 ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
             {
@@ -238,7 +238,7 @@ pub fn resolve_vision_model(
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(ref model_ref) = config.defaults.as_ref().and_then(|d| d.vision.as_ref()) {
+        if let Some(model_ref) = config.defaults.as_ref().and_then(|d| d.vision.as_ref()) {
             if let Ok(provider) =
                 ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
             {
@@ -266,7 +266,7 @@ pub fn resolve_planning_model(
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(ref model_ref) = config.defaults.as_ref().and_then(|d| d.planning.as_ref()) {
+        if let Some(model_ref) = config.defaults.as_ref().and_then(|d| d.planning.as_ref()) {
             if let Ok(provider) =
                 ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
             {
@@ -289,7 +289,7 @@ pub fn resolve_search_model(
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(ref model_ref) = config.defaults.as_ref().and_then(|d| d.search.as_ref()) {
+        if let Some(model_ref) = config.defaults.as_ref().and_then(|d| d.search.as_ref()) {
             if let Ok(provider) =
                 ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
             {
@@ -313,7 +313,7 @@ pub fn resolve_code_review_model(
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(ref model_ref) = config
+        if let Some(model_ref) = config
             .defaults
             .as_ref()
             .and_then(|d| d.code_review.as_ref())
@@ -341,7 +341,7 @@ pub fn resolve_subagent_model(
     subagent_type: &str,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(ref model_ref) = config
+        if let Some(model_ref) = config
             .defaults
             .as_ref()
             .and_then(|d| d.subagent_models.get(subagent_type))
@@ -368,7 +368,7 @@ fn resolve_default_chat_model(
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(ref model_ref) = config.defaults.as_ref().map(|d| &d.chat) {
+        if let Some(model_ref) = config.defaults.as_ref().map(|d| &d.chat) {
             if let Ok(provider) =
                 ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
             {

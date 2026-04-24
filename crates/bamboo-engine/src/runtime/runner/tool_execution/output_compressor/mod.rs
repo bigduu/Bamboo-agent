@@ -415,7 +415,7 @@ pub(super) async fn maybe_compress(
         use bamboo_compression::TokenCounter;
         let counter = bamboo_compression::TiktokenTokenCounter::default();
         let tokens = counter.count_text(&result.result);
-        if tokens > max_tool_output_tokens as u32 {
+        if tokens > max_tool_output_tokens {
             let truncated =
                 truncate_to_token_budget(&result.result, max_tool_output_tokens, &counter);
             tracing::info!(

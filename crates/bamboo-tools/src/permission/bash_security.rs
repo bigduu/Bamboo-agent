@@ -556,7 +556,7 @@ fn extract_and_strip_command(
     (Some(stripped.0.to_string()), stripped.1.to_vec())
 }
 
-fn collect_commands<'a>(node: &tree_sitter::Node, source: &'a str) -> Vec<(String, Vec<String>)> {
+fn collect_commands(node: &tree_sitter::Node, source: &str) -> Vec<(String, Vec<String>)> {
     let mut commands = Vec::new();
     collect_commands_recursive(node, source, &mut commands);
     if commands.is_empty() {
@@ -682,8 +682,8 @@ fn strip_wrappers<'a>(name: &'a str, args: &'a [String]) -> (&'a str, &'a [Strin
                 strip_wrappers(&args[1], &args[2..])
             } else {
                 strip_wrappers(
-                    &args.first().map(|s| s.as_str()).unwrap_or(name),
-                    &args.get(1..).unwrap_or(args),
+                    args.first().map(|s| s.as_str()).unwrap_or(name),
+                    args.get(1..).unwrap_or(args),
                 )
             }
         }
@@ -718,11 +718,7 @@ fn strip_wrappers<'a>(name: &'a str, args: &'a [String]) -> (&'a str, &'a [Strin
 
 /// Fallback: extract first word from command string without AST.
 fn extract_command_name_fallback(command: &str) -> Option<String> {
-    command
-        .trim()
-        .split_whitespace()
-        .next()
-        .map(|s| s.to_string())
+    command.split_whitespace().next().map(|s| s.to_string())
 }
 
 // ---- Verdict determination ----
@@ -914,44 +910,36 @@ fn check_suspicious_arguments_node(
         if let Some(ref name) = cmd_name {
             let name_lower = name.as_str();
             // Check for python/perl/ruby/node -c, --eval/-e followed by code
-            if CODE_EXECUTION_COMMANDS.iter().any(|c| name_lower == *c) {
+            if CODE_EXECUTION_COMMANDS.contains(&name_lower) {
                 for (i, arg) in args.iter().enumerate() {
-                    if arg == "--eval" || arg == "-e" || arg == "-c" {
-                        if i + 1 < args.len() {
-                            warnings.push(BashWarning {
-                                kind: BashWarningKind::SuspiciousArguments,
-                                detail: format!(
-                                    "{} {} '{}' may execute arbitrary code",
-                                    name,
-                                    arg,
-                                    args[i + 1]
-                                ),
-                            });
-                        }
+                    if (arg == "--eval" || arg == "-e" || arg == "-c") && i + 1 < args.len() {
+                        warnings.push(BashWarning {
+                            kind: BashWarningKind::SuspiciousArguments,
+                            detail: format!(
+                                "{} {} '{}' may execute arbitrary code",
+                                name,
+                                arg,
+                                args[i + 1]
+                            ),
+                        });
                     }
                 }
             }
 
             // Check for shell -c
-            if SHELL_COMMANDS.iter().any(|c| name_lower == *c) {
+            if SHELL_COMMANDS.contains(&name_lower) {
                 for (i, arg) in args.iter().enumerate() {
-                    if arg == "-c" {
-                        if i + 1 < args.len() {
-                            warnings.push(BashWarning {
-                                kind: BashWarningKind::SuspiciousArguments,
-                                detail: format!(
-                                    "{} -c '{}' executes shell code",
-                                    name,
-                                    args[i + 1]
-                                ),
-                            });
-                        }
+                    if arg == "-c" && i + 1 < args.len() {
+                        warnings.push(BashWarning {
+                            kind: BashWarningKind::SuspiciousArguments,
+                            detail: format!("{} -c '{}' executes shell code", name, args[i + 1]),
+                        });
                     }
                 }
             }
 
             // Check for find/xargs -exec
-            if EXEC_COMMANDS.iter().any(|c| name_lower == *c) {
+            if EXEC_COMMANDS.contains(&name_lower) {
                 for arg in &args {
                     if arg == "-exec" || arg == "-execdir" {
                         warnings.push(BashWarning {
@@ -973,7 +961,7 @@ fn check_suspicious_arguments_node(
 
 fn check_network_commands(command_name: &str) -> Vec<BashWarning> {
     let mut warnings = Vec::new();
-    if NETWORK_COMMANDS.iter().any(|c| *c == command_name) {
+    if NETWORK_COMMANDS.contains(&command_name) {
         warnings.push(BashWarning {
             kind: BashWarningKind::NetworkCommand,
             detail: format!("network command: {}", command_name),
@@ -984,10 +972,7 @@ fn check_network_commands(command_name: &str) -> Vec<BashWarning> {
 
 fn check_privilege_escalation(command_name: &str) -> Vec<BashWarning> {
     let mut warnings = Vec::new();
-    if PRIVILEGE_ESCALATION_COMMANDS
-        .iter()
-        .any(|c| *c == command_name)
-    {
+    if PRIVILEGE_ESCALATION_COMMANDS.contains(&command_name) {
         warnings.push(BashWarning {
             kind: BashWarningKind::PrivilegeEscalation,
             detail: format!("privilege escalation: {}", command_name),
@@ -998,10 +983,7 @@ fn check_privilege_escalation(command_name: &str) -> Vec<BashWarning> {
 
 fn check_permission_modification(command_name: &str, args: &[String]) -> Vec<BashWarning> {
     let mut warnings = Vec::new();
-    if PERMISSION_MODIFICATION_COMMANDS
-        .iter()
-        .any(|c| *c == command_name)
-    {
+    if PERMISSION_MODIFICATION_COMMANDS.contains(&command_name) {
         // Check if any argument targets a sensitive path
         let has_sensitive_target = args.iter().any(|arg| {
             let arg_lower = arg.to_ascii_lowercase();

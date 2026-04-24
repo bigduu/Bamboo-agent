@@ -364,8 +364,7 @@ pub fn is_safe_edit_command(command: &str) -> bool {
         if cmd == safe_cmd {
             return true;
         }
-        if cmd.starts_with(safe_cmd) {
-            let after = &cmd[safe_cmd.len()..];
+        if let Some(after) = cmd.strip_prefix(safe_cmd) {
             if after.is_empty() || after.starts_with(' ') {
                 return true;
             }
@@ -421,10 +420,10 @@ impl PermissionChecker for ModeAwarePermissionChecker {
             }
             PermissionMode::DontAsk => {
                 // Only allow if explicitly whitelisted; otherwise deny (needs_confirmation=true)
-                match self.config.is_whitelist_allowed(perm_type, resource) {
-                    Some(true) => false,
-                    _ => true,
-                }
+                !matches!(
+                    self.config.is_whitelist_allowed(perm_type, resource),
+                    Some(true)
+                )
             }
             PermissionMode::Default => self.inner.needs_confirmation(perm_type, resource).await,
         }
@@ -444,10 +443,9 @@ impl PermissionChecker for ModeAwarePermissionChecker {
                 ctx.resource
             ))),
             PermissionMode::AcceptEdits => {
-                if ctx.permission_type == PermissionType::WriteFile {
-                    Ok(true)
-                } else if ctx.permission_type == PermissionType::ExecuteCommand
-                    && is_safe_edit_command(&ctx.resource)
+                if ctx.permission_type == PermissionType::WriteFile
+                    || (ctx.permission_type == PermissionType::ExecuteCommand
+                        && is_safe_edit_command(&ctx.resource))
                 {
                     Ok(true)
                 } else {

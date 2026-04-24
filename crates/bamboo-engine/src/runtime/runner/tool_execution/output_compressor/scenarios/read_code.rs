@@ -98,7 +98,7 @@ fn collapse_long_comment_blocks(text: &str) -> String {
                     result.push_str(line);
                     result.push('\n');
                 }
-                let range_hint = format_line_range(&lines[start], &lines[i - 1]);
+                let range_hint = format_line_range(lines[start], lines[i - 1]);
                 result.push_str(&format!(
                     "  ... ({}: {} comment lines collapsed)\n",
                     range_hint,
@@ -130,7 +130,7 @@ fn collapse_long_comment_blocks(text: &str) -> String {
                 result.push_str(line);
                 result.push('\n');
             }
-            let range_hint = format_line_range(&lines[start], &lines[lines.len() - 1]);
+            let range_hint = format_line_range(lines[start], lines[lines.len() - 1]);
             result.push_str(&format!(
                 "  ... ({}: {} comment lines collapsed)\n",
                 range_hint,

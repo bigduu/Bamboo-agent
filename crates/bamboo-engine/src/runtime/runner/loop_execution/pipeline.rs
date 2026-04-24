@@ -965,11 +965,11 @@ fn heuristic_complexity(
         .map(|tc| tc.function.name.as_str())
         .collect();
 
-    if names.iter().any(|n| complex_tools.contains(&(*n))) {
+    if names.iter().any(|n| complex_tools.contains(n)) {
         return TaskComplexity::Complex;
     }
 
-    if names.iter().all(|n| simple_tools.contains(&(*n))) && !names.is_empty() {
+    if names.iter().all(|n| simple_tools.contains(n)) && !names.is_empty() {
         return TaskComplexity::Simple;
     }
 

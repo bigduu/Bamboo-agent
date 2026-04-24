@@ -206,10 +206,7 @@ impl PermissionStorage {
         let has_any = user_config.is_some() || project_config.is_some() || local_config.is_some();
 
         // Merge: local > project > user
-        let mut result = match user_config {
-            Some(c) => c,
-            None => PermissionConfig::new(),
-        };
+        let mut result: PermissionConfig = user_config.unwrap_or_default();
         if let Some(proj) = project_config {
             result = proj.merge(&result);
         }

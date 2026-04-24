@@ -205,7 +205,7 @@ impl AppState {
         );
 
         let config_for_resolver = config.clone();
-        let subagent_model_resolver: Option<Arc<dyn Fn(&str) -> Option<String> + Send + Sync>> = {
+        let subagent_model_resolver: Option<crate::tools::SubagentModelResolver> = {
             let config_snap = config.read().await.clone();
             let registry = provider_registry.clone();
             if config_snap.features.provider_model_ref && config_snap.defaults.is_some() {

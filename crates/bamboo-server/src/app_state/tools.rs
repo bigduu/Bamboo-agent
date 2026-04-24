@@ -104,7 +104,7 @@ pub(super) fn build_root_tools(
     session_event_senders: Arc<
         RwLock<HashMap<String, broadcast::Sender<bamboo_agent_core::AgentEvent>>>,
     >,
-    subagent_model_resolver: Option<Arc<dyn Fn(&str) -> Option<String> + Send + Sync>>,
+    subagent_model_resolver: Option<crate::tools::SubagentModelResolver>,
 ) -> Arc<dyn ToolExecutor> {
     // Shared adapter for both child session tools.
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {

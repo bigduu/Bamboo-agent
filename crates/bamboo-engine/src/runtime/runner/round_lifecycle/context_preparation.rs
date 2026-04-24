@@ -96,7 +96,10 @@ fn emit_context_pressure_notification(
     });
 }
 
-const DEGRADATION_LEVELS: &[(&str, fn(&str) -> String)] = &[
+type DegradationStripFn = fn(&str) -> String;
+type DegradationLevel = (&'static str, DegradationStripFn);
+
+const DEGRADATION_LEVELS: &[DegradationLevel] = &[
     ("tool_guide", strip_existing_tool_guide_context),
     ("skill_context", strip_existing_skill_context),
     ("external_memory", strip_existing_external_memory),
