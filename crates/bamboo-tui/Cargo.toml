@@ -1,0 +1,41 @@
+[package]
+name = "bamboo-tui"
+version = "2026.4.12"
+edition = "2021"
+license = "MIT"
+authors = ["mugeng.du@gmail.com"]
+description = "Terminal UI client for the Bamboo agent runtime"
+
+[[bin]]
+name = "bamboo-tui"
+path = "src/main.rs"
+
+[dependencies]
+# Async
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tui-textarea = "0.7"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest-eventsource = "0.6"
+
+# SSE
+eventsource-client = "0.17"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+unicode-width = "0.2"
