@@ -21,8 +21,8 @@ use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ProviderModelRef;
+use bamboo_domain::ReasoningEffort;
 use bamboo_domain::{Role, Session, SessionKind, TokenBudgetUsage};
 
 use crate::storage::search_index::{should_index_session, SessionSearchIndex};

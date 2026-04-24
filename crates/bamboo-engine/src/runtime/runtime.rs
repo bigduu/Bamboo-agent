@@ -332,9 +332,14 @@ impl AgentRuntime {
             metrics_collector: Some(self.metrics_collector.clone()),
             model_name: model,
             fast_model_name: config.get_fast_model(),
-            background_model_name: background_model.or_else(|| config.get_memory_background_model()),
+            background_model_name: background_model
+                .or_else(|| config.get_memory_background_model()),
             background_model_provider,
-            planning_model_name: config.defaults.as_ref().and_then(|d| d.planning.as_ref()).map(|r| r.model.clone()),
+            planning_model_name: config
+                .defaults
+                .as_ref()
+                .and_then(|d| d.planning.as_ref())
+                .map(|r| r.model.clone()),
             search_model_name: config
                 .defaults
                 .as_ref()

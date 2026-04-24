@@ -275,13 +275,17 @@ impl BodhiProvider {
         }
 
         if max_output_tokens.is_some()
-            || reasoning_effort.and_then(Self::thinking_budget_for_effort).is_some()
+            || reasoning_effort
+                .and_then(Self::thinking_budget_for_effort)
+                .is_some()
         {
             let mut generation_config = serde_json::Map::new();
             if let Some(max_tokens) = max_output_tokens {
                 generation_config.insert("maxOutputTokens".to_string(), json!(max_tokens));
             }
-            if let Some(thinking_budget) = reasoning_effort.and_then(Self::thinking_budget_for_effort) {
+            if let Some(thinking_budget) =
+                reasoning_effort.and_then(Self::thinking_budget_for_effort)
+            {
                 generation_config.insert(
                     "thinkingConfig".to_string(),
                     json!({ "thinkingBudget": thinking_budget }),
@@ -291,10 +295,7 @@ impl BodhiProvider {
         }
 
         let headers = self.build_headers()?;
-        let url = self.proxy_url(&format!(
-            "v1beta/models/{}:streamGenerateContent",
-            model
-        ));
+        let url = self.proxy_url(&format!("v1beta/models/{}:streamGenerateContent", model));
 
         let response = self
             .client

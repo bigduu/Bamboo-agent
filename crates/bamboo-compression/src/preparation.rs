@@ -493,7 +493,10 @@ pub fn estimate_prompt_cache_savings(
         policy,
         counter,
     );
-    candidates.iter().map(|c| c.saved_tokens).fold(0u32, u32::saturating_add)
+    candidates
+        .iter()
+        .map(|c| c.saved_tokens)
+        .fold(0u32, u32::saturating_add)
 }
 
 fn build_prompt_cache_candidates(
@@ -697,10 +700,23 @@ note: Full output remains in session history and UI; this compact summary is use
 
 fn extract_semantic_lines(content: &str, max_chars: usize) -> String {
     let patterns = [
-        "error", "warning", "fail", "panic", "exception", "timeout",
-        "not found", "permission denied", "conflict",
-        "src/", "crates/", ".rs:", ".ts:", ".js:", ".toml:",
-        "file:", "path:",
+        "error",
+        "warning",
+        "fail",
+        "panic",
+        "exception",
+        "timeout",
+        "not found",
+        "permission denied",
+        "conflict",
+        "src/",
+        "crates/",
+        ".rs:",
+        ".ts:",
+        ".js:",
+        ".toml:",
+        "file:",
+        "path:",
     ];
     let mut seen = std::collections::HashSet::new();
     let mut result = String::new();
@@ -1830,13 +1846,7 @@ mod tests {
     #[test]
     fn cached_summary_includes_semantic_excerpt_for_large_output() {
         let content = "normal line\n".repeat(600); // ~7200 chars
-        let summary = build_cached_tool_output_summary(
-            "Bash",
-            "call_1",
-            &content,
-            280,
-            180,
-        );
+        let summary = build_cached_tool_output_summary("Bash", "call_1", &content, 280, 180);
         // No matching patterns → no semantic_excerpt
         assert!(
             !summary.contains("semantic_excerpt"),
@@ -1855,13 +1865,7 @@ mod tests {
         for i in 500..1000 {
             content.push_str(&format!("more output {i}\n"));
         }
-        let summary = build_cached_tool_output_summary(
-            "Bash",
-            "call_2",
-            &content,
-            280,
-            180,
-        );
+        let summary = build_cached_tool_output_summary("Bash", "call_2", &content, 280, 180);
         assert!(
             summary.contains("semantic_excerpt"),
             "large output with errors should have semantic_excerpt"

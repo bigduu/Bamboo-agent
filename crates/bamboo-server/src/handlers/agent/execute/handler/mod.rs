@@ -54,12 +54,18 @@ pub async fn handler(
     let config = crate::session_app::types::ExecutionConfigSnapshot {
         default_model: get_default_model_for_provider(&config_snapshot, requested_provider).ok(),
         default_model_ref: config_snapshot.defaults.as_ref().map(|d| d.chat.clone()),
-        default_reasoning_effort: get_reasoning_effort_for_provider(&config_snapshot, requested_provider),
+        default_reasoning_effort: get_reasoning_effort_for_provider(
+            &config_snapshot,
+            requested_provider,
+        ),
         disabled_tools: disabled_tools_vec.clone(),
         disabled_skill_ids: disabled_skill_ids_vec.clone(),
         provider_name: requested_provider.to_string(),
         fast_model: get_memory_background_model_for_provider(&config_snapshot, requested_provider),
-        fast_model_ref: config_snapshot.defaults.as_ref().and_then(|d| d.fast.clone()),
+        fast_model_ref: config_snapshot
+            .defaults
+            .as_ref()
+            .and_then(|d| d.fast.clone()),
         image_fallback: image_fallback.clone(),
         provider_model_ref_enabled: config_snapshot.features.provider_model_ref,
     };
@@ -83,30 +89,33 @@ pub async fn handler(
         }),
     };
 
-    let outcome = match crate::session_app::execute::prepare_execute(state.as_ref(), config.clone(), input)
-        .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            return match error {
-                crate::session_app::errors::ExecutePreparationError::NotFound(_) => {
-                    tracing::warn!("[{session_id}] Execute session not found");
-                    HttpResponse::NotFound().json(serde_json::json!({
-                        "error": "Session not found",
-                        "session_id": session_id
-                    }))
-                }
-                crate::session_app::errors::ExecutePreparationError::LoadFailed(load_err) => {
-                    let err_msg = load_err.to_string();
-                    tracing::error!("[{session_id}] Execute session load error: {err_msg}");
-                    HttpResponse::InternalServerError().json(serde_json::json!({
-                        "error": format!("Failed to load session: {err_msg}")
-                    }))
-                }
-                _ => internal_server_error_response(format!("Execute preparation failed: {error}")),
-            };
-        }
-    };
+    let outcome =
+        match crate::session_app::execute::prepare_execute(state.as_ref(), config.clone(), input)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return match error {
+                    crate::session_app::errors::ExecutePreparationError::NotFound(_) => {
+                        tracing::warn!("[{session_id}] Execute session not found");
+                        HttpResponse::NotFound().json(serde_json::json!({
+                            "error": "Session not found",
+                            "session_id": session_id
+                        }))
+                    }
+                    crate::session_app::errors::ExecutePreparationError::LoadFailed(load_err) => {
+                        let err_msg = load_err.to_string();
+                        tracing::error!("[{session_id}] Execute session load error: {err_msg}");
+                        HttpResponse::InternalServerError().json(serde_json::json!({
+                            "error": format!("Failed to load session: {err_msg}")
+                        }))
+                    }
+                    _ => internal_server_error_response(format!(
+                        "Execute preparation failed: {error}"
+                    )),
+                };
+            }
+        };
 
     match outcome {
         crate::session_app::types::ExecutePreparationOutcome::Ready {

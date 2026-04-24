@@ -75,7 +75,11 @@ pub async fn submit_pending_response(
     if let Some(model_ref) = request_model_ref.as_ref() {
         persist_model_ref(&mut session, model_ref);
     } else {
-        persist_legacy_model_provider(&mut session, input.model.as_deref(), input.provider.as_deref());
+        persist_legacy_model_provider(
+            &mut session,
+            input.model.as_deref(),
+            input.provider.as_deref(),
+        );
     }
     if let Some(reasoning_effort) = input.reasoning_effort {
         session.reasoning_effort = Some(reasoning_effort);

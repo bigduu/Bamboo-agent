@@ -16,9 +16,7 @@ use super::prompt_context::{
     inject_external_memory_into_system_message, inject_task_list_into_system_message,
     PromptMemoryRuntimeContext, PROMPT_MEMORY_OBSERVABILITY_KEY,
 };
-use super::session_setup::prompt_setup::{
-    persist_prompt_snapshot_metadata, PromptAssemblyReport,
-};
+use super::session_setup::prompt_setup::{persist_prompt_snapshot_metadata, PromptAssemblyReport};
 use bamboo_agent_core::PromptSnapshot;
 
 // ---- prompt_updates functions ----
@@ -131,46 +129,55 @@ fn persist_round_prompt_metadata(session: &mut Session, prompt: &str) {
         EXTERNAL_MEMORY_START_MARKER,
         EXTERNAL_MEMORY_END_MARKER,
     )
-    .map(|section| strip_wrapped_markers(&section, EXTERNAL_MEMORY_START_MARKER, EXTERNAL_MEMORY_END_MARKER));
+    .map(|section| {
+        strip_wrapped_markers(
+            &section,
+            EXTERNAL_MEMORY_START_MARKER,
+            EXTERNAL_MEMORY_END_MARKER,
+        )
+    });
     let task_list = extract_wrapped_section(prompt, TASK_LIST_START_MARKER, TASK_LIST_END_MARKER)
-        .map(|section| strip_wrapped_markers(&section, TASK_LIST_START_MARKER, TASK_LIST_END_MARKER));
+        .map(|section| {
+            strip_wrapped_markers(&section, TASK_LIST_START_MARKER, TASK_LIST_END_MARKER)
+        });
 
-    let mut snapshot =
-        super::session_setup::prompt_setup::read_prompt_snapshot_metadata(session)
-            .unwrap_or_else(|| PromptSnapshot {
-                base_system_prompt: session
-                    .metadata
-                    .get("base_system_prompt")
-                    .cloned()
-                    .unwrap_or_default(),
-                enhancement_prompt: session.metadata.get("enhance_prompt").cloned(),
-                workspace_context: session.metadata.get("workspace_path").and_then(
-                    |workspace_path| {
-                        crate::runtime::context::build_workspace_prompt_context(workspace_path)
-                    },
-                ),
-                instruction_context: session.metadata.get("workspace_path").and_then(
-                    |workspace_path| {
-                        crate::runtime::context::instruction::build_instruction_prompt_context(
-                            workspace_path,
-                        )
-                    },
-                ),
-                env_context: None,
-                skill_context: None,
-                tool_guide_context: None,
-                dream_notebook: None,
-                session_memory_note: None,
-                project_memory_index: None,
-                relevant_durable_memories: None,
-                project_dream: None,
-                global_dream_fallback: None,
-                prompt_memory_observability: None,
-                external_memory: None,
-                task_list: None,
-                effective_system_prompt: prompt.trim().to_string(),
-            });
-    let external_memory_parts = bamboo_agent_core::parse_prompt_external_memory_sections(external_memory.as_deref());
+    let mut snapshot = super::session_setup::prompt_setup::read_prompt_snapshot_metadata(session)
+        .unwrap_or_else(|| PromptSnapshot {
+            base_system_prompt: session
+                .metadata
+                .get("base_system_prompt")
+                .cloned()
+                .unwrap_or_default(),
+            enhancement_prompt: session.metadata.get("enhance_prompt").cloned(),
+            workspace_context: session
+                .metadata
+                .get("workspace_path")
+                .and_then(|workspace_path| {
+                    crate::runtime::context::build_workspace_prompt_context(workspace_path)
+                }),
+            instruction_context: session.metadata.get("workspace_path").and_then(
+                |workspace_path| {
+                    crate::runtime::context::instruction::build_instruction_prompt_context(
+                        workspace_path,
+                    )
+                },
+            ),
+            env_context: None,
+            skill_context: None,
+            tool_guide_context: None,
+            dream_notebook: None,
+            session_memory_note: None,
+            project_memory_index: None,
+            relevant_durable_memories: None,
+            project_dream: None,
+            global_dream_fallback: None,
+            prompt_memory_observability: None,
+            external_memory: None,
+            task_list: None,
+            effective_system_prompt: prompt.trim().to_string(),
+        });
+    let external_memory_parts =
+        bamboo_agent_core::parse_prompt_external_memory_sections(external_memory.as_deref());
     snapshot.dream_notebook = external_memory_parts.dream_notebook;
     snapshot.session_memory_note = external_memory_parts.session_memory_note;
     snapshot.project_memory_index = external_memory_parts.project_memory_index;
@@ -180,7 +187,9 @@ fn persist_round_prompt_metadata(session: &mut Session, prompt: &str) {
     snapshot.prompt_memory_observability = session
         .metadata
         .get(PROMPT_MEMORY_OBSERVABILITY_KEY)
-        .and_then(|raw| serde_json::from_str::<bamboo_agent_core::PromptMemoryObservability>(raw).ok());
+        .and_then(|raw| {
+            serde_json::from_str::<bamboo_agent_core::PromptMemoryObservability>(raw).ok()
+        });
     snapshot.external_memory = external_memory;
     snapshot.task_list = task_list;
     snapshot.effective_system_prompt = prompt.trim().to_string();
@@ -203,8 +212,18 @@ fn build_round_prompt_sections(
 
     vec![
         PromptSection::new("round_base_prompt", PromptLayer::CoreStatic, false, prompt),
-        PromptSection::new("external_memory", PromptLayer::EnvironmentWorkspace, true, external_memory),
-        PromptSection::new("task_list", PromptLayer::EnvironmentWorkspace, true, task_list),
+        PromptSection::new(
+            "external_memory",
+            PromptLayer::EnvironmentWorkspace,
+            true,
+            external_memory,
+        ),
+        PromptSection::new(
+            "task_list",
+            PromptLayer::EnvironmentWorkspace,
+            true,
+            task_list,
+        ),
     ]
 }
 
@@ -282,8 +301,19 @@ pub(crate) async fn prepare_round(
     update_task_round_state(task_context, round, max_rounds);
 
     let round_id = build_round_id(session_id, round);
-    log_round_start(debug_enabled, session_id, round, max_rounds, session.messages.len());
-    ensure_not_cancelled(cancel_token, metrics_collector, session_id, session.messages.len())?;
+    log_round_start(
+        debug_enabled,
+        session_id,
+        round,
+        max_rounds,
+        session.messages.len(),
+    );
+    ensure_not_cancelled(
+        cancel_token,
+        metrics_collector,
+        session_id,
+        session.messages.len(),
+    )?;
 
     super::metrics_lifecycle::record_round_started(
         metrics_collector,

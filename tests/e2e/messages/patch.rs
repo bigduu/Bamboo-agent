@@ -34,6 +34,8 @@ async fn test_patch_message_persists_and_clears_derived_context() {
         truncation_occurred: false,
         segments_removed: 0,
         prompt_cached_tool_outputs: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
     });
     session.conversation_summary = Some(ConversationSummary::new("summary", 2, 5));
 

@@ -157,7 +157,10 @@ pub(crate) fn collapse_duplicate_lines(input: &str, window: usize) -> String {
             result.push_str(current);
             result.push('\n');
             if run_len > 1 {
-                result.push_str(&format!("  ... ({} identical lines collapsed)\n", run_len - 1));
+                result.push_str(&format!(
+                    "  ... ({} identical lines collapsed)\n",
+                    run_len - 1
+                ));
             }
             i += run_len;
         } else {

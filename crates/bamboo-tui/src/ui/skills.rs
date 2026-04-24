@@ -9,15 +9,15 @@ use crate::theme::colors;
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     if app.skills.loading && app.skills.skills.is_empty() {
-        let loading = Paragraph::new("Loading skills...")
-            .style(Style::default().fg(colors::INACTIVE));
+        let loading =
+            Paragraph::new("Loading skills...").style(Style::default().fg(colors::INACTIVE));
         f.render_widget(loading, area);
         return;
     }
 
     if let Some(err) = &app.skills.error {
-        let error = Paragraph::new(format!("Error: {}", err))
-            .style(Style::default().fg(colors::ERROR));
+        let error =
+            Paragraph::new(format!("Error: {}", err)).style(Style::default().fg(colors::ERROR));
         f.render_widget(error, area);
         return;
     }
@@ -35,7 +35,9 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     // Header
     let header = Paragraph::new(Line::from(Span::styled(
         " Skills",
-        Style::default().fg(colors::BRAND).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(colors::BRAND)
+            .add_modifier(Modifier::BOLD),
     )));
     f.render_widget(header, chunks[0]);
 
@@ -83,27 +85,22 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     // Detail
     if let Some(detail) = &app.skills.detail {
-        let mut detail_lines = vec![
-            Line::from(Span::styled(
-                format!(" {} - {}", detail.name, detail.id),
-                Style::default().fg(colors::BRAND),
-            )),
-        ];
+        let mut detail_lines = vec![Line::from(Span::styled(
+            format!(" {} - {}", detail.name, detail.id),
+            Style::default().fg(colors::BRAND),
+        ))];
         if let Some(desc) = &detail.description {
             detail_lines.push(Line::from(format!("  {}", desc)));
         }
         if let Some(tools) = &detail.tools {
-            detail_lines.push(Line::from(format!(
-                "  Tools: {}",
-                tools.join(", ")
-            )));
+            detail_lines.push(Line::from(format!("  Tools: {}", tools.join(", "))));
         }
         let detail_widget = Paragraph::new(detail_lines);
         f.render_widget(detail_widget, chunks[2]);
     }
 
     // Footer
-    let footer = Paragraph::new(" [Enter] View details")
-        .style(Style::default().fg(colors::INACTIVE));
+    let footer =
+        Paragraph::new(" [Enter] View details").style(Style::default().fg(colors::INACTIVE));
     f.render_widget(footer, chunks[3]);
 }

@@ -9,9 +9,9 @@ use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_compression::TokenBudget;
 use bamboo_domain::ReasoningEffort;
-use bamboo_infrastructure::MemoryConfig;
 use bamboo_infrastructure::config::PermissionMode;
 use bamboo_infrastructure::LLMProvider;
+use bamboo_infrastructure::MemoryConfig;
 use bamboo_tools::ToolRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

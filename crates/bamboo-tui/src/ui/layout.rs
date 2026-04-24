@@ -96,15 +96,9 @@ pub fn render_status_info(f: &mut Frame, area: Rect, app: &App) {
 
     // Connection indicator
     if app.connected {
-        spans.push(Span::styled(
-            " ● ",
-            Style::default().fg(colors::SUCCESS),
-        ));
+        spans.push(Span::styled(" ● ", Style::default().fg(colors::SUCCESS)));
     } else {
-        spans.push(Span::styled(
-            " ○ ",
-            Style::default().fg(colors::ERROR),
-        ));
+        spans.push(Span::styled(" ○ ", Style::default().fg(colors::ERROR)));
     }
 
     // Status message (right-aligned as remaining text)
@@ -170,12 +164,11 @@ pub fn render_help(f: &mut Frame) {
         Line::raw("  Press any key to close"),
     ];
 
-    let help = Paragraph::new(help_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(colors::BRAND)),
-        );
+    let help = Paragraph::new(help_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::BRAND)),
+    );
     f.render_widget(help, area);
 }
 

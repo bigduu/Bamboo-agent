@@ -239,7 +239,9 @@ pub async fn create_child_action(
     let mut child = Session::new_child(
         input.child_id.clone(),
         input.parent_session.id.clone(),
-        input.model_override.clone()
+        input
+            .model_override
+            .clone()
             .unwrap_or_else(|| input.parent_session.model.clone()),
         input.title.clone(),
     );

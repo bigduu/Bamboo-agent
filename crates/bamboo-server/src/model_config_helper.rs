@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use bamboo_domain::reasoning::ReasoningEffort;
-use bamboo_infrastructure::{LLMError, ProviderModelRouter, ProviderRegistry, ResolvedModel};
 use bamboo_infrastructure::Config;
+use bamboo_infrastructure::{LLMError, ProviderModelRouter, ProviderRegistry, ResolvedModel};
 
 /// Get the default model for a specific provider from config.
 pub fn get_default_model_for_provider(
@@ -187,7 +187,9 @@ pub fn resolve_background_model(
             .and_then(|d| d.memory_background.as_ref())
             .or_else(|| config.defaults.as_ref().and_then(|d| d.fast.as_ref()))
         {
-            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+            if let Ok(provider) =
+                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
+            {
                 return Some(ResolvedModel {
                     provider,
                     model_name: model_ref.model.clone(),
@@ -197,7 +199,10 @@ pub fn resolve_background_model(
     }
     let model_name = get_memory_background_model_for_provider(config, provider_name)?;
     let provider = provider_registry.get(provider_name)?;
-    Some(ResolvedModel { provider, model_name })
+    Some(ResolvedModel {
+        provider,
+        model_name,
+    })
 }
 
 /// Resolve the fast model for lightweight tasks like title generation.
@@ -208,7 +213,9 @@ pub fn resolve_fast_model(
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
         if let Some(ref model_ref) = config.defaults.as_ref().and_then(|d| d.fast.as_ref()) {
-            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+            if let Ok(provider) =
+                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
+            {
                 return Some(ResolvedModel {
                     provider,
                     model_name: model_ref.model.clone(),
@@ -218,7 +225,10 @@ pub fn resolve_fast_model(
     }
     let model_name = get_fast_model_for_provider(config, provider_name)?;
     let provider = provider_registry.get(provider_name)?;
-    Some(ResolvedModel { provider, model_name })
+    Some(ResolvedModel {
+        provider,
+        model_name,
+    })
 }
 
 /// Resolve the vision-capable model for image understanding.
@@ -229,7 +239,9 @@ pub fn resolve_vision_model(
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
         if let Some(ref model_ref) = config.defaults.as_ref().and_then(|d| d.vision.as_ref()) {
-            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+            if let Ok(provider) =
+                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
+            {
                 return Some(ResolvedModel {
                     provider,
                     model_name: model_ref.model.clone(),
@@ -239,7 +251,10 @@ pub fn resolve_vision_model(
     }
     let model_name = config.get_vision_model()?;
     let provider = provider_registry.get(provider_name)?;
-    Some(ResolvedModel { provider, model_name })
+    Some(ResolvedModel {
+        provider,
+        model_name,
+    })
 }
 
 /// Resolve the planning/coordination model for architecture and task decomposition.
@@ -252,7 +267,9 @@ pub fn resolve_planning_model(
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
         if let Some(ref model_ref) = config.defaults.as_ref().and_then(|d| d.planning.as_ref()) {
-            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+            if let Ok(provider) =
+                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
+            {
                 return Some(ResolvedModel {
                     provider,
                     model_name: model_ref.model.clone(),
@@ -273,7 +290,9 @@ pub fn resolve_search_model(
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
         if let Some(ref model_ref) = config.defaults.as_ref().and_then(|d| d.search.as_ref()) {
-            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+            if let Ok(provider) =
+                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
+            {
                 return Some(ResolvedModel {
                     provider,
                     model_name: model_ref.model.clone(),
@@ -294,8 +313,14 @@ pub fn resolve_code_review_model(
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(ref model_ref) = config.defaults.as_ref().and_then(|d| d.code_review.as_ref()) {
-            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+        if let Some(ref model_ref) = config
+            .defaults
+            .as_ref()
+            .and_then(|d| d.code_review.as_ref())
+        {
+            if let Ok(provider) =
+                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
+            {
                 return Some(ResolvedModel {
                     provider,
                     model_name: model_ref.model.clone(),
@@ -321,7 +346,9 @@ pub fn resolve_subagent_model(
             .as_ref()
             .and_then(|d| d.subagent_models.get(subagent_type))
         {
-            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+            if let Ok(provider) =
+                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
+            {
                 return Some(ResolvedModel {
                     provider,
                     model_name: model_ref.model.clone(),
@@ -342,7 +369,9 @@ fn resolve_default_chat_model(
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
         if let Some(ref model_ref) = config.defaults.as_ref().map(|d| &d.chat) {
-            if let Ok(provider) = ProviderModelRouter::new(provider_registry.clone()).route(model_ref) {
+            if let Ok(provider) =
+                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
+            {
                 return Some(ResolvedModel {
                     provider,
                     model_name: model_ref.model.clone(),
@@ -352,7 +381,10 @@ fn resolve_default_chat_model(
     }
     let model_name = get_default_model_for_provider(config, provider_name).ok()?;
     let provider = provider_registry.get(provider_name)?;
-    Some(ResolvedModel { provider, model_name })
+    Some(ResolvedModel {
+        provider,
+        model_name,
+    })
 }
 
 #[cfg(test)]

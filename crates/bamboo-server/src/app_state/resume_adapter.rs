@@ -63,10 +63,12 @@ impl ResumeExecutionPort for AppStateResumeRef {
             .map(|model_ref| model_ref.provider)
             .unwrap_or(config.provider_name);
         let resolved_bg_provider = config.background_model_provider.clone();
-        let resolved_fast_model = config.fast_model.or_else(|| {
-            let config_snapshot = self.0.config.blocking_read().clone();
+        let resolved_fast_model = if let Some(fast_model) = config.fast_model {
+            Some(fast_model)
+        } else {
+            let config_snapshot = self.0.config.read().await.clone();
             get_memory_background_model_for_provider(&config_snapshot, &resolved_provider_name)
-        });
+        };
         let is_child_session = session.kind == bamboo_agent_core::SessionKind::Child;
         let reasoning_effort = session.reasoning_effort;
         let reasoning_effort_source = session

@@ -10,8 +10,8 @@ pub mod tool_names;
 pub mod tool_types;
 
 // Provider/Model first-class types
-pub mod provider_model_ref;
 pub mod provider_catalog;
+pub mod provider_model_ref;
 
 // From bamboo-domain-session (was root-level modules, now under session/)
 pub mod session;

@@ -19,10 +19,7 @@ impl ProviderRegistry {
     ///
     /// Used by tests and higher-level orchestration that manages
     /// provider lifecycle independently of config files.
-    pub fn new(
-        providers: HashMap<String, Arc<dyn LLMProvider>>,
-        default_provider: String,
-    ) -> Self {
+    pub fn new(providers: HashMap<String, Arc<dyn LLMProvider>>, default_provider: String) -> Self {
         Self {
             providers,
             default_provider,
@@ -33,10 +30,7 @@ impl ProviderRegistry {
     ///
     /// Providers that fail to initialize (missing API key, auth failure, etc.)
     /// are skipped with a warning log rather than aborting the entire startup.
-    pub async fn from_config(
-        config: &Config,
-        app_data_dir: PathBuf,
-    ) -> Result<Self, LLMError> {
+    pub async fn from_config(config: &Config, app_data_dir: PathBuf) -> Result<Self, LLMError> {
         let mut providers: HashMap<String, Arc<dyn LLMProvider>> = HashMap::new();
 
         for name in crate::llm::provider_factory::AVAILABLE_PROVIDERS {

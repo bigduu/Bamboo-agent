@@ -16,7 +16,9 @@ pub fn render(f: &mut Frame, content: Rect, input: Rect, app: &App) {
     let scroll_offset = if app.chat.auto_scroll {
         total_lines.saturating_sub(visible_height)
     } else {
-        app.chat.scroll_offset.min(total_lines.saturating_sub(visible_height))
+        app.chat
+            .scroll_offset
+            .min(total_lines.saturating_sub(visible_height))
     };
 
     let messages = Paragraph::new(lines)
@@ -29,7 +31,10 @@ pub fn render(f: &mut Frame, content: Rect, input: Rect, app: &App) {
     if app.chat.streaming {
         let blocked = Paragraph::new(Line::from(vec![
             Span::styled("❯ ", Style::default().fg(colors::BRAND)),
-            Span::styled("Waiting for response... (Ctrl+S to stop, j/k to scroll)", Style::default().fg(colors::INACTIVE)),
+            Span::styled(
+                "Waiting for response... (Ctrl+S to stop, j/k to scroll)",
+                Style::default().fg(colors::INACTIVE),
+            ),
         ]));
         f.render_widget(blocked, input);
     } else {
@@ -99,9 +104,7 @@ fn build_message_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 if let Some(reasoning) = &msg.reasoning {
                     let sep_len: usize = 40;
                     lines.push(Line::from(Span::styled(
-                        format!("── thinking {}",
-                            "─".repeat(sep_len.saturating_sub(14)))
-                            ,
+                        format!("── thinking {}", "─".repeat(sep_len.saturating_sub(14))),
                         Style::default().fg(colors::THINKING),
                     )));
                     for rline in reasoning.lines().take(5) {
@@ -146,7 +149,10 @@ fn build_message_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             let (icon, style) = match tc.phase.as_str() {
                 "complete" => ("✓", Style::default().fg(colors::TOOL_DONE)),
                 "error" => ("✗", Style::default().fg(colors::TOOL_ERROR)),
-                _ => (theme::BRAILLE_SPINNER[tick], Style::default().fg(colors::TOOL_RUNNING)),
+                _ => (
+                    theme::BRAILLE_SPINNER[tick],
+                    Style::default().fg(colors::TOOL_RUNNING),
+                ),
             };
             lines.push(Line::from(Span::styled(
                 format!(" {} {}", icon, tc.tool_name),

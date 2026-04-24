@@ -104,7 +104,9 @@ mod tests {
             .expect("execute should succeed");
 
         assert!(result.success);
-        assert!(result.result.contains("with instructions: Preserve all function signatures"));
+        assert!(result
+            .result
+            .contains("with instructions: Preserve all function signatures"));
     }
 
     #[tokio::test]
@@ -138,9 +140,7 @@ mod tests {
     #[tokio::test]
     async fn execute_with_invalid_args_returns_error() {
         let tool = CompactContextTool;
-        let result = tool
-            .execute(serde_json::json!("not an object"))
-            .await;
+        let result = tool.execute(serde_json::json!("not an object")).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -174,9 +174,17 @@ mod tests {
     fn parameters_schema_has_instructions_field() {
         let tool = CompactContextTool;
         let schema = tool.parameters_schema();
-        let props = schema.get("properties").expect("schema should have properties");
-        assert!(props.get("instructions").is_some(), "should have instructions property");
+        let props = schema
+            .get("properties")
+            .expect("schema should have properties");
+        assert!(
+            props.get("instructions").is_some(),
+            "should have instructions property"
+        );
         // No required fields — instructions is optional
-        assert!(schema.get("required").is_none(), "instructions should be optional");
+        assert!(
+            schema.get("required").is_none(),
+            "instructions should be optional"
+        );
     }
 }

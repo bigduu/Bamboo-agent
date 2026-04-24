@@ -47,9 +47,7 @@ impl FromStr for ProviderModelRef {
     type Err = ParseProviderModelRefError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (provider, model) = s
-            .split_once('/')
-            .ok_or(ParseProviderModelRefError)?;
+        let (provider, model) = s.split_once('/').ok_or(ParseProviderModelRefError)?;
         Ok(Self {
             provider: provider.to_string(),
             model: model.to_string(),

@@ -55,7 +55,8 @@ impl StreamAccumulationState {
     }
 
     pub(super) fn record_cache(&mut self, creation: u64, read: u64) {
-        self.cache_creation_input_tokens = self.cache_creation_input_tokens.saturating_add(creation);
+        self.cache_creation_input_tokens =
+            self.cache_creation_input_tokens.saturating_add(creation);
         self.cache_read_input_tokens = self.cache_read_input_tokens.saturating_add(read);
     }
 

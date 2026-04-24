@@ -288,10 +288,28 @@ impl PermissionChecker for DenyDangerousPermissionChecker {
 
 /// Shell commands that are considered safe for auto-approval in AcceptEdits mode.
 const SAFE_EDIT_COMMANDS: &[&str] = &[
-    "mkdir", "touch", "cp", "mv", "ls", "cat", "echo", "pwd", "chmod", "chown",
-    "git status", "git diff", "git log", "git add", "git commit",
-    "cargo check", "cargo build", "cargo test", "cargo clippy",
-    "npm run", "npm test", "npm install",
+    "mkdir",
+    "touch",
+    "cp",
+    "mv",
+    "ls",
+    "cat",
+    "echo",
+    "pwd",
+    "chmod",
+    "chown",
+    "git status",
+    "git diff",
+    "git log",
+    "git add",
+    "git commit",
+    "cargo check",
+    "cargo build",
+    "cargo test",
+    "cargo clippy",
+    "npm run",
+    "npm test",
+    "npm install",
 ];
 
 /// Command wrappers stripped before checking the base command.
@@ -396,9 +414,7 @@ impl PermissionChecker for ModeAwarePermissionChecker {
                     return false;
                 }
                 // Auto-approve safe edit commands
-                if perm_type == PermissionType::ExecuteCommand
-                    && is_safe_edit_command(resource)
-                {
+                if perm_type == PermissionType::ExecuteCommand && is_safe_edit_command(resource) {
                     return false;
                 }
                 self.inner.needs_confirmation(perm_type, resource).await
@@ -410,9 +426,7 @@ impl PermissionChecker for ModeAwarePermissionChecker {
                     _ => true,
                 }
             }
-            PermissionMode::Default => {
-                self.inner.needs_confirmation(perm_type, resource).await
-            }
+            PermissionMode::Default => self.inner.needs_confirmation(perm_type, resource).await,
         }
     }
 
@@ -648,7 +662,8 @@ mod tests {
     fn mode_aware_setup(mode: PermissionMode) -> ModeAwarePermissionChecker {
         let config = Arc::new(PermissionConfig::new());
         config.set_mode(mode);
-        let inner: Arc<dyn PermissionChecker> = Arc::new(ConfigPermissionChecker::new(config.clone()));
+        let inner: Arc<dyn PermissionChecker> =
+            Arc::new(ConfigPermissionChecker::new(config.clone()));
         ModeAwarePermissionChecker::new(inner, config)
     }
 
@@ -656,16 +671,36 @@ mod tests {
     async fn test_mode_default_delegates_to_inner() {
         let checker = mode_aware_setup(PermissionMode::Default);
         // Default mode: no whitelist rules, so everything needs confirmation
-        assert!(checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
-        assert!(checker.needs_confirmation(PermissionType::ExecuteCommand, "ls").await);
+        assert!(
+            checker
+                .needs_confirmation(PermissionType::WriteFile, "/tmp/test")
+                .await
+        );
+        assert!(
+            checker
+                .needs_confirmation(PermissionType::ExecuteCommand, "ls")
+                .await
+        );
     }
 
     #[tokio::test]
     async fn test_mode_bypass_allows_everything() {
         let checker = mode_aware_setup(PermissionMode::BypassPermissions);
-        assert!(!checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
-        assert!(!checker.needs_confirmation(PermissionType::ExecuteCommand, "rm -rf /").await);
-        assert!(!checker.needs_confirmation(PermissionType::DeleteOperation, "/etc/passwd").await);
+        assert!(
+            !checker
+                .needs_confirmation(PermissionType::WriteFile, "/tmp/test")
+                .await
+        );
+        assert!(
+            !checker
+                .needs_confirmation(PermissionType::ExecuteCommand, "rm -rf /")
+                .await
+        );
+        assert!(
+            !checker
+                .needs_confirmation(PermissionType::DeleteOperation, "/etc/passwd")
+                .await
+        );
 
         // request_confirmation should also succeed
         let ctx = PermissionContext::new(PermissionType::ExecuteCommand, "rm -rf /", "dangerous");
@@ -676,9 +711,21 @@ mod tests {
     async fn test_mode_plan_blocks_mutating() {
         let checker = mode_aware_setup(PermissionMode::Plan);
         // Plan mode: high/medium risk operations need confirmation (blocked)
-        assert!(checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
-        assert!(checker.needs_confirmation(PermissionType::ExecuteCommand, "ls").await);
-        assert!(checker.needs_confirmation(PermissionType::DeleteOperation, "/tmp/file").await);
+        assert!(
+            checker
+                .needs_confirmation(PermissionType::WriteFile, "/tmp/test")
+                .await
+        );
+        assert!(
+            checker
+                .needs_confirmation(PermissionType::ExecuteCommand, "ls")
+                .await
+        );
+        assert!(
+            checker
+                .needs_confirmation(PermissionType::DeleteOperation, "/tmp/file")
+                .await
+        );
 
         // request_confirmation should deny with Plan mode message
         let ctx = PermissionContext::new(PermissionType::WriteFile, "/tmp/test", "write");
@@ -692,9 +739,17 @@ mod tests {
     async fn test_mode_accept_edits_auto_approves_writes() {
         let checker = mode_aware_setup(PermissionMode::AcceptEdits);
         // WriteFile should be auto-approved
-        assert!(!checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
+        assert!(
+            !checker
+                .needs_confirmation(PermissionType::WriteFile, "/tmp/test")
+                .await
+        );
         // ExecuteCommand should still need confirmation (delegated to inner)
-        assert!(checker.needs_confirmation(PermissionType::ExecuteCommand, "rm -rf /").await);
+        assert!(
+            checker
+                .needs_confirmation(PermissionType::ExecuteCommand, "rm -rf /")
+                .await
+        );
     }
 
     #[tokio::test]
@@ -702,15 +757,28 @@ mod tests {
         let config = Arc::new(PermissionConfig::new());
         config.set_mode(PermissionMode::DontAsk);
         // Add a whitelist allow rule
-        config.add_rule(PermissionRule::new(PermissionType::WriteFile, "/safe/*", true));
+        config.add_rule(PermissionRule::new(
+            PermissionType::WriteFile,
+            "/safe/*",
+            true,
+        ));
 
-        let inner: Arc<dyn PermissionChecker> = Arc::new(ConfigPermissionChecker::new(config.clone()));
+        let inner: Arc<dyn PermissionChecker> =
+            Arc::new(ConfigPermissionChecker::new(config.clone()));
         let checker = ModeAwarePermissionChecker::new(inner, config);
 
         // Whitelisted path: allowed
-        assert!(!checker.needs_confirmation(PermissionType::WriteFile, "/safe/file.rs").await);
+        assert!(
+            !checker
+                .needs_confirmation(PermissionType::WriteFile, "/safe/file.rs")
+                .await
+        );
         // Non-whitelisted path: denied (needs_confirmation=true)
-        assert!(checker.needs_confirmation(PermissionType::WriteFile, "/unsafe/file.rs").await);
+        assert!(
+            checker
+                .needs_confirmation(PermissionType::WriteFile, "/unsafe/file.rs")
+                .await
+        );
 
         // request_confirmation should deny
         let ctx = PermissionContext::new(PermissionType::WriteFile, "/unsafe/file.rs", "write");
@@ -722,18 +790,31 @@ mod tests {
     #[tokio::test]
     async fn test_mode_switches_at_runtime() {
         let config = Arc::new(PermissionConfig::new());
-        let inner: Arc<dyn PermissionChecker> = Arc::new(ConfigPermissionChecker::new(config.clone()));
+        let inner: Arc<dyn PermissionChecker> =
+            Arc::new(ConfigPermissionChecker::new(config.clone()));
         let checker = ModeAwarePermissionChecker::new(inner, config.clone());
 
         // Start in Default mode
-        assert!(checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
+        assert!(
+            checker
+                .needs_confirmation(PermissionType::WriteFile, "/tmp/test")
+                .await
+        );
 
         // Switch to Bypass
         config.set_mode(PermissionMode::BypassPermissions);
-        assert!(!checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
+        assert!(
+            !checker
+                .needs_confirmation(PermissionType::WriteFile, "/tmp/test")
+                .await
+        );
 
         // Switch to Plan
         config.set_mode(PermissionMode::Plan);
-        assert!(checker.needs_confirmation(PermissionType::WriteFile, "/tmp/test").await);
+        assert!(
+            checker
+                .needs_confirmation(PermissionType::WriteFile, "/tmp/test")
+                .await
+        );
     }
 }

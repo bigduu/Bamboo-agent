@@ -50,7 +50,10 @@ pub(super) async fn handle_chunk_result(
             tracing::debug!("[{}] LLM stream completed", session_id);
             Ok(())
         }
-        Ok(LLMChunk::CacheUsage { cache_creation_input_tokens, cache_read_input_tokens }) => {
+        Ok(LLMChunk::CacheUsage {
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        }) => {
             tracing::debug!(
                 "[{}] Cache usage: creation={}, read={}",
                 session_id,
@@ -60,7 +63,10 @@ pub(super) async fn handle_chunk_result(
             state.record_cache(cache_creation_input_tokens, cache_read_input_tokens);
             Ok(())
         }
-        Ok(LLMChunk::UsageSummary { output_tokens, thinking_tokens }) => {
+        Ok(LLMChunk::UsageSummary {
+            output_tokens,
+            thinking_tokens,
+        }) => {
             tracing::debug!(
                 "[{}] Usage summary: output={}, thinking={}",
                 session_id,

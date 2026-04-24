@@ -92,9 +92,7 @@ impl ModelCatalogService {
     ///
     /// Returns a result per provider, preserving individual success/failure status
     /// so callers can see partial results.
-    pub async fn fetch_models_for_all_providers(
-        &self,
-    ) -> Vec<ProviderFetchResult> {
+    pub async fn fetch_models_for_all_providers(&self) -> Vec<ProviderFetchResult> {
         let names = self.registry.provider_names();
         let mut results = Vec::with_capacity(names.len());
 
@@ -390,7 +388,9 @@ mod tests {
         let results = service.fetch_models_for_all_providers().await;
 
         assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|r| r.models.is_some() && r.error.is_none()));
+        assert!(results
+            .iter()
+            .all(|r| r.models.is_some() && r.error.is_none()));
     }
 
     #[tokio::test]

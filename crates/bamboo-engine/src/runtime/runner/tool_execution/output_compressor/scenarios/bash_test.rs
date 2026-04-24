@@ -247,7 +247,11 @@ fn try_compress_cargo_test(stdout: &str, stderr: &str, exit_code: i64) -> Option
             let names_start = summary.len();
             let max_len = 200;
             for (idx, name) in names.iter().enumerate() {
-                let entry = if idx == 0 { name.to_string() } else { format!(", {}", name) };
+                let entry = if idx == 0 {
+                    name.to_string()
+                } else {
+                    format!(", {}", name)
+                };
                 if summary.len() + entry.len() - names_start > max_len {
                     summary.push_str(&format!(", ... ({} more)", names.len() - idx));
                     break;
@@ -1276,7 +1280,10 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     fn cargo_test_many_names_truncated() {
         let mut stdout = String::from("running 50 tests\n");
         for i in 0..50 {
-            stdout.push_str(&format!("test module::test_case_name_{}_with_long_name ... ok\n", i));
+            stdout.push_str(&format!(
+                "test module::test_case_name_{}_with_long_name ... ok\n",
+                i
+            ));
         }
         stdout.push_str("\ntest result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n");
         let padding = "x".repeat(MIN_COMPRESS_LEN as usize);

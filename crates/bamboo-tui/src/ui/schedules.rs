@@ -9,15 +9,15 @@ use crate::theme::colors;
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     if app.schedules.loading && app.schedules.schedules.is_empty() {
-        let loading = Paragraph::new("Loading schedules...")
-            .style(Style::default().fg(colors::INACTIVE));
+        let loading =
+            Paragraph::new("Loading schedules...").style(Style::default().fg(colors::INACTIVE));
         f.render_widget(loading, area);
         return;
     }
 
     if let Some(err) = &app.schedules.error {
-        let error = Paragraph::new(format!("Error: {}", err))
-            .style(Style::default().fg(colors::ERROR));
+        let error =
+            Paragraph::new(format!("Error: {}", err)).style(Style::default().fg(colors::ERROR));
         f.render_widget(error, area);
         return;
     }
@@ -33,7 +33,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     // Header
     let header = Paragraph::new(Line::from(vec![
-        Span::styled(" Schedules", Style::default().fg(colors::BRAND).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Schedules",
+            Style::default()
+                .fg(colors::BRAND)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("   "),
         Span::styled("[d] Delete", Style::default().fg(colors::INACTIVE)),
         Span::raw("  "),
@@ -98,7 +103,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(list, chunks[1]);
 
     // Footer
-    let footer = Paragraph::new(" [d] Delete · [r] Run now")
-        .style(Style::default().fg(colors::INACTIVE));
+    let footer =
+        Paragraph::new(" [d] Delete · [r] Run now").style(Style::default().fg(colors::INACTIVE));
     f.render_widget(footer, chunks[2]);
 }

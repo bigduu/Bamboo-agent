@@ -12,8 +12,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::metrics::{
-    MetricsCollector, RoundStatus as MetricsRoundStatus,
-    SessionStatus as MetricsSessionStatus, TokenUsage as MetricsTokenUsage,
+    MetricsCollector, RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
+    TokenUsage as MetricsTokenUsage,
 };
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
@@ -70,9 +70,7 @@ struct TurnOutcome {
 
 // ---- Metrics helpers (from round_error.rs) ----
 
-fn map_turn_error_status(
-    error: &AgentError,
-) -> (MetricsRoundStatus, MetricsSessionStatus) {
+fn map_turn_error_status(error: &AgentError) -> (MetricsRoundStatus, MetricsSessionStatus) {
     if matches!(error, AgentError::Cancelled) {
         (
             MetricsRoundStatus::Cancelled,
@@ -365,7 +363,7 @@ pub(super) async fn run_pipeline(
             llm: llm.clone(),
             background_model_name: config.background_model_name.clone(),
         };
-    crate::runtime::runner::round_prelude::refresh_round_prompt_context(
+        crate::runtime::runner::round_prelude::refresh_round_prompt_context(
             session,
             config.prompt_memory_flags,
             Some(&runtime_context),
@@ -410,11 +408,8 @@ pub(super) async fn run_pipeline(
         );
 
         // --- Resolve tool schemas ---
-        let tool_schemas = resolve_available_tool_schemas_for_session(
-            config,
-            tools.as_ref(),
-            session,
-        );
+        let tool_schemas =
+            resolve_available_tool_schemas_for_session(config, tools.as_ref(), session);
 
         // --- LLM call with retry ---
         let mut overflow_recovery_attempted = false;
@@ -681,13 +676,10 @@ pub(super) async fn run_pipeline(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        is_overflow_recoverable, map_turn_error_status, should_retry_turn_error,
-    };
     use super::super::startup::OverflowRecoveryState;
+    use super::{is_overflow_recoverable, map_turn_error_status, should_retry_turn_error};
     use crate::metrics::{
-        RoundStatus as MetricsRoundStatus,
-        SessionStatus as MetricsSessionStatus,
+        RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
         TokenUsage as MetricsTokenUsage,
     };
     use bamboo_agent_core::{AgentError, AgentEvent, Session};
@@ -752,7 +744,9 @@ mod tests {
     #[test]
     fn does_not_retry_empty_llm_error() {
         assert!(!should_retry_turn_error(&AgentError::LLM("".to_string())));
-        assert!(!should_retry_turn_error(&AgentError::LLM("   ".to_string())));
+        assert!(!should_retry_turn_error(&AgentError::LLM(
+            "   ".to_string()
+        )));
     }
 
     #[test]
@@ -880,7 +874,10 @@ mod tests {
         assert!(outcome.should_break);
         assert!(outcome.sent_complete);
         assert_eq!(session.messages.len(), 1);
-        assert!(matches!(session.messages[0].role, bamboo_agent_core::Role::Assistant));
+        assert!(matches!(
+            session.messages[0].role,
+            bamboo_agent_core::Role::Assistant
+        ));
         assert_eq!(session.messages[0].content, "final answer");
         assert_eq!(
             session.messages[0].reasoning.as_deref(),
@@ -940,7 +937,9 @@ mod tests {
         };
 
         usage.prompt_tokens = usage.prompt_tokens.saturating_add(delta.prompt_tokens);
-        usage.completion_tokens = usage.completion_tokens.saturating_add(delta.completion_tokens);
+        usage.completion_tokens = usage
+            .completion_tokens
+            .saturating_add(delta.completion_tokens);
         usage.recompute_total();
 
         assert_eq!(usage.prompt_tokens, u64::MAX);
@@ -953,7 +952,9 @@ mod tests {
 ///
 /// This is used when `features.dynamic_model_routing` is enabled but
 /// `MiniLoopExecutor` is not wired through the runner.
-fn heuristic_complexity(tool_calls: &[bamboo_agent_core::tools::ToolCall]) -> crate::runtime::complexity_classifier::TaskComplexity {
+fn heuristic_complexity(
+    tool_calls: &[bamboo_agent_core::tools::ToolCall],
+) -> crate::runtime::complexity_classifier::TaskComplexity {
     use crate::runtime::complexity_classifier::TaskComplexity;
 
     let simple_tools = ["Read", "Glob", "Grep", "Bash"];

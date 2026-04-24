@@ -32,13 +32,17 @@ impl PermissionRuleSet {
     pub fn merge(&mut self, other: &PermissionRuleSet) {
         // Always accumulate deny rules from all levels
         for rule in &other.deny {
-            if !self.deny.iter().any(|r| r.resource_pattern == rule.resource_pattern && r.tool_type == rule.tool_type) {
+            if !self.deny.iter().any(|r| {
+                r.resource_pattern == rule.resource_pattern && r.tool_type == rule.tool_type
+            }) {
                 self.deny.push(rule.clone());
             }
         }
         // Allow rules from other override self's matching allow rules
         for rule in &other.allow {
-            if !self.allow.iter().any(|r| r.resource_pattern == rule.resource_pattern && r.tool_type == rule.tool_type) {
+            if !self.allow.iter().any(|r| {
+                r.resource_pattern == rule.resource_pattern && r.tool_type == rule.tool_type
+            }) {
                 self.allow.push(rule.clone());
             }
         }
@@ -98,8 +102,16 @@ mod tests {
     #[test]
     fn test_rule_set_from_config() {
         let config = PermissionConfig::new();
-        config.add_rule(PermissionRule::new(PermissionType::WriteFile, "/safe/*", true));
-        config.add_rule(PermissionRule::new(PermissionType::WriteFile, "/safe/secret", false));
+        config.add_rule(PermissionRule::new(
+            PermissionType::WriteFile,
+            "/safe/*",
+            true,
+        ));
+        config.add_rule(PermissionRule::new(
+            PermissionType::WriteFile,
+            "/safe/secret",
+            false,
+        ));
 
         let set = PermissionRuleSet::from_config(&config);
         assert_eq!(set.allow.len(), 1);
@@ -109,23 +121,49 @@ mod tests {
     #[test]
     fn test_rule_set_check() {
         let config = PermissionConfig::new();
-        config.add_rule(PermissionRule::new(PermissionType::WriteFile, "/safe/*", true));
-        config.add_rule(PermissionRule::new(PermissionType::WriteFile, "/safe/secret", false));
+        config.add_rule(PermissionRule::new(
+            PermissionType::WriteFile,
+            "/safe/*",
+            true,
+        ));
+        config.add_rule(PermissionRule::new(
+            PermissionType::WriteFile,
+            "/safe/secret",
+            false,
+        ));
 
         let set = PermissionRuleSet::from_config(&config);
-        assert_eq!(set.check(PermissionType::WriteFile, "/safe/code.rs"), Some(true));
-        assert_eq!(set.check(PermissionType::WriteFile, "/safe/secret"), Some(false));
+        assert_eq!(
+            set.check(PermissionType::WriteFile, "/safe/code.rs"),
+            Some(true)
+        );
+        assert_eq!(
+            set.check(PermissionType::WriteFile, "/safe/secret"),
+            Some(false)
+        );
         assert_eq!(set.check(PermissionType::WriteFile, "/other/file.rs"), None);
     }
 
     #[test]
     fn test_rule_set_merge_accumulates_denies() {
         let mut user = PermissionRuleSet::default();
-        user.deny.push(PermissionRule::new(PermissionType::ExecuteCommand, "curl *", false));
+        user.deny.push(PermissionRule::new(
+            PermissionType::ExecuteCommand,
+            "curl *",
+            false,
+        ));
 
         let mut project = PermissionRuleSet::default();
-        project.deny.push(PermissionRule::new(PermissionType::WriteFile, "./.env", false));
-        project.allow.push(PermissionRule::new(PermissionType::ExecuteCommand, "npm run *", true));
+        project.deny.push(PermissionRule::new(
+            PermissionType::WriteFile,
+            "./.env",
+            false,
+        ));
+        project.allow.push(PermissionRule::new(
+            PermissionType::ExecuteCommand,
+            "npm run *",
+            true,
+        ));
 
         user.merge(&project);
         // Deny from both sources present
@@ -136,10 +174,21 @@ mod tests {
     #[test]
     fn test_rule_set_deny_overrides_allow() {
         let mut set = PermissionRuleSet::default();
-        set.allow.push(PermissionRule::new(PermissionType::WriteFile, "/tmp/*", true));
-        set.deny.push(PermissionRule::new(PermissionType::WriteFile, "/tmp/secret", false));
+        set.allow.push(PermissionRule::new(
+            PermissionType::WriteFile,
+            "/tmp/*",
+            true,
+        ));
+        set.deny.push(PermissionRule::new(
+            PermissionType::WriteFile,
+            "/tmp/secret",
+            false,
+        ));
 
         // Deny takes precedence even if allow also matches
-        assert_eq!(set.check(PermissionType::WriteFile, "/tmp/secret"), Some(false));
+        assert_eq!(
+            set.check(PermissionType::WriteFile, "/tmp/secret"),
+            Some(false)
+        );
     }
 }

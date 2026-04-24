@@ -21,7 +21,8 @@ pub(super) async fn handle_streaming_response(
     prepared: PreparedResponsesRequest,
     forward_id: String,
 ) -> Result<HttpResponse, AppError> {
-    let display_model = prepared.provider_name
+    let display_model = prepared
+        .provider_name
         .as_ref()
         .map(|p| format!("{}/{}", p, prepared.resolved_model))
         .unwrap_or_else(|| prepared.resolved_model.clone());

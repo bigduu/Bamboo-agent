@@ -44,7 +44,8 @@ pub async fn prepare_execute(
     // ---- Resolve model cascade ----
     // Flag ON (new): session.model_ref → request.model_ref → config.default_model_ref
     // Flag OFF (old): session.model → config.default_model → request.model
-    let (effective_model_ref, effective_model, model_source) = if config.provider_model_ref_enabled {
+    let (effective_model_ref, effective_model, model_source) = if config.provider_model_ref_enabled
+    {
         resolve_model_ref_cascade(&session, &input, &config)
     } else {
         let (effective_model, model_source) = resolve_model_cascade(&session, &input, &config);
@@ -172,7 +173,11 @@ pub(crate) fn resolve_model_ref_cascade(
     session: &Session,
     input: &ExecuteInput,
     config: &ExecutionConfigSnapshot,
-) -> (Option<bamboo_domain::ProviderModelRef>, Option<String>, &'static str) {
+) -> (
+    Option<bamboo_domain::ProviderModelRef>,
+    Option<String>,
+    &'static str,
+) {
     let session_model_ref = session_effective_model_ref(session);
     let request_model_ref = super::provider_model::derive_model_ref(
         input.request_model_ref.as_ref(),
@@ -380,7 +385,10 @@ mod tests {
 
     #[test]
     fn normalize_model_trims_whitespace() {
-        assert_eq!(normalize_model(Some("  gpt-4  ")), Some("gpt-4".to_string()));
+        assert_eq!(
+            normalize_model(Some("  gpt-4  ")),
+            Some("gpt-4".to_string())
+        );
     }
 
     #[test]
@@ -474,7 +482,10 @@ mod tests {
         config.provider_model_ref_enabled = true;
 
         let (model_ref, model, source) = resolve_model_ref_cascade(&session, &input, &config);
-        assert_eq!(model_ref, Some(ProviderModelRef::new("anthropic", "claude-3")));
+        assert_eq!(
+            model_ref,
+            Some(ProviderModelRef::new("anthropic", "claude-3"))
+        );
         assert_eq!(model, Some("claude-3".to_string()));
         assert_eq!(source, "session");
     }
@@ -489,7 +500,10 @@ mod tests {
         config.default_model_ref = Some(ProviderModelRef::new("openai", "gpt-4o"));
 
         let (model_ref, model, source) = resolve_model_ref_cascade(&session, &input, &config);
-        assert_eq!(model_ref, Some(ProviderModelRef::new("gemini", "gemini-pro")));
+        assert_eq!(
+            model_ref,
+            Some(ProviderModelRef::new("gemini", "gemini-pro"))
+        );
         assert_eq!(model, Some("gemini-pro".to_string()));
         assert_eq!(source, "request");
     }
@@ -532,7 +546,10 @@ mod tests {
         config.provider_model_ref_enabled = true;
 
         let (model_ref, model, source) = resolve_model_ref_cascade(&session, &input, &config);
-        assert_eq!(model_ref, Some(ProviderModelRef::new("anthropic", "claude-3")));
+        assert_eq!(
+            model_ref,
+            Some(ProviderModelRef::new("anthropic", "claude-3"))
+        );
         assert_eq!(model, Some("claude-3".to_string()));
         assert_eq!(source, "session");
     }
@@ -729,9 +746,10 @@ mod tests {
     #[test]
     fn conclusion_with_options_resume_true() {
         let mut session = Session::new("test", "gpt-4");
-        session
-            .metadata
-            .insert("conclusion_with_options_resume_pending".to_string(), "true".to_string());
+        session.metadata.insert(
+            "conclusion_with_options_resume_pending".to_string(),
+            "true".to_string(),
+        );
         assert!(has_pending_conclusion_with_options_resume(&session));
     }
 
@@ -744,9 +762,10 @@ mod tests {
     #[test]
     fn conclusion_with_options_resume_false_when_not_true() {
         let mut session = Session::new("test", "gpt-4");
-        session
-            .metadata
-            .insert("conclusion_with_options_resume_pending".to_string(), "false".to_string());
+        session.metadata.insert(
+            "conclusion_with_options_resume_pending".to_string(),
+            "false".to_string(),
+        );
         assert!(!has_pending_conclusion_with_options_resume(&session));
     }
 
@@ -770,9 +789,10 @@ mod tests {
     #[test]
     fn consume_removes_resume_metadata() {
         let mut session = Session::new("test", "gpt-4");
-        session
-            .metadata
-            .insert("conclusion_with_options_resume_pending".to_string(), "true".to_string());
+        session.metadata.insert(
+            "conclusion_with_options_resume_pending".to_string(),
+            "true".to_string(),
+        );
         session
             .metadata
             .insert("retry_resume_pending".to_string(), "true".to_string());
@@ -794,7 +814,9 @@ mod tests {
     #[test]
     fn snapshot_from_session_counts_messages() {
         let mut session = Session::new("test", "gpt-4");
-        session.messages.push(bamboo_agent_core::Message::user("hi"));
+        session
+            .messages
+            .push(bamboo_agent_core::Message::user("hi"));
         session
             .messages
             .push(bamboo_agent_core::Message::assistant("hello", None));

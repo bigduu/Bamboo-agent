@@ -328,7 +328,7 @@ pub fn create_budget_for_model(model: &str, strategy: crate::BudgetStrategy) -> 
         max_output_tokens: limit.get_max_output_tokens(),
         strategy,
         safety_margin: limit.get_safety_margin(),
-        compression_trigger_percent: 85,   // legacy — only used when working_reserve_tokens == 0
+        compression_trigger_percent: 85, // legacy — only used when working_reserve_tokens == 0
         compression_target_percent: 45,
         working_reserve_tokens: 50_000,
         fallback_trigger_percent: 75,

@@ -105,7 +105,9 @@ impl BambooSettings {
         }
         // Merge extra: lower_priority keys only if not in self
         for (key, value) in &lower_priority.extra {
-            self.extra.entry(key.clone()).or_insert_with(|| value.clone());
+            self.extra
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
         }
     }
 }
@@ -174,7 +176,9 @@ mod tests {
         higher.merge(&lower);
         assert_eq!(higher.allowed_tools.len(), 2);
         assert_eq!(higher.denied_tools.len(), 2);
-        assert!(higher.allowed_tools.contains(&"Bash(npm run *)".to_string()));
+        assert!(higher
+            .allowed_tools
+            .contains(&"Bash(npm run *)".to_string()));
         assert!(higher.allowed_tools.contains(&"Write(/src/**)".to_string()));
     }
 

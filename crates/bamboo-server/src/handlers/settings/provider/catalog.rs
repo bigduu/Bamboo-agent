@@ -45,10 +45,12 @@ pub async fn fetch_catalog_models(
                 error: None,
             }]
         }
-        None => app_state
-            .model_catalog
-            .fetch_models_for_all_providers()
-            .await,
+        None => {
+            app_state
+                .model_catalog
+                .fetch_models_for_all_providers()
+                .await
+        }
     };
 
     Ok(HttpResponse::Ok().json(FetchModelsResponse { fetched: results }))

@@ -64,7 +64,10 @@ fn classify_tier(text: &str) -> CompressionTier {
 /// - Low pressure (< 50%): only compress Standard and above
 /// - Normal pressure (50-80%): compress Light and above
 /// - High pressure (> 80%): compress everything, promote Light → Standard
-fn adjust_tier_for_pressure(tier: CompressionTier, pressure: Option<&ContextPressure>) -> CompressionTier {
+fn adjust_tier_for_pressure(
+    tier: CompressionTier,
+    pressure: Option<&ContextPressure>,
+) -> CompressionTier {
     let Some(p) = pressure else {
         return tier; // no pressure info → use base tier
     };
@@ -396,7 +399,8 @@ pub(super) async fn maybe_compress(
         if compressed.was_compressed {
             // Tee-save full output when compression occurred.
             let tee_note =
-                tee::tee_save_if_needed(session_id, args_json, &original, &compressed.compressed).await;
+                tee::tee_save_if_needed(session_id, args_json, &original, &compressed.compressed)
+                    .await;
 
             // Replace result with compressed version (+ optional tee note).
             result.result = match tee_note {
@@ -412,11 +416,8 @@ pub(super) async fn maybe_compress(
         let counter = bamboo_compression::TiktokenTokenCounter::default();
         let tokens = counter.count_text(&result.result);
         if tokens > max_tool_output_tokens as u32 {
-            let truncated = truncate_to_token_budget(
-                &result.result,
-                max_tool_output_tokens,
-                &counter,
-            );
+            let truncated =
+                truncate_to_token_budget(&result.result, max_tool_output_tokens, &counter);
             tracing::info!(
                 "[{}] Tool output truncated: {} tokens > {} limit, {} chars → {} chars",
                 session_id,
@@ -718,7 +719,10 @@ mod tests {
 
     #[test]
     fn pressure_low_skips_light_tier() {
-        let pressure = ContextPressure { usage_percent: 30, remaining_tokens: 100_000 };
+        let pressure = ContextPressure {
+            usage_percent: 30,
+            remaining_tokens: 100_000,
+        };
         assert_eq!(
             adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
             CompressionTier::Passthrough
@@ -731,7 +735,10 @@ mod tests {
 
     #[test]
     fn pressure_normal_uses_base_tier() {
-        let pressure = ContextPressure { usage_percent: 65, remaining_tokens: 50_000 };
+        let pressure = ContextPressure {
+            usage_percent: 65,
+            remaining_tokens: 50_000,
+        };
         assert_eq!(
             adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
             CompressionTier::Light
@@ -744,7 +751,10 @@ mod tests {
 
     #[test]
     fn pressure_high_promotes_light_to_standard() {
-        let pressure = ContextPressure { usage_percent: 90, remaining_tokens: 5_000 };
+        let pressure = ContextPressure {
+            usage_percent: 90,
+            remaining_tokens: 5_000,
+        };
         assert_eq!(
             adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
             CompressionTier::Standard
@@ -757,8 +767,14 @@ mod tests {
 
     #[test]
     fn pressure_none_uses_base_tier() {
-        assert_eq!(adjust_tier_for_pressure(CompressionTier::Light, None), CompressionTier::Light);
-        assert_eq!(adjust_tier_for_pressure(CompressionTier::Passthrough, None), CompressionTier::Passthrough);
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Light, None),
+            CompressionTier::Light
+        );
+        assert_eq!(
+            adjust_tier_for_pressure(CompressionTier::Passthrough, None),
+            CompressionTier::Passthrough
+        );
     }
 
     // ── Tier classification edge cases ──
@@ -787,7 +803,10 @@ mod tests {
     #[test]
     fn pressure_boundary_50_percent() {
         // Exactly 50% → normal range (50-80)
-        let pressure = ContextPressure { usage_percent: 50, remaining_tokens: 50_000 };
+        let pressure = ContextPressure {
+            usage_percent: 50,
+            remaining_tokens: 50_000,
+        };
         assert_eq!(
             adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
             CompressionTier::Light
@@ -797,7 +816,10 @@ mod tests {
     #[test]
     fn pressure_boundary_80_percent() {
         // Exactly 80% → normal range (50-80)
-        let pressure = ContextPressure { usage_percent: 80, remaining_tokens: 20_000 };
+        let pressure = ContextPressure {
+            usage_percent: 80,
+            remaining_tokens: 20_000,
+        };
         assert_eq!(
             adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
             CompressionTier::Light
@@ -807,7 +829,10 @@ mod tests {
     #[test]
     fn pressure_boundary_81_percent() {
         // 81% → high pressure range (>80)
-        let pressure = ContextPressure { usage_percent: 81, remaining_tokens: 19_000 };
+        let pressure = ContextPressure {
+            usage_percent: 81,
+            remaining_tokens: 19_000,
+        };
         assert_eq!(
             adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
             CompressionTier::Standard
@@ -817,7 +842,10 @@ mod tests {
     #[test]
     fn pressure_boundary_49_percent() {
         // 49% → low pressure range (<50)
-        let pressure = ContextPressure { usage_percent: 49, remaining_tokens: 51_000 };
+        let pressure = ContextPressure {
+            usage_percent: 49,
+            remaining_tokens: 51_000,
+        };
         assert_eq!(
             adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
             CompressionTier::Passthrough
@@ -826,7 +854,10 @@ mod tests {
 
     #[test]
     fn pressure_does_not_change_aggressive() {
-        let low = ContextPressure { usage_percent: 10, remaining_tokens: 90_000 };
+        let low = ContextPressure {
+            usage_percent: 10,
+            remaining_tokens: 90_000,
+        };
         assert_eq!(
             adjust_tier_for_pressure(CompressionTier::Aggressive, Some(&low)),
             CompressionTier::Aggressive
@@ -835,7 +866,10 @@ mod tests {
 
     #[test]
     fn pressure_does_not_change_standard_at_low() {
-        let low = ContextPressure { usage_percent: 10, remaining_tokens: 90_000 };
+        let low = ContextPressure {
+            usage_percent: 10,
+            remaining_tokens: 90_000,
+        };
         assert_eq!(
             adjust_tier_for_pressure(CompressionTier::Standard, Some(&low)),
             CompressionTier::Standard
@@ -844,7 +878,10 @@ mod tests {
 
     #[test]
     fn pressure_zero_percent() {
-        let pressure = ContextPressure { usage_percent: 0, remaining_tokens: 200_000 };
+        let pressure = ContextPressure {
+            usage_percent: 0,
+            remaining_tokens: 200_000,
+        };
         assert_eq!(
             adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
             CompressionTier::Passthrough
@@ -853,7 +890,10 @@ mod tests {
 
     #[test]
     fn pressure_100_percent() {
-        let pressure = ContextPressure { usage_percent: 100, remaining_tokens: 0 };
+        let pressure = ContextPressure {
+            usage_percent: 100,
+            remaining_tokens: 0,
+        };
         assert_eq!(
             adjust_tier_for_pressure(CompressionTier::Light, Some(&pressure)),
             CompressionTier::Standard
@@ -884,7 +924,8 @@ mod tests {
             "stdout": "\x1b[32mhello\x1b[0m",
             "stderr": "",
             "exit_code": 0,
-        }).to_string();
+        })
+        .to_string();
         let result = apply_light_compression(&json);
         assert!(result.was_compressed);
         assert!(!result.compressed.contains("\x1b["));
@@ -902,7 +943,8 @@ mod tests {
             "stdout": "clean output\n",
             "stderr": "no ansi here\n",
             "exit_code": 0,
-        }).to_string();
+        })
+        .to_string();
         let result = apply_light_compression(&json);
         assert!(!result.was_compressed);
     }

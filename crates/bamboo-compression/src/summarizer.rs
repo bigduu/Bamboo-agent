@@ -270,7 +270,8 @@ impl LlmSummarizer {
         let mut prompt_messages = Vec::new();
 
         let system_prompt = match self.summary_mode {
-            SummaryMode::FullRewrite => r#"You are a conversation summarizer. Your task is to create a concise but reliable working-memory summary for a conversation that was removed due to context window limits.
+            SummaryMode::FullRewrite => {
+                r#"You are a conversation summarizer. Your task is to create a concise but reliable working-memory summary for a conversation that was removed due to context window limits.
 
 Guidelines:
 - First capture the in-flight work right before compression (what was being done, where, and with which tool/file)
@@ -283,8 +284,10 @@ Guidelines:
 - Explicitly evaluate each clear user requirement (e.g. requirement 1, requirement 2) with a status and evidence
 - Keep the next step specific and aligned with the active work only
 - Use structured sections
-- Write in the same language as the original conversation"#,
-            SummaryMode::IncrementalMerge => r#"You are updating an existing conversation summary with new information from recent messages.
+- Write in the same language as the original conversation"#
+            }
+            SummaryMode::IncrementalMerge => {
+                r#"You are updating an existing conversation summary with new information from recent messages.
 
 Guidelines:
 - Incorporate new information into the existing summary structure
@@ -296,7 +299,8 @@ Guidelines:
 - The provided current task list is the source of truth for active work
 - Maintain the same structured sections as the existing summary
 - Write in the same language as the original conversation
-- Be concise: avoid repeating information already well-captured in the existing summary"#,
+- Be concise: avoid repeating information already well-captured in the existing summary"#
+            }
         };
 
         prompt_messages.push(Message::system(system_prompt));
@@ -789,13 +793,9 @@ mod tests {
 
     #[test]
     fn full_rewrite_mode_uses_default_system_prompt() {
-        let summarizer = LlmSummarizer::new(
-            Arc::new(DummyProvider),
-            "model".to_string(),
-            None,
-            None,
-        )
-        .with_summary_mode(SummaryMode::FullRewrite);
+        let summarizer =
+            LlmSummarizer::new(Arc::new(DummyProvider), "model".to_string(), None, None)
+                .with_summary_mode(SummaryMode::FullRewrite);
         let messages = vec![Message::user("hello"), Message::assistant("hi", None)];
         let prompts = summarizer.build_summarization_messages(&messages);
         let system = &prompts[0].content;
@@ -845,7 +845,10 @@ mod tests {
             None,
         )
         .with_summary_mode(SummaryMode::IncrementalMerge);
-        let messages = vec![Message::user("new work"), Message::assistant("doing it", None)];
+        let messages = vec![
+            Message::user("new work"),
+            Message::assistant("doing it", None),
+        ];
         let prompts = summarizer.build_summarization_messages(&messages);
         let user_content = &prompts[1].content;
         assert!(

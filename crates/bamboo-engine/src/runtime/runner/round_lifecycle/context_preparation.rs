@@ -3,9 +3,8 @@ use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{AgentError, AgentEvent, CompressionTriggerType, Role, Session};
 use bamboo_compression::{
     apply_compression_plan, build_forced_compression_plan_with_summary,
-    estimate_context_compression_exposure, prepare_hybrid_context,
-    summary_source_messages, LlmSummarizer, PreparedContext, Summarizer, TiktokenTokenCounter,
-    TokenBudget, TokenCounter,
+    estimate_context_compression_exposure, prepare_hybrid_context, summary_source_messages,
+    LlmSummarizer, PreparedContext, Summarizer, TiktokenTokenCounter, TokenBudget, TokenCounter,
 };
 use bamboo_infrastructure::LLMProvider;
 use std::sync::Arc;
@@ -178,7 +177,9 @@ async fn maybe_apply_host_context_compression_with_budget(
         if let Some(degraded) = degrade_prompt_context_sections_for_overflow(session) {
             tracing::info!(
                 "[{}] {} pre-summarization degradation stripped: {}, skipping LLM summarization",
-                session_id, phase_label, degraded,
+                session_id,
+                phase_label,
+                degraded,
             );
             emit_context_compression_status(event_tx, phase_label, "degraded_sections").await;
             return Ok(true);
@@ -196,7 +197,10 @@ async fn maybe_apply_host_context_compression_with_budget(
             .map(|s| counter.count_message(&bamboo_agent_core::Message::system(&s.content)))
             .unwrap_or(0);
         let savings = bamboo_compression::estimate_prompt_cache_savings(
-            session, budget, &counter, summary_tokens,
+            session,
+            budget,
+            &counter,
+            summary_tokens,
         );
         if savings > 0 {
             let projected = exposure.active_tokens.saturating_sub(savings);
@@ -386,7 +390,11 @@ async fn maybe_apply_host_context_compression_with_budget(
                     .conversation_summary
                     .as_ref()
                     .map(|s| {
-                        let end = s.content.char_indices().nth(200).map_or(s.content.len(), |(i, _)| i);
+                        let end = s
+                            .content
+                            .char_indices()
+                            .nth(200)
+                            .map_or(s.content.len(), |(i, _)| i);
                         s.content[..end].to_string()
                     })
                     .unwrap_or_default(),
@@ -514,12 +522,7 @@ pub(super) async fn prepare_round_context(
     logging::log_context_truncation(session_id, &prepared_context);
 
     let mut _pressure_level = None;
-    emit_context_pressure_notification(
-        session,
-        &budget,
-        event_tx,
-        &mut _pressure_level,
-    );
+    emit_context_pressure_notification(session, &budget, event_tx, &mut _pressure_level);
 
     Ok(PreparedRoundContext {
         prepared_context,

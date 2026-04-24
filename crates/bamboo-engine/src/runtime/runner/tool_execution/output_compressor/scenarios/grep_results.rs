@@ -74,14 +74,18 @@ fn compress_grep_output(text: &str) -> String {
     let mut hidden_first_line: Option<usize> = None;
     let mut hidden_last_line: Option<usize> = None;
 
-    let flush_hidden = |result: &mut String, count: usize, first: Option<usize>, last: Option<usize>| {
-        let range_hint = match (first, last) {
-            (Some(f), Some(l)) if f != l => format!(" at lines {}-{}", f, l),
-            (Some(f), _) => format!(" at line {}", f),
-            _ => String::new(),
+    let flush_hidden =
+        |result: &mut String, count: usize, first: Option<usize>, last: Option<usize>| {
+            let range_hint = match (first, last) {
+                (Some(f), Some(l)) if f != l => format!(" at lines {}-{}", f, l),
+                (Some(f), _) => format!(" at line {}", f),
+                _ => String::new(),
+            };
+            result.push_str(&format!(
+                "  ... ({} more matches hidden{})\n",
+                count, range_hint
+            ));
         };
-        result.push_str(&format!("  ... ({} more matches hidden{})\n", count, range_hint));
-    };
 
     for line in &lines {
         // Try to extract file path from the line
@@ -94,7 +98,12 @@ fn compress_grep_output(text: &str) -> String {
             if Some(&file) != current_file.as_ref() {
                 // Flush hidden count for previous file
                 if hidden_count > 0 {
-                    flush_hidden(&mut result, hidden_count, hidden_first_line, hidden_last_line);
+                    flush_hidden(
+                        &mut result,
+                        hidden_count,
+                        hidden_first_line,
+                        hidden_last_line,
+                    );
                     hidden_count = 0;
                     hidden_first_line = None;
                     hidden_last_line = None;
@@ -122,7 +131,12 @@ fn compress_grep_output(text: &str) -> String {
         } else {
             // Non-match lines (e.g., context separators `--`)
             if hidden_count > 0 {
-                flush_hidden(&mut result, hidden_count, hidden_first_line, hidden_last_line);
+                flush_hidden(
+                    &mut result,
+                    hidden_count,
+                    hidden_first_line,
+                    hidden_last_line,
+                );
                 hidden_count = 0;
                 hidden_first_line = None;
                 hidden_last_line = None;
@@ -134,7 +148,12 @@ fn compress_grep_output(text: &str) -> String {
 
     // Final flush
     if hidden_count > 0 {
-        flush_hidden(&mut result, hidden_count, hidden_first_line, hidden_last_line);
+        flush_hidden(
+            &mut result,
+            hidden_count,
+            hidden_first_line,
+            hidden_last_line,
+        );
     }
 
     result

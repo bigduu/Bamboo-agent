@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex};
 use super::{maybe_apply_host_context_compression, prepare_round_context};
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::tools::{FunctionCall, ToolCall};
-use bamboo_agent_core::{AgentEvent, CompressionTriggerType, Message, Role, Session, TokenBudgetUsage};
+use bamboo_agent_core::{
+    AgentEvent, CompressionTriggerType, Message, Role, Session, TokenBudgetUsage,
+};
 use bamboo_compression::{BudgetStrategy, TokenBudget, TokenCounter};
 use bamboo_domain::MessagePart;
 use bamboo_infrastructure::models::{ContentPart, ImageUrl};
@@ -1093,7 +1095,12 @@ async fn five_level_degradation_strips_in_order() {
 
     // 1st call: strips tool_guide
     let applied = super::force_overflow_context_recovery(
-        &mut session, &config, "test-model", "session-5-level-degrade", &llm, None,
+        &mut session,
+        &config,
+        "test-model",
+        "session-5-level-degrade",
+        &llm,
+        None,
     )
     .await
     .expect("first degradation");
@@ -1104,7 +1111,12 @@ async fn five_level_degradation_strips_in_order() {
 
     // 2nd call: strips skill_context
     let applied = super::force_overflow_context_recovery(
-        &mut session, &config, "test-model", "session-5-level-degrade", &llm, None,
+        &mut session,
+        &config,
+        "test-model",
+        "session-5-level-degrade",
+        &llm,
+        None,
     )
     .await
     .expect("second degradation");
@@ -1115,7 +1127,12 @@ async fn five_level_degradation_strips_in_order() {
 
     // 3rd call: strips external_memory
     let applied = super::force_overflow_context_recovery(
-        &mut session, &config, "test-model", "session-5-level-degrade", &llm, None,
+        &mut session,
+        &config,
+        "test-model",
+        "session-5-level-degrade",
+        &llm,
+        None,
     )
     .await
     .expect("third degradation");
@@ -1126,7 +1143,12 @@ async fn five_level_degradation_strips_in_order() {
 
     // 4th call: strips task_list
     let applied = super::force_overflow_context_recovery(
-        &mut session, &config, "test-model", "session-5-level-degrade", &llm, None,
+        &mut session,
+        &config,
+        "test-model",
+        "session-5-level-degrade",
+        &llm,
+        None,
     )
     .await
     .expect("fourth degradation");
@@ -1137,7 +1159,12 @@ async fn five_level_degradation_strips_in_order() {
 
     // 5th call: strips env_context
     let applied = super::force_overflow_context_recovery(
-        &mut session, &config, "test-model", "session-5-level-degrade", &llm, None,
+        &mut session,
+        &config,
+        "test-model",
+        "session-5-level-degrade",
+        &llm,
+        None,
     )
     .await
     .expect("fifth degradation");
@@ -1150,7 +1177,9 @@ async fn five_level_degradation_strips_in_order() {
 #[tokio::test]
 async fn degradation_returns_none_when_all_sections_already_stripped() {
     let mut session = Session::new("session-degrade-none", "test-model");
-    session.messages.push(Message::system("Just base prompt".to_string()));
+    session
+        .messages
+        .push(Message::system("Just base prompt".to_string()));
 
     let config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
@@ -1162,7 +1191,12 @@ async fn degradation_returns_none_when_all_sections_already_stripped() {
     // All sections already absent — should fall through to LLM summarization path
     // but with a small session it won't have enough messages, so it returns Ok(false).
     let applied = super::force_overflow_context_recovery(
-        &mut session, &config, "test-model", "session-degrade-none", &llm, None,
+        &mut session,
+        &config,
+        "test-model",
+        "session-degrade-none",
+        &llm,
+        None,
     )
     .await
     .expect("no degradation");
@@ -1188,7 +1222,12 @@ async fn degradation_skips_missing_sections() {
     let llm = noop_llm();
 
     let applied = super::force_overflow_context_recovery(
-        &mut session, &config, "test-model", "session-degrade-skip", &llm, None,
+        &mut session,
+        &config,
+        "test-model",
+        "session-degrade-skip",
+        &llm,
+        None,
     )
     .await
     .expect("skip absent sections");

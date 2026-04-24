@@ -64,5 +64,9 @@ async fn compact_context_tool_schema_and_name() {
     let tool = bamboo_server::server_tools::CompactContextTool;
     assert_eq!(tool.name(), "compact_context");
     let schema = tool.parameters_schema();
-    assert!(schema.get("properties").unwrap().get("instructions").is_some());
+    assert!(schema
+        .get("properties")
+        .unwrap()
+        .get("instructions")
+        .is_some());
 }

@@ -353,6 +353,7 @@ impl CompressionEvent {
 pub struct PromptMemoryObservability {
     pub project_prompt_injection_enabled: bool,
     pub relevant_recall_enabled: bool,
+    #[serde(default)]
     pub relevant_recall_rerank_enabled: bool,
     pub project_first_dream_enabled: bool,
     pub latest_user_query_present: bool,
@@ -1011,7 +1012,17 @@ mod tests {
             message_count: 5,
             token_count: 100,
         });
-        session.compression_events = vec![CompressionEvent::new(1, 2, 50.0, 25.0, 10, CompressionTriggerType::Auto, 2.0, None, 0)];
+        session.compression_events = vec![CompressionEvent::new(
+            1,
+            2,
+            50.0,
+            25.0,
+            10,
+            CompressionTriggerType::Auto,
+            2.0,
+            None,
+            0,
+        )];
         session.metadata.insert(
             "responses.previous_response_id".to_string(),
             "resp-123".to_string(),
@@ -1041,7 +1052,10 @@ mod tests {
             "created_at": "2025-01-01T00:00:00Z"
         }"#;
         let msg: Message = serde_json::from_str(json).unwrap();
-        assert!(!msg.never_compress, "never_compress should default to false");
+        assert!(
+            !msg.never_compress,
+            "never_compress should default to false"
+        );
     }
 
     #[test]
@@ -1057,14 +1071,20 @@ mod tests {
     fn never_compress_false_omitted_from_serialization() {
         let msg = Message::user("normal");
         let json = serde_json::to_string(&msg).unwrap();
-        assert!(!json.contains("never_compress"), "false should be omitted: {json}");
+        assert!(
+            !json.contains("never_compress"),
+            "false should be omitted: {json}"
+        );
     }
 
     #[test]
     fn compression_level_zero_omitted_from_serialization() {
         let msg = Message::user("normal");
         let json = serde_json::to_string(&msg).unwrap();
-        assert!(!json.contains("compression_level"), "zero should be omitted: {json}");
+        assert!(
+            !json.contains("compression_level"),
+            "zero should be omitted: {json}"
+        );
     }
 
     #[test]
@@ -1103,21 +1123,24 @@ mod tests {
 
     #[test]
     fn compression_trigger_type_default_is_auto() {
-        assert_eq!(CompressionTriggerType::default(), CompressionTriggerType::Auto);
+        assert_eq!(
+            CompressionTriggerType::default(),
+            CompressionTriggerType::Auto
+        );
     }
 
     #[test]
     fn compression_event_extended_fields_roundtrip() {
         let event = CompressionEvent::new(
-            42,                    // messages_compressed
-            10,                    // segments_removed
-            92.5,                  // usage_before_percent
-            35.2,                  // usage_after_percent
-            500,                   // summary_tokens
+            42,   // messages_compressed
+            10,   // segments_removed
+            92.5, // usage_before_percent
+            35.2, // usage_after_percent
+            500,  // summary_tokens
             CompressionTriggerType::Manual,
-            2.63,                  // compression_ratio
+            2.63, // compression_ratio
             Some("gpt-5.4-mini".to_string()),
-            1500,                  // latency_ms
+            1500, // latency_ms
         );
 
         let json = serde_json::to_string(&event).unwrap();
@@ -1148,9 +1171,9 @@ mod tests {
         }"#;
         let event: CompressionEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.trigger_type, CompressionTriggerType::Auto); // default
-        assert_eq!(event.compression_ratio, 0.0);  // default
-        assert!(event.model_used.is_none());        // default
-        assert_eq!(event.latency_ms, 0);            // default
+        assert_eq!(event.compression_ratio, 0.0); // default
+        assert!(event.model_used.is_none()); // default
+        assert_eq!(event.latency_ms, 0); // default
     }
 
     #[test]

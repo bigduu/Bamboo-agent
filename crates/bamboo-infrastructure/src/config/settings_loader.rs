@@ -20,10 +20,7 @@ pub struct ResolvedSettings {
 ///
 /// If `project_dir` is `None`, only user-level settings are loaded.
 pub fn load_settings(project_dir: Option<&Path>) -> ResolvedSettings {
-    load_settings_from_dirs(
-        &paths::user_settings_path(),
-        project_dir,
-    )
+    load_settings_from_dirs(&paths::user_settings_path(), project_dir)
 }
 
 /// Load settings with explicit directories (testable without global state).
@@ -101,7 +98,11 @@ mod tests {
     fn test_load_settings_user_only() {
         let temp = TempDir::new().unwrap();
         let user_path = temp.path().join("settings.json");
-        write_settings(temp.path(), "settings.json", r#"{"permissionMode": "plan"}"#);
+        write_settings(
+            temp.path(),
+            "settings.json",
+            r#"{"permissionMode": "plan"}"#,
+        );
 
         let resolved = load_settings_from_dirs(&user_path, None);
         assert_eq!(
@@ -118,18 +119,23 @@ mod tests {
         // User settings
         let user_dir = temp.path().join("user_bamboo");
         std::fs::create_dir_all(&user_dir).unwrap();
-        write_settings(&user_dir, "settings.json", r#"{"permissionMode": "bypassPermissions", "defaultModel": "gpt-4"}"#);
+        write_settings(
+            &user_dir,
+            "settings.json",
+            r#"{"permissionMode": "bypassPermissions", "defaultModel": "gpt-4"}"#,
+        );
 
         // Project settings
         let project_dir = temp.path().join("my_project");
         let project_bamboo = project_dir.join(".bamboo");
         std::fs::create_dir_all(&project_bamboo).unwrap();
-        write_settings(&project_bamboo, "settings.json", r#"{"permissionMode": "plan"}"#);
-
-        let resolved = load_settings_from_dirs(
-            &user_dir.join("settings.json"),
-            Some(&project_dir),
+        write_settings(
+            &project_bamboo,
+            "settings.json",
+            r#"{"permissionMode": "plan"}"#,
         );
+
+        let resolved = load_settings_from_dirs(&user_dir.join("settings.json"), Some(&project_dir));
         // Project mode overrides user mode
         assert_eq!(
             resolved.settings.permission_mode,
@@ -152,13 +158,18 @@ mod tests {
         let project_dir = temp.path().join("my_project");
         let project_bamboo = project_dir.join(".bamboo");
         std::fs::create_dir_all(&project_bamboo).unwrap();
-        write_settings(&project_bamboo, "settings.json", r#"{"permissionMode": "plan"}"#);
-        write_settings(&project_bamboo, "settings.local.json", r#"{"permissionMode": "acceptEdits"}"#);
-
-        let resolved = load_settings_from_dirs(
-            &user_dir.join("settings.json"),
-            Some(&project_dir),
+        write_settings(
+            &project_bamboo,
+            "settings.json",
+            r#"{"permissionMode": "plan"}"#,
         );
+        write_settings(
+            &project_bamboo,
+            "settings.local.json",
+            r#"{"permissionMode": "acceptEdits"}"#,
+        );
+
+        let resolved = load_settings_from_dirs(&user_dir.join("settings.json"), Some(&project_dir));
         assert_eq!(
             resolved.settings.permission_mode,
             Some(crate::config::settings::PermissionMode::AcceptEdits)
@@ -175,24 +186,34 @@ mod tests {
         // Simulated user settings
         let user_dir = temp.path().join("user_bamboo");
         std::fs::create_dir_all(&user_dir).unwrap();
-        write_settings(&user_dir, "settings.json", r#"{"permissionMode": "acceptEdits", "defaultModel": "user-model"}"#);
+        write_settings(
+            &user_dir,
+            "settings.json",
+            r#"{"permissionMode": "acceptEdits", "defaultModel": "user-model"}"#,
+        );
 
         // Simulated project settings
         let project_dir = temp.path().join("my_project");
         let project_bamboo = project_dir.join(".bamboo");
         std::fs::create_dir_all(&project_bamboo).unwrap();
-        write_settings(&project_bamboo, "settings.json", r#"{"defaultModel": "project-model"}"#);
+        write_settings(
+            &project_bamboo,
+            "settings.json",
+            r#"{"defaultModel": "project-model"}"#,
+        );
 
         // Simulated managed settings (highest priority)
         let managed_dir = temp.path().join("managed");
         std::fs::create_dir_all(&managed_dir).unwrap();
-        write_settings(&managed_dir, "settings.json", r#"{"permissionMode": "plan"}"#);
+        write_settings(
+            &managed_dir,
+            "settings.json",
+            r#"{"permissionMode": "plan"}"#,
+        );
 
         // Load user + project normally
-        let mut resolved = load_settings_from_dirs(
-            &user_dir.join("settings.json"),
-            Some(&project_dir),
-        );
+        let mut resolved =
+            load_settings_from_dirs(&user_dir.join("settings.json"), Some(&project_dir));
 
         // Now apply managed on top (simulating what load_settings_from_dirs does)
         let managed_path = managed_dir.join("settings.json");
@@ -207,6 +228,9 @@ mod tests {
             Some(crate::config::settings::PermissionMode::Plan)
         );
         // User and project models merge through
-        assert_eq!(resolved.settings.default_model, Some("project-model".to_string()));
+        assert_eq!(
+            resolved.settings.default_model,
+            Some("project-model".to_string())
+        );
     }
 }

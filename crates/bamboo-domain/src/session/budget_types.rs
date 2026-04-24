@@ -163,9 +163,7 @@ impl TokenBudget {
 
         // Fallback 2: working_reserve_tokens == 0 — legacy percentage mode.
         let percent = normalize_trigger_percent(self.compression_trigger_percent);
-        let trigger = context_window
-            .saturating_mul(percent)
-            .saturating_div(100);
+        let trigger = context_window.saturating_mul(percent).saturating_div(100);
         trigger.clamp(1, context_window)
     }
 
@@ -362,7 +360,10 @@ mod tests {
         budget.compression_target_percent = 40;
         let trigger = budget.compression_trigger_context_tokens();
         let target = budget.compression_target_context_tokens();
-        assert!(target < trigger, "target ({target}) must be < trigger ({trigger})");
+        assert!(
+            target < trigger,
+            "target ({target}) must be < trigger ({trigger})"
+        );
     }
 
     #[test]
@@ -448,9 +449,9 @@ mod tests {
 
     #[test]
     fn normalize_target_percent_clamps_to_range() {
-        assert_eq!(normalize_target_percent(10), 20);  // below min
-        assert_eq!(normalize_target_percent(40), 40);  // in range
-        assert_eq!(normalize_target_percent(80), 50);  // above max
+        assert_eq!(normalize_target_percent(10), 20); // below min
+        assert_eq!(normalize_target_percent(40), 40); // in range
+        assert_eq!(normalize_target_percent(80), 50); // above max
     }
 
     #[test]

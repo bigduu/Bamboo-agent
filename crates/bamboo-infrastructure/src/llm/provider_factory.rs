@@ -6,7 +6,9 @@ use crate::config::paths::bamboo_dir;
 use crate::config::Config;
 use crate::llm::provider::{LLMError, LLMProvider};
 use crate::llm::providers::common::MaskingProviderDecorator;
-use crate::llm::providers::{AnthropicProvider, BodhiProvider, CopilotProvider, GeminiProvider, OpenAIProvider};
+use crate::llm::providers::{
+    AnthropicProvider, BodhiProvider, CopilotProvider, GeminiProvider, OpenAIProvider,
+};
 use reqwest::Client;
 use std::sync::Arc;
 
@@ -183,18 +185,17 @@ pub async fn create_provider_by_name(
         }
 
         "bodhi" => {
-            let bodhi_config = config.providers.bodhi.as_ref().ok_or_else(|| {
-                LLMError::Auth("Bodhi configuration required".to_string())
-            })?;
+            let bodhi_config = config
+                .providers
+                .bodhi
+                .as_ref()
+                .ok_or_else(|| LLMError::Auth("Bodhi configuration required".to_string()))?;
 
             if bodhi_config.api_key.is_empty() {
                 return Err(LLMError::Auth("Bodhi API key is required".to_string()));
             }
 
-            let target_provider = bodhi_config
-                .target_provider
-                .as_deref()
-                .unwrap_or("openai");
+            let target_provider = bodhi_config.target_provider.as_deref().unwrap_or("openai");
 
             let mut provider =
                 BodhiProvider::new(&bodhi_config.api_key).with_client(http_client.clone());
@@ -270,9 +271,11 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
         }
 
         "bodhi" => {
-            let bodhi_config = config.providers.bodhi.as_ref().ok_or_else(|| {
-                LLMError::Auth("Bodhi configuration required".to_string())
-            })?;
+            let bodhi_config = config
+                .providers
+                .bodhi
+                .as_ref()
+                .ok_or_else(|| LLMError::Auth("Bodhi configuration required".to_string()))?;
 
             if bodhi_config.api_key.is_empty() {
                 return Err(LLMError::Auth("Bodhi API key is required".to_string()));

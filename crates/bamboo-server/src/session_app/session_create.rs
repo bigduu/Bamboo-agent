@@ -8,7 +8,7 @@ use bamboo_agent_core::{Message, Session};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::ProviderModelRef;
 
-use super::provider_model::{persist_model_ref, persist_legacy_model_provider};
+use super::provider_model::{persist_legacy_model_provider, persist_model_ref};
 
 /// Request-level input for session creation.
 pub struct CreateSessionInput {

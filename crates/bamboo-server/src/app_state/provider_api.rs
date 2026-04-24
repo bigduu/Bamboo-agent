@@ -61,14 +61,12 @@ impl AppState {
         };
 
         if use_registry {
-            self.provider_registry
-                .get(provider_name)
-                .ok_or_else(|| {
-                    AppError::InternalError(anyhow::anyhow!(
-                        "Provider '{}' not found in registry",
-                        provider_name
-                    ))
-                })
+            self.provider_registry.get(provider_name).ok_or_else(|| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "Provider '{}' not found in registry",
+                    provider_name
+                ))
+            })
         } else {
             Ok(self.get_provider().await)
         }
@@ -134,7 +132,10 @@ mod tests {
         let models = provider.list_models().await;
         // Default config has no API keys, so the unconfigured provider
         // returns an auth error — but it should still return a provider handle.
-        assert!(models.is_err(), "Default provider should be UnconfiguredProvider");
+        assert!(
+            models.is_err(),
+            "Default provider should be UnconfiguredProvider"
+        );
     }
 
     // ---- get_provider_for_endpoint ----
@@ -149,7 +150,10 @@ mod tests {
         }
 
         let result = state.get_provider_for_endpoint("openai").await;
-        assert!(result.is_ok(), "Flag OFF should always return default provider");
+        assert!(
+            result.is_ok(),
+            "Flag OFF should always return default provider"
+        );
     }
 
     #[tokio::test]

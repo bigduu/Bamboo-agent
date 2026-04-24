@@ -126,7 +126,11 @@ async fn execute_and_apply_single_tool_call(
                 &tool_call.function.arguments,
                 session_id,
                 outcome,
-                session.token_budget.as_ref().map(|b| b.max_tool_output_tokens).unwrap_or(0),
+                session
+                    .token_budget
+                    .as_ref()
+                    .map(|b| b.max_tool_output_tokens)
+                    .unwrap_or(0),
                 build_context_pressure(session),
             )
             .await;
@@ -210,7 +214,11 @@ async fn execute_and_apply_single_tool_call(
         &tool_call.function.arguments,
         session_id,
         outcome,
-        session.token_budget.as_ref().map(|b| b.max_tool_output_tokens).unwrap_or(0),
+        session
+            .token_budget
+            .as_ref()
+            .map(|b| b.max_tool_output_tokens)
+            .unwrap_or(0),
         build_context_pressure(session),
     )
     .await;
@@ -251,21 +259,27 @@ fn detect_manual_compression_request(session: &mut Session) {
     }
 
     // Find the most recent assistant message containing a compact_context tool call.
-    let Some((call_id, instructions)) = session.messages.iter().rev()
+    let Some((call_id, instructions)) = session
+        .messages
+        .iter()
+        .rev()
         .take(6)
         .find(|m| {
             m.role == bamboo_agent_core::Role::Assistant
-                && m.tool_calls.as_ref().is_some_and(|calls| {
-                    calls.iter().any(|c| c.function.name == "compact_context")
-                })
+                && m.tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.iter().any(|c| c.function.name == "compact_context"))
         })
         .and_then(|m| {
             m.tool_calls.as_ref().and_then(|calls| {
-                let call = calls.iter().find(|c| c.function.name == "compact_context")?;
-                let instructions = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-                    .ok()
-                    .and_then(|args| args.get("instructions").cloned())
-                    .and_then(|v| v.as_str().map(String::from));
+                let call = calls
+                    .iter()
+                    .find(|c| c.function.name == "compact_context")?;
+                let instructions =
+                    serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                        .ok()
+                        .and_then(|args| args.get("instructions").cloned())
+                        .and_then(|v| v.as_str().map(String::from));
                 Some((call.id.clone(), instructions))
             })
         })
@@ -274,12 +288,10 @@ fn detect_manual_compression_request(session: &mut Session) {
     };
 
     // Verify the corresponding tool result exists (call completed, not in-flight).
-    let result_exists = session.messages.iter().rev()
-        .take(4)
-        .any(|m| {
-            m.role == bamboo_agent_core::Role::Tool
-                && m.tool_call_id.as_deref() == Some(call_id.as_str())
-        });
+    let result_exists = session.messages.iter().rev().take(4).any(|m| {
+        m.role == bamboo_agent_core::Role::Tool
+            && m.tool_call_id.as_deref() == Some(call_id.as_str())
+    });
 
     if result_exists {
         tracing::info!("detected compact_context tool call, flagging for manual compression");
@@ -532,19 +544,33 @@ pub(crate) async fn execute_round_tool_calls(
             );
 
             // Compress all outcomes in parallel before applying sequentially.
-            let max_tool_tokens = session.token_budget.as_ref().map(|b| b.max_tool_output_tokens).unwrap_or(0);
+            let max_tool_tokens = session
+                .token_budget
+                .as_ref()
+                .map(|b| b.max_tool_output_tokens)
+                .unwrap_or(0);
             let pressure = build_context_pressure(session);
             let compressed: Vec<_> =
                 join_all(batch.iter().zip(outcomes).map(|(batch_call, outcome)| {
                     let tool_name = batch_call.function.name.clone();
                     let args = batch_call.function.arguments.clone();
                     let sid = session_id.to_string();
-                    let pressure = pressure.as_ref().map(|p| output_compressor::ContextPressure {
-                        usage_percent: p.usage_percent,
-                        remaining_tokens: p.remaining_tokens,
-                    });
+                    let pressure = pressure
+                        .as_ref()
+                        .map(|p| output_compressor::ContextPressure {
+                            usage_percent: p.usage_percent,
+                            remaining_tokens: p.remaining_tokens,
+                        });
                     async move {
-                        output_compressor::maybe_compress(&tool_name, &args, &sid, outcome, max_tool_tokens, pressure).await
+                        output_compressor::maybe_compress(
+                            &tool_name,
+                            &args,
+                            &sid,
+                            outcome,
+                            max_tool_tokens,
+                            pressure,
+                        )
+                        .await
                     }
                 }))
                 .await;
@@ -838,7 +864,10 @@ mod tests {
             let is_mutating = bamboo_tools::orchestrator::classify_tool(name)
                 == bamboo_tools::orchestrator::ToolMutability::Mutating;
             let is_exempt = PLAN_MODE_EXEMPT_TOOLS.contains(name);
-            assert!(is_mutating && !is_exempt, "{name} should be blocked in plan mode");
+            assert!(
+                is_mutating && !is_exempt,
+                "{name} should be blocked in plan mode"
+            );
         }
     }
 
@@ -861,13 +890,16 @@ mod tests {
         for name in &read_only_tools {
             let is_readonly = bamboo_tools::orchestrator::classify_tool(name)
                 == bamboo_tools::orchestrator::ToolMutability::ReadOnly;
-            assert!(is_readonly, "{name} should be read-only (allowed in plan mode)");
+            assert!(
+                is_readonly,
+                "{name} should be read-only (allowed in plan mode)"
+            );
         }
     }
 
     #[tokio::test]
     async fn plan_mode_gate_blocks_write_in_pipeline() {
-        use super::{execute_and_apply_single_tool_call, policy, loop_state::RoundExecutionState};
+        use super::{execute_and_apply_single_tool_call, loop_state::RoundExecutionState, policy};
         use bamboo_agent_core::Session;
         use bamboo_infrastructure::config::PermissionMode;
         use tokio::sync::mpsc;
@@ -918,7 +950,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_mode_gate_allows_read_in_pipeline() {
-        use super::{execute_and_apply_single_tool_call, policy, loop_state::RoundExecutionState};
+        use super::{execute_and_apply_single_tool_call, loop_state::RoundExecutionState, policy};
         use bamboo_agent_core::Session;
         use bamboo_infrastructure::config::PermissionMode;
         use tokio::sync::mpsc;
@@ -937,10 +969,8 @@ mod tests {
         let file_path = temp_dir.join("test.txt");
         std::fs::write(&file_path, "hello").ok();
 
-        let tool_call = tool_call_with_args(
-            "Read",
-            json!({"file_path": file_path.to_str().unwrap()}),
-        );
+        let tool_call =
+            tool_call_with_args("Read", json!({"file_path": file_path.to_str().unwrap()}));
 
         let control = execute_and_apply_single_tool_call(
             &tool_call,
@@ -974,7 +1004,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_mode_gate_allows_exit_plan_mode_tool() {
-        use super::{execute_and_apply_single_tool_call, policy, loop_state::RoundExecutionState};
+        use super::{execute_and_apply_single_tool_call, loop_state::RoundExecutionState, policy};
         use bamboo_agent_core::Session;
         use bamboo_infrastructure::config::PermissionMode;
         use tokio::sync::mpsc;
@@ -988,10 +1018,7 @@ mod tests {
         let mut state = RoundExecutionState::default();
         let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
 
-        let tool_call = tool_call_with_args(
-            "ExitPlanMode",
-            json!({"plan": "test plan"}),
-        );
+        let tool_call = tool_call_with_args("ExitPlanMode", json!({"plan": "test plan"}));
 
         let control = execute_and_apply_single_tool_call(
             &tool_call,
@@ -1013,7 +1040,9 @@ mod tests {
         assert!(!control.stop_round);
         let last_msg = session.messages.last().expect("should have a tool result");
         assert!(
-            !last_msg.content.contains("Plan mode: ExitPlanMode operation blocked"),
+            !last_msg
+                .content
+                .contains("Plan mode: ExitPlanMode operation blocked"),
             "ExitPlanMode should be exempt from plan mode gate, got: {}",
             last_msg.content
         );
@@ -1021,7 +1050,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_mode_does_not_block_write() {
-        use super::{execute_and_apply_single_tool_call, policy, loop_state::RoundExecutionState};
+        use super::{execute_and_apply_single_tool_call, loop_state::RoundExecutionState, policy};
         use bamboo_agent_core::Session;
         use tokio::sync::mpsc;
 
@@ -1073,9 +1102,9 @@ mod tests {
     #[test]
     fn detect_manual_compression_request_sets_flag_when_tool_result_exists() {
         use super::detect_manual_compression_request;
-        use bamboo_agent_core::{Message, Role, Session};
-        use bamboo_agent_core::tools::ToolCall;
         use bamboo_agent_core::tools::FunctionCall;
+        use bamboo_agent_core::tools::ToolCall;
+        use bamboo_agent_core::{Message, Role, Session};
 
         let mut session = Session::new("s1", "m1");
 
@@ -1108,9 +1137,9 @@ mod tests {
     #[test]
     fn detect_manual_compression_request_extracts_empty_when_no_instructions() {
         use super::detect_manual_compression_request;
-        use bamboo_agent_core::{Message, Session};
-        use bamboo_agent_core::tools::ToolCall;
         use bamboo_agent_core::tools::FunctionCall;
+        use bamboo_agent_core::tools::ToolCall;
+        use bamboo_agent_core::{Message, Session};
 
         let mut session = Session::new("s2", "m2");
 
@@ -1138,9 +1167,9 @@ mod tests {
     #[test]
     fn detect_manual_compression_request_skips_if_flag_already_set() {
         use super::detect_manual_compression_request;
-        use bamboo_agent_core::{Message, Session};
-        use bamboo_agent_core::tools::ToolCall;
         use bamboo_agent_core::tools::FunctionCall;
+        use bamboo_agent_core::tools::ToolCall;
+        use bamboo_agent_core::{Message, Session};
 
         let mut session = Session::new("s3", "m3");
         session.force_manual_compression = Some("already set".to_string());
@@ -1171,9 +1200,9 @@ mod tests {
     #[test]
     fn detect_manual_compression_request_does_nothing_without_tool_result() {
         use super::detect_manual_compression_request;
-        use bamboo_agent_core::{Message, Session};
-        use bamboo_agent_core::tools::ToolCall;
         use bamboo_agent_core::tools::FunctionCall;
+        use bamboo_agent_core::tools::ToolCall;
+        use bamboo_agent_core::{Message, Session};
 
         let mut session = Session::new("s4", "m4");
 
@@ -1197,9 +1226,9 @@ mod tests {
     #[test]
     fn detect_manual_compression_request_does_nothing_for_other_tools() {
         use super::detect_manual_compression_request;
-        use bamboo_agent_core::{Message, Session};
-        use bamboo_agent_core::tools::ToolCall;
         use bamboo_agent_core::tools::FunctionCall;
+        use bamboo_agent_core::tools::ToolCall;
+        use bamboo_agent_core::{Message, Session};
 
         let mut session = Session::new("s5", "m5");
 
@@ -1226,9 +1255,9 @@ mod tests {
     #[test]
     fn detect_manual_compression_request_finds_call_among_parallel_tool_calls() {
         use super::detect_manual_compression_request;
-        use bamboo_agent_core::{Message, Session};
-        use bamboo_agent_core::tools::ToolCall;
         use bamboo_agent_core::tools::FunctionCall;
+        use bamboo_agent_core::tools::ToolCall;
+        use bamboo_agent_core::{Message, Session};
 
         let mut session = Session::new("s6", "m6");
 

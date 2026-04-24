@@ -195,21 +195,15 @@ impl PermissionStorage {
         let user_config = self.load().await.unwrap_or(None);
 
         // Load project-level config
-        let project_storage = PermissionStorage::new(
-            project_dir.join(".bamboo"),
-        );
+        let project_storage = PermissionStorage::new(project_dir.join(".bamboo"));
         let project_config = project_storage.load().await.unwrap_or(None);
 
         // Load local project-level config (highest priority)
-        let local_storage = PermissionStorage::new(
-            project_dir.join(".bamboo"),
-        );
+        let local_storage = PermissionStorage::new(project_dir.join(".bamboo"));
         let local_config = local_storage.load().await.unwrap_or(None);
 
         // Track if any source was present before we consume the Options
-        let has_any = user_config.is_some()
-            || project_config.is_some()
-            || local_config.is_some();
+        let has_any = user_config.is_some() || project_config.is_some() || local_config.is_some();
 
         // Merge: local > project > user
         let mut result = match user_config {

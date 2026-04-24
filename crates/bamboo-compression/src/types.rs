@@ -125,21 +125,24 @@ mod tests {
 
     #[test]
     fn fixed_reserve_trigger_subtracts_reserve_from_context() {
-        let budget = TokenBudget::with_safety_margin(200_000, 4_096, BudgetStrategy::default(), 1000);
+        let budget =
+            TokenBudget::with_safety_margin(200_000, 4_096, BudgetStrategy::default(), 1000);
         // default working_reserve_tokens = 50_000
         assert_eq!(budget.compression_trigger_context_tokens(), 150_000);
     }
 
     #[test]
     fn fixed_reserve_trigger_for_small_context() {
-        let budget = TokenBudget::with_safety_margin(100_000, 4_096, BudgetStrategy::default(), 1000);
+        let budget =
+            TokenBudget::with_safety_margin(100_000, 4_096, BudgetStrategy::default(), 1000);
         // 100K >= 50K * 2, so fixed reserve: 100K - 50K = 50K
         assert_eq!(budget.compression_trigger_context_tokens(), 50_000);
     }
 
     #[test]
     fn fixed_reserve_fallback_for_tiny_context() {
-        let budget = TokenBudget::with_safety_margin(60_000, 4_096, BudgetStrategy::default(), 1000);
+        let budget =
+            TokenBudget::with_safety_margin(60_000, 4_096, BudgetStrategy::default(), 1000);
         // 60K < 50K * 2 = 100K, so fallback to 75%
         assert_eq!(budget.compression_trigger_context_tokens(), 45_000);
     }

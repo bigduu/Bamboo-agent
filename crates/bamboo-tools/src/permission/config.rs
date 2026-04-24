@@ -817,9 +817,7 @@ impl PermissionConfig {
         for entry in other.session_grants.iter() {
             let perm_type = entry.key();
             let grants = entry.value();
-            merged
-                .session_grants
-                .insert(*perm_type, grants.clone());
+            merged.session_grants.insert(*perm_type, grants.clone());
         }
 
         // Mode from other takes precedence
@@ -1433,12 +1431,24 @@ mod integration_tests {
     #[test]
     fn test_permission_config_merge() {
         let user = PermissionConfig::new();
-        user.add_rule(PermissionRule::new(PermissionType::WriteFile, "/tmp/user/*", true));
+        user.add_rule(PermissionRule::new(
+            PermissionType::WriteFile,
+            "/tmp/user/*",
+            true,
+        ));
         user.set_mode(PermissionMode::Default);
 
         let project = PermissionConfig::new();
-        project.add_rule(PermissionRule::new(PermissionType::WriteFile, "/tmp/project/*", true));
-        project.add_rule(PermissionRule::new(PermissionType::WriteFile, "/tmp/project/secret", false));
+        project.add_rule(PermissionRule::new(
+            PermissionType::WriteFile,
+            "/tmp/project/*",
+            true,
+        ));
+        project.add_rule(PermissionRule::new(
+            PermissionType::WriteFile,
+            "/tmp/project/secret",
+            false,
+        ));
         project.set_mode(PermissionMode::AcceptEdits);
 
         let merged = user.merge(&project);

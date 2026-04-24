@@ -1110,7 +1110,12 @@ async fn run_auto_dream_once_for_scope(
             .defaults
             .as_ref()
             .and_then(|d| d.memory_background.as_ref())
-            .or_else(|| config_snapshot.defaults.as_ref().and_then(|d| d.fast.as_ref()))
+            .or_else(|| {
+                config_snapshot
+                    .defaults
+                    .as_ref()
+                    .and_then(|d| d.fast.as_ref())
+            })
     } else {
         None
     };
@@ -1268,7 +1273,8 @@ async fn run_auto_dream_once_for_scope(
         MemoryScope::Session => unreachable!("session scope handled above"),
     };
     let extracted_count =
-        extract_and_persist_durable_candidates(&bg_provider, memory, &model, &extraction_sessions).await?;
+        extract_and_persist_durable_candidates(&bg_provider, memory, &model, &extraction_sessions)
+            .await?;
     let notebook_chars = final_note.chars().count();
 
     tracing::info!(
@@ -1739,10 +1745,14 @@ mod tests {
             Utc::now() - chrono::Duration::hours(24),
         )
         .await;
-        let writes =
-            extract_and_persist_durable_candidates(&context.provider, &memory, "fast-model", &sessions)
-                .await
-                .expect("empty extraction should succeed");
+        let writes = extract_and_persist_durable_candidates(
+            &context.provider,
+            &memory,
+            "fast-model",
+            &sessions,
+        )
+        .await
+        .expect("empty extraction should succeed");
         assert_eq!(writes, 0);
 
         let state = memory

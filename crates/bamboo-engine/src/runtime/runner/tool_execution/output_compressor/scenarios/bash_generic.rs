@@ -103,8 +103,10 @@ fn compress_plain_text(text: &str) -> CompressionResult {
     let (capped, line_capped) = filters::cap_lines(&deduped, MAX_STDOUT_LINES);
     let (final_text, byte_capped) = filters::cap_bytes(&capped, filters::DEFAULT_MAX_BYTES);
 
-    let any_change =
-        line_capped || byte_capped || deduped.len() != collapsed.len() || final_text.len() != text.len();
+    let any_change = line_capped
+        || byte_capped
+        || deduped.len() != collapsed.len()
+        || final_text.len() != text.len();
 
     CompressionResult {
         compressed: final_text,
@@ -255,8 +257,14 @@ mod tests {
 
     #[test]
     fn stdout_and_stderr_both_long() {
-        let big_stdout = (0..300).map(|i| format!("out {}", i)).collect::<Vec<_>>().join("\n");
-        let big_stderr = (0..200).map(|i| format!("err {}", i)).collect::<Vec<_>>().join("\n");
+        let big_stdout = (0..300)
+            .map(|i| format!("out {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let big_stderr = (0..200)
+            .map(|i| format!("err {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let input = make_bash_json(&big_stdout, &big_stderr, 0);
         let result = compress(&input, CompressionTier::Standard);
         assert!(result.was_compressed);

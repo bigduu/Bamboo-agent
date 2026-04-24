@@ -48,7 +48,9 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
         }
 
         // Bullet
-        let bullet_content = raw_line.strip_prefix("- ").or_else(|| raw_line.strip_prefix("* "));
+        let bullet_content = raw_line
+            .strip_prefix("- ")
+            .or_else(|| raw_line.strip_prefix("* "));
         if let Some(content) = bullet_content {
             let mut spans = vec![Span::raw("  • ")];
             spans.extend(parse_inline(content));

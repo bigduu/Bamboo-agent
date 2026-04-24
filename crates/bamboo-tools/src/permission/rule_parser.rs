@@ -125,7 +125,9 @@ impl ParsedRule {
         if let Some(open_paren) = trimmed.find('(') {
             if trimmed.ends_with(')') {
                 let tool_name = trimmed[..open_paren].trim().to_string();
-                let pattern = trimmed[open_paren + 1..trimmed.len() - 1].trim().to_string();
+                let pattern = trimmed[open_paren + 1..trimmed.len() - 1]
+                    .trim()
+                    .to_string();
 
                 if pattern.is_empty() {
                     return Self {
@@ -277,10 +279,7 @@ mod tests {
     fn test_match_write_path() {
         let rule = ParsedRule::parse("Write(/src/**)");
         assert!(rule.matches_tool_call("Write", &json!({"file_path": "/src/main.rs"})));
-        assert!(rule.matches_tool_call(
-            "Write",
-            &json!({"file_path": "/src/components/button.rs"})
-        ));
+        assert!(rule.matches_tool_call("Write", &json!({"file_path": "/src/components/button.rs"})));
         assert!(!rule.matches_tool_call("Write", &json!({"file_path": "/tmp/test.txt"})));
     }
 
@@ -303,10 +302,7 @@ mod tests {
     fn test_match_web_fetch() {
         let rule = ParsedRule::parse("WebFetch(*example.com*)");
         assert!(rule.matches_tool_call("WebFetch", &json!({"url": "https://example.com/path"})));
-        assert!(rule.matches_tool_call(
-            "WebFetch",
-            &json!({"url": "http://sub.example.com/api"})
-        ));
+        assert!(rule.matches_tool_call("WebFetch", &json!({"url": "http://sub.example.com/api"})));
         assert!(!rule.matches_tool_call("WebFetch", &json!({"url": "https://other.com"})));
     }
 
@@ -343,10 +339,7 @@ mod tests {
     fn test_match_apply_patch() {
         let rule = ParsedRule::parse("apply_patch(/src/**)");
         assert!(rule.matches_tool_call("apply_patch", &json!({"file_path": "/src/main.rs"})));
-        assert!(!rule.matches_tool_call(
-            "apply_patch",
-            &json!({"file_path": "/tmp/test.txt"})
-        ));
+        assert!(!rule.matches_tool_call("apply_patch", &json!({"file_path": "/tmp/test.txt"})));
     }
 
     #[test]
@@ -356,10 +349,9 @@ mod tests {
             "NotebookEdit",
             &json!({"notebook_path": "/notebooks/test.ipynb"})
         ));
-        assert!(!rule.matches_tool_call(
-            "NotebookEdit",
-            &json!({"notebook_path": "/tmp/test.ipynb"})
-        ));
+        assert!(
+            !rule.matches_tool_call("NotebookEdit", &json!({"notebook_path": "/tmp/test.ipynb"}))
+        );
     }
 
     #[test]

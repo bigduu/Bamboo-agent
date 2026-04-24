@@ -487,9 +487,7 @@ impl App {
     async fn handle_chat_key(&mut self, key: KeyEvent) -> Result<()> {
         if self.chat.streaming {
             match key.code {
-                KeyCode::Char('s')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.stop_streaming().await?;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
@@ -498,8 +496,7 @@ impl App {
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     self.chat.auto_scroll = false;
-                    self.chat.scroll_offset =
-                        self.chat.scroll_offset.saturating_sub(3);
+                    self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(3);
                 }
                 KeyCode::Char('G') => {
                     self.chat.auto_scroll = true;
@@ -528,8 +525,7 @@ impl App {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.chat.auto_scroll = false;
-                self.chat.scroll_offset =
-                    self.chat.scroll_offset.saturating_sub(3);
+                self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(3);
             }
             KeyCode::Char('G') => {
                 self.chat.auto_scroll = true;
@@ -580,10 +576,7 @@ impl App {
                 SseStream::start(&base_url, &resp.session_id, sse_tx)?;
 
                 // Now start agent execution.
-                let _ = self
-                    .client
-                    .execute(&resp.session_id, Some(&model))
-                    .await;
+                let _ = self.client.execute(&resp.session_id, Some(&model)).await;
             }
             Err(e) => {
                 self.status_message = format!("Error: {}", e);
@@ -636,17 +629,9 @@ impl App {
                 summary,
                 ..
             } => {
-                if let Some(tc) = self
-                    .chat
-                    .current_tool_calls
-                    .iter_mut()
-                    .rev()
-                    .find(|t| {
-                        t.tool_name == tool_name
-                            && t.phase != "complete"
-                            && t.phase != "error"
-                    })
-                {
+                if let Some(tc) = self.chat.current_tool_calls.iter_mut().rev().find(|t| {
+                    t.tool_name == tool_name && t.phase != "complete" && t.phase != "error"
+                }) {
                     tc.phase = phase;
                     if let Some(s) = summary {
                         tc.result = Some(s);
@@ -680,9 +665,7 @@ impl App {
 
     fn finalize_streaming(&mut self) {
         self.chat.streaming = false;
-        if !self.chat.current_response.is_empty()
-            || !self.chat.current_tool_calls.is_empty()
-        {
+        if !self.chat.current_response.is_empty() || !self.chat.current_tool_calls.is_empty() {
             self.chat.messages.push(ChatMessage {
                 role: MessageRole::Assistant,
                 content: std::mem::take(&mut self.chat.current_response),
@@ -748,8 +731,7 @@ impl App {
         match key.code {
             KeyCode::Down => {
                 if !self.mcp.servers.is_empty() {
-                    self.mcp.selected =
-                        (self.mcp.selected + 1).min(self.mcp.servers.len() - 1);
+                    self.mcp.selected = (self.mcp.selected + 1).min(self.mcp.servers.len() - 1);
                 }
             }
             KeyCode::Up => {

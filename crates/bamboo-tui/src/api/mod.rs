@@ -26,7 +26,12 @@ impl BambooClient {
     // ── Chat ──
 
     pub async fn chat(&self, req: ChatRequest) -> Result<ChatResponse> {
-        let resp = self.client.post(self.url("/api/v1/chat")).json(&req).send().await?;
+        let resp = self
+            .client
+            .post(self.url("/api/v1/chat"))
+            .json(&req)
+            .send()
+            .await?;
         let chat_resp = resp.json().await?;
         Ok(chat_resp)
     }
@@ -66,10 +71,7 @@ impl BambooClient {
     pub async fn pending_question(&self, session_id: &str) -> Result<PendingQuestion> {
         let resp = self
             .client
-            .get(self.url(&format!(
-                "/api/v1/respond/{}/pending",
-                session_id
-            )))
+            .get(self.url(&format!("/api/v1/respond/{}/pending", session_id)))
             .send()
             .await?;
         let pq = resp.json().await?;
@@ -79,11 +81,7 @@ impl BambooClient {
     // ── Sessions ──
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
-        let resp = self
-            .client
-            .get(self.url("/api/v1/sessions"))
-            .send()
-            .await?;
+        let resp = self.client.get(self.url("/api/v1/sessions")).send().await?;
         let sessions = resp.json().await?;
         Ok(sessions)
     }
@@ -137,10 +135,7 @@ impl BambooClient {
 
     pub async fn disconnect_mcp(&self, id: &str) -> Result<()> {
         self.client
-            .post(self.url(&format!(
-                "/api/v1/mcp/servers/{}/disconnect",
-                id
-            )))
+            .post(self.url(&format!("/api/v1/mcp/servers/{}/disconnect", id)))
             .send()
             .await?;
         Ok(())
@@ -224,7 +219,11 @@ impl BambooClient {
     // ── Config ──
 
     pub async fn get_config(&self) -> Result<serde_json::Value> {
-        let resp = self.client.get(self.url("/v1/bamboo/config")).send().await?;
+        let resp = self
+            .client
+            .get(self.url("/v1/bamboo/config"))
+            .send()
+            .await?;
         let val = resp.json().await?;
         Ok(val)
     }

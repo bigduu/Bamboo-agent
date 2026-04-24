@@ -54,7 +54,10 @@ pub fn check_permissions(
                 ));
             }
 
-            if !contexts.iter().any(|ctx| ctx.resource.starts_with("SECURITY:")) {
+            if !contexts
+                .iter()
+                .any(|ctx| ctx.resource.starts_with("SECURITY:"))
+            {
                 contexts.push(PermissionContext::new(
                     PermissionType::ExecuteCommand,
                     command,

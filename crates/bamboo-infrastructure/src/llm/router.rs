@@ -23,9 +23,7 @@ impl ProviderModelRouter {
             LLMError::Auth(format!(
                 "Provider '{}' not available. Available: {}",
                 target.provider,
-                self.registry
-                    .provider_names()
-                    .join(", ")
+                self.registry.provider_names().join(", ")
             ))
         })
     }
@@ -43,7 +41,12 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let registry = rt.block_on(ProviderRegistry::from_config(&config, std::path::PathBuf::new())).unwrap();
+        let registry = rt
+            .block_on(ProviderRegistry::from_config(
+                &config,
+                std::path::PathBuf::new(),
+            ))
+            .unwrap();
         let router = ProviderModelRouter::new(Arc::new(registry));
 
         let target = ProviderModelRef::new("nonexistent", "some-model");

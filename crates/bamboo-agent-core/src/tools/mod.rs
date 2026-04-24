@@ -178,7 +178,10 @@ mod tests {
 
     #[test]
     fn classify_unknown_as_mutating() {
-        assert_eq!(classify_tool("totally_unknown_tool"), ToolMutability::Mutating);
+        assert_eq!(
+            classify_tool("totally_unknown_tool"),
+            ToolMutability::Mutating
+        );
     }
 
     #[test]

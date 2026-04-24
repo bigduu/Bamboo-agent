@@ -2,14 +2,19 @@ use crate::counter::{TiktokenTokenCounter, TokenCounter};
 use crate::limits::create_budget_for_model;
 use crate::{BudgetStrategy, TokenBudget};
 use bamboo_agent_core::MessagePhase;
-use bamboo_agent_core::{CompressionEvent, CompressionTriggerType, ConversationSummary, Message, Session};
+use bamboo_agent_core::{
+    CompressionEvent, CompressionTriggerType, ConversationSummary, Message, Session,
+};
 
 /// Checks if a message is part of a skill tool chain (load_skill / read_skill_resource).
 fn is_skill_tool_chain_message(message: &Message) -> bool {
     message.tool_calls.as_ref().is_some_and(|calls| {
-        calls
-            .iter()
-            .any(|call| matches!(call.function.name.as_str(), "load_skill" | "read_skill_resource"))
+        calls.iter().any(|call| {
+            matches!(
+                call.function.name.as_str(),
+                "load_skill" | "read_skill_resource"
+            )
+        })
     })
 }
 use chrono::Utc;
@@ -327,9 +332,7 @@ fn build_compression_plan_with_summary_internal(
     if !skill_call_ids.is_empty() {
         for m in &*messages_to_summarize {
             if let Some(ref call_id) = m.tool_call_id {
-                if skill_call_ids.contains(call_id)
-                    && !never_compress_ids.contains(&m.id)
-                {
+                if skill_call_ids.contains(call_id) && !never_compress_ids.contains(&m.id) {
                     never_compress_ids.push(m.id.clone());
                 }
             }
@@ -357,13 +360,10 @@ fn build_compression_plan_with_summary_internal(
             break;
         }
 
-        let Some(remove_index) = messages_to_keep
-            .iter()
-            .position(|message| {
-                !protected_user_ids.contains(message.id.as_str())
-                    && !never_compress_ids.contains(&message.id)
-            })
-        else {
+        let Some(remove_index) = messages_to_keep.iter().position(|message| {
+            !protected_user_ids.contains(message.id.as_str())
+                && !never_compress_ids.contains(&message.id)
+        }) else {
             // Remaining messages are all protected; stop shrinking.
             break;
         };
@@ -437,12 +437,13 @@ pub(super) fn extract_recently_modified_files(messages: &[Message]) -> Vec<(Stri
                     } else if let Some(cmd) = parsed.get("command").and_then(|v| v.as_str()) {
                         // Extract file paths from shell commands heuristically
                         for part in cmd.split_whitespace() {
-                            if part.contains('/') && (part.ends_with(".rs")
-                                || part.ends_with(".ts")
-                                || part.ends_with(".js")
-                                || part.ends_with(".toml")
-                                || part.ends_with(".json")
-                                || part.ends_with(".md"))
+                            if part.contains('/')
+                                && (part.ends_with(".rs")
+                                    || part.ends_with(".ts")
+                                    || part.ends_with(".js")
+                                    || part.ends_with(".toml")
+                                    || part.ends_with(".json")
+                                    || part.ends_with(".md"))
                             {
                                 files.push((part.to_string(), "Bash".to_string()));
                             }
@@ -459,9 +460,19 @@ pub(super) fn extract_recently_modified_files(messages: &[Message]) -> Vec<(Stri
 /// Extract key decision snippets from assistant messages.
 pub(super) fn extract_key_decisions(messages: &[Message], limit: usize) -> Vec<String> {
     let decision_keywords = [
-        "decided to", "approach is", "use ", "using ", "we'll go with",
-        "the plan is", "strategy:", "solution:", "chose to", "switched to",
-        "refactored to", "migrated to", "replaced with",
+        "decided to",
+        "approach is",
+        "use ",
+        "using ",
+        "we'll go with",
+        "the plan is",
+        "strategy:",
+        "solution:",
+        "chose to",
+        "switched to",
+        "refactored to",
+        "migrated to",
+        "replaced with",
     ];
     let mut decisions = Vec::new();
     for message in messages {
@@ -553,7 +564,10 @@ fn validate_summary_quality(summary: &str, messages: &[Message]) -> SummaryQuali
     let files = extract_recently_modified_files(messages);
     let decisions = extract_key_decisions(messages, 10);
 
-    let files_mentioned = files.iter().filter(|(path, _)| summary.contains(path.as_str())).count();
+    let files_mentioned = files
+        .iter()
+        .filter(|(path, _)| summary.contains(path.as_str()))
+        .count();
     let file_coverage = if files.is_empty() {
         1.0
     } else {
@@ -1427,21 +1441,19 @@ mod tests {
 
     #[test]
     fn summary_quality_full_coverage_when_all_files_mentioned() {
-        let messages = vec![
-            {
-                let mut m = Message::assistant("writing", None);
-                m.tool_calls = Some(vec![ToolCall {
-                    id: "tc1".to_string(),
-                    tool_type: "function".to_string(),
-                    function: FunctionCall {
-                        name: "Write".to_string(),
-                        arguments: r#"{"file_path":"/src/main.rs","content":"fn main() {}"}"#
-                            .to_string(),
-                    },
-                }]);
-                m
-            },
-        ];
+        let messages = vec![{
+            let mut m = Message::assistant("writing", None);
+            m.tool_calls = Some(vec![ToolCall {
+                id: "tc1".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "Write".to_string(),
+                    arguments: r#"{"file_path":"/src/main.rs","content":"fn main() {}"}"#
+                        .to_string(),
+                },
+            }]);
+            m
+        }];
         let summary = "Modified /src/main.rs to add main function";
         let quality = validate_summary_quality(summary, &messages);
         assert!(
@@ -1453,21 +1465,19 @@ mod tests {
 
     #[test]
     fn summary_quality_zero_coverage_when_no_files_mentioned() {
-        let messages = vec![
-            {
-                let mut m = Message::assistant("writing", None);
-                m.tool_calls = Some(vec![ToolCall {
-                    id: "tc1".to_string(),
-                    tool_type: "function".to_string(),
-                    function: FunctionCall {
-                        name: "Write".to_string(),
-                        arguments: r#"{"file_path":"/src/main.rs","content":"fn main() {}"}"#
-                            .to_string(),
-                    },
-                }]);
-                m
-            },
-        ];
+        let messages = vec![{
+            let mut m = Message::assistant("writing", None);
+            m.tool_calls = Some(vec![ToolCall {
+                id: "tc1".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "Write".to_string(),
+                    arguments: r#"{"file_path":"/src/main.rs","content":"fn main() {}"}"#
+                        .to_string(),
+                },
+            }]);
+            m
+        }];
         let summary = "Summary that mentions nothing about files";
         let quality = validate_summary_quality(summary, &messages);
         assert!(

@@ -9,15 +9,15 @@ use crate::theme::colors;
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     if app.sessions.loading && app.sessions.sessions.is_empty() {
-        let loading = Paragraph::new("Loading sessions...")
-            .style(Style::default().fg(colors::INACTIVE));
+        let loading =
+            Paragraph::new("Loading sessions...").style(Style::default().fg(colors::INACTIVE));
         f.render_widget(loading, area);
         return;
     }
 
     if let Some(err) = &app.sessions.error {
-        let error = Paragraph::new(format!("Error: {}", err))
-            .style(Style::default().fg(colors::ERROR));
+        let error =
+            Paragraph::new(format!("Error: {}", err)).style(Style::default().fg(colors::ERROR));
         f.render_widget(error, area);
         return;
     }
@@ -35,14 +35,19 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .constraints([
             ratatui::layout::Constraint::Length(1), // header
             ratatui::layout::Constraint::Min(5),    // list
-            ratatui::layout::Constraint::Length(5),  // detail
-            ratatui::layout::Constraint::Length(1),  // footer
+            ratatui::layout::Constraint::Length(5), // detail
+            ratatui::layout::Constraint::Length(1), // footer
         ])
         .split(area);
 
     // Header
     let header = Paragraph::new(Line::from(vec![
-        Span::styled(" Sessions", Style::default().fg(colors::BRAND).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Sessions",
+            Style::default()
+                .fg(colors::BRAND)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("   "),
         Span::styled("[r] Refresh", Style::default().fg(colors::INACTIVE)),
         Span::raw("  "),
@@ -54,12 +59,10 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     // Session list
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(
-            " ID                Model                    Msgs  Status",
-            Style::default().fg(colors::SUBTLE),
-        ),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        " ID                Model                    Msgs  Status",
+        Style::default().fg(colors::SUBTLE),
+    )]));
 
     for (i, session) in app.sessions.sessions.iter().enumerate() {
         let style = if i == app.sessions.selected {
@@ -89,10 +92,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         let status = session.status.as_deref().unwrap_or("-");
 
         lines.push(Line::from(Span::styled(
-            format!(
-                " {:16}  {:22}  {:4}  {}",
-                id_short, model, msgs, status
-            ),
+            format!(" {:16}  {:22}  {:4}  {}", id_short, model, msgs, status),
             style,
         )));
     }
@@ -103,14 +103,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     // Detail
     if let Some(session) = app.sessions.sessions.get(app.sessions.selected) {
         let detail_lines = vec![
-            Line::from(Span::styled(
-                " Details",
-                Style::default().fg(colors::BRAND),
-            )),
-            Line::from(format!(
-                "  ID: {}",
-                session.id
-            )),
+            Line::from(Span::styled(" Details", Style::default().fg(colors::BRAND))),
+            Line::from(format!("  ID: {}", session.id)),
             Line::from(format!(
                 "  Model: {}",
                 session.model.as_deref().unwrap_or("-")

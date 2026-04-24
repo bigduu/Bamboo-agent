@@ -26,6 +26,8 @@ async fn session_index_persists_token_usage() {
         truncation_occurred: true,
         segments_removed: 3,
         prompt_cached_tool_outputs: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
     });
 
     store.save_session(&session).await.expect("save session");
