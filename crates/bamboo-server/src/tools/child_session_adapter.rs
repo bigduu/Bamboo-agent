@@ -33,7 +33,7 @@ pub struct ChildSessionAdapter {
     pub(crate) agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub(crate) session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     /// Optional subagent model resolver: maps subagent_type → model name.
-    pub(crate) subagent_model_resolver: Option<crate::tools::SubagentModelResolver>,
+    pub(crate) subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
 }
 
 impl ChildSessionAdapter {

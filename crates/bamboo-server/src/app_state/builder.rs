@@ -5,6 +5,7 @@ use super::init::{
 };
 use super::tools::{build_base_tools, build_root_tools};
 use super::*;
+use crate::tools::OptionalSubagentModelResolver;
 
 impl AppState {
     /// Create unified app state with direct provider access
@@ -205,7 +206,7 @@ impl AppState {
         );
 
         let config_for_resolver = config.clone();
-        let subagent_model_resolver: Option<crate::tools::SubagentModelResolver> = {
+        let subagent_model_resolver: OptionalSubagentModelResolver = {
             let config_snap = config.read().await.clone();
             let registry = provider_registry.clone();
             if config_snap.features.provider_model_ref && config_snap.defaults.is_some() {
