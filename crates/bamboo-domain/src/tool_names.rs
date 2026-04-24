@@ -49,8 +49,9 @@ pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 7] = [
     ("schedule_tasks", "scheduler"),
 ];
 
-pub const SERVER_TOOL_NAMES: [&str; 7] = [
+pub const SERVER_TOOL_NAMES: [&str; 8] = [
     "SubSession",
+    "compact_context",
     "scheduler",
     "sub_session_manager",
     "recall",

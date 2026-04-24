@@ -306,6 +306,16 @@ pub fn task_blocker_kind_label(kind: &TaskBlockerKind) -> &'static str {
 }
 
 impl TaskList {
+    /// Returns true if any task is currently in-progress at the Execution or
+    /// Verification phase — a signal that compression should be deferred when
+    /// context pressure is moderate.
+    pub fn has_active_execution_tasks(&self) -> bool {
+        self.items.iter().any(|item| {
+            matches!(item.status, TaskItemStatus::InProgress)
+                && matches!(item.phase, TaskPhase::Execution | TaskPhase::Verification)
+        })
+    }
+
     /// Format task list for display in system prompt.
     pub fn format_for_prompt(&self) -> String {
         if self.items.is_empty() {

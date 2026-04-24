@@ -11,7 +11,7 @@ pub use agent::events::{AgentEvent, TokenUsage};
 pub use agent::hooks::AgentHook;
 pub use agent::types::{parse_prompt_external_memory_sections, PromptSnapshotExternalMemoryParts};
 pub use agent::types::{
-    CompressionEvent, ConversationSummary, ImageOcrLine, ImageOcrResult, ImageUrlRef, Message,
+    CompressionEvent, CompressionTriggerType, ConversationSummary, ImageOcrLine, ImageOcrResult, ImageUrlRef, Message,
     MessageContent, MessagePart, MessagePhase, PendingQuestion, PromptMemoryObservability,
     PromptSnapshot, Role, Session, SessionKind,
 };

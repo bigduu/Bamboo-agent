@@ -1,3 +1,4 @@
+use crate::provider_model_ref::ProviderModelRef;
 use crate::reasoning::ReasoningEffort;
 use crate::session::budget_types::{TokenBudget, TokenBudgetUsage};
 use crate::session::message_part::MessagePart;
@@ -73,6 +74,14 @@ pub struct Message {
     pub compressed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compressed_by_event_id: Option<String>,
+    /// When true, this message is protected from context compression and will
+    /// never be moved into the summary set.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub never_compress: bool,
+    /// Progressive compression level: 0=uncompressed, 1=lightly compacted (head/tail),
+    /// 2=heavily compacted. Applied at context preparation time, not persisted.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub compression_level: u8,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +116,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_zero(value: &u8) -> bool {
+    *value == 0
+}
+
 impl Message {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
@@ -122,6 +135,8 @@ impl Message {
             tool_success: None,
             compressed: false,
             compressed_by_event_id: None,
+            never_compress: false,
+            compression_level: 0,
             created_at: Utc::now(),
             metadata: None,
         }
@@ -141,6 +156,8 @@ impl Message {
             tool_success: None,
             compressed: false,
             compressed_by_event_id: None,
+            never_compress: false,
+            compression_level: 0,
             created_at: Utc::now(),
             metadata: None,
         }
@@ -173,6 +190,8 @@ impl Message {
             tool_success: None,
             compressed: false,
             compressed_by_event_id: None,
+            never_compress: false,
+            compression_level: 0,
             created_at: Utc::now(),
             metadata: None,
         }
@@ -200,6 +219,8 @@ impl Message {
             tool_success: Some(success),
             compressed: false,
             compressed_by_event_id: None,
+            never_compress: false,
+            compression_level: 0,
             created_at: Utc::now(),
             metadata: None,
         }
@@ -219,6 +240,8 @@ impl Message {
             tool_success: None,
             compressed: false,
             compressed_by_event_id: None,
+            never_compress: false,
+            compression_level: 0,
             created_at: Utc::now(),
             metadata: None,
         }
@@ -264,6 +287,16 @@ impl ConversationSummary {
     }
 }
 
+/// Trigger type for a compression event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionTriggerType {
+    #[default]
+    Auto,
+    Manual,
+    CriticalOverflow,
+}
+
 /// Persistent context-compression event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressionEvent {
@@ -277,6 +310,14 @@ pub struct CompressionEvent {
     pub usage_after_percent: f64,
     #[serde(default)]
     pub summary_tokens: u32,
+    #[serde(default)]
+    pub trigger_type: CompressionTriggerType,
+    #[serde(default)]
+    pub compression_ratio: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_used: Option<String>,
+    #[serde(default)]
+    pub latency_ms: u64,
 }
 
 impl CompressionEvent {
@@ -286,6 +327,10 @@ impl CompressionEvent {
         usage_before_percent: f64,
         usage_after_percent: f64,
         summary_tokens: u32,
+        trigger_type: CompressionTriggerType,
+        compression_ratio: f64,
+        model_used: Option<String>,
+        latency_ms: u64,
     ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -295,6 +340,10 @@ impl CompressionEvent {
             usage_before_percent,
             usage_after_percent,
             summary_tokens,
+            trigger_type,
+            compression_ratio,
+            model_used,
+            latency_ms,
         }
     }
 }
@@ -405,6 +454,8 @@ pub struct Session {
     #[serde(default)]
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<ProviderModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub metadata: std::collections::HashMap<String, String>,
@@ -418,8 +469,16 @@ pub struct Session {
     pub prompt_snapshot: Option<PromptSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compression_events: Vec<CompressionEvent>,
+    /// Custom instructions for conversation summarization at the session level.
+    /// Overrides config-level `compression_instructions` when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_runtime_state: Option<crate::session::runtime_state::AgentRuntimeState>,
+    /// Runtime-only flag: when set, the next mid-turn compression check should
+    /// force compression regardless of threshold. Set by `compact_context` tool.
+    #[serde(skip)]
+    pub force_manual_compression: Option<String>,
 }
 
 /// Session type marker for spawn-session support.
@@ -449,6 +508,7 @@ impl Session {
             task_list: None,
             pending_question: None,
             model: model.into(),
+            model_ref: None,
             reasoning_effort: None,
             metadata: std::collections::HashMap::new(),
             token_budget: None,
@@ -456,7 +516,9 @@ impl Session {
             conversation_summary: None,
             prompt_snapshot: None,
             compression_events: Vec::new(),
+            compression_instructions: None,
             agent_runtime_state: None,
+            force_manual_compression: None,
         }
     }
 
@@ -483,6 +545,7 @@ impl Session {
             task_list: None,
             pending_question: None,
             model: model.into(),
+            model_ref: None,
             reasoning_effort: None,
             metadata: std::collections::HashMap::new(),
             token_budget: None,
@@ -490,7 +553,9 @@ impl Session {
             conversation_summary: None,
             prompt_snapshot: None,
             compression_events: Vec::new(),
+            compression_instructions: None,
             agent_runtime_state: None,
+            force_manual_compression: None,
         }
     }
 
@@ -936,6 +1001,8 @@ mod tests {
             truncation_occurred: false,
             segments_removed: 0,
             prompt_cached_tool_outputs: 0,
+            thinking_tokens: 0,
+            cache_read_input_tokens: 0,
         });
         session.conversation_summary = Some(ConversationSummary {
             created_at: Utc::now(),
@@ -944,7 +1011,7 @@ mod tests {
             message_count: 5,
             token_count: 100,
         });
-        session.compression_events = vec![CompressionEvent::new(1, 2, 50.0, 25.0, 10)];
+        session.compression_events = vec![CompressionEvent::new(1, 2, 50.0, 25.0, 10, CompressionTriggerType::Auto, 2.0, None, 0)];
         session.metadata.insert(
             "responses.previous_response_id".to_string(),
             "resp-123".to_string(),
@@ -963,5 +1030,153 @@ mod tests {
             .contains_key("responses.previous_response_id"));
         assert!(!session.messages[0].compressed);
         assert!(session.messages[0].compressed_by_event_id.is_none());
+    }
+
+    #[test]
+    fn never_compress_field_deserializes_as_false_by_default() {
+        let json = r#"{
+            "id": "msg-nc",
+            "role": "user",
+            "content": "test",
+            "created_at": "2025-01-01T00:00:00Z"
+        }"#;
+        let msg: Message = serde_json::from_str(json).unwrap();
+        assert!(!msg.never_compress, "never_compress should default to false");
+    }
+
+    #[test]
+    fn never_compress_true_preserved_through_roundtrip() {
+        let mut msg = Message::user("important");
+        msg.never_compress = true;
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert!(back.never_compress);
+    }
+
+    #[test]
+    fn never_compress_false_omitted_from_serialization() {
+        let msg = Message::user("normal");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("never_compress"), "false should be omitted: {json}");
+    }
+
+    #[test]
+    fn compression_level_zero_omitted_from_serialization() {
+        let msg = Message::user("normal");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("compression_level"), "zero should be omitted: {json}");
+    }
+
+    #[test]
+    fn compression_level_preserved_through_roundtrip() {
+        let mut msg = Message::assistant("analysis", None);
+        msg.compression_level = 1;
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.compression_level, 1);
+    }
+
+    #[test]
+    fn compression_trigger_type_serde_roundtrip() {
+        for variant in [
+            CompressionTriggerType::Auto,
+            CompressionTriggerType::Manual,
+            CompressionTriggerType::CriticalOverflow,
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let back: CompressionTriggerType = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "roundtrip failed for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn compression_trigger_type_snake_case_serialization() {
+        assert_eq!(
+            serde_json::to_string(&CompressionTriggerType::CriticalOverflow).unwrap(),
+            "\"critical_overflow\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CompressionTriggerType::Manual).unwrap(),
+            "\"manual\""
+        );
+    }
+
+    #[test]
+    fn compression_trigger_type_default_is_auto() {
+        assert_eq!(CompressionTriggerType::default(), CompressionTriggerType::Auto);
+    }
+
+    #[test]
+    fn compression_event_extended_fields_roundtrip() {
+        let event = CompressionEvent::new(
+            42,                    // messages_compressed
+            10,                    // segments_removed
+            92.5,                  // usage_before_percent
+            35.2,                  // usage_after_percent
+            500,                   // summary_tokens
+            CompressionTriggerType::Manual,
+            2.63,                  // compression_ratio
+            Some("gpt-5.4-mini".to_string()),
+            1500,                  // latency_ms
+        );
+
+        let json = serde_json::to_string(&event).unwrap();
+        let back: CompressionEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.messages_compressed, 42);
+        assert_eq!(back.segments_removed, 10);
+        assert!((back.usage_before_percent - 92.5).abs() < 0.01);
+        assert!((back.usage_after_percent - 35.2).abs() < 0.01);
+        assert_eq!(back.summary_tokens, 500);
+        assert_eq!(back.trigger_type, CompressionTriggerType::Manual);
+        assert!((back.compression_ratio - 2.63).abs() < 0.01);
+        assert_eq!(back.model_used.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(back.latency_ms, 1500);
+    }
+
+    #[test]
+    fn compression_event_backward_compat_deserializes_old_format() {
+        // Old format without the new extended fields
+        let json = r#"{
+            "id": "evt-old",
+            "created_at": "2025-01-01T00:00:00Z",
+            "messages_compressed": 10,
+            "segments_removed": 5,
+            "usage_before_percent": 80.0,
+            "usage_after_percent": 40.0,
+            "summary_tokens": 200
+        }"#;
+        let event: CompressionEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.trigger_type, CompressionTriggerType::Auto); // default
+        assert_eq!(event.compression_ratio, 0.0);  // default
+        assert!(event.model_used.is_none());        // default
+        assert_eq!(event.latency_ms, 0);            // default
+    }
+
+    #[test]
+    fn force_manual_compression_not_serialized() {
+        let mut session = Session::new("test-session", "test-model");
+        session.force_manual_compression = Some("keep errors".to_string());
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(
+            !json.contains("force_manual_compression"),
+            "runtime-only flag should not be serialized: {json}"
+        );
+    }
+
+    #[test]
+    fn compression_instructions_serialized_when_present() {
+        let mut session = Session::new("test-session", "test-model");
+        session.compression_instructions = Some("Focus on API contracts".to_string());
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(json.contains("compression_instructions"));
+        assert!(json.contains("Focus on API contracts"));
+    }
+
+    #[test]
+    fn compression_instructions_omitted_when_none() {
+        let session = Session::new("test-session", "test-model");
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(!json.contains("compression_instructions"));
     }
 }

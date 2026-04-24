@@ -250,6 +250,26 @@ pub enum AgentEvent {
         messages_summarized: usize,
         /// Tokens saved by summarization
         tokens_saved: u32,
+        /// Context usage percentage before compression
+        #[serde(default)]
+        usage_before_percent: f64,
+        /// Context usage percentage after compression
+        #[serde(default)]
+        usage_after_percent: f64,
+        /// What triggered the compression: "auto" | "manual" | "critical"
+        #[serde(default)]
+        trigger_type: String,
+    },
+
+    /// Emitted when context pressure reaches warning or critical levels.
+    /// Frontend should display this to the user as a proactive notification.
+    ContextPressureNotification {
+        /// Context usage as a percentage of the context window.
+        percent: f64,
+        /// Severity level: "warning" (70%) or "critical" (90%).
+        level: String,
+        /// Human-readable message describing the pressure state.
+        message: String,
     },
 
     /// A child session was spawned from a parent session (async background job).

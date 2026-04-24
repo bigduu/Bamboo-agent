@@ -140,6 +140,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "memory_note",
     "recall",
     "session_inspector",
+    "compact_context",
     "Sleep",
 ];
 
@@ -152,5 +153,42 @@ pub fn classify_tool(tool_name: &str) -> ToolMutability {
         ToolMutability::ReadOnly
     } else {
         ToolMutability::Mutating
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_compact_context_as_read_only() {
+        assert_eq!(classify_tool("compact_context"), ToolMutability::ReadOnly);
+    }
+
+    #[test]
+    fn classify_compact_context_case_insensitive() {
+        assert_eq!(classify_tool("Compact_Context"), ToolMutability::ReadOnly);
+        assert_eq!(classify_tool("COMPACT_CONTEXT"), ToolMutability::ReadOnly);
+    }
+
+    #[test]
+    fn classify_write_as_mutating() {
+        assert_eq!(classify_tool("Write"), ToolMutability::Mutating);
+    }
+
+    #[test]
+    fn classify_unknown_as_mutating() {
+        assert_eq!(classify_tool("totally_unknown_tool"), ToolMutability::Mutating);
+    }
+
+    #[test]
+    fn classify_all_read_only_tools() {
+        for name in READ_ONLY_TOOLS {
+            assert_eq!(
+                classify_tool(name),
+                ToolMutability::ReadOnly,
+                "{name} should be classified as read-only"
+            );
+        }
     }
 }
