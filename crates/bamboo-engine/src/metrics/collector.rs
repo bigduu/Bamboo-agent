@@ -53,6 +53,15 @@ enum CollectorCommand {
         reason: String,
         occurred_at: DateTime<Utc>,
     },
+    ContextCompressed {
+        session_id: String,
+        messages_compressed: u32,
+        tokens_saved: u32,
+        usage_before_percent: f64,
+        usage_after_percent: f64,
+        trigger_type: String,
+        latency_ms: u64,
+    },
     ForwardStarted {
         forward_id: String,
         endpoint: String,
@@ -173,6 +182,25 @@ impl MetricsCollector {
                         storage
                             .increment_execute_sync_mismatch(&reason, occurred_at)
                             .await
+                    }
+                    CollectorCommand::ContextCompressed {
+                        session_id,
+                        messages_compressed,
+                        tokens_saved,
+                        usage_before_percent,
+                        usage_after_percent,
+                        trigger_type,
+                        latency_ms,
+                    } => {
+                        tracing::info!(
+                            "[{}] metrics: context compressed — messages={}, tokens_saved={}, before={:.1}%, after={:.1}%, trigger={}, latency={}ms",
+                            session_id, messages_compressed, tokens_saved,
+                            usage_before_percent, usage_after_percent, trigger_type, latency_ms,
+                        );
+                        // No-op storage for now; metrics are logged and emitted as AgentEvent.
+                        // Per-round and per-session persistence can be added when the schema
+                        // gains compression columns.
+                        Ok(())
                     }
                     CollectorCommand::ForwardStarted {
                         forward_id,
@@ -388,6 +416,27 @@ impl MetricsCollector {
         let _ = self.tx.send(CollectorCommand::ExecuteSyncMismatch {
             reason: reason.into(),
             occurred_at,
+        });
+    }
+
+    pub fn context_compressed(
+        &self,
+        session_id: impl Into<String>,
+        messages_compressed: u32,
+        tokens_saved: u32,
+        usage_before_percent: f64,
+        usage_after_percent: f64,
+        trigger_type: impl Into<String>,
+        latency_ms: u64,
+    ) {
+        let _ = self.tx.send(CollectorCommand::ContextCompressed {
+            session_id: session_id.into(),
+            messages_compressed,
+            tokens_saved,
+            usage_before_percent,
+            usage_after_percent,
+            trigger_type: trigger_type.into(),
+            latency_ms,
         });
     }
 

@@ -328,13 +328,16 @@ pub fn create_budget_for_model(model: &str, strategy: crate::BudgetStrategy) -> 
         max_output_tokens: limit.get_max_output_tokens(),
         strategy,
         safety_margin: limit.get_safety_margin(),
-        compression_trigger_percent: 85,
-        compression_target_percent: 65,
+        compression_trigger_percent: 85,   // legacy — only used when working_reserve_tokens == 0
+        compression_target_percent: 45,
+        working_reserve_tokens: 50_000,
+        fallback_trigger_percent: 75,
         prompt_cache_min_tool_output_chars: 1_200,
         prompt_cache_head_chars: 280,
         prompt_cache_tail_chars: 180,
         prompt_cache_recent_user_turns: 2,
         prompt_cache_recent_tool_chains: 2,
+        max_tool_output_tokens: 0,
     }
 }
 

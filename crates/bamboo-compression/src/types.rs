@@ -80,6 +80,7 @@ mod tests {
     fn compression_trigger_context_tokens_respects_percent() {
         let mut budget =
             TokenBudget::with_safety_margin(1000, 200, BudgetStrategy::Window { size: 20 }, 100);
+        budget.working_reserve_tokens = 0; // use legacy percentage mode
         budget.compression_trigger_percent = 50;
         assert_eq!(budget.compression_trigger_context_tokens(), 500);
     }
@@ -104,6 +105,7 @@ mod tests {
     fn compression_target_always_stays_below_trigger_limit() {
         let mut budget =
             TokenBudget::with_safety_margin(1000, 200, BudgetStrategy::Window { size: 20 }, 100);
+        budget.working_reserve_tokens = 0; // use legacy percentage mode
         budget.compression_trigger_percent = 30;
         budget.compression_target_percent = 50;
         assert_eq!(budget.compression_target_context_tokens(), 299);
@@ -113,10 +115,41 @@ mod tests {
     fn trigger_percent_zero_means_disabled() {
         let mut budget =
             TokenBudget::with_safety_margin(1000, 200, BudgetStrategy::Window { size: 20 }, 100);
+        budget.working_reserve_tokens = 0; // use legacy percentage mode
         budget.compression_trigger_percent = 0;
         assert_eq!(
             budget.compression_trigger_context_tokens(),
             budget.max_context_tokens
         );
+    }
+
+    #[test]
+    fn fixed_reserve_trigger_subtracts_reserve_from_context() {
+        let budget = TokenBudget::with_safety_margin(200_000, 4_096, BudgetStrategy::default(), 1000);
+        // default working_reserve_tokens = 50_000
+        assert_eq!(budget.compression_trigger_context_tokens(), 150_000);
+    }
+
+    #[test]
+    fn fixed_reserve_trigger_for_small_context() {
+        let budget = TokenBudget::with_safety_margin(100_000, 4_096, BudgetStrategy::default(), 1000);
+        // 100K >= 50K * 2, so fixed reserve: 100K - 50K = 50K
+        assert_eq!(budget.compression_trigger_context_tokens(), 50_000);
+    }
+
+    #[test]
+    fn fixed_reserve_fallback_for_tiny_context() {
+        let budget = TokenBudget::with_safety_margin(60_000, 4_096, BudgetStrategy::default(), 1000);
+        // 60K < 50K * 2 = 100K, so fallback to 75%
+        assert_eq!(budget.compression_trigger_context_tokens(), 45_000);
+    }
+
+    #[test]
+    fn working_reserve_zero_uses_legacy_percentage() {
+        let mut budget =
+            TokenBudget::with_safety_margin(200_000, 4_096, BudgetStrategy::default(), 1000);
+        budget.working_reserve_tokens = 0;
+        budget.compression_trigger_percent = 85;
+        assert_eq!(budget.compression_trigger_context_tokens(), 170_000);
     }
 }

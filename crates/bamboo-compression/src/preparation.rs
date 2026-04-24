@@ -8,7 +8,7 @@ use crate::segmenter::{MessageSegment, MessageSegmenter};
 use crate::types::{
     BudgetError, BudgetStrategy, PreparedContext, TokenBudget, TokenUsageBreakdown,
 };
-use bamboo_agent_core::{Role, Session};
+use bamboo_agent_core::{Message, Role, Session};
 use std::collections::{HashMap, HashSet};
 
 const PROMPT_CACHE_MAX_MIN_TOOL_OUTPUT_CHARS: usize = 200_000;
@@ -77,6 +77,9 @@ pub fn prepare_hybrid_context(
         summary_tokens,
     );
     let active_messages = prompt_cache_result.messages;
+
+    // Compact verbose old assistant analysis messages (lightweight head/tail excerpt).
+    let active_messages = maybe_compact_old_assistant_analysis(active_messages, budget);
 
     // 1. Extract system messages (always included) - takes ownership, no clone needed
     let (system_messages, mut segments) = segmenter.segment_with_system(active_messages);
@@ -454,6 +457,45 @@ fn maybe_compact_old_tool_outputs_for_prompt(
     }
 }
 
+/// Estimate how many tokens prompt cache compaction could save without modifying any messages.
+///
+/// This is used by the microcompact-first pass to decide whether lightweight prompt
+/// section stripping or prompt cache compaction alone can bring usage below the trigger
+/// threshold, avoiding an expensive LLM summarization call.
+pub fn estimate_prompt_cache_savings(
+    session: &Session,
+    budget: &TokenBudget,
+    counter: &dyn TokenCounter,
+    _summary_tokens: u32,
+) -> u32 {
+    let active_messages = crate::compression_tooling::active_messages_for_budget(session);
+    if active_messages.is_empty() {
+        return 0;
+    }
+    let policy = prompt_cache_policy_from_budget(budget);
+    let context_window = budget.max_context_tokens;
+    if context_window == 0 {
+        return 0;
+    }
+    let Some(protected_turn_start) =
+        recent_user_turn_start_index(&active_messages, policy.recent_user_turns)
+    else {
+        return 0;
+    };
+    let tool_call_names = tool_call_name_index(&active_messages);
+    let protected_recent_calls =
+        collect_recent_tool_call_ids(&active_messages, policy.recent_tool_chains);
+    let candidates = build_prompt_cache_candidates(
+        &active_messages,
+        protected_turn_start,
+        &protected_recent_calls,
+        &tool_call_names,
+        policy,
+        counter,
+    );
+    candidates.iter().map(|c| c.saved_tokens).fold(0u32, u32::saturating_add)
+}
+
 fn build_prompt_cache_candidates(
     messages: &[bamboo_agent_core::Message],
     protected_turn_start: usize,
@@ -627,6 +669,17 @@ fn build_cached_tool_output_summary(
     let line_count = content.lines().count();
     let char_count = content.chars().count();
 
+    let semantic_section = if char_count > 5000 {
+        let excerpt = extract_semantic_lines(content, 300);
+        if excerpt.is_empty() {
+            String::new()
+        } else {
+            format!("semantic_excerpt:\n{excerpt}\n")
+        }
+    } else {
+        String::new()
+    };
+
     format!(
         "{PROMPT_CACHE_MARKER}\n\
 tool: {tool_name}\n\
@@ -635,10 +688,39 @@ original_chars: {char_count}\n\
 original_lines: {line_count}\n\
 head_excerpt:\n\
 {head}\n\
+{semantic_section}\
 tail_excerpt:\n\
 {tail}\n\
 note: Full output remains in session history and UI; this compact summary is used for context efficiency."
     )
+}
+
+fn extract_semantic_lines(content: &str, max_chars: usize) -> String {
+    let patterns = [
+        "error", "warning", "fail", "panic", "exception", "timeout",
+        "not found", "permission denied", "conflict",
+        "src/", "crates/", ".rs:", ".ts:", ".js:", ".toml:",
+        "file:", "path:",
+    ];
+    let mut seen = std::collections::HashSet::new();
+    let mut result = String::new();
+    for line in content.lines() {
+        let lower = line.to_lowercase();
+        if !patterns.iter().any(|p| lower.contains(p)) || line.trim().is_empty() {
+            continue;
+        }
+        let trimmed = line.trim();
+        if seen.insert(trimmed.to_string()) {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(trimmed);
+            if result.chars().count() >= max_chars {
+                break;
+            }
+        }
+    }
+    result
 }
 
 fn take_first_chars(value: &str, max_chars: usize) -> String {
@@ -683,6 +765,68 @@ fn segment_contains_skill_tool_chain(segment: &MessageSegment) -> bool {
             })
         })
     })
+}
+
+/// Lightweight per-message compression for verbose old assistant analysis.
+///
+/// Identifies assistant messages before the protected turn window that:
+/// - Have no tool calls (pure analysis/commentary)
+/// - Exceed a character threshold
+///
+/// Replaces them with head/tail excerpts similar to prompt-side tool cache.
+/// This is applied at context preparation time only — original messages
+/// remain intact in the session store.
+fn maybe_compact_old_assistant_analysis(
+    messages: Vec<Message>,
+    budget: &TokenBudget,
+) -> Vec<Message> {
+    const MIN_CHARS: usize = 2000;
+    const HEAD_CHARS: usize = 400;
+    const TAIL_CHARS: usize = 200;
+
+    let protected_turn_start =
+        recent_user_turn_start_index(&messages, budget.prompt_cache_recent_user_turns as usize)
+            .unwrap_or(messages.len());
+
+    messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut message)| {
+            if message.compression_level > 0 {
+                return message;
+            }
+            if index >= protected_turn_start {
+                return message;
+            }
+            if message.role != Role::Assistant {
+                return message;
+            }
+            if message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty())
+            {
+                return message;
+            }
+            if message.content.len() < MIN_CHARS {
+                return message;
+            }
+
+            let original_chars = message.content.chars().count();
+            let head = take_first_chars(&message.content, HEAD_CHARS);
+            let tail = take_last_chars(&message.content, TAIL_CHARS);
+            message.content = format!(
+                "[compacted_assistant_analysis]\n\
+                 original_chars: {original_chars}\n\
+                 head_excerpt:\n{head}\n\
+                 [... analysis compacted ...]\n\
+                 tail_excerpt:\n{tail}\n\
+                 note: Full analysis remains in session history. This compact summary is for context efficiency."
+            );
+            message.compression_level = 1;
+            message
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1661,6 +1805,74 @@ mod tests {
         assert!(
             keeps_latest_goal,
             "Latest user goal/request should survive hard-limit fitting"
+        );
+    }
+
+    #[test]
+    fn semantic_extraction_finds_error_lines_in_large_output() {
+        let content = "line 1\nline 2\nerror: missing semicolon at src/main.rs:42\nline 4\n"
+            .to_string()
+            .repeat(1500); // ~6000+ chars
+        let excerpt = extract_semantic_lines(&content, 300);
+        assert!(
+            excerpt.contains("error: missing semicolon at src/main.rs:42"),
+            "should extract the error line"
+        );
+    }
+
+    #[test]
+    fn semantic_extraction_empty_for_no_matches() {
+        let content = "hello world\nfoo bar\nbaz qux\n".repeat(2000);
+        let excerpt = extract_semantic_lines(&content, 300);
+        assert!(excerpt.is_empty(), "no pattern matches → empty excerpt");
+    }
+
+    #[test]
+    fn cached_summary_includes_semantic_excerpt_for_large_output() {
+        let content = "normal line\n".repeat(600); // ~7200 chars
+        let summary = build_cached_tool_output_summary(
+            "Bash",
+            "call_1",
+            &content,
+            280,
+            180,
+        );
+        // No matching patterns → no semantic_excerpt
+        assert!(
+            !summary.contains("semantic_excerpt"),
+            "no semantic patterns → no semantic_excerpt section"
+        );
+    }
+
+    #[test]
+    fn cached_summary_includes_semantic_excerpt_with_errors() {
+        let mut content = String::new();
+        for i in 0..500 {
+            content.push_str(&format!("output line {i}\n"));
+        }
+        content.push_str("error: compilation failed at src/lib.rs:10\n");
+        content.push_str("warning: unused variable in crates/mod.rs:5\n");
+        for i in 500..1000 {
+            content.push_str(&format!("more output {i}\n"));
+        }
+        let summary = build_cached_tool_output_summary(
+            "Bash",
+            "call_2",
+            &content,
+            280,
+            180,
+        );
+        assert!(
+            summary.contains("semantic_excerpt"),
+            "large output with errors should have semantic_excerpt"
+        );
+        assert!(
+            summary.contains("error: compilation failed"),
+            "semantic excerpt should contain the error line"
+        );
+        assert!(
+            summary.contains("warning: unused variable"),
+            "semantic excerpt should contain the warning line"
         );
     }
 }

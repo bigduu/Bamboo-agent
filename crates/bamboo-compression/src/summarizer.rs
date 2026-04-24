@@ -210,6 +210,16 @@ impl SummaryManager {
     }
 }
 
+/// Mode controlling how the LLM summarizer handles existing summaries.
+#[derive(Debug, Clone, Default)]
+pub enum SummaryMode {
+    /// Generate a complete summary from scratch (default).
+    #[default]
+    FullRewrite,
+    /// Update an existing summary by incorporating new information incrementally.
+    IncrementalMerge,
+}
+
 /// LLM-based summarizer that calls the current session's model to generate
 /// a rich summary of compressed/removed messages.
 ///
@@ -222,15 +232,13 @@ pub struct LlmSummarizer {
     /// Optional current task list prompt so summary generation can distinguish
     /// active vs completed/obsolete work using the session's source of truth.
     task_list_prompt: Option<String>,
+    /// Optional user-provided instructions that override/extend the default summary focus.
+    custom_instructions: Option<String>,
+    /// Controls how the summarizer handles existing summaries.
+    summary_mode: SummaryMode,
 }
 
 impl LlmSummarizer {
-    /// Create a new LLM-based summarizer.
-    ///
-    /// # Arguments
-    /// * `llm` - The LLM provider to use (same as the current session's provider)
-    /// * `model` - Model name to use for summarization
-    /// * `existing_summary` - Optional previous summary to extend
     pub fn new(
         llm: Arc<dyn LLMProvider>,
         model: String,
@@ -242,14 +250,27 @@ impl LlmSummarizer {
             model,
             existing_summary,
             task_list_prompt,
+            custom_instructions: None,
+            summary_mode: SummaryMode::default(),
         }
+    }
+
+    pub fn with_custom_instructions(mut self, instructions: Option<String>) -> Self {
+        self.custom_instructions = instructions;
+        self
+    }
+
+    pub fn with_summary_mode(mut self, mode: SummaryMode) -> Self {
+        self.summary_mode = mode;
+        self
     }
 
     /// Build the summarization prompt for the LLM.
     fn build_summarization_messages(&self, messages: &[Message]) -> Vec<Message> {
         let mut prompt_messages = Vec::new();
 
-        let system_prompt = r#"You are a conversation summarizer. Your task is to create a concise but reliable working-memory summary for a conversation that was removed due to context window limits.
+        let system_prompt = match self.summary_mode {
+            SummaryMode::FullRewrite => r#"You are a conversation summarizer. Your task is to create a concise but reliable working-memory summary for a conversation that was removed due to context window limits.
 
 Guidelines:
 - First capture the in-flight work right before compression (what was being done, where, and with which tool/file)
@@ -257,11 +278,26 @@ Guidelines:
 - Do not restate old tasks as active unless they are still unresolved
 - The provided current task list is the source of truth for active work
 - Preserve key decisions, constraints, file paths, code changes, tool findings, blockers, and important outcomes
+- Preserve error messages, test results (pass/fail counts), and function/variable names that are relevant to active work
 - If earlier plans conflict with newer messages or the current task list, mark them as obsolete or completed
 - Explicitly evaluate each clear user requirement (e.g. requirement 1, requirement 2) with a status and evidence
 - Keep the next step specific and aligned with the active work only
 - Use structured sections
-- Write in the same language as the original conversation"#;
+- Write in the same language as the original conversation"#,
+            SummaryMode::IncrementalMerge => r#"You are updating an existing conversation summary with new information from recent messages.
+
+Guidelines:
+- Incorporate new information into the existing summary structure
+- Mark previously active work as completed if the new messages confirm completion
+- Remove or condense information that is no longer relevant
+- Preserve all key decisions, file paths, and constraints that remain active
+- If new messages conflict with the existing summary, the new messages take precedence
+- Keep the summary focused on what is currently active and relevant
+- The provided current task list is the source of truth for active work
+- Maintain the same structured sections as the existing summary
+- Write in the same language as the original conversation
+- Be concise: avoid repeating information already well-captured in the existing summary"#,
+        };
 
         prompt_messages.push(Message::system(system_prompt));
 
@@ -282,6 +318,14 @@ Guidelines:
             user_content.push_str("## Current Task List\n\n");
             user_content.push_str(task_list_prompt);
             user_content.push_str("\n\n---\n\n");
+        }
+
+        if let Some(ref instructions) = self.custom_instructions {
+            if !instructions.trim().is_empty() {
+                user_content.push_str("## Custom Compression Instructions\n\n");
+                user_content.push_str(instructions.trim());
+                user_content.push_str("\n\n---\n\n");
+            }
         }
 
         user_content.push_str(
@@ -741,5 +785,76 @@ mod tests {
             .lock()
             .expect("captured reasoning lock should not be poisoned");
         assert_eq!(captured.as_slice(), [Some(ReasoningEffort::High)]);
+    }
+
+    #[test]
+    fn full_rewrite_mode_uses_default_system_prompt() {
+        let summarizer = LlmSummarizer::new(
+            Arc::new(DummyProvider),
+            "model".to_string(),
+            None,
+            None,
+        )
+        .with_summary_mode(SummaryMode::FullRewrite);
+        let messages = vec![Message::user("hello"), Message::assistant("hi", None)];
+        let prompts = summarizer.build_summarization_messages(&messages);
+        let system = &prompts[0].content;
+        assert!(
+            system.contains("conversation summarizer"),
+            "FullRewrite prompt should contain 'conversation summarizer'"
+        );
+        assert!(
+            !system.contains("updating an existing"),
+            "FullRewrite prompt should not contain incremental language"
+        );
+    }
+
+    #[test]
+    fn incremental_merge_mode_uses_update_system_prompt() {
+        let summarizer = LlmSummarizer::new(
+            Arc::new(DummyProvider),
+            "model".to_string(),
+            Some("Previous summary content".to_string()),
+            None,
+        )
+        .with_summary_mode(SummaryMode::IncrementalMerge);
+        let messages = vec![Message::user("hello"), Message::assistant("hi", None)];
+        let prompts = summarizer.build_summarization_messages(&messages);
+        let system = &prompts[0].content;
+        assert!(
+            system.contains("updating an existing conversation summary"),
+            "IncrementalMerge prompt should contain 'updating an existing conversation summary'"
+        );
+        assert!(
+            system.contains("Incorporate new information"),
+            "IncrementalMerge prompt should mention incorporating new information"
+        );
+    }
+
+    #[test]
+    fn default_summary_mode_is_full_rewrite() {
+        assert!(matches!(SummaryMode::default(), SummaryMode::FullRewrite));
+    }
+
+    #[test]
+    fn incremental_merge_includes_existing_summary_in_user_content() {
+        let summarizer = LlmSummarizer::new(
+            Arc::new(DummyProvider),
+            "model".to_string(),
+            Some("Previous summary content".to_string()),
+            None,
+        )
+        .with_summary_mode(SummaryMode::IncrementalMerge);
+        let messages = vec![Message::user("new work"), Message::assistant("doing it", None)];
+        let prompts = summarizer.build_summarization_messages(&messages);
+        let user_content = &prompts[1].content;
+        assert!(
+            user_content.contains("Previous Summary"),
+            "IncrementalMerge user prompt should include the existing summary"
+        );
+        assert!(
+            user_content.contains("Previous summary content"),
+            "IncrementalMerge user prompt should include the actual summary text"
+        );
     }
 }

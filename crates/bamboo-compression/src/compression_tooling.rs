@@ -2,7 +2,16 @@ use crate::counter::{TiktokenTokenCounter, TokenCounter};
 use crate::limits::create_budget_for_model;
 use crate::{BudgetStrategy, TokenBudget};
 use bamboo_agent_core::MessagePhase;
-use bamboo_agent_core::{CompressionEvent, ConversationSummary, Message, Session};
+use bamboo_agent_core::{CompressionEvent, CompressionTriggerType, ConversationSummary, Message, Session};
+
+/// Checks if a message is part of a skill tool chain (load_skill / read_skill_resource).
+fn is_skill_tool_chain_message(message: &Message) -> bool {
+    message.tool_calls.as_ref().is_some_and(|calls| {
+        calls
+            .iter()
+            .any(|call| matches!(call.function.name.as_str(), "load_skill" | "read_skill_resource"))
+    })
+}
 use chrono::Utc;
 use std::collections::HashSet;
 
@@ -78,6 +87,10 @@ pub struct CompressionPlan {
     pub trigger_percent: u8,
     pub target_percent: u8,
     pub segments_removed: usize,
+    pub trigger_type: CompressionTriggerType,
+    pub compression_ratio: f64,
+    pub model_used: Option<String>,
+    pub latency_ms: u64,
 }
 
 pub fn context_window_usage_percent(total_tokens: u32, context_window_tokens: u32) -> f64 {
@@ -139,8 +152,13 @@ pub fn estimate_context_compression_exposure(
         .unwrap_or(estimated_usage);
 
     let rounded = usage.clamp(0.0, 100.0).round() as u8;
-    let trigger = normalized_trigger_percent(budget.compression_trigger_percent);
-    let threshold_reached = usage >= trigger;
+    let trigger_tokens = budget.compression_trigger_context_tokens();
+    let trigger_percent = if budget.max_context_tokens > 0 {
+        (trigger_tokens as f64 / budget.max_context_tokens as f64) * 100.0
+    } else {
+        0.0
+    };
+    let threshold_reached = usage >= trigger_percent;
 
     // Check non-system message count to stay consistent with the plan
     // building requirement of >=3 non-system messages.  Using
@@ -176,6 +194,7 @@ pub fn build_compression_plan_with_summary(
         configured_budget,
         summary_content,
         true,
+        CompressionTriggerType::Auto,
     )
 }
 
@@ -189,6 +208,7 @@ pub fn build_forced_compression_plan_with_summary(
     model_name: &str,
     configured_budget: Option<&TokenBudget>,
     summary_content: String,
+    trigger_type: CompressionTriggerType,
 ) -> Result<CompressionPlan, CompressionPlanError> {
     build_compression_plan_with_summary_internal(
         session,
@@ -196,6 +216,7 @@ pub fn build_forced_compression_plan_with_summary(
         configured_budget,
         summary_content,
         false,
+        trigger_type,
     )
 }
 
@@ -205,6 +226,7 @@ fn build_compression_plan_with_summary_internal(
     configured_budget: Option<&TokenBudget>,
     summary_content: String,
     require_exposure_gate: bool,
+    trigger_type: CompressionTriggerType,
 ) -> Result<CompressionPlan, CompressionPlanError> {
     let exposure = estimate_context_compression_exposure(session, model_name, configured_budget);
     if require_exposure_gate && !exposure.should_expose_tool {
@@ -288,8 +310,46 @@ fn build_compression_plan_with_summary_internal(
     // boundary. If budget is still too high, continue moving the oldest
     // non-protected messages into the summarize set.
     let mut messages_to_summarize = non_system[..anchor_index].to_vec();
+
+    // Protected messages must never be summarized — move them to the keep set.
+    let mut never_compress_ids: Vec<String> = messages_to_summarize
+        .iter()
+        .filter(|m| m.never_compress || is_skill_tool_chain_message(m))
+        .map(|m| m.id.clone())
+        .collect();
+
+    // Also protect tool result messages that correspond to skill tool calls.
+    let skill_call_ids: Vec<String> = messages_to_summarize
+        .iter()
+        .filter(|m| is_skill_tool_chain_message(m))
+        .flat_map(|m| m.tool_calls.iter().flatten().map(|c| c.id.clone()))
+        .collect();
+    if !skill_call_ids.is_empty() {
+        for m in &*messages_to_summarize {
+            if let Some(ref call_id) = m.tool_call_id {
+                if skill_call_ids.contains(call_id)
+                    && !never_compress_ids.contains(&m.id)
+                {
+                    never_compress_ids.push(m.id.clone());
+                }
+            }
+        }
+    }
+
+    if !never_compress_ids.is_empty() {
+        messages_to_summarize.retain(|m| !never_compress_ids.contains(&m.id));
+    }
+
     let non_system_count = non_system.len();
     let mut messages_to_keep = non_system[anchor_index..].to_vec();
+    // Add never_compress / skill messages to the keep set.
+    for id in &never_compress_ids {
+        if let Some(msg) = non_system.iter().find(|m| &m.id == id) {
+            if !messages_to_keep.iter().any(|m| m.id == *id) {
+                messages_to_keep.push(msg.clone());
+            }
+        }
+    }
 
     while !messages_to_keep.is_empty() {
         let keep_tokens = counter.count_messages(&messages_to_keep);
@@ -299,9 +359,12 @@ fn build_compression_plan_with_summary_internal(
 
         let Some(remove_index) = messages_to_keep
             .iter()
-            .position(|message| !protected_user_ids.contains(message.id.as_str()))
+            .position(|message| {
+                !protected_user_ids.contains(message.id.as_str())
+                    && !never_compress_ids.contains(&message.id)
+            })
         else {
-            // Remaining messages are all protected user turns; stop shrinking.
+            // Remaining messages are all protected; stop shrinking.
             break;
         };
         let moved = messages_to_keep.remove(remove_index);
@@ -349,10 +412,173 @@ fn build_compression_plan_with_summary_internal(
         trigger_percent: budget.compression_trigger_percent,
         target_percent: budget.compression_target_percent,
         segments_removed,
+        trigger_type,
+        compression_ratio: 0.0,
+        model_used: None,
+        latency_ms: 0,
     })
 }
 
 /// Apply a previously computed compression plan to the session.
+/// Extract recently modified files from tool calls in the given messages.
+pub(super) fn extract_recently_modified_files(messages: &[Message]) -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    for message in messages {
+        if let Some(ref tool_calls) = message.tool_calls {
+            for call in tool_calls {
+                let tool_name = call.function.name.as_str();
+                if !matches!(tool_name, "Write" | "Edit" | "Bash") {
+                    continue;
+                }
+                let args = &call.function.arguments;
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
+                    if let Some(path) = parsed.get("file_path").and_then(|v| v.as_str()) {
+                        files.push((path.to_string(), tool_name.to_string()));
+                    } else if let Some(cmd) = parsed.get("command").and_then(|v| v.as_str()) {
+                        // Extract file paths from shell commands heuristically
+                        for part in cmd.split_whitespace() {
+                            if part.contains('/') && (part.ends_with(".rs")
+                                || part.ends_with(".ts")
+                                || part.ends_with(".js")
+                                || part.ends_with(".toml")
+                                || part.ends_with(".json")
+                                || part.ends_with(".md"))
+                            {
+                                files.push((part.to_string(), "Bash".to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    files.truncate(10);
+    files
+}
+
+/// Extract key decision snippets from assistant messages.
+pub(super) fn extract_key_decisions(messages: &[Message], limit: usize) -> Vec<String> {
+    let decision_keywords = [
+        "decided to", "approach is", "use ", "using ", "we'll go with",
+        "the plan is", "strategy:", "solution:", "chose to", "switched to",
+        "refactored to", "migrated to", "replaced with",
+    ];
+    let mut decisions = Vec::new();
+    for message in messages {
+        if !matches!(message.role, bamboo_agent_core::Role::Assistant) {
+            continue;
+        }
+        let content = &message.content;
+        for line in content.lines() {
+            let line_lower = line.to_lowercase();
+            if decision_keywords.iter().any(|kw| line_lower.contains(kw)) {
+                let truncated: String = line.chars().take(200).collect();
+                decisions.push(truncated);
+                if decisions.len() >= limit {
+                    return decisions;
+                }
+            }
+        }
+    }
+    decisions
+}
+
+/// Build a post-compaction recovery message that preserves critical context
+/// from the compressed messages so the LLM can continue work without losing
+/// track of active files, tasks, and decisions.
+fn build_post_compaction_recovery_message(
+    compressed_messages: &[Message],
+    session: &Session,
+) -> Option<Message> {
+    if compressed_messages.is_empty() {
+        return None;
+    }
+
+    let mut sections = Vec::new();
+
+    // 1. Recently modified files
+    let files = extract_recently_modified_files(compressed_messages);
+    if !files.is_empty() {
+        let mut section = String::from("## Recently Modified Files\n");
+        for (path, tool) in &files {
+            section.push_str(&format!("- {} ({})\n", path, tool));
+        }
+        sections.push(section);
+    }
+
+    // 2. Active tasks from task list
+    if let Some(ref task_list) = session.task_list {
+        let active_items: Vec<_> = task_list
+            .items
+            .iter()
+            .filter(|item| !matches!(item.status, bamboo_domain::TaskItemStatus::Completed))
+            .collect();
+        if !active_items.is_empty() {
+            let mut section = String::from("## Active Tasks\n");
+            for item in active_items.iter().take(10) {
+                section.push_str(&format!("- [{:?}] {}\n", item.status, item.description));
+            }
+            sections.push(section);
+        }
+    }
+
+    // 3. Key decisions
+    let decisions = extract_key_decisions(compressed_messages, 5);
+    if !decisions.is_empty() {
+        let mut section = String::from("## Key Decisions\n");
+        for decision in &decisions {
+            section.push_str(&format!("- {}\n", decision));
+        }
+        sections.push(section);
+    }
+
+    if sections.is_empty() {
+        return None;
+    }
+
+    let mut content = String::from("[post-compaction-recovery]\nContext extracted from compressed messages for continued work.\n\n");
+    content.push_str(&sections.join("\n"));
+
+    let mut message = Message::assistant(content, None);
+    message.never_compress = true;
+    Some(message)
+}
+
+struct SummaryQualityMetrics {
+    file_coverage: f64,
+    decision_coverage: f64,
+}
+
+fn validate_summary_quality(summary: &str, messages: &[Message]) -> SummaryQualityMetrics {
+    let files = extract_recently_modified_files(messages);
+    let decisions = extract_key_decisions(messages, 10);
+
+    let files_mentioned = files.iter().filter(|(path, _)| summary.contains(path.as_str())).count();
+    let file_coverage = if files.is_empty() {
+        1.0
+    } else {
+        files_mentioned as f64 / files.len() as f64
+    };
+
+    let decisions_mentioned = decisions
+        .iter()
+        .filter(|d| {
+            let check_len = d.len().min(50);
+            summary.contains(&d[..check_len])
+        })
+        .count();
+    let decision_coverage = if decisions.is_empty() {
+        1.0
+    } else {
+        decisions_mentioned as f64 / decisions.len() as f64
+    };
+
+    SummaryQualityMetrics {
+        file_coverage,
+        decision_coverage,
+    }
+}
+
 pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> usize {
     let compressed_ids: HashSet<&str> = plan
         .compressed_message_ids
@@ -379,6 +605,10 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
         plan.active_usage_before_percent,
         plan.active_usage_after_percent,
         plan.summary_tokens,
+        plan.trigger_type,
+        plan.compression_ratio,
+        plan.model_used.clone(),
+        plan.latency_ms,
     );
     let event_id = event.id.clone();
     for index in changed_indexes {
@@ -390,6 +620,35 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
         plan.compressed_message_ids.len(),
         plan.summary_tokens,
     ));
+
+    // Inject a post-compaction recovery message to preserve critical context
+    // from the compressed messages (files, tasks, decisions).
+    let compressed_messages: Vec<Message> = session
+        .messages
+        .iter()
+        .filter(|m| compressed_ids.contains(m.id.as_str()))
+        .cloned()
+        .collect();
+    if let Some(recovery) = build_post_compaction_recovery_message(&compressed_messages, session) {
+        // Insert just before the last user message, or at the end
+        let insert_pos = session
+            .messages
+            .iter()
+            .rposition(|m| matches!(m.role, bamboo_agent_core::Role::User) && !m.compressed)
+            .map(|pos| pos + 1)
+            .unwrap_or(session.messages.len());
+        session.messages.insert(insert_pos, recovery);
+    }
+
+    let quality = validate_summary_quality(&plan.summary_content, &compressed_messages);
+    if quality.file_coverage < 0.5 || quality.decision_coverage < 0.3 {
+        tracing::warn!(
+            "[{}] Summary quality: file_coverage={:.0}%, decision_coverage={:.0}%",
+            session.id,
+            quality.file_coverage * 100.0,
+            quality.decision_coverage * 100.0
+        );
+    }
 
     // Instead of clearing token_usage entirely (which forces the next round
     // to rely on heuristic estimates that don't account for tool schema
@@ -444,6 +703,8 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
         truncation_occurred: false,
         segments_removed: 0,
         prompt_cached_tool_outputs: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
     });
 
     session.updated_at = Utc::now();
@@ -566,7 +827,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use bamboo_agent_core::TokenBudgetUsage;
-    use bamboo_domain::{TaskItem, TaskItemStatus, TaskList};
+    use bamboo_domain::{FunctionCall, TaskItem, TaskItemStatus, TaskList, ToolCall};
     use chrono::Utc;
 
     fn make_budget() -> TokenBudget {
@@ -580,11 +841,14 @@ mod tests {
             safety_margin: 0,
             compression_trigger_percent: 50,
             compression_target_percent: 20,
+            working_reserve_tokens: 0,
+            fallback_trigger_percent: 75,
             prompt_cache_min_tool_output_chars: 1_200,
             prompt_cache_head_chars: 280,
             prompt_cache_tail_chars: 180,
             prompt_cache_recent_user_turns: 2,
             prompt_cache_recent_tool_chains: 2,
+            max_tool_output_tokens: 0,
         }
     }
 
@@ -704,11 +968,14 @@ mod tests {
             safety_margin: 0,
             compression_trigger_percent: 80,
             compression_target_percent: 20,
+            working_reserve_tokens: 0,
+            fallback_trigger_percent: 75,
             prompt_cache_min_tool_output_chars: 1_200,
             prompt_cache_head_chars: 280,
             prompt_cache_tail_chars: 180,
             prompt_cache_recent_user_turns: 2,
             prompt_cache_recent_tool_chains: 2,
+            max_tool_output_tokens: 0,
         };
         let mut session = Session::new("keep-last-three-user-turns", "gpt-4o-mini");
         session.token_budget = Some(budget.clone());
@@ -729,6 +996,7 @@ mod tests {
             "gpt-4o-mini",
             Some(&budget),
             "summary".to_string(),
+            CompressionTriggerType::CriticalOverflow,
         )
         .expect("forced plan should build");
 
@@ -775,11 +1043,14 @@ mod tests {
             safety_margin: 0,
             compression_trigger_percent: 80,
             compression_target_percent: 50,
+            working_reserve_tokens: 0,
+            fallback_trigger_percent: 75,
             prompt_cache_min_tool_output_chars: 1_200,
             prompt_cache_head_chars: 280,
             prompt_cache_tail_chars: 180,
             prompt_cache_recent_user_turns: 2,
             prompt_cache_recent_tool_chains: 2,
+            max_tool_output_tokens: 0,
         });
         session.add_message(Message::system("system"));
         session.add_message(Message::user("short"));
@@ -796,6 +1067,8 @@ mod tests {
             truncation_occurred: true,
             segments_removed: 12,
             prompt_cached_tool_outputs: 0,
+            thinking_tokens: 0,
+            cache_read_input_tokens: 0,
         });
 
         let exposure = estimate_context_compression_exposure(
@@ -810,5 +1083,404 @@ mod tests {
             exposure.active_usage_percent
         );
         assert!(exposure.should_expose_tool);
+    }
+
+    #[test]
+    fn never_compress_messages_are_excluded_from_summarize_set() {
+        let budget = TokenBudget {
+            max_context_tokens: 1200,
+            max_output_tokens: 100,
+            strategy: BudgetStrategy::Hybrid {
+                window_size: 20,
+                enable_summarization: true,
+            },
+            safety_margin: 0,
+            compression_trigger_percent: 80,
+            compression_target_percent: 20,
+            working_reserve_tokens: 0,
+            fallback_trigger_percent: 75,
+            prompt_cache_min_tool_output_chars: 1_200,
+            prompt_cache_head_chars: 280,
+            prompt_cache_tail_chars: 180,
+            prompt_cache_recent_user_turns: 2,
+            prompt_cache_recent_tool_chains: 2,
+            max_tool_output_tokens: 0,
+        };
+        let mut session = Session::new("never-compress-test", "gpt-4o-mini");
+        session.token_budget = Some(budget.clone());
+        session.add_message(Message::system("system"));
+
+        // Old user message that should be summarized
+        session.add_message(Message::user("Old question about X"));
+        session.add_message(Message::assistant("Old answer about X", None));
+
+        // Protected user message (never_compress = true)
+        let mut protected = Message::user("Critical context that must survive");
+        protected.never_compress = true;
+        session.add_message(protected);
+        session.add_message(Message::assistant("Response to critical", None));
+
+        // Recent user messages that anchor the keep window
+        for i in 0..4 {
+            session.add_message(Message::user(format!(
+                "Recent U{i}: {}",
+                "padding text to fill budget ".repeat(6)
+            )));
+            session.add_message(Message::assistant(
+                format!("Recent A{i}: {}", "reply padding text ".repeat(6)),
+                None,
+            ));
+        }
+
+        let plan = build_forced_compression_plan_with_summary(
+            &session,
+            "gpt-4o-mini",
+            Some(&budget),
+            "summary".to_string(),
+            CompressionTriggerType::Auto,
+        )
+        .expect("plan should build");
+
+        let compressed_ids: HashSet<&str> = plan
+            .compressed_message_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+
+        // Find the never_compress message
+        let protected_msg = session
+            .messages
+            .iter()
+            .find(|m| m.never_compress)
+            .expect("should find the protected message");
+
+        assert!(
+            !compressed_ids.contains(protected_msg.id.as_str()),
+            "never_compress message should NOT be in the compressed set"
+        );
+    }
+
+    #[test]
+    fn skill_tool_chain_messages_are_protected_from_compression() {
+        let budget = TokenBudget {
+            max_context_tokens: 1200,
+            max_output_tokens: 100,
+            strategy: BudgetStrategy::Hybrid {
+                window_size: 20,
+                enable_summarization: true,
+            },
+            safety_margin: 0,
+            compression_trigger_percent: 80,
+            compression_target_percent: 20,
+            working_reserve_tokens: 0,
+            fallback_trigger_percent: 75,
+            prompt_cache_min_tool_output_chars: 1_200,
+            prompt_cache_head_chars: 280,
+            prompt_cache_tail_chars: 180,
+            prompt_cache_recent_user_turns: 2,
+            prompt_cache_recent_tool_chains: 2,
+            max_tool_output_tokens: 0,
+        };
+        let mut session = Session::new("skill-chain-test", "gpt-4o-mini");
+        session.token_budget = Some(budget.clone());
+        session.add_message(Message::system("system"));
+
+        // Skill tool chain (load_skill + read_skill_resource)
+        let mut skill_call = Message::assistant(String::new(), None);
+        skill_call.tool_calls = Some(vec![ToolCall {
+            id: "tc-skill".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "load_skill".to_string(),
+                arguments: r#"{"skill_id":"my-skill"}"#.to_string(),
+            },
+        }]);
+        session.add_message(skill_call);
+
+        let mut skill_result = Message::tool_result("tc-skill", "skill loaded");
+        skill_result.tool_success = Some(true);
+        session.add_message(skill_result);
+
+        // Regular messages to fill budget
+        for i in 0..6 {
+            session.add_message(Message::user(format!(
+                "U{i}: {}",
+                "alpha beta gamma delta ".repeat(8)
+            )));
+            session.add_message(Message::assistant(
+                format!("A{i}: {}", "analysis steps plan ".repeat(8)),
+                None,
+            ));
+        }
+
+        let plan = build_forced_compression_plan_with_summary(
+            &session,
+            "gpt-4o-mini",
+            Some(&budget),
+            "summary".to_string(),
+            CompressionTriggerType::Auto,
+        )
+        .expect("plan should build");
+
+        let compressed_ids: HashSet<&str> = plan
+            .compressed_message_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+
+        // Skill tool chain messages should not be compressed
+        let skill_messages: Vec<&Message> = session
+            .messages
+            .iter()
+            .filter(|m| {
+                m.tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.iter().any(|c| c.function.name == "load_skill"))
+                    || m.tool_call_id.as_deref() == Some("tc-skill")
+            })
+            .collect();
+
+        for msg in &skill_messages {
+            assert!(
+                !compressed_ids.contains(msg.id.as_str()),
+                "skill tool chain message {} should NOT be compressed",
+                msg.id
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_message_returns_none_for_empty_messages() {
+        let session = Session::new("recovery-empty", "model");
+        let result = build_post_compaction_recovery_message(&[], &session);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn recovery_message_has_never_compress_flag() {
+        let mut session = Session::new("recovery-flag", "model");
+        let messages = vec![Message::assistant("no decisions here", None)];
+        session.set_task_list(TaskList {
+            session_id: session.id.clone(),
+            title: "Tasks".to_string(),
+            items: vec![TaskItem {
+                id: "t1".to_string(),
+                description: "Active task".to_string(),
+                status: TaskItemStatus::InProgress,
+                ..TaskItem::default()
+            }],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        let recovery = build_post_compaction_recovery_message(&messages, &session)
+            .expect("should return recovery message");
+        assert!(recovery.never_compress);
+        assert!(recovery.content.contains("[post-compaction-recovery]"));
+    }
+
+    #[test]
+    fn recovery_message_extracts_file_paths_from_tool_calls() {
+        let session = Session::new("recovery-files", "model");
+        let mut write_call = Message::assistant("writing file", None);
+        write_call.tool_calls = Some(vec![ToolCall {
+            id: "tc1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Write".to_string(),
+                arguments: r#"{"file_path":"/src/main.rs","content":"fn main() {}"}"#.to_string(),
+            },
+        }]);
+        let mut edit_call = Message::assistant("editing file", None);
+        edit_call.tool_calls = Some(vec![ToolCall {
+            id: "tc2".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Edit".to_string(),
+                arguments: r#"{"file_path":"/lib/utils.rs","old":"x","new":"y"}"#.to_string(),
+            },
+        }]);
+        let messages = vec![write_call, edit_call];
+
+        let recovery = build_post_compaction_recovery_message(&messages, &session)
+            .expect("should return recovery");
+        assert!(recovery.content.contains("/src/main.rs"));
+        assert!(recovery.content.contains("/lib/utils.rs"));
+        assert!(recovery.content.contains("Recently Modified Files"));
+    }
+
+    #[test]
+    fn recovery_message_includes_active_tasks() {
+        let mut session = Session::new("recovery-tasks", "model");
+        session.set_task_list(TaskList {
+            session_id: session.id.clone(),
+            title: "Tasks".to_string(),
+            items: vec![
+                TaskItem {
+                    id: "t1".to_string(),
+                    description: "Fix auth middleware".to_string(),
+                    status: TaskItemStatus::InProgress,
+                    ..TaskItem::default()
+                },
+                TaskItem {
+                    id: "t2".to_string(),
+                    description: "Add tests".to_string(),
+                    status: TaskItemStatus::Pending,
+                    ..TaskItem::default()
+                },
+                TaskItem {
+                    id: "t3".to_string(),
+                    description: "Done task".to_string(),
+                    status: TaskItemStatus::Completed,
+                    ..TaskItem::default()
+                },
+            ],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        let messages = vec![Message::assistant("some work", None)];
+
+        let recovery = build_post_compaction_recovery_message(&messages, &session)
+            .expect("should return recovery");
+        assert!(recovery.content.contains("Active Tasks"));
+        assert!(recovery.content.contains("Fix auth middleware"));
+        assert!(recovery.content.contains("Add tests"));
+        // Completed tasks should NOT appear in active tasks
+        assert!(!recovery.content.contains("Done task"));
+    }
+
+    #[test]
+    fn apply_compression_plan_injects_recovery_message() {
+        let budget = TokenBudget {
+            max_context_tokens: 1200,
+            max_output_tokens: 100,
+            strategy: BudgetStrategy::Hybrid {
+                window_size: 20,
+                enable_summarization: true,
+            },
+            safety_margin: 0,
+            compression_trigger_percent: 80,
+            compression_target_percent: 20,
+            working_reserve_tokens: 0,
+            fallback_trigger_percent: 75,
+            prompt_cache_min_tool_output_chars: 1_200,
+            prompt_cache_head_chars: 280,
+            prompt_cache_tail_chars: 180,
+            prompt_cache_recent_user_turns: 2,
+            prompt_cache_recent_tool_chains: 2,
+            max_tool_output_tokens: 0,
+        };
+        let mut session = Session::new("recovery-inject", "gpt-4o-mini");
+        session.token_budget = Some(budget.clone());
+        session.add_message(Message::system("system"));
+
+        // Old messages with tool calls containing file paths
+        let mut write_msg = Message::assistant("writing", None);
+        write_msg.tool_calls = Some(vec![ToolCall {
+            id: "tc-w".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Write".to_string(),
+                arguments: r#"{"file_path":"/src/lib.rs","content":"pub fn hello() {}"}"#
+                    .to_string(),
+            },
+        }]);
+        session.add_message(Message::user("Write the file"));
+        session.add_message(write_msg);
+
+        // Fill with enough messages to force compression
+        for i in 0..6 {
+            session.add_message(Message::user(format!(
+                "U{i}: {}",
+                "alpha beta gamma delta ".repeat(8)
+            )));
+            session.add_message(Message::assistant(
+                format!("A{i}: {}", "analysis plan ".repeat(8)),
+                None,
+            ));
+        }
+
+        let plan = build_forced_compression_plan_with_summary(
+            &session,
+            "gpt-4o-mini",
+            Some(&budget),
+            "summary text".to_string(),
+            CompressionTriggerType::Auto,
+        )
+        .expect("plan should build");
+
+        assert!(plan.compressed_message_ids.len() > 0);
+
+        let compressed_count = apply_compression_plan(&mut session, plan);
+        assert!(compressed_count > 0);
+
+        // Verify recovery message was injected
+        let has_recovery = session.messages.iter().any(|m| {
+            m.never_compress
+                && m.content.contains("[post-compaction-recovery]")
+                && m.content.contains("/src/lib.rs")
+        });
+        assert!(
+            has_recovery,
+            "session should contain a post-compaction recovery message with the file path"
+        );
+    }
+
+    #[test]
+    fn summary_quality_full_coverage_when_all_files_mentioned() {
+        let messages = vec![
+            {
+                let mut m = Message::assistant("writing", None);
+                m.tool_calls = Some(vec![ToolCall {
+                    id: "tc1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "Write".to_string(),
+                        arguments: r#"{"file_path":"/src/main.rs","content":"fn main() {}"}"#
+                            .to_string(),
+                    },
+                }]);
+                m
+            },
+        ];
+        let summary = "Modified /src/main.rs to add main function";
+        let quality = validate_summary_quality(summary, &messages);
+        assert!(
+            quality.file_coverage >= 0.99,
+            "file_coverage should be ~1.0, got {:.2}",
+            quality.file_coverage
+        );
+    }
+
+    #[test]
+    fn summary_quality_zero_coverage_when_no_files_mentioned() {
+        let messages = vec![
+            {
+                let mut m = Message::assistant("writing", None);
+                m.tool_calls = Some(vec![ToolCall {
+                    id: "tc1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "Write".to_string(),
+                        arguments: r#"{"file_path":"/src/main.rs","content":"fn main() {}"}"#
+                            .to_string(),
+                    },
+                }]);
+                m
+            },
+        ];
+        let summary = "Summary that mentions nothing about files";
+        let quality = validate_summary_quality(summary, &messages);
+        assert!(
+            quality.file_coverage < 0.01,
+            "file_coverage should be ~0.0, got {:.2}",
+            quality.file_coverage
+        );
+    }
+
+    #[test]
+    fn summary_quality_handles_empty_messages() {
+        let quality = validate_summary_quality("some summary", &[]);
+        assert_eq!(quality.file_coverage, 1.0);
+        assert_eq!(quality.decision_coverage, 1.0);
     }
 }

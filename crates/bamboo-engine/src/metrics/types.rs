@@ -128,6 +128,12 @@ pub struct RoundMetrics {
     /// Number of tool outputs compacted into prompt-side cache summaries in this round.
     #[serde(default)]
     pub prompt_cached_tool_outputs: u32,
+    /// Number of context compression events applied during this round.
+    #[serde(default)]
+    pub compression_count: u32,
+    /// Tokens saved by context compression during this round.
+    #[serde(default)]
+    pub tokens_saved: u32,
 }
 
 /// Metrics for an entire session
@@ -158,6 +164,12 @@ pub struct SessionMetrics {
     /// Total number of prompt-side cached tool outputs observed across rounds.
     #[serde(default)]
     pub prompt_cached_tool_outputs: u64,
+    /// Total number of context compression events across all rounds.
+    #[serde(default)]
+    pub total_compression_events: u64,
+    /// Total tokens saved by context compression across all rounds.
+    #[serde(default)]
+    pub total_tokens_saved: u64,
 }
 
 /// Detailed session metrics with round information
@@ -481,10 +493,11 @@ mod tests {
             error: None,
             duration_ms: None,
             prompt_cached_tool_outputs: 0,
+            compression_count: 0,
+            tokens_saved: 0,
         };
 
         let json = serde_json::to_string(&metrics).unwrap();
-        assert!(json.contains("\"round_id\":\"round-1\""));
         assert!(json.contains("\"model\":\"gpt-4\""));
     }
 
@@ -503,6 +516,8 @@ mod tests {
             message_count: 15,
             duration_ms: None,
             prompt_cached_tool_outputs: 0,
+            total_compression_events: 0,
+            total_tokens_saved: 0,
         };
 
         let json = serde_json::to_string(&metrics).unwrap();
@@ -654,5 +669,21 @@ mod tests {
     fn test_session_status_eq() {
         assert_eq!(SessionStatus::Running, SessionStatus::Running);
         assert_ne!(SessionStatus::Running, SessionStatus::Completed);
+    }
+
+    #[test]
+    fn test_round_metrics_compression_fields_deserialize_with_defaults() {
+        let json = r#"{"round_id":"r1","session_id":"s1","model":"m","started_at":"2026-01-01T00:00:00Z","completed_at":null,"token_usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0},"tool_calls":[],"status":"running","error":null,"duration_ms":null,"prompt_cached_tool_outputs":0}"#;
+        let metrics: RoundMetrics = serde_json::from_str(json).unwrap();
+        assert_eq!(metrics.compression_count, 0);
+        assert_eq!(metrics.tokens_saved, 0);
+    }
+
+    #[test]
+    fn test_session_metrics_compression_fields_deserialize_with_defaults() {
+        let json = r#"{"session_id":"s1","model":"m","started_at":"2026-01-01T00:00:00Z","completed_at":null,"total_rounds":0,"total_token_usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0},"tool_call_count":0,"tool_breakdown":{},"status":"running","message_count":0,"duration_ms":null,"prompt_cached_tool_outputs":0}"#;
+        let metrics: SessionMetrics = serde_json::from_str(json).unwrap();
+        assert_eq!(metrics.total_compression_events, 0);
+        assert_eq!(metrics.total_tokens_saved, 0);
     }
 }

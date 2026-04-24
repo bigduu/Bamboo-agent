@@ -1639,6 +1639,8 @@ impl MetricsStorage for SqliteMetricsStorage {
                     status,
                     message_count: row.get::<_, i64>(11)? as u32,
                     duration_ms: compute_duration_ms(started_at, completed_at),
+                    total_compression_events: 0,
+                    total_tokens_saved: 0,
                 });
             }
 
@@ -1712,6 +1714,8 @@ impl MetricsStorage for SqliteMetricsStorage {
                 status,
                 message_count: message_count as u32,
                 duration_ms: compute_duration_ms(started_at, completed_at),
+                total_compression_events: 0,
+                total_tokens_saved: 0,
             };
 
             let rounds = load_rounds(connection, &session_id)?;
@@ -2212,6 +2216,8 @@ fn load_rounds(connection: &Connection, session_id: &str) -> MetricsResult<Vec<R
             prompt_cached_tool_outputs: row.get::<_, i64>(9)? as u32,
             error: row.get(10)?,
             duration_ms: compute_duration_ms(started_at, completed_at),
+            compression_count: 0,
+            tokens_saved: 0,
         });
     }
 
