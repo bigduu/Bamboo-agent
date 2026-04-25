@@ -46,7 +46,6 @@ dirs = "5"
 libc = "0.2"
 rand = "0.8"
 sysinfo = "0.33"
-arboard = "3"
 bytes = "1"
 
 [target.'cfg(windows)'.dependencies]

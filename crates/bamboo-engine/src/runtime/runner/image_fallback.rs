@@ -14,14 +14,14 @@ mod placeholder;
 mod rewrite;
 
 #[cfg(windows)]
-pub(super) async fn ensure_session_image_ocr_cached(
+pub async fn ensure_session_image_ocr_cached(
     session: &mut bamboo_agent_core::Session,
     attachment_reader: Option<&dyn AttachmentReader>,
 ) -> bool {
     ocr::ensure_session_image_ocr_cached(session, attachment_reader).await
 }
 
-pub(super) async fn resolve_bamboo_attachments_for_llm(
+pub async fn resolve_bamboo_attachments_for_llm(
     messages: &mut [Message],
     reader: &dyn AttachmentReader,
 ) -> std::result::Result<(), AgentError> {
@@ -29,11 +29,11 @@ pub(super) async fn resolve_bamboo_attachments_for_llm(
 }
 
 #[cfg(any(test, windows))]
-pub(super) fn persistable_image_urls(parts: &[bamboo_domain::MessagePart]) -> Vec<String> {
+pub fn persistable_image_urls(parts: &[bamboo_domain::MessagePart]) -> Vec<String> {
     placeholder::persistable_image_urls(parts)
 }
 
-pub(super) async fn apply_image_fallback_to_llm_messages(
+pub async fn apply_image_fallback_to_llm_messages(
     messages: &mut [Message],
     fallback: ImageFallbackConfig,
     attachment_reader: Option<&dyn AttachmentReader>,
