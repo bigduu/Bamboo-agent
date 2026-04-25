@@ -2,7 +2,6 @@
 //!
 //! This module provides slash commands, workflows, and keyword masking functionality.
 
-pub mod copy;
 pub mod keyword_masking;
 pub mod slash_commands;
 pub mod workflows;
