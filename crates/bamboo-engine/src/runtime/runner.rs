@@ -15,7 +15,7 @@ use bamboo_infrastructure::LLMProvider;
 
 use crate::runtime::config::AgentLoopConfig;
 
-pub mod image_fallback;
+mod image_fallback;
 mod logging;
 mod loop_execution;
 mod metrics_lifecycle;

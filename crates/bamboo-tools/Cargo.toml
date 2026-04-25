@@ -37,6 +37,7 @@ toml = "0.8"
 dirs = "5"
 libc = "0.2"
 colored = "2"
+arboard = "3"
 
 [dev-dependencies]
 tempfile = "3"
