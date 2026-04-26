@@ -6,11 +6,12 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 20] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
     "conclusion_with_options",
     "Bash",
     "BashOutput",
     "Edit",
+    "EnterPlanMode",
     "ExitPlanMode",
     "GetFileInfo",
     "Glob",
@@ -243,6 +244,18 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Keep exactly one item in_progress whenever possible.",
             )],
         )),
+        "EnterPlanMode" => Some(guide(
+            "EnterPlanMode",
+            ToolCategory::UserInteraction,
+            "Switch to plan mode for complex tasks requiring exploration and design before implementation.",
+            "Do not use for simple tasks that can be implemented directly.",
+            &["Task", "ExitPlanMode"],
+            vec![example(
+                "Start planning a complex refactor",
+                json!({"reason":"This refactor touches multiple crates and needs careful design"}),
+                "Use when facing a complex task that requires exploration before implementation.",
+            )],
+        )),
         "ExitPlanMode" => Some(guide(
             "ExitPlanMode",
             ToolCategory::UserInteraction,
@@ -271,14 +284,21 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "WebSearch" => Some(guide(
             "WebSearch",
             ToolCategory::CommandExecution,
-            "Search the web with optional domain allow/block filters.",
-            "Do not use for local codebase search.",
+            "Search the web with optional domain allow/block filters. When searching for recent information, documentation, or current events, include the current year in the query to get up-to-date results.",
+            "Do not use for local codebase search. Do not specify both allowed_domains and blocked_domains in the same request.",
             &["WebFetch", "Grep"],
-            vec![example(
-                "Search official docs",
-                json!({"query":"rust async trait object", "allowed_domains":["doc.rust-lang.org"]}),
-                "Use before WebFetch when URL is unknown.",
-            )],
+            vec![
+                example(
+                    "Search official docs",
+                    json!({"query":"rust async trait object", "allowed_domains":["doc.rust-lang.org"]}),
+                    "Use before WebFetch when URL is unknown.",
+                ),
+                example(
+                    "Search recent documentation",
+                    json!({"query":"React documentation 2026", "max_results": 5}),
+                    "Include the current year for recent docs or current events.",
+                ),
+            ],
         )),
         // GetCurrentDir is now an alias for Workspace (get mode)
         "GetCurrentDir" => Some(guide(
