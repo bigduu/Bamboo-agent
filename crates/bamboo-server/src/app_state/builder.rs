@@ -250,6 +250,18 @@ impl AppState {
         let tool_factory =
             crate::tools::ToolSurfaceFactory::new(base_tools, tools_with_task, tools);
 
+        // Subagent profile registry: built-ins + user/project/env overrides.
+        // Workspace path is intentionally `None` here — the registry is a
+        // process-wide singleton; per-workspace overrides can still be picked
+        // up via the `BAMBOO_SUBAGENT_PROFILES_FILE` env var or by
+        // resolving against `<bamboo_home_dir>/subagent_profiles.json`.
+        let subagent_profiles = crate::subagent_profiles::load_registry(&bamboo_home_dir, None)
+            .map_err(|e| {
+                crate::error::AppError::InternalError(anyhow::anyhow!(
+                    "failed to load subagent profile registry: {e}"
+                ))
+            })?;
+
         Ok(Self {
             app_data_dir: bamboo_home_dir,
             config,
@@ -262,6 +274,7 @@ impl AppState {
             schedule_store,
             schedule_manager,
             tool_factory,
+            subagent_profiles,
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             skill_manager,
             mcp_manager,

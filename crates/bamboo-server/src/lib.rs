@@ -126,6 +126,7 @@ pub mod server_tools;
 pub mod services;
 pub mod session_app;
 pub mod spawn_scheduler;
+pub mod subagent_profiles;
 pub mod tools;
 pub mod workflow;
 
