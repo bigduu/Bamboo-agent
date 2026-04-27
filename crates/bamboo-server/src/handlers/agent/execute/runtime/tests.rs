@@ -8,8 +8,39 @@ use bamboo_engine::execution::agent_spawn::{
     preserve_concurrent_session_overrides, terminal_error_event_for_result,
 };
 
+use super::execution::{execution_tool_surface, tools_for_execution};
 use super::session_state::{selected_skill_ids_for_session, selected_skill_mode_for_session};
 use crate::app_state::runner_lifecycle::status_from_execution_result;
+use crate::app_state::AppState;
+use crate::tools::ToolSurface;
+
+#[test]
+fn execution_tool_surface_selects_root_for_root_sessions_and_child_for_child_sessions() {
+    assert_eq!(execution_tool_surface(false), ToolSurface::Root);
+    assert_eq!(execution_tool_surface(true), ToolSurface::Child);
+}
+
+#[tokio::test]
+async fn execution_tools_expose_sub_session_only_for_root_sessions() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+
+    let root_names: std::collections::HashSet<String> = tools_for_execution(&state, false)
+        .list_tools()
+        .into_iter()
+        .map(|schema| schema.function.name)
+        .collect();
+    let child_names: std::collections::HashSet<String> = tools_for_execution(&state, true)
+        .list_tools()
+        .into_iter()
+        .map(|schema| schema.function.name)
+        .collect();
+
+    assert!(root_names.contains("SubSession"));
+    assert!(!child_names.contains("SubSession"));
+}
 
 #[test]
 fn has_pending_user_message_only_when_last_message_is_user() {

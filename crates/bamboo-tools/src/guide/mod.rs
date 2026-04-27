@@ -397,13 +397,27 @@ impl EnhancedPromptBuilder {
     ) -> String {
         let guides = Self::collect_guides(registry, tool_names);
 
-        let (core_guides, discoverable_guides): (Vec<ToolGuideSpec>, Vec<ToolGuideSpec>) = guides
-            .into_iter()
-            .partition(|guide| is_core_tool(&canonical_tool_name(&guide.tool_name)));
+        // Split into core, activated-discoverable, and inactive-discoverable.
+        let activated = &context.activated_discoverable_tools;
+        let mut core_guides: Vec<ToolGuideSpec> = Vec::new();
+        let mut activated_discoverable: Vec<ToolGuideSpec> = Vec::new();
+        let mut inactive_discoverable: Vec<ToolGuideSpec> = Vec::new();
+
+        for guide in guides {
+            let canonical = canonical_tool_name(&guide.tool_name);
+            if is_core_tool(&canonical) {
+                core_guides.push(guide);
+            } else if activated.contains(&canonical) {
+                activated_discoverable.push(guide);
+            } else {
+                inactive_discoverable.push(guide);
+            }
+        }
 
         let mut output = String::from("## Tool Usage Guidelines\n");
         let mut rendered_any = false;
 
+        // Render core tools (always full detail).
         if !core_guides.is_empty() {
             rendered_any = true;
             let mut grouped: BTreeMap<ToolCategory, Vec<&ToolGuideSpec>> = BTreeMap::new();
@@ -425,52 +439,59 @@ impl EnhancedPromptBuilder {
                 output.push('\n');
 
                 for guide in category_guides {
-                    output.push_str(&format!("\n**{}**\n", guide.tool_name));
-                    output.push_str(&format!(
-                        "- {}: {}\n",
-                        when_to_use_label(context.language),
-                        guide.when_to_use
-                    ));
-                    output.push_str(&format!(
-                        "- {}: {}\n",
-                        when_not_to_use_label(context.language),
-                        guide.when_not_to_use
-                    ));
-
-                    for example in guide.examples.iter().take(context.max_examples_per_tool) {
-                        let params = serde_json::to_string(&example.parameters)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        output.push_str(&format!(
-                            "- {}: {}\n  -> {}\n",
-                            example_label(context.language),
-                            params,
-                            example.explanation
-                        ));
-                    }
-
-                    if !guide.related_tools.is_empty() {
-                        output.push_str(&format!(
-                            "- {}: {}\n",
-                            related_tools_label(context.language),
-                            guide.related_tools.join(", ")
-                        ));
-                    }
+                    Self::render_full_guide(&mut output, guide, context);
                 }
             }
         }
 
-        if !discoverable_guides.is_empty() {
+        // Render activated discoverable tools with full detail.
+        if !activated_discoverable.is_empty() {
+            rendered_any = true;
+            let mut grouped: BTreeMap<ToolCategory, Vec<&ToolGuideSpec>> = BTreeMap::new();
+            for guide in &activated_discoverable {
+                grouped.entry(guide.category).or_default().push(guide);
+            }
+
+            for guides in grouped.values_mut() {
+                guides.sort_by_key(|g| g.tool_name.clone());
+            }
+
+            output.push_str(&format!(
+                "\n### {}\n",
+                activated_discoverable_title(context.language)
+            ));
+            output.push_str(activated_discoverable_description(context.language));
+            output.push('\n');
+
+            for category in ToolCategory::ordered() {
+                let Some(category_guides) = grouped.get(category) else {
+                    continue;
+                };
+
+                output.push_str(&format!("\n#### {}\n", category.title(context.language)));
+                output.push_str(category.description(context.language));
+                output.push('\n');
+
+                for guide in category_guides {
+                    Self::render_full_guide(&mut output, guide, context);
+                }
+            }
+        }
+
+        // Render inactive discoverable tools with short summaries.
+        if !inactive_discoverable.is_empty() {
             rendered_any = true;
             output.push('\n');
             output.push_str(&Self::render_discoverable_section(
-                &discoverable_guides,
+                &inactive_discoverable,
                 context,
             ));
         }
 
         let guided_names: BTreeSet<String> = core_guides
             .iter()
-            .chain(discoverable_guides.iter())
+            .chain(activated_discoverable.iter())
+            .chain(inactive_discoverable.iter())
             .map(|guide| guide.tool_name.clone())
             .collect();
         let unguided_schemas: Vec<ToolSchema> = fallback_schemas
@@ -504,6 +525,39 @@ impl EnhancedPromptBuilder {
         }
 
         output
+    }
+
+    fn render_full_guide(output: &mut String, guide: &ToolGuideSpec, context: &GuideBuildContext) {
+        output.push_str(&format!("\n**{}**\n", guide.tool_name));
+        output.push_str(&format!(
+            "- {}: {}\n",
+            when_to_use_label(context.language),
+            guide.when_to_use
+        ));
+        output.push_str(&format!(
+            "- {}: {}\n",
+            when_not_to_use_label(context.language),
+            guide.when_not_to_use
+        ));
+
+        for example in guide.examples.iter().take(context.max_examples_per_tool) {
+            let params =
+                serde_json::to_string(&example.parameters).unwrap_or_else(|_| "{}".to_string());
+            output.push_str(&format!(
+                "- {}: {}\n  -> {}\n",
+                example_label(context.language),
+                params,
+                example.explanation
+            ));
+        }
+
+        if !guide.related_tools.is_empty() {
+            output.push_str(&format!(
+                "- {}: {}\n",
+                related_tools_label(context.language),
+                guide.related_tools.join(", ")
+            ));
+        }
     }
 
     /// Collects guides for the specified tools from registry and built-in guides
@@ -645,10 +699,30 @@ fn discoverable_tools_title(language: GuideLanguage) -> &'static str {
 fn discoverable_tools_description(language: GuideLanguage) -> &'static str {
     match language {
         GuideLanguage::Chinese => {
-            "These lower-frequency tools are available but not fully expanded by default to save context."
+            "These lower-frequency tools are available but not fully expanded by default to save context. Activate them when needed for full parameter details and examples."
         }
         GuideLanguage::English => {
-            "These lower-frequency tools are available but not fully expanded by default to save context."
+            "These lower-frequency tools are available but not fully expanded by default to save context. Activate them when needed for full parameter details and examples."
+        }
+    }
+}
+
+/// Returns the activated-discoverable section title in the appropriate language
+fn activated_discoverable_title(language: GuideLanguage) -> &'static str {
+    match language {
+        GuideLanguage::Chinese => "Activated Discoverable Tools",
+        GuideLanguage::English => "Activated Discoverable Tools",
+    }
+}
+
+/// Returns the activated-discoverable section description in the appropriate language
+fn activated_discoverable_description(language: GuideLanguage) -> &'static str {
+    match language {
+        GuideLanguage::Chinese => {
+            "These discoverable tools are currently activated and available with full detail."
+        }
+        GuideLanguage::English => {
+            "These discoverable tools are currently activated and available with full detail."
         }
     }
 }
@@ -854,6 +928,104 @@ mod tests {
         assert!(
             saved > 0,
             "expected prompt savings for summarized discoverable tools"
+        );
+    }
+
+    #[test]
+    fn build_shows_activated_discoverable_tools_with_full_detail() {
+        let registry = ToolRegistry::new();
+        registry.register(crate::tools::SleepTool::new()).unwrap();
+
+        let schemas = registry.list_tools();
+        let mut context = GuideBuildContext::default();
+        context
+            .activated_discoverable_tools
+            .insert("Sleep".to_string());
+
+        let prompt = EnhancedPromptBuilder::build(Some(&registry), &schemas, &context);
+
+        assert!(
+            prompt.contains("### Activated Discoverable Tools"),
+            "activated discoverable section should appear"
+        );
+        assert!(
+            prompt.contains("**Sleep**"),
+            "activated Sleep should show full guide with bold name"
+        );
+        assert!(
+            prompt.contains("When to use"),
+            "activated Sleep should include when_to_use"
+        );
+        assert!(
+            prompt.contains("When NOT to use"),
+            "activated Sleep should include when_not_to_use"
+        );
+        assert!(
+            !prompt.contains("### Discoverable Tools"),
+            "inactive discoverable section should not appear when all discoverable tools are activated"
+        );
+    }
+
+    #[test]
+    fn build_shows_inactive_discoverable_tools_with_short_summary() {
+        let registry = ToolRegistry::new();
+        registry.register(crate::tools::SleepTool::new()).unwrap();
+
+        let schemas = registry.list_tools();
+        let context = GuideBuildContext::default();
+
+        let prompt = EnhancedPromptBuilder::build(Some(&registry), &schemas, &context);
+
+        assert!(
+            prompt.contains("### Discoverable Tools"),
+            "inactive discoverable section should appear"
+        );
+        assert!(
+            prompt.contains("`Sleep`"),
+            "inactive Sleep should show as short summary"
+        );
+        assert!(
+            !prompt.contains("**Sleep**"),
+            "inactive Sleep should NOT show full guide with bold name"
+        );
+        assert!(
+            !prompt.contains("Activated Discoverable Tools"),
+            "activated section should not appear when no discoverable tools are activated"
+        );
+    }
+
+    #[test]
+    fn build_separates_core_and_discoverable_tools_correctly() {
+        let registry = ToolRegistry::new();
+        registry.register(ReadTool::new()).unwrap();
+        registry.register(crate::tools::SleepTool::new()).unwrap();
+
+        let schemas = registry.list_tools();
+        let mut context = GuideBuildContext::default();
+        context
+            .activated_discoverable_tools
+            .insert("Sleep".to_string());
+
+        let prompt = EnhancedPromptBuilder::build(Some(&registry), &schemas, &context);
+
+        // Core tool (Read) should appear in its category section with full detail
+        assert!(
+            prompt.contains("### File Reading Tools"),
+            "core tools should appear in category section"
+        );
+        assert!(
+            prompt.contains("**Read**"),
+            "core Read should show full guide"
+        );
+
+        // Activated discoverable should appear in activated section
+        assert!(
+            prompt.contains("### Activated Discoverable Tools"),
+            "activated discoverable section should appear"
+        );
+        assert!(
+            prompt.contains("**Sleep**"),
+            "activated Sleep should show full guide"
         );
     }
 }

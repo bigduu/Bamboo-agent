@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
@@ -255,9 +257,11 @@ pub(crate) fn build_tool_guide_context(
     tool_schemas: &[ToolSchema],
     base_prompt_for_language: &str,
     session_id: &str,
+    activated_discoverable_tools: &BTreeSet<String>,
 ) -> String {
     let normalized_base_prompt = normalize_base_prompt(base_prompt_for_language);
-    let guide_context = GuideBuildContext::from_system_prompt(&normalized_base_prompt);
+    let mut guide_context = GuideBuildContext::from_system_prompt(&normalized_base_prompt);
+    guide_context.activated_discoverable_tools = activated_discoverable_tools.clone();
     let tool_guide_context = EnhancedPromptBuilder::build(
         Some(config.tool_registry.as_ref()),
         tool_schemas,

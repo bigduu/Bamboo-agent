@@ -10,10 +10,10 @@ use bamboo_domain::tool_names::{normalize_builtin_alias, resolve_alias};
 use crate::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
 use crate::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::tools::{
-    BashOutputTool, BashTool, ConclusionWithOptionsTool, EditTool, ExitPlanModeTool,
-    GetFileInfoTool, GlobTool, GrepTool, JsReplTool, KillShellTool, NotebookEditTool, ReadTool,
-    RequestPermissionsTool, SessionNoteTool, SleepTool, TaskTool, ToolRegistry, WebFetchTool,
-    WebSearchTool, WorkspaceTool, WriteTool,
+    BashOutputTool, BashTool, ConclusionWithOptionsTool, EditTool, EnterPlanModeTool,
+    ExitPlanModeTool, GetFileInfoTool, GlobTool, GrepTool, JsReplTool, KillShellTool,
+    NotebookEditTool, ReadTool, RequestPermissionsTool, SessionNoteTool, SleepTool, TaskTool,
+    ToolRegistry, WebFetchTool, WebSearchTool, WorkspaceTool, WriteTool,
 };
 use bamboo_infrastructure::Config;
 use tokio::sync::RwLock;
@@ -165,6 +165,7 @@ impl BuiltinToolExecutor {
         let _ = registry.register(BashTool::new());
         let _ = registry.register(BashOutputTool::new());
         let _ = registry.register(EditTool::new());
+        let _ = registry.register(EnterPlanModeTool::new());
         let _ = registry.register(ExitPlanModeTool::new());
         // NOTE: FileExists is now an alias for GetFileInfo – no separate registration.
         let _ = registry.register(GetFileInfoTool::new());

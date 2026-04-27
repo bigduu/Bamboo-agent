@@ -22,6 +22,7 @@ pub(super) async fn handle_get_provider_config(
             .map(|value| value.to_string())
             .collect(),
         providers: masked_providers,
+        defaults: config.defaults.clone(),
         features: config.features.clone(),
     };
 

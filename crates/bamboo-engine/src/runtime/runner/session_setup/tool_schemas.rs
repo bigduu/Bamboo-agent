@@ -1,7 +1,10 @@
 use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::{ToolExecutor, ToolSchema};
 use bamboo_agent_core::Session;
-use bamboo_tools::exposure::{activated_discoverable_tools, canonical_tool_name, is_core_tool};
+use bamboo_tools::exposure::{
+    activated_discoverable_tools, canonical_tool_name, discoverable_tool_short_description,
+    is_core_tool,
+};
 
 const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str =
     "copilot_conclusion_with_options_enhancement_enabled";
@@ -47,10 +50,19 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
     }
 
     let activated = activated_discoverable_tools(session);
-    tool_schemas.retain(|schema| {
+
+    // Replace descriptions for inactive discoverable tools with short summaries.
+    // All tools remain available to the LLM; activation only controls the
+    // depth of guidance (short vs full) shown in the tool guide.
+    for schema in &mut tool_schemas {
         let canonical = canonical_tool_name(&schema.function.name);
-        is_core_tool(&canonical) || activated.contains(&canonical)
-    });
+        if !is_core_tool(&canonical) && !activated.contains(&canonical) {
+            if let Some(short) = discoverable_tool_short_description(&canonical) {
+                schema.function.description =
+                    format!("[Discoverable — not fully activated] {}", short);
+            }
+        }
+    }
 
     apply_session_tool_schema_overrides(session, &mut tool_schemas);
 

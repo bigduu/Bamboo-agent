@@ -63,6 +63,12 @@ fn build_provider_patch(payload: &UpdateProviderRequest) -> serde_json::Map<Stri
         Value::String(payload.provider.clone()),
     );
     patch_obj.insert("providers".to_string(), payload.providers.clone());
+    if let Some(defaults) = &payload.defaults {
+        patch_obj.insert(
+            "defaults".to_string(),
+            serde_json::to_value(defaults).expect("DefaultsConfig should serialize"),
+        );
+    }
     patch_obj
 }
 
@@ -103,6 +109,7 @@ mod tests {
         let request = UpdateProviderRequest {
             provider: "openai".to_string(),
             providers: serde_json::json!({"openai":{"model":"gpt-4.1"}}),
+            defaults: None,
         };
 
         let patch = build_provider_patch(&request);
@@ -110,6 +117,41 @@ mod tests {
         assert_eq!(
             patch.get("providers"),
             Some(&serde_json::json!({"openai":{"model":"gpt-4.1"}}))
+        );
+        assert!(patch.get("defaults").is_none());
+    }
+
+    #[test]
+    fn build_provider_patch_preserves_defaults_chat_model_ref() {
+        let request = UpdateProviderRequest {
+            provider: "copilot".to_string(),
+            providers: serde_json::json!({"copilot":{"model":"gpt-5.5"}}),
+            defaults: Some(bamboo_infrastructure::DefaultsConfig {
+                chat: bamboo_domain::ProviderModelRef {
+                    provider: "copilot".to_string(),
+                    model: "gpt-5.5".to_string(),
+                },
+                fast: Some(bamboo_domain::ProviderModelRef {
+                    provider: "openai".to_string(),
+                    model: "qwen3.6-plus".to_string(),
+                }),
+                vision: None,
+                memory_background: None,
+                planning: None,
+                search: None,
+                code_review: None,
+                sub_session: None,
+                subagent_models: std::collections::HashMap::new(),
+            }),
+        };
+
+        let patch = build_provider_patch(&request);
+        assert_eq!(
+            patch.get("defaults"),
+            Some(&serde_json::json!({
+                "chat": {"provider":"copilot", "model":"gpt-5.5"},
+                "fast": {"provider":"openai", "model":"qwen3.6-plus"}
+            }))
         );
     }
 }

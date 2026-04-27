@@ -56,7 +56,6 @@ async fn root_tools_include_server_overlays_and_session_note() {
     assert!(names.contains("Task"));
     assert!(names.contains("SubSession"));
     assert!(names.contains("scheduler"));
-    assert!(names.contains("sub_session_manager"));
     assert!(names.contains("recall"));
     assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
@@ -157,15 +156,12 @@ async fn overlay_tools_require_session_context() {
         Err(ToolError::Execution(msg)) if msg.contains("session_id")
     ));
 
-    let sub_session_manager_result = state
+    let sub_session_result = state
         .tools_for(ToolSurface::Root)
-        .execute(&make_tool_call(
-            "sub_session_manager",
-            json!({ "action": "list" }),
-        ))
+        .execute(&make_tool_call("SubSession", json!({ "action": "list" })))
         .await;
     assert!(matches!(
-        sub_session_manager_result,
+        sub_session_result,
         Err(ToolError::Execution(msg)) if msg.contains("session_id")
     ));
 }

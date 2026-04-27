@@ -175,8 +175,11 @@ impl Tool for WebSearchTool {
             ));
         }
 
+        let allowed_domains = parsed.allowed_domains.filter(|v| !v.is_empty());
+        let blocked_domains = parsed.blocked_domains.filter(|v| !v.is_empty());
+
         // Mutual-exclusion validation
-        if parsed.allowed_domains.is_some() && parsed.blocked_domains.is_some() {
+        if allowed_domains.is_some() && blocked_domains.is_some() {
             return Err(ToolError::InvalidArguments(
                 "Cannot specify both allowed_domains and blocked_domains in the same request"
                     .to_string(),
@@ -189,7 +192,7 @@ impl Tool for WebSearchTool {
             .min(ABSOLUTE_MAX_RESULTS);
 
         // Check cache
-        let cache_key = Self::cache_key(query, &parsed.allowed_domains, &parsed.blocked_domains);
+        let cache_key = Self::cache_key(query, &allowed_domains, &blocked_domains);
         if let Some(cached) = Self::try_cache(&cache_key) {
             ctx.emit_tool_token("Using cached search results\n").await;
             return Ok(ToolResult {
@@ -226,14 +229,13 @@ impl Tool for WebSearchTool {
             ));
         }
 
-        let allowed: Option<HashSet<String>> = parsed.allowed_domains.map(|domains| {
+        let allowed: Option<HashSet<String>> = allowed_domains.map(|domains| {
             domains
                 .into_iter()
                 .map(|value| value.to_ascii_lowercase())
                 .collect()
         });
-        let blocked: HashSet<String> = parsed
-            .blocked_domains
+        let blocked: HashSet<String> = blocked_domains
             .unwrap_or_default()
             .into_iter()
             .map(|value| value.to_ascii_lowercase())

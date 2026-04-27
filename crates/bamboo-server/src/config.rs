@@ -379,11 +379,29 @@ pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
     let allowlist = parse_cors_allowlist_env();
 
     let cors = if bind_addr == "127.0.0.1" || bind_addr == "localhost" || bind_addr == "::1" {
-        // Development/Desktop mode - allow all origins and headers for maximum flexibility
-        // This is safe because the server only binds to localhost
-        info!("CORS configured for development mode: allowing all origins and headers (localhost only)");
+        // Development/Desktop mode. Keep origins permissive for local/Tauri callers, but do not
+        // combine wildcard `Access-Control-Allow-Origin: *` with credentialed requests. The Lotus
+        // client sends `credentials: "include"` so browsers require a concrete echoed Origin.
+        info!("CORS configured for development mode: allowing local/Tauri origins (+ optional allowlist)");
         Cors::default()
-            .allow_any_origin()
+            .allowed_origin_fn(move |origin, _req_head| {
+                let o = match origin.to_str() {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+
+                if is_allowed_by_allowlist(o, &allowlist) {
+                    return true;
+                }
+
+                if is_local_dev_origin(o) {
+                    return true;
+                }
+
+                o == "tauri://localhost"
+                    || o == "https://tauri.localhost"
+                    || o == "http://tauri.localhost"
+            })
             .allow_any_method()
             .allow_any_header()
             .supports_credentials()

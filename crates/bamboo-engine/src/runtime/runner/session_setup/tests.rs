@@ -138,7 +138,19 @@ fn resolve_available_tool_schemas_hides_discoverable_tools_by_default() {
         .map(|item| item.function.name.as_str())
         .collect();
 
-    assert_eq!(names, vec!["Read"]);
+    assert_eq!(names, vec!["Read", "Sleep", "scheduler"]);
+
+    // Inactive discoverable tools get shortened descriptions
+    let sleep = resolved
+        .iter()
+        .find(|s| s.function.name == "Sleep")
+        .unwrap();
+    assert!(sleep.function.description.contains("Discoverable"));
+    let scheduler = resolved
+        .iter()
+        .find(|s| s.function.name == "scheduler")
+        .unwrap();
+    assert!(scheduler.function.description.contains("Discoverable"));
 }
 
 #[test]
@@ -157,6 +169,13 @@ fn resolve_available_tool_schemas_includes_activated_discoverable_tools() {
         .collect();
 
     assert_eq!(names, vec!["Read", "Sleep", "scheduler"]);
+
+    // Activated discoverable tools keep full descriptions
+    let sleep = resolved
+        .iter()
+        .find(|s| s.function.name == "Sleep")
+        .unwrap();
+    assert!(!sleep.function.description.contains("Discoverable"));
 }
 
 #[test]
@@ -178,7 +197,13 @@ fn resolve_available_tool_schemas_does_not_mutate_session_metadata() {
         .map(|item| item.function.name.as_str())
         .collect();
 
-    assert_eq!(names, vec!["Write"]);
+    // All tools are available; inactive discoverable ones get shortened descriptions
+    assert_eq!(names, vec!["Write", "recall"]);
+    let recall = resolved
+        .iter()
+        .find(|s| s.function.name == "recall")
+        .unwrap();
+    assert!(recall.function.description.contains("Discoverable"));
     assert_eq!(
         session.metadata.get("existing").map(String::as_str),
         Some("value")

@@ -331,32 +331,62 @@ pub fn resolve_code_review_model(
     resolve_default_chat_model(config, provider_name, provider_registry)
 }
 
+/// Resolve the provider+model reference for a specific subagent type.
+///
+/// Fallback chain: `defaults.subagent_models[type]` → `defaults.sub_session` →
+/// `defaults.fast`/legacy fast → `defaults.chat`/legacy default.
+pub fn resolve_subagent_model_ref(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+    subagent_type: &str,
+) -> Option<bamboo_domain::ProviderModelRef> {
+    if config.features.provider_model_ref {
+        let router = ProviderModelRouter::new(provider_registry.clone());
+        if let Some(defaults) = config.defaults.as_ref() {
+            let candidate_refs = [
+                defaults.subagent_models.get(subagent_type),
+                defaults.sub_session.as_ref(),
+                defaults.fast.as_ref(),
+            ];
+
+            for model_ref in candidate_refs.into_iter().flatten() {
+                if router.route(model_ref).is_ok() {
+                    return Some(model_ref.clone());
+                }
+            }
+        }
+    }
+
+    resolve_fast_model(config, provider_name, provider_registry)
+        .or_else(|| resolve_default_chat_model(config, provider_name, provider_registry))
+        .map(|resolved| bamboo_domain::ProviderModelRef::new(provider_name, resolved.model_name))
+}
+
 /// Resolve the model for a specific subagent type.
 ///
-/// Fallback chain: `defaults.subagent_models[type]` → `defaults.chat`.
+/// Fallback chain: `defaults.subagent_models[type]` → `defaults.sub_session` →
+/// `defaults.fast`/legacy fast → `defaults.chat`/legacy default.
 pub fn resolve_subagent_model(
     config: &Config,
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
     subagent_type: &str,
 ) -> Option<ResolvedModel> {
-    if config.features.provider_model_ref {
-        if let Some(model_ref) = config
-            .defaults
-            .as_ref()
-            .and_then(|d| d.subagent_models.get(subagent_type))
-        {
-            if let Ok(provider) =
-                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
-            {
-                return Some(ResolvedModel {
-                    provider,
-                    model_name: model_ref.model.clone(),
-                });
-            }
-        }
-    }
-    resolve_default_chat_model(config, provider_name, provider_registry)
+    let model_ref =
+        resolve_subagent_model_ref(config, provider_name, provider_registry, subagent_type)?;
+    let provider = ProviderModelRouter::new(provider_registry.clone())
+        .route(&model_ref)
+        .or_else(|_| {
+            provider_registry.get(&model_ref.provider).ok_or_else(|| {
+                LLMError::Auth(format!("Provider '{}' not available", model_ref.provider))
+            })
+        })
+        .ok()?;
+    Some(ResolvedModel {
+        provider,
+        model_name: model_ref.model,
+    })
 }
 
 /// Resolve the default chat model from config.
@@ -390,7 +420,34 @@ fn resolve_default_chat_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_infrastructure::{CopilotConfig, OpenAIConfig, ProviderConfigs};
+    use bamboo_agent_core::tools::ToolSchema;
+    use bamboo_agent_core::Message;
+    use bamboo_domain::ProviderModelRef;
+    use bamboo_infrastructure::{
+        CopilotConfig, DefaultsConfig, LLMProvider, LLMStream, OpenAIConfig, ProviderConfigs,
+    };
+    use std::collections::HashMap;
+
+    struct NoopProvider;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for NoopProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Err(LLMError::Api("noop".to_string()))
+        }
+    }
+
+    fn test_registry() -> Arc<ProviderRegistry> {
+        let mut providers: HashMap<String, Arc<dyn LLMProvider>> = HashMap::new();
+        providers.insert("openai".to_string(), Arc::new(NoopProvider));
+        Arc::new(ProviderRegistry::new(providers, "openai".to_string()))
+    }
 
     #[test]
     fn test_get_model_from_openai_config() {
@@ -568,5 +625,50 @@ mod tests {
             get_reasoning_effort_for_provider(&config, "openai"),
             Some(ReasoningEffort::Medium)
         );
+    }
+    #[test]
+    fn resolve_subagent_model_ref_prefers_sub_session_over_fast() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.features.provider_model_ref = true;
+        config.defaults = Some(DefaultsConfig {
+            chat: ProviderModelRef::new("openai", "gpt-chat"),
+            fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
+            vision: None,
+            memory_background: None,
+            planning: None,
+            search: None,
+            code_review: None,
+            sub_session: Some(ProviderModelRef::new("openai", "gpt-sub-session")),
+            subagent_models: HashMap::new(),
+        });
+
+        let resolved = resolve_subagent_model_ref(&config, "openai", &test_registry(), "coder")
+            .expect("sub-session model should resolve");
+
+        assert_eq!(resolved, ProviderModelRef::new("openai", "gpt-sub-session"));
+    }
+
+    #[test]
+    fn resolve_subagent_model_ref_falls_back_to_fast_when_sub_session_unset() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.features.provider_model_ref = true;
+        config.defaults = Some(DefaultsConfig {
+            chat: ProviderModelRef::new("openai", "gpt-chat"),
+            fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
+            vision: None,
+            memory_background: None,
+            planning: None,
+            search: None,
+            code_review: None,
+            sub_session: None,
+            subagent_models: HashMap::new(),
+        });
+
+        let resolved = resolve_subagent_model_ref(&config, "openai", &test_registry(), "coder")
+            .expect("fast model should resolve");
+
+        assert_eq!(resolved, ProviderModelRef::new("openai", "gpt-fast"));
     }
 }

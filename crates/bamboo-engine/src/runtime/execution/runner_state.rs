@@ -74,6 +74,22 @@ pub struct AgentRunner {
     /// When a new client subscribes to an ongoing run, this
     /// allows them to receive the most recent token usage info.
     pub last_budget_event: Option<AgentEvent>,
+
+    /// Name of the most recently executed tool (if any).
+    /// Updated live during execution for diagnostic visibility.
+    pub last_tool_name: Option<String>,
+
+    /// Phase of the most recently executed tool: "begin", "finished", or "error".
+    /// Updated live during execution for diagnostic visibility.
+    pub last_tool_phase: Option<String>,
+
+    /// Timestamp of the last event received during this run.
+    /// Updated live during execution for liveness checks.
+    pub last_event_at: Option<DateTime<Utc>>,
+
+    /// Number of completed rounds (turns) so far.
+    /// Updated live during execution for progress tracking.
+    pub round_count: u32,
 }
 
 impl Default for AgentRunner {
@@ -99,6 +115,10 @@ impl AgentRunner {
             started_at: Utc::now(),
             completed_at: None,
             last_budget_event: None,
+            last_tool_name: None,
+            last_tool_phase: None,
+            last_event_at: None,
+            round_count: 0,
         }
     }
 }

@@ -246,7 +246,12 @@ pub async fn send_clarification_request(
     options: Option<Vec<String>>,
 ) {
     let _ = event_tx
-        .send(AgentEvent::NeedClarification { question, options })
+        .send(AgentEvent::NeedClarification {
+            question,
+            options,
+            tool_call_id: None,
+            allow_custom: true,
+        })
         .await;
 }
 
@@ -453,7 +458,9 @@ mod tests {
 
         let event = event_rx.recv().await.expect("missing clarification event");
         match event {
-            AgentEvent::NeedClarification { question, options } => {
+            AgentEvent::NeedClarification {
+                question, options, ..
+            } => {
                 assert_eq!(question, "Which file should I inspect?");
                 assert_eq!(
                     options,

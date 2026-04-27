@@ -23,6 +23,7 @@ anyhow = "1"
 regex = "1"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 dashmap = "6"
+seahash = "4"
 
 [dev-dependencies]
 tempfile = "3"

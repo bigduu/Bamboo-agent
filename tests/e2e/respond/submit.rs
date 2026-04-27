@@ -10,6 +10,7 @@ async fn test_submit_response_rejects_invalid_option_and_keeps_pending_question(
     session.add_message(Message::tool_result("tool-call-1", "placeholder"));
     session.set_pending_question(
         "tool-call-1".to_string(),
+        "ConclusionWithOptions".to_string(),
         "Pick one".to_string(),
         vec!["A".to_string(), "B".to_string()],
         false,
@@ -59,6 +60,7 @@ async fn test_submit_response_updates_tool_result_and_clears_pending_question() 
     session.add_message(Message::tool_result("tool-call-2", "placeholder"));
     session.set_pending_question(
         "tool-call-2".to_string(),
+        "ConclusionWithOptions".to_string(),
         "Pick one".to_string(),
         vec!["A".to_string(), "B".to_string()],
         false,

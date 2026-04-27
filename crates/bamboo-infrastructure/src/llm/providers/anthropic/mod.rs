@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use crate::config::RequestOverridesConfig;
 use crate::llm::provider::LLMRequestOptions;
 use crate::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
+use crate::llm::providers::common::model_fetcher;
 use crate::llm::providers::common::request_overrides;
 use crate::llm::types::LLMChunk;
 use bamboo_domain::ReasoningEffort;
@@ -291,6 +292,12 @@ impl LLMProvider for AnthropicProvider {
         );
 
         Ok(stream)
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>> {
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        model_fetcher::fetch_model_list(&self.client, &url, headers, "Anthropic").await
     }
 }
 

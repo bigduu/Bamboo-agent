@@ -421,6 +421,7 @@ fn test_session_set_pending_question() {
 
     session.set_pending_question(
         "call-123".to_string(),
+        "ConclusionWithOptions".to_string(),
         "Which language?".to_string(),
         vec!["Rust".to_string(), "Python".to_string()],
         false,
@@ -441,6 +442,7 @@ fn test_session_clear_pending_question() {
 
     session.set_pending_question(
         "call-123".to_string(),
+        "ConclusionWithOptions".to_string(),
         "Question?".to_string(),
         vec![],
         true,
@@ -462,6 +464,7 @@ fn test_session_has_pending_question() {
 
     session.set_pending_question(
         "call-123".to_string(),
+        "ConclusionWithOptions".to_string(),
         "Question?".to_string(),
         vec![],
         true,

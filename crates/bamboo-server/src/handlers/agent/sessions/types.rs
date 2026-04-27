@@ -155,6 +155,19 @@ pub struct PatchSessionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ActivateDiscoverableToolsRequest {
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiscoverableToolsResponse {
+    pub session_id: String,
+    pub tools: Vec<serde_json::Value>,
+    pub activated: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CleanupRequest {
     pub mode: String,
     #[serde(default)]

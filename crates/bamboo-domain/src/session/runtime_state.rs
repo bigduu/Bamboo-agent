@@ -124,6 +124,42 @@ pub struct HookCheckpoint {
 }
 
 // ---------------------------------------------------------------------------
+// Plan mode state
+// ---------------------------------------------------------------------------
+
+/// Status within a plan mode session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanModeStatus {
+    /// Exploring the codebase with read-only tools.
+    #[default]
+    Exploring,
+    /// Designing the implementation approach.
+    Designing,
+    /// Reviewing the plan before finalizing.
+    Reviewing,
+    /// Writing the plan to the plan file.
+    Finalizing,
+    /// Awaiting user approval to exit plan mode.
+    AwaitingApproval,
+}
+
+/// Structured state for an active plan mode session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlanModeState {
+    /// When plan mode was entered.
+    pub entered_at: DateTime<Utc>,
+    /// The permission mode to restore when exiting plan mode.
+    pub pre_permission_mode: String,
+    /// Path to the persisted plan file, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_file_path: Option<String>,
+    /// Current phase within plan mode.
+    #[serde(default)]
+    pub status: PlanModeStatus,
+}
+
+// ---------------------------------------------------------------------------
 // Top-level state
 // ---------------------------------------------------------------------------
 
@@ -153,6 +189,8 @@ pub struct AgentRuntimeState {
     pub children: ChildSessionRuntimeState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<HookCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_mode: Option<PlanModeState>,
 }
 
 impl AgentRuntimeState {
@@ -169,6 +207,7 @@ impl AgentRuntimeState {
             llm: LlmRuntimeState::default(),
             children: ChildSessionRuntimeState::default(),
             checkpoints: Vec::new(),
+            plan_mode: None,
         }
     }
 }
@@ -187,6 +226,7 @@ impl Default for AgentRuntimeState {
             llm: LlmRuntimeState::default(),
             children: ChildSessionRuntimeState::default(),
             checkpoints: Vec::new(),
+            plan_mode: None,
         }
     }
 }
@@ -268,6 +308,64 @@ mod tests {
         for variant in &variants {
             let json = serde_json::to_string(variant).unwrap();
             let restored: AgentStatusState = serde_json::from_str(&json).unwrap();
+            assert_eq!(variant, &restored, "round-trip failed for {:?}", variant);
+        }
+    }
+
+    #[test]
+    fn plan_mode_state_serialize_deserialize_round_trip() {
+        let state = PlanModeState {
+            entered_at: Utc::now(),
+            pre_permission_mode: "default".to_string(),
+            plan_file_path: Some("/tmp/plans/test-plan.md".to_string()),
+            status: PlanModeStatus::Designing,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: PlanModeState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, restored);
+    }
+
+    #[test]
+    fn old_json_without_plan_mode_field_deserializes() {
+        // Simulate JSON from before plan_mode was added
+        let json = r#"{"version":1,"run_id":"old-run","status":"idle","checkpoints":[]}"#;
+        let state: AgentRuntimeState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.version, 1);
+        assert_eq!(state.run_id, "old-run");
+        assert!(state.plan_mode.is_none());
+    }
+
+    #[test]
+    fn agent_runtime_state_with_plan_mode_round_trip() {
+        let mut state = AgentRuntimeState::new("run-plan");
+        state.plan_mode = Some(PlanModeState {
+            entered_at: Utc::now(),
+            pre_permission_mode: "accept_edits".to_string(),
+            plan_file_path: None,
+            status: PlanModeStatus::Exploring,
+        });
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: AgentRuntimeState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, restored);
+        assert!(restored.plan_mode.is_some());
+        let plan = restored.plan_mode.unwrap();
+        assert_eq!(plan.pre_permission_mode, "accept_edits");
+        assert_eq!(plan.status, PlanModeStatus::Exploring);
+    }
+
+    #[test]
+    fn all_plan_mode_status_variants_serialize_correctly() {
+        let variants = [
+            PlanModeStatus::Exploring,
+            PlanModeStatus::Designing,
+            PlanModeStatus::Reviewing,
+            PlanModeStatus::Finalizing,
+            PlanModeStatus::AwaitingApproval,
+        ];
+        for variant in &variants {
+            let json = serde_json::to_string(variant).unwrap();
+            let restored: PlanModeStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(variant, &restored, "round-trip failed for {:?}", variant);
         }
     }

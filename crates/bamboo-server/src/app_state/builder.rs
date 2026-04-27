@@ -157,9 +157,9 @@ impl AppState {
         let child_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = base_tools.clone();
 
         // Unified agent runtime (shared resources for all execution paths).
-        // default_tools = base_tools (builtin + MCP + memory + skills).
-        // Root sessions use runtime default (no override);
-        // child sessions override via ExecuteRequest with ToolSurface::Child.
+        // default_tools = base_tools (builtin + MCP + memory + skills) as a safe fallback.
+        // Interactive execution paths pass an explicit tool surface override:
+        // root sessions use ToolSurface::Root; child sessions use ToolSurface::Child.
         let agent = Arc::new(
             bamboo_engine::Agent::builder()
                 .storage(storage.clone())
@@ -174,12 +174,17 @@ impl AppState {
         );
 
         // Initialize sub-session spawn scheduler (async background jobs).
+        let config_snapshot = config.read().await.clone();
+        let external_runner =
+            crate::external_agents::runtime::build_external_child_runner(&config_snapshot);
         let spawn_scheduler = build_spawn_scheduler(
             agent.clone(),
             child_tools,
             sessions.clone(),
             agent_runners.clone(),
             session_event_senders.clone(),
+            external_runner,
+            Some(provider_router.clone()),
         );
 
         let tools_with_task = base_tools.clone();
@@ -207,22 +212,25 @@ impl AppState {
 
         let config_for_resolver = config.clone();
         let subagent_model_resolver: OptionalSubagentModelResolver = {
-            let config_snap = config.read().await.clone();
             let registry = provider_registry.clone();
-            if config_snap.features.provider_model_ref && config_snap.defaults.is_some() {
-                Some(Arc::new(move |subagent_type: &str| -> Option<String> {
-                    let config_snap = config_for_resolver.blocking_read().clone();
-                    crate::model_config_helper::resolve_subagent_model(
-                        &config_snap,
-                        &config_snap.provider,
-                        &registry,
-                        subagent_type,
-                    )
-                    .map(|m| m.model_name)
-                }))
-            } else {
-                None
-            }
+            Some(Arc::new(
+                move |subagent_type: String| -> futures::future::BoxFuture<
+                    'static,
+                    Option<bamboo_domain::ProviderModelRef>,
+                > {
+                    let config_for_resolver = config_for_resolver.clone();
+                    let registry = registry.clone();
+                    Box::pin(async move {
+                        let config_snap = config_for_resolver.read().await.clone();
+                        crate::model_config_helper::resolve_subagent_model_ref(
+                            &config_snap,
+                            &config_snap.provider,
+                            &registry,
+                            &subagent_type,
+                        )
+                    })
+                },
+            ))
         };
 
         let tools = build_root_tools(
@@ -236,6 +244,7 @@ impl AppState {
             agent_runners.clone(),
             session_event_senders.clone(),
             subagent_model_resolver,
+            config.clone(),
         );
 
         let tool_factory =

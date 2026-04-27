@@ -205,13 +205,14 @@ impl TaskTool {
         args: &serde_json::Value,
         session_id: &str,
     ) -> Result<TaskList, ToolError> {
-        Self::task_list_from_args_with_existing(args, session_id, None)
+        Self::task_list_from_args_with_existing(args, session_id, None, None)
     }
 
     pub fn task_list_from_args_with_existing(
         args: &serde_json::Value,
         session_id: &str,
         existing: Option<&TaskList>,
+        default_phase: Option<TaskPhase>,
     ) -> Result<TaskList, ToolError> {
         let parsed: TaskArgsRaw = serde_json::from_value(args.clone())
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid Task args: {e}")))?;
@@ -349,7 +350,9 @@ impl TaskTool {
             };
             item.active_form = active_form;
             item.parent_id = parent_id;
-            item.phase = task.phase.unwrap_or_default();
+            item.phase = task
+                .phase
+                .unwrap_or_else(|| default_phase.as_ref().cloned().unwrap_or_default());
             item.priority = task.priority.unwrap_or_default();
             item.completion_criteria = completion_criteria;
 
@@ -616,6 +619,7 @@ mod tests {
             }),
             "session_3",
             Some(&existing),
+            None,
         )
         .expect("ids should be preserved");
 
@@ -738,6 +742,7 @@ mod tests {
             }),
             "session_6",
             Some(&existing),
+            None,
         )
         .expect("positional ids should be reused when item count is unchanged");
 
@@ -819,6 +824,7 @@ mod tests {
             }),
             "session_9",
             Some(&existing),
+            None,
         )
         .expect_err("ambiguous rewrite should be rejected");
 
@@ -861,6 +867,7 @@ mod tests {
             }),
             "session_10",
             Some(&existing),
+            None,
         )
         .expect("adding new items after matching existing ids should be allowed");
 

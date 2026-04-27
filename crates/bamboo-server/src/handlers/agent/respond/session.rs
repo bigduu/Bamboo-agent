@@ -22,6 +22,7 @@ mod tests {
         let mut storage_session = memory_session.clone();
         storage_session.set_pending_question(
             "tool-call-1".to_string(),
+            "ConclusionWithOptions".to_string(),
             "Need confirmation?".to_string(),
             vec!["OK".to_string()],
             true,

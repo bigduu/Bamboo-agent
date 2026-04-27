@@ -109,6 +109,7 @@ pub mod claude_runner;
 pub mod config;
 pub mod config_manager;
 pub mod error;
+pub mod external_agents;
 pub mod handlers;
 pub mod logging;
 pub mod message_hooks;

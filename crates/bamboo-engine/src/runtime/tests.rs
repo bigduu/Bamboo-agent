@@ -84,7 +84,9 @@ async fn need_clarification_sends_event() {
 
     let event = event_rx.recv().await.expect("missing clarification event");
     match event {
-        AgentEvent::NeedClarification { question, options } => {
+        AgentEvent::NeedClarification {
+            question, options, ..
+        } => {
             assert_eq!(question, "Which file should I inspect?");
             assert_eq!(
                 options,

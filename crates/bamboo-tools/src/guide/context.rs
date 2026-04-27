@@ -34,6 +34,10 @@ pub struct GuideBuildContext {
     pub include_best_practices: bool,
     /// Maximum number of examples to include per tool
     pub max_examples_per_tool: usize,
+    /// Discoverable tools that are currently activated for the session.
+    /// Activated discoverable tools render with full guides; inactive ones
+    /// render with short summaries only.
+    pub activated_discoverable_tools: std::collections::BTreeSet<String>,
 }
 
 impl Default for GuideBuildContext {
@@ -42,6 +46,7 @@ impl Default for GuideBuildContext {
             language: GuideLanguage::English,
             include_best_practices: true,
             max_examples_per_tool: 2,
+            activated_discoverable_tools: std::collections::BTreeSet::new(),
         }
     }
 }

@@ -13,8 +13,9 @@ use bamboo_agent_core::{AgentError, Role, Session};
 use bamboo_infrastructure::LLMProvider;
 
 use super::prompt_context::{
-    inject_external_memory_into_system_message, inject_task_list_into_system_message,
-    PromptMemoryRuntimeContext, PROMPT_MEMORY_OBSERVABILITY_KEY,
+    inject_external_memory_into_system_message, inject_plan_mode_instructions,
+    inject_task_list_into_system_message, PromptMemoryRuntimeContext,
+    PROMPT_MEMORY_OBSERVABILITY_KEY,
 };
 use super::session_setup::prompt_setup::{persist_prompt_snapshot_metadata, PromptAssemblyReport};
 use bamboo_agent_core::PromptSnapshot;
@@ -36,6 +37,7 @@ pub(crate) async fn refresh_round_prompt_context(
 ) {
     inject_external_memory_into_system_message(session, prompt_memory_flags, runtime_context).await;
     inject_task_list_into_system_message(session);
+    inject_plan_mode_instructions(session);
 
     let session_id = session.id.clone();
     let prompt_for_metadata = session

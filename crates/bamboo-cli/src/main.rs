@@ -379,7 +379,9 @@ async fn stream_message(
                         AgentEvent::ToolError { error, .. } => {
                             println!("{}", format!("❌ Tool error: {}", error).red());
                         }
-                        AgentEvent::NeedClarification { question, options } => {
+                        AgentEvent::NeedClarification {
+                            question, options, ..
+                        } => {
                             println!();
                             println!(
                                 "{}",

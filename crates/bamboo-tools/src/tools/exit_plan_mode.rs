@@ -6,6 +6,8 @@ use serde_json::json;
 #[derive(Debug, Deserialize)]
 struct ExitPlanModeArgs {
     plan: String,
+    #[serde(default)]
+    exit_mode: Option<String>,
 }
 
 pub struct ExitPlanModeTool;
@@ -38,7 +40,11 @@ impl Tool for ExitPlanModeTool {
             "properties": {
                 "plan": {
                     "type": "string",
-                    "description": "The plan to run by the user for approval"
+                    "description": "The plan to present to the user for approval"
+                },
+                "exit_mode": {
+                    "type": "string",
+                    "description": "Suggested permission mode after exiting plan mode: 'default', 'accept_edits', 'dont_ask', or 'bypass_permissions'"
                 }
             },
             "required": ["plan"],
@@ -51,12 +57,47 @@ impl Tool for ExitPlanModeTool {
             ToolError::InvalidArguments(format!("Invalid ExitPlanMode args: {}", e))
         })?;
 
+        // Build options based on suggested exit_mode
+        let options = match parsed.exit_mode.as_deref() {
+            Some("accept_edits") => vec![
+                "Approve (Accept edits mode)",
+                "Approve (Default mode)",
+                "Stay in plan mode",
+                "Edit plan first",
+            ],
+            Some("dont_ask") => vec![
+                "Approve (Don't ask mode)",
+                "Approve (Default mode)",
+                "Stay in plan mode",
+                "Edit plan first",
+            ],
+            Some("bypass_permissions") => vec![
+                "Approve (Bypass permissions)",
+                "Approve (Default mode)",
+                "Stay in plan mode",
+                "Edit plan first",
+            ],
+            _ => vec![
+                "Approve (Default mode)",
+                "Approve (Accept edits mode)",
+                "Stay in plan mode",
+                "Edit plan first",
+            ],
+        };
+
+        let question = if parsed.plan.trim().is_empty() {
+            "Plan ready. Exit plan mode and start implementation?"
+        } else {
+            "Plan ready. Review the plan below and approve to exit plan mode and start implementation."
+        };
+
         let payload = json!({
             "status": "awaiting_user_input",
-            "question": "Plan ready. Exit plan mode and start implementation?",
-            "options": ["Exit plan mode", "Stay in plan mode"],
+            "question": question,
+            "options": options,
             "allow_custom": false,
             "plan": parsed.plan,
+            "exit_mode": parsed.exit_mode,
         });
 
         Ok(ToolResult {
@@ -114,14 +155,12 @@ mod tests {
 
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
         assert_eq!(payload["status"], "awaiting_user_input");
-        assert!(payload["question"]
-            .as_str()
-            .unwrap()
-            .contains("Exit plan mode"));
-        assert_eq!(
-            payload["options"],
-            json!(["Exit plan mode", "Stay in plan mode"])
-        );
+        assert!(payload["question"].as_str().unwrap().contains("Plan ready"));
+        let options = payload["options"].as_array().unwrap();
+        assert_eq!(options.len(), 4);
+        assert!(options.contains(&json!("Approve (Default mode)")));
+        assert!(options.contains(&json!("Stay in plan mode")));
+        assert!(options.contains(&json!("Edit plan first")));
         assert_eq!(payload["allow_custom"], false);
         assert_eq!(payload["plan"], "Implement feature X");
     }
@@ -325,7 +364,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exit_plan_mode_options_has_two_choices() {
+    async fn exit_plan_mode_options_has_four_choices_by_default() {
         let tool = ExitPlanModeTool::new();
         let result = tool
             .execute(json!({
@@ -337,9 +376,45 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
         let options = payload["options"].as_array().unwrap();
 
-        assert_eq!(options.len(), 2);
-        assert!(options.contains(&json!("Exit plan mode")));
+        assert_eq!(options.len(), 4);
+        assert!(options.contains(&json!("Approve (Default mode)")));
+        assert!(options.contains(&json!("Approve (Accept edits mode)")));
         assert!(options.contains(&json!("Stay in plan mode")));
+        assert!(options.contains(&json!("Edit plan first")));
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_with_accept_edits_exit_mode() {
+        let tool = ExitPlanModeTool::new();
+        let result = tool
+            .execute(json!({
+                "plan": "Test",
+                "exit_mode": "accept_edits"
+            }))
+            .await
+            .unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        let options = payload["options"].as_array().unwrap();
+        assert!(options.contains(&json!("Approve (Accept edits mode)")));
+        assert!(options[0] == "Approve (Accept edits mode)"); // First option
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_empty_plan_changes_question() {
+        let tool = ExitPlanModeTool::new();
+        let result = tool
+            .execute(json!({
+                "plan": ""
+            }))
+            .await
+            .unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert!(payload["question"]
+            .as_str()
+            .unwrap()
+            .contains("start implementation"));
     }
 
     #[test]

@@ -21,17 +21,8 @@ pub fn canonical_tool_name(name: &str) -> String {
 pub fn exposure_for_tool_name(name: &str) -> ToolExposure {
     match canonical_tool_name(name).as_str() {
         // Lower-frequency or specialized tools stay discoverable by default.
-        "Sleep"
-        | "NotebookEdit"
-        | "js_repl"
-        | "WebFetch"
-        | "WebSearch"
-        | "memory"
-        | "scheduler"
-        | "SubSession"
-        | "sub_session_manager"
-        | "recall"
-        | "ExitPlanMode" => ToolExposure::Discoverable,
+        "Sleep" | "NotebookEdit" | "js_repl" | "WebFetch" | "WebSearch" | "memory"
+        | "scheduler" | "SubSession" | "recall" | "ExitPlanMode" => ToolExposure::Discoverable,
         _ => ToolExposure::Core,
     }
 }
@@ -90,6 +81,69 @@ where
     }
 }
 
+/// Deactivate discoverable tools by canonical name.
+///
+/// Non-discoverable or non-activated names are silently ignored.
+pub fn deactivate_discoverable_tools<I, S>(session: &mut Session, tool_names: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut activated = activated_discoverable_tools(session);
+    for tool_name in tool_names {
+        let canonical = canonical_tool_name(tool_name.as_ref());
+        activated.remove(&canonical);
+    }
+
+    if activated.is_empty() {
+        session
+            .metadata
+            .remove(ACTIVATED_DISCOVERABLE_TOOLS_METADATA_KEY);
+        return;
+    }
+
+    let mut names: Vec<String> = activated.into_iter().collect();
+    names.truncate(MAX_ACTIVATED_DISCOVERABLE_TOOLS);
+    if let Ok(raw) = serde_json::to_string(&names) {
+        session
+            .metadata
+            .insert(ACTIVATED_DISCOVERABLE_TOOLS_METADATA_KEY.to_string(), raw);
+    }
+}
+
+/// Short description for discoverable tools shown when not activated.
+pub fn discoverable_tool_short_description(name: &str) -> Option<&'static str> {
+    match canonical_tool_name(name).as_str() {
+        "Sleep" => Some("Pause briefly when waiting for an external state change before polling again."),
+        "NotebookEdit" => Some("Edit notebook cells by replace/insert/delete."),
+        "js_repl" => Some("Execute JavaScript code using Node.js with top-level await support."),
+        "WebFetch" => Some("Fetch a webpage by URL when you need cleaned page text from a known target."),
+        "WebSearch" => Some("Search the web with optional domain allow/block filters."),
+        "memory" => Some("Manage Bamboo's unified memory system for session notes and durable project/global memories."),
+        "scheduler" => Some("Manage Bamboo scheduled automation jobs for recurring or delayed work."),
+        "SubSession" => Some("Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work."),
+        "recall" => Some("Inspect prior Bamboo context from local session storage."),
+        "ExitPlanMode" => Some("Ask for confirmation before leaving plan mode."),
+        _ => None,
+    }
+}
+
+/// Return the canonical names of all discoverable tools.
+pub fn list_discoverable_tools() -> Vec<&'static str> {
+    vec![
+        "Sleep",
+        "NotebookEdit",
+        "js_repl",
+        "WebFetch",
+        "WebSearch",
+        "memory",
+        "scheduler",
+        "SubSession",
+        "recall",
+        "ExitPlanMode",
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +155,18 @@ mod tests {
             canonical_tool_name("default::set_workspace"),
             "set_workspace"
         );
+    }
+
+    #[test]
+    fn discoverable_exposure_includes_memory_and_subsession() {
+        assert!(is_discoverable_tool("memory"));
+        assert!(is_discoverable_tool("SubSession"));
+        assert!(is_discoverable_tool("sub_session_manager"));
+        assert!(list_discoverable_tools().contains(&"memory"));
+        assert!(list_discoverable_tools().contains(&"SubSession"));
+        assert!(discoverable_tool_short_description("memory").is_some());
+        assert!(discoverable_tool_short_description("SubSession").is_some());
+        assert!(discoverable_tool_short_description("sub_session_manager").is_some());
     }
 
     #[test]

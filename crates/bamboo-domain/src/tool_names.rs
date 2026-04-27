@@ -8,11 +8,12 @@
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 20] = [
+pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
     "conclusion_with_options",
     "Bash",
     "BashOutput",
     "Edit",
+    "EnterPlanMode",
     "ExitPlanMode",
     "GetFileInfo",
     "Glob",
@@ -34,7 +35,7 @@ pub const BUILTIN_TOOL_NAMES: [&str; 20] = [
 /// Tool names that are accepted as aliases for built-in/server tools but are not
 /// independently listed in `BUILTIN_TOOL_NAMES`/`SERVER_TOOL_NAMES`. Calls to these names are
 /// transparently routed to their canonical counterpart.
-pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 7] = [
+pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 8] = [
     // apply_patch is a patch-only alias for Edit
     ("apply_patch", "Edit"),
     // FileExists is subsumed by GetFileInfo (returns {exists: false} for missing paths)
@@ -47,13 +48,14 @@ pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 7] = [
     // Server tool renames
     ("session_inspector", "recall"),
     ("schedule_tasks", "scheduler"),
+    // SubSession manager alias
+    ("sub_session_manager", "SubSession"),
 ];
 
-pub const SERVER_TOOL_NAMES: [&str; 8] = [
+pub const SERVER_TOOL_NAMES: [&str; 7] = [
     "SubSession",
     "compact_context",
     "scheduler",
-    "sub_session_manager",
     "recall",
     "memory",
     "load_skill",
@@ -125,6 +127,7 @@ pub fn normalize_builtin_alias(name: &str) -> &str {
         "teamAgent" => "SubSession",
         "child_session" => "SubSession",
         "childSession" => "SubSession",
+        "sub_session_manager" => "SubSession",
         "write_file" => "Write",
         "sessionInspector" => "session_inspector",
         "scheduleTasks" => "schedule_tasks",

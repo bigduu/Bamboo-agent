@@ -14,14 +14,16 @@ pub use crate::server_tools::{
 
 pub mod child_session_adapter;
 pub mod schedule_tasks;
-pub mod spawn_session;
-pub mod sub_session_manager;
+pub mod sub_session;
 
-pub type SubagentModelResolver = std::sync::Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+pub type SubagentModelResolver = std::sync::Arc<
+    dyn Fn(String) -> futures::future::BoxFuture<'static, Option<bamboo_domain::ProviderModelRef>>
+        + Send
+        + Sync,
+>;
 pub type OptionalSubagentModelResolver = Option<SubagentModelResolver>;
 
 // Re-export server-specific tool types for convenience
 pub use child_session_adapter::ChildSessionAdapter;
 pub use schedule_tasks::ScheduleTasksTool;
-pub use spawn_session::SpawnSessionTool;
-pub use sub_session_manager::SubSessionManagerTool;
+pub use sub_session::SubSessionTool;

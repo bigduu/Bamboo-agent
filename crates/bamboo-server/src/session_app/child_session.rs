@@ -52,6 +52,17 @@ pub struct DeleteChildResult {
     pub cancelled_running_child: bool,
 }
 
+/// Diagnostic snapshot of a running child session runner.
+#[derive(Debug, Clone)]
+pub struct ChildRunnerInfo {
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_tool_name: Option<String>,
+    pub last_tool_phase: Option<String>,
+    pub last_event_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub round_count: u32,
+}
+
 /// Default system prompt for child sessions.
 pub const CHILD_SYSTEM_PROMPT: &str = r#"You are a **Child Session**, delegated by a parent session.
 
@@ -60,6 +71,38 @@ Requirements:
 - You may use tools to complete the task.
 - Do not create or trigger any additional child sessions (no recursive spawn).
 - Keep output concise: provide the conclusion first, then only necessary evidence or steps.
+"#;
+
+/// System prompt for plan-mode exploration child sessions.
+pub const PLAN_AGENT_SYSTEM_PROMPT: &str = r#"You are a **Plan Agent**, a read-only exploration specialist delegated by a parent session.
+
+Your role is EXCLUSIVELY to explore the codebase and gather information to help design an implementation plan. You MUST NOT modify anything.
+
+=== CRITICAL: READ-ONLY MODE — NO FILE MODIFICATIONS ===
+
+You are FORBIDDEN from using these tools:
+- Write — do not create new files
+- Edit — do not modify existing files
+- NotebookEdit — do not edit notebooks
+- Bash — do not execute shell commands
+- BashOutput — do not execute shell commands
+- KillShell — do not manage processes
+- SubSession — do not spawn further child sessions
+
+You MAY use these read-only tools:
+- Read — read file contents
+- Glob — list files matching patterns
+- Grep — search code for patterns
+- GetFileInfo — get file metadata
+- WebFetch — fetch web content
+- WebSearch — search the web
+- MemoryNote — write observations to session memory
+
+Requirements:
+- Focus only on the assigned exploration task.
+- Provide clear, structured findings: what you discovered, where the relevant code is, and what it does.
+- Keep output concise but thorough — the parent session needs enough detail to design a plan.
+- If you cannot find something after reasonable searching, say so clearly.
 "#;
 
 /// Input for creating a child session.
@@ -74,6 +117,14 @@ pub struct CreateChildInput {
     /// Optional model override resolved from subagent_type routing.
     /// When `None`, the child inherits the parent session's model.
     pub model_override: Option<String>,
+    /// Optional provider+model override resolved from subagent routing.
+    /// When present, this preserves cross-provider routing for child execution.
+    pub model_ref_override: Option<bamboo_domain::ProviderModelRef>,
+    /// Runtime metadata resolved from subagent routing (e.g. external agent config).
+    pub runtime_metadata: std::collections::HashMap<String, String>,
+    /// Whether to immediately enqueue the child for execution.
+    /// Defaults to `true`.
+    pub auto_run: bool,
 }
 
 /// Result of creating a child session.
@@ -109,6 +160,8 @@ pub trait ChildSessionPort: Send + Sync {
         parent_id: &str,
         child_id: &str,
     ) -> Result<DeleteChildResult, ChildSessionError>;
+    /// Return live diagnostic info for a running child session, if available.
+    async fn get_child_runner_info(&self, child_id: &str) -> Option<ChildRunnerInfo>;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +278,49 @@ pub fn map_child_entry(entry: &ChildSessionEntry) -> serde_json::Value {
     })
 }
 
+/// Generate contextual guidance for the root LLM based on child status and runner info.
+pub fn compute_status_guidance(
+    status: Option<&str>,
+    runner_info: Option<&ChildRunnerInfo>,
+    has_pending_messages: bool,
+) -> String {
+    match status {
+        Some("running") => {
+            let mut parts = vec!["Child is active.".to_string()];
+            if let Some(info) = runner_info {
+                if let Some(ref tool_name) = info.last_tool_name {
+                    if info.last_tool_phase.as_deref() == Some("begin") {
+                        parts.push(format!("Currently executing tool: {tool_name}. Wait for completion."));
+                    } else {
+                        parts.push(format!("Last tool: {tool_name} ({}).", info.last_tool_phase.as_deref().unwrap_or("unknown")));
+                    }
+                }
+                if let Some(last_event) = info.last_event_at {
+                    let elapsed = chrono::Utc::now().signed_duration_since(last_event);
+                    let secs = elapsed.num_seconds();
+                    if secs < 30 {
+                        parts.push("Progress event received very recently. Do not create a replacement; wait 30-60s.".to_string());
+                    } else if secs > 120 {
+                        parts.push("No progress event for 120s. Consider send_message or cancel if stalled.".to_string());
+                    }
+                }
+            }
+            if has_pending_messages {
+                parts.push("A follow-up message is already queued and will be picked up at the next turn boundary.".to_string());
+            } else {
+                parts.push("Use send_message with interrupt_running=false to queue a follow-up, or interrupt_running=true to cancel and restart.".to_string());
+            }
+            parts.join(" ")
+        }
+        Some("error") => "Child failed. Use send_message with corrected instructions to retry in place, or create a new child only if the approach needs to change completely.".to_string(),
+        Some("completed") => "Child finished. Use get to read results, or send_message for follow-up work.".to_string(),
+        Some("pending") => "Child is waiting to run. Use action=run to start execution.".to_string(),
+        Some("cancelled") => "Child was cancelled. Use send_message to resume, or action=run to restart.".to_string(),
+        Some("skipped") => "Child had no pending message. Use send_message to add work, then action=run.".to_string(),
+        _ => "Use action=get to inspect progress, send_message to redirect, or create only if a new delegation is needed.".to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Action functions
 // ---------------------------------------------------------------------------
@@ -240,11 +336,31 @@ pub async fn create_child_action(
         input.child_id.clone(),
         input.parent_session.id.clone(),
         input
-            .model_override
-            .clone()
+            .model_ref_override
+            .as_ref()
+            .map(|model_ref| model_ref.model.clone())
+            .or_else(|| input.model_override.clone())
             .unwrap_or_else(|| input.parent_session.model.clone()),
         input.title.clone(),
     );
+
+    if let Some(model_ref) = input.model_ref_override.clone() {
+        child.model_ref = Some(model_ref.clone());
+        child
+            .metadata
+            .insert("provider_name".to_string(), model_ref.provider);
+    } else if let Some(parent_model_ref) = input.parent_session.model_ref.clone() {
+        child.model_ref = Some(parent_model_ref.clone());
+        child
+            .metadata
+            .insert("provider_name".to_string(), parent_model_ref.provider);
+    } else if let Some(parent_provider) =
+        input.parent_session.metadata.get("provider_name").cloned()
+    {
+        child
+            .metadata
+            .insert("provider_name".to_string(), parent_provider);
+    }
 
     child
         .metadata
@@ -263,12 +379,23 @@ pub async fn create_child_action(
         .metadata
         .insert("last_run_status".to_string(), "pending".to_string());
     child.metadata.remove("last_run_error");
-    child.metadata.insert(
-        "base_system_prompt".to_string(),
-        CHILD_SYSTEM_PROMPT.to_string(),
-    );
 
-    child.add_message(Message::system(CHILD_SYSTEM_PROMPT));
+    // Apply runtime metadata (e.g. external agent routing).
+    for (key, value) in input.runtime_metadata {
+        child.metadata.insert(key, value);
+    }
+
+    let system_prompt = if input.subagent_type.trim().eq_ignore_ascii_case("plan") {
+        PLAN_AGENT_SYSTEM_PROMPT
+    } else {
+        CHILD_SYSTEM_PROMPT
+    };
+
+    child
+        .metadata
+        .insert("base_system_prompt".to_string(), system_prompt.to_string());
+
+    child.add_message(Message::system(system_prompt));
 
     // Child sessions get more aggressive compression: trigger at 70% instead
     // of the default 85%, target 35% instead of 40%. This prevents long child
@@ -295,8 +422,10 @@ pub async fn create_child_action(
 
     let model = child.model.clone();
     port.save_child_session(&child).await?;
-    port.enqueue_child_run(&input.parent_session, &child)
-        .await?;
+    if input.auto_run {
+        port.enqueue_child_run(&input.parent_session, &child)
+            .await?;
+    }
 
     Ok(CreateChildResult {
         child_session_id: child.id,
@@ -325,6 +454,9 @@ pub async fn get_child_action(
         .load_child_for_parent(parent_id, &child_session_id)
         .await?;
 
+    let status = metadata_text(&child, "last_run_status");
+    let runner_info = port.get_child_runner_info(&child.id).await;
+
     Ok(json!({
         "child_session_id": child.id,
         "title": child.title,
@@ -332,7 +464,7 @@ pub async fn get_child_action(
         "pinned": child.pinned,
         "message_count": child.messages.len(),
         "is_running": port.is_child_running(&child.id).await,
-        "last_run_status": metadata_text(&child, "last_run_status"),
+        "last_run_status": status,
         "last_run_error": metadata_text(&child, "last_run_error"),
         "responsibility": metadata_text(&child, "responsibility"),
         "subagent_type": metadata_text(&child, "subagent_type"),
@@ -343,6 +475,20 @@ pub async fn get_child_action(
             .rposition(|message| matches!(message.role, bamboo_agent_core::Role::User))
             .and_then(|idx| child.messages.get(idx))
             .map(|message| message.content.clone()),
+        "runtime_kind": metadata_text(&child, "runtime.kind"),
+        "external_protocol": metadata_text(&child, "external.protocol"),
+        "external_agent_id": metadata_text(&child, "external.agent_id"),
+        "a2a_context_id": metadata_text(&child, "a2a.context_id"),
+        "a2a_latest_task_id": metadata_text(&child, "a2a.latest_task_id"),
+        "a2a_last_state": metadata_text(&child, "a2a.last_state"),
+        "runner_started_at": runner_info.as_ref().and_then(|r| r.started_at.map(|t| t.to_rfc3339())),
+        "runner_completed_at": runner_info.as_ref().and_then(|r| r.completed_at.map(|t| t.to_rfc3339())),
+        "last_tool_name": runner_info.as_ref().and_then(|r| r.last_tool_name.clone()),
+        "last_tool_phase": runner_info.as_ref().and_then(|r| r.last_tool_phase.clone()),
+        "last_event_at": runner_info.as_ref().and_then(|r| r.last_event_at.map(|t| t.to_rfc3339())),
+        "round_count": runner_info.as_ref().map(|r| r.round_count).unwrap_or(0),
+        "has_pending_injected_messages": child.metadata.contains_key("pending_injected_messages"),
+        "guidance": compute_status_guidance(status.as_deref(), runner_info.as_ref(), child.metadata.contains_key("pending_injected_messages")),
     }))
 }
 
@@ -475,6 +621,14 @@ pub async fn run_child_action(
     }))
 }
 
+/// A queued follow-up message stored in session metadata for later injection.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct QueuedInjectedMessage {
+    pub content: String,
+    #[serde(default)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 pub async fn send_message_to_child_action(
     port: &dyn ChildSessionPort,
     parent: &Session,
@@ -487,13 +641,10 @@ pub async fn send_message_to_child_action(
         .load_child_for_parent(&parent.id, &child_session_id)
         .await?;
 
-    if port.is_child_running(&child.id).await {
-        if !interrupt_running.unwrap_or(false) {
-            return Err(ChildSessionError::Execution(
-                "cannot send a follow-up message while the child session is running; set interrupt_running=true to cancel and continue".to_string(),
-            ));
-        }
+    let is_running = port.is_child_running(&child.id).await;
+    let should_interrupt = interrupt_running.unwrap_or(false);
 
+    if is_running && should_interrupt {
         port.cancel_child_run_and_wait(&child.id).await?;
         child = port
             .load_child_for_parent(&parent.id, &child_session_id)
@@ -501,6 +652,34 @@ pub async fn send_message_to_child_action(
     }
 
     let message = normalize_required_text(Some(message), "message")?;
+
+    if is_running && !should_interrupt {
+        // Store the message in session metadata so the running agent loop
+        // can merge it at the next turn boundary without canceling progress.
+        let mut pending: Vec<QueuedInjectedMessage> = child
+            .metadata
+            .get("pending_injected_messages")
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default();
+        pending.push(QueuedInjectedMessage {
+            content: message.clone(),
+            created_at: Some(chrono::Utc::now()),
+        });
+        child.metadata.insert(
+            "pending_injected_messages".to_string(),
+            serde_json::to_string(&pending).unwrap_or_default(),
+        );
+        port.save_child_session(&child).await?;
+        return Ok(json!({
+            "child_session_id": child.id,
+            "status": "message_queued",
+            "auto_run": false,
+            "message": message,
+            "message_count": child.messages.len(),
+            "note": "Message queued for the child session. It will be picked up at the next turn boundary without canceling current progress.",
+        }));
+    }
+
     child.add_message(bamboo_agent_core::Message::user(message.clone()));
     child
         .metadata
@@ -524,6 +703,28 @@ pub async fn send_message_to_child_action(
         } else {
             "Follow-up message appended. Use action=run to execute the child session."
         },
+    }))
+}
+
+pub async fn cancel_child_action(
+    port: &dyn ChildSessionPort,
+    parent_id: &str,
+    child_session_id: String,
+) -> Result<serde_json::Value, ChildSessionError> {
+    let mut child = port
+        .load_child_for_parent(parent_id, &child_session_id)
+        .await?;
+    port.cancel_child_run_and_wait(&child_session_id).await?;
+    child
+        .metadata
+        .insert("last_run_status".to_string(), "cancelled".to_string());
+    child
+        .metadata
+        .insert("last_run_error".to_string(), "Cancelled by parent".to_string());
+    port.save_child_session(&child).await?;
+    Ok(json!({
+        "child_session_id": child_session_id,
+        "status": "cancelled",
     }))
 }
 

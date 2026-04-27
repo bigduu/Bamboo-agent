@@ -79,6 +79,27 @@ pub enum AgentEvent {
         phase: String,
         status: String,
     },
+    PlanModeEntered {
+        session_id: String,
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        pre_permission_mode: Option<String>,
+    },
+    PlanModeExited {
+        session_id: String,
+        approved: bool,
+        #[serde(default)]
+        plan: Option<String>,
+        #[serde(default)]
+        restored_mode: Option<String>,
+    },
+    PlanFileUpdated {
+        session_id: String,
+        file_path: String,
+        #[serde(default)]
+        content_summary: Option<String>,
+    },
     Complete {
         usage: TokenUsage,
     },

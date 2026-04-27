@@ -30,6 +30,7 @@ fn build_context_pressure(session: &Session) -> Option<output_compressor::Contex
 
 /// Tools exempt from plan-mode blocking (UI pause/clarification tools).
 const PLAN_MODE_EXEMPT_TOOLS: &[&str] = &[
+    "EnterPlanMode",
     "ExitPlanMode",
     "request_permissions",
     "conclusion_with_options",
@@ -845,6 +846,7 @@ mod tests {
         use super::PLAN_MODE_EXEMPT_TOOLS;
 
         // These tools must NOT be blocked by plan mode
+        assert!(PLAN_MODE_EXEMPT_TOOLS.contains(&"EnterPlanMode"));
         assert!(PLAN_MODE_EXEMPT_TOOLS.contains(&"ExitPlanMode"));
         assert!(PLAN_MODE_EXEMPT_TOOLS.contains(&"request_permissions"));
         assert!(PLAN_MODE_EXEMPT_TOOLS.contains(&"conclusion_with_options"));

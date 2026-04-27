@@ -12,6 +12,7 @@ use reqwest::{
 use serde_json::json;
 
 use crate::llm::provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, Result};
+use crate::llm::providers::common::model_fetcher;
 use crate::llm::providers::common::openai_compat::{
     build_openai_compat_body, parse_openai_compat_sse_data_strict,
 };
@@ -140,7 +141,18 @@ impl LLMProvider for BodhiProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {
-        Ok(vec![])
+        let url = self.proxy_url("v1/models");
+        let headers = self.build_headers()?;
+
+        // Try to fetch models through the bodhi proxy.
+        // If the bodhi server doesn't support this endpoint, return empty gracefully.
+        match model_fetcher::fetch_model_list(&self.client, &url, headers, "Bodhi").await {
+            Ok(models) => Ok(models),
+            Err(e) => {
+                tracing::debug!("Bodhi proxy models endpoint not available: {}", e);
+                Ok(vec![])
+            }
+        }
     }
 
     async fn list_model_info(&self) -> Result<Vec<crate::llm::provider::ProviderModelInfo>> {

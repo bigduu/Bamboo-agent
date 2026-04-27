@@ -28,9 +28,19 @@ pub(super) async fn maybe_handle_taskwrite(
     };
 
     let existing_task_list = session.task_list.as_ref();
-    let Ok(task_list) =
-        TaskTool::task_list_from_args_with_existing(&args, &shared_session_id, existing_task_list)
-    else {
+    let is_plan_mode = session
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|s| s.plan_mode.as_ref())
+        .is_some();
+    let default_phase = is_plan_mode.then_some(bamboo_domain::TaskPhase::Planning);
+
+    let Ok(task_list) = TaskTool::task_list_from_args_with_existing(
+        &args,
+        &shared_session_id,
+        existing_task_list,
+        default_phase,
+    ) else {
         return;
     };
 
