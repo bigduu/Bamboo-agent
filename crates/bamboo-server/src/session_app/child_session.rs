@@ -132,6 +132,13 @@ pub struct CreateChildInput {
     /// Whether to immediately enqueue the child for execution.
     /// Defaults to `true`.
     pub auto_run: bool,
+    /// Optional reasoning effort to apply to the child's own LLM calls.
+    /// `None` (the default) leaves `Session::reasoning_effort` at `None`,
+    /// so the provider falls back to its default. The child does NOT
+    /// inherit the parent's reasoning_effort — fan-out children that
+    /// only need a quick lookup should not pay for `xhigh` reasoning
+    /// just because the orchestrator is running at `xhigh`.
+    pub reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
 }
 
 /// Result of creating a child session.
@@ -392,6 +399,13 @@ pub async fn create_child_action(
             .insert("provider_name".to_string(), parent_provider);
     }
 
+    // Apply explicit reasoning_effort override if the LLM passed one;
+    // otherwise leave at `None` (provider default). Per CreateChildInput
+    // contract, children do NOT inherit the parent's reasoning_effort.
+    if let Some(effort) = input.reasoning_effort {
+        child.reasoning_effort = Some(effort);
+    }
+
     child
         .metadata
         .insert("spawned_by".to_string(), "SubSession".to_string());
@@ -522,6 +536,7 @@ pub async fn get_child_action(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_child_action(
     port: &dyn ChildSessionPort,
     parent_id: &str,
@@ -531,6 +546,7 @@ pub async fn update_child_action(
     prompt: Option<String>,
     subagent_type: Option<String>,
     reset_after_update: Option<bool>,
+    reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
 ) -> Result<serde_json::Value, ChildSessionError> {
     let mut child = port
         .load_child_for_parent(parent_id, &child_session_id)
@@ -544,11 +560,15 @@ pub async fn update_child_action(
     let should_refresh_assignment =
         responsibility.is_some() || prompt.is_some() || subagent_type.is_some();
 
-    if title.is_none() && !should_refresh_assignment {
+    if title.is_none() && !should_refresh_assignment && reasoning_effort.is_none() {
         return Err(ChildSessionError::InvalidArguments(
-            "update requires at least one field: title/responsibility/prompt/subagent_type"
+            "update requires at least one field: title/responsibility/prompt/subagent_type/reasoning_effort"
                 .to_string(),
         ));
+    }
+
+    if let Some(effort) = reasoning_effort {
+        child.reasoning_effort = Some(effort);
     }
 
     if let Some(title) = title {

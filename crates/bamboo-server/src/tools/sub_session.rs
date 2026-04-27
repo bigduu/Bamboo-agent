@@ -8,6 +8,7 @@ use crate::session_app::child_session::{self, ChildSessionPort, CreateChildInput
 use crate::tools::child_session_adapter::{tool_error_from_child_session, ChildSessionAdapter};
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use bamboo_domain::subagent::SubagentProfileRegistry;
+use bamboo_domain::ReasoningEffort;
 
 // ---------------------------------------------------------------------------
 // Args enum
@@ -27,6 +28,13 @@ enum SubSessionArgs {
         subagent_type: String,
         #[serde(default)]
         auto_run: Option<bool>,
+        /// Optional reasoning effort for the child session. When omitted,
+        /// the child stays at `None` so the provider's default applies
+        /// (it does NOT inherit the parent's reasoning_effort). The LLM
+        /// should pass an explicit value (e.g. `"low"` for cheap fan-outs,
+        /// `"high"`/`"max"` for hard reasoning) when it has a preference.
+        #[serde(default)]
+        reasoning_effort: Option<ReasoningEffort>,
     },
     List,
     Get {
@@ -46,6 +54,11 @@ enum SubSessionArgs {
         reset_after_update: Option<bool>,
         #[serde(default)]
         auto_run: Option<bool>,
+        /// Optional reasoning effort to apply to the existing child session.
+        /// `Some(level)` overrides the current value; `None` (the default)
+        /// leaves it unchanged.
+        #[serde(default)]
+        reasoning_effort: Option<ReasoningEffort>,
     },
     Run {
         child_session_id: String,
@@ -199,6 +212,11 @@ impl Tool for SubSessionTool {
                 "interrupt_running": {
                     "type": "boolean",
                     "description": "For send_message/cancel: if true, cancel a currently running child session before appending or returning. Defaults to false for send_message. When false on a running child, the message is queued and will be picked up at the next turn boundary without canceling progress."
+                },
+                "reasoning_effort": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high", "xhigh", "max"],
+                    "description": "For create/update: reasoning effort level applied to the child session's own LLM calls. Use \"low\" for trivial fan-outs (e.g. simple lookups), \"medium\"/\"high\" for normal coding/analysis, \"xhigh\"/\"max\" for deep reasoning tasks. Omit to leave at provider default; the child does NOT inherit the parent's reasoning_effort."
                 }
             },
             "required": ["action"],
@@ -255,6 +273,7 @@ impl Tool for SubSessionTool {
                 prompt,
                 subagent_type,
                 auto_run,
+                reasoning_effort,
             } => {
                 let title = normalize_title(title, description)?;
                 let responsibility = normalize_required_text(responsibility, "responsibility")?;
@@ -290,6 +309,7 @@ impl Tool for SubSessionTool {
                         runtime_metadata,
                         system_prompt_override,
                         auto_run: auto_run.unwrap_or(true),
+                        reasoning_effort,
                     },
                 )
                 .await
@@ -317,6 +337,7 @@ impl Tool for SubSessionTool {
                     "child_session_id": result.child_session_id,
                     "parent_session_id": parent_session_id,
                     "model": result.model,
+                    "reasoning_effort": reasoning_effort.map(|effort| effort.as_str()),
                     "note": "Child session created. Typical execution time: 30-120 seconds. Use action=get to check progress. Wait at least 30 seconds before polling. If the child fails or needs correction, use send_message (not create) to retry in place."
                 }))
             }
@@ -343,6 +364,7 @@ impl Tool for SubSessionTool {
                 subagent_type,
                 reset_after_update,
                 auto_run,
+                reasoning_effort,
             } => {
                 let result = child_session::update_child_action(
                     self.adapter.as_ref(),
@@ -353,6 +375,7 @@ impl Tool for SubSessionTool {
                     prompt,
                     subagent_type,
                     reset_after_update,
+                    reasoning_effort,
                 )
                 .await
                 .map_err(tool_error_from_child_session)?;
@@ -1230,6 +1253,151 @@ mod tests {
         assert!(
             note.contains("send_message"),
             "note should mention send_message: {note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_persists_explicit_reasoning_effort_to_child_session() {
+        let harness = build_test_harness().await;
+
+        let result = harness
+            .tool
+            .execute_with_context(
+                json!({
+                    "action": "create",
+                    "title": "Reasoning Child",
+                    "responsibility": "Investigate hard problem",
+                    "prompt": "Think carefully step by step",
+                    "subagent_type": "general-purpose",
+                    "auto_run": false,
+                    "reasoning_effort": "high"
+                }),
+                ToolExecutionContext {
+                    session_id: Some(harness.parent_session_id.as_str()),
+                    tool_call_id: "tool_call_create_with_effort",
+                    event_tx: None,
+                    available_tool_schemas: None,
+                },
+            )
+            .await
+            .expect("create should succeed");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.result).expect("tool result should be JSON");
+        assert_eq!(
+            payload["reasoning_effort"].as_str(),
+            Some("high"),
+            "tool result should echo the resolved reasoning_effort"
+        );
+
+        let child_id = payload["child_session_id"]
+            .as_str()
+            .expect("child_session_id present")
+            .to_string();
+        let child = harness
+            .storage
+            .load_session(&child_id)
+            .await
+            .expect("child should be persisted")
+            .expect("child session should exist");
+        assert_eq!(
+            child.reasoning_effort,
+            Some(bamboo_domain::ReasoningEffort::High),
+            "child.reasoning_effort should reflect the explicit override"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_without_reasoning_effort_leaves_child_at_provider_default() {
+        let harness = build_test_harness().await;
+
+        let result = harness
+            .tool
+            .execute_with_context(
+                json!({
+                    "action": "create",
+                    "title": "Default Child",
+                    "responsibility": "Quick lookup",
+                    "prompt": "Read a file and summarise",
+                    "subagent_type": "general-purpose",
+                    "auto_run": false
+                }),
+                ToolExecutionContext {
+                    session_id: Some(harness.parent_session_id.as_str()),
+                    tool_call_id: "tool_call_create_default_effort",
+                    event_tx: None,
+                    available_tool_schemas: None,
+                },
+            )
+            .await
+            .expect("create should succeed");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.result).expect("tool result should be JSON");
+        assert!(
+            payload["reasoning_effort"].is_null(),
+            "tool result should report null reasoning_effort when omitted, got {:?}",
+            payload["reasoning_effort"]
+        );
+
+        let child_id = payload["child_session_id"]
+            .as_str()
+            .expect("child_session_id present")
+            .to_string();
+        let child = harness
+            .storage
+            .load_session(&child_id)
+            .await
+            .expect("child should be persisted")
+            .expect("child session should exist");
+        assert_eq!(
+            child.reasoning_effort, None,
+            "child.reasoning_effort should stay at None (provider default) when caller omits it; \
+             children must NOT inherit the parent's reasoning_effort"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_can_change_reasoning_effort_on_existing_child() {
+        let harness = build_test_harness().await;
+
+        // Pre-condition: the seeded child has reasoning_effort = None.
+        let seeded = harness
+            .storage
+            .load_session(&harness.child_session_id)
+            .await
+            .expect("seeded child should load")
+            .expect("seeded child exists");
+        assert_eq!(seeded.reasoning_effort, None);
+
+        let _ = harness
+            .tool
+            .execute_with_context(
+                json!({
+                    "action": "update",
+                    "child_session_id": harness.child_session_id,
+                    "reasoning_effort": "max"
+                }),
+                ToolExecutionContext {
+                    session_id: Some(harness.parent_session_id.as_str()),
+                    tool_call_id: "tool_call_update_effort",
+                    event_tx: None,
+                    available_tool_schemas: None,
+                },
+            )
+            .await
+            .expect("update should succeed");
+
+        let updated = harness
+            .storage
+            .load_session(&harness.child_session_id)
+            .await
+            .expect("updated child should load")
+            .expect("child still exists");
+        assert_eq!(
+            updated.reasoning_effort,
+            Some(bamboo_domain::ReasoningEffort::Max),
+            "update should persist the new reasoning_effort"
         );
     }
 
