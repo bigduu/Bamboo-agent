@@ -41,5 +41,6 @@ pub mod gemini;
 pub mod openai;
 pub mod settings;
 pub mod skill;
+pub mod subagent_profiles;
 pub mod tools;
 pub mod workspace;
