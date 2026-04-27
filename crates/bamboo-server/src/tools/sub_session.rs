@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::session_app::child_session::{self, ChildSessionPort, CreateChildInput};
 use crate::tools::child_session_adapter::{tool_error_from_child_session, ChildSessionAdapter};
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_domain::subagent::SubagentProfileRegistry;
 
 // ---------------------------------------------------------------------------
 // Args enum
@@ -65,6 +66,11 @@ enum SubSessionArgs {
     Delete {
         child_session_id: String,
     },
+    /// Enumerate the available subagent profiles (built-ins plus any
+    /// user/project overrides). Read-only; does not touch any session.
+    /// Useful both for the LLM (to discover roles before calling
+    /// `create`) and for the frontend (to populate a role dropdown).
+    ListProfiles,
 }
 
 // ---------------------------------------------------------------------------
@@ -120,11 +126,14 @@ fn tool_result(value: serde_json::Value) -> Result<ToolResult, ToolError> {
 
 pub struct SubSessionTool {
     adapter: Arc<ChildSessionAdapter>,
+    /// Registry consulted by `action=list_profiles`. Held as `Arc` so the
+    /// tool stays cheap to clone and share across executors.
+    profiles: Arc<SubagentProfileRegistry>,
 }
 
 impl SubSessionTool {
-    pub fn new(adapter: Arc<ChildSessionAdapter>) -> Self {
-        Self { adapter }
+    pub fn new(adapter: Arc<ChildSessionAdapter>, profiles: Arc<SubagentProfileRegistry>) -> Self {
+        Self { adapter, profiles }
     }
 }
 
@@ -144,8 +153,8 @@ impl Tool for SubSessionTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "list", "get", "update", "run", "send_message", "cancel", "delete"],
-                    "description": "Sub-session lifecycle operation. Use create to delegate a new independent child session; use list/get to inspect; use update/run/send_message/cancel/delete to manage existing child sessions."
+                    "enum": ["create", "list", "get", "update", "run", "send_message", "cancel", "delete", "list_profiles"],
+                    "description": "Sub-session lifecycle operation. Use create to delegate a new independent child session; use list/get to inspect; use update/run/send_message/cancel/delete to manage existing child sessions. Use list_profiles to enumerate available subagent roles before deciding which subagent_type to pass to create."
                 },
                 "child_session_id": {
                     "type": "string",
@@ -222,6 +231,14 @@ impl Tool for SubSessionTool {
         let parsed: SubSessionArgs = serde_json::from_value(args).map_err(|error| {
             ToolError::InvalidArguments(format!("Invalid SubSession args: {error}"))
         })?;
+
+        // `list_profiles` is read-only and operates purely on the
+        // in-memory profile registry, so we short-circuit before doing
+        // any session lookup. This also lets the LLM call `list_profiles`
+        // safely from any context (root or otherwise).
+        if let SubSessionArgs::ListProfiles = parsed {
+            return tool_result(self.list_profiles_payload());
+        }
 
         let parent = self
             .adapter
@@ -406,7 +423,64 @@ impl Tool for SubSessionTool {
                 .map_err(tool_error_from_child_session)?;
                 tool_result(result)
             }
+            // Already short-circuited above; kept here so the match stays
+            // exhaustive without a wildcard.
+            SubSessionArgs::ListProfiles => tool_result(self.list_profiles_payload()),
         }
+    }
+}
+
+impl SubSessionTool {
+    /// Build the JSON payload returned by `action=list_profiles`.
+    ///
+    /// Shape (kept stable as a public contract for the frontend and for
+    /// the LLM):
+    ///
+    /// ```jsonc
+    /// {
+    ///   "profiles": [
+    ///     {
+    ///       "id": "researcher",
+    ///       "display_name": "Researcher",
+    ///       "description": "...",
+    ///       "tools": { "mode": "allowlist", "allow": ["Read", "Grep"] },
+    ///       "model_hint": null,
+    ///       "default_responsibility": null,
+    ///       "ui": { "icon": "🔎", "color": "blue" }
+    ///       // NOTE: `system_prompt` is intentionally omitted from the
+    ///       // listing — it can be lengthy and is not needed for UI/LLM
+    ///       // selection. Use `action=get` on a child to inspect the
+    ///       // resolved prompt of an active session.
+    ///     }
+    ///   ],
+    ///   "fallback_id": "general-purpose",
+    ///   "count": 6
+    /// }
+    /// ```
+    fn list_profiles_payload(&self) -> serde_json::Value {
+        // Project each profile into a UI-friendly shape that excludes the
+        // (potentially large) `system_prompt`. This keeps the payload
+        // small for both the LLM context window and the frontend list.
+        let profiles: Vec<serde_json::Value> = self
+            .profiles
+            .iter()
+            .map(|p| {
+                json!({
+                    "id": p.id,
+                    "display_name": p.display_name,
+                    "description": p.description,
+                    "tools": p.tools,
+                    "model_hint": p.model_hint,
+                    "default_responsibility": p.default_responsibility,
+                    "ui": p.ui,
+                })
+            })
+            .collect();
+        json!({
+            "profiles": profiles,
+            "fallback_id": self.profiles.fallback_id(),
+            "count": self.profiles.len(),
+        })
     }
 }
 
@@ -555,6 +629,12 @@ mod tests {
             provider_router: None,
         }));
 
+        let test_profiles = std::sync::Arc::new(
+            bamboo_domain::subagent::SubagentProfileRegistry::builder()
+                .extend(crate::subagent_profiles::builtin::builtin_profiles())
+                .build()
+                .expect("builtin subagent profiles must build"),
+        );
         let adapter = Arc::new(ChildSessionAdapter {
             session_store,
             storage: storage.clone(),
@@ -564,14 +644,9 @@ mod tests {
             session_event_senders,
             subagent_model_resolver,
             config: Arc::new(RwLock::new(bamboo_infrastructure::Config::default())),
-            subagent_profiles: std::sync::Arc::new(
-                bamboo_domain::subagent::SubagentProfileRegistry::builder()
-                    .extend(crate::subagent_profiles::builtin::builtin_profiles())
-                    .build()
-                    .expect("builtin subagent profiles must build"),
-            ),
+            subagent_profiles: test_profiles.clone(),
         });
-        let tool = SubSessionTool::new(adapter);
+        let tool = SubSessionTool::new(adapter, test_profiles);
 
         TestHarness {
             tool,
@@ -1189,5 +1264,102 @@ mod tests {
             .await
             .unwrap();
         assert!(child.is_none());
+    }
+
+    /// `action=list_profiles` returns every built-in profile (without
+    /// the `system_prompt` body), reports the registry's fallback id,
+    /// and uses the registry's stable insertion order. The shape of
+    /// this payload is a public contract — UI / LLM rely on it.
+    #[tokio::test]
+    async fn list_profiles_returns_builtin_catalog() {
+        let harness = build_test_harness().await;
+
+        let result = harness
+            .tool
+            .execute_with_context(
+                json!({"action": "list_profiles"}),
+                ToolExecutionContext {
+                    session_id: Some(harness.parent_session_id.as_str()),
+                    tool_call_id: "tool_call_list_profiles",
+                    event_tx: None,
+                    available_tool_schemas: None,
+                },
+            )
+            .await
+            .expect("list_profiles should succeed");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.result).expect("tool result should be JSON");
+
+        // Top-level shape.
+        let profiles = payload["profiles"]
+            .as_array()
+            .expect("list_profiles must return a `profiles` array");
+        assert!(
+            profiles.len() >= 6,
+            "expected at least 6 built-in profiles, got {}",
+            profiles.len()
+        );
+        assert_eq!(payload["count"], profiles.len());
+        assert_eq!(payload["fallback_id"], "general-purpose");
+
+        // Required fields per profile, and explicit guarantee that we
+        // do NOT leak `system_prompt` (could be very large).
+        for entry in profiles {
+            assert!(entry.get("id").and_then(|v| v.as_str()).is_some());
+            assert!(entry.get("display_name").and_then(|v| v.as_str()).is_some());
+            assert!(entry.get("tools").is_some());
+            assert!(
+                entry.get("system_prompt").is_none(),
+                "system_prompt must NOT be returned by list_profiles",
+            );
+        }
+
+        // Built-in catalogue must include the documented baseline ids
+        // so the LLM can rely on them being present.
+        let ids: Vec<&str> = profiles
+            .iter()
+            .map(|p| p["id"].as_str().unwrap_or(""))
+            .collect();
+        for required in [
+            "general-purpose",
+            "plan",
+            "researcher",
+            "coder",
+            "reviewer",
+            "tester",
+        ] {
+            assert!(
+                ids.contains(&required),
+                "built-in profile `{required}` missing from list_profiles output (got: {ids:?})"
+            );
+        }
+    }
+
+    /// `list_profiles` is read-only and must not require a real,
+    /// loadable parent session. We pass a non-existent session_id and
+    /// expect success (registry is consulted directly, no session
+    /// lookup is performed).
+    #[tokio::test]
+    async fn list_profiles_does_not_load_parent_session() {
+        let harness = build_test_harness().await;
+
+        let result = harness
+            .tool
+            .execute_with_context(
+                json!({"action": "list_profiles"}),
+                ToolExecutionContext {
+                    session_id: Some("non-existent-session-id"),
+                    tool_call_id: "tool_call_list_profiles_no_session",
+                    event_tx: None,
+                    available_tool_schemas: None,
+                },
+            )
+            .await
+            .expect("list_profiles should succeed even when the parent session id is unknown");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.result).expect("tool result should be JSON");
+        assert!(payload["profiles"].as_array().is_some());
     }
 }

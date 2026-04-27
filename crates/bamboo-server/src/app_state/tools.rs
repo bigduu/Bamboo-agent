@@ -109,7 +109,10 @@ pub(super) fn build_root_tools(
     config: Arc<RwLock<Config>>,
     subagent_profiles: Arc<bamboo_domain::subagent::SubagentProfileRegistry>,
 ) -> Arc<dyn ToolExecutor> {
-    // Shared adapter for the unified child session tool.
+    // Shared adapter for the unified child session tool. Cloning the
+    // profile registry Arc is cheap and lets us hand the same registry
+    // to the SubSessionTool below without going through the adapter.
+    let profiles_for_tool = subagent_profiles.clone();
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {
         session_store: session_store.clone(),
         storage: storage.clone(),
@@ -123,7 +126,10 @@ pub(super) fn build_root_tools(
     });
 
     // Root sessions can create and manage child sessions via unified SubSession tool.
-    let sub_session_tool = Arc::new(crate::tools::SubSessionTool::new(adapter));
+    let sub_session_tool = Arc::new(crate::tools::SubSessionTool::new(
+        adapter,
+        profiles_for_tool,
+    ));
     let tools_with_sub_session: Arc<dyn ToolExecutor> = Arc::new(
         crate::tools::OverlayToolExecutor::new(base_tools, sub_session_tool),
     );
