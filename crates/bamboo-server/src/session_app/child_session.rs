@@ -122,6 +122,13 @@ pub struct CreateChildInput {
     pub model_ref_override: Option<bamboo_domain::ProviderModelRef>,
     /// Runtime metadata resolved from subagent routing (e.g. external agent config).
     pub runtime_metadata: std::collections::HashMap<String, String>,
+    /// Optional system prompt override resolved from the
+    /// `SubagentProfileRegistry`. When `None`, the child falls back to
+    /// the legacy hard-coded prompts (`PLAN_AGENT_SYSTEM_PROMPT` for
+    /// `subagent_type == "plan"`, `CHILD_SYSTEM_PROMPT` otherwise) so
+    /// that callers that have not yet been wired up keep their pre-PR-3
+    /// behaviour byte-for-byte.
+    pub system_prompt_override: Option<String>,
     /// Whether to immediately enqueue the child for execution.
     /// Defaults to `true`.
     pub auto_run: bool,
@@ -200,6 +207,29 @@ pub fn normalize_required_text(
         )));
     }
     Ok(trimmed.to_string())
+}
+
+/// Resolve the system prompt for a child session.
+///
+/// - When `override_prompt` is `Some`, that value is used verbatim. Callers
+///   resolve this from the [`SubagentProfileRegistry`] before invoking
+///   `create_child_action`.
+/// - When `override_prompt` is `None`, falls back to the legacy hard-coded
+///   prompts: [`PLAN_AGENT_SYSTEM_PROMPT`] when `subagent_type == "plan"`
+///   (case-insensitive, surrounding whitespace ignored), and
+///   [`CHILD_SYSTEM_PROMPT`] otherwise. This keeps unwired call paths
+///   byte-for-byte equivalent to pre-PR-3 behaviour.
+pub fn resolve_system_prompt<'a>(
+    subagent_type: &str,
+    override_prompt: Option<&'a str>,
+) -> std::borrow::Cow<'a, str> {
+    if let Some(prompt) = override_prompt {
+        std::borrow::Cow::Borrowed(prompt)
+    } else if subagent_type.trim().eq_ignore_ascii_case("plan") {
+        std::borrow::Cow::Borrowed(PLAN_AGENT_SYSTEM_PROMPT)
+    } else {
+        std::borrow::Cow::Borrowed(CHILD_SYSTEM_PROMPT)
+    }
 }
 
 pub fn metadata_text(session: &Session, key: &str) -> Option<String> {
@@ -385,17 +415,17 @@ pub async fn create_child_action(
         child.metadata.insert(key, value);
     }
 
-    let system_prompt = if input.subagent_type.trim().eq_ignore_ascii_case("plan") {
-        PLAN_AGENT_SYSTEM_PROMPT
-    } else {
-        CHILD_SYSTEM_PROMPT
-    };
+    let system_prompt = resolve_system_prompt(
+        &input.subagent_type,
+        input.system_prompt_override.as_deref(),
+    );
 
-    child
-        .metadata
-        .insert("base_system_prompt".to_string(), system_prompt.to_string());
+    child.metadata.insert(
+        "base_system_prompt".to_string(),
+        system_prompt.clone().into_owned(),
+    );
 
-    child.add_message(Message::system(system_prompt));
+    child.add_message(Message::system(system_prompt.as_ref()));
 
     // Child sessions get more aggressive compression: trigger at 70% instead
     // of the default 85%, target 35% instead of 40%. This prevents long child
@@ -718,9 +748,10 @@ pub async fn cancel_child_action(
     child
         .metadata
         .insert("last_run_status".to_string(), "cancelled".to_string());
-    child
-        .metadata
-        .insert("last_run_error".to_string(), "Cancelled by parent".to_string());
+    child.metadata.insert(
+        "last_run_error".to_string(),
+        "Cancelled by parent".to_string(),
+    );
     port.save_child_session(&child).await?;
     Ok(json!({
         "child_session_id": child_session_id,
@@ -805,5 +836,47 @@ mod tests {
         assert!(result.contains("Responsibility"));
         assert!(result.contains("Type"));
         assert!(result.contains("Task brief"));
+    }
+
+    // ----- resolve_system_prompt: PR-3 prompt routing contract --------------
+
+    #[test]
+    fn resolve_system_prompt_uses_override_verbatim() {
+        let custom = "You are a custom subagent.";
+        let prompt = resolve_system_prompt("anything", Some(custom));
+        assert_eq!(prompt.as_ref(), custom);
+    }
+
+    #[test]
+    fn resolve_system_prompt_uses_override_even_when_subagent_type_is_plan() {
+        // Override beats legacy plan routing: this is what lets the registry
+        // actually swap the plan agent's prompt.
+        let custom = "Plan override";
+        let prompt = resolve_system_prompt("plan", Some(custom));
+        assert_eq!(prompt.as_ref(), custom);
+    }
+
+    #[test]
+    fn resolve_system_prompt_falls_back_to_plan_for_plan_subagent_type() {
+        let prompt = resolve_system_prompt("plan", None);
+        assert_eq!(prompt.as_ref(), PLAN_AGENT_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn resolve_system_prompt_plan_match_is_case_and_whitespace_insensitive() {
+        let prompt = resolve_system_prompt("  PLAN  ", None);
+        assert_eq!(prompt.as_ref(), PLAN_AGENT_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn resolve_system_prompt_falls_back_to_general_for_unknown_subagent_type() {
+        let prompt = resolve_system_prompt("researcher", None);
+        assert_eq!(prompt.as_ref(), CHILD_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn resolve_system_prompt_falls_back_to_general_for_empty_subagent_type() {
+        let prompt = resolve_system_prompt("", None);
+        assert_eq!(prompt.as_ref(), CHILD_SYSTEM_PROMPT);
     }
 }

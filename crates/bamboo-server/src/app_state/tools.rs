@@ -92,6 +92,7 @@ pub(super) fn build_base_tools(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_root_tools(
     base_tools: Arc<dyn ToolExecutor>,
     schedule_store: Arc<ScheduleStore>,
@@ -106,6 +107,7 @@ pub(super) fn build_root_tools(
     >,
     subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
     config: Arc<RwLock<Config>>,
+    subagent_profiles: Arc<bamboo_domain::subagent::SubagentProfileRegistry>,
 ) -> Arc<dyn ToolExecutor> {
     // Shared adapter for the unified child session tool.
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {
@@ -117,6 +119,7 @@ pub(super) fn build_root_tools(
         session_event_senders,
         subagent_model_resolver,
         config,
+        subagent_profiles,
     });
 
     // Root sessions can create and manage child sessions via unified SubSession tool.

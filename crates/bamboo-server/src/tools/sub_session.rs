@@ -256,6 +256,8 @@ impl Tool for SubSessionTool {
                     .as_ref()
                     .map(|model_ref| model_ref.model.clone());
                 let runtime_metadata = self.adapter.resolve_runtime_metadata(&subagent_type).await;
+                let system_prompt_override =
+                    Some(self.adapter.resolve_subagent_prompt(&subagent_type));
 
                 let result = child_session::create_child_action(
                     self.adapter.as_ref(),
@@ -269,6 +271,7 @@ impl Tool for SubSessionTool {
                         model_override,
                         model_ref_override,
                         runtime_metadata,
+                        system_prompt_override,
                         auto_run: auto_run.unwrap_or(true),
                     },
                 )
@@ -561,6 +564,12 @@ mod tests {
             session_event_senders,
             subagent_model_resolver,
             config: Arc::new(RwLock::new(bamboo_infrastructure::Config::default())),
+            subagent_profiles: std::sync::Arc::new(
+                bamboo_domain::subagent::SubagentProfileRegistry::builder()
+                    .extend(crate::subagent_profiles::builtin::builtin_profiles())
+                    .build()
+                    .expect("builtin subagent profiles must build"),
+            ),
         });
         let tool = SubSessionTool::new(adapter);
 

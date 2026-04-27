@@ -36,6 +36,9 @@ pub struct ChildSessionAdapter {
     pub(crate) subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
     /// Application config for resolving subagent routing and external agent profiles.
     pub(crate) config: Arc<RwLock<Config>>,
+    /// Subagent profile registry. Used to resolve `subagent_type` →
+    /// `system_prompt` (and, in later PRs, the tool surface filter).
+    pub(crate) subagent_profiles: Arc<bamboo_domain::subagent::SubagentProfileRegistry>,
 }
 
 impl ChildSessionAdapter {
@@ -54,6 +57,18 @@ impl ChildSessionAdapter {
     pub async fn resolve_runtime_metadata(&self, subagent_type: &str) -> HashMap<String, String> {
         let config = self.config.read().await;
         crate::external_agents::config::resolve_runtime_metadata(&config, subagent_type)
+    }
+
+    /// Resolve the canonical system prompt for the given `subagent_type`.
+    ///
+    /// Always returns a prompt: unknown / empty `subagent_type` values fall
+    /// back to the `general-purpose` profile (whose prompt is byte-equal to
+    /// the legacy `CHILD_SYSTEM_PROMPT`).
+    pub fn resolve_subagent_prompt(&self, subagent_type: &str) -> String {
+        self.subagent_profiles
+            .resolve(subagent_type)
+            .system_prompt
+            .clone()
     }
 }
 
