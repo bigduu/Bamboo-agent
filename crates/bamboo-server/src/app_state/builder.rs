@@ -153,8 +153,30 @@ impl AppState {
         let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
-        // Child tools intentionally do not expose `SubSession` (no nested child spawns).
-        let child_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = base_tools.clone();
+        // Subagent profile registry: built-ins + user/project/env overrides.
+        // Loaded here (rather than further down) so we can wrap the child
+        // tool executor with `PolicyAwareToolExecutor` before it is handed
+        // to the spawn scheduler. Workspace path is intentionally `None` —
+        // the registry is a process-wide singleton; per-workspace overrides
+        // can still be picked up via `BAMBOO_SUBAGENT_PROFILES_FILE` or by
+        // resolving against `<bamboo_home_dir>/subagent_profiles.json`.
+        let subagent_profiles = crate::subagent_profiles::load_registry(&bamboo_home_dir, None)
+            .map_err(|e| {
+                crate::error::AppError::InternalError(anyhow::anyhow!(
+                    "failed to load subagent profile registry: {e}"
+                ))
+            })?;
+
+        // Child tools intentionally do not expose `SubSession` (no nested
+        // child spawns). They are wrapped by `PolicyAwareToolExecutor` so
+        // that each child's `subagent_type` metadata is consulted to
+        // enforce its `ToolPolicy` (allow/deny/inherit) at tool-call time.
+        let child_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+            Arc::new(crate::tools::PolicyAwareToolExecutor::new(
+                base_tools.clone(),
+                subagent_profiles.clone(),
+                sessions.clone(),
+            ));
 
         // Unified agent runtime (shared resources for all execution paths).
         // default_tools = base_tools (builtin + MCP + memory + skills) as a safe fallback.
@@ -232,18 +254,6 @@ impl AppState {
                 },
             ))
         };
-
-        // Subagent profile registry: built-ins + user/project/env overrides.
-        // Workspace path is intentionally `None` here — the registry is a
-        // process-wide singleton; per-workspace overrides can still be picked
-        // up via the `BAMBOO_SUBAGENT_PROFILES_FILE` env var or by
-        // resolving against `<bamboo_home_dir>/subagent_profiles.json`.
-        let subagent_profiles = crate::subagent_profiles::load_registry(&bamboo_home_dir, None)
-            .map_err(|e| {
-                crate::error::AppError::InternalError(anyhow::anyhow!(
-                    "failed to load subagent profile registry: {e}"
-                ))
-            })?;
 
         let tools = build_root_tools(
             tools_with_task.clone(),

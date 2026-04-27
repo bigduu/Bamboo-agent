@@ -13,6 +13,7 @@ pub use crate::server_tools::{
 };
 
 pub mod child_session_adapter;
+pub mod policy_aware;
 pub mod schedule_tasks;
 pub mod sub_session;
 
@@ -25,5 +26,6 @@ pub type OptionalSubagentModelResolver = Option<SubagentModelResolver>;
 
 // Re-export server-specific tool types for convenience
 pub use child_session_adapter::ChildSessionAdapter;
+pub use policy_aware::PolicyAwareToolExecutor;
 pub use schedule_tasks::ScheduleTasksTool;
 pub use sub_session::SubSessionTool;
