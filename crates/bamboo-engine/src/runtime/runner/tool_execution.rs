@@ -708,7 +708,7 @@ mod tests {
             "WebSearch",
             "Workspace",
             "BashOutput",
-            "recall",
+            "session_history",
             "Sleep",
         ];
         for name in &parallel_tools {
@@ -886,7 +886,7 @@ mod tests {
             "WebFetch",
             "WebSearch",
             "BashOutput",
-            "recall",
+            "session_history",
             "Sleep",
         ];
         for name in &read_only_tools {

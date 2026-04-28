@@ -200,7 +200,7 @@ fn read_only_tools() -> Vec<String> {
         "WebSearch".into(),
         "MemoryNote".into(),
         "memory".into(),
-        "recall".into(),
+        "session_history".into(),
     ]
 }
 
@@ -271,7 +271,7 @@ Your job is to gather comprehensive, accurate information on the assigned topic 
 Capabilities:
 - Read-only code access: Read, Glob, Grep, GetFileInfo.
 - Web access: WebFetch, WebSearch.
-- Memory: session_note, memory, recall to consult and accumulate findings.
+- Memory: session_note, memory, session_history to consult and accumulate findings.
 
 Constraints:
 - You MUST NOT modify any files or execute shell commands.

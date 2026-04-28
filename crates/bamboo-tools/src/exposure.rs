@@ -22,7 +22,9 @@ pub fn exposure_for_tool_name(name: &str) -> ToolExposure {
     match canonical_tool_name(name).as_str() {
         // Lower-frequency or specialized tools stay discoverable by default.
         "Sleep" | "NotebookEdit" | "js_repl" | "WebFetch" | "WebSearch" | "memory"
-        | "scheduler" | "SubSession" | "recall" | "ExitPlanMode" => ToolExposure::Discoverable,
+        | "scheduler" | "SubSession" | "session_history" | "ExitPlanMode" => {
+            ToolExposure::Discoverable
+        }
         _ => ToolExposure::Core,
     }
 }
@@ -122,7 +124,7 @@ pub fn discoverable_tool_short_description(name: &str) -> Option<&'static str> {
         "memory" => Some("Manage Bamboo's unified memory system for session notes and durable project/global memories."),
         "scheduler" => Some("Manage Bamboo scheduled automation jobs for recurring or delayed work."),
         "SubSession" => Some("Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work."),
-        "recall" => Some("Inspect prior Bamboo context from local session storage."),
+        "session_history" => Some("Read-only viewer over local Bamboo session history (list/inspect/search prior conversations). Distinct from `memory` (durable knowledge)."),
         "ExitPlanMode" => Some("Ask for confirmation before leaving plan mode."),
         _ => None,
     }
@@ -139,7 +141,7 @@ pub fn list_discoverable_tools() -> Vec<&'static str> {
         "memory",
         "scheduler",
         "SubSession",
-        "recall",
+        "session_history",
         "ExitPlanMode",
     ]
 }

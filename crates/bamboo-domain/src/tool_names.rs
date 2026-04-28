@@ -35,7 +35,7 @@ pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
 /// Tool names that are accepted as aliases for built-in/server tools but are not
 /// independently listed in `BUILTIN_TOOL_NAMES`/`SERVER_TOOL_NAMES`. Calls to these names are
 /// transparently routed to their canonical counterpart.
-pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 8] = [
+pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 9] = [
     // apply_patch is a patch-only alias for Edit
     ("apply_patch", "Edit"),
     // FileExists is subsumed by GetFileInfo (returns {exists: false} for missing paths)
@@ -45,8 +45,12 @@ pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 8] = [
     ("SetWorkspace", "Workspace"),
     // Session note rename
     ("memory_note", "session_note"),
-    // Server tool renames
-    ("session_inspector", "recall"),
+    // Server tool renames: `recall` was ambiguous with durable-memory recall
+    // (RAG-style relevant-memory injection). The canonical name is now
+    // `session_history` — strictly a read-only viewer over local SQLite
+    // session storage. Older names still route to the canonical tool.
+    ("recall", "session_history"),
+    ("session_inspector", "session_history"),
     ("schedule_tasks", "scheduler"),
     // SubSession manager alias
     ("sub_session_manager", "SubSession"),
@@ -56,7 +60,7 @@ pub const SERVER_TOOL_NAMES: [&str; 7] = [
     "SubSession",
     "compact_context",
     "scheduler",
-    "recall",
+    "session_history",
     "memory",
     "load_skill",
     "read_skill_resource",

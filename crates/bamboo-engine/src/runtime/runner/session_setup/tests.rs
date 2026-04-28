@@ -182,7 +182,7 @@ fn resolve_available_tool_schemas_includes_activated_discoverable_tools() {
 fn resolve_available_tool_schemas_does_not_mutate_session_metadata() {
     let config = crate::runtime::config::AgentLoopConfig::default();
     let tools = StaticToolExecutor {
-        schemas: vec![schema("Write"), schema("recall")],
+        schemas: vec![schema("Write"), schema("session_history")],
     };
     let mut session = Session::new("session-1", "gpt-4o-mini");
     session.add_message(Message::system("sys"));
@@ -198,12 +198,15 @@ fn resolve_available_tool_schemas_does_not_mutate_session_metadata() {
         .collect();
 
     // All tools are available; inactive discoverable ones get shortened descriptions
-    assert_eq!(names, vec!["Write", "recall"]);
-    let recall = resolved
+    assert_eq!(names, vec!["Write", "session_history"]);
+    let session_history = resolved
         .iter()
-        .find(|s| s.function.name == "recall")
+        .find(|s| s.function.name == "session_history")
         .unwrap();
-    assert!(recall.function.description.contains("Discoverable"));
+    assert!(session_history
+        .function
+        .description
+        .contains("Discoverable"));
     assert_eq!(
         session.metadata.get("existing").map(String::as_str),
         Some("value")

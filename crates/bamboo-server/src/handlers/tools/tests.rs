@@ -102,14 +102,14 @@ fn validate_session_context_requirement_rejects_missing_session_for_edit() {
 }
 
 #[test]
-fn validate_session_context_requirement_rejects_missing_session_for_recall() {
-    let error = validate_session_context_requirement("recall", None)
+fn validate_session_context_requirement_rejects_missing_session_for_session_history() {
+    let error = validate_session_context_requirement("session_history", None)
         .expect_err("expected missing-session validation error");
 
     match error {
         AppError::BadRequest(message) => {
             assert!(message.contains("requires session_id"));
-            assert!(message.contains("recall"));
+            assert!(message.contains("session_history"));
         }
         other => panic!("unexpected error: {other}"),
     }

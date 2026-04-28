@@ -347,7 +347,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::TaskManagement,
             "Store durable session-scoped notes and retrieve them across turns. Use it for local context, user preferences, constraints, and compression-resistant reminders within the current workstream.",
             "Do not store secrets/tokens, one-turn scratch text, or use it as the primary long-term knowledge base.",
-            &["Task", "recall"],
+            &["Task", "session_history"],
             vec![
                 example(
                     "Persist a durable session constraint",
@@ -366,7 +366,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::TaskManagement,
             "Manage Bamboo's unified memory system. Use session_* actions only for current-session continuity notes, and use query/get/write/merge/purge/inspect/rebuild for durable project or global memories backed by canonical topic files.",
             "Do not use session actions for long-term project knowledge, and do not dump large bodies through query when query -> get(id) or inspect is more appropriate. Prefer query first, then get the specific durable item you need before writing or merging.",
-            &["session_note", "recall", "Task"],
+            &["session_note", "session_history", "Task"],
             vec![
                 example(
                     "Read the current session note topic",
@@ -489,14 +489,14 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Use when the loaded instructions point to additional files.",
             )],
         )),
-        "recall" | "session_inspector" => Some(guide(
-            if tool_name == "session_inspector" {
-                "session_inspector"
-            } else {
-                "recall"
+        "session_history" | "recall" | "session_inspector" => Some(guide(
+            match tool_name {
+                "session_inspector" => "session_inspector",
+                "recall" => "recall",
+                _ => "session_history",
             },
             ToolCategory::FileReading,
-            "Inspect prior Bamboo context from local session storage. Use list/get_meta before deep reads when possible, then read bounded message slices, compressed recall, or search results to recover previous discussion context.",
+            "Inspect prior Bamboo session history from local SQLite storage. Use list/get_meta before deep reads when possible, then read bounded message slices, compressed conversation cache, or search results to recover previous discussion context. Distinct from `memory` (durable cross-session knowledge).",
             "Do not use as a broad substitute for local code search, and do not delegate child-session inspection unless the user explicitly asks for delegated work.",
             &["session_note", "Read", "Task"],
             vec![

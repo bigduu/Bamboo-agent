@@ -56,7 +56,7 @@ async fn root_tools_include_server_overlays_and_session_note() {
     assert!(names.contains("Task"));
     assert!(names.contains("SubSession"));
     assert!(names.contains("scheduler"));
-    assert!(names.contains("recall"));
+    assert!(names.contains("session_history"));
     assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
@@ -94,11 +94,11 @@ async fn default_first_round_tool_surface_is_smaller_than_full_root_tool_catalog
     );
     assert!(!visible_names.contains("scheduler"));
     assert!(!visible_names.contains("sub_session_manager"));
-    assert!(!visible_names.contains("recall"));
+    assert!(!visible_names.contains("session_history"));
 }
 
 #[tokio::test]
-async fn child_tools_exclude_scheduler_and_recall() {
+async fn child_tools_exclude_scheduler_and_session_history() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
@@ -112,7 +112,7 @@ async fn child_tools_exclude_scheduler_and_recall() {
 
     assert!(!names.contains("scheduler"));
     assert!(!names.contains("sub_session_manager"));
-    assert!(!names.contains("recall"));
+    assert!(!names.contains("session_history"));
     assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
@@ -137,7 +137,10 @@ async fn overlay_tools_require_session_context() {
 
     let inspector_result = state
         .tools_for(ToolSurface::Root)
-        .execute(&make_tool_call("recall", json!({ "action": "list" })))
+        .execute(&make_tool_call(
+            "session_history",
+            json!({ "action": "list" }),
+        ))
         .await;
     assert!(matches!(
         inspector_result,

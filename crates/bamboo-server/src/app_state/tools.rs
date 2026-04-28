@@ -3,7 +3,7 @@
 //! These functions compose the tool executor chain:
 //! ```text
 //! base_tools (builtin + MCP + memory + skills + compact_context)
-//!   └─> root_tools (base + SubSession + scheduler + recall/session inspector)
+//!   └─> root_tools (base + SubSession + scheduler + session_history)
 //! ```
 
 use std::collections::HashMap;

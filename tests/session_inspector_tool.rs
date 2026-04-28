@@ -1,4 +1,5 @@
-//! Integration tests for the server-only `recall` tool (legacy alias: `session_inspector`).
+//! Integration tests for the server-only `session_history` tool
+//! (legacy aliases: `recall`, `session_inspector`).
 
 use std::sync::Arc;
 
