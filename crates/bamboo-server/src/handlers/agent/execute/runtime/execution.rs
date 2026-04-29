@@ -39,12 +39,26 @@ pub(crate) struct SpawnAgentExecution {
     pub(crate) image_fallback: Option<ImageFallbackConfig>,
 }
 
-pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
-    let tools_override = if args.is_child_session {
-        Some(args.state.tools_for(ToolSurface::Child))
+pub(super) fn execution_tool_surface(is_child_session: bool) -> ToolSurface {
+    if is_child_session {
+        ToolSurface::Child
     } else {
-        None
-    };
+        ToolSurface::Root
+    }
+}
+
+pub(super) fn tools_for_execution(
+    state: &AppState,
+    is_child_session: bool,
+) -> Arc<dyn bamboo_agent_core::tools::ToolExecutor> {
+    state.tools_for(execution_tool_surface(is_child_session))
+}
+
+pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
+    let tools_override = Some(tools_for_execution(
+        args.state.as_ref(),
+        args.is_child_session,
+    ));
 
     let selected_skill_ids = session_state::selected_skill_ids_for_session(&args.session);
     let selected_skill_mode = session_state::selected_skill_mode_for_session(&args.session);

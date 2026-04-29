@@ -17,8 +17,8 @@ pub async fn get_models(app_state: web::Data<AppState>) -> Result<HttpResponse, 
         chrono::Utc::now(),
     );
 
-    // Get provider and fetch models.
-    let provider = app_state.get_provider().await;
+    // Get Anthropic provider and fetch models.
+    let provider = app_state.get_provider_for_endpoint("anthropic").await?;
     let model_ids = match provider.list_models().await {
         Ok(model_ids) => {
             app_state.metrics_service.collector().forward_completed(

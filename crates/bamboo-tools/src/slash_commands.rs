@@ -393,6 +393,20 @@ fn create_default_commands() -> Vec<SlashCommand> {
             has_file_references: false,
             accepts_arguments: false,
         },
+        SlashCommand {
+            id: "default-plan".to_string(),
+            name: "plan".to_string(),
+            full_command: "/plan".to_string(),
+            scope: "default".to_string(),
+            namespace: None,
+            file_path: "".to_string(),
+            content: "I want you to enter plan mode. This is a complex task that requires exploration and design before implementation.\n\nUse the EnterPlanMode tool to switch to read-only exploration. Then:\n1. Explore the codebase to understand the problem\n2. Design a concrete implementation approach\n3. Break the work into steps using the Task tool\n4. Write the plan to the plan file\n5. Exit plan mode when ready for my review".to_string(),
+            description: Some("Enter plan mode for complex tasks".to_string()),
+            allowed_tools: vec![],
+            has_bash_commands: false,
+            has_file_references: false,
+            accepts_arguments: false,
+        },
     ]
 }
 

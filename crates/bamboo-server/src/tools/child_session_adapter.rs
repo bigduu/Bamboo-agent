@@ -1,7 +1,7 @@
 //! Shared adapter implementing `ChildSessionPort` for server-side child session tools.
 //!
-//! Both `SpawnSessionTool` and `SubSessionManagerTool` delegate to this adapter
-//! instead of duplicating `ChildSessionPort` implementations.
+//! The unified `SubSessionTool` delegates to this adapter instead of
+//! duplicating `ChildSessionPort` implementations.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,17 +13,17 @@ use tokio::time::{sleep, Duration, Instant};
 use crate::app_state::session_events::get_or_create_event_sender;
 use crate::app_state::{AgentRunner, AgentStatus};
 use crate::session_app::child_session::{
-    ChildSessionEntry, ChildSessionError, ChildSessionPort, DeleteChildResult,
+    ChildRunnerInfo, ChildSessionEntry, ChildSessionError, ChildSessionPort, DeleteChildResult,
 };
 use crate::spawn_scheduler::{SpawnJob, SpawnScheduler};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolError;
 use bamboo_agent_core::{AgentEvent, Session, SessionKind};
-use bamboo_infrastructure::{SessionIndexEntry, SessionStoreV2};
+use bamboo_infrastructure::{Config, SessionIndexEntry, SessionStoreV2};
 
 /// Server-side adapter that bridges domain `ChildSessionPort` to infrastructure.
 ///
-/// Holds all shared state needed by both `SpawnSessionTool` and `SubSessionManagerTool`.
+/// Holds all shared state needed by `SubSessionTool`.
 /// Implements the full `ChildSessionPort` trait with real methods (no stubs).
 pub struct ChildSessionAdapter {
     pub(crate) session_store: Arc<SessionStoreV2>,
@@ -32,16 +32,43 @@ pub struct ChildSessionAdapter {
     pub(crate) sessions_cache: Arc<RwLock<HashMap<String, Session>>>,
     pub(crate) agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub(crate) session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
-    /// Optional subagent model resolver: maps subagent_type → model name.
+    /// Optional subagent model resolver: maps subagent_type → provider+model ref.
     pub(crate) subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
+    /// Application config for resolving subagent routing and external agent profiles.
+    pub(crate) config: Arc<RwLock<Config>>,
+    /// Subagent profile registry. Used to resolve `subagent_type` →
+    /// `system_prompt` (and, in later PRs, the tool surface filter).
+    pub(crate) subagent_profiles: Arc<bamboo_domain::subagent::SubagentProfileRegistry>,
 }
 
 impl ChildSessionAdapter {
-    /// Resolve the model for a given subagent_type using the configured resolver.
-    pub fn resolve_subagent_model(&self, subagent_type: &str) -> Option<String> {
-        self.subagent_model_resolver
-            .as_ref()
-            .and_then(|resolver| resolver(subagent_type))
+    /// Resolve the provider+model ref for a given subagent_type using the configured resolver.
+    pub async fn resolve_subagent_model(
+        &self,
+        subagent_type: &str,
+    ) -> Option<bamboo_domain::ProviderModelRef> {
+        match &self.subagent_model_resolver {
+            Some(resolver) => resolver(subagent_type.to_string()).await,
+            None => None,
+        }
+    }
+
+    /// Resolve runtime metadata (e.g. external agent routing) for a subagent_type.
+    pub async fn resolve_runtime_metadata(&self, subagent_type: &str) -> HashMap<String, String> {
+        let config = self.config.read().await;
+        crate::external_agents::config::resolve_runtime_metadata(&config, subagent_type)
+    }
+
+    /// Resolve the canonical system prompt for the given `subagent_type`.
+    ///
+    /// Always returns a prompt: unknown / empty `subagent_type` values fall
+    /// back to the `general-purpose` profile (whose prompt is byte-equal to
+    /// the legacy `CHILD_SYSTEM_PROMPT`).
+    pub fn resolve_subagent_prompt(&self, subagent_type: &str) -> String {
+        self.subagent_profiles
+            .resolve(subagent_type)
+            .system_prompt
+            .clone()
     }
 }
 
@@ -269,6 +296,18 @@ impl ChildSessionPort for ChildSessionAdapter {
         Ok(DeleteChildResult {
             deleted,
             cancelled_running_child,
+        })
+    }
+
+    async fn get_child_runner_info(&self, child_id: &str) -> Option<ChildRunnerInfo> {
+        let runners = self.agent_runners.read().await;
+        runners.get(child_id).map(|runner| ChildRunnerInfo {
+            started_at: Some(runner.started_at),
+            completed_at: runner.completed_at,
+            last_tool_name: runner.last_tool_name.clone(),
+            last_tool_phase: runner.last_tool_phase.clone(),
+            last_event_at: runner.last_event_at,
+            round_count: runner.round_count,
         })
     }
 }

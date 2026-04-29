@@ -60,7 +60,13 @@ pub async fn evaluate_task_progress(
         return Ok(skipped_evaluation("No in-progress tasks to evaluate"));
     }
 
-    if !has_tool_activity(ctx) {
+    let is_plan_mode = session
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|s| s.plan_mode.as_ref())
+        .is_some();
+
+    if !is_plan_mode && !has_tool_activity(ctx) {
         return Ok(skipped_evaluation(
             "No tool executions yet; skipping task evaluation.",
         ));

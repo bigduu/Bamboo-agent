@@ -74,6 +74,18 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 web::get().to(agent::sessions::get_system_prompt_snapshot),
             )
             .route(
+                "/sessions/{session_id}/discoverable-tools",
+                web::get().to(agent::sessions::list_discoverable_tools),
+            )
+            .route(
+                "/sessions/{session_id}/discoverable-tools",
+                web::post().to(agent::sessions::activate_discoverable_tools),
+            )
+            .route(
+                "/sessions/{session_id}/discoverable-tools",
+                web::delete().to(agent::sessions::deactivate_discoverable_tools),
+            )
+            .route(
                 "/sessions/{session_id}",
                 web::patch().to(agent::sessions::patch_session),
             )

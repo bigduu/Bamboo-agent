@@ -2,8 +2,8 @@
 //!
 //! These functions compose the tool executor chain:
 //! ```text
-//! base_tools (builtin + MCP + memory + skills)
-//!   └─> root_tools (base + SubSession + ScheduleTasks + SubSessionManager + SessionInspector)
+//! base_tools (builtin + MCP + memory + skills + compact_context)
+//!   └─> root_tools (base + SubSession + scheduler + session_history)
 //! ```
 
 use std::collections::HashMap;
@@ -92,6 +92,7 @@ pub(super) fn build_base_tools(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_root_tools(
     base_tools: Arc<dyn ToolExecutor>,
     schedule_store: Arc<ScheduleStore>,
@@ -105,8 +106,13 @@ pub(super) fn build_root_tools(
         RwLock<HashMap<String, broadcast::Sender<bamboo_agent_core::AgentEvent>>>,
     >,
     subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
+    config: Arc<RwLock<Config>>,
+    subagent_profiles: Arc<bamboo_domain::subagent::SubagentProfileRegistry>,
 ) -> Arc<dyn ToolExecutor> {
-    // Shared adapter for both child session tools.
+    // Shared adapter for the unified child session tool. Cloning the
+    // profile registry Arc is cheap and lets us hand the same registry
+    // to the SubSessionTool below without going through the adapter.
+    let profiles_for_tool = subagent_profiles.clone();
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {
         session_store: session_store.clone(),
         storage: storage.clone(),
@@ -115,13 +121,18 @@ pub(super) fn build_root_tools(
         agent_runners: agent_runners.clone(),
         session_event_senders,
         subagent_model_resolver,
+        config,
+        subagent_profiles,
     });
 
-    // Root sessions can spawn child sessions.
-    let spawn_tool = Arc::new(crate::tools::SpawnSessionTool::new(adapter.clone()));
-    let tools_with_spawn: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        base_tools, spawn_tool,
+    // Root sessions can create and manage child sessions via unified SubSession tool.
+    let sub_session_tool = Arc::new(crate::tools::SubSessionTool::new(
+        adapter,
+        profiles_for_tool,
     ));
+    let tools_with_sub_session: Arc<dyn ToolExecutor> = Arc::new(
+        crate::tools::OverlayToolExecutor::new(base_tools, sub_session_tool),
+    );
 
     // Root sessions can manage schedules via `scheduler`.
     // Background schedule runs intentionally use `tools_for_schedules` above and therefore
@@ -133,12 +144,7 @@ pub(super) fn build_root_tools(
         storage.clone(),
     ));
     let tools_with_schedule: Arc<dyn ToolExecutor> = Arc::new(
-        crate::tools::OverlayToolExecutor::new(tools_with_spawn, schedule_tasks_tool),
-    );
-
-    let sub_session_manager_tool = Arc::new(crate::tools::SubSessionManagerTool::new(adapter));
-    let tools_with_sub_session_manager: Arc<dyn ToolExecutor> = Arc::new(
-        crate::tools::OverlayToolExecutor::new(tools_with_schedule, sub_session_manager_tool),
+        crate::tools::OverlayToolExecutor::new(tools_with_sub_session, schedule_tasks_tool),
     );
 
     let session_inspector_tool = Arc::new(crate::tools::SessionInspectorTool::new(
@@ -147,7 +153,7 @@ pub(super) fn build_root_tools(
     ));
 
     Arc::new(crate::tools::OverlayToolExecutor::new(
-        tools_with_sub_session_manager,
+        tools_with_schedule,
         session_inspector_tool,
     ))
 }

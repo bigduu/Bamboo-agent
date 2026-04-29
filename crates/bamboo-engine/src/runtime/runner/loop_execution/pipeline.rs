@@ -61,6 +61,58 @@ fn is_overflow_recoverable(error: &AgentError) -> bool {
     matches!(error, AgentError::LLMOverflow(_))
 }
 
+// ---- Pending injected message merge ----
+
+/// Merge any queued follow-up messages that were injected via `send_message`
+/// while the child session is running. Loads the latest persisted session to
+/// check for `pending_injected_messages` metadata, appends them to the in-memory
+/// session, and clears the metadata flag.
+async fn maybe_merge_pending_injected_messages(
+    session: &mut Session,
+    storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
+) {
+    let Some(storage) = storage else { return };
+
+    let Ok(Some(latest)) = storage.load_session(&session.id).await else {
+        return;
+    };
+
+    let Some(raw) = latest.metadata.get("pending_injected_messages") else {
+        return;
+    };
+
+    let Ok(messages) = serde_json::from_str::<Vec<serde_json::Value>>(raw) else {
+        return;
+    };
+
+    let mut merged = 0usize;
+    for msg in messages {
+        if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
+            session.add_message(Message::user(content.to_string()));
+            merged += 1;
+        }
+    }
+
+    if merged > 0 {
+        session.metadata.remove("pending_injected_messages");
+        session.updated_at = chrono::Utc::now();
+
+        if let Err(error) = storage.save_session(session).await {
+            tracing::warn!(
+                "[{}] Failed to persist pending injected message cleanup: {}",
+                session.id,
+                error
+            );
+        }
+
+        tracing::info!(
+            "[{}] Merged {} injected message(s) from queued send_message at turn boundary",
+            session.id,
+            merged
+        );
+    }
+}
+
 // ---- Turn outcome (replaces RoundFlowOutcome) ----
 
 struct TurnOutcome {
@@ -389,6 +441,17 @@ pub(super) async fn run_pipeline(
             );
         }
 
+        // --- Runner progress event ---
+        let _ = event_tx
+            .send(AgentEvent::RunnerProgress {
+                session_id: state.session_id.clone(),
+                round_count: turn_counter,
+            })
+            .await;
+
+        // --- Merge any queued injected messages from send_message ---
+        maybe_merge_pending_injected_messages(session, config.storage.as_ref()).await;
+
         // --- Cancellation check ---
         if cancel_token.is_cancelled() {
             crate::runtime::runner::metrics_lifecycle::record_session_cancelled(
@@ -677,12 +740,89 @@ pub(super) async fn run_pipeline(
 #[cfg(test)]
 mod tests {
     use super::super::startup::OverflowRecoveryState;
-    use super::{is_overflow_recoverable, map_turn_error_status, should_retry_turn_error};
+    use super::{
+        is_overflow_recoverable, map_turn_error_status, maybe_merge_pending_injected_messages,
+        should_retry_turn_error,
+    };
     use crate::metrics::{
         RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
         TokenUsage as MetricsTokenUsage,
     };
-    use bamboo_agent_core::{AgentError, AgentEvent, Session};
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    #[derive(Default)]
+    struct TestStorage {
+        sessions: RwLock<HashMap<String, Session>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for TestStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.sessions
+                .write()
+                .await
+                .insert(session.id.clone(), session.clone());
+            Ok(())
+        }
+
+        async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+            Ok(self.sessions.read().await.get(session_id).cloned())
+        }
+
+        async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
+            Ok(self.sessions.write().await.remove(session_id).is_some())
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_injected_messages_are_merged_once_and_cleared_from_storage() {
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        let mut persisted = Session::new_child("child-merge", "parent", "model", "Child");
+        persisted.add_message(Message::system("system"));
+        persisted.add_message(Message::user("original task"));
+        persisted.metadata.insert(
+            "pending_injected_messages".to_string(),
+            serde_json::json!([
+                {
+                    "content": "queued correction",
+                    "created_at": chrono::Utc::now(),
+                }
+            ])
+            .to_string(),
+        );
+        storage
+            .save_session(&persisted)
+            .await
+            .expect("persisted child should be saved");
+
+        let mut running = persisted.clone();
+        running.metadata.remove("pending_injected_messages");
+
+        maybe_merge_pending_injected_messages(&mut running, Some(&storage)).await;
+
+        assert_eq!(
+            running
+                .messages
+                .last()
+                .map(|message| message.content.as_str()),
+            Some("queued correction")
+        );
+        assert!(!running.metadata.contains_key("pending_injected_messages"));
+        let saved = storage
+            .load_session("child-merge")
+            .await
+            .expect("load should succeed")
+            .expect("session should exist");
+        assert!(!saved.metadata.contains_key("pending_injected_messages"));
+
+        let count_after_first_merge = running.messages.len();
+        maybe_merge_pending_injected_messages(&mut running, Some(&storage)).await;
+        assert_eq!(running.messages.len(), count_after_first_merge);
+    }
 
     // --- Tests from rounds.rs ---
 

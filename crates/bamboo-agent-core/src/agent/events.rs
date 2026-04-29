@@ -176,6 +176,12 @@ pub enum AgentEvent {
         question: String,
         /// Optional predefined options
         options: Option<Vec<String>>,
+        /// Tool call identifier that triggered this clarification
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+        /// Whether the user can provide a free-text response
+        #[serde(default = "default_allow_custom")]
+        allow_custom: bool,
     },
 
     /// Emitted when task list is created or updated.
@@ -307,6 +313,51 @@ pub enum AgentEvent {
         error: Option<String>,
     },
 
+    /// Plan mode was entered.
+    PlanModeEntered {
+        /// Session identifier
+        session_id: String,
+        /// Optional reason for entering plan mode
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// Previous permission mode before entering plan mode
+        pre_permission_mode: String,
+    },
+
+    /// Plan mode was exited.
+    PlanModeExited {
+        /// Session identifier
+        session_id: String,
+        /// Whether the exit was approved by the user
+        approved: bool,
+        /// The permission mode restored after exiting
+        restored_mode: String,
+        /// Plan content that was reviewed, if any
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<String>,
+    },
+
+    /// Plan file was updated.
+    PlanFileUpdated {
+        /// Session identifier
+        session_id: String,
+        /// Path to the plan file
+        file_path: String,
+        /// Summary of the plan content (truncated)
+        content_summary: String,
+    },
+
+    /// Runner progress update emitted at the start of each agent turn.
+    ///
+    /// Used to track live execution progress (round count, current activity)
+    /// for diagnostic visibility, especially for child sessions.
+    RunnerProgress {
+        /// Session identifier
+        session_id: String,
+        /// Current turn/round count
+        round_count: u32,
+    },
+
     /// Agent execution completed successfully.
     Complete {
         /// Final token usage statistics
@@ -318,6 +369,10 @@ pub enum AgentEvent {
         /// Error message
         message: String,
     },
+}
+
+fn default_allow_custom() -> bool {
+    true
 }
 
 /// Re-exported shared token usage type.
@@ -384,5 +439,146 @@ mod tests {
         assert_eq!(value["type"], "context_compression_status");
         assert_eq!(value["phase"], "mid-turn");
         assert_eq!(value["status"], "started");
+    }
+
+    #[test]
+    fn need_clarification_serializes_with_new_fields() {
+        let event = AgentEvent::NeedClarification {
+            question: "Continue?".to_string(),
+            options: Some(vec!["Yes".to_string(), "No".to_string()]),
+            tool_call_id: Some("tool-1".to_string()),
+            allow_custom: false,
+        };
+
+        let value = serde_json::to_value(event).expect("event should serialize");
+        assert_eq!(value["type"], "need_clarification");
+        assert_eq!(value["question"], "Continue?");
+        assert_eq!(value["options"], serde_json::json!(["Yes", "No"]));
+        assert_eq!(value["tool_call_id"], "tool-1");
+        assert_eq!(value["allow_custom"], false);
+    }
+
+    #[test]
+    fn need_clarification_deserializes_from_old_format_without_new_fields() {
+        let json = serde_json::json!({
+            "type": "need_clarification",
+            "question": "Continue?",
+            "options": ["Yes", "No"]
+        });
+
+        let event: AgentEvent =
+            serde_json::from_value(json).expect("should deserialize old format");
+        match event {
+            AgentEvent::NeedClarification {
+                question,
+                options,
+                tool_call_id,
+                allow_custom,
+            } => {
+                assert_eq!(question, "Continue?");
+                assert_eq!(options, Some(vec!["Yes".to_string(), "No".to_string()]));
+                assert_eq!(tool_call_id, None);
+                assert!(allow_custom); // default_allow_custom returns true
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn need_clarification_deserializes_with_allow_custom_false() {
+        let json = serde_json::json!({
+            "type": "need_clarification",
+            "question": "Pick one",
+            "allow_custom": false
+        });
+
+        let event: AgentEvent = serde_json::from_value(json).expect("should deserialize");
+        match event {
+            AgentEvent::NeedClarification {
+                question,
+                options,
+                tool_call_id,
+                allow_custom,
+            } => {
+                assert_eq!(question, "Pick one");
+                assert_eq!(options, None);
+                assert_eq!(tool_call_id, None);
+                assert!(!allow_custom);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_mode_entered_serializes_correctly() {
+        let event = AgentEvent::PlanModeEntered {
+            session_id: "sess-1".to_string(),
+            reason: Some("Complex refactor".to_string()),
+            pre_permission_mode: "default".to_string(),
+        };
+
+        let value = serde_json::to_value(event).expect("event should serialize");
+        assert_eq!(value["type"], "plan_mode_entered");
+        assert_eq!(value["session_id"], "sess-1");
+        assert_eq!(value["reason"], "Complex refactor");
+        assert_eq!(value["pre_permission_mode"], "default");
+    }
+
+    #[test]
+    fn plan_mode_exited_serializes_correctly() {
+        let event = AgentEvent::PlanModeExited {
+            session_id: "sess-1".to_string(),
+            approved: true,
+            restored_mode: "accept_edits".to_string(),
+            plan: Some("# Plan\n1. Step one".to_string()),
+        };
+
+        let value = serde_json::to_value(event).expect("event should serialize");
+        assert_eq!(value["type"], "plan_mode_exited");
+        assert_eq!(value["session_id"], "sess-1");
+        assert_eq!(value["approved"], true);
+        assert_eq!(value["restored_mode"], "accept_edits");
+        assert_eq!(value["plan"], "# Plan\n1. Step one");
+    }
+
+    #[test]
+    fn plan_file_updated_serializes_correctly() {
+        let event = AgentEvent::PlanFileUpdated {
+            session_id: "sess-1".to_string(),
+            file_path: "/tmp/plans/sess-1.md".to_string(),
+            content_summary: "Implementation plan for feature X".to_string(),
+        };
+
+        let value = serde_json::to_value(event).expect("event should serialize");
+        assert_eq!(value["type"], "plan_file_updated");
+        assert_eq!(value["session_id"], "sess-1");
+        assert_eq!(value["file_path"], "/tmp/plans/sess-1.md");
+        assert_eq!(
+            value["content_summary"],
+            "Implementation plan for feature X"
+        );
+    }
+
+    #[test]
+    fn plan_mode_events_deserialize_without_optional_fields() {
+        let json = serde_json::json!({
+            "type": "plan_mode_entered",
+            "session_id": "sess-1",
+            "pre_permission_mode": "default"
+        });
+
+        let event: AgentEvent = serde_json::from_value(json).expect("should deserialize");
+        match event {
+            AgentEvent::PlanModeEntered {
+                session_id,
+                reason,
+                pre_permission_mode,
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(reason, None);
+                assert_eq!(pre_permission_mode, "default");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }

@@ -1,5 +1,6 @@
 //! Bamboo infrastructure — config, LLM, storage, process.
 
+pub mod a2a;
 pub mod config;
 pub mod llm;
 pub mod process;

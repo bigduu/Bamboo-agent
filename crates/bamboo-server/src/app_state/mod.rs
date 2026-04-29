@@ -204,6 +204,15 @@ pub struct AppState {
     /// `state.tools_for(ToolSurface::Child)` for child sessions, etc.
     pub tool_factory: crate::tools::ToolSurfaceFactory,
 
+    /// Subagent profile registry (role definitions for child sessions).
+    ///
+    /// Composed from built-in profiles + user/project/env overrides at
+    /// startup. Currently provided as ambient state for future PRs that
+    /// will plumb it into child-session creation and tool-surface filtering;
+    /// the runtime does not read from it yet, so adding this field is a
+    /// no-op for existing behaviour.
+    pub subagent_profiles: Arc<bamboo_domain::subagent::SubagentProfileRegistry>,
+
     /// Cancellation tokens for in-flight requests
     ///
     /// Maps request/session IDs to their cancellation tokens,

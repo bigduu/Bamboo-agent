@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Role, Session, SessionKind};
+use bamboo_domain::ProviderModelRef;
+use bamboo_infrastructure::{LLMProvider, ProviderModelRouter};
 
 use crate::runtime::Agent;
 use crate::runtime::ExecuteRequest;
@@ -30,6 +32,25 @@ pub struct SpawnJob {
     pub model: String,
 }
 
+/// Trait for external child session runtimes (e.g. A2A, CLI adapters).
+///
+/// Implementors are responsible for emitting AgentEvents via `event_tx`
+/// and respecting the `cancel_token`.
+#[async_trait::async_trait]
+pub trait ExternalChildRunner: Send + Sync {
+    /// Returns true if this runner should handle the given child session.
+    async fn should_handle(&self, session: &Session) -> bool;
+
+    /// Execute the child session using an external runtime.
+    async fn execute_external_child(
+        &self,
+        session: &mut Session,
+        job: &SpawnJob,
+        event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        cancel_token: CancellationToken,
+    ) -> crate::runtime::runner::Result<()>;
+}
+
 #[derive(Clone)]
 pub struct SpawnContext {
     pub agent: Arc<Agent>,
@@ -37,6 +58,8 @@ pub struct SpawnContext {
     pub sessions_cache: Arc<RwLock<HashMap<String, Session>>>,
     pub agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
+    pub external_child_runner: Option<Arc<dyn ExternalChildRunner>>,
+    pub provider_router: Option<Arc<ProviderModelRouter>>,
 }
 
 #[derive(Clone)]
@@ -65,6 +88,56 @@ impl SpawnScheduler {
             .await
             .map_err(|_| "spawn scheduler is not running".to_string())
     }
+}
+
+fn child_model_ref(session: &Session, model: &str) -> Option<ProviderModelRef> {
+    if let Some(model_ref) = session.model_ref.clone() {
+        let provider = model_ref.provider.trim();
+        let model_name = model_ref.model.trim();
+        if !provider.is_empty() && !model_name.is_empty() {
+            return Some(ProviderModelRef::new(provider, model_name));
+        }
+    }
+
+    let provider = session
+        .metadata
+        .get("provider_name")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let model_name = model.trim();
+    if model_name.is_empty() {
+        return None;
+    }
+    Some(ProviderModelRef::new(provider, model_name))
+}
+
+fn resolve_child_provider_override(
+    router: Option<&Arc<ProviderModelRouter>>,
+    session: &Session,
+    model: &str,
+) -> (Option<Arc<dyn LLMProvider>>, Option<String>) {
+    let model_ref = child_model_ref(session, model);
+    let provider_name = model_ref
+        .as_ref()
+        .map(|model_ref| model_ref.provider.clone());
+    let provider = router.and_then(|router| {
+        let model_ref = model_ref.as_ref()?;
+        match router.route(model_ref) {
+            Ok(provider) => Some(provider),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session.id,
+                    provider = %model_ref.provider,
+                    model = %model_ref.model,
+                    error = %error,
+                    "failed to resolve provider override for child session; falling back to runtime provider"
+                );
+                None
+            }
+        }
+    });
+    (provider, provider_name)
 }
 
 async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
@@ -209,37 +282,67 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
     let sessions_cache = ctx.sessions_cache.clone();
     let agent = ctx.agent.clone();
     let tools = ctx.tools.clone();
+    let external_runner = ctx.external_child_runner.clone();
     let done = forwarder_done.clone();
     let parent_tx_for_done = parent_tx.clone();
     let parent_id_for_done = job.parent_session_id.clone();
     let child_id_for_done = job.child_session_id.clone();
     let session_event_senders = ctx.session_event_senders.clone();
+    let provider_router = ctx.provider_router.clone();
 
     tokio::spawn(async move {
         session.model = model.clone();
 
-        let result: crate::runtime::runner::Result<()> = agent
-            .execute(
-                &mut session,
-                ExecuteRequest {
-                    initial_message: String::new(), // handled by agent loop
-                    event_tx: mpsc_tx,
-                    cancel_token,
-                    tools: Some(tools),
-                    provider_override: None,
-                    model: Some(model.clone()),
-                    provider_name: None,
-                    background_model: None,
-                    background_model_provider: None,
-                    reasoning_effort: None,
-                    disabled_tools: None,
-                    disabled_skill_ids: None,
-                    selected_skill_ids: None,
-                    selected_skill_mode: None,
-                    image_fallback: None,
-                },
-            )
-            .await;
+        let wants_external = session
+            .metadata
+            .get("runtime.kind")
+            .is_some_and(|v| v == "external");
+
+        let result: crate::runtime::runner::Result<()> = if wants_external {
+            if let Some(runner) = external_runner {
+                if runner.should_handle(&session).await {
+                    runner
+                        .execute_external_child(&mut session, &job, mpsc_tx, cancel_token)
+                        .await
+                } else {
+                    Err(bamboo_agent_core::AgentError::LLM(format!(
+                        "No external runner matched child session runtime metadata: agent_id={:?}, protocol={:?}",
+                        session.metadata.get("external.agent_id"),
+                        session.metadata.get("external.protocol"),
+                    )))
+                }
+            } else {
+                Err(bamboo_agent_core::AgentError::LLM(
+                    "Child session requires external runtime, but no external runner is configured"
+                        .to_string(),
+                ))
+            }
+        } else {
+            let (provider_override, provider_name) =
+                resolve_child_provider_override(provider_router.as_ref(), &session, &model);
+            agent
+                .execute(
+                    &mut session,
+                    ExecuteRequest {
+                        initial_message: String::new(), // handled by agent loop
+                        event_tx: mpsc_tx,
+                        cancel_token,
+                        tools: Some(tools),
+                        provider_override,
+                        model: Some(model.clone()),
+                        provider_name,
+                        background_model: None,
+                        background_model_provider: None,
+                        reasoning_effort: None,
+                        disabled_tools: None,
+                        disabled_skill_ids: None,
+                        selected_skill_ids: None,
+                        selected_skill_mode: None,
+                        image_fallback: None,
+                    },
+                )
+                .await
+        };
 
         let (status, error) = match &result {
             Ok(_) => ("completed".to_string(), None),
@@ -250,6 +353,26 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
         };
 
         finalize_runner(&agent_runners_for_status, &session_id_clone, &result).await;
+
+        // Merge any queued injected messages that the pipeline didn't pick up
+        // (e.g. if the loop exited before the next turn boundary).
+        match agent.storage().load_session(&session_id_clone).await {
+            Ok(Some(latest)) => {
+                if let Some(raw) = latest.metadata.get("pending_injected_messages") {
+                    if let Ok(messages) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
+                        for msg in messages {
+                            if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
+                                session.add_message(bamboo_agent_core::Message::user(
+                                    content.to_string(),
+                                ));
+                            }
+                        }
+                        session.metadata.remove("pending_injected_messages");
+                    }
+                }
+            }
+            _ => {}
+        }
 
         // Persist final session snapshot.
         session

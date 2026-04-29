@@ -28,4 +28,4 @@ pub use event_forwarder::create_event_forwarder;
 pub use runner_lifecycle::{finalize_runner, status_from_execution_result, try_reserve_runner};
 pub use runner_state::{AgentRunner, AgentStatus};
 pub use session_events::{get_or_create_event_sender, SESSION_EVENT_CHANNEL_CAPACITY};
-pub use spawn::{SpawnContext, SpawnJob, SpawnScheduler};
+pub use spawn::{ExternalChildRunner, SpawnContext, SpawnJob, SpawnScheduler};

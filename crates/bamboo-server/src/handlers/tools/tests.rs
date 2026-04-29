@@ -24,6 +24,29 @@ fn canonical_tool_name_or_error_resolves_aliases() {
 }
 
 #[test]
+fn canonical_tool_name_or_error_resolves_sub_session_manager_alias() {
+    let canonical = canonical_tool_name_or_error("sub_session_manager")
+        .expect("legacy manager alias should resolve");
+    assert_eq!(canonical, "SubSession");
+}
+
+#[test]
+fn validate_session_context_requirement_rejects_missing_session_for_sub_session_manager_alias() {
+    let canonical = canonical_tool_name_or_error("sub_session_manager")
+        .expect("legacy manager alias should resolve");
+    let error = validate_session_context_requirement(&canonical, None)
+        .expect_err("legacy manager alias should still require session context");
+
+    match error {
+        AppError::BadRequest(message) => {
+            assert!(message.contains("requires session_id"));
+            assert!(message.contains("SubSession"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn canonical_tool_name_or_error_rejects_removed_compress_context() {
     let error = canonical_tool_name_or_error("compress_context")
         .expect_err("compress_context should not resolve once removed");
@@ -79,14 +102,14 @@ fn validate_session_context_requirement_rejects_missing_session_for_edit() {
 }
 
 #[test]
-fn validate_session_context_requirement_rejects_missing_session_for_recall() {
-    let error = validate_session_context_requirement("recall", None)
+fn validate_session_context_requirement_rejects_missing_session_for_session_history() {
+    let error = validate_session_context_requirement("session_history", None)
         .expect_err("expected missing-session validation error");
 
     match error {
         AppError::BadRequest(message) => {
             assert!(message.contains("requires session_id"));
-            assert!(message.contains("recall"));
+            assert!(message.contains("session_history"));
         }
         other => panic!("unexpected error: {other}"),
     }

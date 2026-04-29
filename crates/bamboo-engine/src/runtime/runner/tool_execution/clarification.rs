@@ -54,10 +54,11 @@ pub(super) async fn maybe_handle_user_question_tool(
     )
     .await;
 
-    emit_need_clarification_event(event_tx, &question_payload).await;
+    emit_need_clarification_event(event_tx, &question_payload, &tool_call.id).await;
 
     session.set_pending_question(
         tool_call.id.clone(),
+        tool_call.function.name.clone(),
         question_payload.question,
         question_payload.options,
         question_payload.allow_custom,

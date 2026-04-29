@@ -34,6 +34,10 @@ pub struct GuideBuildContext {
     pub include_best_practices: bool,
     /// Maximum number of examples to include per tool
     pub max_examples_per_tool: usize,
+    /// Discoverable tools that are currently activated for the session.
+    /// Activated discoverable tools render with full guides; inactive ones
+    /// render with short summaries only.
+    pub activated_discoverable_tools: std::collections::BTreeSet<String>,
 }
 
 impl Default for GuideBuildContext {
@@ -42,6 +46,7 @@ impl Default for GuideBuildContext {
             language: GuideLanguage::English,
             include_best_practices: true,
             max_examples_per_tool: 2,
+            activated_discoverable_tools: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -72,7 +77,7 @@ impl GuideBuildContext {
                 "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
                 "Use Bash only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
                 "When multiple Bash commands are independent, run them in parallel tool calls. For dependent commands, chain with &&.",
-                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, WebFetch, WebSearch, recall. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
+                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, WebFetch, WebSearch, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
                 "For commit requests: inspect git status, git diff, and recent git log first; commit only when explicitly requested; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
                 "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
                 "When referencing code locations in responses, use file_path:line_number format.",
@@ -88,7 +93,7 @@ impl GuideBuildContext {
                 "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
                 "Use Bash only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
                 "When multiple Bash commands are independent, run them in parallel tool calls. For dependent commands, chain with &&.",
-                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, WebFetch, WebSearch, recall. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
+                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, WebFetch, WebSearch, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
                 "For commit requests: inspect git status, git diff, and recent git log first; commit only when explicitly requested; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
                 "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
                 "When referencing code locations in responses, use file_path:line_number format.",

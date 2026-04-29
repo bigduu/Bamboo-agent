@@ -6,11 +6,12 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 20] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
     "conclusion_with_options",
     "Bash",
     "BashOutput",
     "Edit",
+    "EnterPlanMode",
     "ExitPlanMode",
     "GetFileInfo",
     "Glob",
@@ -243,6 +244,18 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Keep exactly one item in_progress whenever possible.",
             )],
         )),
+        "EnterPlanMode" => Some(guide(
+            "EnterPlanMode",
+            ToolCategory::UserInteraction,
+            "Switch to plan mode for complex tasks requiring exploration and design before implementation.",
+            "Do not use for simple tasks that can be implemented directly.",
+            &["Task", "ExitPlanMode"],
+            vec![example(
+                "Start planning a complex refactor",
+                json!({"reason":"This refactor touches multiple crates and needs careful design"}),
+                "Use when facing a complex task that requires exploration before implementation.",
+            )],
+        )),
         "ExitPlanMode" => Some(guide(
             "ExitPlanMode",
             ToolCategory::UserInteraction,
@@ -271,14 +284,21 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "WebSearch" => Some(guide(
             "WebSearch",
             ToolCategory::CommandExecution,
-            "Search the web with optional domain allow/block filters.",
-            "Do not use for local codebase search.",
+            "Search the web with optional domain allow/block filters. When searching for recent information, documentation, or current events, include the current year in the query to get up-to-date results.",
+            "Do not use for local codebase search. Do not specify both allowed_domains and blocked_domains in the same request.",
             &["WebFetch", "Grep"],
-            vec![example(
-                "Search official docs",
-                json!({"query":"rust async trait object", "allowed_domains":["doc.rust-lang.org"]}),
-                "Use before WebFetch when URL is unknown.",
-            )],
+            vec![
+                example(
+                    "Search official docs",
+                    json!({"query":"rust async trait object", "allowed_domains":["doc.rust-lang.org"]}),
+                    "Use before WebFetch when URL is unknown.",
+                ),
+                example(
+                    "Search recent documentation",
+                    json!({"query":"React documentation 2026", "max_results": 5}),
+                    "Include the current year for recent docs or current events.",
+                ),
+            ],
         )),
         // GetCurrentDir is now an alias for Workspace (get mode)
         "GetCurrentDir" => Some(guide(
@@ -327,7 +347,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::TaskManagement,
             "Store durable session-scoped notes and retrieve them across turns. Use it for local context, user preferences, constraints, and compression-resistant reminders within the current workstream.",
             "Do not store secrets/tokens, one-turn scratch text, or use it as the primary long-term knowledge base.",
-            &["Task", "recall"],
+            &["Task", "session_history"],
             vec![
                 example(
                     "Persist a durable session constraint",
@@ -346,7 +366,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::TaskManagement,
             "Manage Bamboo's unified memory system. Use session_* actions only for current-session continuity notes, and use query/get/write/merge/purge/inspect/rebuild for durable project or global memories backed by canonical topic files.",
             "Do not use session actions for long-term project knowledge, and do not dump large bodies through query when query -> get(id) or inspect is more appropriate. Prefer query first, then get the specific durable item you need before writing or merging.",
-            &["session_note", "recall", "Task"],
+            &["session_note", "session_history", "Task"],
             vec![
                 example(
                     "Read the current session note topic",
@@ -469,14 +489,14 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Use when the loaded instructions point to additional files.",
             )],
         )),
-        "recall" | "session_inspector" => Some(guide(
-            if tool_name == "session_inspector" {
-                "session_inspector"
-            } else {
-                "recall"
+        "session_history" | "recall" | "session_inspector" => Some(guide(
+            match tool_name {
+                "session_inspector" => "session_inspector",
+                "recall" => "recall",
+                _ => "session_history",
             },
             ToolCategory::FileReading,
-            "Inspect prior Bamboo context from local session storage. Use list/get_meta before deep reads when possible, then read bounded message slices, compressed recall, or search results to recover previous discussion context.",
+            "Inspect prior Bamboo session history from local SQLite storage. Use list/get_meta before deep reads when possible, then read bounded message slices, compressed conversation cache, or search results to recover previous discussion context. Distinct from `memory` (durable cross-session knowledge).",
             "Do not use as a broad substitute for local code search, and do not delegate child-session inspection unless the user explicitly asks for delegated work.",
             &["session_note", "Read", "Task"],
             vec![
@@ -518,38 +538,29 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "SubSession" => Some(guide(
             "SubSession",
             ToolCategory::TaskManagement,
-            "Create and run a child session asynchronously when the user explicitly requests delegated, parallel, or sub-agent work.",
-            "Do not use proactively just to speed things up or split work on your own; only use it when the user clearly asked for delegation/sub-agents/parallel agent work.",
-            &["sub_session_manager", "Task"],
+            "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. Use action=create to spawn a new child; use list/get to inspect existing children before creating duplicates; use update/run/send_message/cancel/delete to manage existing children.",
+            "Do not use proactively for simple one-step tasks; do not spawn children from child sessions; do not create multiple overlapping children with unclear responsibilities.",
+            &["Task"],
             vec![
                 example(
-                    "Start delegated review work explicitly requested by the user",
-                    json!({"title":"Backend API audit","responsibility":"Review backend API integration points","subagent_type":"general-purpose","prompt":"Analyze the backend API surface and report coupling risks."}),
-                    "Use only after the user explicitly asked for delegation or parallel agent help.",
+                    "Create a read-only research child",
+                    json!({"action":"create","title":"Inspect parser module","responsibility":"Find parser entrypoints and summarize data flow","prompt":"Read parser-related files and report key functions. Do not modify files.","subagent_type":"researcher"}),
+                    "Use for isolated investigation that would otherwise fill the main context.",
                 ),
                 example(
-                    "Create a focused child session",
-                    json!({"title":"Docs verification","responsibility":"Verify docs against implementation","subagent_type":"researcher","prompt":"Compare current docs with implementation details and list mismatches."}),
-                    "Keep the child session responsibility single-purpose and explicit.",
-                ),
-            ],
-        )),
-        "sub_session_manager" => Some(guide(
-            "sub_session_manager",
-            ToolCategory::TaskManagement,
-            "Manage existing child sessions under the current root session. Use it to inspect, retry, update, rerun, or message child sessions after they already exist.",
-            "Do not use it to create new child sessions from scratch; use SubSession for creation, and do not use it inside child sessions.",
-            &["SubSession", "Task"],
-            vec![
-                example(
-                    "List existing child sessions",
+                    "List existing children",
                     json!({"action":"list"}),
-                    "Use before following up on an existing child session when you need to inspect what already exists.",
+                    "Use before creating a new child when you might already have a relevant one.",
                 ),
                 example(
-                    "Send follow-up instructions to an existing child",
-                    json!({"action":"send_message","child_session_id":"child_123","message":"Continue and focus on test failures.","auto_run":true}),
-                    "Use after a child session exists and you want it to continue with updated instructions.",
+                    "Send follow-up to existing child",
+                    json!({"action":"send_message","child_session_id":"child_123","message":"Focus on error handling paths and summarize risks.","auto_run":true}),
+                    "Use follow-up instead of creating a duplicate child session.",
+                ),
+                example(
+                    "Cancel a running child",
+                    json!({"action":"cancel","child_session_id":"child_123"}),
+                    "Use when a child session is no longer needed or has gone off track.",
                 ),
             ],
         )),

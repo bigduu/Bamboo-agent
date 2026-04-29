@@ -1,12 +1,17 @@
 use crate::error::AppError;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall};
+use bamboo_domain::tool_names::resolve_alias;
 use bamboo_tools::normalize_tool_ref;
 use serde_json::Value;
 
 use super::models::ToolParameter;
 
 pub(super) fn canonical_tool_name_or_error(tool_name: &str) -> Result<String, AppError> {
-    normalize_tool_ref(tool_name).ok_or_else(|| AppError::ToolNotFound(tool_name.to_string()))
+    let normalized = normalize_tool_ref(tool_name)
+        .ok_or_else(|| AppError::ToolNotFound(tool_name.to_string()))?;
+    Ok(resolve_alias(&normalized)
+        .unwrap_or(normalized.as_str())
+        .to_string())
 }
 
 pub(super) fn trimmed_session_id(session_id: Option<&str>) -> Option<&str> {
@@ -63,7 +68,7 @@ pub(super) fn requires_session_context(tool_name: &str) -> bool {
             | "memory_note"
             | "scheduler"
             | "schedule_tasks"
-            | "sub_session_manager"
+            | "session_history"
             | "recall"
             | "session_inspector"
     )

@@ -25,6 +25,9 @@ pub mod workflow;
 // Storage port definitions (moved from application-agent)
 pub mod storage;
 
+// Subagent profile definitions (additive — not yet wired into runtime).
+pub mod subagent;
+
 // Flat re-exports for backward-compatible access
 pub use mcp_config::*;
 pub use provider_catalog::*;

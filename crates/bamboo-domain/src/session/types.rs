@@ -252,6 +252,9 @@ impl Message {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingQuestion {
     pub tool_call_id: String,
+    /// Name of the tool that created this pending question (e.g. "EnterPlanMode", "ExitPlanMode").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tool_name: String,
     pub question: String,
     pub options: Vec<String>,
     pub allow_custom: bool,
@@ -732,12 +735,14 @@ impl Session {
     pub fn set_pending_question(
         &mut self,
         tool_call_id: String,
+        tool_name: String,
         question: String,
         options: Vec<String>,
         allow_custom: bool,
     ) {
         self.pending_question = Some(PendingQuestion {
             tool_call_id,
+            tool_name,
             question,
             options,
             allow_custom,

@@ -85,6 +85,14 @@ pub struct SessionIndexEntry {
     /// loading full session.json for every row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenBudgetUsage>,
+    /// SubAgent profile id for child sessions spawned by `SubSession.create`.
+    /// Mirrored into the index from `session.metadata["subagent_type"]` so the
+    /// frontend can render role badges (e.g. "general-purpose", "plan") on the
+    /// child-session list without loading each session.json.
+    /// `None` for root sessions and for legacy children created before this
+    /// field was introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +334,11 @@ impl SessionStoreV2 {
             .get("schedule_run_id")
             .cloned()
             .filter(|v| !v.trim().is_empty());
+        let subagent_type = session
+            .metadata
+            .get("subagent_type")
+            .cloned()
+            .filter(|v| !v.trim().is_empty());
         self.update_index(|index| {
             index.sessions.insert(
                 session.id.clone(),
@@ -351,6 +364,7 @@ impl SessionStoreV2 {
                     last_run_status,
                     last_run_error,
                     token_usage: session.token_usage.clone(),
+                    subagent_type,
                 },
             );
             Ok(())

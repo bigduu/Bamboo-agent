@@ -138,7 +138,19 @@ fn resolve_available_tool_schemas_hides_discoverable_tools_by_default() {
         .map(|item| item.function.name.as_str())
         .collect();
 
-    assert_eq!(names, vec!["Read"]);
+    assert_eq!(names, vec!["Read", "Sleep", "scheduler"]);
+
+    // Inactive discoverable tools get shortened descriptions
+    let sleep = resolved
+        .iter()
+        .find(|s| s.function.name == "Sleep")
+        .unwrap();
+    assert!(sleep.function.description.contains("Discoverable"));
+    let scheduler = resolved
+        .iter()
+        .find(|s| s.function.name == "scheduler")
+        .unwrap();
+    assert!(scheduler.function.description.contains("Discoverable"));
 }
 
 #[test]
@@ -157,13 +169,20 @@ fn resolve_available_tool_schemas_includes_activated_discoverable_tools() {
         .collect();
 
     assert_eq!(names, vec!["Read", "Sleep", "scheduler"]);
+
+    // Activated discoverable tools keep full descriptions
+    let sleep = resolved
+        .iter()
+        .find(|s| s.function.name == "Sleep")
+        .unwrap();
+    assert!(!sleep.function.description.contains("Discoverable"));
 }
 
 #[test]
 fn resolve_available_tool_schemas_does_not_mutate_session_metadata() {
     let config = crate::runtime::config::AgentLoopConfig::default();
     let tools = StaticToolExecutor {
-        schemas: vec![schema("Write"), schema("recall")],
+        schemas: vec![schema("Write"), schema("session_history")],
     };
     let mut session = Session::new("session-1", "gpt-4o-mini");
     session.add_message(Message::system("sys"));
@@ -178,7 +197,16 @@ fn resolve_available_tool_schemas_does_not_mutate_session_metadata() {
         .map(|item| item.function.name.as_str())
         .collect();
 
-    assert_eq!(names, vec!["Write"]);
+    // All tools are available; inactive discoverable ones get shortened descriptions
+    assert_eq!(names, vec!["Write", "session_history"]);
+    let session_history = resolved
+        .iter()
+        .find(|s| s.function.name == "session_history")
+        .unwrap();
+    assert!(session_history
+        .function
+        .description
+        .contains("Discoverable"));
     assert_eq!(
         session.metadata.get("existing").map(String::as_str),
         Some("value")

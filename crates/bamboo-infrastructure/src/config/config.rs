@@ -357,6 +357,10 @@ pub struct DefaultsConfig {
     /// Falls back to `chat` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_review: Option<bamboo_domain::ProviderModelRef>,
+    /// Default model for child SubSession runs.
+    /// Falls back to `fast`, then `chat` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_session: Option<bamboo_domain::ProviderModelRef>,
     /// Per-subagent-type model overrides.
     /// Key = subagent_type (e.g. "researcher", "coder"), Value = ProviderModelRef.
     /// Falls back to `chat` when no match is found for a given type.

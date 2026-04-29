@@ -1,11 +1,13 @@
 //! Event forwarding from MPSC to broadcast channels.
 //!
 //! Creates an MPSC channel for agent loop events and spawns a background task
-//! that relays events to the session's broadcast sender while tracking budget events.
+//! that relays events to the session's broadcast sender while tracking runner
+//! diagnostic state (budget events, tool execution, round progress).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::Utc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 use bamboo_agent_core::AgentEvent;
@@ -13,7 +15,8 @@ use bamboo_agent_core::AgentEvent;
 use super::runner_state::AgentRunner;
 
 /// Create an MPSC channel for agent events and spawn a forwarding task
-/// that relays events to the broadcast sender while tracking budget events.
+/// that relays events to the broadcast sender while tracking runner
+/// diagnostic fields for live visibility.
 ///
 /// Returns `(mpsc_tx, forwarder_handle)`.
 pub fn create_event_forwarder(
@@ -25,10 +28,30 @@ pub fn create_event_forwarder(
 
     let forwarder = tokio::spawn(async move {
         while let Some(event) = mpsc_rx.recv().await {
-            if matches!(&event, AgentEvent::TokenBudgetUpdated { .. }) {
+            {
                 let mut runners = runners.write().await;
                 if let Some(runner) = runners.get_mut(&session_id) {
-                    runner.last_budget_event = Some(event.clone());
+                    runner.last_event_at = Some(Utc::now());
+
+                    match &event {
+                        AgentEvent::TokenBudgetUpdated { .. } => {
+                            runner.last_budget_event = Some(event.clone());
+                        }
+                        AgentEvent::ToolStart { tool_name, .. } => {
+                            runner.last_tool_name = Some(tool_name.clone());
+                            runner.last_tool_phase = Some("begin".to_string());
+                        }
+                        AgentEvent::ToolLifecycle {
+                            tool_name, phase, ..
+                        } => {
+                            runner.last_tool_name = Some(tool_name.clone());
+                            runner.last_tool_phase = Some(phase.clone());
+                        }
+                        AgentEvent::RunnerProgress { round_count, .. } => {
+                            runner.round_count = *round_count;
+                        }
+                        _ => {}
+                    }
                 }
             }
             let _ = broadcast_tx.send(event);

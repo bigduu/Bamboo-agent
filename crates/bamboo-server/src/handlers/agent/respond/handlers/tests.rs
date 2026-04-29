@@ -9,6 +9,7 @@ use crate::session_app::respond::{
 fn pending_question(allow_custom: bool) -> PendingQuestion {
     PendingQuestion {
         tool_call_id: "tool-1".to_string(),
+        tool_name: "ConclusionWithOptions".to_string(),
         question: "Pick one".to_string(),
         options: vec!["A".to_string(), "B".to_string()],
         allow_custom,

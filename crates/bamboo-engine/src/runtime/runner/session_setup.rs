@@ -12,6 +12,7 @@ use crate::skills::runtime_metadata::{
 };
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{Message, Session};
+use bamboo_tools::exposure::activated_discoverable_tools;
 
 use super::logging::DebugLogger;
 
@@ -87,11 +88,13 @@ pub(crate) async fn prepare_session_for_loop(
         tool_schemas::resolve_available_tool_schemas_for_session(config, tools, session);
     let base_prompt_for_language =
         prompt_setup::resolve_base_prompt_for_language(config, session).to_string();
+    let activated = activated_discoverable_tools(session);
     let tool_guide_context = prompt_setup::build_tool_guide_context(
         config,
         &tool_schemas,
         &base_prompt_for_language,
         session_id,
+        &activated,
     );
 
     prompt_setup::apply_system_prompt_contexts(

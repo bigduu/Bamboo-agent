@@ -94,6 +94,17 @@ pub fn render_status_info(f: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(" · ", Style::default().fg(colors::SUBTLE)));
     }
 
+    // Plan mode indicator
+    if app.chat.plan_mode {
+        spans.push(Span::styled(
+            " PLAN ",
+            Style::default()
+                .fg(colors::WARNING)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" · ", Style::default().fg(colors::SUBTLE)));
+    }
+
     // Connection indicator
     if app.connected {
         spans.push(Span::styled(" ● ", Style::default().fg(colors::SUCCESS)));

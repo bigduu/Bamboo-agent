@@ -138,6 +138,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "BashOutput",
     "session_note",
     "memory_note",
+    "session_history",
     "recall",
     "session_inspector",
     "compact_context",

@@ -15,6 +15,7 @@ use crate::config::RequestOverridesConfig;
 use crate::llm::protocol::gemini::GeminiRequest;
 use crate::llm::protocol::ToProvider;
 use crate::llm::provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, Result};
+use crate::llm::providers::common::model_fetcher;
 use crate::llm::providers::common::request_overrides;
 use crate::llm::types::LLMChunk;
 use bamboo_domain::Message;
@@ -334,6 +335,16 @@ impl LLMProvider for GeminiProvider {
         );
 
         Ok(stream)
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>> {
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None);
+        let url = format!(
+            "{}/models?key={}",
+            self.base_url.trim_end_matches('/'),
+            self.api_key
+        );
+        model_fetcher::fetch_model_list(&self.client, &url, headers, "Gemini").await
     }
 }
 

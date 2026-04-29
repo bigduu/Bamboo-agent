@@ -102,6 +102,7 @@ pub struct ChatState {
     pub current_reasoning: String,
     pub model: String,
     pub token_usage: Option<TokenUsage>,
+    pub plan_mode: bool,
 }
 
 impl ChatState {
@@ -121,6 +122,7 @@ impl ChatState {
             current_reasoning: String::new(),
             model: String::new(),
             token_usage: None,
+            plan_mode: false,
         }
     }
 }
@@ -638,7 +640,9 @@ impl App {
                     }
                 }
             }
-            AgentEvent::NeedClarification { question, options } => {
+            AgentEvent::NeedClarification {
+                question, options, ..
+            } => {
                 self.status_message = format!("Question: {}", question);
                 if let Some(opts) = options {
                     self.status_message
@@ -658,6 +662,27 @@ impl App {
             }
             AgentEvent::ContextCompressionStatus { phase, status } => {
                 self.status_message = format!("Compression: {} ({})", status, phase);
+            }
+            AgentEvent::PlanModeEntered { reason, .. } => {
+                self.chat.plan_mode = true;
+                self.status_message = format!(
+                    "Plan mode active{}",
+                    reason
+                        .as_ref()
+                        .map(|r| format!(": {}", r))
+                        .unwrap_or_default()
+                );
+            }
+            AgentEvent::PlanModeExited { approved, .. } => {
+                self.chat.plan_mode = false;
+                self.status_message = if approved {
+                    "Plan mode exited (approved)".to_string()
+                } else {
+                    "Plan mode exited".to_string()
+                };
+            }
+            AgentEvent::PlanFileUpdated { file_path, .. } => {
+                self.status_message = format!("Plan updated: {}", file_path);
             }
         }
         Ok(())

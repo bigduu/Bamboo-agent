@@ -4,3 +4,4 @@ pub mod auto_dream;
 pub mod budget;
 pub mod memory;
 pub mod memory_store;
+pub mod plan_store;

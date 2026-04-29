@@ -3,6 +3,7 @@ use std::sync::Arc;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::Role;
 use bamboo_agent_core::Session;
+use bamboo_tools::exposure::activated_discoverable_tools;
 
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::managers::prompt::{PromptAssemblyOutput, PromptManager};
@@ -37,12 +38,14 @@ impl PromptManager for DefaultPromptManager {
                 session,
             );
 
+        let activated = activated_discoverable_tools(session);
         let tool_guide_context =
             crate::runtime::runner::session_setup::prompt_setup::build_tool_guide_context(
                 config,
                 &tool_schemas,
                 base_prompt,
                 &session.id,
+                &activated,
             );
 
         let skill_context = session

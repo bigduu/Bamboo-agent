@@ -18,6 +18,7 @@ use bamboo_agent_core::storage::{AttachmentReader, Storage};
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Role, Session};
 use bamboo_domain::ReasoningEffort;
+use bamboo_infrastructure::config::PermissionMode;
 use bamboo_infrastructure::Config;
 use bamboo_infrastructure::LLMProvider;
 
@@ -355,6 +356,11 @@ impl AgentRuntime {
                 .map(PromptMemoryFlags::from)
                 .unwrap_or_default(),
             features_dynamic_model_routing: config.features.dynamic_model_routing,
+            permission_mode: session
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.plan_mode.as_ref())
+                .map(|_| PermissionMode::Plan),
             ..Default::default()
         };
 

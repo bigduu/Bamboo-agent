@@ -72,9 +72,16 @@ async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events(
 
     let second_event = rx.recv().await.expect("second event");
     match second_event {
-        AgentEvent::NeedClarification { question, options } => {
+        AgentEvent::NeedClarification {
+            question,
+            options,
+            tool_call_id,
+            allow_custom,
+        } => {
             assert_eq!(question, "Continue?");
             assert_eq!(options, Some(vec!["Yes".to_string(), "No".to_string()]));
+            assert_eq!(tool_call_id, Some("ask-1".to_string()));
+            assert!(!allow_custom);
         }
         other => panic!("unexpected second event: {other:?}"),
     }
@@ -143,12 +150,19 @@ async fn maybe_handle_user_question_tool_handles_request_permissions() {
 
     let second_event = rx.recv().await.expect("second event");
     match second_event {
-        AgentEvent::NeedClarification { question, options } => {
+        AgentEvent::NeedClarification {
+            question,
+            options,
+            tool_call_id,
+            allow_custom,
+        } => {
             assert!(question.contains("Permission Request"));
             assert_eq!(
                 options,
                 Some(vec!["Approve".to_string(), "Deny".to_string()])
             );
+            assert_eq!(tool_call_id, Some("perm-1".to_string()));
+            assert!(!allow_custom);
         }
         other => panic!("unexpected second event: {other:?}"),
     }

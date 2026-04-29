@@ -36,6 +36,12 @@ pub struct SessionSummary {
     pub last_run_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<bamboo_agent_core::TokenBudgetUsage>,
+    /// SubAgent profile id mirrored from `session.metadata["subagent_type"]`.
+    /// Allows the frontend to render role badges on child-session lists
+    /// without loading every session.json. Always `None` for root sessions
+    /// and for legacy children created before this field was introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
 }
 
 impl SessionSummary {
@@ -63,6 +69,7 @@ impl SessionSummary {
             last_run_status: entry.last_run_status,
             last_run_error: entry.last_run_error,
             token_usage: entry.token_usage,
+            subagent_type: entry.subagent_type,
         }
     }
 }
@@ -152,6 +159,19 @@ pub struct PatchSessionRequest {
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     pub clear_reasoning_effort: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActivateDiscoverableToolsRequest {
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiscoverableToolsResponse {
+    pub session_id: String,
+    pub tools: Vec<serde_json::Value>,
+    pub activated: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,6 +310,7 @@ mod tests {
             last_run_status: None,
             last_run_error: None,
             token_usage: None,
+            subagent_type: None,
         };
 
         let response = CreateSessionResponse { session: summary };
@@ -324,6 +345,7 @@ mod tests {
             last_run_status: Some("success".to_string()),
             last_run_error: None,
             token_usage: None,
+            subagent_type: None,
         };
 
         let response = GetSessionResponse { session: summary };
@@ -445,6 +467,7 @@ mod tests {
             last_run_status: None,
             last_run_error: None,
             token_usage: None,
+            subagent_type: None,
         };
 
         let debug_str = format!("{:?}", summary);
