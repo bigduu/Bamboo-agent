@@ -38,7 +38,8 @@ async fn test_execute_tool_with_valid_input() {
         .uri("/v1/tools/execute")
         .set_json(json!({
             "tool_name": "get_current_dir",
-            "parameters": []
+            "parameters": [],
+            "session_id": "test-session"
         }))
         .to_request();
 
@@ -171,7 +172,8 @@ async fn test_execute_tool_response_format() {
         .uri("/v1/tools/execute")
         .set_json(json!({
             "tool_name": "get_current_dir",
-            "parameters": []
+            "parameters": [],
+            "session_id": "test-session"
         }))
         .to_request();
 
