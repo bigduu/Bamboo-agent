@@ -254,12 +254,14 @@ impl Tool for WebSearchTool {
                 })?;
 
         // Build a map of snippet content by href (to match with result links)
+        let href_re = Regex::new(r#"href="([^"]+)""#)
+            .map_err(|e| ToolError::Execution(format!("Failed to compile href regex: {}", e)))?;
         let mut snippets: HashMap<String, String> = HashMap::new();
         for cap in snippet_re.captures_iter(&html) {
             if let Some(href_cap) = cap.get(0) {
                 let href_text = href_cap.as_str();
                 // Extract the href URL from the snippet anchor
-                if let Some(url_match) = Regex::new(r#"href="([^"]+)""#).unwrap().find(href_text) {
+                if let Some(url_match) = href_re.find(href_text) {
                     let raw_href = &href_text[url_match.start() + 6..url_match.end() - 1];
                     if let Some(decoded) = Self::decode_duckduckgo_url(raw_href) {
                         let snippet_text = cap

@@ -12,6 +12,7 @@ pub struct A2AMappedEvents {
 }
 
 /// Stateful mapper that tracks the latest A2A task state across a stream.
+#[derive(Default)]
 pub struct A2AEventMapper {
     terminal_sent: bool,
     latest_task_id: Option<String>,
@@ -21,12 +22,7 @@ pub struct A2AEventMapper {
 
 impl A2AEventMapper {
     pub fn new() -> Self {
-        Self {
-            terminal_sent: false,
-            latest_task_id: None,
-            context_id: None,
-            final_text: String::new(),
-        }
+        Self::default()
     }
 
     pub fn latest_task_id(&self) -> Option<&str> {

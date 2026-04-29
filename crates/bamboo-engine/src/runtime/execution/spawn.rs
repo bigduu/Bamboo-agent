@@ -356,22 +356,18 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
 
         // Merge any queued injected messages that the pipeline didn't pick up
         // (e.g. if the loop exited before the next turn boundary).
-        match agent.storage().load_session(&session_id_clone).await {
-            Ok(Some(latest)) => {
-                if let Some(raw) = latest.metadata.get("pending_injected_messages") {
-                    if let Ok(messages) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
-                        for msg in messages {
-                            if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
-                                session.add_message(bamboo_agent_core::Message::user(
-                                    content.to_string(),
-                                ));
-                            }
+        if let Ok(Some(latest)) = agent.storage().load_session(&session_id_clone).await {
+            if let Some(raw) = latest.metadata.get("pending_injected_messages") {
+                if let Ok(messages) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
+                    for msg in messages {
+                        if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
+                            session
+                                .add_message(bamboo_agent_core::Message::user(content.to_string()));
                         }
-                        session.metadata.remove("pending_injected_messages");
                     }
+                    session.metadata.remove("pending_injected_messages");
                 }
             }
-            _ => {}
         }
 
         // Persist final session snapshot.
