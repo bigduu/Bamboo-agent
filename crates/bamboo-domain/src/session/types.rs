@@ -324,6 +324,7 @@ pub struct CompressionEvent {
 }
 
 impl CompressionEvent {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         messages_compressed: usize,
         segments_removed: usize,
