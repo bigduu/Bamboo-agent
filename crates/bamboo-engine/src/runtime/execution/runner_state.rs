@@ -75,6 +75,12 @@ pub struct AgentRunner {
     /// allows them to receive the most recent token usage info.
     pub last_budget_event: Option<AgentEvent>,
 
+    /// Small ring of critical state events (TaskListUpdated, SubSession*, etc.)
+    /// cached for replay to late/reconnecting subscribers.
+    ///
+    /// Bounded to [`CRITICAL_EVENTS_CAPACITY`] entries; oldest are evicted.
+    pub last_critical_events: Vec<AgentEvent>,
+
     /// Name of the most recently executed tool (if any).
     /// Updated live during execution for diagnostic visibility.
     pub last_tool_name: Option<String>,
@@ -102,6 +108,9 @@ impl AgentRunner {
     /// Broadcast channel capacity for agent events.
     pub const EVENT_CHANNEL_CAPACITY: usize = 1000;
 
+    /// Maximum number of critical events cached for late-subscriber replay.
+    pub const CRITICAL_EVENTS_CAPACITY: usize = 32;
+
     /// Create a new agent runner with default settings.
     ///
     /// Initializes a broadcast channel, a fresh cancellation token,
@@ -115,10 +124,21 @@ impl AgentRunner {
             started_at: Utc::now(),
             completed_at: None,
             last_budget_event: None,
+            last_critical_events: Vec::new(),
             last_tool_name: None,
             last_tool_phase: None,
             last_event_at: None,
             round_count: 0,
         }
+    }
+
+    /// Push a critical event into the bounded replay cache.
+    ///
+    /// If the cache is full, the oldest entry is evicted.
+    pub fn push_critical_event(&mut self, event: AgentEvent) {
+        if self.last_critical_events.len() >= Self::CRITICAL_EVENTS_CAPACITY {
+            self.last_critical_events.remove(0);
+        }
+        self.last_critical_events.push(event);
     }
 }

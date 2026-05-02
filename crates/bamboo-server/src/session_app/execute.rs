@@ -1,6 +1,6 @@
 //! Execute use case: prepare a session for agent execution.
 
-use bamboo_agent_core::Role;
+use bamboo_agent_core::{Message, Role};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::Session;
 
@@ -330,11 +330,100 @@ pub fn has_pending_retry_resume(session: &Session) -> bool {
         .is_some_and(|value| value == "true")
 }
 
+/// Returns true if the message is flagged `metadata.hidden_from_ui == true`.
+///
+/// Such messages are runtime-injected (e.g. child-completion resume, retry
+/// resume, conclusion-with-options resume) and are filtered out of any
+/// client-facing view. Both `GET /history` and the execute sync snapshot
+/// must use this exact predicate so the client and server agree on the
+/// visible message_count and last_message_id.
+pub(crate) fn is_hidden_from_ui(message: &Message) -> bool {
+    message
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("hidden_from_ui"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Billing helpers
+// ---------------------------------------------------------------------------
+//
+// Some upstream products bill on "user-initiated message turns" rather than on
+// LLM request count. With the runtime-level suspend/resume model used by the
+// SubSession tool, the engine can append `Role::User` messages that are NOT
+// caused by the human user (e.g. child-completion resume, retry resume,
+// conclusion_with_options resume). These helpers let a billing layer count
+// only genuine user turns and skip system-injected resume messages.
+
+/// Returns true if the message was synthesized by the runtime to resume a
+/// suspended root session (child completion, retry, conclusion-with-options).
+///
+/// Such messages have one or both of the following stable markers:
+/// - `metadata.hidden_from_ui == true`
+/// - `metadata.runtime_kind` set to a known resume kind
+pub fn is_system_resume_message(message: &Message) -> bool {
+    if !matches!(message.role, Role::User) {
+        return false;
+    }
+    let Some(metadata) = message.metadata.as_ref() else {
+        return false;
+    };
+
+    if metadata
+        .get("hidden_from_ui")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    matches!(
+        metadata
+            .get("runtime_kind")
+            .and_then(|value| value.as_str()),
+        Some("child_completion_resume")
+            | Some("retry_resume")
+            | Some("conclusion_with_options_resume")
+    )
+}
+
+/// Returns true when the message represents a billable end-user turn.
+///
+/// Use this in any per-message billing accounting (e.g. "1 user message =
+/// 1 quota unit"). LLM request / token billing should still be done at the
+/// provider call layer; this helper is only relevant when the product itself
+/// counts user-initiated messages.
+pub fn is_billable_user_turn(message: &Message) -> bool {
+    matches!(message.role, Role::User) && !is_system_resume_message(message)
+}
+
+/// Count the number of billable user turns in a session — i.e. user messages
+/// that were actually initiated by the human, excluding runtime-injected
+/// resume messages from child completion, retry, or conclusion-with-options.
+pub fn billable_user_turn_count(session: &Session) -> usize {
+    session
+        .messages
+        .iter()
+        .filter(|message| is_billable_user_turn(message))
+        .count()
+}
+
 impl ServerExecuteSnapshot {
     pub fn from_session(session: &Session) -> Self {
+        // Mirror the GET /history filter so the client (which only ever sees
+        // visible messages) and the server agree on message_count /
+        // last_message_id. Hidden runtime resume messages stay internal and
+        // do not leak into the sync protocol.
+        let visible: Vec<&Message> = session
+            .messages
+            .iter()
+            .filter(|message| !is_hidden_from_ui(message))
+            .collect();
         Self {
-            message_count: session.messages.len(),
-            last_message_id: session.messages.last().map(|message| message.id.clone()),
+            message_count: visible.len(),
+            last_message_id: visible.last().map(|message| message.id.clone()),
             has_pending_question: session.pending_question.is_some(),
             pending_question_tool_call_id: session
                 .pending_question
@@ -838,5 +927,208 @@ mod tests {
         assert_eq!(snapshot.last_message_id, None);
         assert!(!snapshot.has_pending_question);
         assert!(!snapshot.has_pending_user_message);
+    }
+
+    #[test]
+    fn snapshot_excludes_hidden_user_message() {
+        // Mirror the runtime resume injection: visible user, assistant reply,
+        // then a hidden_from_ui synthetic user message. The client only ever
+        // sees the first two via /history, so the snapshot must agree.
+        let mut session = Session::new("test", "gpt-4");
+        session.messages.push(Message::user("hi"));
+        session.messages.last_mut().unwrap().id = "msg-1".to_string();
+        session.messages.push(Message::assistant("hello", None));
+        session.messages.last_mut().unwrap().id = "msg-2".to_string();
+        let mut hidden = make_user_with_metadata(
+            "runtime",
+            serde_json::json!({
+                "hidden_from_ui": true,
+                "runtime_kind": "child_completion_resume",
+            }),
+        );
+        hidden.id = "msg-3".to_string();
+        session.messages.push(hidden);
+
+        let snapshot = ServerExecuteSnapshot::from_session(&session);
+        assert_eq!(snapshot.message_count, 2);
+        assert_eq!(snapshot.last_message_id, Some("msg-2".to_string()));
+        // Raw last is a (hidden) user message, so the runtime still has work
+        // to do — the snapshot must keep this true so resume can proceed.
+        assert!(snapshot.has_pending_user_message);
+    }
+
+    #[test]
+    fn snapshot_excludes_trailing_hidden_message_for_last_id() {
+        // If the trailing message is hidden, last_message_id must come from
+        // the last visible message — otherwise the client (which never saw
+        // the hidden id) will report LastMessageIdMismatch on every execute.
+        let mut session = Session::new("test", "gpt-4");
+        session.messages.push(Message::user("hi"));
+        session.messages.last_mut().unwrap().id = "visible-user".to_string();
+        session.messages.push(Message::assistant("hello", None));
+        session.messages.last_mut().unwrap().id = "visible-assistant".to_string();
+        let mut hidden = make_user_with_metadata(
+            "runtime",
+            serde_json::json!({ "hidden_from_ui": true }),
+        );
+        hidden.id = "hidden-tail".to_string();
+        session.messages.push(hidden);
+
+        let snapshot = ServerExecuteSnapshot::from_session(&session);
+        assert_eq!(
+            snapshot.last_message_id,
+            Some("visible-assistant".to_string())
+        );
+    }
+
+    #[test]
+    fn evaluate_client_sync_passes_with_hidden_messages_filtered() {
+        // Regression for the "Execute remains out-of-sync after 2 recovery
+        // attempt(s)" loop: server has 1 hidden runtime message appended
+        // after the visible turn, the client only sees the visible turn,
+        // and execute used to return MessageCountMismatch forever.
+        let mut session = Session::new("test", "gpt-4");
+        session.messages.push(Message::user("hi"));
+        session.messages.last_mut().unwrap().id = "msg-1".to_string();
+        session.messages.push(Message::assistant("hello", None));
+        session.messages.last_mut().unwrap().id = "msg-2".to_string();
+        let mut hidden = make_user_with_metadata(
+            "runtime",
+            serde_json::json!({ "hidden_from_ui": true }),
+        );
+        hidden.id = "msg-3".to_string();
+        session.messages.push(hidden);
+
+        let snapshot = ServerExecuteSnapshot::from_session(&session);
+        let client_sync = ExecuteClientSync {
+            client_message_count: 2,
+            client_last_message_id: Some("msg-2".to_string()),
+            client_has_pending_question: false,
+            client_pending_question_tool_call_id: None,
+        };
+
+        assert_eq!(evaluate_client_sync(Some(&client_sync), &snapshot), None);
+    }
+
+    #[test]
+    fn snapshot_visibility_matches_history_filter() {
+        // The bug this whole change fixes was a *consistency* failure: the
+        // /history endpoint and the execute sync snapshot were using
+        // different rules to decide which messages are visible to the
+        // client. Lock that rule in by computing the visible view both
+        // ways from the same session and asserting they agree on
+        // count and last id.
+        let mut session = Session::new("test", "gpt-4");
+        let mut visible_user = Message::user("hello");
+        visible_user.id = "v-1".to_string();
+        session.messages.push(visible_user);
+        let mut hidden_a = make_user_with_metadata(
+            "runtime",
+            serde_json::json!({ "hidden_from_ui": true }),
+        );
+        hidden_a.id = "h-1".to_string();
+        session.messages.push(hidden_a);
+        let mut visible_assistant = Message::assistant("world", None);
+        visible_assistant.id = "v-2".to_string();
+        session.messages.push(visible_assistant);
+        let mut hidden_b = make_user_with_metadata(
+            "runtime",
+            serde_json::json!({
+                "hidden_from_ui": true,
+                "runtime_kind": "retry_resume",
+            }),
+        );
+        hidden_b.id = "h-2".to_string();
+        session.messages.push(hidden_b);
+
+        // Reproduce the /history filter using the same shared helper.
+        let history_visible: Vec<&Message> = session
+            .messages
+            .iter()
+            .filter(|m| !is_hidden_from_ui(m))
+            .collect();
+
+        let snapshot = ServerExecuteSnapshot::from_session(&session);
+        assert_eq!(snapshot.message_count, history_visible.len());
+        assert_eq!(
+            snapshot.last_message_id,
+            history_visible.last().map(|m| m.id.clone())
+        );
+    }
+
+    // ---- billing helpers ----
+
+    fn make_user_with_metadata(content: &str, metadata: serde_json::Value) -> Message {
+        let mut msg = Message::user(content);
+        msg.metadata = Some(metadata);
+        msg
+    }
+
+    #[test]
+    fn is_system_resume_detects_hidden_from_ui_flag() {
+        let msg = make_user_with_metadata("runtime", serde_json::json!({ "hidden_from_ui": true }));
+        assert!(is_system_resume_message(&msg));
+        assert!(!is_billable_user_turn(&msg));
+    }
+
+    #[test]
+    fn is_system_resume_detects_known_runtime_kinds() {
+        for kind in [
+            "child_completion_resume",
+            "retry_resume",
+            "conclusion_with_options_resume",
+        ] {
+            let msg =
+                make_user_with_metadata("runtime", serde_json::json!({ "runtime_kind": kind }));
+            assert!(
+                is_system_resume_message(&msg),
+                "expected runtime_kind={kind} to be detected"
+            );
+            assert!(!is_billable_user_turn(&msg));
+        }
+    }
+
+    #[test]
+    fn is_system_resume_ignores_unknown_runtime_kinds() {
+        let msg = make_user_with_metadata(
+            "runtime",
+            serde_json::json!({ "runtime_kind": "something_else" }),
+        );
+        assert!(!is_system_resume_message(&msg));
+        assert!(is_billable_user_turn(&msg));
+    }
+
+    #[test]
+    fn is_system_resume_returns_false_for_plain_user_message() {
+        let msg = Message::user("hello");
+        assert!(!is_system_resume_message(&msg));
+        assert!(is_billable_user_turn(&msg));
+    }
+
+    #[test]
+    fn is_system_resume_returns_false_for_assistant_messages() {
+        let msg = Message::assistant("hi", None);
+        assert!(!is_system_resume_message(&msg));
+        assert!(!is_billable_user_turn(&msg));
+    }
+
+    #[test]
+    fn billable_user_turn_count_skips_runtime_messages() {
+        let mut session = Session::new("test", "gpt-4");
+        session.messages.push(Message::user("first"));
+        session.messages.push(Message::assistant("response", None));
+        session.messages.push(make_user_with_metadata(
+            "runtime",
+            serde_json::json!({
+                "hidden_from_ui": true,
+                "runtime_kind": "child_completion_resume",
+            }),
+        ));
+        session
+            .messages
+            .push(Message::assistant("response 2", None));
+        session.messages.push(Message::user("second"));
+
+        assert_eq!(billable_user_turn_count(&session), 2);
     }
 }

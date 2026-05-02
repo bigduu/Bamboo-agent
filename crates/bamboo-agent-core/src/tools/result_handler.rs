@@ -15,6 +15,20 @@ use crate::{AgentEvent, Message, Session};
 pub enum ToolHandlingOutcome {
     Continue,
     AwaitingClarification,
+    WaitingForChildren,
+}
+
+fn is_waiting_for_children_control(result: &ToolResult) -> bool {
+    if result.display_preference.as_deref() == Some("runtime_control:waiting_for_children") {
+        return true;
+    }
+
+    result.result.trim_start().starts_with('{')
+        && serde_json::from_str::<serde_json::Value>(&result.result)
+            .ok()
+            .and_then(|value| value.get("runtime_control").cloned())
+            .and_then(|control| control.as_str().map(str::to_string))
+            .is_some_and(|control| control == "waiting_for_children")
 }
 
 pub const MAX_SUB_ACTIONS: usize = 64;
@@ -186,19 +200,34 @@ pub async fn handle_tool_result_with_agentic_support(
     tools: &dyn ToolExecutor,
     composition_executor: Option<Arc<CompositionExecutor>>,
 ) -> ToolHandlingOutcome {
+    let should_wait_for_children = is_waiting_for_children_control(result);
+    if should_wait_for_children {
+        session.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+    }
     let Some(agentic_result) = try_parse_agentic_result(result) else {
         session.add_message(Message::tool_result_with_status(
             tool_call.id.clone(),
             result.result.clone(),
             result.success,
         ));
-        return ToolHandlingOutcome::Continue;
+        return if should_wait_for_children {
+            ToolHandlingOutcome::WaitingForChildren
+        } else {
+            ToolHandlingOutcome::Continue
+        };
     };
 
     match agentic_result {
         AgenticToolResult::Success { result } => {
             session.add_message(Message::tool_result(tool_call.id.clone(), result));
-            ToolHandlingOutcome::Continue
+            if should_wait_for_children {
+                ToolHandlingOutcome::WaitingForChildren
+            } else {
+                ToolHandlingOutcome::Continue
+            }
         }
         AgenticToolResult::Error { error } => {
             let _ = event_tx

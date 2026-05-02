@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -22,6 +23,7 @@ use crate::runtime::stream::handler::StreamHandlingOutput;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
+use bamboo_domain::session::runtime_state::{AgentStatusState, SuspensionState};
 use bamboo_infrastructure::LLMProvider;
 
 use super::super::to_event_token_usage;
@@ -253,6 +255,7 @@ async fn handle_tool_calls_path(
 
     // Track round state for metrics
     let mut awaiting_clarification = false;
+    let mut waiting_for_children = false;
     let mut round_status = MetricsRoundStatus::Success;
     let mut round_error: Option<String> = None;
 
@@ -265,8 +268,11 @@ async fn handle_tool_calls_path(
     if tool_execution.awaiting_clarification {
         awaiting_clarification = true;
     }
+    if tool_execution.waiting_for_children {
+        waiting_for_children = true;
+    }
 
-    if awaiting_clarification {
+    if awaiting_clarification || waiting_for_children {
         crate::runtime::runner::metrics_lifecycle::record_round_completed(
             metrics_collector,
             round_id,
@@ -719,6 +725,64 @@ pub(super) async fn run_pipeline(
             state.overflow_recovery.total_recoveries as u32;
         state.runtime_state.memory.overflow_recovery_consecutive =
             state.overflow_recovery.consecutive_recoveries as u32;
+
+        if session
+            .metadata
+            .get("runtime.suspend_reason")
+            .is_some_and(|reason| reason == "waiting_for_children")
+        {
+            state.runtime_state.status = AgentStatusState::Suspended;
+            state.runtime_state.suspension = Some(SuspensionState {
+                reason: "waiting_for_children".to_string(),
+                suspended_at: Utc::now(),
+                resumable: true,
+                hook_point: Some("AfterToolExecution".to_string()),
+            });
+
+            // The SubSession adapter registers durable wait details against the
+            // persisted parent while the runner still owns this local session
+            // snapshot. Merge those details before final save so we do not
+            // clobber them when this suspended runner tears down.
+            if let Some(storage) = config.storage.as_ref() {
+                if let Ok(Some(persisted)) = storage.load_session(&state.session_id).await {
+                    if let Some(runtime_state) = persisted.agent_runtime_state {
+                        state.runtime_state.waiting_for_children =
+                            runtime_state.waiting_for_children;
+                    }
+
+                    // If a very fast child completed before this suspended
+                    // parent runner finished saving, the coordinator may have
+                    // already appended a hidden runtime resume message. Preserve
+                    // it so finalization does not overwrite the pending resume.
+                    let existing_ids: std::collections::HashSet<String> = session
+                        .messages
+                        .iter()
+                        .map(|message| message.id.clone())
+                        .collect();
+                    let mut appended = 0usize;
+                    for message in persisted.messages {
+                        let hidden_runtime_resume = message
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.get("runtime_kind"))
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|kind| kind == "child_completion_resume");
+                        if hidden_runtime_resume && !existing_ids.contains(message.id.as_str()) {
+                            session.messages.push(message);
+                            appended += 1;
+                        }
+                    }
+                    if appended > 0 {
+                        tracing::info!(
+                            "[{}] Preserved {} hidden child-completion resume message(s) during parent suspension save",
+                            state.session_id,
+                            appended
+                        );
+                    }
+                }
+            }
+        }
+
         state_bridge::write_runtime_state(session, &state.runtime_state);
 
         sent_complete = sent_complete || outcome.sent_complete;

@@ -195,6 +195,19 @@ impl AppState {
                 .expect("agent runtime should be fully configured"),
         );
 
+        let child_completion_coordinator = Arc::new(
+            super::child_completion_coordinator::ChildCompletionCoordinator::new(
+                storage.clone(),
+                sessions.clone(),
+                agent_runners.clone(),
+                session_event_senders.clone(),
+                agent.clone(),
+                config.clone(),
+                provider_registry.clone(),
+                provider_router.clone(),
+            ),
+        );
+
         // Initialize sub-session spawn scheduler (async background jobs).
         let config_snapshot = config.read().await.clone();
         let external_runner =
@@ -207,6 +220,7 @@ impl AppState {
             session_event_senders.clone(),
             external_runner,
             Some(provider_router.clone()),
+            Some(child_completion_coordinator.clone()),
         );
 
         let tools_with_task = base_tools.clone();
@@ -270,6 +284,10 @@ impl AppState {
             subagent_profiles.clone(),
         );
 
+        child_completion_coordinator
+            .set_root_tools(tools.clone())
+            .await;
+
         let tool_factory =
             crate::tools::ToolSurfaceFactory::new(base_tools, tools_with_task, tools);
 
@@ -282,6 +300,7 @@ impl AppState {
             storage,
             session_store,
             spawn_scheduler,
+            child_completion_coordinator,
             schedule_store,
             schedule_manager,
             tool_factory,

@@ -20,6 +20,7 @@ use bamboo_infrastructure::{LLMProvider, ProviderModelRouter};
 use crate::runtime::Agent;
 use crate::runtime::ExecuteRequest;
 
+use super::child_completion::{ChildCompletion, ChildCompletionHandler};
 use super::event_forwarder::create_event_forwarder;
 use super::runner_lifecycle::{finalize_runner, try_reserve_runner};
 use super::runner_state::AgentRunner;
@@ -60,6 +61,11 @@ pub struct SpawnContext {
     pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     pub external_child_runner: Option<Arc<dyn ExternalChildRunner>>,
     pub provider_router: Option<Arc<ProviderModelRouter>>,
+    /// Optional application-layer completion hook. The engine still emits
+    /// `SubSessionCompleted` to the parent stream itself; this hook lets the
+    /// server persist parent wait state and resume the parent runner without
+    /// introducing an engine -> AppState dependency.
+    pub completion_handler: Option<Arc<dyn ChildCompletionHandler>>,
 }
 
 #[derive(Clone)]
@@ -112,6 +118,164 @@ fn child_model_ref(session: &Session, model: &str) -> Option<ProviderModelRef> {
     Some(ProviderModelRef::new(provider, model_name))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ChildWatchdogPolicy {
+    check_interval_secs: i64,
+    max_total_secs: i64,
+    max_idle_secs: i64,
+}
+
+impl Default for ChildWatchdogPolicy {
+    fn default() -> Self {
+        Self {
+            check_interval_secs: 15,
+            // Parent waits may be longer, but child execution owns its own
+            // liveness. A one hour total cap avoids indefinitely orphaned
+            // sub-session runners.
+            max_total_secs: 60 * 60,
+            // No child event for 15 minutes is considered stalled.
+            max_idle_secs: 15 * 60,
+        }
+    }
+}
+
+fn metadata_i64(session: &Session, key: &str) -> Option<i64> {
+    session
+        .metadata
+        .get(key)
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn watchdog_policy_for_session(session: &Session) -> ChildWatchdogPolicy {
+    let mut policy = ChildWatchdogPolicy::default();
+    if let Some(value) = metadata_i64(session, "child_watchdog.max_total_secs") {
+        policy.max_total_secs = value;
+    }
+    if let Some(value) = metadata_i64(session, "child_watchdog.max_idle_secs") {
+        policy.max_idle_secs = value;
+    }
+    if let Some(value) = metadata_i64(session, "child_watchdog.check_interval_secs") {
+        policy.check_interval_secs = value;
+    }
+    policy
+}
+
+async fn publish_child_completion(
+    parent_tx: &broadcast::Sender<AgentEvent>,
+    completion_handler: Option<Arc<dyn ChildCompletionHandler>>,
+    completion: ChildCompletion,
+) {
+    let _ = parent_tx.send(AgentEvent::SubSessionCompleted {
+        parent_session_id: completion.parent_session_id.clone(),
+        child_session_id: completion.child_session_id.clone(),
+        status: completion.status.clone(),
+        error: completion.error.clone(),
+    });
+
+    if let Some(handler) = completion_handler {
+        handler.on_child_completed(completion).await;
+    }
+}
+
+async fn publish_child_completion_parts(
+    parent_tx: &broadcast::Sender<AgentEvent>,
+    completion_handler: Option<Arc<dyn ChildCompletionHandler>>,
+    parent_session_id: String,
+    child_session_id: String,
+    status: String,
+    error: Option<String>,
+) {
+    publish_child_completion(
+        parent_tx,
+        completion_handler,
+        ChildCompletion {
+            parent_session_id,
+            child_session_id,
+            status,
+            error,
+            completed_at: Utc::now(),
+        },
+    )
+    .await;
+}
+
+async fn watch_child_liveness(
+    parent_session_id: String,
+    child_session_id: String,
+    runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+    cancel_token: CancellationToken,
+    timeout_reason: Arc<RwLock<Option<String>>>,
+    done: CancellationToken,
+    policy: ChildWatchdogPolicy,
+) {
+    let mut ticker =
+        tokio::time::interval(Duration::from_secs(policy.check_interval_secs.max(1) as u64));
+    // Skip the immediate tick.
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = done.cancelled() => return,
+            _ = ticker.tick() => {
+                if cancel_token.is_cancelled() {
+                    return;
+                }
+
+                let snapshot = {
+                    let guard = runners.read().await;
+                    guard.get(&child_session_id).cloned()
+                };
+                let Some(runner) = snapshot else {
+                    return;
+                };
+                if !matches!(runner.status, super::runner_state::AgentStatus::Running) {
+                    return;
+                }
+
+                let now = Utc::now();
+                let total_secs = now.signed_duration_since(runner.started_at).num_seconds();
+                if total_secs >= policy.max_total_secs {
+                    let reason = format!(
+                        "Child session timed out after {} seconds (max_total_secs={})",
+                        total_secs, policy.max_total_secs
+                    );
+                    tracing::warn!(
+                        parent_session_id = %parent_session_id,
+                        child_session_id = %child_session_id,
+                        reason = %reason,
+                        "child session total timeout; cancelling child runner"
+                    );
+                    *timeout_reason.write().await = Some(reason);
+                    cancel_token.cancel();
+                    return;
+                }
+
+                let last_activity_at = runner.last_event_at.unwrap_or(runner.started_at);
+                let idle_secs = now.signed_duration_since(last_activity_at).num_seconds();
+                if idle_secs >= policy.max_idle_secs {
+                    let reason = format!(
+                        "Child session idle timeout after {} seconds without events (max_idle_secs={})",
+                        idle_secs, policy.max_idle_secs
+                    );
+                    tracing::warn!(
+                        parent_session_id = %parent_session_id,
+                        child_session_id = %child_session_id,
+                        reason = %reason,
+                        last_tool_name = ?runner.last_tool_name,
+                        last_tool_phase = ?runner.last_tool_phase,
+                        round_count = runner.round_count,
+                        "child session idle timeout; cancelling child runner"
+                    );
+                    *timeout_reason.write().await = Some(reason);
+                    cancel_token.cancel();
+                    return;
+                }
+            }
+        }
+    }
+}
+
 fn resolve_child_provider_override(
     router: Option<&Arc<ProviderModelRouter>>,
     session: &Session,
@@ -147,16 +311,6 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
     let child_tx =
         get_or_create_event_sender(&ctx.session_event_senders, &job.child_session_id).await;
 
-    let emit_error_completion = |error: String| {
-        let _ = parent_tx.send(AgentEvent::SubSessionCompleted {
-            parent_session_id: job.parent_session_id.clone(),
-            child_session_id: job.child_session_id.clone(),
-            status: "error".to_string(),
-            error: Some(error.clone()),
-        });
-        error
-    };
-
     // Load child session.
     let mut session = match ctx
         .agent
@@ -165,18 +319,46 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
         .await
     {
         Ok(Some(s)) => s,
-        Ok(None) => return Err(emit_error_completion("child session not found".to_string())),
+        Ok(None) => {
+            let error = "child session not found".to_string();
+            publish_child_completion_parts(
+                &parent_tx,
+                ctx.completion_handler.clone(),
+                job.parent_session_id.clone(),
+                job.child_session_id.clone(),
+                "error".to_string(),
+                Some(error.clone()),
+            )
+            .await;
+            return Err(error);
+        }
         Err(e) => {
-            return Err(emit_error_completion(format!(
-                "failed to load child session: {e}"
-            )))
+            let error = format!("failed to load child session: {e}");
+            publish_child_completion_parts(
+                &parent_tx,
+                ctx.completion_handler.clone(),
+                job.parent_session_id.clone(),
+                job.child_session_id.clone(),
+                "error".to_string(),
+                Some(error.clone()),
+            )
+            .await;
+            return Err(error);
         }
     };
 
     if session.kind != SessionKind::Child {
-        return Err(emit_error_completion(
-            "spawn job child session is not kind=child".to_string(),
-        ));
+        let error = "spawn job child session is not kind=child".to_string();
+        publish_child_completion_parts(
+            &parent_tx,
+            ctx.completion_handler.clone(),
+            job.parent_session_id.clone(),
+            job.child_session_id.clone(),
+            "error".to_string(),
+            Some(error.clone()),
+        )
+        .await;
+        return Err(error);
     }
 
     // Ensure last message is user (otherwise nothing to do).
@@ -194,12 +376,19 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
             "No pending message to execute".to_string(),
         );
         let _ = ctx.agent.storage().save_session(&session).await;
-        let _ = parent_tx.send(AgentEvent::SubSessionCompleted {
-            parent_session_id: job.parent_session_id.clone(),
-            child_session_id: job.child_session_id.clone(),
-            status: "skipped".to_string(),
-            error: Some("No pending message to execute".to_string()),
-        });
+        {
+            let mut sessions = ctx.sessions_cache.write().await;
+            sessions.insert(job.child_session_id.clone(), session);
+        }
+        publish_child_completion_parts(
+            &parent_tx,
+            ctx.completion_handler.clone(),
+            job.parent_session_id.clone(),
+            job.child_session_id.clone(),
+            "skipped".to_string(),
+            Some("No pending message to execute".to_string()),
+        )
+        .await;
         return Ok(());
     }
 
@@ -275,6 +464,20 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
         ctx.agent_runners.clone(),
     );
 
+    // Child liveness is owned by the child runner. The parent wait state can
+    // have a longer lease, but it should not poll or terminate children.
+    let timeout_reason = Arc::new(RwLock::new(None::<String>));
+    let watchdog_policy = watchdog_policy_for_session(&session);
+    tokio::spawn(watch_child_liveness(
+        job.parent_session_id.clone(),
+        job.child_session_id.clone(),
+        ctx.agent_runners.clone(),
+        cancel_token.clone(),
+        timeout_reason.clone(),
+        forwarder_done.clone(),
+        watchdog_policy,
+    ));
+
     // Run child loop via unified spawn_session_execution.
     let model = job.model.clone();
     let session_id_clone = job.child_session_id.clone();
@@ -289,6 +492,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
     let child_id_for_done = job.child_session_id.clone();
     let session_event_senders = ctx.session_event_senders.clone();
     let provider_router = ctx.provider_router.clone();
+    let completion_handler = ctx.completion_handler.clone();
 
     tokio::spawn(async move {
         session.model = model.clone();
@@ -302,7 +506,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
             if let Some(runner) = external_runner {
                 if runner.should_handle(&session).await {
                     runner
-                        .execute_external_child(&mut session, &job, mpsc_tx, cancel_token)
+                        .execute_external_child(&mut session, &job, mpsc_tx, cancel_token.clone())
                         .await
                 } else {
                     Err(bamboo_agent_core::AgentError::LLM(format!(
@@ -326,7 +530,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
                     ExecuteRequest {
                         initial_message: String::new(), // handled by agent loop
                         event_tx: mpsc_tx,
-                        cancel_token,
+                        cancel_token: cancel_token.clone(),
                         tools: Some(tools),
                         provider_override,
                         model: Some(model.clone()),
@@ -344,12 +548,17 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
                 .await
         };
 
-        let (status, error) = match &result {
-            Ok(_) => ("completed".to_string(), None),
-            Err(e) if e.to_string().contains("cancelled") => {
-                ("cancelled".to_string(), Some(e.to_string()))
+        let timeout_error = timeout_reason.read().await.clone();
+        let (status, error) = if let Some(reason) = timeout_error {
+            ("timeout".to_string(), Some(reason))
+        } else {
+            match &result {
+                Ok(_) => ("completed".to_string(), None),
+                Err(e) if e.to_string().contains("cancelled") => {
+                    ("cancelled".to_string(), Some(e.to_string()))
+                }
+                Err(e) => ("error".to_string(), Some(e.to_string())),
             }
-            Err(e) => ("error".to_string(), Some(e.to_string())),
         };
 
         finalize_runner(&agent_runners_for_status, &session_id_clone, &result).await;
@@ -387,14 +596,18 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
             sessions.insert(session_id_clone.clone(), session);
         }
 
-        // Stop forwarding/heartbeats and emit terminal child status.
+        // Stop forwarding/heartbeats and emit terminal child status through the
+        // same durable completion path used by success/error/cancel/timeout.
         done.cancel();
-        let _ = parent_tx_for_done.send(AgentEvent::SubSessionCompleted {
-            parent_session_id: parent_id_for_done,
-            child_session_id: child_id_for_done,
+        publish_child_completion_parts(
+            &parent_tx_for_done,
+            completion_handler,
+            parent_id_for_done,
+            child_id_for_done,
             status,
             error,
-        });
+        )
+        .await;
 
         // Allow dead code: session_event_senders keeps the sender alive during the task.
         drop(session_event_senders);

@@ -95,10 +95,15 @@ pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -
     )
     .await;
 
-    if outcome == ToolHandlingOutcome::AwaitingClarification {
-        ctx.state.mark_awaiting_clarification();
-        return true;
+    match outcome {
+        ToolHandlingOutcome::AwaitingClarification => {
+            ctx.state.mark_awaiting_clarification();
+            true
+        }
+        ToolHandlingOutcome::WaitingForChildren => {
+            ctx.state.mark_waiting_for_children();
+            true
+        }
+        ToolHandlingOutcome::Continue => false,
     }
-
-    false
 }

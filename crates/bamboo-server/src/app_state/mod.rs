@@ -192,6 +192,9 @@ pub struct AppState {
     /// Background scheduler for async sub-session spawning.
     pub spawn_scheduler: Arc<SpawnScheduler>,
 
+    /// Coordinates child completion notifications into parent resume.
+    pub child_completion_coordinator: Arc<child_completion_coordinator::ChildCompletionCoordinator>,
+
     /// Schedule store (timed tasks).
     pub schedule_store: Arc<ScheduleStore>,
 
@@ -274,6 +277,7 @@ pub struct AppState {
 }
 
 mod builder;
+pub mod child_completion_coordinator;
 mod config_runtime;
 pub mod init;
 mod persistence;

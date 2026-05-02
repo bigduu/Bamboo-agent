@@ -104,6 +104,50 @@ pub struct ChildSessionRuntimeState {
     pub completed_ids: Vec<String>,
 }
 
+/// Parent wait policy for child-session orchestration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildWaitPolicy {
+    /// Resume the parent when every tracked child reaches a terminal state.
+    #[default]
+    All,
+    /// Resume the parent when any tracked child reaches a terminal state.
+    Any,
+    /// Resume the parent immediately on error/timeout/cancelled, otherwise wait
+    /// for all children to complete successfully.
+    FirstError,
+}
+
+impl ChildWaitPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Any => "any",
+            Self::FirstError => "first_error",
+        }
+    }
+}
+
+/// Durable parent-side wait state for event-driven child-session orchestration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WaitingForChildrenState {
+    /// Child sessions this parent is currently waiting on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_session_ids: Vec<String>,
+    /// Wait completion policy.
+    #[serde(default)]
+    pub wait_for: ChildWaitPolicy,
+    /// When this wait state was registered.
+    pub registered_at: DateTime<Utc>,
+    /// Optional parent wait lease. Expiry does not kill children; child runners
+    /// own child liveness/timeout decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_at: Option<DateTime<Utc>>,
+    /// Tool call that registered the wait, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered_by_tool_call_id: Option<String>,
+}
+
 /// Suspension reason and context for resumable runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SuspensionState {
@@ -187,6 +231,8 @@ pub struct AgentRuntimeState {
     pub llm: LlmRuntimeState,
     #[serde(default)]
     pub children: ChildSessionRuntimeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for_children: Option<WaitingForChildrenState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<HookCheckpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,6 +252,7 @@ impl AgentRuntimeState {
             memory: MemoryRuntimeState::default(),
             llm: LlmRuntimeState::default(),
             children: ChildSessionRuntimeState::default(),
+            waiting_for_children: None,
             checkpoints: Vec::new(),
             plan_mode: None,
         }
@@ -225,6 +272,7 @@ impl Default for AgentRuntimeState {
             memory: MemoryRuntimeState::default(),
             llm: LlmRuntimeState::default(),
             children: ChildSessionRuntimeState::default(),
+            waiting_for_children: None,
             checkpoints: Vec::new(),
             plan_mode: None,
         }
@@ -242,6 +290,7 @@ mod tests {
         assert_eq!(state.run_id, "run-001");
         assert_eq!(state.status, AgentStatusState::Idle);
         assert!(state.suspension.is_none());
+        assert!(state.waiting_for_children.is_none());
         assert_eq!(state.round.current_round, 0);
         assert!(state.checkpoints.is_empty());
     }
@@ -333,6 +382,29 @@ mod tests {
         assert_eq!(state.version, 1);
         assert_eq!(state.run_id, "old-run");
         assert!(state.plan_mode.is_none());
+    }
+
+    #[test]
+    fn waiting_for_children_round_trip() {
+        let mut state = AgentRuntimeState::new("run-wait");
+        state.waiting_for_children = Some(WaitingForChildrenState {
+            child_session_ids: vec!["child-1".to_string(), "child-2".to_string()],
+            wait_for: ChildWaitPolicy::All,
+            registered_at: Utc::now(),
+            timeout_at: None,
+            registered_by_tool_call_id: Some("tool-1".to_string()),
+        });
+
+        let serialized = serde_json::to_string(&state).expect("serialize");
+        let deserialized: AgentRuntimeState =
+            serde_json::from_str(&serialized).expect("deserialize");
+
+        let wait = deserialized
+            .waiting_for_children
+            .expect("wait state should round-trip");
+        assert_eq!(wait.child_session_ids.len(), 2);
+        assert_eq!(wait.wait_for, ChildWaitPolicy::All);
+        assert_eq!(wait.registered_by_tool_call_id.as_deref(), Some("tool-1"));
     }
 
     #[test]

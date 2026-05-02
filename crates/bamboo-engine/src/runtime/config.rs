@@ -92,16 +92,21 @@ pub struct AgentLoopConfig {
     pub metrics_collector: Option<MetricsCollector>,
     /// Model name used for metrics attribution
     pub model_name: Option<String>,
-    /// Optional explicit fast/cheap model name for lightweight foreground tasks
-    /// such as task evaluation.
+    /// Fast/cheap model for lightweight tasks (task evaluation, search, etc.)
+    /// and background work (context compression, summarization).
+    ///
+    /// This is the same concept as `background_model_name` — both refer to the
+    /// same cheap model. The separate field exists only because different call
+    /// sites have different fallback requirements (foreground tasks may fall back
+    /// to `model_name`, while background tasks must not).
     ///
     /// Call sites may fall back to `model_name` when this is unset.
     pub fast_model_name: Option<String>,
-    /// Dedicated background summarization model for host-side context compression
-    /// and other non-interactive maintenance work.
+    /// Fast/cheap model for background summarization and context compression.
     ///
-    /// Unlike `fast_model_name`, this must not silently fall back to the main
-    /// interaction model.
+    /// This is the same model as `fast_model_name` (both are resolved from the
+    /// same `resolve_background_model` source). The separate field exists because
+    /// background tasks must not silently fall back to the main interaction model.
     pub background_model_name: Option<String>,
     /// Model for planning/coordination tasks (task decomposition, architecture).
     /// Falls back to `model_name` when unset.

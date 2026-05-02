@@ -133,6 +133,23 @@ fn tool_result(value: serde_json::Value) -> Result<ToolResult, ToolError> {
     })
 }
 
+fn waiting_for_children_tool_result(mut value: serde_json::Value) -> Result<ToolResult, ToolError> {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("runtime_control".to_string(), json!("waiting_for_children"));
+        object.insert("wait_for".to_string(), json!("all"));
+        object.insert(
+            "note".to_string(),
+            json!("Child session queued. The parent run is suspended and will resume automatically when the child finishes or times out."),
+        );
+    }
+
+    Ok(ToolResult {
+        success: true,
+        result: value.to_string(),
+        display_preference: Some("runtime_control:waiting_for_children".to_string()),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tool struct
 // ---------------------------------------------------------------------------
@@ -295,6 +312,7 @@ impl Tool for SubSessionTool {
                 let system_prompt_override =
                     Some(self.adapter.resolve_subagent_prompt(&subagent_type));
 
+                let should_auto_run = auto_run.unwrap_or(true);
                 let result = child_session::create_child_action(
                     self.adapter.as_ref(),
                     CreateChildInput {
@@ -308,7 +326,7 @@ impl Tool for SubSessionTool {
                         model_ref_override,
                         runtime_metadata,
                         system_prompt_override,
-                        auto_run: auto_run.unwrap_or(true),
+                        auto_run: should_auto_run,
                         reasoning_effort,
                     },
                 )
@@ -328,7 +346,7 @@ impl Tool for SubSessionTool {
                 ))
                 .await;
 
-                tool_result(json!({
+                let payload = json!({
                     "title": title.clone(),
                     "description": title,
                     "responsibility": responsibility,
@@ -338,8 +356,14 @@ impl Tool for SubSessionTool {
                     "parent_session_id": parent_session_id,
                     "model": result.model,
                     "reasoning_effort": reasoning_effort.map(|effort| effort.as_str()),
-                    "note": "Child session created. Typical execution time: 30-120 seconds. Use action=get to check progress. Wait at least 30 seconds before polling. If the child fails or needs correction, use send_message (not create) to retry in place."
-                }))
+                    "status": if should_auto_run { "queued" } else { "created" },
+                    "note": "Child session created. Typical execution time: 30-120 seconds. If the child fails or needs correction, use send_message (not create) to retry in place."
+                });
+                if should_auto_run {
+                    waiting_for_children_tool_result(payload)
+                } else {
+                    tool_result(payload)
+                }
             }
             SubSessionArgs::List => {
                 let result =
@@ -380,7 +404,8 @@ impl Tool for SubSessionTool {
                 .await
                 .map_err(tool_error_from_child_session)?;
 
-                if auto_run.unwrap_or(false) {
+                let should_auto_run = auto_run.unwrap_or(false);
+                if should_auto_run {
                     let child = self
                         .adapter
                         .load_child_for_parent(&parent.id, &child_session_id)
@@ -392,7 +417,11 @@ impl Tool for SubSessionTool {
                         .map_err(tool_error_from_child_session)?;
                 }
 
-                tool_result(result)
+                if should_auto_run {
+                    waiting_for_children_tool_result(result)
+                } else {
+                    tool_result(result)
+                }
             }
             SubSessionArgs::Run {
                 child_session_id,
@@ -406,7 +435,7 @@ impl Tool for SubSessionTool {
                 )
                 .await
                 .map_err(tool_error_from_child_session)?;
-                tool_result(result)
+                waiting_for_children_tool_result(result)
             }
             SubSessionArgs::SendMessage {
                 child_session_id,
@@ -414,6 +443,7 @@ impl Tool for SubSessionTool {
                 auto_run,
                 interrupt_running,
             } => {
+                let should_auto_run = auto_run.unwrap_or(true);
                 let result = child_session::send_message_to_child_action(
                     self.adapter.as_ref(),
                     &parent,
@@ -424,7 +454,16 @@ impl Tool for SubSessionTool {
                 )
                 .await
                 .map_err(tool_error_from_child_session)?;
-                tool_result(result)
+                if should_auto_run
+                    && result
+                        .get("status")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|status| status == "queued")
+                {
+                    waiting_for_children_tool_result(result)
+                } else {
+                    tool_result(result)
+                }
             }
             SubSessionArgs::Cancel { child_session_id } => {
                 let result = child_session::cancel_child_action(
@@ -650,6 +689,7 @@ mod tests {
             session_event_senders: session_event_senders.clone(),
             external_child_runner: None,
             provider_router: None,
+            completion_handler: None,
         }));
 
         let test_profiles = std::sync::Arc::new(

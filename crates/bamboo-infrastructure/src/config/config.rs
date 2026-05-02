@@ -1020,9 +1020,17 @@ impl Config {
 
     /// Get the effective default model for the currently active provider.
     ///
+    /// When `features.provider_model_ref` is enabled, reads from `defaults.chat`
+    /// before falling back to legacy provider-specific config.
+    ///
     /// Note: for most providers this is a required config value (returns None when absent).
     /// Copilot has a built-in fallback when no model is configured.
     pub fn get_model(&self) -> Option<String> {
+        if self.features.provider_model_ref {
+            if let Some(model_ref) = self.defaults.as_ref().map(|d| &d.chat) {
+                return Some(model_ref.model.clone());
+            }
+        }
         match self.provider.as_str() {
             "openai" => self.providers.openai.as_ref().and_then(|c| c.model.clone()),
             "anthropic" => self
@@ -1044,9 +1052,17 @@ impl Config {
 
     /// Get the fast/cheap model for the currently active provider.
     ///
+    /// When `features.provider_model_ref` is enabled, reads from `defaults.fast`
+    /// before falling back to legacy provider-specific config.
+    ///
     /// Used for lightweight tasks like title generation and summarization.
     /// Falls back to `get_model()` when no fast_model is configured.
     pub fn get_fast_model(&self) -> Option<String> {
+        if self.features.provider_model_ref {
+            if let Some(model_ref) = self.defaults.as_ref().and_then(|d| d.fast.as_ref()) {
+                return Some(model_ref.model.clone());
+            }
+        }
         let fast = match self.provider.as_str() {
             "openai" => self
                 .providers
@@ -1075,13 +1091,28 @@ impl Config {
 
     /// Get the configured memory/background summarization model.
     ///
-    /// Falls back to the provider fast model when `memory.background_model`
-    /// is not configured or resolves to an empty string.
+    /// When `features.provider_model_ref` is enabled, reads from
+    /// `defaults.memory_background` before falling back to legacy config.
+    ///
+    /// Falls back to the provider fast model when no background model is
+    /// configured or resolves to an empty string.
     ///
     /// IMPORTANT: this intentionally does **not** fall back to the main
     /// interaction model. Memory compaction / reflection should be skipped or
     /// fail loudly when no background/fast model is configured.
     pub fn get_memory_background_model(&self) -> Option<String> {
+        if self.features.provider_model_ref {
+            if let Some(model_ref) = self
+                .defaults
+                .as_ref()
+                .and_then(|d| d.memory_background.as_ref())
+            {
+                return Some(model_ref.model.clone());
+            }
+            if let Some(model_ref) = self.defaults.as_ref().and_then(|d| d.fast.as_ref()) {
+                return Some(model_ref.model.clone());
+            }
+        }
         let configured = self
             .memory
             .as_ref()
@@ -1979,6 +2010,7 @@ mod tests {
     #[test]
     fn get_memory_background_model_prefers_memory_specific_override() {
         let mut config = Config::default();
+        config.features.provider_model_ref = false;
         config.provider = "openai".to_string();
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
@@ -2006,6 +2038,7 @@ mod tests {
     #[test]
     fn get_memory_background_model_falls_back_to_provider_fast_model() {
         let mut config = Config::default();
+        config.features.provider_model_ref = false;
         config.provider = "openai".to_string();
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
@@ -2029,6 +2062,7 @@ mod tests {
     #[test]
     fn get_memory_background_model_does_not_fall_back_to_main_model() {
         let mut config = Config::default();
+        config.features.provider_model_ref = false;
         config.provider = "openai".to_string();
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
@@ -2746,6 +2780,264 @@ mod tests {
         assert_eq!(
             restored.env_vars[1].value_encrypted.as_deref(),
             Some("enc123")
+        );
+    }
+
+    // ---- defaults.* model resolution tests ----
+
+    #[test]
+    fn get_model_prefers_defaults_chat_when_provider_model_ref_enabled() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.providers.openai = Some(OpenAIConfig {
+            api_key: "test".to_string(),
+            api_key_encrypted: None,
+            base_url: None,
+            model: Some("legacy-gpt-4o".to_string()),
+            fast_model: None,
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: vec![],
+            request_overrides: None,
+            extra: Default::default(),
+        });
+        config.features.provider_model_ref = true;
+        config.defaults = Some(DefaultsConfig {
+            chat: bamboo_domain::ProviderModelRef::new("anthropic", "claude-3-7-sonnet"),
+            fast: None,
+            vision: None,
+            memory_background: None,
+            planning: None,
+            search: None,
+            code_review: None,
+            sub_session: None,
+            subagent_models: Default::default(),
+        });
+
+        assert_eq!(config.get_model(), Some("claude-3-7-sonnet".to_string()));
+    }
+
+    #[test]
+    fn get_model_ignores_defaults_chat_when_provider_model_ref_disabled() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.providers.openai = Some(OpenAIConfig {
+            api_key: "test".to_string(),
+            api_key_encrypted: None,
+            base_url: None,
+            model: Some("legacy-gpt-4o".to_string()),
+            fast_model: None,
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: vec![],
+            request_overrides: None,
+            extra: Default::default(),
+        });
+        config.features.provider_model_ref = false;
+        config.defaults = Some(DefaultsConfig {
+            chat: bamboo_domain::ProviderModelRef::new("anthropic", "claude-3-7-sonnet"),
+            fast: None,
+            vision: None,
+            memory_background: None,
+            planning: None,
+            search: None,
+            code_review: None,
+            sub_session: None,
+            subagent_models: Default::default(),
+        });
+
+        assert_eq!(config.get_model(), Some("legacy-gpt-4o".to_string()));
+    }
+
+    #[test]
+    fn get_fast_model_prefers_defaults_fast_when_provider_model_ref_enabled() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.providers.openai = Some(OpenAIConfig {
+            api_key: "test".to_string(),
+            api_key_encrypted: None,
+            base_url: None,
+            model: Some("gpt-4o".to_string()),
+            fast_model: Some("legacy-gpt-4o-mini".to_string()),
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: vec![],
+            request_overrides: None,
+            extra: Default::default(),
+        });
+        config.features.provider_model_ref = true;
+        config.defaults = Some(DefaultsConfig {
+            chat: bamboo_domain::ProviderModelRef::new("openai", "gpt-4o"),
+            fast: Some(bamboo_domain::ProviderModelRef::new("anthropic", "claude-3-5-haiku")),
+            vision: None,
+            memory_background: None,
+            planning: None,
+            search: None,
+            code_review: None,
+            sub_session: None,
+            subagent_models: Default::default(),
+        });
+
+        assert_eq!(
+            config.get_fast_model(),
+            Some("claude-3-5-haiku".to_string())
+        );
+    }
+
+    #[test]
+    fn get_fast_model_ignores_defaults_fast_when_provider_model_ref_disabled() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.providers.openai = Some(OpenAIConfig {
+            api_key: "test".to_string(),
+            api_key_encrypted: None,
+            base_url: None,
+            model: Some("gpt-4o".to_string()),
+            fast_model: Some("legacy-gpt-4o-mini".to_string()),
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: vec![],
+            request_overrides: None,
+            extra: Default::default(),
+        });
+        config.features.provider_model_ref = false;
+        config.defaults = Some(DefaultsConfig {
+            chat: bamboo_domain::ProviderModelRef::new("openai", "gpt-4o"),
+            fast: Some(bamboo_domain::ProviderModelRef::new("anthropic", "claude-3-5-haiku")),
+            vision: None,
+            memory_background: None,
+            planning: None,
+            search: None,
+            code_review: None,
+            sub_session: None,
+            subagent_models: Default::default(),
+        });
+
+        assert_eq!(
+            config.get_fast_model(),
+            Some("legacy-gpt-4o-mini".to_string())
+        );
+    }
+
+    #[test]
+    fn get_fast_model_falls_back_to_defaults_chat_when_fast_unset() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.features.provider_model_ref = true;
+        config.defaults = Some(DefaultsConfig {
+            chat: bamboo_domain::ProviderModelRef::new("anthropic", "claude-3-7-sonnet"),
+            fast: None,
+            vision: None,
+            memory_background: None,
+            planning: None,
+            search: None,
+            code_review: None,
+            sub_session: None,
+            subagent_models: Default::default(),
+        });
+
+        assert_eq!(
+            config.get_fast_model(),
+            Some("claude-3-7-sonnet".to_string())
+        );
+    }
+
+    #[test]
+    fn get_memory_background_model_prefers_defaults_memory_background() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.providers.openai = Some(OpenAIConfig {
+            api_key: "test".to_string(),
+            api_key_encrypted: None,
+            base_url: None,
+            model: Some("gpt-4o".to_string()),
+            fast_model: Some("gpt-4o-mini".to_string()),
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: vec![],
+            request_overrides: None,
+            extra: Default::default(),
+        });
+        config.features.provider_model_ref = true;
+        config.defaults = Some(DefaultsConfig {
+            chat: bamboo_domain::ProviderModelRef::new("openai", "gpt-4o"),
+            fast: Some(bamboo_domain::ProviderModelRef::new("openai", "gpt-4o-mini")),
+            vision: None,
+            memory_background: Some(bamboo_domain::ProviderModelRef::new(
+                "anthropic",
+                "claude-3-5-haiku",
+            )),
+            planning: None,
+            search: None,
+            code_review: None,
+            sub_session: None,
+            subagent_models: Default::default(),
+        });
+
+        assert_eq!(
+            config.get_memory_background_model(),
+            Some("claude-3-5-haiku".to_string())
+        );
+    }
+
+    #[test]
+    fn get_memory_background_model_falls_back_to_defaults_fast_when_memory_background_unset() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.features.provider_model_ref = true;
+        config.defaults = Some(DefaultsConfig {
+            chat: bamboo_domain::ProviderModelRef::new("openai", "gpt-4o"),
+            fast: Some(bamboo_domain::ProviderModelRef::new("anthropic", "claude-3-5-haiku")),
+            vision: None,
+            memory_background: None,
+            planning: None,
+            search: None,
+            code_review: None,
+            sub_session: None,
+            subagent_models: Default::default(),
+        });
+
+        assert_eq!(
+            config.get_memory_background_model(),
+            Some("claude-3-5-haiku".to_string())
+        );
+    }
+
+    #[test]
+    fn get_memory_background_model_ignores_defaults_when_provider_model_ref_disabled() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.providers.openai = Some(OpenAIConfig {
+            api_key: "test".to_string(),
+            api_key_encrypted: None,
+            base_url: None,
+            model: Some("gpt-4o".to_string()),
+            fast_model: Some("legacy-gpt-4o-mini".to_string()),
+            vision_model: None,
+            reasoning_effort: None,
+            responses_only_models: vec![],
+            request_overrides: None,
+            extra: Default::default(),
+        });
+        config.features.provider_model_ref = false;
+        config.defaults = Some(DefaultsConfig {
+            chat: bamboo_domain::ProviderModelRef::new("openai", "gpt-4o"),
+            fast: Some(bamboo_domain::ProviderModelRef::new("anthropic", "claude-3-5-haiku")),
+            vision: None,
+            memory_background: Some(bamboo_domain::ProviderModelRef::new(
+                "anthropic",
+                "claude-3-5-haiku",
+            )),
+            planning: None,
+            search: None,
+            code_review: None,
+            sub_session: None,
+            subagent_models: Default::default(),
+        });
+
+        assert_eq!(
+            config.get_memory_background_model(),
+            Some("legacy-gpt-4o-mini".to_string())
         );
     }
 }

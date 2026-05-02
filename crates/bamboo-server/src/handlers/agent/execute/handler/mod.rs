@@ -133,7 +133,7 @@ pub async fn handler(
             {
                 RunnerReservation::Started(token) => token,
                 RunnerReservation::AlreadyRunning => {
-                    let sync_info = build_sync_info_from_session(&session, None);
+                    let sync_info = build_sync_info_from_session(&session);
                     return already_running_response(&session_id, sync_info);
                 }
             };
@@ -164,7 +164,7 @@ pub async fn handler(
             let resolved_bg_provider = resolved_bg.map(|m| m.provider);
 
             // Build sync info before moving session into SpawnAgentExecution.
-            let sync_info = build_sync_info_from_session(&session, None);
+            let sync_info = build_sync_info_from_session(&session);
 
             tracing::info!(
                 "[{}] Starting agent execution with provider={}, model={}, model_source={}, reasoning_effort={}, reasoning_source={}",
@@ -281,20 +281,14 @@ fn server_snapshot_to_sync_info(
     }
 }
 
-fn build_sync_info_from_session(
-    session: &bamboo_agent_core::Session,
-    reason: Option<ExecuteSyncReason>,
-) -> ExecuteSyncInfo {
-    ExecuteSyncInfo {
-        need_sync: reason.is_some(),
-        reason,
-        server_message_count: session.messages.len(),
-        server_last_message_id: session.messages.last().map(|m| m.id.clone()),
-        has_pending_question: session.pending_question.is_some(),
-        pending_question_tool_call_id: session
-            .pending_question
-            .as_ref()
-            .map(|p| p.tool_call_id.clone()),
-        has_pending_user_message: false,
-    }
+fn build_sync_info_from_session(session: &bamboo_agent_core::Session) -> ExecuteSyncInfo {
+    // Reuse `server_snapshot_to_sync_info` so the visible-message filter
+    // (matching GET /history) lives in exactly one place. Override
+    // `has_pending_user_message` to false: this builder is used when the
+    // runner is already started (Ready) or already running for the session,
+    // i.e. the client should not retry execute.
+    let snapshot = crate::session_app::types::ServerExecuteSnapshot::from_session(session);
+    let mut info = server_snapshot_to_sync_info(&snapshot, None);
+    info.has_pending_user_message = false;
+    info
 }

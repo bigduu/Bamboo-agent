@@ -78,6 +78,7 @@ fn scheduling_mode_for_tool_call(
 
 pub(crate) struct RoundToolExecutionResult {
     pub awaiting_clarification: bool,
+    pub waiting_for_children: bool,
     pub round_status: MetricsRoundStatus,
     pub round_error: Option<String>,
 }

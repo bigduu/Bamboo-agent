@@ -245,6 +245,7 @@ pub fn build_spawn_scheduler(
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     external_child_runner: Option<Arc<dyn bamboo_engine::runtime::execution::ExternalChildRunner>>,
     provider_router: Option<Arc<bamboo_infrastructure::ProviderModelRouter>>,
+    completion_handler: Option<Arc<dyn bamboo_engine::execution::ChildCompletionHandler>>,
 ) -> Arc<SpawnScheduler> {
     Arc::new(SpawnScheduler::new(SpawnContext {
         agent,
@@ -254,6 +255,7 @@ pub fn build_spawn_scheduler(
         session_event_senders,
         external_child_runner,
         provider_router,
+        completion_handler,
     }))
 }
 

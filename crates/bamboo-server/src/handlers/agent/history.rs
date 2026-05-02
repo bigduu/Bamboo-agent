@@ -104,9 +104,16 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> imp
             "session_id": session_id
         }));
     };
+
+    let messages: Vec<_> = session
+        .messages
+        .into_iter()
+        .filter(|message| !crate::session_app::execute::is_hidden_from_ui(message))
+        .collect();
+
     HttpResponse::Ok().json(serde_json::json!({
         "session_id": session_id,
-        "messages": session.messages,
+        "messages": messages,
         "compression_events": session.compression_events
     }))
 }

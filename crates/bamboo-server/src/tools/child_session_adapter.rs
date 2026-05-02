@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{Duration as ChronoDuration, Utc};
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -19,6 +20,9 @@ use crate::spawn_scheduler::{SpawnJob, SpawnScheduler};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolError;
 use bamboo_agent_core::{AgentEvent, Session, SessionKind};
+use bamboo_domain::session::runtime_state::{
+    AgentRuntimeState, ChildWaitPolicy, WaitingForChildrenState,
+};
 use bamboo_infrastructure::{Config, SessionIndexEntry, SessionStoreV2};
 
 /// Server-side adapter that bridges domain `ChildSessionPort` to infrastructure.
@@ -39,6 +43,30 @@ pub struct ChildSessionAdapter {
     /// Subagent profile registry. Used to resolve `subagent_type` →
     /// `system_prompt` (and, in later PRs, the tool surface filter).
     pub(crate) subagent_profiles: Arc<bamboo_domain::subagent::SubagentProfileRegistry>,
+}
+
+const AGENT_RUNTIME_STATE_METADATA_KEY: &str = "agent.runtime.state";
+
+fn read_runtime_state(session: &Session) -> AgentRuntimeState {
+    session
+        .agent_runtime_state
+        .clone()
+        .or_else(|| {
+            session
+                .metadata
+                .get(AGENT_RUNTIME_STATE_METADATA_KEY)
+                .and_then(|raw| serde_json::from_str::<AgentRuntimeState>(raw).ok())
+        })
+        .unwrap_or_else(|| AgentRuntimeState::new(format!("{}-wait", session.id)))
+}
+
+fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState) {
+    session.agent_runtime_state = Some(runtime_state.clone());
+    if let Ok(serialized) = serde_json::to_string(runtime_state) {
+        session
+            .metadata
+            .insert(AGENT_RUNTIME_STATE_METADATA_KEY.to_string(), serialized);
+    }
 }
 
 impl ChildSessionAdapter {
@@ -69,6 +97,92 @@ impl ChildSessionAdapter {
             .resolve(subagent_type)
             .system_prompt
             .clone()
+    }
+
+    /// Register a durable parent wait for an enqueued child session.
+    ///
+    /// This is intentionally idempotent: repeated registrations for the same
+    /// child merge into the existing wait set. The child runner owns timeout
+    /// and liveness; the parent wait timeout is a long lease for observability.
+    pub async fn register_parent_wait_for_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        tool_call_id: Option<&str>,
+    ) -> Result<(), ChildSessionError> {
+        let Some(mut parent) =
+            self.storage
+                .load_session(parent_session_id)
+                .await
+                .map_err(|error| {
+                    ChildSessionError::Execution(format!(
+                        "failed to load parent session {parent_session_id}: {error}"
+                    ))
+                })?
+        else {
+            return Err(ChildSessionError::NotFound(parent_session_id.to_string()));
+        };
+
+        let mut runtime_state = read_runtime_state(&parent);
+        runtime_state
+            .children
+            .active_ids
+            .retain(|id| id != child_session_id);
+        runtime_state
+            .children
+            .completed_ids
+            .retain(|id| id != child_session_id);
+        runtime_state
+            .children
+            .active_ids
+            .push(child_session_id.to_string());
+        runtime_state.children.active_ids.sort();
+        runtime_state.children.active_ids.dedup();
+        runtime_state.children.active_children = runtime_state.children.active_ids.len() as u32;
+        runtime_state.children.completed_children =
+            runtime_state.children.completed_ids.len() as u32;
+
+        let now = Utc::now();
+        let mut wait = runtime_state
+            .waiting_for_children
+            .take()
+            .unwrap_or_else(|| WaitingForChildrenState {
+                child_session_ids: Vec::new(),
+                wait_for: ChildWaitPolicy::All,
+                registered_at: now,
+                timeout_at: Some(now + ChronoDuration::hours(6)),
+                registered_by_tool_call_id: tool_call_id.map(str::to_string),
+            });
+        if !wait
+            .child_session_ids
+            .iter()
+            .any(|id| id == child_session_id)
+        {
+            wait.child_session_ids.push(child_session_id.to_string());
+        }
+        wait.child_session_ids.sort();
+        wait.child_session_ids.dedup();
+        if wait.registered_by_tool_call_id.is_none() {
+            wait.registered_by_tool_call_id = tool_call_id.map(str::to_string);
+        }
+        runtime_state.waiting_for_children = Some(wait);
+
+        write_runtime_state(&mut parent, &runtime_state);
+        parent.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+        parent.updated_at = Utc::now();
+
+        self.storage.save_session(&parent).await.map_err(|error| {
+            ChildSessionError::Execution(format!("failed to save parent wait state: {error}"))
+        })?;
+        self.sessions_cache
+            .write()
+            .await
+            .insert(parent.id.clone(), parent);
+
+        Ok(())
     }
 }
 
@@ -189,6 +303,9 @@ impl ChildSessionPort for ChildSessionAdapter {
                 "child model is empty and parent model is unavailable".to_string(),
             ));
         }
+
+        self.register_parent_wait_for_child(&parent.id, &child.id, None)
+            .await?;
 
         self.scheduler
             .enqueue(SpawnJob {

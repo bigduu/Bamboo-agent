@@ -14,6 +14,7 @@
 //! - [`spawn_session_execution`] — spawn agent execution with full orchestration
 
 pub mod agent_spawn;
+pub mod child_completion;
 pub mod event_forwarder;
 pub mod runner_lifecycle;
 pub mod runner_state;
@@ -24,6 +25,7 @@ pub use agent_spawn::{
     log_base_system_prompt_snapshot, preserve_concurrent_session_overrides,
     spawn_session_execution, SessionExecutionArgs,
 };
+pub use child_completion::{ChildCompletion, ChildCompletionHandler};
 pub use event_forwarder::create_event_forwarder;
 pub use runner_lifecycle::{finalize_runner, status_from_execution_result, try_reserve_runner};
 pub use runner_state::{AgentRunner, AgentStatus};

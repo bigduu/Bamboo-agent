@@ -332,7 +332,9 @@ impl AgentRuntime {
             attachment_reader: Some(self.attachment_reader.clone()),
             metrics_collector: Some(self.metrics_collector.clone()),
             model_name: model,
-            fast_model_name: config.get_fast_model(),
+            fast_model_name: background_model
+                .clone()
+                .or_else(|| config.get_fast_model()),
             background_model_name: background_model
                 .or_else(|| config.get_memory_background_model()),
             background_model_provider,

@@ -49,6 +49,12 @@ pub async fn handler(
         .as_ref()
         .and_then(|runner| runner.last_budget_event.clone());
 
+    // Collect cached critical events for replay (TaskListUpdated, SubSession*, etc.).
+    let critical_events_to_replay: Vec<_> = runner_snapshot
+        .as_ref()
+        .map(|runner| runner.last_critical_events.clone())
+        .unwrap_or_default();
+
     // If the runner is not actively running (or missing), and the session has no pending
     // user message, return a one-shot terminal event and close the stream. This makes it safe
     // for UIs to "subscribe once" on open even when they missed the live stream.
@@ -61,9 +67,13 @@ pub async fn handler(
         if let Some(terminal_event) =
             terminal_event_if_ready(&state, &session_id, runner_status).await
         {
-            return terminal_response(budget_event_to_replay, terminal_event);
+            return terminal_response(
+                budget_event_to_replay,
+                critical_events_to_replay,
+                terminal_event,
+            );
         }
     }
 
-    live_stream_response(budget_event_to_replay, receiver)
+    live_stream_response(budget_event_to_replay, critical_events_to_replay, receiver)
 }

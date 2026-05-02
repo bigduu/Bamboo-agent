@@ -7,6 +7,7 @@ use bamboo_agent_core::AgentEvent;
 
 pub(super) fn terminal_response(
     budget_event_to_replay: Option<AgentEvent>,
+    critical_events_to_replay: Vec<AgentEvent>,
     terminal_event: AgentEvent,
 ) -> HttpResponse {
     HttpResponse::Ok()
@@ -14,6 +15,12 @@ pub(super) fn terminal_response(
         .append_header((header::CACHE_CONTROL, "no-cache"))
         .append_header((header::CONNECTION, "keep-alive"))
         .streaming(async_stream::stream! {
+            // Replay cached critical state events first (task list, sub-sessions, …).
+            for event in &critical_events_to_replay {
+                if let Some(sse_data) = as_sse_data(Some(event)) {
+                    yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
+                }
+            }
             if let Some(sse_data) = as_sse_data(budget_event_to_replay.as_ref()) {
                 yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
             }
@@ -26,6 +33,7 @@ pub(super) fn terminal_response(
 
 pub(super) fn live_stream_response(
     budget_event_to_replay: Option<AgentEvent>,
+    critical_events_to_replay: Vec<AgentEvent>,
     mut receiver: broadcast::Receiver<AgentEvent>,
 ) -> HttpResponse {
     HttpResponse::Ok()
@@ -33,6 +41,12 @@ pub(super) fn live_stream_response(
         .append_header((header::CACHE_CONTROL, "no-cache"))
         .append_header((header::CONNECTION, "keep-alive"))
         .streaming(async_stream::stream! {
+            // Replay cached critical state events first (task list, sub-sessions, …).
+            for event in &critical_events_to_replay {
+                if let Some(sse_data) = as_sse_data(Some(event)) {
+                    yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
+                }
+            }
             if let Some(sse_data) = as_sse_data(budget_event_to_replay.as_ref()) {
                 yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
             }
