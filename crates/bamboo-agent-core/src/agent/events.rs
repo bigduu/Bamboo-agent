@@ -372,6 +372,21 @@ pub enum AgentEvent {
         started_at: String,
     },
 
+    /// Tool execution requires user approval before proceeding.
+    ///
+    /// Emitted when a permission checker determines that a tool call needs
+    /// explicit user confirmation (e.g., mutating operations in restricted
+    /// permission mode). The frontend should present the approval request and
+    /// either grant or deny it.
+    ToolApprovalRequested {
+        /// Unique identifier for the tool call awaiting approval.
+        tool_call_id: String,
+        /// Name of the tool being executed.
+        tool_name: String,
+        /// Parameters that were passed to the tool.
+        parameters: serde_json::Value,
+    },
+
     /// Agent execution completed successfully.
     Complete {
         /// Final token usage statistics
@@ -571,6 +586,52 @@ mod tests {
             value["content_summary"],
             "Implementation plan for feature X"
         );
+    }
+
+    #[test]
+    fn tool_approval_requested_serializes_correctly() {
+        let event = AgentEvent::ToolApprovalRequested {
+            tool_call_id: "call-abc".to_string(),
+            tool_name: "Write".to_string(),
+            parameters: serde_json::json!({"file_path": "/tmp/test.txt"}),
+        };
+
+        let value = serde_json::to_value(event).expect("event should serialize");
+        assert_eq!(value["type"], "tool_approval_requested");
+        assert_eq!(value["tool_call_id"], "call-abc");
+        assert_eq!(value["tool_name"], "Write");
+        assert_eq!(
+            value["parameters"],
+            serde_json::json!({"file_path": "/tmp/test.txt"})
+        );
+    }
+
+    #[test]
+    fn tool_approval_requested_deserializes_correctly() {
+        let json = serde_json::json!({
+            "type": "tool_approval_requested",
+            "tool_call_id": "call-xyz",
+            "tool_name": "Bash",
+            "parameters": {"command": "ls -la"}
+        });
+
+        let event: AgentEvent =
+            serde_json::from_value(json).expect("should deserialize");
+        match event {
+            AgentEvent::ToolApprovalRequested {
+                tool_call_id,
+                tool_name,
+                parameters,
+            } => {
+                assert_eq!(tool_call_id, "call-xyz");
+                assert_eq!(tool_name, "Bash");
+                assert_eq!(
+                    parameters,
+                    serde_json::json!({"command": "ls -la"})
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]

@@ -280,15 +280,36 @@ impl ToolExecutor for BuiltinToolExecutor {
             {
                 for context in contexts {
                     let resource = context.resource.clone();
-                    let allowed = permission_checker
-                        .check_or_request(context)
-                        .await
-                        .map_err(permission_error_to_tool_error)?;
-                    if !allowed {
-                        return Err(ToolError::Execution(format!(
-                            "Permission denied for: {}",
-                            resource
-                        )));
+                    match permission_checker.check_or_request(context).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err(ToolError::Execution(format!(
+                                "Permission denied for: {}",
+                                resource
+                            )));
+                        }
+                        Err(PermissionError::ConfirmationRequired {
+                            permission_type: _,
+                            resource: _,
+                        }) => {
+                            // Emit approval request so the frontend can show it
+                            if let Some(tx) = ctx.event_tx {
+                                let _ = tx
+                                    .send(bamboo_agent_core::AgentEvent::ToolApprovalRequested {
+                                        tool_call_id: call.id.clone(),
+                                        tool_name: tool_name.clone(),
+                                        parameters: args.clone(),
+                                    })
+                                    .await;
+                            }
+                            return Err(ToolError::Execution(format!(
+                                "Permission approval required for: {}",
+                                resource
+                            )));
+                        }
+                        Err(other) => {
+                            return Err(permission_error_to_tool_error(other));
+                        }
                     }
                 }
             }
