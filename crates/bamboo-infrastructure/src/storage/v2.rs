@@ -72,6 +72,11 @@ pub struct SessionIndexEntry {
     pub last_activity_at: DateTime<Utc>,
     pub message_count: usize,
     pub has_attachments: bool,
+    /// Whether the session currently has a pending question awaiting user response.
+    /// Mirrored into the index from `session.has_pending_question()` so the frontend
+    /// can display the question dialog badge without loading session.json.
+    #[serde(default)]
+    pub has_pending_question: bool,
     /// Last known run status for this session
     /// ("pending" | "running" | "completed" | "error" | "cancelled" | "skipped").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -361,6 +366,7 @@ impl SessionStoreV2 {
                     last_activity_at: session.updated_at,
                     message_count: session.messages.len(),
                     has_attachments,
+                    has_pending_question: session.has_pending_question(),
                     last_run_status,
                     last_run_error,
                     token_usage: session.token_usage.clone(),

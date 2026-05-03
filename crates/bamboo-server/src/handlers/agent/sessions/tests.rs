@@ -26,6 +26,7 @@ fn session_summary_from_entry_includes_last_run_fields() {
         last_activity_at: Utc::now(),
         message_count: 5,
         has_attachments: false,
+        has_pending_question: true,
         last_run_status: Some("completed".to_string()),
         last_run_error: None,
         token_usage: None,
@@ -38,6 +39,8 @@ fn session_summary_from_entry_includes_last_run_fields() {
     assert_eq!(summary.last_run_error, None);
     assert_eq!(summary.schedule_run_id.as_deref(), Some("run-123"));
     assert_eq!(summary.subagent_type, None);
+    assert_eq!(summary.has_pending_question, true);
+    assert_eq!(summary.running_child_count, 0);
 }
 
 #[test]
@@ -61,6 +64,7 @@ fn session_summary_from_entry_propagates_subagent_type() {
         last_activity_at: Utc::now(),
         message_count: 0,
         has_attachments: false,
+        has_pending_question: false,
         last_run_status: None,
         last_run_error: None,
         token_usage: None,
@@ -69,4 +73,5 @@ fn session_summary_from_entry_propagates_subagent_type() {
 
     let summary = SessionSummary::from_entry(entry, false);
     assert_eq!(summary.subagent_type.as_deref(), Some("plan"));
+    assert_eq!(summary.has_pending_question, false);
 }

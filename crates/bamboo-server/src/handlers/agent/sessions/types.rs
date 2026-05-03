@@ -42,6 +42,15 @@ pub struct SessionSummary {
     /// and for legacy children created before this field was introduced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_type: Option<String>,
+    /// Whether the session currently has a pending question awaiting user response.
+    /// Sourced from `SessionIndexEntry.has_pending_question` for list endpoints
+    /// and from `session.has_pending_question()` for detail endpoints.
+    #[serde(default)]
+    pub has_pending_question: bool,
+    /// Number of child sessions currently running under this session.
+    /// Computed dynamically at query time by scanning running sessions.
+    #[serde(default)]
+    pub running_child_count: u32,
 }
 
 impl SessionSummary {
@@ -70,6 +79,8 @@ impl SessionSummary {
             last_run_error: entry.last_run_error,
             token_usage: entry.token_usage,
             subagent_type: entry.subagent_type,
+            has_pending_question: entry.has_pending_question,
+            running_child_count: 0,
         }
     }
 }
@@ -335,6 +346,8 @@ mod tests {
             last_run_error: None,
             token_usage: None,
             subagent_type: None,
+            has_pending_question: false,
+            running_child_count: 0,
         };
 
         let response = CreateSessionResponse { session: summary };
@@ -370,6 +383,8 @@ mod tests {
             last_run_error: None,
             token_usage: None,
             subagent_type: None,
+            has_pending_question: false,
+            running_child_count: 0,
         };
 
         let response = GetSessionResponse { session: summary };
@@ -492,6 +507,8 @@ mod tests {
             last_run_error: None,
             token_usage: None,
             subagent_type: None,
+            has_pending_question: false,
+            running_child_count: 0,
         };
 
         let debug_str = format!("{:?}", summary);
