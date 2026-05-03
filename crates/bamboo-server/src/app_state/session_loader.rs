@@ -197,7 +197,7 @@ mod tests {
         let session = bamboo_agent_core::Session::new(session_id.to_string(), "test-model");
 
         // Seed storage only.
-        state.storage.save_session(&session).await;
+        state.storage.save_session(&session).await.expect("save session");
 
         let loaded = state.load_session(session_id).await;
         assert!(loaded.is_some());
@@ -249,7 +249,7 @@ mod tests {
             let mut sessions = state.sessions.write().await;
             sessions.insert(session_id.to_string(), memory_session);
         }
-        state.storage.save_session(&storage_session).await;
+        state.storage.save_session(&storage_session).await.expect("save session");
 
         let loaded = state.load_session_merged(session_id).await;
         assert!(loaded.is_some());
