@@ -3,6 +3,7 @@ mod discoverable_tools;
 mod patch;
 mod query;
 mod running;
+mod running_snapshot;
 mod system_prompt;
 
 #[cfg(test)]
@@ -14,4 +15,5 @@ pub use discoverable_tools::{
 };
 pub use patch::patch_session;
 pub use query::{get_session, list_sessions};
+pub use running_snapshot::running_sessions_snapshot;
 pub use system_prompt::get_system_prompt_snapshot;

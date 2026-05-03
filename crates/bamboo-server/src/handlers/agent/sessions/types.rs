@@ -79,6 +79,30 @@ pub struct ListSessionsResponse {
     pub sessions: Vec<SessionSummary>,
 }
 
+/// Snapshot of an actively running session for frontend boot/reconnect replay.
+#[derive(Debug, Serialize)]
+pub struct RunningSessionEntry {
+    pub session_id: String,
+    pub run_id: String,
+    pub started_at: String,
+    pub round_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_at: Option<String>,
+    /// Recent critical events replayed for late subscribers.
+    pub last_critical_events: Vec<bamboo_agent_core::AgentEvent>,
+    /// IDs of child sessions currently running under this session.
+    pub running_child_session_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunningSessionsResponse {
+    pub sessions: Vec<RunningSessionEntry>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
     #[serde(default)]
