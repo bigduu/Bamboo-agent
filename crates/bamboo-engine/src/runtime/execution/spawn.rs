@@ -22,7 +22,7 @@ use crate::runtime::ExecuteRequest;
 
 use super::child_completion::{ChildCompletion, ChildCompletionHandler};
 use super::event_forwarder::create_event_forwarder;
-use super::runner_lifecycle::{finalize_runner, try_reserve_runner};
+use super::runner_lifecycle::{finalize_runner, try_reserve_runner, RunnerReservation};
 use super::runner_state::AgentRunner;
 use super::session_events::get_or_create_event_sender;
 
@@ -400,7 +400,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
     let _ = ctx.agent.storage().save_session(&session).await;
 
     // Insert runner status.
-    let Some(cancel_token) =
+    let Some(RunnerReservation { cancel_token, .. }) =
         try_reserve_runner(&ctx.agent_runners, &job.child_session_id, &child_tx).await
     else {
         return Ok(());

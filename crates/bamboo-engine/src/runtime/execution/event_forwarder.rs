@@ -27,6 +27,20 @@ pub fn create_event_forwarder(
     let (mpsc_tx, mut mpsc_rx) = mpsc::channel::<AgentEvent>(100);
 
     let forwarder = tokio::spawn(async move {
+        // Emit ExecutionStarted as the first event so the frontend can correlate
+        // all subsequent events to this run via run_id.
+        {
+            let runners = runners.read().await;
+            if let Some(runner) = runners.get(&session_id) {
+                let started_event = AgentEvent::ExecutionStarted {
+                    run_id: runner.run_id.clone(),
+                    session_id: session_id.clone(),
+                    started_at: Utc::now().to_rfc3339(),
+                };
+                let _ = broadcast_tx.send(started_event);
+            }
+        }
+
         while let Some(event) = mpsc_rx.recv().await {
             {
                 let mut runners = runners.write().await;

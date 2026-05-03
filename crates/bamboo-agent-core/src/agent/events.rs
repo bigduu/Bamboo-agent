@@ -358,6 +358,20 @@ pub enum AgentEvent {
         round_count: u32,
     },
 
+    /// Execution run has started and the runner is now active.
+    ///
+    /// Emitted as the first event after a runner reservation succeeds,
+    /// before any token or tool events. Carries the `run_id` so the
+    /// frontend can correlate subsequent SSE events across reconnects.
+    ExecutionStarted {
+        /// Unique identifier for this execution run.
+        run_id: String,
+        /// Session identifier.
+        session_id: String,
+        /// ISO 8601 timestamp when the run started.
+        started_at: String,
+    },
+
     /// Agent execution completed successfully.
     Complete {
         /// Final token usage statistics

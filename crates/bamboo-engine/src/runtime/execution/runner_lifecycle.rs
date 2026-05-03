@@ -16,18 +16,27 @@ use bamboo_agent_core::AgentEvent;
 
 use super::runner_state::{AgentRunner, AgentStatus};
 
+/// Reservation result from `try_reserve_runner`.
+#[derive(Debug, Clone)]
+pub struct RunnerReservation {
+    pub cancel_token: CancellationToken,
+    pub run_id: String,
+}
+
 /// Try to reserve a runner for the given session.
 ///
 /// If a runner with `Running` status already exists, returns `None`
-/// (caller should skip execution).
+/// (caller should skip execution). The `AlreadyRunning` case is surfaced
+/// by the caller via `ExecuteResponse` with the *existing* runner's `run_id`
+/// so the frontend can correlate subsequent SSE events.
 ///
 /// Otherwise removes any stale runner and inserts a fresh one, returning
-/// the associated `CancellationToken`.
+/// the associated `CancellationToken` and the new `run_id`.
 pub async fn try_reserve_runner(
     runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_id: &str,
     event_sender: &broadcast::Sender<AgentEvent>,
-) -> Option<CancellationToken> {
+) -> Option<RunnerReservation> {
     let mut guard = runners.write().await;
     if let Some(runner) = guard.get(session_id) {
         if matches!(runner.status, AgentStatus::Running) {
@@ -41,10 +50,13 @@ pub async fn try_reserve_runner(
     let mut runner = AgentRunner::new();
     runner.status = AgentStatus::Running;
     runner.event_sender = event_sender.clone();
-    let cancel_token = runner.cancel_token.clone();
+    let reservation = RunnerReservation {
+        cancel_token: runner.cancel_token.clone(),
+        run_id: runner.run_id.clone(),
+    };
 
     guard.insert(session_id.to_string(), runner);
-    Some(cancel_token)
+    Some(reservation)
 }
 
 /// Map an execution result to `AgentStatus`.

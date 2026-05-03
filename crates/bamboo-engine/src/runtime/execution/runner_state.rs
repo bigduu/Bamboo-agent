@@ -7,6 +7,7 @@
 use chrono::{DateTime, Utc};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use bamboo_agent_core::AgentEvent;
 
@@ -96,6 +97,12 @@ pub struct AgentRunner {
     /// Number of completed rounds (turns) so far.
     /// Updated live during execution for progress tracking.
     pub round_count: u32,
+
+    /// Unique identifier for this execution run.
+    /// Generated fresh for every `try_reserve_runner` call so that
+    /// frontend SSE events can be matched to the correct run even
+    /// across reconnects.
+    pub run_id: String,
 }
 
 impl Default for AgentRunner {
@@ -129,6 +136,7 @@ impl AgentRunner {
             last_tool_phase: None,
             last_event_at: None,
             round_count: 0,
+            run_id: Uuid::new_v4().to_string(),
         }
     }
 

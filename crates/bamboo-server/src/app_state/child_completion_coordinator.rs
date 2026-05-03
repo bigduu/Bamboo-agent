@@ -11,8 +11,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
-use tokio_util::sync::CancellationToken;
-
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Message, Role, Session, SessionKind};
@@ -21,7 +19,7 @@ use bamboo_domain::session::runtime_state::{
 };
 use bamboo_engine::execution::{
     create_event_forwarder, spawn_session_execution, try_reserve_runner, AgentRunner,
-    ChildCompletion, ChildCompletionHandler, SessionExecutionArgs,
+    ChildCompletion, ChildCompletionHandler, RunnerReservation, SessionExecutionArgs,
 };
 use bamboo_engine::Agent;
 use bamboo_infrastructure::{Config, ProviderModelRouter, ProviderRegistry};
@@ -406,7 +404,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         &self,
         session_id: &str,
         event_sender: &broadcast::Sender<AgentEvent>,
-    ) -> Option<CancellationToken> {
+    ) -> Option<RunnerReservation> {
         try_reserve_runner(&self.agent_runners, session_id, event_sender).await
     }
 
@@ -423,6 +421,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             session_id,
             session,
             cancel_token,
+            run_id: _,
             event_sender,
             config,
         } = request;

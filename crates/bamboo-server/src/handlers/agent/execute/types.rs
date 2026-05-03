@@ -66,6 +66,7 @@ pub struct ExecuteSyncInfo {
 /// * `session_id` - The session identifier
 /// * `status` - Execution status ("started", "completed", "already_running")
 /// * `events_url` - URL endpoint to subscribe to agent events (SSE)
+/// * `run_id` - Unique identifier for this execution run (present when started/already_running)
 #[derive(Serialize)]
 pub struct ExecuteResponse {
     /// Session identifier for tracking this execution
@@ -77,6 +78,9 @@ pub struct ExecuteResponse {
     /// Optional sync snapshot allowing the frontend to reconcile with server state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<ExecuteSyncInfo>,
+    /// Unique run identifier for correlating SSE events across reconnects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// Request payload for agent execution.
@@ -138,12 +142,14 @@ mod tests {
             status: "started".to_string(),
             events_url: "/api/v1/execute/session-123/events".to_string(),
             sync: None,
+            run_id: Some("run-456".to_string()),
         };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("session-123"));
         assert!(json.contains("started"));
         assert!(json.contains("events"));
+        assert!(json.contains("run-456"));
     }
 
     #[test]
@@ -161,11 +167,14 @@ mod tests {
                 pending_question_tool_call_id: None,
                 has_pending_user_message: false,
             }),
+            run_id: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("completed"));
         assert!(json.contains("server_message_count"));
+        // run_id should be absent when None (skip_serializing_if)
+        assert!(!json.contains("run_id"));
     }
 
     #[test]

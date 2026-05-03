@@ -12,9 +12,8 @@ use crate::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
 use async_trait::async_trait;
 use bamboo_agent_core::AgentEvent;
 use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
 
-use super::runner_lifecycle::try_reserve_runner;
+use super::runner_lifecycle::{try_reserve_runner, RunnerReservation};
 use super::session_events::get_or_create_event_sender;
 use super::AppState;
 use crate::handlers::agent::execute::runtime::SpawnAgentExecution;
@@ -41,7 +40,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
         &self,
         session_id: &str,
         event_sender: &broadcast::Sender<AgentEvent>,
-    ) -> Option<CancellationToken> {
+    ) -> Option<RunnerReservation> {
         try_reserve_runner(&self.0.agent_runners, session_id, event_sender).await
     }
 
@@ -54,6 +53,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
             session_id,
             session,
             cancel_token,
+            run_id: _,
             event_sender,
             config,
         } = request;

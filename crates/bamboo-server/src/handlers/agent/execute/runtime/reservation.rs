@@ -4,8 +4,8 @@ use crate::app_state::{AgentRunner, AgentStatus, AppState};
 use bamboo_agent_core::AgentEvent;
 
 pub(in crate::handlers::agent::execute) enum RunnerReservation {
-    Started(CancellationToken),
-    AlreadyRunning,
+    Started(CancellationToken, String),
+    AlreadyRunning(String),
 }
 
 pub(in crate::handlers::agent::execute) async fn reserve_runner(
@@ -22,7 +22,7 @@ pub(in crate::handlers::agent::execute) async fn reserve_runner(
                 "[{}] Runner already running, returning status: already_running",
                 session_id
             );
-            return RunnerReservation::AlreadyRunning;
+            return RunnerReservation::AlreadyRunning(runner.run_id.clone());
         }
         tracing::debug!(
             "[{}] Existing runner with status {:?}, will restart",
@@ -38,7 +38,8 @@ pub(in crate::handlers::agent::execute) async fn reserve_runner(
     runner.status = AgentStatus::Running;
     runner.event_sender = session_tx.clone();
     let cancel_token = runner.cancel_token.clone();
+    let run_id = runner.run_id.clone();
 
     runners.insert(session_id.to_string(), runner);
-    RunnerReservation::Started(cancel_token)
+    RunnerReservation::Started(cancel_token, run_id)
 }

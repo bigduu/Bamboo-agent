@@ -58,6 +58,7 @@ fn execute_response_payload_formats_status_and_events_url() {
             pending_question_tool_call_id: None,
             has_pending_user_message: true,
         }),
+        None,
     );
     assert_eq!(payload.session_id, "session-123");
     assert_eq!(payload.status, "started");

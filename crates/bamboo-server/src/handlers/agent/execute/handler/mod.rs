@@ -129,14 +129,15 @@ pub async fn handler(
             let session = *session;
             // ---- Reserve runner ----
             let session_tx = state.get_session_event_sender(&session_id).await;
-            let cancel_token = match reserve_runner(state.get_ref(), &session_id, &session_tx).await
-            {
-                RunnerReservation::Started(token) => token,
-                RunnerReservation::AlreadyRunning => {
-                    let sync_info = build_sync_info_from_session(&session);
-                    return already_running_response(&session_id, sync_info);
-                }
-            };
+            let (cancel_token, run_id) =
+                match reserve_runner(state.get_ref(), &session_id, &session_tx).await
+                {
+                    RunnerReservation::Started(token, rid) => (token, rid),
+                    RunnerReservation::AlreadyRunning(rid) => {
+                        let sync_info = build_sync_info_from_session(&session);
+                        return already_running_response(&session_id, sync_info, Some(rid));
+                    }
+                };
 
             // ---- Save session before spawn ----
             if let Err(error) = state.storage.save_session(&session).await {
@@ -206,14 +207,14 @@ pub async fn handler(
                 image_fallback,
             });
 
-            started_response(&session_id, sync_info)
+            started_response(&session_id, sync_info, run_id)
         }
 
         crate::session_app::types::ExecutePreparationOutcome::AlreadyRunning {
             server_snapshot,
         } => {
             let sync_info = server_snapshot_to_sync_info(&server_snapshot, None);
-            already_running_response(&session_id, sync_info)
+            already_running_response(&session_id, sync_info, None)
         }
 
         crate::session_app::types::ExecutePreparationOutcome::NoPendingMessage {

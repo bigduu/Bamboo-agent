@@ -10,7 +10,7 @@ use bamboo_agent_core::{AgentEvent, Message, Role, Session};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_engine::execution::{
     create_event_forwarder, finalize_runner, get_or_create_event_sender, try_reserve_runner,
-    AgentRunner,
+    AgentRunner, RunnerReservation,
 };
 use bamboo_engine::ExecuteRequest;
 
@@ -297,7 +297,8 @@ async fn run_schedule_job(
     let run_id_for_log = job.run_id.clone();
 
     // Insert runner status (for cancellation/status introspection).
-    let Some(cancel_token) = try_reserve_runner(&ctx.agent_runners, &session_id, &session_tx).await
+    let Some(RunnerReservation { cancel_token, .. }) =
+        try_reserve_runner(&ctx.agent_runners, &session_id, &session_tx).await
     else {
         return Ok(ScheduleRunLifecycleResult::Terminal(
             ScheduleRunStatus::Skipped,

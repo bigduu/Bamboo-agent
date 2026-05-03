@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::execute::{consume_pending_conclusion_with_options_resume, has_pending_user_message};
 use super::types::{ResumeConfigSnapshot, ResumeOutcome};
+use bamboo_engine::execution::runner_lifecycle::RunnerReservation;
 
 // ---------------------------------------------------------------------------
 // Port trait
@@ -36,7 +37,7 @@ pub trait ResumeExecutionPort: Send + Sync {
         &self,
         session_id: &str,
         event_sender: &broadcast::Sender<AgentEvent>,
-    ) -> Option<CancellationToken>;
+    ) -> Option<RunnerReservation>;
 
     /// Get or create the long-lived broadcast sender for session events.
     async fn get_or_create_event_sender(&self, session_id: &str) -> broadcast::Sender<AgentEvent>;
@@ -60,6 +61,7 @@ pub struct ResumeSpawnRequest {
     pub session_id: String,
     pub session: Session,
     pub cancel_token: CancellationToken,
+    pub run_id: String,
     pub event_sender: broadcast::Sender<AgentEvent>,
     pub config: ResumeConfigSnapshot,
 }
@@ -91,7 +93,7 @@ pub async fn resume_session_execution(
 
     // Reserve runner slot.
     let event_sender = port.get_or_create_event_sender(session_id).await;
-    let Some(cancel_token) = port.try_reserve_runner(session_id, &event_sender).await else {
+    let Some(reservation) = port.try_reserve_runner(session_id, &event_sender).await else {
         return ResumeOutcome::AlreadyRunning;
     };
 
@@ -101,7 +103,8 @@ pub async fn resume_session_execution(
     port.spawn_resume_execution(ResumeSpawnRequest {
         session_id: session_id.to_string(),
         session,
-        cancel_token,
+        cancel_token: reservation.cancel_token,
+        run_id: reservation.run_id,
         event_sender,
         config,
     })
