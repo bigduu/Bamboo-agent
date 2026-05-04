@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::{Duration as ChronoDuration, Utc};
+
 use async_trait::async_trait;
 use futures::stream;
 use tokio::sync::{broadcast, Notify, RwLock};
@@ -382,6 +384,9 @@ async fn schedule_tasks_crud_and_list_sessions() {
     store.save_session(&caller).await.unwrap();
 
     // Create schedule.
+    let now = Utc::now();
+    let start_at = (now - ChronoDuration::days(1)).to_rfc3339();
+    let end_at = (now + ChronoDuration::days(30)).to_rfc3339();
     let created = tool
         .execute_with_context(
             serde_json::json!({
@@ -389,8 +394,8 @@ async fn schedule_tasks_crud_and_list_sessions() {
                 "name": "My Schedule",
                 "trigger": {"type": "daily", "hour": 9, "minute": 30},
                 "timezone": "Asia/Shanghai",
-                "start_at": "2026-04-05T00:00:00Z",
-                "end_at": "2026-05-05T00:00:00Z",
+                "start_at": start_at,
+                "end_at": end_at,
                 "misfire_policy": { "type": "catch_up_window", "max_catch_up_runs": 2, "max_lateness_seconds": 1800 },
                 "overlap_policy": "skip",
                 "enabled": false,

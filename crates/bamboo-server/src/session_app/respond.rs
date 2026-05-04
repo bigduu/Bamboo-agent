@@ -108,40 +108,36 @@ fn apply_plan_mode_transition(
     user_response: &str,
 ) {
     match pending.tool_name.as_str() {
-        "EnterPlanMode" => {
-            if user_response.to_lowercase().contains("enter plan mode") {
-                let pre_mode = session
-                    .agent_runtime_state
-                    .as_ref()
-                    .and_then(|s| s.plan_mode.as_ref())
-                    .map(|p| p.pre_permission_mode.clone())
-                    .unwrap_or_else(|| "default".to_string());
+        "EnterPlanMode" if user_response.to_lowercase().contains("enter plan mode") => {
+            let pre_mode = session
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|s| s.plan_mode.as_ref())
+                .map(|p| p.pre_permission_mode.clone())
+                .unwrap_or_else(|| "default".to_string());
 
-                let runtime_state = session.agent_runtime_state.get_or_insert_with(|| {
-                    AgentRuntimeState::new(uuid::Uuid::new_v4().to_string())
-                });
-                runtime_state.plan_mode = Some(PlanModeState {
-                    entered_at: Utc::now(),
-                    pre_permission_mode: pre_mode,
-                    plan_file_path: None,
-                    status: PlanModeStatus::Exploring,
-                });
-                tracing::info!(
-                    session_id = %session.id,
-                    "Entered plan mode"
-                );
-            }
+            let runtime_state = session
+                .agent_runtime_state
+                .get_or_insert_with(|| AgentRuntimeState::new(uuid::Uuid::new_v4().to_string()));
+            runtime_state.plan_mode = Some(PlanModeState {
+                entered_at: Utc::now(),
+                pre_permission_mode: pre_mode,
+                plan_file_path: None,
+                status: PlanModeStatus::Exploring,
+            });
+            tracing::info!(
+                session_id = %session.id,
+                "Entered plan mode"
+            );
         }
-        "ExitPlanMode" => {
-            if is_exit_plan_mode_approved(user_response) {
-                if let Some(ref mut runtime_state) = session.agent_runtime_state {
-                    runtime_state.plan_mode = None;
-                }
-                tracing::info!(
-                    session_id = %session.id,
-                    "Exited plan mode"
-                );
+        "ExitPlanMode" if is_exit_plan_mode_approved(user_response) => {
+            if let Some(ref mut runtime_state) = session.agent_runtime_state {
+                runtime_state.plan_mode = None;
             }
+            tracing::info!(
+                session_id = %session.id,
+                "Exited plan mode"
+            );
         }
         _ => {}
     }
