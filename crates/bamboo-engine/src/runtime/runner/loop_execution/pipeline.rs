@@ -72,6 +72,7 @@ fn is_overflow_recoverable(error: &AgentError) -> bool {
 async fn maybe_merge_pending_injected_messages(
     session: &mut Session,
     storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
+    persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
 ) {
     let Some(storage) = storage else { return };
 
@@ -99,12 +100,14 @@ async fn maybe_merge_pending_injected_messages(
         session.metadata.remove("pending_injected_messages");
         session.updated_at = chrono::Utc::now();
 
-        if let Err(error) = storage.save_session(session).await {
-            tracing::warn!(
-                "[{}] Failed to persist pending injected message cleanup: {}",
-                session.id,
-                error
-            );
+        if let Some(persistence) = persistence {
+            if let Err(error) = persistence.save_runtime_session(session).await {
+                tracing::warn!(
+                    "[{}] Failed to persist pending injected message cleanup: {}",
+                    session.id,
+                    error
+                );
+            }
         }
 
         tracing::info!(
@@ -456,7 +459,7 @@ pub(super) async fn run_pipeline(
             .await;
 
         // --- Merge any queued injected messages from send_message ---
-        maybe_merge_pending_injected_messages(session, config.storage.as_ref()).await;
+        maybe_merge_pending_injected_messages(session, config.storage.as_ref(), config.persistence.as_ref()).await;
 
         // --- Cancellation check ---
         if cancel_token.is_cancelled() {
@@ -842,9 +845,20 @@ mod tests {
         }
     }
 
+    struct TestPersistence(Arc<dyn Storage>);
+
+    #[async_trait::async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for TestPersistence {
+        async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            self.0.save_session(session).await
+        }
+    }
+
     #[tokio::test]
     async fn pending_injected_messages_are_merged_once_and_cleared_from_storage() {
         let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            Arc::new(TestPersistence(storage.clone()));
         let mut persisted = Session::new_child("child-merge", "parent", "model", "Child");
         persisted.add_message(Message::system("system"));
         persisted.add_message(Message::user("original task"));
@@ -866,7 +880,7 @@ mod tests {
         let mut running = persisted.clone();
         running.metadata.remove("pending_injected_messages");
 
-        maybe_merge_pending_injected_messages(&mut running, Some(&storage)).await;
+        maybe_merge_pending_injected_messages(&mut running, Some(&storage), Some(&persistence)).await;
 
         assert_eq!(
             running
@@ -884,7 +898,7 @@ mod tests {
         assert!(!saved.metadata.contains_key("pending_injected_messages"));
 
         let count_after_first_merge = running.messages.len();
-        maybe_merge_pending_injected_messages(&mut running, Some(&storage)).await;
+        maybe_merge_pending_injected_messages(&mut running, Some(&storage), Some(&persistence)).await;
         assert_eq!(running.messages.len(), count_after_first_merge);
     }
 

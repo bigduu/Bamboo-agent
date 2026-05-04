@@ -23,7 +23,7 @@ use bamboo_agent_core::{AgentEvent, Session, SessionKind};
 use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, ChildWaitPolicy, WaitingForChildrenState,
 };
-use bamboo_infrastructure::{Config, SessionIndexEntry, SessionStoreV2};
+use bamboo_infrastructure::{Config, LockedSessionStore, SessionIndexEntry, SessionStoreV2};
 
 /// Server-side adapter that bridges domain `ChildSessionPort` to infrastructure.
 ///
@@ -32,6 +32,7 @@ use bamboo_infrastructure::{Config, SessionIndexEntry, SessionStoreV2};
 pub struct ChildSessionAdapter {
     pub(crate) session_store: Arc<SessionStoreV2>,
     pub(crate) storage: Arc<dyn Storage>,
+    pub(crate) persistence: Arc<LockedSessionStore>,
     pub(crate) scheduler: Arc<SpawnScheduler>,
     pub(crate) sessions_cache: Arc<RwLock<HashMap<String, Session>>>,
     pub(crate) agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
@@ -174,9 +175,12 @@ impl ChildSessionAdapter {
         );
         parent.updated_at = Utc::now();
 
-        self.storage.save_session(&parent).await.map_err(|error| {
-            ChildSessionError::Execution(format!("failed to save parent wait state: {error}"))
-        })?;
+        self.persistence
+            .merge_save_runtime(&mut parent)
+            .await
+            .map_err(|error| {
+                ChildSessionError::Execution(format!("failed to save parent wait state: {error}"))
+            })?;
         self.sessions_cache
             .write()
             .await
@@ -257,10 +261,13 @@ impl ChildSessionPort for ChildSessionAdapter {
         Ok(child)
     }
 
-    async fn save_child_session(&self, child: &Session) -> Result<(), ChildSessionError> {
-        self.storage.save_session(child).await.map_err(|error| {
-            ChildSessionError::Execution(format!("failed to save child session: {error}"))
-        })?;
+    async fn save_child_session(&self, child: &mut Session) -> Result<(), ChildSessionError> {
+        self.persistence
+            .merge_save_runtime(child)
+            .await
+            .map_err(|error| {
+                ChildSessionError::Execution(format!("failed to save child session: {error}"))
+            })?;
 
         let mut sessions = self.sessions_cache.write().await;
         sessions.insert(child.id.clone(), child.clone());

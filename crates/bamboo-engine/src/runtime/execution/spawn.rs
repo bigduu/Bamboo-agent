@@ -375,7 +375,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
             "last_run_error".to_string(),
             "No pending message to execute".to_string(),
         );
-        let _ = ctx.agent.storage().save_session(&session).await;
+        let _ = ctx.agent.persistence().save_runtime_session(&mut session).await;
         {
             let mut sessions = ctx.sessions_cache.write().await;
             sessions.insert(job.child_session_id.clone(), session);
@@ -397,7 +397,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
         .metadata
         .insert("last_run_status".to_string(), "running".to_string());
     session.metadata.remove("last_run_error");
-    let _ = ctx.agent.storage().save_session(&session).await;
+    let _ = ctx.agent.persistence().save_runtime_session(&mut session).await;
 
     // Insert runner status.
     let Some(RunnerReservation { cancel_token, .. }) =
@@ -590,7 +590,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
         } else {
             session.metadata.remove("last_run_error");
         }
-        let _ = agent.storage().save_session(&session).await;
+        let _ = agent.persistence().save_runtime_session(&mut session).await;
         {
             let mut sessions = sessions_cache.write().await;
             sessions.insert(session_id_clone.clone(), session);

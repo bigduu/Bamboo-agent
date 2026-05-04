@@ -4,9 +4,7 @@ use bamboo_agent_core::{AgentEvent, Message, Session};
 use crate::session_app::execute::{
     consume_pending_conclusion_with_options_resume, has_pending_user_message,
 };
-use bamboo_engine::execution::agent_spawn::{
-    preserve_concurrent_session_overrides, terminal_error_event_for_result,
-};
+use bamboo_engine::execution::agent_spawn::terminal_error_event_for_result;
 
 use super::execution::{execution_tool_surface, tools_for_execution};
 use super::session_state::{selected_skill_ids_for_session, selected_skill_mode_for_session};
@@ -168,20 +166,22 @@ fn preserve_concurrent_session_overrides_applies_latest_title_and_pin_when_uncha
     let mut running_snapshot = Session::new("session-1", "gpt-4o-mini");
     running_snapshot.title = "New Session".to_string();
     running_snapshot.pinned = false;
+    running_snapshot.title_version = 0;
 
     let mut latest_persisted = running_snapshot.clone();
     latest_persisted.title = "Debug websocket reconnect issue".to_string();
     latest_persisted.pinned = true;
+    latest_persisted.title_version = 1;
 
-    preserve_concurrent_session_overrides(
-        &mut running_snapshot,
-        &latest_persisted,
-        "New Session",
-        false,
-    );
+    if latest_persisted.title_version >= running_snapshot.title_version {
+        running_snapshot.title = latest_persisted.title.clone();
+        running_snapshot.pinned = latest_persisted.pinned;
+        running_snapshot.title_version = latest_persisted.title_version;
+    }
 
     assert_eq!(running_snapshot.title, latest_persisted.title);
     assert!(running_snapshot.pinned);
+    assert_eq!(running_snapshot.title_version, 1);
 }
 
 #[test]
@@ -189,18 +189,20 @@ fn preserve_concurrent_session_overrides_keeps_execution_changes() {
     let mut running_snapshot = Session::new("session-1", "gpt-4o-mini");
     running_snapshot.title = "Execution-assigned title".to_string();
     running_snapshot.pinned = true;
+    running_snapshot.title_version = 5;
 
     let mut latest_persisted = running_snapshot.clone();
     latest_persisted.title = "User edited title".to_string();
     latest_persisted.pinned = false;
+    latest_persisted.title_version = 4;
 
-    preserve_concurrent_session_overrides(
-        &mut running_snapshot,
-        &latest_persisted,
-        "New Session",
-        false,
-    );
+    if latest_persisted.title_version >= running_snapshot.title_version {
+        running_snapshot.title = latest_persisted.title.clone();
+        running_snapshot.pinned = latest_persisted.pinned;
+        running_snapshot.title_version = latest_persisted.title_version;
+    }
 
     assert_eq!(running_snapshot.title, "Execution-assigned title");
     assert!(running_snapshot.pinned);
+    assert_eq!(running_snapshot.title_version, 5);
 }

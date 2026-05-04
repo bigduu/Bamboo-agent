@@ -126,7 +126,7 @@ pub async fn handler(
             reasoning_source,
             is_child_session,
         } => {
-            let session = *session;
+            let mut session = *session;
             // ---- Reserve runner ----
             let session_tx = state.get_session_event_sender(&session_id).await;
             let (cancel_token, run_id) =
@@ -138,8 +138,8 @@ pub async fn handler(
                     }
                 };
 
-            // ---- Save session before spawn ----
-            if let Err(error) = state.storage.save_session(&session).await {
+            // ---- Save session before spawn (metadata-group merge) ----
+            if let Err(error) = state.persistence.merge_save_runtime(&mut session).await {
                 return internal_server_error_response(format!(
                     "Failed to persist session config before execute: {}",
                     error
@@ -148,6 +148,19 @@ pub async fn handler(
             {
                 let mut sessions = state.sessions.write().await;
                 sessions.insert(session_id.clone(), session.clone());
+            }
+
+            // Kick off async auto-title generation for fresh, untitled sessions.
+            if crate::title_gen::is_untitled(&session.title)
+                && session
+                    .messages
+                    .iter()
+                    .any(|m| matches!(m.role, bamboo_agent_core::Role::User))
+            {
+                crate::title_gen::spawn_title_generation(
+                    state.clone().into_inner(),
+                    session_id.clone(),
+                );
             }
 
             let disabled_tools: BTreeSet<String> = disabled_tools_vec.into_iter().collect();

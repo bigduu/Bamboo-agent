@@ -160,7 +160,7 @@ pub trait ChildSessionPort: Send + Sync {
         parent_id: &str,
         child_id: &str,
     ) -> Result<Session, ChildSessionError>;
-    async fn save_child_session(&self, child: &Session) -> Result<(), ChildSessionError>;
+    async fn save_child_session(&self, child: &mut Session) -> Result<(), ChildSessionError>;
     async fn is_child_running(&self, child_id: &str) -> bool;
     async fn list_children(&self, parent_id: &str) -> Vec<ChildSessionEntry>;
     async fn enqueue_child_run(
@@ -465,7 +465,7 @@ pub async fn create_child_action(
     }
 
     let model = child.model.clone();
-    port.save_child_session(&child).await?;
+    port.save_child_session(&mut child).await?;
     if input.auto_run {
         port.enqueue_child_run(&input.parent_session, &child)
             .await?;
@@ -620,7 +620,7 @@ pub async fn update_child_action(
     }
 
     child.updated_at = Utc::now();
-    port.save_child_session(&child).await?;
+    port.save_child_session(&mut child).await?;
 
     Ok(json!({
         "child_session_id": child.id,
@@ -659,7 +659,7 @@ pub async fn run_child_action(
         .insert("last_run_status".to_string(), "pending".to_string());
     child.metadata.remove("last_run_error");
     child.updated_at = Utc::now();
-    port.save_child_session(&child).await?;
+    port.save_child_session(&mut child).await?;
 
     port.enqueue_child_run(parent, &child).await?;
 
@@ -719,7 +719,7 @@ pub async fn send_message_to_child_action(
             "pending_injected_messages".to_string(),
             serde_json::to_string(&pending).unwrap_or_default(),
         );
-        port.save_child_session(&child).await?;
+        port.save_child_session(&mut child).await?;
         return Ok(json!({
             "child_session_id": child.id,
             "status": "message_queued",
@@ -735,7 +735,7 @@ pub async fn send_message_to_child_action(
         .metadata
         .insert("last_run_status".to_string(), "pending".to_string());
     child.metadata.remove("last_run_error");
-    port.save_child_session(&child).await?;
+    port.save_child_session(&mut child).await?;
 
     let should_auto_run = auto_run.unwrap_or(true);
     if should_auto_run {
@@ -772,7 +772,7 @@ pub async fn cancel_child_action(
         "last_run_error".to_string(),
         "Cancelled by parent".to_string(),
     );
-    port.save_child_session(&child).await?;
+    port.save_child_session(&mut child).await?;
     Ok(json!({
         "child_session_id": child_session_id,
         "status": "cancelled",

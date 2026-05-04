@@ -4,6 +4,7 @@ pub mod budget_types;
 pub mod composition;
 pub mod hook_types;
 pub mod message_part;
+pub mod persistence;
 pub mod runtime_state;
 pub mod task;
 pub mod tool_types;
@@ -14,6 +15,7 @@ pub use budget_types::{BudgetStrategy, TokenBudget, TokenBudgetUsage, TokenUsage
 pub use composition::*;
 pub use hook_types::*;
 pub use message_part::{ImageUrlRef, MessagePart};
+pub use persistence::*;
 pub use runtime_state::*;
 pub use task::*;
 pub use tool_types::{FunctionCall, ToolCall};

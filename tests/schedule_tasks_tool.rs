@@ -139,6 +139,7 @@ fn build_manager(
     let ctx = ScheduleContext {
         schedule_store,
         agent: agent.clone(),
+        persistence: Arc::new(bamboo_infrastructure::LockedSessionStore::new(store.clone())),
         tools: Arc::new(NoopTools),
         sessions_cache: Arc::new(RwLock::new(HashMap::new())),
         agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),

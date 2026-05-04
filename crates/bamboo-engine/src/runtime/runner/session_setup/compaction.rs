@@ -15,8 +15,8 @@ pub(crate) async fn compact_oversized_tool_messages(
             session_id,
             compacted_messages
         );
-        if let Some(ref storage) = config.storage {
-            if let Err(error) = storage.save_session(session).await {
+        if let Some(ref persistence) = config.persistence {
+            if let Err(error) = persistence.save_runtime_session(session).await {
                 tracing::warn!(
                     "[{}] Failed to persist compacted tool messages: {}",
                     session_id,

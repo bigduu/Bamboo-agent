@@ -7,7 +7,7 @@ pub mod tools;
 pub mod workspace_state;
 
 // Re-export commonly used types (mirrors current agent/core/mod.rs)
-pub use agent::events::{AgentEvent, TokenUsage};
+pub use agent::events::{AgentEvent, TitleSource, TokenUsage};
 pub use agent::hooks::AgentHook;
 pub use agent::types::{parse_prompt_external_memory_sections, PromptSnapshotExternalMemoryParts};
 pub use agent::types::{

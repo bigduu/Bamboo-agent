@@ -355,8 +355,8 @@ async fn maybe_apply_host_context_compression_with_budget(
         return Ok(false);
     }
 
-    if let Some(storage) = config.storage.as_ref() {
-        if let Err(error) = storage.save_session(session).await {
+    if let Some(persistence) = config.persistence.as_ref() {
+        if let Err(error) = persistence.save_runtime_session(session).await {
             tracing::warn!(
                 "[{}] Failed to persist forced context compression result: {}",
                 session_id,

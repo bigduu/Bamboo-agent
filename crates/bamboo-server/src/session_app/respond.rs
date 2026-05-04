@@ -91,7 +91,7 @@ pub async fn submit_pending_response(
     }
 
     // ---- Save ----
-    repo.save_and_cache(&session).await?;
+    repo.save_and_cache(&mut session).await?;
 
     tracing::info!(
         "[{}] Response processed successfully, agent loop can resume",

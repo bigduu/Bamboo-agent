@@ -109,6 +109,7 @@ pub mod claude_runner;
 pub mod config;
 pub mod config_manager;
 pub mod error;
+pub mod events;
 pub mod external_agents;
 pub mod handlers;
 pub mod logging;
@@ -127,6 +128,7 @@ pub mod services;
 pub mod session_app;
 pub mod spawn_scheduler;
 pub mod subagent_profiles;
+pub mod title_gen;
 pub mod tools;
 pub mod workflow;
 

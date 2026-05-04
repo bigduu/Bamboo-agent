@@ -109,7 +109,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     }
 
     // Re-save to persist image attachments (if any).
-    state.save_and_cache_session(&session).await;
+    state.save_and_cache_session(&mut session).await;
 
     HttpResponse::Created().json(ChatResponse {
         session_id: session_id.clone(),

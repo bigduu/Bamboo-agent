@@ -66,55 +66,57 @@ pub(super) async fn maybe_handle_taskwrite(
 
 async fn persist_task_list(
     config: &AgentLoopConfig,
-    session: &Session,
+    session: &mut Session,
     shared_session_id: &str,
     session_id: &str,
     task_list: &bamboo_domain::TaskList,
 ) {
     if let Some(ref storage) = config.storage {
-        if let Err(error) = storage.save_session(session).await {
-            tracing::warn!(
-                "[{}] Failed to save session after Task update: {}",
-                session_id,
-                error
-            );
-        } else {
-            tracing::debug!("[{}] Session saved after Task update", session_id);
-        }
+        if let Some(ref persistence) = config.persistence {
+            if let Err(error) = persistence.save_runtime_session(session).await {
+                tracing::warn!(
+                    "[{}] Failed to save session after Task update: {}",
+                    session_id,
+                    error
+                );
+            } else {
+                tracing::debug!("[{}] Session saved after Task update", session_id);
+            }
 
-        if shared_session_id != session.id {
-            match storage.load_session(shared_session_id).await {
-                Ok(Some(mut root_session)) => {
-                    root_session.set_task_list(task_list.clone());
-                    if let Err(error) = storage.save_session(&root_session).await {
+            if shared_session_id != session.id {
+                match storage.load_session(shared_session_id).await {
+                    Ok(Some(mut root_session)) => {
+                        root_session.set_task_list(task_list.clone());
+                        if let Err(error) = persistence.save_runtime_session(&mut root_session).await {
+                            tracing::warn!(
+                                "[{}] Failed to save shared root task list on {}: {}",
+                                session_id,
+                                shared_session_id,
+                                error
+                            );
+                        } else {
+                            tracing::debug!(
+                                "[{}] Shared root task list saved on {}",
+                                session_id,
+                                shared_session_id
+                            );
+                        }
+                    }
+                    Ok(None) => {
                         tracing::warn!(
-                            "[{}] Failed to save shared root task list on {}: {}",
-                            session_id,
-                            shared_session_id,
-                            error
-                        );
-                    } else {
-                        tracing::debug!(
-                            "[{}] Shared root task list saved on {}",
+                            "[{}] Root session {} not found while syncing shared task list",
                             session_id,
                             shared_session_id
                         );
                     }
-                }
-                Ok(None) => {
-                    tracing::warn!(
-                        "[{}] Root session {} not found while syncing shared task list",
-                        session_id,
-                        shared_session_id
-                    );
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "[{}] Failed to load root session {} while syncing shared task list: {}",
-                        session_id,
-                        shared_session_id,
-                        error
-                    );
+                    Err(error) => {
+                        tracing::warn!(
+                            "[{}] Failed to load root session {} while syncing shared task list: {}",
+                            session_id,
+                            shared_session_id,
+                            error
+                        );
+                    }
                 }
             }
         }

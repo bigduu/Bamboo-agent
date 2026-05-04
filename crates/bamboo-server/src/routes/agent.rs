@@ -94,6 +94,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 web::patch().to(agent::sessions::patch_session),
             )
             .route(
+                "/sessions/{session_id}/regenerate-title",
+                web::post().to(agent::sessions::regenerate_session_title),
+            )
+            .route(
                 "/sessions/{session_id}/clear",
                 web::post().to(agent::sessions::clear_session),
             )

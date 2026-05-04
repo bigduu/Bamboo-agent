@@ -669,6 +669,9 @@ mod tests {
         let agent_runtime = Arc::new(
             bamboo_engine::Agent::builder()
                 .storage(storage.clone())
+                .persistence(Arc::new(
+                    bamboo_infrastructure::LockedSessionStore::new(storage.clone()),
+                ))
                 .attachment_reader(session_store.clone())
                 .skill_manager(Arc::new(SkillManager::new()))
                 .metrics_collector(metrics_collector)
@@ -701,6 +704,7 @@ mod tests {
         let adapter = Arc::new(ChildSessionAdapter {
             session_store,
             storage: storage.clone(),
+            persistence: Arc::new(bamboo_infrastructure::LockedSessionStore::new(storage.clone())),
             scheduler,
             sessions_cache,
             agent_runners: agent_runners.clone(),

@@ -68,7 +68,7 @@ pub use process::{
     ProcessHandle, ProcessInfo, ProcessRegistrationConfig, ProcessRegistry, ProcessType,
 };
 pub use storage::{CleanupMode, CleanupResult, SessionIndexEntry, SessionStoreV2, SessionsIndex};
-pub use storage::{JsonlStorage, SessionSearchIndex, SessionSearchMatch};
+pub use storage::{merge_save_session, JsonlStorage, LockedSessionStore, SessionSearchIndex, SessionSearchMatch};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use process::process_utils::{

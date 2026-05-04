@@ -4,6 +4,7 @@ pub mod chat;
 pub mod child_session;
 pub mod errors;
 pub mod execute;
+pub mod metadata;
 pub mod provider_model;
 pub mod repository;
 pub mod respond;

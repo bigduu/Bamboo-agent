@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Message, Role, Session, SessionKind};
+use bamboo_infrastructure::LockedSessionStore;
 use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState,
 };
@@ -162,6 +163,7 @@ fn runtime_resume_message(
 #[derive(Clone)]
 pub struct ChildCompletionCoordinator {
     storage: Arc<dyn Storage>,
+    persistence: Arc<bamboo_infrastructure::LockedSessionStore>,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
@@ -176,6 +178,7 @@ impl ChildCompletionCoordinator {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage: Arc<dyn Storage>,
+        persistence: Arc<LockedSessionStore>,
         sessions: Arc<RwLock<HashMap<String, Session>>>,
         agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
         session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
@@ -186,6 +189,7 @@ impl ChildCompletionCoordinator {
     ) -> Self {
         Self {
             storage,
+            persistence,
             sessions,
             agent_runners,
             session_event_senders,
@@ -254,8 +258,8 @@ impl ChildCompletionCoordinator {
         }
     }
 
-    async fn save_and_cache(&self, session: &Session) {
-        if let Err(error) = self.storage.save_session(session).await {
+    async fn save_and_cache(&self, session: &mut Session) {
+        if let Err(error) = self.persistence.merge_save_runtime(session).await {
             tracing::warn!(session_id = %session.id, %error, "failed to persist session");
         }
         self.sessions
@@ -375,7 +379,7 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
 
         parent.updated_at = Utc::now();
         write_runtime_state(&mut parent, &runtime_state);
-        self.save_and_cache(&parent).await;
+        self.save_and_cache(&mut parent).await;
 
         if should_resume {
             self.resume_parent(parent.id.clone()).await;
@@ -396,7 +400,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         }
     }
 
-    async fn save_and_cache_session(&self, session: &Session) {
+    async fn save_and_cache_session(&self, session: &mut Session) {
         self.save_and_cache(session).await;
     }
 

@@ -18,6 +18,7 @@ use bamboo_agent_core::Session;
 use bamboo_engine::McpServerManager;
 use bamboo_engine::SkillManager;
 use bamboo_infrastructure::Config;
+use bamboo_infrastructure::LockedSessionStore;
 use bamboo_infrastructure::SessionStoreV2;
 
 use super::init::PermissionChecker;
@@ -29,6 +30,7 @@ pub(super) fn build_base_tools(
     mcp_manager: Arc<McpServerManager>,
     skill_manager: Arc<SkillManager>,
     storage: Arc<dyn Storage>,
+    persistence: Arc<LockedSessionStore>,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     app_data_dir: PathBuf,
 ) -> Arc<dyn ToolExecutor> {
@@ -67,6 +69,7 @@ pub(super) fn build_base_tools(
         config.clone(),
         sessions.clone(),
         storage.clone(),
+        persistence.clone(),
     ));
     let with_load_skill: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_memory,
@@ -78,6 +81,7 @@ pub(super) fn build_base_tools(
         config,
         sessions,
         storage,
+        persistence,
     ));
     let with_skills: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_load_skill,
@@ -99,6 +103,7 @@ pub(super) fn build_root_tools(
     schedule_manager: Arc<ScheduleManager>,
     session_store: Arc<SessionStoreV2>,
     storage: Arc<dyn Storage>,
+    persistence: Arc<LockedSessionStore>,
     spawn_scheduler: Arc<SpawnScheduler>,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
@@ -116,6 +121,7 @@ pub(super) fn build_root_tools(
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {
         session_store: session_store.clone(),
         storage: storage.clone(),
+        persistence: persistence.clone(),
         scheduler: spawn_scheduler,
         sessions_cache: sessions,
         agent_runners: agent_runners.clone(),

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use bamboo_agent_core::Session;
 
+use bamboo_domain::RuntimeSessionPersistence;
 use crate::runtime::{AgentRuntime, AgentRuntimeBuilder, ExecuteRequest};
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,11 @@ impl Agent {
     pub fn storage(&self) -> &Arc<dyn bamboo_agent_core::storage::Storage> {
         &self.runtime.storage
     }
+
+    /// Access the runtime persistence adapter for non-authoritative saves.
+    pub fn persistence(&self) -> &Arc<dyn RuntimeSessionPersistence> {
+        &self.runtime.persistence
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +77,11 @@ impl AgentBuilder {
 
     pub fn storage(mut self, v: Arc<dyn bamboo_agent_core::storage::Storage>) -> Self {
         self.inner = self.inner.storage(v);
+        self
+    }
+
+    pub fn persistence(mut self, v: Arc<dyn RuntimeSessionPersistence>) -> Self {
+        self.inner = self.inner.persistence(v);
         self
     }
 

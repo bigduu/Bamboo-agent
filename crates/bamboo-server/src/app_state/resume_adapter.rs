@@ -32,7 +32,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
         AppState::load_session(&self.0, session_id).await
     }
 
-    async fn save_and_cache_session(&self, session: &bamboo_agent_core::Session) {
+    async fn save_and_cache_session(&self, session: &mut bamboo_agent_core::Session) {
         AppState::save_and_cache_session(&self.0, session).await;
     }
 

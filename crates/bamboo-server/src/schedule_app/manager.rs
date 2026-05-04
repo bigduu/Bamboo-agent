@@ -13,6 +13,7 @@ use bamboo_engine::execution::{
     AgentRunner, RunnerReservation,
 };
 use bamboo_engine::ExecuteRequest;
+use bamboo_infrastructure::LockedSessionStore;
 
 use super::store::{ClaimedScheduleRun, ScheduleStore};
 use super::trigger_engine::DynTriggerEngine;
@@ -47,6 +48,7 @@ pub struct ResolvedRunConfig {
 pub struct ScheduleContext {
     pub schedule_store: Arc<ScheduleStore>,
     pub agent: Arc<bamboo_engine::Agent>,
+    pub persistence: Arc<LockedSessionStore>,
     pub tools: Arc<dyn ToolExecutor>,
     pub sessions_cache: Arc<RwLock<HashMap<String, Session>>>,
     pub agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
@@ -229,9 +231,8 @@ async fn run_schedule_job(
     let session_id = session.id.clone();
 
     // Persist session and index entry.
-    ctx.agent
-        .storage()
-        .save_session(&session)
+    ctx.persistence
+        .merge_save_runtime(&mut session)
         .await
         .map_err(|e| format!("failed to save scheduled session: {e}"))?;
     if let Err(error) = ctx
@@ -288,7 +289,7 @@ async fn run_schedule_job(
     if resolved.model.trim().is_empty() {
         let msg = "resolved model is empty".to_string();
         session.add_message(Message::assistant(format!("❌ {msg}"), None));
-        let _ = ctx.agent.storage().save_session(&session).await;
+        let _ = ctx.persistence.merge_save_runtime(&mut session).await;
         return Err(msg);
     }
 
@@ -315,7 +316,7 @@ async fn run_schedule_job(
     let agent_runtime = ctx.agent.clone();
     let tools = ctx.tools.clone();
     let schedule_store = ctx.schedule_store.clone();
-    let storage = ctx.agent.storage().clone();
+    let persistence = ctx.persistence.clone();
     let session_id_clone = session_id.clone();
     let schedule_id_for_state = job.schedule_id.clone();
     let run_id_for_state = job.run_id.clone();
@@ -403,7 +404,7 @@ async fn run_schedule_job(
 
         finalize_runner(&agent_runners_for_status, &session_id_clone, &result).await;
 
-        let _ = storage.save_session(&session).await;
+        let _ = persistence.merge_save_runtime(&mut session).await;
         {
             let mut sessions = sessions_cache.write().await;
             sessions.insert(session_id_clone.clone(), session);

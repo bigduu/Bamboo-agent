@@ -77,8 +77,8 @@ pub async fn activate_discoverable_tools(
     session.updated_at = chrono::Utc::now();
 
     state
-        .storage
-        .save_session(&session)
+        .persistence
+        .merge_save_runtime(&mut session)
         .await
         .map_err(|error| {
             actix_web::error::ErrorInternalServerError(format!("Failed to save session: {error}"))
@@ -124,8 +124,8 @@ pub async fn deactivate_discoverable_tools(
     session.updated_at = chrono::Utc::now();
 
     state
-        .storage
-        .save_session(&session)
+        .persistence
+        .merge_save_runtime(&mut session)
         .await
         .map_err(|error| {
             actix_web::error::ErrorInternalServerError(format!("Failed to save session: {error}"))

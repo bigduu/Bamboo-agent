@@ -29,7 +29,10 @@ pub trait ResumeExecutionPort: Send + Sync {
     async fn load_session(&self, session_id: &str) -> Option<Session>;
 
     /// Persist a session and update any caches.
-    async fn save_and_cache_session(&self, session: &Session);
+    ///
+    /// Implementations may merge concurrent UI edits to title/pinned/title_version
+    /// from disk back into `session` (which is why this takes `&mut`).
+    async fn save_and_cache_session(&self, session: &mut Session);
 
     /// Try to reserve a runner slot for the given session.
     /// Returns `None` if a runner is already active.
@@ -98,7 +101,7 @@ pub async fn resume_session_execution(
     };
 
     consume_pending_conclusion_with_options_resume(&mut session);
-    port.save_and_cache_session(&session).await;
+    port.save_and_cache_session(&mut session).await;
 
     port.spawn_resume_execution(ResumeSpawnRequest {
         session_id: session_id.to_string(),

@@ -87,7 +87,7 @@ use bamboo_engine::SkillManager;
 use bamboo_infrastructure::registry::ProcessRegistry;
 use bamboo_infrastructure::Config;
 use bamboo_infrastructure::SessionStoreV2;
-use bamboo_infrastructure::{LLMError, LLMProvider, LLMStream};
+use bamboo_infrastructure::{LLMError, LLMProvider, LLMStream, LockedSessionStore};
 
 // Context functions moved to bamboo-agent-runtime::context
 pub use bamboo_engine::context::{
@@ -189,6 +189,14 @@ pub struct AppState {
     /// Concrete session store implementation (for index/list/cleanup APIs).
     pub session_store: Arc<SessionStoreV2>,
 
+    /// Per-session write serialisation + metadata-merge persistence layer.
+    ///
+    /// Wraps the same [`Storage`] as `self.storage`, adding per-session
+    /// `Mutex` guards and authoritative-metadata-group merge semantics.
+    /// Use `self.persistence.merge_save_runtime(...)` for any write that
+    /// may race with a UI metadata update.
+    pub persistence: Arc<LockedSessionStore>,
+
     /// Background scheduler for async sub-session spawning.
     pub spawn_scheduler: Arc<SpawnScheduler>,
 
@@ -274,6 +282,25 @@ pub struct AppState {
 
     /// Unified model catalog service (used when features.provider_model_ref is enabled).
     pub model_catalog: Arc<bamboo_infrastructure::ModelCatalogService>,
+
+    /// Tracks session ids whose auto-title generation is currently in flight.
+    ///
+    /// Used by [`crate::title_gen`] to dedupe concurrent invocations
+    /// (e.g. execute handler firing while a regenerate-title request is running).
+    pub title_gen_in_flight: Arc<dashmap::DashSet<String>>,
+}
+
+impl AppState {
+    /// Try to claim the title-generation slot for `session_id`.
+    /// Returns `true` on success, `false` if generation is already in flight.
+    pub fn title_gen_acquire(&self, session_id: &str) -> bool {
+        self.title_gen_in_flight.insert(session_id.to_string())
+    }
+
+    /// Release the title-generation slot for `session_id`. Idempotent.
+    pub fn title_gen_release(&self, session_id: &str) {
+        self.title_gen_in_flight.remove(session_id);
+    }
 }
 
 mod builder;

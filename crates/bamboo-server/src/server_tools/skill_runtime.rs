@@ -19,6 +19,7 @@ use bamboo_infrastructure::Config;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use bamboo_agent_core::Session;
+use bamboo_infrastructure::LockedSessionStore;
 
 const MAX_RESOURCE_CONTENT_CHARS: usize = 50_000;
 
@@ -28,6 +29,7 @@ struct SkillToolAccess {
     config: Arc<RwLock<Config>>,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     storage: Arc<dyn Storage>,
+    persistence: Arc<LockedSessionStore>,
 }
 
 impl SkillToolAccess {
@@ -36,12 +38,14 @@ impl SkillToolAccess {
         config: Arc<RwLock<Config>>,
         sessions: Arc<RwLock<HashMap<String, Session>>>,
         storage: Arc<dyn Storage>,
+        persistence: Arc<LockedSessionStore>,
     ) -> Self {
         Self {
             skill_manager,
             config,
             sessions,
             storage,
+            persistence,
         }
     }
 
@@ -108,8 +112,8 @@ impl SkillSessionPort for SkillToolAccess {
             }
         }
 
-        self.storage
-            .save_session(&session)
+        self.persistence
+            .merge_save_runtime(&mut session)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -150,9 +154,10 @@ impl LoadSkillTool {
         config: Arc<RwLock<Config>>,
         sessions: Arc<RwLock<HashMap<String, Session>>>,
         storage: Arc<dyn Storage>,
+        persistence: Arc<LockedSessionStore>,
     ) -> Self {
         Self {
-            access: SkillToolAccess::new(skill_manager, config, sessions, storage),
+            access: SkillToolAccess::new(skill_manager, config, sessions, storage, persistence),
         }
     }
 }
@@ -267,9 +272,10 @@ impl ReadSkillResourceTool {
         config: Arc<RwLock<Config>>,
         sessions: Arc<RwLock<HashMap<String, Session>>>,
         storage: Arc<dyn Storage>,
+        persistence: Arc<LockedSessionStore>,
     ) -> Self {
         Self {
-            access: SkillToolAccess::new(skill_manager, config, sessions, storage),
+            access: SkillToolAccess::new(skill_manager, config, sessions, storage, persistence),
         }
     }
 }
@@ -411,7 +417,11 @@ impl Tool for ReadSkillResourceTool {
                             LAST_RESOURCE_READ_SUMMARY_METADATA_KEY.to_string(),
                             summary.to_string(),
                         );
-                        let _ = self.access.storage.save_session(&session).await;
+                        let _ = self
+                            .access
+                            .persistence
+                            .merge_save_runtime(&mut session)
+                            .await;
                         let mut sessions = self.access.sessions.write().await;
                         sessions.insert(session_id.to_string(), session);
                     }
@@ -555,7 +565,9 @@ Use this demo skill."#,
             .await
             .expect("session should be saved");
 
-        let tool = LoadSkillTool::new(skill_manager, config, sessions, storage);
+        let persistence = Arc::new(bamboo_infrastructure::LockedSessionStore::new(storage.clone()));
+
+        let tool = LoadSkillTool::new(skill_manager, config, sessions, storage, persistence);
         let ctx = ToolExecutionContext {
             session_id: Some(session_id),
             tool_call_id: "tool-call-1",
@@ -610,8 +622,15 @@ Use this demo skill."#,
             .save_session(&session)
             .await
             .expect("session should be saved");
+        let persistence = Arc::new(bamboo_infrastructure::LockedSessionStore::new(storage.clone()));
 
-        let tool = LoadSkillTool::new(skill_manager, config, sessions.clone(), storage.clone());
+        let tool = LoadSkillTool::new(
+            skill_manager,
+            config,
+            sessions.clone(),
+            storage.clone(),
+            persistence.clone(),
+        );
         let ctx = ToolExecutionContext {
             session_id: Some(session_id),
             tool_call_id: "tool-call-2",
@@ -676,15 +695,22 @@ Use this demo skill."#,
             .save_session(&session)
             .await
             .expect("session should be saved");
+        let persistence = Arc::new(bamboo_infrastructure::LockedSessionStore::new(storage.clone()));
 
         let load_tool = LoadSkillTool::new(
             skill_manager.clone(),
             config.clone(),
             sessions.clone(),
             storage.clone(),
+            persistence.clone(),
         );
-        let read_tool =
-            ReadSkillResourceTool::new(skill_manager, config, sessions, storage.clone());
+        let read_tool = ReadSkillResourceTool::new(
+            skill_manager,
+            config,
+            sessions,
+            storage.clone(),
+            persistence,
+        );
 
         let load_ctx = ToolExecutionContext {
             session_id: Some(session_id),

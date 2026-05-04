@@ -25,6 +25,7 @@ pub fn build_schedule_context(
         agent_runners: base.agent_runners,
         session_event_senders: base.session_event_senders,
         trigger_engine: base.trigger_engine,
+        persistence: base.persistence,
         resolve_run_config: std::sync::Arc::new(move |job: &ScheduleRunJob| {
             resolve_run_config_from_config(job, &config)
         }),

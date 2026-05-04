@@ -51,6 +51,8 @@ pub struct SessionIndexEntry {
     /// Path relative to `bamboo_home_dir` (e.g. "sessions/<id>" or "sessions/<root>/children/<id>").
     pub rel_path: String,
     pub title: String,
+    #[serde(default)]
+    pub title_version: u64,
     pub pinned: bool,
     pub parent_session_id: Option<String>,
     pub root_session_id: String,
@@ -352,6 +354,7 @@ impl SessionStoreV2 {
                     kind: session.kind,
                     rel_path,
                     title: session.title.clone(),
+                    title_version: session.title_version,
                     pinned: session.pinned,
                     parent_session_id: session.parent_session_id.clone(),
                     root_session_id: session.root_session_id.clone(),

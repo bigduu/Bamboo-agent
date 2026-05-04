@@ -124,7 +124,7 @@ pub async fn prepare_chat_turn(
     }
 
     // ---- Save ----
-    repo.save_and_cache(&session).await?;
+    repo.save_and_cache(&mut session).await?;
 
     Ok(session)
 }

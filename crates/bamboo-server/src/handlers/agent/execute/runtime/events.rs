@@ -15,6 +15,8 @@ fn is_critical_event(event: &AgentEvent) -> bool {
             | AgentEvent::TaskListCompleted { .. }
             | AgentEvent::SubSessionStarted { .. }
             | AgentEvent::SubSessionCompleted { .. }
+            | AgentEvent::SessionTitleUpdated { .. }
+            | AgentEvent::SessionPinnedUpdated { .. }
     )
 }
 
@@ -132,6 +134,30 @@ mod tests {
             child_session_id: "child-1".into(),
             status: "completed".into(),
             error: None,
+        };
+        assert!(is_critical_event(&event));
+    }
+
+    #[test]
+    fn critical_event_includes_session_title_updated() {
+        use bamboo_agent_core::TitleSource;
+        use chrono::Utc;
+        let event = AgentEvent::SessionTitleUpdated {
+            session_id: "s".to_string(),
+            title: "t".to_string(),
+            title_version: 1,
+            source: TitleSource::Manual,
+            updated_at: Utc::now(),
+        };
+        assert!(is_critical_event(&event));
+    }
+
+    #[test]
+    fn critical_event_includes_session_pinned_updated() {
+        let event = AgentEvent::SessionPinnedUpdated {
+            session_id: "s".to_string(),
+            pinned: true,
+            updated_at: Utc::now(),
         };
         assert!(is_critical_event(&event));
     }

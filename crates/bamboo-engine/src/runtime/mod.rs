@@ -14,6 +14,7 @@ pub mod task_context;
 pub mod task_evaluation;
 
 pub use agent::{Agent, AgentBuilder};
+pub use bamboo_domain::RuntimeSessionPersistence;
 pub use complexity_classifier::{ComplexityClassifier, TaskComplexity};
 pub use config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 pub use execution::runner_state::{AgentRunner, AgentStatus};

@@ -19,6 +19,7 @@ use bamboo_engine::McpServerManager;
 use bamboo_engine::{SkillManager, SkillStoreConfig};
 use bamboo_infrastructure::Config;
 use bamboo_infrastructure::LLMProvider;
+use bamboo_infrastructure::LockedSessionStore;
 use bamboo_infrastructure::SessionStoreV2;
 
 use crate::error::AppError;
@@ -267,6 +268,7 @@ pub fn build_schedule_manager(
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
+    persistence: Arc<LockedSessionStore>,
     config: Arc<RwLock<Config>>,
 ) -> Arc<ScheduleManager> {
     let base_ctx = ScheduleContext {
@@ -276,6 +278,7 @@ pub fn build_schedule_manager(
         sessions_cache: sessions,
         agent_runners,
         session_event_senders,
+        persistence,
         trigger_engine: crate::schedules::default_trigger_engine(),
         resolve_run_config: Arc::new(|_| unimplemented!("replaced by build_schedule_context")),
     };

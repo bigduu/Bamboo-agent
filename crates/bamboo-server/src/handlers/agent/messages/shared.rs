@@ -43,8 +43,8 @@ pub(super) async fn save_and_cache_session(
 ) -> Result<()> {
     session.updated_at = Utc::now();
     state
-        .storage
-        .save_session(&session)
+        .persistence
+        .merge_save_runtime(&mut session)
         .await
         .map_err(|e| ErrorInternalServerError(format!("Failed to save session: {e}")))?;
 

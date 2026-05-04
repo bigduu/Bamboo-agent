@@ -90,6 +90,7 @@ impl AppState {
     ) -> Result<Self, AppError> {
         let data_dir = bamboo_home_dir.clone();
         let (session_store, storage) = init_storage(&data_dir).await?;
+        let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
 
         // In-memory session cache (shared across handlers and background jobs).
         let sessions: Arc<RwLock<HashMap<String, bamboo_agent_core::Session>>> =
@@ -145,6 +146,7 @@ impl AppState {
             mcp_manager.clone(),
             skill_manager.clone(),
             storage.clone(),
+            persistence.clone(),
             sessions.clone(),
             bamboo_home_dir.clone(),
         );
@@ -185,6 +187,7 @@ impl AppState {
         let agent = Arc::new(
             bamboo_engine::Agent::builder()
                 .storage(storage.clone())
+                .persistence(persistence.clone())
                 .attachment_reader(session_store.clone())
                 .skill_manager(skill_manager.clone())
                 .metrics_collector(metrics_service.collector())
@@ -198,6 +201,7 @@ impl AppState {
         let child_completion_coordinator = Arc::new(
             super::child_completion_coordinator::ChildCompletionCoordinator::new(
                 storage.clone(),
+                persistence.clone(),
                 sessions.clone(),
                 agent_runners.clone(),
                 session_event_senders.clone(),
@@ -233,6 +237,7 @@ impl AppState {
             sessions.clone(),
             agent_runners.clone(),
             session_event_senders.clone(),
+            persistence.clone(),
             config.clone(),
         );
 
@@ -275,6 +280,7 @@ impl AppState {
             schedule_manager.clone(),
             session_store.clone(),
             storage.clone(),
+            persistence.clone(),
             spawn_scheduler.clone(),
             sessions.clone(),
             agent_runners.clone(),
@@ -299,6 +305,7 @@ impl AppState {
             sessions,
             storage,
             session_store,
+            persistence,
             spawn_scheduler,
             child_completion_coordinator,
             schedule_store,
@@ -317,6 +324,7 @@ impl AppState {
             provider_registry,
             provider_router,
             model_catalog,
+            title_gen_in_flight: Arc::new(dashmap::DashSet::new()),
         })
     }
 }

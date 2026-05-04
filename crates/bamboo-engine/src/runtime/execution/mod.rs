@@ -22,8 +22,7 @@ pub mod session_events;
 pub mod spawn;
 
 pub use agent_spawn::{
-    log_base_system_prompt_snapshot, preserve_concurrent_session_overrides,
-    spawn_session_execution, SessionExecutionArgs,
+    log_base_system_prompt_snapshot, spawn_session_execution, SessionExecutionArgs,
 };
 pub use child_completion::{ChildCompletion, ChildCompletionHandler};
 pub use event_forwarder::create_event_forwarder;

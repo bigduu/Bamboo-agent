@@ -66,9 +66,8 @@ pub struct SessionExecutionArgs {
 /// 1. Executes the agent loop via `agent.execute()`
 /// 2. Sends a terminal error event if the execution fails
 /// 3. Finalizes the runner status
-/// 4. Checks for concurrent session overrides (title/pin edits)
-/// 5. Persists the session via storage
-/// 6. Updates the in-memory session cache
+/// 4. Persists the session via merge-save (preserves concurrent UI title/pin edits)
+/// 5. Updates the in-memory session cache
 pub fn spawn_session_execution(args: SessionExecutionArgs) {
     let span_session_id = args.session_id.clone();
     let session_span = tracing::info_span!("agent_execution", session_id = %span_session_id);
@@ -97,8 +96,6 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 runners,
                 sessions_cache,
             } = args;
-            let initial_title = session.title.clone();
-            let initial_pinned = session.pinned;
 
             let initial_message = initial_user_message_for_session(&session);
             let selected_skill_ids =
@@ -154,26 +151,12 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // Update runner status.
             finalize_runner(&runners, &session_id, &result).await;
 
-            // Avoid clobbering concurrent UI edits (title/pin).
-            match agent.storage().load_session(&session_id).await {
-                Ok(Some(latest_persisted)) => preserve_concurrent_session_overrides(
-                    &mut session,
-                    &latest_persisted,
-                    &initial_title,
-                    initial_pinned,
-                ),
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        "[{}] Failed to load latest session before final save: {}",
-                        session_id,
-                        error
-                    );
-                }
-            }
-
-            // Save session.
-            if let Err(error) = agent.storage().save_session(&session).await {
+            // Save session via merge-save so any concurrent UI edits to
+            // title / pinned / title_version are preserved (the runtime is not
+            // an authoritative title writer).
+            if let Err(error) =
+                agent.persistence().save_runtime_session(&mut session).await
+            {
                 tracing::warn!("[{}] Failed to save session: {}", session_id, error);
             }
 
@@ -212,22 +195,6 @@ pub fn log_base_system_prompt_snapshot(session_id: &str, prompt: &str) {
         "[{}] ========== END BASE SYSTEM PROMPT SNAPSHOT ==========",
         session_id
     );
-}
-
-/// Preserve concurrent session overrides (title/pin) made via external edits
-/// while the agent loop was running.
-pub fn preserve_concurrent_session_overrides(
-    session: &mut Session,
-    latest_persisted: &Session,
-    initial_title: &str,
-    initial_pinned: bool,
-) {
-    if session.title == initial_title {
-        session.title = latest_persisted.title.clone();
-    }
-    if session.pinned == initial_pinned {
-        session.pinned = latest_persisted.pinned;
-    }
 }
 
 /// Map an execution result to a terminal error event.

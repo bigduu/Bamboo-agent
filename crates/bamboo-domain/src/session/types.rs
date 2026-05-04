@@ -437,6 +437,14 @@ pub struct Session {
     #[serde(default)]
     pub pinned: bool,
     #[serde(default)]
+    pub title_version: u64,
+    /// Authoritative UI metadata revision. Bumped by every authoritative
+    /// metadata write (title / pinned / future replayable metadata fields).
+    /// Runtime / non-authoritative paths must not bump this; they read it
+    /// to detect when their session struct holds stale UI metadata.
+    #[serde(default)]
+    pub metadata_version: u64,
+    #[serde(default)]
     pub kind: SessionKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
@@ -503,6 +511,8 @@ impl Session {
             id: id.clone(),
             title: "New Session".to_string(),
             pinned: false,
+            title_version: 0,
+            metadata_version: 0,
             kind: SessionKind::Root,
             parent_session_id: None,
             root_session_id: id,
@@ -540,6 +550,8 @@ impl Session {
             id: id.clone(),
             title: title.into(),
             pinned: false,
+            title_version: 0,
+            metadata_version: 0,
             kind: SessionKind::Child,
             parent_session_id: Some(root_session_id.clone()),
             root_session_id,

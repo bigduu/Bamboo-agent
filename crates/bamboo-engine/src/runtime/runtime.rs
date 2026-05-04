@@ -27,6 +27,7 @@ use crate::runtime::hooks::HookRunner;
 use crate::runtime::managers::{
     LifecycleManager, LlmManager, MemoryManager, PromptManager, ToolManager,
 };
+use bamboo_domain::RuntimeSessionPersistence;
 use crate::runtime::runner::run_agent_loop_with_config;
 
 // ---------------------------------------------------------------------------
@@ -40,6 +41,7 @@ use crate::runtime::runner::run_agent_loop_with_config;
 #[derive(Clone)]
 pub struct AgentRuntime {
     pub storage: Arc<dyn Storage>,
+    pub persistence: Arc<dyn RuntimeSessionPersistence>,
     pub attachment_reader: Arc<dyn AttachmentReader>,
     pub skill_manager: Arc<SkillManager>,
     pub metrics_collector: MetricsCollector,
@@ -84,6 +86,7 @@ pub struct AgentRuntime {
 /// ```
 pub struct AgentRuntimeBuilder {
     storage: Option<Arc<dyn Storage>>,
+    persistence: Option<Arc<dyn RuntimeSessionPersistence>>,
     attachment_reader: Option<Arc<dyn AttachmentReader>>,
     skill_manager: Option<Arc<SkillManager>>,
     metrics_collector: Option<MetricsCollector>,
@@ -102,6 +105,7 @@ impl AgentRuntimeBuilder {
     pub fn new() -> Self {
         Self {
             storage: None,
+            persistence: None,
             attachment_reader: None,
             skill_manager: None,
             metrics_collector: None,
@@ -119,6 +123,11 @@ impl AgentRuntimeBuilder {
 
     pub fn storage(mut self, v: Arc<dyn Storage>) -> Self {
         self.storage = Some(v);
+        self
+    }
+
+    pub fn persistence(mut self, v: Arc<dyn RuntimeSessionPersistence>) -> Self {
+        self.persistence = Some(v);
         self
     }
 
@@ -185,6 +194,9 @@ impl AgentRuntimeBuilder {
     pub fn build(self) -> Result<AgentRuntime, &'static str> {
         Ok(AgentRuntime {
             storage: self.storage.ok_or_else(|| format_missing("storage"))?,
+            persistence: self
+                .persistence
+                .ok_or_else(|| format_missing("persistence"))?,
             attachment_reader: self
                 .attachment_reader
                 .ok_or_else(|| format_missing("attachment_reader"))?,
@@ -214,6 +226,7 @@ fn format_missing(field: &str) -> &'static str {
     // This is good enough for a builder that only runs at startup.
     match field {
         "storage" => "AgentRuntimeBuilder: missing storage",
+        "persistence" => "AgentRuntimeBuilder: missing persistence",
         "attachment_reader" => "AgentRuntimeBuilder: missing attachment_reader",
         "skill_manager" => "AgentRuntimeBuilder: missing skill_manager",
         "metrics_collector" => "AgentRuntimeBuilder: missing metrics_collector",
@@ -329,6 +342,7 @@ impl AgentRuntime {
             skill_manager: Some(self.skill_manager.clone()),
             skip_initial_user_message: true,
             storage: Some(self.storage.clone()),
+            persistence: Some(self.persistence.clone()),
             attachment_reader: Some(self.attachment_reader.clone()),
             metrics_collector: Some(self.metrics_collector.clone()),
             model_name: model,

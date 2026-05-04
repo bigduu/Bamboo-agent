@@ -37,17 +37,17 @@ impl crate::session_app::repository::SessionAccess for AppState {
 
     async fn save_session(
         &self,
-        session: &bamboo_agent_core::Session,
+        session: &mut bamboo_agent_core::Session,
     ) -> Result<(), crate::session_app::errors::SessionSaveError> {
-        self.storage
-            .save_session(session)
+        self.persistence
+            .merge_save_runtime(session)
             .await
             .map_err(|e| crate::session_app::errors::SessionSaveError::StorageError(e.to_string()))
     }
 
     async fn save_and_cache(
         &self,
-        session: &bamboo_agent_core::Session,
+        session: &mut bamboo_agent_core::Session,
     ) -> Result<(), crate::session_app::errors::SessionSaveError> {
         AppState::save_and_cache_session(self, session).await;
         Ok(())
@@ -142,8 +142,12 @@ impl AppState {
     }
 
     /// Persist session to storage and update the in-memory cache.
-    pub async fn save_and_cache_session(&self, session: &bamboo_agent_core::Session) {
-        if let Err(error) = self.storage.save_session(session).await {
+    ///
+    /// Uses [`bamboo_infrastructure::LockedSessionStore::merge_save_runtime`]
+    /// so concurrent UI edits to the authoritative metadata group are preserved.
+    /// The in-memory cache is updated with the merged session (post-merge fields).
+    pub async fn save_and_cache_session(&self, session: &mut bamboo_agent_core::Session) {
+        if let Err(error) = self.persistence.merge_save_runtime(session).await {
             tracing::warn!("[{}] Failed to save session: {}", session.id, error);
         }
         let mut sessions = self.sessions.write().await;
@@ -275,7 +279,7 @@ mod tests {
         let mut session = bamboo_agent_core::Session::new(session_id.to_string(), "test-model");
         session.title = "test-title".to_string();
 
-        state.save_and_cache_session(&session).await;
+        state.save_and_cache_session(&mut session).await;
 
         // Verify memory cache.
         let cached = {

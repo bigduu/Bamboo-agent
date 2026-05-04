@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::metrics::MetricsCollector;
+use bamboo_domain::RuntimeSessionPersistence;
 use crate::skills::SkillManager;
 use bamboo_agent_core::composition::CompositionExecutor;
 use bamboo_agent_core::storage::AttachmentReader;
@@ -85,6 +86,9 @@ pub struct AgentLoopConfig {
     pub skip_initial_user_message: bool,
     /// Optional storage for persisting session changes
     pub storage: Option<Arc<dyn Storage>>,
+    /// Optional runtime persistence for non-authoritative session saves.
+    /// When set, engine save sites use this instead of `storage` for writes.
+    pub persistence: Option<Arc<dyn RuntimeSessionPersistence>>,
     /// Optional attachment reader for resolving `bamboo-attachment://...` references
     /// into `data:` URLs for upstream providers. This must not mutate session storage.
     pub attachment_reader: Option<Arc<dyn AttachmentReader>>,
@@ -173,6 +177,7 @@ impl Default for AgentLoopConfig {
             skill_manager: None,
             skip_initial_user_message: false,
             storage: None,
+            persistence: None,
             attachment_reader: None,
             metrics_collector: None,
             model_name: None,

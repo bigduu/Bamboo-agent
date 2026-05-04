@@ -23,8 +23,9 @@ pub(super) async fn maybe_cache_ocr_results(
         let changed =
             ensure_session_image_ocr_cached(session, config.attachment_reader.as_deref()).await;
         if changed {
-            if let Some(ref storage) = config.storage {
-                if let Err(error) = storage.save_session(session).await {
+            if let Some(ref persistence) = config.persistence {
+                if let Err(error) = persistence.save_runtime_session(session).await
+                {
                     tracing::warn!(
                         "[{}] Failed to save session after OCR caching: {}",
                         session_id,
