@@ -9,8 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::Utc;
-use tokio::sync::{broadcast, RwLock};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Message, Role, Session, SessionKind};
@@ -23,6 +21,8 @@ use bamboo_engine::execution::{
 };
 use bamboo_engine::Agent;
 use bamboo_infrastructure::{Config, ProviderModelRouter, ProviderRegistry};
+use chrono::Utc;
+use tokio::sync::{broadcast, RwLock};
 
 use crate::model_config_helper::resolve_background_model;
 use crate::session_app::provider_model::session_effective_model_ref;

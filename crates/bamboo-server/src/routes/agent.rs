@@ -59,7 +59,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 web::delete().to(agent::prompt_presets::delete_prompt_preset),
             )
             // Session index / management (V2)
-            .route("/runs/active", web::get().to(agent::sessions::running_sessions_snapshot))
+            .route(
+                "/runs/active",
+                web::get().to(agent::sessions::running_sessions_snapshot),
+            )
             .route("/sessions", web::get().to(agent::sessions::list_sessions))
             .route("/sessions", web::post().to(agent::sessions::create_session))
             .route(

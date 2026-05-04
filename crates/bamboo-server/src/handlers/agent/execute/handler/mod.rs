@@ -130,8 +130,7 @@ pub async fn handler(
             // ---- Reserve runner ----
             let session_tx = state.get_session_event_sender(&session_id).await;
             let (cancel_token, run_id) =
-                match reserve_runner(state.get_ref(), &session_id, &session_tx).await
-                {
+                match reserve_runner(state.get_ref(), &session_id, &session_tx).await {
                     RunnerReservation::Started(token, rid) => (token, rid),
                     RunnerReservation::AlreadyRunning(rid) => {
                         let sync_info = build_sync_info_from_session(&session);

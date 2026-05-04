@@ -967,10 +967,8 @@ mod tests {
         session.messages.last_mut().unwrap().id = "visible-user".to_string();
         session.messages.push(Message::assistant("hello", None));
         session.messages.last_mut().unwrap().id = "visible-assistant".to_string();
-        let mut hidden = make_user_with_metadata(
-            "runtime",
-            serde_json::json!({ "hidden_from_ui": true }),
-        );
+        let mut hidden =
+            make_user_with_metadata("runtime", serde_json::json!({ "hidden_from_ui": true }));
         hidden.id = "hidden-tail".to_string();
         session.messages.push(hidden);
 
@@ -992,10 +990,8 @@ mod tests {
         session.messages.last_mut().unwrap().id = "msg-1".to_string();
         session.messages.push(Message::assistant("hello", None));
         session.messages.last_mut().unwrap().id = "msg-2".to_string();
-        let mut hidden = make_user_with_metadata(
-            "runtime",
-            serde_json::json!({ "hidden_from_ui": true }),
-        );
+        let mut hidden =
+            make_user_with_metadata("runtime", serde_json::json!({ "hidden_from_ui": true }));
         hidden.id = "msg-3".to_string();
         session.messages.push(hidden);
 
@@ -1022,10 +1018,8 @@ mod tests {
         let mut visible_user = Message::user("hello");
         visible_user.id = "v-1".to_string();
         session.messages.push(visible_user);
-        let mut hidden_a = make_user_with_metadata(
-            "runtime",
-            serde_json::json!({ "hidden_from_ui": true }),
-        );
+        let mut hidden_a =
+            make_user_with_metadata("runtime", serde_json::json!({ "hidden_from_ui": true }));
         hidden_a.id = "h-1".to_string();
         session.messages.push(hidden_a);
         let mut visible_assistant = Message::assistant("world", None);

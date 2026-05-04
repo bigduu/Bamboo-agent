@@ -50,15 +50,12 @@ pub async fn get_session(
             let running_child_count = all_entries
                 .iter()
                 .filter(|e| {
-                    e.parent_session_id.as_ref() == Some(&session_id)
-                        && running.contains(&e.id)
+                    e.parent_session_id.as_ref() == Some(&session_id) && running.contains(&e.id)
                 })
                 .count() as u32;
             let mut summary = SessionSummary::from_entry(entry, is_running);
             summary.running_child_count = running_child_count;
-            Ok(HttpResponse::Ok().json(GetSessionResponse {
-                session: summary,
-            }))
+            Ok(HttpResponse::Ok().json(GetSessionResponse { session: summary }))
         }
         None => Ok(HttpResponse::NotFound().json(serde_json::json!({
             "error": "Session not found",

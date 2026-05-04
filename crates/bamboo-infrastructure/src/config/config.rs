@@ -2868,7 +2868,10 @@ mod tests {
         config.features.provider_model_ref = true;
         config.defaults = Some(DefaultsConfig {
             chat: bamboo_domain::ProviderModelRef::new("openai", "gpt-4o"),
-            fast: Some(bamboo_domain::ProviderModelRef::new("anthropic", "claude-3-5-haiku")),
+            fast: Some(bamboo_domain::ProviderModelRef::new(
+                "anthropic",
+                "claude-3-5-haiku",
+            )),
             vision: None,
             memory_background: None,
             planning: None,
@@ -2903,7 +2906,10 @@ mod tests {
         config.features.provider_model_ref = false;
         config.defaults = Some(DefaultsConfig {
             chat: bamboo_domain::ProviderModelRef::new("openai", "gpt-4o"),
-            fast: Some(bamboo_domain::ProviderModelRef::new("anthropic", "claude-3-5-haiku")),
+            fast: Some(bamboo_domain::ProviderModelRef::new(
+                "anthropic",
+                "claude-3-5-haiku",
+            )),
             vision: None,
             memory_background: None,
             planning: None,
@@ -2961,7 +2967,10 @@ mod tests {
         config.features.provider_model_ref = true;
         config.defaults = Some(DefaultsConfig {
             chat: bamboo_domain::ProviderModelRef::new("openai", "gpt-4o"),
-            fast: Some(bamboo_domain::ProviderModelRef::new("openai", "gpt-4o-mini")),
+            fast: Some(bamboo_domain::ProviderModelRef::new(
+                "openai",
+                "gpt-4o-mini",
+            )),
             vision: None,
             memory_background: Some(bamboo_domain::ProviderModelRef::new(
                 "anthropic",
@@ -2987,7 +2996,10 @@ mod tests {
         config.features.provider_model_ref = true;
         config.defaults = Some(DefaultsConfig {
             chat: bamboo_domain::ProviderModelRef::new("openai", "gpt-4o"),
-            fast: Some(bamboo_domain::ProviderModelRef::new("anthropic", "claude-3-5-haiku")),
+            fast: Some(bamboo_domain::ProviderModelRef::new(
+                "anthropic",
+                "claude-3-5-haiku",
+            )),
             vision: None,
             memory_background: None,
             planning: None,
@@ -3022,7 +3034,10 @@ mod tests {
         config.features.provider_model_ref = false;
         config.defaults = Some(DefaultsConfig {
             chat: bamboo_domain::ProviderModelRef::new("openai", "gpt-4o"),
-            fast: Some(bamboo_domain::ProviderModelRef::new("anthropic", "claude-3-5-haiku")),
+            fast: Some(bamboo_domain::ProviderModelRef::new(
+                "anthropic",
+                "claude-3-5-haiku",
+            )),
             vision: None,
             memory_background: Some(bamboo_domain::ProviderModelRef::new(
                 "anthropic",

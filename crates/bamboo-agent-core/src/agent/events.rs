@@ -615,8 +615,7 @@ mod tests {
             "parameters": {"command": "ls -la"}
         });
 
-        let event: AgentEvent =
-            serde_json::from_value(json).expect("should deserialize");
+        let event: AgentEvent = serde_json::from_value(json).expect("should deserialize");
         match event {
             AgentEvent::ToolApprovalRequested {
                 tool_call_id,
@@ -625,10 +624,7 @@ mod tests {
             } => {
                 assert_eq!(tool_call_id, "call-xyz");
                 assert_eq!(tool_name, "Bash");
-                assert_eq!(
-                    parameters,
-                    serde_json::json!({"command": "ls -la"})
-                );
+                assert_eq!(parameters, serde_json::json!({"command": "ls -la"}));
             }
             other => panic!("unexpected event: {other:?}"),
         }

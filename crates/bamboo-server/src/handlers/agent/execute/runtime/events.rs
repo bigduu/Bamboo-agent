@@ -195,7 +195,12 @@ mod tests {
 
         // Send a critical event while there are zero broadcast subscribers.
         mpsc_tx.send(task_list_updated()).await.unwrap();
-        mpsc_tx.send(AgentEvent::Token { content: "hi".into() }).await.unwrap();
+        mpsc_tx
+            .send(AgentEvent::Token {
+                content: "hi".into(),
+            })
+            .await
+            .unwrap();
 
         // Give the forwarder task a chance to process.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -213,7 +218,10 @@ mod tests {
             "should have cached exactly one critical event"
         );
         assert!(
-            matches!(runner.last_critical_events[0], AgentEvent::TaskListUpdated { .. }),
+            matches!(
+                runner.last_critical_events[0],
+                AgentEvent::TaskListUpdated { .. }
+            ),
             "cached event should be TaskListUpdated"
         );
     }
@@ -242,16 +250,16 @@ mod tests {
         let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
         let (session_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
 
-        spawn_event_forwarder(
-            state.clone(),
-            session_id.to_string(),
-            mpsc_rx,
-            session_tx,
-        );
+        spawn_event_forwarder(state.clone(), session_id.to_string(), mpsc_rx, session_tx);
 
         // Send a critical event, then a non-critical event, then another critical event.
         mpsc_tx.send(task_list_updated()).await.unwrap();
-        mpsc_tx.send(AgentEvent::Token { content: "thinking".into() }).await.unwrap();
+        mpsc_tx
+            .send(AgentEvent::Token {
+                content: "thinking".into(),
+            })
+            .await
+            .unwrap();
         mpsc_tx.send(sub_session_started()).await.unwrap();
 
         // Drop sender to terminate forwarder.
@@ -262,8 +270,14 @@ mod tests {
         let runners = state.agent_runners.read().await;
         let runner = runners.get(session_id).expect("runner should exist");
         assert_eq!(runner.last_critical_events.len(), 2);
-        assert!(matches!(runner.last_critical_events[0], AgentEvent::TaskListUpdated { .. }));
-        assert!(matches!(runner.last_critical_events[1], AgentEvent::SubSessionStarted { .. }));
+        assert!(matches!(
+            runner.last_critical_events[0],
+            AgentEvent::TaskListUpdated { .. }
+        ));
+        assert!(matches!(
+            runner.last_critical_events[1],
+            AgentEvent::SubSessionStarted { .. }
+        ));
     }
 
     #[tokio::test]
@@ -300,7 +314,12 @@ mod tests {
         );
 
         // Send events with no subscriber.
-        mpsc_tx.send(AgentEvent::Token { content: "before-sub".into() }).await.unwrap();
+        mpsc_tx
+            .send(AgentEvent::Token {
+                content: "before-sub".into(),
+            })
+            .await
+            .unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
@@ -308,16 +327,18 @@ mod tests {
         let mut late_rx = session_tx.subscribe();
 
         // Send more events.
-        mpsc_tx.send(AgentEvent::Token { content: "after-sub".into() }).await.unwrap();
+        mpsc_tx
+            .send(AgentEvent::Token {
+                content: "after-sub".into(),
+            })
+            .await
+            .unwrap();
 
         // Late subscriber should receive the event sent after subscription.
-        let received = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            late_rx.recv(),
-        )
-        .await
-        .expect("should receive event before timeout")
-        .expect("should not get channel closed");
+        let received = tokio::time::timeout(std::time::Duration::from_millis(200), late_rx.recv())
+            .await
+            .expect("should receive event before timeout")
+            .expect("should not get channel closed");
 
         match received {
             AgentEvent::Token { content } => assert_eq!(content, "after-sub"),
