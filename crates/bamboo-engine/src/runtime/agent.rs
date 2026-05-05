@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use bamboo_agent_core::Session;
 
-use bamboo_domain::RuntimeSessionPersistence;
 use crate::runtime::{AgentRuntime, AgentRuntimeBuilder, ExecuteRequest};
+use bamboo_domain::RuntimeSessionPersistence;
 
 // ---------------------------------------------------------------------------
 // Agent — stable public object

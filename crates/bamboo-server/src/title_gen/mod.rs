@@ -165,7 +165,10 @@ async fn run_title_generation(
 /// Extract the first user message's text, preferring `Text` parts when
 /// `content_parts` is set. Truncates to `MAX_USER_TEXT_FOR_TITLE` characters.
 fn first_user_text(session: &Session) -> Option<String> {
-    let msg = session.messages.iter().find(|m| matches!(m.role, Role::User))?;
+    let msg = session
+        .messages
+        .iter()
+        .find(|m| matches!(m.role, Role::User))?;
     let raw = if let Some(parts) = msg.content_parts.as_ref() {
         let joined: String = parts
             .iter()

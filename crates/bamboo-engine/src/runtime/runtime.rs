@@ -27,8 +27,8 @@ use crate::runtime::hooks::HookRunner;
 use crate::runtime::managers::{
     LifecycleManager, LlmManager, MemoryManager, PromptManager, ToolManager,
 };
-use bamboo_domain::RuntimeSessionPersistence;
 use crate::runtime::runner::run_agent_loop_with_config;
+use bamboo_domain::RuntimeSessionPersistence;
 
 // ---------------------------------------------------------------------------
 // AgentRuntime — shared resources (assembled once)

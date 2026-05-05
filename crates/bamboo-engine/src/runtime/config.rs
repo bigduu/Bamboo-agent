@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::metrics::MetricsCollector;
-use bamboo_domain::RuntimeSessionPersistence;
 use crate::skills::SkillManager;
 use bamboo_agent_core::composition::CompositionExecutor;
 use bamboo_agent_core::storage::AttachmentReader;
@@ -10,6 +9,7 @@ use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_compression::TokenBudget;
 use bamboo_domain::ReasoningEffort;
+use bamboo_domain::RuntimeSessionPersistence;
 use bamboo_infrastructure::config::PermissionMode;
 use bamboo_infrastructure::LLMProvider;
 use bamboo_infrastructure::MemoryConfig;

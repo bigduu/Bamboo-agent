@@ -12,7 +12,6 @@ use async_trait::async_trait;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Message, Role, Session, SessionKind};
-use bamboo_infrastructure::LockedSessionStore;
 use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState,
 };
@@ -21,6 +20,7 @@ use bamboo_engine::execution::{
     ChildCompletion, ChildCompletionHandler, RunnerReservation, SessionExecutionArgs,
 };
 use bamboo_engine::Agent;
+use bamboo_infrastructure::LockedSessionStore;
 use bamboo_infrastructure::{Config, ProviderModelRouter, ProviderRegistry};
 use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};

@@ -11,10 +11,7 @@ const MAX_FALLBACK_LEN: usize = 60;
 pub fn heuristic_title(first_user_text: &str) -> String {
     let cleaned = strip_code_fences(first_user_text);
     let collapsed: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    let first_sentence = collapsed
-        .split(['.', '!', '?', '\n'])
-        .next()
-        .unwrap_or("");
+    let first_sentence = collapsed.split(['.', '!', '?', '\n']).next().unwrap_or("");
     let limit = first_sentence
         .char_indices()
         .nth(MAX_FALLBACK_LEN)

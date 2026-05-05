@@ -565,7 +565,9 @@ Use this demo skill."#,
             .await
             .expect("session should be saved");
 
-        let persistence = Arc::new(bamboo_infrastructure::LockedSessionStore::new(storage.clone()));
+        let persistence = Arc::new(bamboo_infrastructure::LockedSessionStore::new(
+            storage.clone(),
+        ));
 
         let tool = LoadSkillTool::new(skill_manager, config, sessions, storage, persistence);
         let ctx = ToolExecutionContext {
@@ -622,7 +624,9 @@ Use this demo skill."#,
             .save_session(&session)
             .await
             .expect("session should be saved");
-        let persistence = Arc::new(bamboo_infrastructure::LockedSessionStore::new(storage.clone()));
+        let persistence = Arc::new(bamboo_infrastructure::LockedSessionStore::new(
+            storage.clone(),
+        ));
 
         let tool = LoadSkillTool::new(
             skill_manager,
@@ -695,7 +699,9 @@ Use this demo skill."#,
             .save_session(&session)
             .await
             .expect("session should be saved");
-        let persistence = Arc::new(bamboo_infrastructure::LockedSessionStore::new(storage.clone()));
+        let persistence = Arc::new(bamboo_infrastructure::LockedSessionStore::new(
+            storage.clone(),
+        ));
 
         let load_tool = LoadSkillTool::new(
             skill_manager.clone(),

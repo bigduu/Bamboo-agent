@@ -7,7 +7,10 @@ fn terminal_event_for_cancelled_maps_to_cancelled_event() {
     let event = terminal_event_for_status(Some(AgentStatus::Cancelled));
     match event {
         AgentEvent::Cancelled { message } => {
-            assert_eq!(message.as_deref(), Some("Agent execution cancelled by user"));
+            assert_eq!(
+                message.as_deref(),
+                Some("Agent execution cancelled by user")
+            );
         }
         other => panic!("expected cancelled event, got {other:?}"),
     }

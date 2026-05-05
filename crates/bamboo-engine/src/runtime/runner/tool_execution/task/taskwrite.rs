@@ -87,7 +87,9 @@ async fn persist_task_list(
                 match storage.load_session(shared_session_id).await {
                     Ok(Some(mut root_session)) => {
                         root_session.set_task_list(task_list.clone());
-                        if let Err(error) = persistence.save_runtime_session(&mut root_session).await {
+                        if let Err(error) =
+                            persistence.save_runtime_session(&mut root_session).await
+                        {
                             tracing::warn!(
                                 "[{}] Failed to save shared root task list on {}: {}",
                                 session_id,

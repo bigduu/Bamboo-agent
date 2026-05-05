@@ -296,11 +296,8 @@ mod tests {
         assert_eq!(persisted.title_version, 0);
         assert_eq!(persisted.metadata_version, 0); // unchanged
 
-        let event_or_timeout = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            subscriber.recv(),
-        )
-        .await;
+        let event_or_timeout =
+            tokio::time::timeout(std::time::Duration::from_millis(50), subscriber.recv()).await;
         assert!(event_or_timeout.is_err(), "no event should be broadcast");
     }
 
@@ -407,9 +404,7 @@ mod tests {
             .expect("not closed");
         match event {
             AgentEvent::SessionPinnedUpdated {
-                session_id,
-                pinned,
-                ..
+                session_id, pinned, ..
             } => {
                 assert_eq!(session_id, "s1");
                 assert!(pinned);
@@ -476,16 +471,14 @@ mod tests {
         assert_eq!(persisted.title_version, 2);
         assert_eq!(persisted.metadata_version, 2);
 
-        let event1 =
-            tokio::time::timeout(std::time::Duration::from_millis(200), subscriber.recv())
-                .await
-                .expect("event1")
-                .expect("not closed");
-        let event2 =
-            tokio::time::timeout(std::time::Duration::from_millis(200), subscriber.recv())
-                .await
-                .expect("event2")
-                .expect("not closed");
+        let event1 = tokio::time::timeout(std::time::Duration::from_millis(200), subscriber.recv())
+            .await
+            .expect("event1")
+            .expect("not closed");
+        let event2 = tokio::time::timeout(std::time::Duration::from_millis(200), subscriber.recv())
+            .await
+            .expect("event2")
+            .expect("not closed");
 
         let versions: Vec<u64> = vec![
             match &event1 {
@@ -539,19 +532,14 @@ mod tests {
         // outcomes depending on race ordering. Key invariant: the two
         // operations completed without error.
         let persisted = state.storage.load_session("m1").await.unwrap().unwrap();
-        assert!(
-            persisted.title == "Manual Override" || persisted.title == "Auto Generated"
-        );
+        assert!(persisted.title == "Manual Override" || persisted.title == "Auto Generated");
 
         // Drain events — at least the manual event must be emitted.
         let mut saw_manual = false;
         let mut events: Vec<AgentEvent> = Vec::new();
         loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                subscriber.recv(),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_millis(100), subscriber.recv())
+                .await
             {
                 Ok(Ok(e)) => events.push(e),
                 _ => break,

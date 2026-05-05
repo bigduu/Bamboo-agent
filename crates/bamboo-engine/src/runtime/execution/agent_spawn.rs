@@ -154,9 +154,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // Save session via merge-save so any concurrent UI edits to
             // title / pinned / title_version are preserved (the runtime is not
             // an authoritative title writer).
-            if let Err(error) =
-                agent.persistence().save_runtime_session(&mut session).await
-            {
+            if let Err(error) = agent.persistence().save_runtime_session(&mut session).await {
                 tracing::warn!("[{}] Failed to save session: {}", session_id, error);
             }
 

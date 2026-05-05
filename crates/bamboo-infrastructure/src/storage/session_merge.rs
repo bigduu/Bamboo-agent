@@ -199,7 +199,9 @@ mod tests {
         runtime_copy.metadata_version = 0;
         runtime_copy.messages = vec![];
 
-        merge_save_session(&storage, &mut runtime_copy).await.unwrap();
+        merge_save_session(&storage, &mut runtime_copy)
+            .await
+            .unwrap();
 
         let after = storage.load_session(session_id).await.unwrap().unwrap();
         assert_eq!(after.title, "User Set This");
@@ -223,7 +225,9 @@ mod tests {
         runtime_copy.title_version = 1;
         runtime_copy.metadata_version = 0;
 
-        merge_save_session(&storage, &mut runtime_copy).await.unwrap();
+        merge_save_session(&storage, &mut runtime_copy)
+            .await
+            .unwrap();
 
         let after = storage.load_session(session_id).await.unwrap().unwrap();
         assert_eq!(after.title, "User Title v3");
@@ -245,10 +249,15 @@ mod tests {
         runtime_copy.pinned = false;
         runtime_copy.metadata_version = 0;
 
-        merge_save_session(&storage, &mut runtime_copy).await.unwrap();
+        merge_save_session(&storage, &mut runtime_copy)
+            .await
+            .unwrap();
 
         let after = storage.load_session(session_id).await.unwrap().unwrap();
-        assert!(after.pinned, "disk pinned=true should win over runtime false");
+        assert!(
+            after.pinned,
+            "disk pinned=true should win over runtime false"
+        );
         assert_eq!(after.metadata_version, 2);
     }
 
@@ -269,7 +278,9 @@ mod tests {
         authoritative_copy.metadata_version = 4;
         authoritative_copy.pinned = true;
 
-        merge_save_session(&storage, &mut authoritative_copy).await.unwrap();
+        merge_save_session(&storage, &mut authoritative_copy)
+            .await
+            .unwrap();
 
         let after = storage.load_session(session_id).await.unwrap().unwrap();
         assert_eq!(after.title, "New Authoritative");
@@ -311,7 +322,9 @@ mod tests {
             metadata: None,
         }];
 
-        merge_save_session(&storage, &mut runtime_copy).await.unwrap();
+        merge_save_session(&storage, &mut runtime_copy)
+            .await
+            .unwrap();
 
         let after = storage.load_session(session_id).await.unwrap().unwrap();
         assert_eq!(after.title, "Fresh Title");
@@ -341,7 +354,12 @@ mod tests {
 
         let a = tokio::spawn(async move {
             let _guard = store_a.acquire_lock(&sid_a).await;
-            let mut s = store_a.storage().load_session(&sid_a).await.unwrap().unwrap();
+            let mut s = store_a
+                .storage()
+                .load_session(&sid_a)
+                .await
+                .unwrap()
+                .unwrap();
             s.title = "Writer A".to_string();
             s.title_version = s.title_version.saturating_add(1);
             s.metadata_version = s.metadata_version.saturating_add(1);
@@ -355,7 +373,12 @@ mod tests {
 
         let b = tokio::spawn(async move {
             let _guard = store_b.acquire_lock(&sid_b).await;
-            let mut s = store_b.storage().load_session(&sid_b).await.unwrap().unwrap();
+            let mut s = store_b
+                .storage()
+                .load_session(&sid_b)
+                .await
+                .unwrap()
+                .unwrap();
             s.title = "Writer B".to_string();
             s.title_version = s.title_version.saturating_add(1);
             s.metadata_version = s.metadata_version.saturating_add(1);
@@ -365,7 +388,12 @@ mod tests {
         });
 
         let (ver_a, ver_b) = tokio::join!(a, b);
-        let final_s = store.storage().load_session(&session_id).await.unwrap().unwrap();
+        let final_s = store
+            .storage()
+            .load_session(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             ver_a.unwrap() != ver_b.unwrap(),
             "concurrent writers must produce distinct versions"
@@ -386,7 +414,12 @@ mod tests {
 
         store.commit_metadata(&s).await.unwrap();
 
-        let after = store.storage().load_session(session_id).await.unwrap().unwrap();
+        let after = store
+            .storage()
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(after.title, "Committed");
         assert_eq!(after.metadata_version, 1);
         assert_eq!(after.title_version, 2);

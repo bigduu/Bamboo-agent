@@ -125,10 +125,11 @@ mod tests {
         ));
         drop(runners);
 
-        let received = tokio::time::timeout(std::time::Duration::from_millis(100), subscriber.recv())
-            .await
-            .expect("broadcast received before timeout")
-            .expect("broadcast not closed");
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(100), subscriber.recv())
+                .await
+                .expect("broadcast received before timeout")
+                .expect("broadcast not closed");
         assert!(matches!(received, AgentEvent::SessionTitleUpdated { .. }));
     }
 
@@ -156,10 +157,11 @@ mod tests {
         ));
         drop(runners);
 
-        let received = tokio::time::timeout(std::time::Duration::from_millis(100), subscriber.recv())
-            .await
-            .expect("broadcast received")
-            .expect("broadcast not closed");
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(100), subscriber.recv())
+                .await
+                .expect("broadcast received")
+                .expect("broadcast not closed");
         assert!(matches!(
             received,
             AgentEvent::SessionPinnedUpdated { pinned: true, .. }
@@ -182,10 +184,11 @@ mod tests {
         publish_replayable_session_event(&state, session_id, title_event(session_id)).await;
 
         // No runner, so no cache check needed; broadcast must still succeed.
-        let received = tokio::time::timeout(std::time::Duration::from_millis(100), subscriber.recv())
-            .await
-            .expect("broadcast received")
-            .expect("broadcast not closed");
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(100), subscriber.recv())
+                .await
+                .expect("broadcast received")
+                .expect("broadcast not closed");
         assert!(matches!(received, AgentEvent::SessionTitleUpdated { .. }));
 
         // Sanity: no panic, no runner created as a side effect.

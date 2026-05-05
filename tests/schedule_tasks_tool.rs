@@ -109,9 +109,14 @@ fn build_manager(
     let metrics_storage = Arc::new(SqliteMetricsStorage::new(dir.join("metrics.db")));
     let metrics = MetricsCollector::spawn(metrics_storage, 1);
 
+    let persistence = Arc::new(bamboo_infrastructure::LockedSessionStore::new(
+        store.clone(),
+    ));
+
     let agent = AgentBuilder::new()
         .storage(store.clone())
         .attachment_reader(store.clone())
+        .persistence(persistence)
         .skill_manager(Arc::new(SkillManager::new()))
         .metrics_collector(metrics)
         .config(Arc::new(RwLock::new(config.clone())))
@@ -139,7 +144,9 @@ fn build_manager(
     let ctx = ScheduleContext {
         schedule_store,
         agent: agent.clone(),
-        persistence: Arc::new(bamboo_infrastructure::LockedSessionStore::new(store.clone())),
+        persistence: Arc::new(bamboo_infrastructure::LockedSessionStore::new(
+            store.clone(),
+        )),
         tools: Arc::new(NoopTools),
         sessions_cache: Arc::new(RwLock::new(HashMap::new())),
         agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),

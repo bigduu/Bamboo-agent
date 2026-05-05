@@ -459,7 +459,12 @@ pub(super) async fn run_pipeline(
             .await;
 
         // --- Merge any queued injected messages from send_message ---
-        maybe_merge_pending_injected_messages(session, config.storage.as_ref(), config.persistence.as_ref()).await;
+        maybe_merge_pending_injected_messages(
+            session,
+            config.storage.as_ref(),
+            config.persistence.as_ref(),
+        )
+        .await;
 
         // --- Cancellation check ---
         if cancel_token.is_cancelled() {
@@ -880,7 +885,8 @@ mod tests {
         let mut running = persisted.clone();
         running.metadata.remove("pending_injected_messages");
 
-        maybe_merge_pending_injected_messages(&mut running, Some(&storage), Some(&persistence)).await;
+        maybe_merge_pending_injected_messages(&mut running, Some(&storage), Some(&persistence))
+            .await;
 
         assert_eq!(
             running
@@ -898,7 +904,8 @@ mod tests {
         assert!(!saved.metadata.contains_key("pending_injected_messages"));
 
         let count_after_first_merge = running.messages.len();
-        maybe_merge_pending_injected_messages(&mut running, Some(&storage), Some(&persistence)).await;
+        maybe_merge_pending_injected_messages(&mut running, Some(&storage), Some(&persistence))
+            .await;
         assert_eq!(running.messages.len(), count_after_first_merge);
     }
 

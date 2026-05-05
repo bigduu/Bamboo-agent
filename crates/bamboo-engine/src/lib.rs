@@ -13,10 +13,10 @@ pub use bamboo_agent_core::{
 };
 
 // Re-export from runtime
+pub use bamboo_domain::RuntimeSessionPersistence;
 pub use runtime::agent::AgentBuilder;
 pub use runtime::config::AgentLoopConfig;
 pub use runtime::config::{ImageFallbackConfig, ImageFallbackMode};
-pub use bamboo_domain::RuntimeSessionPersistence;
 pub use runtime::execution::runner_state::{AgentRunner, AgentStatus};
 pub use runtime::hooks::HookRunner;
 pub use runtime::managers::{
