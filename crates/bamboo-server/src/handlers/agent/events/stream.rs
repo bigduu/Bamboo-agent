@@ -11,9 +11,10 @@ pub(super) fn terminal_response(
     terminal_event: AgentEvent,
 ) -> HttpResponse {
     HttpResponse::Ok()
-        .append_header((header::CONTENT_TYPE, "text/event-stream"))
-        .append_header((header::CACHE_CONTROL, "no-cache"))
+        .append_header((header::CONTENT_TYPE, "text/event-stream; charset=utf-8"))
+        .append_header((header::CACHE_CONTROL, "no-cache, no-transform"))
         .append_header((header::CONNECTION, "keep-alive"))
+        .append_header(("X-Accel-Buffering", "no"))
         .streaming(async_stream::stream! {
             // Replay cached critical state events first (task list, sub-sessions, …).
             for event in &critical_events_to_replay {
@@ -28,6 +29,7 @@ pub(super) fn terminal_response(
                 let sse_data = format!("data: {}\n\n", event_json);
                 yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
             }
+            yield Ok::<_, actix_web::Error>(web::Bytes::from(done_sse_data()));
         })
 }
 
@@ -37,9 +39,10 @@ pub(super) fn live_stream_response(
     mut receiver: broadcast::Receiver<AgentEvent>,
 ) -> HttpResponse {
     HttpResponse::Ok()
-        .append_header((header::CONTENT_TYPE, "text/event-stream"))
-        .append_header((header::CACHE_CONTROL, "no-cache"))
+        .append_header((header::CONTENT_TYPE, "text/event-stream; charset=utf-8"))
+        .append_header((header::CACHE_CONTROL, "no-cache, no-transform"))
         .append_header((header::CONNECTION, "keep-alive"))
+        .append_header(("X-Accel-Buffering", "no"))
         .streaming(async_stream::stream! {
             // Replay cached critical state events first (task list, sub-sessions, …).
             for event in &critical_events_to_replay {
@@ -61,16 +64,21 @@ pub(super) fn live_stream_response(
             loop {
                 tokio::select! {
                     _ = heartbeat.tick() => {
-                        yield Ok::<_, actix_web::Error>(web::Bytes::from(": heartbeat\n\n"));
+                        yield Ok::<_, actix_web::Error>(web::Bytes::from(keepalive_sse_data()));
                     }
                     recv = receiver.recv() => {
                         match recv {
                             Ok(event) => {
+                                let is_terminal = is_terminal_event(&event);
                                 let Ok(event_json) = serde_json::to_string(&event) else {
                                     continue;
                                 };
                                 let sse_data = format!("data: {}\n\n", event_json);
                                 yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
+                                if is_terminal {
+                                    yield Ok::<_, actix_web::Error>(web::Bytes::from(done_sse_data()));
+                                    break;
+                                }
                             }
                             Err(broadcast::error::RecvError::Lagged(_)) => {
                                 // Best-effort stream; late subscribers can open history.
@@ -92,4 +100,19 @@ fn as_sse_data(event: Option<&AgentEvent>) -> Option<String> {
     serde_json::to_string(event)
         .ok()
         .map(|event_json| format!("data: {}\n\n", event_json))
+}
+
+fn done_sse_data() -> &'static str {
+    "data: [DONE]\n\n"
+}
+
+fn keepalive_sse_data() -> &'static str {
+    "data: [KEEPALIVE]\n\n"
+}
+
+fn is_terminal_event(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::Complete { .. } | AgentEvent::Cancelled { .. } | AgentEvent::Error { .. }
+    )
 }

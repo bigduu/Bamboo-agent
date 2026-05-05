@@ -22,8 +22,8 @@ pub(super) async fn terminal_event_if_ready(
 pub(super) fn terminal_event_for_status(runner_status: Option<AgentStatus>) -> AgentEvent {
     match runner_status {
         Some(AgentStatus::Error(message)) => AgentEvent::Error { message },
-        Some(AgentStatus::Cancelled) => AgentEvent::Error {
-            message: "Agent execution cancelled by user".to_string(),
+        Some(AgentStatus::Cancelled) => AgentEvent::Cancelled {
+            message: Some("Agent execution cancelled by user".to_string()),
         },
         _ => AgentEvent::Complete {
             // We don't persist TokenUsage today; clients can fetch history for results.

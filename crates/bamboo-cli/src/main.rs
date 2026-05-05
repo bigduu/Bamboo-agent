@@ -122,6 +122,9 @@ enum AgentEvent {
     Complete {
         usage: TokenUsage,
     },
+    Cancelled {
+        message: Option<String>,
+    },
     Error {
         message: String,
     },
@@ -348,6 +351,20 @@ async fn stream_message(
                     );
                 }
 
+                if event.data == "[DONE]" {
+                    if debug {
+                        eprintln!("{}", "[DEBUG] Received [DONE] sentinel".dimmed());
+                    }
+                    break;
+                }
+
+                if event.data == "[KEEPALIVE]" {
+                    if debug {
+                        eprintln!("{}", "[DEBUG] Received [KEEPALIVE] sentinel".dimmed());
+                    }
+                    continue;
+                }
+
                 if let Ok(agent_event) = serde_json::from_str::<AgentEvent>(&event.data) {
                     match &agent_event {
                         AgentEvent::Token { content } => {
@@ -435,6 +452,19 @@ async fn stream_message(
                                     usage.total_tokens
                                 )
                                 .dimmed()
+                            );
+                        }
+                        AgentEvent::Cancelled { message } => {
+                            println!();
+                            println!(
+                                "{}",
+                                format!(
+                                    "🛑 Cancelled: {}",
+                                    message
+                                        .as_deref()
+                                        .unwrap_or("Agent execution cancelled by user")
+                                )
+                                .yellow()
                             );
                         }
                         AgentEvent::Error { message } => {

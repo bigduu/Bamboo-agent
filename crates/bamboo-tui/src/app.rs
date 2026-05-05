@@ -653,6 +653,10 @@ impl App {
                 self.finalize_streaming();
                 self.chat.token_usage = Some(usage);
             }
+            AgentEvent::Cancelled { message } => {
+                self.status_message = message.unwrap_or_else(|| "Cancelled".to_string());
+                self.finalize_streaming();
+            }
             AgentEvent::Error { message } => {
                 self.status_message = format!("Error: {}", message);
                 self.finalize_streaming();

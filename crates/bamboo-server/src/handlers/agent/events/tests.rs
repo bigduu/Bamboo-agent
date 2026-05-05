@@ -3,13 +3,13 @@ use crate::app_state::AgentStatus;
 use bamboo_agent_core::AgentEvent;
 
 #[test]
-fn terminal_event_for_cancelled_maps_to_error_event() {
+fn terminal_event_for_cancelled_maps_to_cancelled_event() {
     let event = terminal_event_for_status(Some(AgentStatus::Cancelled));
     match event {
-        AgentEvent::Error { message } => {
-            assert_eq!(message, "Agent execution cancelled by user");
+        AgentEvent::Cancelled { message } => {
+            assert_eq!(message.as_deref(), Some("Agent execution cancelled by user"));
         }
-        other => panic!("expected error event, got {other:?}"),
+        other => panic!("expected cancelled event, got {other:?}"),
     }
 }
 

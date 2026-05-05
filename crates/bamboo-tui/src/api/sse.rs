@@ -77,10 +77,15 @@ impl SseStream {
                 continue;
             }
             if let Some(data) = line.strip_prefix("data: ") {
+                if data == "[DONE]" || data == "[KEEPALIVE]" {
+                    return;
+                }
                 if let Ok(event) = serde_json::from_str::<AgentEvent>(data) {
                     let is_terminal = matches!(
                         &event,
-                        AgentEvent::Complete { .. } | AgentEvent::Error { .. }
+                        AgentEvent::Complete { .. }
+                            | AgentEvent::Cancelled { .. }
+                            | AgentEvent::Error { .. }
                     );
                     if tx.send(event).is_err() {
                         return;

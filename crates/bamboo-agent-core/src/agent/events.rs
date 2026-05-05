@@ -15,7 +15,7 @@
 //! 2. **ToolStart/ToolComplete** track tool execution
 //! 3. **TaskListUpdated** tracks progress
 //! 4. **TokenBudgetUpdated** reports context management
-//! 5. **Complete** or **Error** ends the stream
+//! 5. **Complete**, **Cancelled**, or **Error** ends the stream
 //!
 //! # Example
 //!
@@ -79,6 +79,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// ## Terminal Events
 /// - `Complete` - Execution finished successfully
+/// - `Cancelled` - Execution was cancelled by the user
 /// - `Error` - Execution failed
 ///
 /// # Serialization
@@ -87,6 +88,7 @@ use serde::{Deserialize, Serialize};
 /// ```json
 /// {"type": "token", "content": "Hello"}
 /// {"type": "complete", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
+/// {"type": "cancelled", "message": "Agent execution cancelled by user"}
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -413,6 +415,13 @@ pub enum AgentEvent {
         usage: TokenUsage,
     },
 
+    /// Agent execution was cancelled.
+    Cancelled {
+        /// Optional human-readable message explaining the cancellation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+
     /// Agent execution failed.
     Error {
         /// Error message
@@ -472,6 +481,20 @@ mod tests {
         assert_eq!(value["type"], "task_list_updated");
         assert!(value.get("task_list").is_some());
         assert!(value.get("todo_list").is_none());
+    }
+
+    #[test]
+    fn cancelled_serializes_with_snake_case_type() {
+        let event = AgentEvent::Cancelled {
+            message: Some("Agent execution cancelled by user".to_string()),
+        };
+
+        let value = serde_json::to_value(event).expect("event should serialize");
+        assert_eq!(value["type"], "cancelled");
+        assert_eq!(
+            value["message"],
+            serde_json::Value::String("Agent execution cancelled by user".to_string())
+        );
     }
 
     #[test]

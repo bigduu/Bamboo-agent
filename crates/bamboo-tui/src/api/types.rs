@@ -103,6 +103,10 @@ pub enum AgentEvent {
     Complete {
         usage: TokenUsage,
     },
+    Cancelled {
+        #[serde(default)]
+        message: Option<String>,
+    },
     Error {
         message: String,
     },
