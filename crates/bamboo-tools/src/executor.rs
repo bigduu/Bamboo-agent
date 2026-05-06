@@ -565,7 +565,7 @@ mod tests {
             "default::team_agent",
             "default::child_session",
         ] {
-            assert_eq!(normalize_tool_ref(alias), Some("SubSession".to_string()));
+            assert_eq!(normalize_tool_ref(alias), Some("SubAgent".to_string()));
         }
     }
 

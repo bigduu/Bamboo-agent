@@ -535,8 +535,8 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 ),
             ],
         )),
-        "SubSession" => Some(guide(
-            "SubSession",
+        "SubAgent" => Some(guide(
+            "SubAgent",
             ToolCategory::TaskManagement,
             "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. Use action=create to spawn a new child; use list/get to inspect existing children before creating duplicates; use update/run/send_message/cancel/delete to manage existing children.",
             "Do not use proactively for simple one-step tasks; do not spawn children from child sessions; do not create multiple overlapping children with unclear responsibilities.",

@@ -71,11 +71,11 @@ use serde::{Deserialize, Serialize};
 /// - `ContextCompressionStatus` - Context compression lifecycle progress
 /// - `ContextSummarized` - Old messages summarized
 ///
-/// ## Sub-sessions (Async Spawn)
-/// - `SubSessionStarted` - A child session is created and scheduled to run
-/// - `SubSessionEvent` - Forwarded raw child event (full fidelity)
-/// - `SubSessionHeartbeat` - Periodic heartbeat while the child is running
-/// - `SubSessionCompleted` - Child session finished (completed/cancelled/error)
+/// ## Sub-agents (Async Spawn)
+/// - `SubAgentStarted` - A child session is created and scheduled to run
+/// - `SubAgentEvent` - Forwarded raw child event (full fidelity)
+/// - `SubAgentHeartbeat` - Periodic heartbeat while the child is running
+/// - `SubAgentCompleted` - Child session finished (completed/cancelled/error)
 ///
 /// ## Terminal Events
 /// - `Complete` - Execution finished successfully
@@ -281,7 +281,7 @@ pub enum AgentEvent {
     },
 
     /// A child session was spawned from a parent session (async background job).
-    SubSessionStarted {
+    SubAgentStarted {
         parent_session_id: String,
         child_session_id: String,
         /// Optional title (useful for UI lists).
@@ -292,21 +292,21 @@ pub enum AgentEvent {
     /// Forwarded raw child event to the parent session stream.
     ///
     /// Child sessions are not allowed to spawn further sessions, so this should not nest.
-    SubSessionEvent {
+    SubAgentEvent {
         parent_session_id: String,
         child_session_id: String,
         event: Box<AgentEvent>,
     },
 
     /// Heartbeat emitted while a child session is running.
-    SubSessionHeartbeat {
+    SubAgentHeartbeat {
         parent_session_id: String,
         child_session_id: String,
         timestamp: DateTime<Utc>,
     },
 
     /// Child session finished (completed/cancelled/error).
-    SubSessionCompleted {
+    SubAgentCompleted {
         parent_session_id: String,
         child_session_id: String,
         /// One of: "completed" | "cancelled" | "error" | "skipped"

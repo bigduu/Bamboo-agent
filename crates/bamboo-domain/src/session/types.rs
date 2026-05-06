@@ -492,6 +492,10 @@ pub struct Session {
     /// force compression regardless of threshold. Set by `compact_context` tool.
     #[serde(skip)]
     pub force_manual_compression: Option<String>,
+    /// Workspace directory for file operations in this session.
+    /// For child sessions, this is set from the `workspace` field in `CreateChildInput`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 /// Session type marker for spawn-session support.
@@ -534,6 +538,7 @@ impl Session {
             compression_instructions: None,
             agent_runtime_state: None,
             force_manual_compression: None,
+            workspace: None,
         }
     }
 
@@ -573,6 +578,7 @@ impl Session {
             compression_instructions: None,
             agent_runtime_state: None,
             force_manual_compression: None,
+            workspace: None,
         }
     }
 

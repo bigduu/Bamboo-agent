@@ -35,7 +35,7 @@ pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
 /// Tool names that are accepted as aliases for built-in/server tools but are not
 /// independently listed in `BUILTIN_TOOL_NAMES`/`SERVER_TOOL_NAMES`. Calls to these names are
 /// transparently routed to their canonical counterpart.
-pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 9] = [
+pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 10] = [
     // apply_patch is a patch-only alias for Edit
     ("apply_patch", "Edit"),
     // FileExists is subsumed by GetFileInfo (returns {exists: false} for missing paths)
@@ -52,12 +52,13 @@ pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 9] = [
     ("recall", "session_history"),
     ("session_inspector", "session_history"),
     ("schedule_tasks", "scheduler"),
-    // SubSession manager alias
-    ("sub_session_manager", "SubSession"),
+    // SubAgent manager alias
+    ("sub_session_manager", "SubAgent"),
+    ("SubSession", "SubAgent"),
 ];
 
 pub const SERVER_TOOL_NAMES: [&str; 7] = [
-    "SubSession",
+    "SubAgent",
     "compact_context",
     "scheduler",
     "session_history",
@@ -121,17 +122,21 @@ pub fn normalize_builtin_alias(name: &str) -> &str {
         "setWorkspace" => "SetWorkspace",
         "sleep" => "Sleep",
         "applyPatch" => "apply_patch",
-        "spawn_session" => "SubSession",
-        "spawnSession" => "SubSession",
-        "sub_session" => "SubSession",
-        "subSession" => "SubSession",
-        "sub_task" => "SubSession",
-        "subTask" => "SubSession",
-        "team_agent" => "SubSession",
-        "teamAgent" => "SubSession",
-        "child_session" => "SubSession",
-        "childSession" => "SubSession",
-        "sub_session_manager" => "SubSession",
+        "spawn_session" => "SubAgent",
+        "spawnSession" => "SubAgent",
+        "sub_session" => "SubAgent",
+        "subSession" => "SubAgent",
+        "sub_task" => "SubAgent",
+        "subTask" => "SubAgent",
+        "team_agent" => "SubAgent",
+        "teamAgent" => "SubAgent",
+        "child_session" => "SubAgent",
+        "childSession" => "SubAgent",
+        "sub_session_manager" => "SubAgent",
+        "sub_agent" => "SubAgent",
+        "subAgent" => "SubAgent",
+        "SubSession" => "SubAgent",
+        "subsession" => "SubAgent",
         "write_file" => "Write",
         "sessionInspector" => "session_inspector",
         "scheduleTasks" => "schedule_tasks",
@@ -228,8 +233,12 @@ mod tests {
             "default::sub_task",
             "default::team_agent",
             "default::child_session",
+            "default::sub_agent",
+            "default::subAgent",
+            "default::SubSession",
+            "default::subsession",
         ] {
-            assert_eq!(normalize_tool_ref(alias), Some("SubSession".to_string()));
+            assert_eq!(normalize_tool_ref(alias), Some("SubAgent".to_string()));
         }
     }
 

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// A subagent role definition.
 ///
 /// `id` is the canonical lookup key and matches the `subagent_type` string
-/// passed to the `SubSession` tool (e.g. `"researcher"`, `"coder"`).
+/// passed to the `SubAgent` tool (e.g. `"researcher"`, `"coder"`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentProfile {
     /// Canonical role id (matches `subagent_type` string).
@@ -68,7 +68,7 @@ pub enum ToolPolicy {
 
 /// Optional model preference for a subagent profile.
 ///
-/// `tier` selects from configured tiers (`fast`, `chat`, `sub_session`, ...).
+/// `tier` selects from configured tiers (`fast`, `chat`, `sub_agent`, ...).
 /// `model_ref` overrides `tier` and pins an explicit `provider:model` ref.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ModelHint {
@@ -90,6 +90,32 @@ pub struct UiHint {
     /// Tag colour (free-form string, e.g. `"purple"` / `"#8b5cf6"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+}
+
+/// Compute the set of tool names that should be hidden from the LLM schema
+/// for a given [`ToolPolicy`].
+///
+/// - [`ToolPolicy::Inherit`] → returns an empty set.
+/// - [`ToolPolicy::Allowlist`] → returns every tool in `all_tool_names` that
+///   is **not** on the allow list (complement).
+/// - [`ToolPolicy::Denylist`] → returns the tools on the deny list.
+pub fn disabled_tools_for_profile(
+    policy: &ToolPolicy,
+    all_tool_names: &[String],
+) -> Vec<String> {
+    match policy {
+        ToolPolicy::Inherit => Vec::new(),
+        ToolPolicy::Allowlist { allow } => {
+            let allowed: std::collections::HashSet<&str> =
+                allow.iter().map(|s| s.as_str()).collect();
+            all_tool_names
+                .iter()
+                .filter(|name| !allowed.contains(name.as_str()))
+                .cloned()
+                .collect()
+        }
+        ToolPolicy::Denylist { deny } => deny.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -162,5 +188,57 @@ mod tests {
         let v = serde_json::to_value(&profile).unwrap();
         assert!(v.get("model_hint").is_none());
         assert!(v.get("default_responsibility").is_none());
+    }
+
+    #[test]
+    fn disabled_tools_for_inherit_is_empty() {
+        let policy = ToolPolicy::Inherit;
+        let all = vec!["Read".into(), "Edit".into(), "Write".into()];
+        assert!(disabled_tools_for_profile(&policy, &all).is_empty());
+    }
+
+    #[test]
+    fn disabled_tools_for_allowlist_returns_complement() {
+        let policy = ToolPolicy::Allowlist {
+            allow: vec!["Read".into()],
+        };
+        let all = vec!["Read".into(), "Edit".into(), "Write".into()];
+        let mut disabled = disabled_tools_for_profile(&policy, &all);
+        disabled.sort();
+        assert_eq!(disabled, vec!["Edit", "Write"]);
+    }
+
+    #[test]
+    fn disabled_tools_for_allowlist_with_unknown_allowed_tool() {
+        let policy = ToolPolicy::Allowlist {
+            allow: vec!["Read".into(), "UnknownTool".into()],
+        };
+        let all = vec!["Read".into(), "Edit".into(), "Write".into()];
+        let mut disabled = disabled_tools_for_profile(&policy, &all);
+        disabled.sort();
+        assert_eq!(disabled, vec!["Edit", "Write"]);
+    }
+
+    #[test]
+    fn disabled_tools_for_denylist_returns_denied() {
+        let policy = ToolPolicy::Denylist {
+            deny: vec!["Edit".into(), "Write".into()],
+        };
+        let all = vec!["Read".into(), "Edit".into(), "Write".into()];
+        assert_eq!(
+            disabled_tools_for_profile(&policy, &all),
+            vec!["Edit", "Write"]
+        );
+    }
+
+    #[test]
+    fn disabled_tools_for_denylist_ignores_all_tools() {
+        let policy = ToolPolicy::Denylist {
+            deny: vec!["SubAgent".into()],
+        };
+        assert_eq!(
+            disabled_tools_for_profile(&policy, &[]),
+            vec!["SubAgent"]
+        );
     }
 }

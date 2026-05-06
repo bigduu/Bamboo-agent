@@ -16,7 +16,7 @@
 mod model;
 mod registry;
 
-pub use model::{ModelHint, SubagentProfile, ToolPolicy, UiHint};
+pub use model::{disabled_tools_for_profile, ModelHint, SubagentProfile, ToolPolicy, UiHint};
 pub use registry::{
     SubagentProfileFile, SubagentProfileRegistry, SubagentProfileRegistryBuilder,
     SubagentProfileRegistryError, DEFAULT_FALLBACK_PROFILE_ID,

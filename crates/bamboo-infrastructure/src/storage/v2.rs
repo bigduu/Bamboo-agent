@@ -92,7 +92,7 @@ pub struct SessionIndexEntry {
     /// loading full session.json for every row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenBudgetUsage>,
-    /// SubAgent profile id for child sessions spawned by `SubSession.create`.
+    /// SubAgent profile id for child sessions spawned by `SubAgent.create`.
     /// Mirrored into the index from `session.metadata["subagent_type"]` so the
     /// frontend can render role badges (e.g. "general-purpose", "plan") on the
     /// child-session list without loading each session.json.
