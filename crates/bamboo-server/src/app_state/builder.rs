@@ -6,6 +6,7 @@ use super::init::{
 use super::tools::{build_base_tools, build_root_tools};
 use super::*;
 use crate::tools::OptionalSubagentModelResolver;
+use bamboo_agent_core::storage::Storage;
 
 impl AppState {
     /// Create unified app state with direct provider access
@@ -103,6 +104,25 @@ impl AppState {
         let skill_manager = init_skill_manager(&data_dir).await;
         let metrics_service = init_metrics_service(&data_dir).await?;
 
+        let startup_sessions = {
+            let entries = session_store.list_index_entries().await;
+            let mut sessions = Vec::new();
+            for entry in entries {
+                if let Some(session) = session_store.load_session(&entry.id).await.map_err(AppError::StorageError)? {
+                    sessions.push(session);
+                }
+            }
+            sessions
+        };
+        metrics_service
+            .reconcile_startup_sessions(startup_sessions, &[])
+            .await
+            .map_err(|error| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "Failed to reconcile stale metrics state on startup: {error}"
+                ))
+            })?;
+
         let agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>> =
             Arc::new(RwLock::new(HashMap::new()));
         spawn_runner_cleanup_task(agent_runners.clone(), None);
@@ -169,7 +189,7 @@ impl AppState {
                 ))
             })?;
 
-        // Child tools intentionally do not expose `SubSession` (no nested
+        // Child tools intentionally do not expose `SubAgent` (no nested
         // child spawns). They are wrapped by `PolicyAwareToolExecutor` so
         // that each child's `subagent_type` metadata is consulted to
         // enforce its `ToolPolicy` (allow/deny/inherit) at tool-call time.

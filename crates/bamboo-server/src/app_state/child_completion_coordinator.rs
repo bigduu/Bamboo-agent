@@ -90,11 +90,11 @@ fn wait_policy_satisfied(
 
 /// Maximum number of characters of the child's final assistant content that
 /// will be embedded into the hidden runtime resume message. Anything longer is
-/// truncated with a marker so the root LLM can still call `SubSession.get` to
+/// truncated with a marker so the root LLM can still call `SubAgent.get` to
 /// fetch the full child output if needed.
 const RUNTIME_RESUME_CHILD_RESULT_MAX_CHARS: usize = 4000;
 const RUNTIME_RESUME_CHILD_RESULT_TRUNCATION_MARKER: &str =
-    "\n\n[... child final response truncated; call SubSession.get for full content ...]";
+    "\n\n[... child final response truncated; call SubAgent.get for full content ...]";
 
 /// Extract the child session's last assistant content, if any. Returns `None`
 /// when the child produced no assistant message (e.g. errored before the first
@@ -143,7 +143,7 @@ fn runtime_resume_message(
 
     body.push_str(
         "\n\nResume the parent task using this child result and continue from the previous plan. \
-         If you need the full child transcript, call SubSession.get(child_session_id).",
+         If you need the full child transcript, call SubAgent.get(child_session_id).",
     );
 
     let mut message = Message::user(body);
@@ -343,7 +343,7 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             parent.metadata.remove("runtime.suspend_reason");
             // Best-effort: load the child session so we can include its final
             // assistant content in the hidden resume message. This avoids the
-            // root LLM having to make an extra `SubSession.get` call after
+            // root LLM having to make an extra `SubAgent.get` call after
             // resume just to read what the child concluded — which would cost
             // an additional LLM round trip.
             let child_final_response = match self

@@ -333,7 +333,7 @@ pub fn resolve_code_review_model(
 
 /// Resolve the provider+model reference for a specific subagent type.
 ///
-/// Fallback chain: `defaults.subagent_models[type]` → `defaults.sub_session` →
+/// Fallback chain: `defaults.subagent_models[type]` → `defaults.sub_agent` →
 /// `defaults.fast`/legacy fast → `defaults.chat`/legacy default.
 pub fn resolve_subagent_model_ref(
     config: &Config,
@@ -346,7 +346,7 @@ pub fn resolve_subagent_model_ref(
         if let Some(defaults) = config.defaults.as_ref() {
             let candidate_refs = [
                 defaults.subagent_models.get(subagent_type),
-                defaults.sub_session.as_ref(),
+                defaults.sub_agent.as_ref(),
                 defaults.fast.as_ref(),
             ];
 
@@ -365,7 +365,7 @@ pub fn resolve_subagent_model_ref(
 
 /// Resolve the model for a specific subagent type.
 ///
-/// Fallback chain: `defaults.subagent_models[type]` → `defaults.sub_session` →
+/// Fallback chain: `defaults.subagent_models[type]` → `defaults.sub_agent` →
 /// `defaults.fast`/legacy fast → `defaults.chat`/legacy default.
 pub fn resolve_subagent_model(
     config: &Config,
@@ -627,7 +627,7 @@ mod tests {
         );
     }
     #[test]
-    fn resolve_subagent_model_ref_prefers_sub_session_over_fast() {
+    fn resolve_subagent_model_ref_prefers_sub_agent_over_fast() {
         let mut config = Config::default();
         config.provider = "openai".to_string();
         config.features.provider_model_ref = true;
@@ -639,18 +639,18 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
-            sub_session: Some(ProviderModelRef::new("openai", "gpt-sub-session")),
+            sub_agent: Some(ProviderModelRef::new("openai", "gpt-sub-agent")),
             subagent_models: HashMap::new(),
         });
 
         let resolved = resolve_subagent_model_ref(&config, "openai", &test_registry(), "coder")
-            .expect("sub-session model should resolve");
+            .expect("sub-agent model should resolve");
 
-        assert_eq!(resolved, ProviderModelRef::new("openai", "gpt-sub-session"));
+        assert_eq!(resolved, ProviderModelRef::new("openai", "gpt-sub-agent"));
     }
 
     #[test]
-    fn resolve_subagent_model_ref_falls_back_to_fast_when_sub_session_unset() {
+    fn resolve_subagent_model_ref_falls_back_to_fast_when_sub_agent_unset() {
         let mut config = Config::default();
         config.provider = "openai".to_string();
         config.features.provider_model_ref = true;
@@ -662,7 +662,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
-            sub_session: None,
+            sub_agent: None,
             subagent_models: HashMap::new(),
         });
 

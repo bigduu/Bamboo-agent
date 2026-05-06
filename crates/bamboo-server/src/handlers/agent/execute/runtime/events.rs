@@ -13,8 +13,8 @@ fn is_critical_event(event: &AgentEvent) -> bool {
         event,
         AgentEvent::TaskListUpdated { .. }
             | AgentEvent::TaskListCompleted { .. }
-            | AgentEvent::SubSessionStarted { .. }
-            | AgentEvent::SubSessionCompleted { .. }
+            | AgentEvent::SubAgentStarted { .. }
+            | AgentEvent::SubAgentCompleted { .. }
             | AgentEvent::SessionTitleUpdated { .. }
             | AgentEvent::SessionPinnedUpdated { .. }
     )
@@ -96,8 +96,8 @@ mod tests {
         }
     }
 
-    fn sub_session_started() -> AgentEvent {
-        AgentEvent::SubSessionStarted {
+    fn sub_agent_started() -> AgentEvent {
+        AgentEvent::SubAgentStarted {
             parent_session_id: "parent".into(),
             child_session_id: "child-1".into(),
             title: Some("child work".into()),
@@ -123,13 +123,13 @@ mod tests {
     }
 
     #[test]
-    fn critical_event_identifies_sub_session_started() {
-        assert!(is_critical_event(&sub_session_started()));
+    fn critical_event_identifies_sub_agent_started() {
+        assert!(is_critical_event(&sub_agent_started()));
     }
 
     #[test]
-    fn critical_event_identifies_sub_session_completed() {
-        let event = AgentEvent::SubSessionCompleted {
+    fn critical_event_identifies_sub_agent_completed() {
+        let event = AgentEvent::SubAgentCompleted {
             parent_session_id: "parent".into(),
             child_session_id: "child-1".into(),
             status: "completed".into(),
@@ -286,7 +286,7 @@ mod tests {
             })
             .await
             .unwrap();
-        mpsc_tx.send(sub_session_started()).await.unwrap();
+        mpsc_tx.send(sub_agent_started()).await.unwrap();
 
         // Drop sender to terminate forwarder.
         drop(mpsc_tx);
@@ -302,7 +302,7 @@ mod tests {
         ));
         assert!(matches!(
             runner.last_critical_events[1],
-            AgentEvent::SubSessionStarted { .. }
+            AgentEvent::SubAgentStarted { .. }
         ));
     }
 

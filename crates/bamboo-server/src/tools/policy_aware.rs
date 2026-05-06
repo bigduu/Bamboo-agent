@@ -29,11 +29,10 @@
 //!   - [`ToolPolicy::Denylist`] → rejected if the tool name is on the
 //!     deny list; otherwise forwarded.
 //! - Tool _discovery_ (`list_tools`) is **not** filtered here. The
-//!   advertised tool surface is per-session and is filtered upstream via
-//!   the engine's `disabled_tools` mechanism (a later PR will wire the
-//!   profile policy into that list as well). Filtering at the wrapper
-//!   level would over-restrict callers that share the wrapper but are not
-//!   actually subject to a child policy.
+//!   advertised tool surface is filtered upstream via the engine's
+//!   `disabled_tools` mechanism, which includes the subagent profile
+//!   policy (see `ChildSessionAdapter::enqueue_child_run`). This wrapper
+//!   remains as a safety net for execution-time enforcement.
 //! - When the wrapper cannot determine a policy (no `session_id`, the
 //!   session is not in cache, no `subagent_type` metadata, or the
 //!   profile is unknown), it forwards unchanged. This keeps the change
@@ -361,7 +360,7 @@ mod tests {
         let registry = registry_with(profile(
             "coder",
             ToolPolicy::Denylist {
-                deny: vec!["SubSession".to_string()],
+                deny: vec!["SubAgent".to_string()],
             },
         ));
         let sessions = sessions_with("s1", Some("coder")).await;
@@ -374,12 +373,12 @@ mod tests {
             available_tool_schemas: None,
         };
         let err = exec
-            .execute_with_context(&make_call("SubSession"), ctx)
+            .execute_with_context(&make_call("SubAgent"), ctx)
             .await
             .unwrap_err();
         match err {
             ToolError::Execution(msg) => {
-                assert!(msg.contains("SubSession"));
+                assert!(msg.contains("SubAgent"));
                 assert!(msg.contains("denylist"));
             }
             other => panic!("expected ToolError::Execution, got {other:?}"),
@@ -393,7 +392,7 @@ mod tests {
         let registry = registry_with(profile(
             "coder",
             ToolPolicy::Denylist {
-                deny: vec!["SubSession".to_string()],
+                deny: vec!["SubAgent".to_string()],
             },
         ));
         let sessions = sessions_with("s1", Some("coder")).await;

@@ -1,6 +1,6 @@
 //! Shared adapter implementing `ChildSessionPort` for server-side child session tools.
 //!
-//! The unified `SubSessionTool` delegates to this adapter instead of
+//! The unified `SubAgentTool` delegates to this adapter instead of
 //! duplicating `ChildSessionPort` implementations.
 
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ use bamboo_infrastructure::{Config, LockedSessionStore, SessionIndexEntry, Sessi
 
 /// Server-side adapter that bridges domain `ChildSessionPort` to infrastructure.
 ///
-/// Holds all shared state needed by `SubSessionTool`.
+/// Holds all shared state needed by `SubAgentTool`.
 /// Implements the full `ChildSessionPort` trait with real methods (no stubs).
 pub struct ChildSessionAdapter {
     pub(crate) session_store: Arc<SessionStoreV2>,
@@ -42,8 +42,11 @@ pub struct ChildSessionAdapter {
     /// Application config for resolving subagent routing and external agent profiles.
     pub(crate) config: Arc<RwLock<Config>>,
     /// Subagent profile registry. Used to resolve `subagent_type` →
-    /// `system_prompt` (and, in later PRs, the tool surface filter).
+    /// `system_prompt` and tool surface filter.
     pub(crate) subagent_profiles: Arc<bamboo_domain::subagent::SubagentProfileRegistry>,
+    /// Cached list of all available tool names from the base executor.
+    /// Used to compute the complement set for Allowlist policies.
+    pub(crate) tool_names: Vec<String>,
 }
 
 const AGENT_RUNTIME_STATE_METADATA_KEY: &str = "agent.runtime.state";
@@ -311,6 +314,30 @@ impl ChildSessionPort for ChildSessionAdapter {
             ));
         }
 
+        // Resolve profile policy into schema-level disabled_tools.
+        let disabled_tools = child
+            .metadata
+            .get("subagent_type")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .and_then(|subagent_type| {
+                let profile = self.subagent_profiles.resolve(subagent_type);
+                match &profile.tools {
+                    bamboo_domain::subagent::ToolPolicy::Inherit => None,
+                    policy => {
+                        let names = bamboo_domain::subagent::disabled_tools_for_profile(
+                            policy,
+                            &self.tool_names,
+                        );
+                        if names.is_empty() {
+                            None
+                        } else {
+                            Some(names)
+                        }
+                    }
+                }
+            });
+
         self.register_parent_wait_for_child(&parent.id, &child.id, None)
             .await?;
 
@@ -319,12 +346,13 @@ impl ChildSessionPort for ChildSessionAdapter {
                 parent_session_id: parent.id.clone(),
                 child_session_id: child.id.clone(),
                 model,
+                disabled_tools,
             })
             .await
             .map_err(ChildSessionError::Execution)?;
 
         let parent_tx = get_or_create_event_sender(&self.session_event_senders, &parent.id).await;
-        let _ = parent_tx.send(AgentEvent::SubSessionStarted {
+        let _ = parent_tx.send(AgentEvent::SubAgentStarted {
             parent_session_id: parent.id.clone(),
             child_session_id: child.id.clone(),
             title: Some(child.title.clone()),
@@ -407,7 +435,7 @@ impl ChildSessionPort for ChildSessionAdapter {
             senders.remove(child_id);
             if cancelled_running_child {
                 if let Some(parent_tx) = senders.get(parent_session_id) {
-                    let _ = parent_tx.send(AgentEvent::SubSessionCompleted {
+                    let _ = parent_tx.send(AgentEvent::SubAgentCompleted {
                         parent_session_id: parent_session_id.to_string(),
                         child_session_id: child_id.to_string(),
                         status: "cancelled".to_string(),

@@ -16,7 +16,7 @@ use bamboo_domain::ReasoningEffort;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
-enum SubSessionArgs {
+enum SubAgentArgs {
     Create {
         #[serde(default)]
         title: Option<String>,
@@ -26,6 +26,7 @@ enum SubSessionArgs {
         responsibility: Option<String>,
         prompt: String,
         subagent_type: String,
+        workspace: String,
         #[serde(default)]
         auto_run: Option<bool>,
         /// Optional reasoning effort for the child session. When omitted,
@@ -154,27 +155,27 @@ fn waiting_for_children_tool_result(mut value: serde_json::Value) -> Result<Tool
 // Tool struct
 // ---------------------------------------------------------------------------
 
-pub struct SubSessionTool {
+pub struct SubAgentTool {
     adapter: Arc<ChildSessionAdapter>,
     /// Registry consulted by `action=list_profiles`. Held as `Arc` so the
     /// tool stays cheap to clone and share across executors.
     profiles: Arc<SubagentProfileRegistry>,
 }
 
-impl SubSessionTool {
+impl SubAgentTool {
     pub fn new(adapter: Arc<ChildSessionAdapter>, profiles: Arc<SubagentProfileRegistry>) -> Self {
         Self { adapter, profiles }
     }
 }
 
 #[async_trait]
-impl Tool for SubSessionTool {
+impl Tool for SubAgentTool {
     fn name(&self) -> &str {
-        "SubSession"
+        "SubAgent"
     }
 
     fn description(&self) -> &str {
-        "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. A child session runs independently under the current root session with its own conversation context, can use a specialized subagent profile, streams progress back to the parent via sub_session_* events, and can be reopened from the Sub-sessions panel. Use action=create for a new delegated task; use list/get to inspect existing children; use update/run/send_message/cancel/delete to manage existing children. Use only when the user explicitly asks for delegation/parallelism or when a side task would otherwise flood the main context. Do not use for simple one-step tasks. Child sessions cannot spawn nested child sessions. IMPORTANT: When a child fails or needs redirection, prefer send_message over creating a duplicate child. Use list before create to avoid spawning redundant children."
+        "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. A child session runs independently under the current root session with its own conversation context, can use a specialized subagent profile, streams progress back to the parent via sub_agent_* events, and can be reopened from the Sub-agents panel. Use action=create for a new delegated task; use list/get to inspect existing children; use update/run/send_message/cancel/delete to manage existing children. Use only when the user explicitly asks for delegation/parallelism or when a side task would otherwise flood the main context. Do not use for simple one-step tasks. Child sessions cannot spawn nested child sessions. IMPORTANT: When a child fails or needs redirection, prefer send_message over creating a duplicate child. Use list before create to avoid spawning redundant children."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -184,7 +185,7 @@ impl Tool for SubSessionTool {
                 "action": {
                     "type": "string",
                     "enum": ["create", "list", "get", "update", "run", "send_message", "cancel", "delete", "list_profiles"],
-                    "description": "Sub-session lifecycle operation. Use create to delegate a new independent child session; use list/get to inspect; use update/run/send_message/cancel/delete to manage existing child sessions. Use list_profiles to enumerate available subagent roles before deciding which subagent_type to pass to create."
+                    "description": "Sub-agent lifecycle operation. Use create to delegate a new independent child session; use list/get to inspect; use update/run/send_message/cancel/delete to manage existing child sessions. Use list_profiles to enumerate available subagent roles before deciding which subagent_type to pass to create."
                 },
                 "child_session_id": {
                     "type": "string",
@@ -192,7 +193,7 @@ impl Tool for SubSessionTool {
                 },
                 "title": {
                     "type": "string",
-                    "description": "Short title for a new or updated child session. Required for create. Displayed in the Sub-sessions panel."
+                    "description": "Short title for a new or updated child session. Required for create. Displayed in the Sub-agents panel."
                 },
                 "description": {
                     "type": "string",
@@ -209,6 +210,10 @@ impl Tool for SubSessionTool {
                 "subagent_type": {
                     "type": "string",
                     "description": "Specialized child agent profile, e.g. general-purpose, researcher, coder, plan. Use plan/researcher for read-only exploration and coder/general-purpose for implementation when allowed."
+                },
+                "workspace": {
+                    "type": "string",
+                    "description": "Absolute path to the working directory for the child session. The child will use this as its workspace for file operations."
                 },
                 "auto_run": {
                     "type": "boolean",
@@ -236,7 +241,7 @@ impl Tool for SubSessionTool {
                     "description": "For create/update: reasoning effort level applied to the child session's own LLM calls. Use \"low\" for trivial fan-outs (e.g. simple lookups), \"medium\"/\"high\" for normal coding/analysis, \"xhigh\"/\"max\" for deep reasoning tasks. Omit to leave at provider default; the child does NOT inherit the parent's reasoning_effort."
                 }
             },
-            "required": ["action"],
+            "required": ["action", "workspace"],
             "additionalProperties": false
         })
     }
@@ -252,10 +257,10 @@ impl Tool for SubSessionTool {
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let parent_session_id = ctx.session_id.ok_or_else(|| {
-            ToolError::Execution("SubSession requires a session_id in tool context".to_string())
+            ToolError::Execution("SubAgent requires a session_id in tool context".to_string())
         })?;
 
-        // Backward compatibility: legacy SubSession calls did not include an
+        // Backward compatibility: legacy SubAgent calls did not include an
         // "action" field and always meant "create". If action is missing,
         // default to "create" before deserializing the tagged enum.
         let mut args = args;
@@ -263,15 +268,15 @@ impl Tool for SubSessionTool {
             args["action"] = json!("create");
         }
 
-        let parsed: SubSessionArgs = serde_json::from_value(args).map_err(|error| {
-            ToolError::InvalidArguments(format!("Invalid SubSession args: {error}"))
+        let parsed: SubAgentArgs = serde_json::from_value(args).map_err(|error| {
+            ToolError::InvalidArguments(format!("Invalid SubAgent args: {error}"))
         })?;
 
         // `list_profiles` is read-only and operates purely on the
         // in-memory profile registry, so we short-circuit before doing
         // any session lookup. This also lets the LLM call `list_profiles`
         // safely from any context (root or otherwise).
-        if let SubSessionArgs::ListProfiles = parsed {
+        if let SubAgentArgs::ListProfiles = parsed {
             return tool_result(self.list_profiles_payload());
         }
 
@@ -283,12 +288,13 @@ impl Tool for SubSessionTool {
             .map_err(tool_error_from_child_session)?;
 
         match parsed {
-            SubSessionArgs::Create {
+            SubAgentArgs::Create {
                 title,
                 description,
                 responsibility,
                 prompt,
                 subagent_type,
+                workspace,
                 auto_run,
                 reasoning_effort,
             } => {
@@ -296,6 +302,7 @@ impl Tool for SubSessionTool {
                 let responsibility = normalize_required_text(responsibility, "responsibility")?;
                 let prompt = normalize_required_text(Some(prompt), "prompt")?;
                 let subagent_type = normalize_required_text(Some(subagent_type), "subagent_type")?;
+                let workspace = normalize_required_text(Some(workspace), "workspace")?;
 
                 if parent.model.trim().is_empty() {
                     return Err(ToolError::Execution(
@@ -322,6 +329,7 @@ impl Tool for SubSessionTool {
                         responsibility: responsibility.clone(),
                         assignment_prompt: prompt.clone(),
                         subagent_type: subagent_type.clone(),
+                        workspace: workspace.clone(),
                         model_override,
                         model_ref_override,
                         runtime_metadata,
@@ -365,12 +373,12 @@ impl Tool for SubSessionTool {
                     tool_result(payload)
                 }
             }
-            SubSessionArgs::List => {
+            SubAgentArgs::List => {
                 let result =
                     child_session::list_children_action(self.adapter.as_ref(), &parent.id).await;
                 tool_result(result)
             }
-            SubSessionArgs::Get { child_session_id } => {
+            SubAgentArgs::Get { child_session_id } => {
                 let result = child_session::get_child_action(
                     self.adapter.as_ref(),
                     &parent.id,
@@ -380,7 +388,7 @@ impl Tool for SubSessionTool {
                 .map_err(tool_error_from_child_session)?;
                 tool_result(result)
             }
-            SubSessionArgs::Update {
+            SubAgentArgs::Update {
                 child_session_id,
                 title,
                 responsibility,
@@ -423,7 +431,7 @@ impl Tool for SubSessionTool {
                     tool_result(result)
                 }
             }
-            SubSessionArgs::Run {
+            SubAgentArgs::Run {
                 child_session_id,
                 reset_to_last_user,
             } => {
@@ -437,7 +445,7 @@ impl Tool for SubSessionTool {
                 .map_err(tool_error_from_child_session)?;
                 waiting_for_children_tool_result(result)
             }
-            SubSessionArgs::SendMessage {
+            SubAgentArgs::SendMessage {
                 child_session_id,
                 message,
                 auto_run,
@@ -465,7 +473,7 @@ impl Tool for SubSessionTool {
                     tool_result(result)
                 }
             }
-            SubSessionArgs::Cancel { child_session_id } => {
+            SubAgentArgs::Cancel { child_session_id } => {
                 let result = child_session::cancel_child_action(
                     self.adapter.as_ref(),
                     &parent.id,
@@ -475,7 +483,7 @@ impl Tool for SubSessionTool {
                 .map_err(tool_error_from_child_session)?;
                 tool_result(result)
             }
-            SubSessionArgs::Delete { child_session_id } => {
+            SubAgentArgs::Delete { child_session_id } => {
                 let result = child_session::delete_child_action(
                     self.adapter.as_ref(),
                     &parent.id,
@@ -487,12 +495,12 @@ impl Tool for SubSessionTool {
             }
             // Already short-circuited above; kept here so the match stays
             // exhaustive without a wildcard.
-            SubSessionArgs::ListProfiles => tool_result(self.list_profiles_payload()),
+            SubAgentArgs::ListProfiles => tool_result(self.list_profiles_payload()),
         }
     }
 }
 
-impl SubSessionTool {
+impl SubAgentTool {
     /// Build the JSON payload returned by `action=list_profiles`.
     ///
     /// Shape (kept stable as a public contract for the frontend and for
@@ -603,7 +611,7 @@ mod tests {
     }
 
     struct TestHarness {
-        tool: SubSessionTool,
+        tool: SubAgentTool,
         storage: Arc<dyn Storage>,
         agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
         parent_session_id: String,
@@ -618,7 +626,7 @@ mod tests {
     async fn build_test_harness_with_resolver(
         subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
     ) -> TestHarness {
-        let bamboo_home = make_temp_dir("bamboo-sub-session-test");
+        let bamboo_home = make_temp_dir("bamboo-sub-agent-test");
         tokio::fs::create_dir_all(&bamboo_home).await.unwrap();
 
         let session_store = Arc::new(SessionStoreV2::new(bamboo_home.clone()).await.unwrap());
@@ -714,8 +722,9 @@ mod tests {
             subagent_model_resolver,
             config: Arc::new(RwLock::new(bamboo_infrastructure::Config::default())),
             subagent_profiles: test_profiles.clone(),
+            tool_names: Vec::new(),
         });
-        let tool = SubSessionTool::new(adapter, test_profiles);
+        let tool = SubAgentTool::new(adapter, test_profiles);
 
         TestHarness {
             tool,
@@ -766,7 +775,8 @@ mod tests {
                     "title": "demo task",
                     "responsibility": "do something",
                     "prompt": "do something",
-                    "subagent_type": "general-purpose"
+                    "subagent_type": "general-purpose",
+                    "workspace": "/tmp/test-workspace"
                 }),
                 ToolExecutionContext::none("tool_call"),
             )
@@ -775,14 +785,14 @@ mod tests {
 
         match err {
             ToolError::Execution(msg) => {
-                assert!(msg.contains("SubSession requires a session_id in tool context"));
+                assert!(msg.contains("SubAgent requires a session_id in tool context"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn create_emits_sub_session_started_event_after_queueing() {
+    async fn create_emits_sub_agent_started_event_after_queueing() {
         let mut harness = build_test_harness().await;
 
         let result = harness
@@ -793,7 +803,8 @@ mod tests {
                     "title": "Child A",
                     "responsibility": "Investigate one module",
                     "prompt": "Read module and summarize",
-                    "subagent_type": "general-purpose"
+                    "subagent_type": "general-purpose",
+                    "workspace": "/tmp/test-workspace"
                 }),
                 ToolExecutionContext {
                     session_id: Some(harness.parent_session_id.as_str()),
@@ -803,7 +814,7 @@ mod tests {
                 },
             )
             .await
-            .expect("SubSession should enqueue a child session");
+            .expect("SubAgent should enqueue a child session");
 
         let parsed_result: serde_json::Value =
             serde_json::from_str(&result.result).expect("tool result should be JSON");
@@ -816,7 +827,7 @@ mod tests {
         let started_event = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 match harness.parent_rx.recv().await {
-                    Ok(AgentEvent::SubSessionStarted {
+                    Ok(AgentEvent::SubAgentStarted {
                         parent_session_id: pid,
                         child_session_id: cid,
                         ..
@@ -830,7 +841,7 @@ mod tests {
             }
         })
         .await
-        .expect("should receive SubSessionStarted event quickly");
+        .expect("should receive SubAgentStarted event quickly");
 
         assert_eq!(started_event.0, harness.parent_session_id);
         assert_eq!(started_event.1, child_session_id);
@@ -858,6 +869,7 @@ mod tests {
                     "responsibility": "Implement a focused change",
                     "prompt": "Patch one file",
                     "subagent_type": "coder",
+                    "workspace": "/tmp/test-workspace",
                     "auto_run": false
                 }),
                 ToolExecutionContext {
@@ -868,7 +880,7 @@ mod tests {
                 },
             )
             .await
-            .expect("SubSession should create a child using async model resolver");
+            .expect("SubAgent should create a child using async model resolver");
 
         let payload: serde_json::Value =
             serde_json::from_str(&result.result).expect("tool result should be JSON");
@@ -898,7 +910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backward_compat_legacy_subsession_call_without_action_defaults_to_create() {
+    async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create() {
         let harness = build_test_harness().await;
 
         let result = harness
@@ -908,7 +920,8 @@ mod tests {
                     "title": "Legacy Child",
                     "responsibility": "Test backward compat",
                     "prompt": "Do something",
-                    "subagent_type": "general-purpose"
+                    "subagent_type": "general-purpose",
+                    "workspace": "/tmp/test-workspace"
                 }),
                 ToolExecutionContext {
                     session_id: Some(harness.parent_session_id.as_str()),
@@ -918,7 +931,7 @@ mod tests {
                 },
             )
             .await
-            .expect("legacy SubSession call without action should default to create");
+            .expect("legacy SubAgent call without action should default to create");
 
         assert!(result.success);
         let parsed: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -926,7 +939,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Management action tests for the unified SubSession tool
+    // Management action tests for the unified SubAgent tool
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -1126,7 +1139,7 @@ mod tests {
         let started_event = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 match harness.parent_rx.recv().await {
-                    Ok(AgentEvent::SubSessionStarted {
+                    Ok(AgentEvent::SubAgentStarted {
                         parent_session_id,
                         child_session_id,
                         ..
@@ -1140,7 +1153,7 @@ mod tests {
             }
         })
         .await
-        .expect("should receive SubSessionStarted event");
+        .expect("should receive SubAgentStarted event");
 
         assert_eq!(started_event.0, harness.parent_session_id);
         assert_eq!(started_event.1, harness.child_session_id);
@@ -1277,6 +1290,7 @@ mod tests {
                     "responsibility": "Do something",
                     "prompt": "Do something useful",
                     "subagent_type": "general-purpose",
+                    "workspace": "/tmp/test-workspace",
                     "auto_run": false
                 }),
                 ToolExecutionContext {
@@ -1315,6 +1329,7 @@ mod tests {
                     "responsibility": "Investigate hard problem",
                     "prompt": "Think carefully step by step",
                     "subagent_type": "general-purpose",
+                    "workspace": "/tmp/test-workspace",
                     "auto_run": false,
                     "reasoning_effort": "high"
                 }),
@@ -1366,6 +1381,7 @@ mod tests {
                     "responsibility": "Quick lookup",
                     "prompt": "Read a file and summarise",
                     "subagent_type": "general-purpose",
+                    "workspace": "/tmp/test-workspace",
                     "auto_run": false
                 }),
                 ToolExecutionContext {
@@ -1575,5 +1591,83 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(&result.result).expect("tool result should be JSON");
         assert!(payload["profiles"].as_array().is_some());
+    }
+
+    #[tokio::test]
+    async fn create_requires_workspace() {
+        let harness = build_test_harness().await;
+
+        let err = harness
+            .tool
+            .execute_with_context(
+                json!({
+                    "action": "create",
+                    "title": "No Workspace Child",
+                    "responsibility": "Test workspace validation",
+                    "prompt": "Do something",
+                    "subagent_type": "general-purpose"
+                }),
+                ToolExecutionContext {
+                    session_id: Some(harness.parent_session_id.as_str()),
+                    tool_call_id: "tool_call_no_workspace",
+                    event_tx: None,
+                    available_tool_schemas: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        match err {
+            ToolError::InvalidArguments(msg) => {
+                assert!(msg.contains("workspace"), "error should mention workspace: {msg}");
+            }
+            other => panic!("expected InvalidArguments error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_sets_child_workspace() {
+        let harness = build_test_harness().await;
+
+        let result = harness
+            .tool
+            .execute_with_context(
+                json!({
+                    "action": "create",
+                    "title": "Workspace Child",
+                    "responsibility": "Test workspace propagation",
+                    "prompt": "Do something",
+                    "subagent_type": "general-purpose",
+                    "workspace": "/tmp/test-workspace",
+                    "auto_run": false
+                }),
+                ToolExecutionContext {
+                    session_id: Some(harness.parent_session_id.as_str()),
+                    tool_call_id: "tool_call_workspace",
+                    event_tx: None,
+                    available_tool_schemas: None,
+                },
+            )
+            .await
+            .expect("create should succeed with workspace");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.result).expect("tool result should be JSON");
+        let child_id = payload["child_session_id"]
+            .as_str()
+            .expect("child_session_id should be present")
+            .to_string();
+
+        let child = harness
+            .storage
+            .load_session(&child_id)
+            .await
+            .expect("child should be persisted")
+            .expect("child session should exist");
+        assert_eq!(
+            child.workspace,
+            Some("/tmp/test-workspace".to_string()),
+            "child workspace should be set from create args"
+        );
     }
 }

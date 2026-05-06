@@ -87,7 +87,7 @@ You are FORBIDDEN from using these tools:
 - Bash — do not execute shell commands
 - BashOutput — do not execute shell commands
 - KillShell — do not manage processes
-- SubSession — do not spawn further child sessions
+- SubAgent — do not spawn further child sessions
 
 You MAY use these read-only tools:
 - Read — read file contents
@@ -114,6 +114,8 @@ pub struct CreateChildInput {
     pub responsibility: String,
     pub assignment_prompt: String,
     pub subagent_type: String,
+    /// Absolute path to the working directory for the child session.
+    pub workspace: String,
     /// Optional model override resolved from subagent_type routing.
     /// When `None`, the child inherits the parent session's model.
     pub model_override: Option<String>,
@@ -406,9 +408,15 @@ pub async fn create_child_action(
         child.reasoning_effort = Some(effort);
     }
 
+    child.workspace = Some(input.workspace.clone());
+    bamboo_agent_core::workspace_state::set_workspace(
+        &child.id,
+        std::path::PathBuf::from(&input.workspace),
+    );
+
     child
         .metadata
-        .insert("spawned_by".to_string(), "SubSession".to_string());
+        .insert("spawned_by".to_string(), "SubAgent".to_string());
     child
         .metadata
         .insert("subagent_type".to_string(), input.subagent_type.clone());

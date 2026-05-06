@@ -1,6 +1,6 @@
 //! HTTP handlers for the subagent-profile catalogue.
 //!
-//! Exposes the same registry consulted by `SubSession.action=list_profiles`
+//! Exposes the same registry consulted by `SubAgent.action=list_profiles`
 //! over a plain REST endpoint so the frontend can populate role pickers
 //! without going through the tool-call surface.
 

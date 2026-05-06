@@ -20,18 +20,18 @@ fn canonical_tool_name_or_error_resolves_aliases() {
 
     let canonical =
         canonical_tool_name_or_error(&request.tool_name).expect("expected canonical name");
-    assert_eq!(canonical, "SubSession");
+    assert_eq!(canonical, "SubAgent");
 }
 
 #[test]
-fn canonical_tool_name_or_error_resolves_sub_session_manager_alias() {
+fn canonical_tool_name_or_error_resolves_sub_agent_manager_alias() {
     let canonical = canonical_tool_name_or_error("sub_session_manager")
         .expect("legacy manager alias should resolve");
-    assert_eq!(canonical, "SubSession");
+    assert_eq!(canonical, "SubAgent");
 }
 
 #[test]
-fn validate_session_context_requirement_rejects_missing_session_for_sub_session_manager_alias() {
+fn validate_session_context_requirement_rejects_missing_session_for_sub_agent_manager_alias() {
     let canonical = canonical_tool_name_or_error("sub_session_manager")
         .expect("legacy manager alias should resolve");
     let error = validate_session_context_requirement(&canonical, None)
@@ -40,7 +40,7 @@ fn validate_session_context_requirement_rejects_missing_session_for_sub_session_
     match error {
         AppError::BadRequest(message) => {
             assert!(message.contains("requires session_id"));
-            assert!(message.contains("SubSession"));
+            assert!(message.contains("SubAgent"));
         }
         other => panic!("unexpected error: {other}"),
     }

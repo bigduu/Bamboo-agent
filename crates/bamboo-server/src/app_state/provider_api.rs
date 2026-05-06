@@ -218,6 +218,6 @@ mod tests {
         let names: std::collections::HashSet<&str> =
             schemas.iter().map(|s| s.function.name.as_str()).collect();
         assert!(names.contains("Task"));
-        assert!(names.contains("SubSession"));
+        assert!(names.contains("SubAgent"));
     }
 }

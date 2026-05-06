@@ -140,7 +140,7 @@ mod tests {
                 planning: None,
                 search: None,
                 code_review: None,
-                sub_session: None,
+                sub_agent: None,
                 subagent_models: std::collections::HashMap::new(),
             }),
         };

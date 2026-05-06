@@ -49,7 +49,7 @@ pub async fn handler(
         .as_ref()
         .and_then(|runner| runner.last_budget_event.clone());
 
-    // Collect cached critical events for replay (TaskListUpdated, SubSession*, etc.).
+    // Collect cached critical events for replay (TaskListUpdated, SubAgent*, etc.).
     let critical_events_to_replay: Vec<_> = runner_snapshot
         .as_ref()
         .map(|runner| runner.last_critical_events.clone())

@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use bamboo_agent_core::Session;
 use bamboo_engine::{
     aggregate_monthly, aggregate_weekly, DailyMetrics, ForwardEndpointMetrics,
     ForwardMetricsFilter, ForwardMetricsSummary, ForwardRequestMetrics, MetricsCollector,
@@ -24,6 +25,25 @@ impl MetricsService {
         let collector = MetricsCollector::spawn(storage_trait, 90);
 
         Ok(Self { storage, collector })
+    }
+
+    pub async fn reconcile_startup_sessions(
+        &self,
+        sessions: impl IntoIterator<Item = Session>,
+        active_session_ids: &[String],
+    ) -> Result<(), MetricsError> {
+        let awaiting_response_session_ids = sessions
+            .into_iter()
+            .filter(|session| session.has_pending_question() || session
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|state| matches!(state.status, bamboo_domain::AgentStatusState::Suspended)))
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+
+        self.storage
+            .reconcile_stale_executions(active_session_ids, &awaiting_response_session_ids)
+            .await
     }
 
     pub fn collector(&self) -> MetricsCollector {

@@ -352,7 +352,7 @@ pub(crate) fn is_hidden_from_ui(message: &Message) -> bool {
 //
 // Some upstream products bill on "user-initiated message turns" rather than on
 // LLM request count. With the runtime-level suspend/resume model used by the
-// SubSession tool, the engine can append `Role::User` messages that are NOT
+// SubAgent tool, the engine can append `Role::User` messages that are NOT
 // caused by the human user (e.g. child-completion resume, retry resume,
 // conclusion_with_options resume). These helpers let a billing layer count
 // only genuine user turns and skip system-injected resume messages.

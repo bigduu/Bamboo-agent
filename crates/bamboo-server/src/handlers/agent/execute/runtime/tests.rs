@@ -19,7 +19,7 @@ fn execution_tool_surface_selects_root_for_root_sessions_and_child_for_child_ses
 }
 
 #[tokio::test]
-async fn execution_tools_expose_sub_session_only_for_root_sessions() {
+async fn execution_tools_expose_sub_agent_only_for_root_sessions() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
@@ -36,8 +36,8 @@ async fn execution_tools_expose_sub_session_only_for_root_sessions() {
         .map(|schema| schema.function.name)
         .collect();
 
-    assert!(root_names.contains("SubSession"));
-    assert!(!child_names.contains("SubSession"));
+    assert!(root_names.contains("SubAgent"));
+    assert!(!child_names.contains("SubAgent"));
 }
 
 #[test]

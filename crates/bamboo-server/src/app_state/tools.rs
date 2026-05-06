@@ -3,7 +3,7 @@
 //! These functions compose the tool executor chain:
 //! ```text
 //! base_tools (builtin + MCP + memory + skills + compact_context)
-//!   └─> root_tools (base + SubSession + scheduler + session_history)
+//!   └─> root_tools (base + SubAgent + scheduler + session_history)
 //! ```
 
 use std::collections::HashMap;
@@ -116,8 +116,13 @@ pub(super) fn build_root_tools(
 ) -> Arc<dyn ToolExecutor> {
     // Shared adapter for the unified child session tool. Cloning the
     // profile registry Arc is cheap and lets us hand the same registry
-    // to the SubSessionTool below without going through the adapter.
+    // to the SubAgentTool below without going through the adapter.
     let profiles_for_tool = subagent_profiles.clone();
+    let tool_names: Vec<String> = base_tools
+        .list_tools()
+        .into_iter()
+        .map(|schema| schema.function.name)
+        .collect();
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {
         session_store: session_store.clone(),
         storage: storage.clone(),
@@ -129,15 +134,16 @@ pub(super) fn build_root_tools(
         subagent_model_resolver,
         config,
         subagent_profiles,
+        tool_names,
     });
 
-    // Root sessions can create and manage child sessions via unified SubSession tool.
-    let sub_session_tool = Arc::new(crate::tools::SubSessionTool::new(
+    // Root sessions can create and manage child sessions via unified SubAgent tool.
+    let sub_agent_tool = Arc::new(crate::tools::SubAgentTool::new(
         adapter,
         profiles_for_tool,
     ));
-    let tools_with_sub_session: Arc<dyn ToolExecutor> = Arc::new(
-        crate::tools::OverlayToolExecutor::new(base_tools, sub_session_tool),
+    let tools_with_sub_agent: Arc<dyn ToolExecutor> = Arc::new(
+        crate::tools::OverlayToolExecutor::new(base_tools, sub_agent_tool),
     );
 
     // Root sessions can manage schedules via `scheduler`.
@@ -150,7 +156,7 @@ pub(super) fn build_root_tools(
         storage.clone(),
     ));
     let tools_with_schedule: Arc<dyn ToolExecutor> = Arc::new(
-        crate::tools::OverlayToolExecutor::new(tools_with_sub_session, schedule_tasks_tool),
+        crate::tools::OverlayToolExecutor::new(tools_with_sub_agent, schedule_tasks_tool),
     );
 
     let session_inspector_tool = Arc::new(crate::tools::SessionInspectorTool::new(

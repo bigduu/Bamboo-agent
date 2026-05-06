@@ -9,12 +9,12 @@ use bamboo_agent_core::tools::ToolExecutor;
 
 /// Tool surface variants for different session types.
 ///
-/// | Surface  | Base | +SubSession | +scheduler | +session_history |
-/// |----------|------|-------------|------------|------------------|
-/// | Base     | ✓    |             |            |                  |
-/// | Child    | ✓    |             |            |                  |
-/// | WithTask | ✓    | ✓           |            |                  |
-/// | Root     | ✓    | ✓           | ✓          | ✓                |
+/// | Surface  | Base | +SubAgent | +scheduler | +session_history |
+/// |----------|------|-----------|------------|------------------|
+/// | Base     | ✓    |           |            |                  |
+/// | Child    | ✓    |           |            |                  |
+/// | WithTask | ✓    | ✓         |            |                  |
+/// | Root     | ✓    | ✓         | ✓          | ✓                |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolSurface {
     /// Base tool set: builtin + MCP + memory + skills.
@@ -22,7 +22,7 @@ pub enum ToolSurface {
     Base,
     /// Same as Base — child sessions cannot recursively spawn.
     Child,
-    /// Base + SubSession tool — used by schedule runs.
+    /// Base + SubAgent tool — used by schedule runs.
     WithTask,
     /// Full root tool set: WithTask + scheduler + session_history.
     Root,

@@ -8,7 +8,7 @@ use bamboo_tools::normalize_tool_ref;
 
 /// Tool executor that overlays a single tool on top of an existing executor.
 ///
-/// This is used to add server-only tools (like `SubSession`) without mutating the
+/// This is used to add server-only tools (like `SubAgent`) without mutating the
 /// underlying built-in/MCP executor.
 pub struct OverlayToolExecutor {
     base: std::sync::Arc<dyn ToolExecutor>,
@@ -101,16 +101,16 @@ mod tests {
         }
     }
 
-    struct SubSessionOverlayTool;
+    struct SubAgentOverlayTool;
 
     #[async_trait]
-    impl Tool for SubSessionOverlayTool {
+    impl Tool for SubAgentOverlayTool {
         fn name(&self) -> &str {
-            "SubSession"
+            "SubAgent"
         }
 
         fn description(&self) -> &str {
-            "overlay sub session"
+            "overlay sub agent"
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
@@ -141,7 +141,7 @@ mod tests {
     async fn overlay_executor_routes_spawn_alias_to_overlay_tool() {
         let overlay = OverlayToolExecutor::new(
             std::sync::Arc::new(BaseExecutor),
-            std::sync::Arc::new(SubSessionOverlayTool),
+            std::sync::Arc::new(SubAgentOverlayTool),
         );
 
         let result = overlay
@@ -157,7 +157,7 @@ mod tests {
     async fn overlay_executor_keeps_non_overlay_calls_on_base_executor() {
         let overlay = OverlayToolExecutor::new(
             std::sync::Arc::new(BaseExecutor),
-            std::sync::Arc::new(SubSessionOverlayTool),
+            std::sync::Arc::new(SubAgentOverlayTool),
         );
 
         let err = overlay

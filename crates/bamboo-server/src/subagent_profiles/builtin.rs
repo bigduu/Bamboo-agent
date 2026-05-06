@@ -45,7 +45,7 @@ fn general_purpose() -> SubagentProfile {
         system_prompt: GENERAL_PURPOSE_SYSTEM_PROMPT.into(),
         tools: ToolPolicy::Inherit,
         model_hint: Some(ModelHint {
-            tier: Some("sub_session".into()),
+            tier: Some("sub_agent".into()),
             model_ref: None,
         }),
         default_responsibility: None,
@@ -109,14 +109,14 @@ fn coder() -> SubagentProfile {
         id: "coder".into(),
         display_name: "Coder".into(),
         description: "Implementation specialist. May edit files and run \
-                      shell commands; cannot spawn further sub-sessions."
+                      shell commands; cannot spawn further sub-agents."
             .into(),
         system_prompt: CODER_SYSTEM_PROMPT.into(),
         tools: ToolPolicy::Denylist {
-            deny: vec!["SubSession".into(), "scheduler".into()],
+            deny: vec!["SubAgent".into(), "scheduler".into()],
         },
         model_hint: Some(ModelHint {
-            tier: Some("sub_session".into()),
+            tier: Some("sub_agent".into()),
             model_ref: None,
         }),
         default_responsibility: Some(
@@ -159,12 +159,12 @@ fn tester() -> SubagentProfile {
         id: "tester".into(),
         display_name: "Tester".into(),
         description: "Test runner. May execute shell commands to run tests \
-                      but cannot modify source files or spawn sub-sessions."
+                      but cannot modify source files or spawn sub-agents."
             .into(),
         system_prompt: TESTER_SYSTEM_PROMPT.into(),
         tools: ToolPolicy::Denylist {
             deny: vec![
-                "SubSession".into(),
+                "SubAgent".into(),
                 "scheduler".into(),
                 "Edit".into(),
                 "Write".into(),
@@ -172,7 +172,7 @@ fn tester() -> SubagentProfile {
             ],
         },
         model_hint: Some(ModelHint {
-            tier: Some("sub_session".into()),
+            tier: Some("sub_agent".into()),
             model_ref: None,
         }),
         default_responsibility: Some(
@@ -246,7 +246,7 @@ You are FORBIDDEN from using these tools:
 - Bash — do not execute shell commands
 - BashOutput — do not execute shell commands
 - KillShell — do not manage processes
-- SubSession — do not spawn further child sessions
+- SubAgent — do not spawn further child sessions
 
 You MAY use these read-only tools:
 - Read — read file contents
@@ -390,14 +390,14 @@ mod tests {
     }
 
     #[test]
-    fn coder_denylist_blocks_subsession() {
+    fn coder_denylist_blocks_subagent() {
         let coder = builtin_profiles()
             .into_iter()
             .find(|p| p.id == "coder")
             .unwrap();
         match coder.tools {
             ToolPolicy::Denylist { deny } => {
-                assert!(deny.iter().any(|t| t == "SubSession"));
+                assert!(deny.iter().any(|t| t == "SubAgent"));
             }
             other => panic!("expected denylist, got {other:?}"),
         }

@@ -15,7 +15,7 @@ pub use crate::server_tools::{
 pub mod child_session_adapter;
 pub mod policy_aware;
 pub mod schedule_tasks;
-pub mod sub_session;
+pub mod sub_agent;
 
 pub type SubagentModelResolver = std::sync::Arc<
     dyn Fn(String) -> futures::future::BoxFuture<'static, Option<bamboo_domain::ProviderModelRef>>
@@ -28,4 +28,4 @@ pub type OptionalSubagentModelResolver = Option<SubagentModelResolver>;
 pub use child_session_adapter::ChildSessionAdapter;
 pub use policy_aware::PolicyAwareToolExecutor;
 pub use schedule_tasks::ScheduleTasksTool;
-pub use sub_session::SubSessionTool;
+pub use sub_agent::SubAgentTool;

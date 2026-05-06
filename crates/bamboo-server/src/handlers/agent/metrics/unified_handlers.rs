@@ -54,17 +54,17 @@ pub async fn v2_unified_summary(
             let total_sync_mismatches = chat.total_sync_mismatches;
             let total_requests = chat.total_sessions + forward.total_requests;
             let total_tokens = chat.total_tokens.total_tokens + forward.total_tokens.total_tokens;
-            let total_success =
-                (chat.total_sessions - chat.active_sessions) + forward.successful_requests;
-            let total_errors = forward.failed_requests;
-            let success_rate = if total_requests > 0 {
-                (total_success as f64 / total_requests as f64) * 100.0
+            let total_success = chat.completed_sessions + forward.successful_requests;
+            let total_errors = chat.error_sessions + chat.cancelled_sessions + forward.failed_requests;
+            let resolved_total = total_success + total_errors;
+            let success_rate = if resolved_total > 0 {
+                (total_success as f64 / resolved_total as f64) * 100.0
             } else {
                 0.0
             };
 
             let unified = UnifiedSummary {
-                chat,
+                chat: chat.clone(),
                 forward,
                 combined: CombinedSummary {
                     total_requests,
@@ -73,6 +73,8 @@ pub async fn v2_unified_summary(
                     total_errors,
                     success_rate,
                     prompt_cached_tool_outputs,
+                    total_compression_events: Some(chat.total_compression_events),
+                    total_tokens_saved: Some(chat.total_tokens_saved),
                     total_sync_mismatches,
                 },
                 memory,

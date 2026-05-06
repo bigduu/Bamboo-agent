@@ -1,6 +1,11 @@
 use super::{AppState, DEFAULT_BASE_PROMPT};
 use crate::tools::ToolSurface;
+use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolError};
+use bamboo_agent_core::Session;
+use bamboo_domain::{AgentRuntimeState, AgentStatusState};
+use bamboo_engine::{MetricsStorage, SessionStatus, SqliteMetricsStorage};
+use bamboo_infrastructure::SessionStoreV2;
 use bamboo_tools::permission::config::{PermissionConfig, PermissionRule, PermissionType};
 use bamboo_tools::permission::storage::PermissionStorage;
 use serde_json::json;
@@ -42,6 +47,63 @@ async fn test_app_state_creation() {
 }
 
 #[tokio::test]
+async fn app_state_creation_reconciles_stale_running_metrics_from_durable_sessions() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = temp_dir.path().to_path_buf();
+
+    let session_store = SessionStoreV2::new(data_dir.clone())
+        .await
+        .expect("session store should initialize");
+    let mut session = Session::new("startup-stale-session", "test-model");
+    let mut runtime_state = AgentRuntimeState::new("run-startup-stale");
+    runtime_state.status = AgentStatusState::Suspended;
+    session.agent_runtime_state = Some(runtime_state);
+    session.metadata.insert(
+        "runtime.suspend_reason".to_string(),
+        "waiting_for_children".to_string(),
+    );
+    session_store
+        .save_session(&session)
+        .await
+        .expect("session should save");
+
+    let metrics_storage = SqliteMetricsStorage::new(data_dir.join("metrics.db"));
+    metrics_storage
+        .init()
+        .await
+        .expect("metrics storage should initialize");
+    metrics_storage
+        .upsert_session_start("startup-stale-session", "test-model", session.created_at)
+        .await
+        .expect("session start metrics should save");
+
+    let state = AppState::new(data_dir)
+        .await
+        .expect("app state should initialize");
+
+    let sessions = state
+        .metrics_service
+        .sessions(Default::default())
+        .await
+        .expect("sessions query should succeed");
+    let session_metrics = sessions
+        .iter()
+        .find(|entry| entry.session_id == "startup-stale-session")
+        .expect("startup-stale-session metrics should exist");
+    assert_eq!(session_metrics.status, SessionStatus::AwaitingResponse);
+    assert!(session_metrics.completed_at.is_some());
+
+    let summary = state
+        .metrics_service
+        .summary(None, None)
+        .await
+        .expect("summary query should succeed");
+    assert_eq!(summary.active_sessions, 0);
+    assert_eq!(summary.awaiting_response_sessions, 1);
+    assert_eq!(summary.completed_sessions, 0);
+}
+
+#[tokio::test]
 async fn root_tools_include_server_overlays_and_session_note() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state = AppState::new(temp_dir.path().to_path_buf())
@@ -54,7 +116,7 @@ async fn root_tools_include_server_overlays_and_session_note() {
         .collect();
 
     assert!(names.contains("Task"));
-    assert!(names.contains("SubSession"));
+    assert!(names.contains("SubAgent"));
     assert!(names.contains("scheduler"));
     assert!(names.contains("session_history"));
     assert!(names.contains("memory"));
@@ -159,12 +221,12 @@ async fn overlay_tools_require_session_context() {
         Err(ToolError::Execution(msg)) if msg.contains("session_id")
     ));
 
-    let sub_session_result = state
+    let sub_agent_result = state
         .tools_for(ToolSurface::Root)
-        .execute(&make_tool_call("SubSession", json!({ "action": "list" })))
+        .execute(&make_tool_call("SubAgent", json!({ "action": "list" })))
         .await;
     assert!(matches!(
-        sub_session_result,
+        sub_agent_result,
         Err(ToolError::Execution(msg)) if msg.contains("session_id")
     ));
 }
