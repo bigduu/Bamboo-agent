@@ -257,6 +257,7 @@ impl MetricsWorker {
                     request_id,
                     status_code,
                     match status {
+                        ForwardStatus::Pending => "pending",
                         ForwardStatus::Success => "success",
                         ForwardStatus::Error => "error",
                     },

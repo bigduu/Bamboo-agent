@@ -76,7 +76,7 @@ pub struct AgentRunner {
     /// allows them to receive the most recent token usage info.
     pub last_budget_event: Option<AgentEvent>,
 
-    /// Small ring of critical state events (TaskListUpdated, SubSession*, etc.)
+    /// Small ring of critical state events (TaskListUpdated, SubAgent*, etc.)
     /// cached for replay to late/reconnecting subscribers.
     ///
     /// Bounded to [`CRITICAL_EVENTS_CAPACITY`] entries; oldest are evicted.

@@ -1,14 +1,17 @@
 //! Bridge between structured [`AgentRuntimeState`] and session metadata.
 //!
-//! During the migration period, runtime state is written to both the
-//! structured `session.agent_runtime_state` field and the legacy
-//! `session.metadata["agent.runtime.state"]` key. The read path always
-//! prefers the structured field.
+//! The read path prefers the structured `session.agent_runtime_state` field
+//! and falls back to the legacy `session.metadata["agent.runtime.state"]` key.
+//! The write path writes only to the structured field; the legacy metadata
+//! mirror is no longer maintained.
+
+use std::sync::Arc;
 
 use bamboo_agent_core::Session;
 use bamboo_domain::AgentRuntimeState;
 
 const METADATA_KEY: &str = "agent.runtime.state";
+const PENDING_INJECTED_MESSAGES_KEY: &str = "pending_injected_messages";
 
 /// Read `AgentRuntimeState` from session.
 ///
@@ -23,17 +26,12 @@ pub fn read_runtime_state(session: &Session) -> Option<AgentRuntimeState> {
     })
 }
 
-/// Write `AgentRuntimeState` to session.
+/// Write `AgentRuntimeState` to the structured session field.
 ///
-/// Dual-writes to both the structured field and the metadata key
-/// for backward compatibility during migration.
+/// Only writes to `session.agent_runtime_state`. The legacy metadata mirror
+/// was removed after the migration completed.
 pub fn write_runtime_state(session: &mut Session, state: &AgentRuntimeState) {
     session.agent_runtime_state = Some(state.clone());
-    if let Ok(serialized) = serde_json::to_string(state) {
-        session
-            .metadata
-            .insert(METADATA_KEY.to_string(), serialized);
-    }
 }
 
 /// Sync runtime state fields from existing metadata keys.
@@ -82,10 +80,72 @@ pub fn sync_from_metadata(session: &Session, state: &mut AgentRuntimeState) {
     }
 }
 
+/// Merge any queued follow-up messages that were injected via `send_message`
+/// while a session is running.
+///
+/// Loads the latest persisted session to check for `pending_injected_messages`
+/// metadata, appends them to the in-memory session as user messages, and
+/// clears the metadata flag.
+///
+/// Returns the number of messages merged.
+pub async fn merge_pending_injected_messages(
+    session: &mut Session,
+    storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
+    persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+) -> usize {
+    let Some(storage) = storage else { return 0 };
+
+    let Ok(Some(latest)) = storage.load_session(&session.id).await else {
+        return 0;
+    };
+
+    let Some(raw) = latest.metadata.get(PENDING_INJECTED_MESSAGES_KEY) else {
+        return 0;
+    };
+
+    let Ok(messages) = serde_json::from_str::<Vec<serde_json::Value>>(raw) else {
+        return 0;
+    };
+
+    let mut merged = 0usize;
+    for msg in messages {
+        if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
+            session.add_message(bamboo_agent_core::Message::user(content.to_string()));
+            merged += 1;
+        }
+    }
+
+    if merged > 0 {
+        session.metadata.remove(PENDING_INJECTED_MESSAGES_KEY);
+        session.updated_at = chrono::Utc::now();
+
+        if let Some(persistence) = persistence {
+            if let Err(error) = persistence.save_runtime_session(session).await {
+                tracing::warn!(
+                    "[{}] Failed to persist pending injected message cleanup: {}",
+                    session.id,
+                    error
+                );
+            }
+        }
+
+        tracing::info!(
+            "[{}] Merged {} injected message(s) from queued send_message at turn boundary",
+            session.id,
+            merged
+        );
+    }
+
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bamboo_agent_core::storage::Storage;
     use bamboo_domain::AgentStatusState;
+    use std::collections::HashMap;
+    use tokio::sync::RwLock;
 
     fn test_session() -> Session {
         Session::new("test-session", "test-model")
@@ -142,14 +202,15 @@ mod tests {
     }
 
     #[test]
-    fn write_dual_writes() {
+    fn write_only_structured_field() {
         let mut session = test_session();
         let state = AgentRuntimeState::new("run-3");
 
         write_runtime_state(&mut session, &state);
 
         assert!(session.agent_runtime_state.is_some());
-        assert!(session.metadata.contains_key(METADATA_KEY));
+        // Legacy metadata mirror is no longer written
+        assert!(!session.metadata.contains_key(METADATA_KEY));
         assert_eq!(
             session.agent_runtime_state.as_ref().unwrap().run_id,
             "run-3"
@@ -173,5 +234,107 @@ mod tests {
             state.llm.responses_previous_id,
             Some("resp-123".to_string())
         );
+    }
+
+    // --- Pending injected message tests ---
+
+    #[derive(Default)]
+    struct TestStorage {
+        sessions: RwLock<HashMap<String, Session>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for TestStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.sessions
+                .write()
+                .await
+                .insert(session.id.clone(), session.clone());
+            Ok(())
+        }
+
+        async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+            Ok(self.sessions.read().await.get(session_id).cloned())
+        }
+
+        async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
+            Ok(self.sessions.write().await.remove(session_id).is_some())
+        }
+    }
+
+    struct TestPersistence(Arc<dyn Storage>);
+
+    #[async_trait::async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for TestPersistence {
+        async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            self.0.save_session(session).await
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_pending_injected_messages_merges_and_clears() {
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            Arc::new(TestPersistence(storage.clone()));
+        let mut persisted =
+            Session::new_child("child-merge", "parent", "model", "Child");
+        persisted.add_message(bamboo_agent_core::Message::system("system"));
+        persisted.add_message(bamboo_agent_core::Message::user("original task"));
+        persisted.metadata.insert(
+            PENDING_INJECTED_MESSAGES_KEY.to_string(),
+            serde_json::json!([
+                {
+                    "content": "queued correction",
+                    "created_at": chrono::Utc::now(),
+                }
+            ])
+            .to_string(),
+        );
+        storage
+            .save_session(&persisted)
+            .await
+            .expect("persisted child should be saved");
+
+        let mut running = persisted.clone();
+        running.metadata.remove(PENDING_INJECTED_MESSAGES_KEY);
+
+        let count = merge_pending_injected_messages(
+            &mut running,
+            Some(&storage),
+            Some(&persistence),
+        )
+        .await;
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            running
+                .messages
+                .last()
+                .map(|message| message.content.as_str()),
+            Some("queued correction")
+        );
+        assert!(!running.metadata.contains_key(PENDING_INJECTED_MESSAGES_KEY));
+        let saved = storage
+            .load_session("child-merge")
+            .await
+            .expect("load should succeed")
+            .expect("session should exist");
+        assert!(!saved.metadata.contains_key(PENDING_INJECTED_MESSAGES_KEY));
+
+        // Second merge is a no-op
+        let count2 = merge_pending_injected_messages(
+            &mut running,
+            Some(&storage),
+            Some(&persistence),
+        )
+        .await;
+        assert_eq!(count2, 0);
+    }
+
+    #[tokio::test]
+    async fn merge_pending_injected_messages_returns_zero_without_storage() {
+        let mut session = test_session();
+        let count = merge_pending_injected_messages(&mut session, None, None).await;
+        assert_eq!(count, 0);
     }
 }

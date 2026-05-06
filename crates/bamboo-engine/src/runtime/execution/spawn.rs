@@ -31,6 +31,9 @@ pub struct SpawnJob {
     pub parent_session_id: String,
     pub child_session_id: String,
     pub model: String,
+    /// Tool names to hide from the LLM schema for this child session.
+    /// Computed from the child's `subagent_type` profile policy.
+    pub disabled_tools: Option<Vec<String>>,
 }
 
 /// Trait for external child session runtimes (e.g. A2A, CLI adapters).
@@ -62,7 +65,7 @@ pub struct SpawnContext {
     pub external_child_runner: Option<Arc<dyn ExternalChildRunner>>,
     pub provider_router: Option<Arc<ProviderModelRouter>>,
     /// Optional application-layer completion hook. The engine still emits
-    /// `SubSessionCompleted` to the parent stream itself; this hook lets the
+    /// `SubAgentCompleted` to the parent stream itself; this hook lets the
     /// server persist parent wait state and resume the parent runner without
     /// introducing an engine -> AppState dependency.
     pub completion_handler: Option<Arc<dyn ChildCompletionHandler>>,
@@ -166,7 +169,7 @@ async fn publish_child_completion(
     completion_handler: Option<Arc<dyn ChildCompletionHandler>>,
     completion: ChildCompletion,
 ) {
-    let _ = parent_tx.send(AgentEvent::SubSessionCompleted {
+    let _ = parent_tx.send(AgentEvent::SubAgentCompleted {
         parent_session_id: completion.parent_session_id.clone(),
         child_session_id: completion.child_session_id.clone(),
         status: completion.status.clone(),
@@ -347,6 +350,15 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
         }
     };
 
+    // Register the child's workspace in the global state so tools
+    // (Read, Glob, Grep, Bash, etc.) can resolve relative paths.
+    if let Some(ref ws) = session.workspace {
+        bamboo_agent_core::workspace_state::set_workspace(
+            &session.id,
+            std::path::PathBuf::from(ws),
+        );
+    }
+
     if session.kind != SessionKind::Child {
         let error = "spawn job child session is not kind=child".to_string();
         publish_child_completion_parts(
@@ -428,7 +440,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
                     evt = rx.recv() => {
                         match evt {
                             Ok(event) => {
-                                let _ = parent_tx.send(AgentEvent::SubSessionEvent {
+                                let _ = parent_tx.send(AgentEvent::SubAgentEvent {
                                     parent_session_id: job_clone.parent_session_id.clone(),
                                     child_session_id: job_clone.child_session_id.clone(),
                                     event: Box::new(event),
@@ -454,7 +466,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
                 tokio::select! {
                     _ = done.cancelled() => break,
                     _ = ticker.tick() => {
-                        let _ = parent_tx.send(AgentEvent::SubSessionHeartbeat {
+                        let _ = parent_tx.send(AgentEvent::SubAgentHeartbeat {
                             parent_session_id: job_clone.parent_session_id.clone(),
                             child_session_id: job_clone.child_session_id.clone(),
                             timestamp: Utc::now(),
@@ -532,6 +544,8 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
         } else {
             let (provider_override, provider_name) =
                 resolve_child_provider_override(provider_router.as_ref(), &session, &model);
+            let disabled_tools: Option<std::collections::BTreeSet<String>> =
+                job.disabled_tools.map(|v| v.into_iter().collect());
             agent
                 .execute(
                     &mut session,
@@ -546,7 +560,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
                         background_model: None,
                         background_model_provider: None,
                         reasoning_effort: None,
-                        disabled_tools: None,
+                        disabled_tools,
                         disabled_skill_ids: None,
                         selected_skill_ids: None,
                         selected_skill_mode: None,
@@ -573,19 +587,12 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
 
         // Merge any queued injected messages that the pipeline didn't pick up
         // (e.g. if the loop exited before the next turn boundary).
-        if let Ok(Some(latest)) = agent.storage().load_session(&session_id_clone).await {
-            if let Some(raw) = latest.metadata.get("pending_injected_messages") {
-                if let Ok(messages) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
-                    for msg in messages {
-                        if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
-                            session
-                                .add_message(bamboo_agent_core::Message::user(content.to_string()));
-                        }
-                    }
-                    session.metadata.remove("pending_injected_messages");
-                }
-            }
-        }
+        crate::runtime::runner::state_bridge::merge_pending_injected_messages(
+            &mut session,
+            Some(agent.storage()),
+            Some(agent.persistence()),
+        )
+        .await;
 
         // Persist final session snapshot.
         session

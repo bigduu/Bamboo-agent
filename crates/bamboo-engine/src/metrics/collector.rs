@@ -55,6 +55,7 @@ enum CollectorCommand {
     },
     ContextCompressed {
         session_id: String,
+        round_id: String,
         messages_compressed: u32,
         tokens_saved: u32,
         usage_before_percent: f64,
@@ -185,6 +186,7 @@ impl MetricsCollector {
                     }
                     CollectorCommand::ContextCompressed {
                         session_id,
+                        round_id,
                         messages_compressed,
                         tokens_saved,
                         usage_before_percent,
@@ -193,14 +195,13 @@ impl MetricsCollector {
                         latency_ms,
                     } => {
                         tracing::info!(
-                            "[{}] metrics: context compressed — messages={}, tokens_saved={}, before={:.1}%, after={:.1}%, trigger={}, latency={}ms",
-                            session_id, messages_compressed, tokens_saved,
+                            "[{}] metrics: context compressed — round={}, messages={}, tokens_saved={}, before={:.1}%, after={:.1}%, trigger={}, latency={}ms",
+                            session_id, round_id, messages_compressed, tokens_saved,
                             usage_before_percent, usage_after_percent, trigger_type, latency_ms,
                         );
-                        // No-op storage for now; metrics are logged and emitted as AgentEvent.
-                        // Per-round and per-session persistence can be added when the schema
-                        // gains compression columns.
-                        Ok(())
+                        storage
+                            .record_round_compression(&round_id, Utc::now(), tokens_saved)
+                            .await
                     }
                     CollectorCommand::ForwardStarted {
                         forward_id,
@@ -422,6 +423,7 @@ impl MetricsCollector {
     pub fn context_compressed(
         &self,
         session_id: impl Into<String>,
+        round_id: impl Into<String>,
         messages_compressed: u32,
         tokens_saved: u32,
         usage_before_percent: f64,
@@ -431,6 +433,7 @@ impl MetricsCollector {
     ) {
         let _ = self.tx.send(CollectorCommand::ContextCompressed {
             session_id: session_id.into(),
+            round_id: round_id.into(),
             messages_compressed,
             tokens_saved,
             usage_before_percent,

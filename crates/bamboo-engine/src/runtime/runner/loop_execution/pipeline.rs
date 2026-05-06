@@ -63,61 +63,6 @@ fn is_overflow_recoverable(error: &AgentError) -> bool {
     matches!(error, AgentError::LLMOverflow(_))
 }
 
-// ---- Pending injected message merge ----
-
-/// Merge any queued follow-up messages that were injected via `send_message`
-/// while the child session is running. Loads the latest persisted session to
-/// check for `pending_injected_messages` metadata, appends them to the in-memory
-/// session, and clears the metadata flag.
-async fn maybe_merge_pending_injected_messages(
-    session: &mut Session,
-    storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
-    persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
-) {
-    let Some(storage) = storage else { return };
-
-    let Ok(Some(latest)) = storage.load_session(&session.id).await else {
-        return;
-    };
-
-    let Some(raw) = latest.metadata.get("pending_injected_messages") else {
-        return;
-    };
-
-    let Ok(messages) = serde_json::from_str::<Vec<serde_json::Value>>(raw) else {
-        return;
-    };
-
-    let mut merged = 0usize;
-    for msg in messages {
-        if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
-            session.add_message(Message::user(content.to_string()));
-            merged += 1;
-        }
-    }
-
-    if merged > 0 {
-        session.metadata.remove("pending_injected_messages");
-        session.updated_at = chrono::Utc::now();
-
-        if let Some(persistence) = persistence {
-            if let Err(error) = persistence.save_runtime_session(session).await {
-                tracing::warn!(
-                    "[{}] Failed to persist pending injected message cleanup: {}",
-                    session.id,
-                    error
-                );
-            }
-        }
-
-        tracing::info!(
-            "[{}] Merged {} injected message(s) from queued send_message at turn boundary",
-            session.id,
-            merged
-        );
-    }
-}
-
 // ---- Turn outcome (replaces RoundFlowOutcome) ----
 
 struct TurnOutcome {
@@ -418,6 +363,7 @@ pub(super) async fn run_pipeline(
         state.runtime_state.round.current_round = turn_counter;
 
         let round_id = format!("{}-round-{}", state.session_id, turn_counter + 1);
+        state.runtime_state.round.last_round_id = Some(round_id.clone());
 
         // --- Prompt context refresh ---
         let runtime_context = PromptMemoryRuntimeContext {
@@ -459,7 +405,7 @@ pub(super) async fn run_pipeline(
             .await;
 
         // --- Merge any queued injected messages from send_message ---
-        maybe_merge_pending_injected_messages(
+        state_bridge::merge_pending_injected_messages(
             session,
             config.storage.as_ref(),
             config.persistence.as_ref(),
@@ -747,7 +693,7 @@ pub(super) async fn run_pipeline(
                 hook_point: Some("AfterToolExecution".to_string()),
             });
 
-            // The SubSession adapter registers durable wait details against the
+            // The SubAgent adapter registers durable wait details against the
             // persisted parent while the runner still owns this local session
             // snapshot. Merge those details before final save so we do not
             // clobber them when this suspended runner tears down.
@@ -813,9 +759,10 @@ pub(super) async fn run_pipeline(
 mod tests {
     use super::super::startup::OverflowRecoveryState;
     use super::{
-        is_overflow_recoverable, map_turn_error_status, maybe_merge_pending_injected_messages,
+        is_overflow_recoverable, map_turn_error_status,
         should_retry_turn_error,
     };
+    use crate::runtime::runner::state_bridge;
     use crate::metrics::{
         RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
         TokenUsage as MetricsTokenUsage,
@@ -885,7 +832,7 @@ mod tests {
         let mut running = persisted.clone();
         running.metadata.remove("pending_injected_messages");
 
-        maybe_merge_pending_injected_messages(&mut running, Some(&storage), Some(&persistence))
+        state_bridge::merge_pending_injected_messages(&mut running, Some(&storage), Some(&persistence))
             .await;
 
         assert_eq!(
@@ -904,7 +851,7 @@ mod tests {
         assert!(!saved.metadata.contains_key("pending_injected_messages"));
 
         let count_after_first_merge = running.messages.len();
-        maybe_merge_pending_injected_messages(&mut running, Some(&storage), Some(&persistence))
+        state_bridge::merge_pending_injected_messages(&mut running, Some(&storage), Some(&persistence))
             .await;
         assert_eq!(running.messages.len(), count_after_first_merge);
     }
@@ -1183,7 +1130,7 @@ fn heuristic_complexity(
     use crate::runtime::complexity_classifier::TaskComplexity;
 
     let simple_tools = ["Read", "Glob", "Grep", "Bash"];
-    let complex_tools = ["Agent", "SubSession", "TodoWrite"];
+    let complex_tools = ["Agent", "SubAgent", "TodoWrite"];
 
     let names: Vec<&str> = tool_calls
         .iter()

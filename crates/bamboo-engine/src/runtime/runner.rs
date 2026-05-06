@@ -24,7 +24,7 @@ pub(crate) mod round_lifecycle;
 pub(crate) mod round_prelude;
 pub(crate) mod session_finalize;
 pub(crate) mod session_setup;
-pub(super) mod state_bridge;
+pub(crate) mod state_bridge;
 mod task_lifecycle;
 pub(crate) mod tool_execution;
 mod workspace_context;

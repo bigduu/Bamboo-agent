@@ -18,7 +18,7 @@ const STRICT_ARGUMENT_TOOL_NAMES: [&str; 11] = [
     "apply_patch",
     "Bash",
     "Task",
-    "SubSession",
+    "SubAgent",
     "scheduler",
     "sub_session_manager",
     "session_note",

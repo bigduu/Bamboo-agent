@@ -362,7 +362,13 @@ impl AgentRuntime {
                 .map(|r| r.model.clone()),
             provider_name: Some(provider_name.unwrap_or_else(|| config.provider.clone())),
             reasoning_effort,
-            disabled_tools: disabled_tools.unwrap_or_else(|| config.disabled_tool_names()),
+            disabled_tools: {
+                let mut merged = config.disabled_tool_names();
+                if let Some(dt) = disabled_tools {
+                    merged.extend(dt);
+                }
+                merged
+            },
             image_fallback,
             prompt_memory_flags: config
                 .memory

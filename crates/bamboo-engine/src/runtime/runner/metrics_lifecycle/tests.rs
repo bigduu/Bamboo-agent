@@ -146,10 +146,15 @@ async fn record_session_completed_if_resolved_respects_pending_question_state() 
     record_session_started(Some(&collector), "metrics-s3", "test-model", started_at, 1);
     record_session_completed_if_resolved(Some(&collector), "metrics-s3", 9, true);
 
-    let running =
-        wait_for_session_state(storage.as_ref(), "metrics-s3", SessionStatus::Running, 9).await;
-    assert_eq!(running.status, SessionStatus::Running);
-    assert_eq!(running.message_count, 9);
+    let awaiting = wait_for_session_state(
+        storage.as_ref(),
+        "metrics-s3",
+        SessionStatus::AwaitingResponse,
+        9,
+    )
+    .await;
+    assert_eq!(awaiting.status, SessionStatus::AwaitingResponse);
+    assert_eq!(awaiting.message_count, 9);
 
     record_session_completed_if_resolved(Some(&collector), "metrics-s3", 10, false);
     let completed =

@@ -102,7 +102,10 @@ pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -
         }
         ToolHandlingOutcome::WaitingForChildren => {
             ctx.state.mark_waiting_for_children();
-            true
+            // Do NOT break — remaining tool calls in this round may spawn
+            // additional children. The pipeline will suspend the root agent
+            // after ALL tool calls finish, once `waiting_for_children` is set.
+            false
         }
         ToolHandlingOutcome::Continue => false,
     }

@@ -36,7 +36,7 @@ The user has indicated they want you to PLAN before implementing. You MUST NOT:
 You MAY:
 - Read files, search code (Read, Glob, Grep, GetFileInfo)
 - Fetch web content (WebFetch, WebSearch)
-- Use SubSession with subagent_type="plan" to spawn read-only exploration agents
+- Use SubAgent with subagent_type="plan" to spawn read-only exploration agents
 - Update the task list (Task tool) — tasks created in plan mode default to phase=planning
 - Write notes to session memory (MemoryNote tool)
 

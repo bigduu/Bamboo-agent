@@ -419,6 +419,11 @@ async fn maybe_apply_host_context_compression_with_budget(
         };
         collector.context_compressed(
             session_id,
+            session
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.round.last_round_id.clone())
+                .unwrap_or_else(|| session_id.to_string()),
             compressed_count as u32,
             tokens_saved as u32,
             usage_percent,

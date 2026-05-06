@@ -54,6 +54,8 @@ impl RoundStatus {
 pub enum SessionStatus {
     /// Session is currently active
     Running,
+    /// Session execution is paused awaiting an external response or resume trigger
+    AwaitingResponse,
     /// Session completed successfully
     Completed,
     /// Session ended with an error
@@ -66,6 +68,7 @@ impl SessionStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::AwaitingResponse => "awaiting_response",
             Self::Completed => "completed",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
@@ -75,6 +78,7 @@ impl SessionStatus {
     pub fn from_db(value: &str) -> Option<Self> {
         match value {
             "running" => Some(Self::Running),
+            "awaiting_response" => Some(Self::AwaitingResponse),
             "completed" => Some(Self::Completed),
             "error" => Some(Self::Error),
             "cancelled" => Some(Self::Cancelled),
@@ -217,6 +221,24 @@ pub struct MetricsSummary {
     /// Total number of prompt-side cached tool outputs.
     #[serde(default)]
     pub prompt_cached_tool_outputs: u64,
+    /// Total number of context compression events.
+    #[serde(default)]
+    pub total_compression_events: u64,
+    /// Total tokens saved by context compression.
+    #[serde(default)]
+    pub total_tokens_saved: u64,
+    /// Number of completed sessions in the selected range.
+    #[serde(default)]
+    pub completed_sessions: u64,
+    /// Number of sessions currently paused awaiting an external response.
+    #[serde(default)]
+    pub awaiting_response_sessions: u64,
+    /// Number of sessions that ended with an error.
+    #[serde(default)]
+    pub error_sessions: u64,
+    /// Number of sessions cancelled by the user.
+    #[serde(default)]
+    pub cancelled_sessions: u64,
     /// Total number of execute sync mismatches observed for the filtered period.
     #[serde(default)]
     pub total_sync_mismatches: u64,
@@ -269,6 +291,8 @@ pub struct SessionMetricsFilter {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ForwardStatus {
+    /// Request has been recorded but not yet completed
+    Pending,
     /// Request succeeded
     Success,
     /// Request failed
@@ -278,6 +302,7 @@ pub enum ForwardStatus {
 impl ForwardStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Success => "success",
             Self::Error => "error",
         }
@@ -285,6 +310,7 @@ impl ForwardStatus {
 
     pub fn from_db(value: &str) -> Option<Self> {
         match value {
+            "pending" => Some(Self::Pending),
             "success" => Some(Self::Success),
             "error" => Some(Self::Error),
             _ => None,
@@ -405,6 +431,7 @@ mod tests {
     #[test]
     fn test_session_status_as_str() {
         assert_eq!(SessionStatus::Running.as_str(), "running");
+        assert_eq!(SessionStatus::AwaitingResponse.as_str(), "awaiting_response");
         assert_eq!(SessionStatus::Completed.as_str(), "completed");
         assert_eq!(SessionStatus::Error.as_str(), "error");
         assert_eq!(SessionStatus::Cancelled.as_str(), "cancelled");
@@ -417,6 +444,10 @@ mod tests {
             Some(SessionStatus::Running)
         );
         assert_eq!(
+            SessionStatus::from_db("awaiting_response"),
+            Some(SessionStatus::AwaitingResponse)
+        );
+        assert_eq!(
             SessionStatus::from_db("completed"),
             Some(SessionStatus::Completed)
         );
@@ -425,12 +456,14 @@ mod tests {
 
     #[test]
     fn test_forward_status_as_str() {
+        assert_eq!(ForwardStatus::Pending.as_str(), "pending");
         assert_eq!(ForwardStatus::Success.as_str(), "success");
         assert_eq!(ForwardStatus::Error.as_str(), "error");
     }
 
     #[test]
     fn test_forward_status_from_db() {
+        assert_eq!(ForwardStatus::from_db("pending"), Some(ForwardStatus::Pending));
         assert_eq!(
             ForwardStatus::from_db("success"),
             Some(ForwardStatus::Success)
@@ -551,6 +584,12 @@ mod tests {
             total_tool_calls: 500,
             active_sessions: 5,
             prompt_cached_tool_outputs: 0,
+            total_compression_events: 0,
+            total_tokens_saved: 0,
+            completed_sessions: 80,
+            awaiting_response_sessions: 10,
+            error_sessions: 7,
+            cancelled_sessions: 3,
             total_sync_mismatches: 0,
             sync_mismatch_breakdown: HashMap::new(),
         };
@@ -639,7 +678,7 @@ mod tests {
 
     #[test]
     fn test_forward_status_clone() {
-        let status = ForwardStatus::Success;
+        let status = ForwardStatus::Pending;
         let cloned = status.clone();
         assert_eq!(status, cloned);
     }
@@ -669,6 +708,7 @@ mod tests {
     fn test_session_status_eq() {
         assert_eq!(SessionStatus::Running, SessionStatus::Running);
         assert_ne!(SessionStatus::Running, SessionStatus::Completed);
+        assert_ne!(SessionStatus::AwaitingResponse, SessionStatus::Completed);
     }
 
     #[test]
@@ -685,5 +725,18 @@ mod tests {
         let metrics: SessionMetrics = serde_json::from_str(json).unwrap();
         assert_eq!(metrics.total_compression_events, 0);
         assert_eq!(metrics.total_tokens_saved, 0);
+    }
+
+    #[test]
+    fn test_metrics_summary_additive_fields_deserialize_with_defaults() {
+        let json = r#"{"total_sessions":1,"total_tokens":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0},"total_tool_calls":0,"active_sessions":0}"#;
+        let summary: MetricsSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(summary.prompt_cached_tool_outputs, 0);
+        assert_eq!(summary.total_compression_events, 0);
+        assert_eq!(summary.total_tokens_saved, 0);
+        assert_eq!(summary.completed_sessions, 0);
+        assert_eq!(summary.awaiting_response_sessions, 0);
+        assert_eq!(summary.error_sessions, 0);
+        assert_eq!(summary.cancelled_sessions, 0);
     }
 }

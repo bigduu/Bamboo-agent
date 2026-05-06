@@ -35,9 +35,11 @@ pub(crate) async fn finalize_session(
 
     send_complete_event_if_needed(event_tx, sent_complete).await;
 
-    record_session_resolution(metrics_collector, session_id, session);
+    record_session_resolution(metrics_collector, session_id, session, runtime_state);
 
-    runtime_state.status = AgentStatusState::Completed;
+    if !matches!(runtime_state.status, AgentStatusState::Suspended) {
+        runtime_state.status = AgentStatusState::Completed;
+    }
     super::state_bridge::write_runtime_state(session, runtime_state);
 }
 

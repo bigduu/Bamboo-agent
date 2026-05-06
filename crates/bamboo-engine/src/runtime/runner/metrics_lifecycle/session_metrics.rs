@@ -37,18 +37,20 @@ pub(in crate::runtime::runner) fn record_session_completed_if_resolved(
     metrics_collector: Option<&MetricsCollector>,
     session_id: &str,
     message_count: u32,
-    has_pending_question: bool,
+    awaiting_response: bool,
 ) {
     let Some(metrics) = metrics_collector else {
         return;
     };
 
     metrics.session_message_count(session_id.to_string(), message_count, Utc::now());
-    if !has_pending_question {
-        metrics.session_completed(
-            session_id.to_string(),
-            MetricsSessionStatus::Completed,
-            Utc::now(),
-        );
-    }
+    metrics.session_completed(
+        session_id.to_string(),
+        if awaiting_response {
+            MetricsSessionStatus::AwaitingResponse
+        } else {
+            MetricsSessionStatus::Completed
+        },
+        Utc::now(),
+    );
 }

@@ -203,7 +203,7 @@ impl Default for AgentLoopConfig {
                 "apply_patch".into(),
                 "Bash".into(),
                 "Task".into(),
-                "SubSession".into(),
+                "SubAgent".into(),
                 "scheduler".into(),
                 "sub_session_manager".into(),
                 "session_note".into(),
