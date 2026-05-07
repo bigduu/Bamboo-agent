@@ -863,6 +863,7 @@ async fn collect_stream_text(
         reasoning_effort: Some(ReasoningEffort::High),
         parallel_tool_calls: None,
         responses: None,
+        request_purpose: Some("auto_dream".to_string()),
     };
 
     let mut stream = provider

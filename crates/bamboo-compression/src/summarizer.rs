@@ -401,6 +401,7 @@ Guidelines:
             reasoning_effort: Some(ReasoningEffort::High),
             parallel_tool_calls: None,
             responses: None,
+            request_purpose: Some("compression".to_string()),
         };
         let stream = self
             .llm

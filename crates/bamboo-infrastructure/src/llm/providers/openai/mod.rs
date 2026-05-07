@@ -160,6 +160,7 @@ impl OpenAIProvider {
         responses_options: Option<&ResponsesRequestOptions>,
         parallel_tool_calls: Option<bool>,
         reasoning_source: &str,
+        request_purpose: &str,
     ) -> Result<LLMStream> {
         let mut body = build_responses_body(
             model,
@@ -321,6 +322,7 @@ impl LLMProvider for OpenAIProvider {
                     responses_options,
                     parallel_tool_calls,
                     reasoning_source,
+                    request_purpose,
                 )
                 .await;
         }
@@ -433,6 +435,7 @@ impl LLMProvider for OpenAIProvider {
                         responses_options,
                         parallel_tool_calls,
                         reasoning_source,
+                        request_purpose,
                     )
                     .await;
             }

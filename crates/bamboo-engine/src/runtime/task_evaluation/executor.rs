@@ -107,6 +107,7 @@ pub async fn evaluate_task_progress(
         reasoning_effort: request_reasoning_effort,
         parallel_tool_calls: None,
         responses: None,
+        request_purpose: Some("task_evaluation".to_string()),
     };
     match llm
         .chat_stream_with_options(&messages, &tools, Some(500), model, Some(&request_options))

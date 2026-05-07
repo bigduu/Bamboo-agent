@@ -175,6 +175,7 @@ pub(super) async fn execute_llm_stream(
         reasoning_effort,
         parallel_tool_calls: Some(true),
         responses: Some(responses_options),
+        request_purpose: Some("agent_loop".to_string()),
     };
 
     if !supports_previous_response_id {

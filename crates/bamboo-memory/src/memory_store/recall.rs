@@ -370,6 +370,7 @@ async fn rerank_candidate_ids(
         reasoning_effort: Some(ReasoningEffort::High),
         parallel_tool_calls: None,
         responses: None,
+        request_purpose: Some("memory_rerank".to_string()),
     };
 
     let mut stream = context
