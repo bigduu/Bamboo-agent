@@ -584,6 +584,7 @@ impl CopilotProvider {
         parallel_tool_calls: Option<bool>,
         reasoning_source: &str,
         session_log_id: &str,
+        request_purpose: &str,
     ) -> Result<LLMStream> {
         let url = "https://api.githubcopilot.com/responses";
         let mut effective_responses_options = responses_options.cloned().unwrap_or_default();
@@ -1130,6 +1131,7 @@ impl LLMProvider for CopilotProvider {
                     parallel_tool_calls,
                     reasoning_source,
                     session_log_id,
+                    request_purpose,
                 )
                 .await;
         }
@@ -1389,6 +1391,7 @@ impl LLMProvider for CopilotProvider {
                             parallel_tool_calls,
                             reasoning_source,
                             session_log_id,
+                            request_purpose,
                         )
                         .await;
                 }
