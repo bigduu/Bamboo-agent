@@ -104,6 +104,8 @@ pub struct LLMRequestOptions {
     pub parallel_tool_calls: Option<bool>,
     /// Responses API specific overrides.
     pub responses: Option<ResponsesRequestOptions>,
+    /// Purpose of this request for observability (e.g., "agent_loop", "task_evaluation").
+    pub request_purpose: Option<String>,
 }
 
 /// Trait for LLM provider implementations

@@ -154,6 +154,10 @@ impl LLMProvider for AnthropicProvider {
             "none"
         };
 
+        let request_purpose = options
+            .and_then(|o| o.request_purpose.as_deref())
+            .unwrap_or("unknown");
+
         tracing::debug!("Anthropic provider using model: {}", model);
 
         let mut body = build_anthropic_request(
@@ -178,7 +182,7 @@ impl LLMProvider for AnthropicProvider {
             .and_then(|thinking| thinking.get("budget_tokens"))
             .and_then(|value| value.as_u64());
         tracing::info!(
-            "Anthropic request model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_enabled={} thinking_budget_tokens={} max_tokens={}",
+            "Anthropic request model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_enabled={} thinking_budget_tokens={} max_tokens={} purpose={}",
             model,
             applied_reasoning_effort
                 .map(ReasoningEffort::as_str)
@@ -189,7 +193,8 @@ impl LLMProvider for AnthropicProvider {
             thinking_budget_tokens
                 .map(|tokens| tokens.to_string())
                 .unwrap_or_else(|| "none".to_string()),
-            max_tokens
+            max_tokens,
+            request_purpose
         );
         let headers = self.build_headers(request_overrides::ENDPOINT_MESSAGES, Some(model))?;
 
@@ -233,10 +238,11 @@ impl LLMProvider for AnthropicProvider {
                 thinking_enabled = false;
                 thinking_budget_tokens = None;
                 tracing::info!(
-                    "Anthropic request retry model='{}' reasoning_effort=none reasoning_source={} request_reasoning_enabled=false thinking_enabled=false thinking_budget_tokens=none max_tokens={}",
+                    "Anthropic request retry model='{}' reasoning_effort=none reasoning_source={} request_reasoning_enabled=false thinking_enabled=false thinking_budget_tokens=none max_tokens={} purpose={}",
                     model,
                     reasoning_source,
-                    max_tokens
+                    max_tokens,
+                    request_purpose
                 );
                 response = self
                     .client

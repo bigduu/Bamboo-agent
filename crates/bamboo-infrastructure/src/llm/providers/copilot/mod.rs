@@ -616,7 +616,7 @@ impl CopilotProvider {
             model
         );
         tracing::info!(
-            "[{}] Copilot request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
+            "[{}] Copilot request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose={}",
             session_log_id,
             model,
             reasoning_effort
@@ -626,7 +626,8 @@ impl CopilotProvider {
             reasoning_effort.is_some(),
             max_output_tokens
                 .map(|tokens| tokens.to_string())
-                .unwrap_or_else(|| "none".to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            request_purpose
         );
 
         let request_headers = self.build_llm_headers(
@@ -1089,6 +1090,9 @@ impl LLMProvider for CopilotProvider {
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
         let responses_options = options.and_then(|o| o.responses.as_ref());
+        let request_purpose = options
+            .and_then(|o| o.request_purpose.as_deref())
+            .unwrap_or("unknown");
         let reasoning_source = if request_reasoning_effort.is_some() {
             "request"
         } else if self.default_reasoning_effort.is_some() {
@@ -1159,7 +1163,7 @@ impl LLMProvider for CopilotProvider {
             Some(upstream_model),
         );
         tracing::info!(
-            "[{}] Copilot request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
+            "[{}] Copilot request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose={}",
             session_log_id,
             upstream_model,
             reasoning_effort
@@ -1169,7 +1173,8 @@ impl LLMProvider for CopilotProvider {
             reasoning_effort.is_some(),
             max_output_tokens
                 .map(|tokens| tokens.to_string())
-                .unwrap_or_else(|| "none".to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            request_purpose
         );
 
         tracing::debug!(

@@ -140,6 +140,9 @@ impl LLMProvider for GeminiProvider {
         } else {
             "none"
         };
+        let request_purpose = options
+            .and_then(|o| o.request_purpose.as_deref())
+            .unwrap_or("unknown");
         let mut applied_reasoning_effort = reasoning_effort;
         let mut applied_thinking_budget =
             reasoning_effort.and_then(Self::thinking_budget_for_effort);
@@ -189,7 +192,7 @@ impl LLMProvider for GeminiProvider {
             Some(model),
         );
         tracing::info!(
-            "Gemini request protocol=streamGenerateContent model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_budget={} max_output_tokens={}",
+            "Gemini request protocol=streamGenerateContent model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_budget={} max_output_tokens={} purpose={}",
             model,
             reasoning_effort
                 .map(ReasoningEffort::as_str)
@@ -201,7 +204,8 @@ impl LLMProvider for GeminiProvider {
                 .unwrap_or_else(|| "none".to_string()),
             max_output_tokens
                 .map(|tokens| tokens.to_string())
-                .unwrap_or_else(|| "none".to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            request_purpose
         );
         tracing::debug!(
             "Gemini request: {}",
@@ -245,12 +249,13 @@ impl LLMProvider for GeminiProvider {
                 applied_reasoning_effort = None;
                 applied_thinking_budget = None;
                 tracing::info!(
-                    "Gemini request retry protocol=streamGenerateContent model='{}' reasoning_effort=none reasoning_source={} request_reasoning_enabled=false thinking_budget=none max_output_tokens={}",
+                    "Gemini request retry protocol=streamGenerateContent model='{}' reasoning_effort=none reasoning_source={} request_reasoning_enabled=false thinking_budget=none max_output_tokens={} purpose={}",
                     model,
                     reasoning_source,
                     max_output_tokens
                         .map(|tokens| tokens.to_string())
-                        .unwrap_or_else(|| "none".to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    request_purpose
                 );
                 let fallback_headers = self.build_headers(
                     request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,

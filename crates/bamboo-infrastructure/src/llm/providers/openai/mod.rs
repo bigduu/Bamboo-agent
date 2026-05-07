@@ -177,7 +177,7 @@ impl OpenAIProvider {
             Some(model),
         );
         tracing::info!(
-            "OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
+            "OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose={}",
             model,
             reasoning_effort
                 .map(ReasoningEffort::as_str)
@@ -186,7 +186,8 @@ impl OpenAIProvider {
             reasoning_effort.is_some(),
             max_output_tokens
                 .map(|tokens| tokens.to_string())
-                .unwrap_or_else(|| "none".to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            request_purpose
         );
 
         let headers = self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
@@ -298,6 +299,9 @@ impl LLMProvider for OpenAIProvider {
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
         let responses_options = options.and_then(|o| o.responses.as_ref());
+        let request_purpose = options
+            .and_then(|o| o.request_purpose.as_deref())
+            .unwrap_or("unknown");
         let reasoning_source = if request_reasoning_effort.is_some() {
             "request"
         } else if self.default_reasoning_effort.is_some() {
@@ -337,7 +341,7 @@ impl LLMProvider for OpenAIProvider {
             Some(model),
         );
         tracing::info!(
-            "OpenAI request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={}",
+            "OpenAI request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose={}",
             model,
             reasoning_effort
                 .map(ReasoningEffort::as_str)
@@ -346,7 +350,8 @@ impl LLMProvider for OpenAIProvider {
             reasoning_effort.is_some(),
             max_output_tokens
                 .map(|tokens| tokens.to_string())
-                .unwrap_or_else(|| "none".to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            request_purpose
         );
 
         let headers =

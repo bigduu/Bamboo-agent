@@ -106,11 +106,15 @@ impl LLMProvider for BodhiProvider {
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
+        let request_purpose = options
+            .and_then(|o| o.request_purpose.as_deref())
+            .unwrap_or("unknown");
 
         tracing::info!(
-            "Bodhi proxy request target={} model='{}'",
+            "Bodhi proxy request target={} model='{}' purpose={}",
             self.target_provider,
-            model
+            model,
+            request_purpose
         );
 
         match self.target_provider.as_str() {
