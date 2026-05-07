@@ -39,7 +39,7 @@ const DEFAULT_CSP: &str = concat!(
     "style-src 'self' 'unsafe-inline'; ",
     "img-src 'self' data: https:; ",
     "font-src 'self' data:; ",
-    "connect-src 'self' ws: wss: http://bodhi.bigduu.com:9562 https://bodhi.bigduu.com:9562; ",
+    "connect-src 'self' ws: wss: http://127.0.0.1:* http://localhost:* http://bodhi.bigduu.com:9562 https://bodhi.bigduu.com:9562; ",
     "form-action 'self';"
 );
 
