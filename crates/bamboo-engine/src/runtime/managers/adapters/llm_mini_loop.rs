@@ -75,9 +75,13 @@ impl MiniLoopExecutor for LLMMiniLoopExecutor {
             },
         ];
 
+        let options = bamboo_infrastructure::llm::provider::LLMRequestOptions {
+            request_purpose: Some("mini_loop".to_string()),
+            ..Default::default()
+        };
         let stream = self
             .provider
-            .chat_stream(&messages, &[], Some(50), &self.model)
+            .chat_stream_with_options(&messages, &[], Some(50), &self.model, Some(&options))
             .await
             .map_err(|e| AgentError::LLM(e.to_string()))?;
 

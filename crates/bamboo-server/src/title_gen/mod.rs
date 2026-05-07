@@ -219,8 +219,12 @@ async fn try_llm_title(
     let provider = resolved.provider;
 
     let fut = async move {
+        let options = bamboo_infrastructure::llm::provider::LLMRequestOptions {
+            request_purpose: Some("title_generation".to_string()),
+            ..Default::default()
+        };
         let stream = provider
-            .chat_stream(&messages, &[], Some(64), &model_name)
+            .chat_stream_with_options(&messages, &[], Some(64), &model_name, Some(&options))
             .await
             .map_err(|e| format!("chat_stream: {e}"))?;
         let output = bamboo_engine::runtime::stream::handler::consume_llm_stream_silent(
