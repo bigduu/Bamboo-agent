@@ -128,6 +128,7 @@ pub struct CopilotConfig {
     /// Unique tracking identifier for analytics
     pub tracking_id: String,
     /// Whether VS Code Electron fetcher v2 is enabled
+    #[serde(default)]
     pub vsc_electron_fetcher_v2: bool,
     /// Whether Xcode support is enabled
     pub xcode: bool,

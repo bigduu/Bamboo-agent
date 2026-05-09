@@ -161,6 +161,7 @@ impl OpenAIProvider {
         parallel_tool_calls: Option<bool>,
         reasoning_source: &str,
         request_purpose: &str,
+        session_log_id: &str,
     ) -> Result<LLMStream> {
         let mut body = build_responses_body(
             model,
@@ -178,7 +179,8 @@ impl OpenAIProvider {
             Some(model),
         );
         tracing::info!(
-            "OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose={}",
+            "[{}] OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} [{}]",
+            session_log_id,
             model,
             reasoning_effort
                 .map(ReasoningEffort::as_str)
@@ -303,6 +305,9 @@ impl LLMProvider for OpenAIProvider {
         let request_purpose = options
             .and_then(|o| o.request_purpose.as_deref())
             .unwrap_or("unknown");
+        let session_log_id = options
+            .and_then(|o| o.session_id.as_deref())
+            .unwrap_or("unknown-session");
         let reasoning_source = if request_reasoning_effort.is_some() {
             "request"
         } else if self.default_reasoning_effort.is_some() {
@@ -323,6 +328,7 @@ impl LLMProvider for OpenAIProvider {
                     parallel_tool_calls,
                     reasoning_source,
                     request_purpose,
+                    session_log_id,
                 )
                 .await;
         }
@@ -343,7 +349,8 @@ impl LLMProvider for OpenAIProvider {
             Some(model),
         );
         tracing::info!(
-            "OpenAI request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose={}",
+            "[{}] OpenAI request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} [{}]",
+            session_log_id,
             model,
             reasoning_effort
                 .map(ReasoningEffort::as_str)
@@ -436,6 +443,7 @@ impl LLMProvider for OpenAIProvider {
                         parallel_tool_calls,
                         reasoning_source,
                         request_purpose,
+                        session_log_id,
                     )
                     .await;
             }

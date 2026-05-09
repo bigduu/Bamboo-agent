@@ -1165,7 +1165,7 @@ impl LLMProvider for CopilotProvider {
             Some(upstream_model),
         );
         tracing::info!(
-            "[{}] Copilot request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose={}",
+            "[{}] Copilot request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} [{}]",
             session_log_id,
             upstream_model,
             reasoning_effort

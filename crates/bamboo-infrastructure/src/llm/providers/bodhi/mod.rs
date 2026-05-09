@@ -109,9 +109,13 @@ impl LLMProvider for BodhiProvider {
         let request_purpose = options
             .and_then(|o| o.request_purpose.as_deref())
             .unwrap_or("unknown");
+        let session_log_id = options
+            .and_then(|o| o.session_id.as_deref())
+            .unwrap_or("unknown-session");
 
         tracing::info!(
-            "Bodhi proxy request target={} model='{}' purpose={}",
+            "[{}] Bodhi proxy request target={} model='{}' [{}]",
+            session_log_id,
             self.target_provider,
             model,
             request_purpose

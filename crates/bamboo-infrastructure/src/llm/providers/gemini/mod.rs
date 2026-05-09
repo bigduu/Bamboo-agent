@@ -143,6 +143,9 @@ impl LLMProvider for GeminiProvider {
         let request_purpose = options
             .and_then(|o| o.request_purpose.as_deref())
             .unwrap_or("unknown");
+        let session_log_id = options
+            .and_then(|o| o.session_id.as_deref())
+            .unwrap_or("unknown-session");
         let mut applied_reasoning_effort = reasoning_effort;
         let mut applied_thinking_budget =
             reasoning_effort.and_then(Self::thinking_budget_for_effort);
@@ -192,7 +195,8 @@ impl LLMProvider for GeminiProvider {
             Some(model),
         );
         tracing::info!(
-            "Gemini request protocol=streamGenerateContent model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_budget={} max_output_tokens={} purpose={}",
+            "[{}] Gemini request protocol=streamGenerateContent model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_budget={} max_output_tokens={} [{}]",
+            session_log_id,
             model,
             reasoning_effort
                 .map(ReasoningEffort::as_str)
