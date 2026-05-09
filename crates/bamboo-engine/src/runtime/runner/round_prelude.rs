@@ -14,8 +14,8 @@ use bamboo_infrastructure::LLMProvider;
 
 use super::prompt_context::{
     inject_external_memory_into_system_message, inject_plan_mode_instructions,
-    inject_task_list_into_system_message, PromptMemoryRuntimeContext,
-    PROMPT_MEMORY_OBSERVABILITY_KEY,
+    inject_plan_runtime_context_into_system_message, inject_task_list_into_system_message,
+    PromptMemoryRuntimeContext, PROMPT_MEMORY_OBSERVABILITY_KEY,
 };
 use super::session_setup::prompt_setup::{persist_prompt_snapshot_metadata, PromptAssemblyReport};
 use bamboo_agent_core::PromptSnapshot;
@@ -34,9 +34,11 @@ pub(crate) async fn refresh_round_prompt_context(
     session: &mut Session,
     prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
+    app_data_dir: Option<&std::path::Path>,
 ) {
     inject_external_memory_into_system_message(session, prompt_memory_flags, runtime_context).await;
     inject_task_list_into_system_message(session);
+    inject_plan_runtime_context_into_system_message(session, app_data_dir);
     inject_plan_mode_instructions(session);
 
     let session_id = session.id.clone();
@@ -299,7 +301,13 @@ pub(crate) async fn prepare_round(
         llm,
         background_model_name: config.background_model_name.clone(),
     };
-    refresh_round_prompt_context(session, config.prompt_memory_flags, Some(&runtime_context)).await;
+    refresh_round_prompt_context(
+        session,
+        config.prompt_memory_flags,
+        Some(&runtime_context),
+        config.app_data_dir.as_deref(),
+    )
+    .await;
     update_task_round_state(task_context, round, max_rounds);
 
     let round_id = build_round_id(session_id, round);

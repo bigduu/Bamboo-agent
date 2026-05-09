@@ -171,6 +171,7 @@ pub struct ChildCompletionCoordinator {
     config: Arc<RwLock<Config>>,
     provider_registry: Arc<ProviderRegistry>,
     provider_router: Arc<ProviderModelRouter>,
+    app_data_dir: std::path::PathBuf,
     root_tools: Arc<RwLock<Option<Arc<dyn ToolExecutor>>>>,
 }
 
@@ -186,6 +187,7 @@ impl ChildCompletionCoordinator {
         config: Arc<RwLock<Config>>,
         provider_registry: Arc<ProviderRegistry>,
         provider_router: Arc<ProviderModelRouter>,
+        app_data_dir: std::path::PathBuf,
     ) -> Self {
         Self {
             storage,
@@ -197,6 +199,7 @@ impl ChildCompletionCoordinator {
             config,
             provider_registry,
             provider_router,
+            app_data_dir,
             root_tools: Arc::new(RwLock::new(None)),
         }
     }
@@ -482,6 +485,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             cancel_token,
             mpsc_tx,
             image_fallback: config.image_fallback,
+            app_data_dir: Some(self.app_data_dir.clone()),
             runners: self.agent_runners.clone(),
             sessions_cache: self.sessions.clone(),
         });

@@ -217,6 +217,7 @@ pub async fn handler(
                 cancel_token,
                 mpsc_tx,
                 image_fallback,
+                app_data_dir: Some(state.app_data_dir.clone()),
             });
 
             started_response(&session_id, sync_info, run_id)

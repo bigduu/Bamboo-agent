@@ -53,6 +53,7 @@ pub struct ScheduleContext {
     pub sessions_cache: Arc<RwLock<HashMap<String, Session>>>,
     pub agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
+    pub app_data_dir: Option<std::path::PathBuf>,
     pub trigger_engine: DynTriggerEngine,
     /// Adapter-provided callback that resolves model, system prompt, workspace path
     /// and reasoning effort for a schedule run job.
@@ -352,6 +353,7 @@ async fn run_schedule_job(
                     selected_skill_ids: None,
                     selected_skill_mode: None,
                     image_fallback: None,
+                    app_data_dir: ctx.app_data_dir.clone(),
                 },
             )
             .await;

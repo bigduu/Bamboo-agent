@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::metrics::MetricsCollector;
@@ -134,6 +135,11 @@ pub struct AgentLoopConfig {
     pub provider_name: Option<String>,
     /// Optional request-time reasoning effort override.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Bamboo application data directory (typically `~/.bamboo`).
+    ///
+    /// Used by runtime features that persist auxiliary artifacts outside the
+    /// session store, such as durable plan mode files under `~/.bamboo/plan`.
+    pub app_data_dir: Option<PathBuf>,
     /// Tool names that should be excluded from schemas sent to the LLM.
     pub disabled_tools: BTreeSet<String>,
     /// Token budget for context management (optional, defaults to model's limits)
@@ -190,6 +196,7 @@ impl Default for AgentLoopConfig {
             background_model_provider: None,
             provider_name: None,
             reasoning_effort: None,
+            app_data_dir: None,
             disabled_tools: BTreeSet::new(),
             token_budget: None,
             image_fallback: None,

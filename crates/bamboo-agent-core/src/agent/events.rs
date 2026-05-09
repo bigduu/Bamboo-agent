@@ -324,6 +324,13 @@ pub enum AgentEvent {
         reason: Option<String>,
         /// Previous permission mode before entering plan mode
         pre_permission_mode: String,
+        /// RFC3339 timestamp when plan mode was entered.
+        entered_at: chrono::DateTime<chrono::Utc>,
+        /// Current plan mode phase/status.
+        status: bamboo_domain::PlanModeStatus,
+        /// Path to the persisted plan file, if already available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_file_path: Option<String>,
     },
 
     /// Plan mode was exited.
@@ -592,10 +599,14 @@ mod tests {
 
     #[test]
     fn plan_mode_entered_serializes_correctly() {
+        let entered_at = Utc::now();
         let event = AgentEvent::PlanModeEntered {
             session_id: "sess-1".to_string(),
             reason: Some("Complex refactor".to_string()),
             pre_permission_mode: "default".to_string(),
+            entered_at,
+            status: bamboo_domain::PlanModeStatus::Exploring,
+            plan_file_path: None,
         };
 
         let value = serde_json::to_value(event).expect("event should serialize");
@@ -603,6 +614,8 @@ mod tests {
         assert_eq!(value["session_id"], "sess-1");
         assert_eq!(value["reason"], "Complex refactor");
         assert_eq!(value["pre_permission_mode"], "default");
+        assert_eq!(value["status"], "exploring");
+        assert_eq!(value["entered_at"], entered_at.to_rfc3339());
     }
 
     #[test]
@@ -706,7 +719,9 @@ mod tests {
         let json = serde_json::json!({
             "type": "plan_mode_entered",
             "session_id": "sess-1",
-            "pre_permission_mode": "default"
+            "pre_permission_mode": "default",
+            "entered_at": "2025-01-01T00:00:00Z",
+            "status": "exploring"
         });
 
         let event: AgentEvent = serde_json::from_value(json).expect("should deserialize");
@@ -715,10 +730,16 @@ mod tests {
                 session_id,
                 reason,
                 pre_permission_mode,
+                entered_at,
+                status,
+                plan_file_path,
             } => {
                 assert_eq!(session_id, "sess-1");
                 assert_eq!(reason, None);
                 assert_eq!(pre_permission_mode, "default");
+                assert_eq!(entered_at.to_rfc3339(), "2025-01-01T00:00:00+00:00");
+                assert_eq!(status, bamboo_domain::PlanModeStatus::Exploring);
+                assert_eq!(plan_file_path, None);
             }
             other => panic!("unexpected event: {other:?}"),
         }

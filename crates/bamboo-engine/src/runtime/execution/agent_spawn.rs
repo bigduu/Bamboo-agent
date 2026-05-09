@@ -54,6 +54,7 @@ pub struct SessionExecutionArgs {
     pub cancel_token: CancellationToken,
     pub mpsc_tx: mpsc::Sender<AgentEvent>,
     pub image_fallback: Option<ImageFallbackConfig>,
+    pub app_data_dir: Option<std::path::PathBuf>,
 
     // Post-execution resources.
     pub runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
@@ -93,6 +94,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 cancel_token,
                 mpsc_tx,
                 image_fallback,
+                app_data_dir,
                 runners,
                 sessions_cache,
             } = args;
@@ -139,6 +141,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                         selected_skill_ids,
                         selected_skill_mode,
                         image_fallback,
+                        app_data_dir,
                     },
                 )
                 .await;

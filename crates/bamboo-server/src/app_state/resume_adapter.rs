@@ -85,7 +85,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
         spawn_event_forwarder(state.clone(), session_id.clone(), mpsc_rx, event_sender);
 
         spawn_agent_execution(SpawnAgentExecution {
-            state,
+            state: state.clone(),
             session_id,
             session,
             is_child_session,
@@ -101,6 +101,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
             cancel_token,
             mpsc_tx,
             image_fallback,
+            app_data_dir: Some(state.app_data_dir.clone()),
         });
     }
 }

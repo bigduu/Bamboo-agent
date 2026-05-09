@@ -2,6 +2,7 @@
 
 mod external_memory;
 mod plan_mode;
+mod plan_runtime;
 mod system_sections;
 mod task;
 
@@ -74,6 +75,13 @@ pub(super) fn strip_existing_task_list(prompt: &str) -> String {
 
 pub(crate) fn inject_plan_mode_instructions(session: &mut bamboo_agent_core::Session) {
     plan_mode::inject_plan_mode_instructions(session);
+}
+
+pub(crate) fn inject_plan_runtime_context_into_system_message(
+    session: &mut bamboo_agent_core::Session,
+    app_data_dir: Option<&std::path::Path>,
+) {
+    plan_runtime::inject_plan_runtime_context_into_system_message(session, app_data_dir);
 }
 
 #[cfg(test)]

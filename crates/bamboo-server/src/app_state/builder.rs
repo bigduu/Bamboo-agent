@@ -229,6 +229,7 @@ impl AppState {
                 config.clone(),
                 provider_registry.clone(),
                 provider_router.clone(),
+                data_dir.clone(),
             ),
         );
 
@@ -245,6 +246,7 @@ impl AppState {
             external_runner,
             Some(provider_router.clone()),
             Some(child_completion_coordinator.clone()),
+            Some(data_dir.clone()),
         );
 
         let tools_with_task = base_tools.clone();
@@ -259,6 +261,7 @@ impl AppState {
             session_event_senders.clone(),
             persistence.clone(),
             config.clone(),
+            Some(data_dir.clone()),
         );
 
         crate::services::auto_dream::spawn_auto_dream_task(

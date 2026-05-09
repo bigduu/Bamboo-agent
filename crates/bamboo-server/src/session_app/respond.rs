@@ -11,6 +11,22 @@ use super::types::RespondInput;
 
 const CONCLUSION_WITH_OPTIONS_RESUME_PENDING_KEY: &str = "conclusion_with_options_resume_pending";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanModeTransition {
+    Entered {
+        reason: Option<String>,
+        pre_permission_mode: String,
+        entered_at: chrono::DateTime<chrono::Utc>,
+        status: PlanModeStatus,
+        plan_file_path: Option<String>,
+    },
+    Exited {
+        approved: bool,
+        restored_mode: String,
+        plan: Option<String>,
+    },
+}
+
 /// Submit a pending response: load session, validate, update messages,
 /// apply plan mode transitions, persist, and return the updated session.
 ///
@@ -18,7 +34,7 @@ const CONCLUSION_WITH_OPTIONS_RESUME_PENDING_KEY: &str = "conclusion_with_option
 pub async fn submit_pending_response(
     repo: &dyn SessionAccess,
     input: RespondInput,
-) -> Result<(Session, String), RespondError> {
+) -> Result<(Session, String, Option<PlanModeTransition>), RespondError> {
     // ---- Load session (merged for respond to pick up in-memory pending question) ----
     let mut session = repo
         .load_merged(&input.session_id)
@@ -45,6 +61,8 @@ pub async fn submit_pending_response(
         tool_call_id
     );
 
+    let reviewed_plan = extract_exit_plan_from_tool_result_message(&session, &tool_call_id);
+
     // ---- Update or append tool result message ----
     let found =
         update_or_append_tool_result_message(&mut session, &tool_call_id, &input.user_response);
@@ -62,7 +80,8 @@ pub async fn submit_pending_response(
     }
 
     // ---- Plan mode state transitions ----
-    apply_plan_mode_transition(&mut session, &pending, &input.user_response);
+    let plan_mode_transition =
+        apply_plan_mode_transition(&mut session, &pending, &input.user_response, reviewed_plan);
 
     // ---- Clear pending question and set resume marker ----
     session.clear_pending_question();
@@ -98,7 +117,7 @@ pub async fn submit_pending_response(
         input.session_id
     );
 
-    Ok((session, input.user_response))
+    Ok((session, input.user_response, plan_mode_transition))
 }
 
 /// Apply plan mode state transitions based on the pending question tool and user response.
@@ -106,7 +125,8 @@ fn apply_plan_mode_transition(
     session: &mut Session,
     pending: &PendingQuestion,
     user_response: &str,
-) {
+    reviewed_plan: Option<String>,
+) -> Option<PlanModeTransition> {
     match pending.tool_name.as_str() {
         "EnterPlanMode" if user_response.to_lowercase().contains("enter plan mode") => {
             let pre_mode = session
@@ -116,21 +136,36 @@ fn apply_plan_mode_transition(
                 .map(|p| p.pre_permission_mode.clone())
                 .unwrap_or_else(|| "default".to_string());
 
+            let entered_at = Utc::now();
+            let status = PlanModeStatus::Exploring;
             let runtime_state = session
                 .agent_runtime_state
                 .get_or_insert_with(|| AgentRuntimeState::new(uuid::Uuid::new_v4().to_string()));
             runtime_state.plan_mode = Some(PlanModeState {
-                entered_at: Utc::now(),
-                pre_permission_mode: pre_mode,
+                entered_at,
+                pre_permission_mode: pre_mode.clone(),
                 plan_file_path: None,
-                status: PlanModeStatus::Exploring,
+                status,
             });
             tracing::info!(
                 session_id = %session.id,
                 "Entered plan mode"
             );
+            Some(PlanModeTransition::Entered {
+                reason: Some(pending.question.clone()),
+                pre_permission_mode: pre_mode,
+                entered_at,
+                status,
+                plan_file_path: None,
+            })
         }
         "ExitPlanMode" if is_exit_plan_mode_approved(user_response) => {
+            let restored_mode = session
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.plan_mode.as_ref())
+                .map(|plan| plan.pre_permission_mode.clone())
+                .unwrap_or_else(|| "default".to_string());
             if let Some(ref mut runtime_state) = session.agent_runtime_state {
                 runtime_state.plan_mode = None;
             }
@@ -138,8 +173,13 @@ fn apply_plan_mode_transition(
                 session_id = %session.id,
                 "Exited plan mode"
             );
+            Some(PlanModeTransition::Exited {
+                approved: true,
+                restored_mode,
+                plan: reviewed_plan,
+            })
         }
-        _ => {}
+        _ => None,
     }
 }
 
@@ -193,6 +233,23 @@ fn selected_message_content(user_response: &str) -> String {
     format!("User selected: {}", user_response)
 }
 
+fn extract_exit_plan_from_tool_result_message(
+    session: &Session,
+    tool_call_id: &str,
+) -> Option<String> {
+    let message = session
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some(tool_call_id))?;
+    let payload = serde_json::from_str::<serde_json::Value>(&message.content).ok()?;
+    payload
+        .get("plan")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,7 +269,7 @@ mod tests {
         let mut session = Session::new("sess-1", "test-model");
         let pending = make_pending("EnterPlanMode");
 
-        apply_plan_mode_transition(&mut session, &pending, "Enter plan mode");
+        apply_plan_mode_transition(&mut session, &pending, "Enter plan mode", None);
 
         assert!(session.agent_runtime_state.is_some());
         let state = session.agent_runtime_state.unwrap();
@@ -227,7 +284,7 @@ mod tests {
         let mut session = Session::new("sess-1", "test-model");
         let pending = make_pending("EnterPlanMode");
 
-        apply_plan_mode_transition(&mut session, &pending, "Stay in normal mode");
+        apply_plan_mode_transition(&mut session, &pending, "Stay in normal mode", None);
 
         assert!(session.agent_runtime_state.is_none());
     }
@@ -244,7 +301,12 @@ mod tests {
         });
         let pending = make_pending("ExitPlanMode");
 
-        apply_plan_mode_transition(&mut session, &pending, "Approve (Default mode)");
+        apply_plan_mode_transition(
+            &mut session,
+            &pending,
+            "Approve (Default mode)",
+            Some("Reviewed plan".to_string()),
+        );
 
         assert!(session.agent_runtime_state.unwrap().plan_mode.is_none());
     }
@@ -261,7 +323,7 @@ mod tests {
         });
         let pending = make_pending("ExitPlanMode");
 
-        apply_plan_mode_transition(&mut session, &pending, "Stay in plan mode");
+        apply_plan_mode_transition(&mut session, &pending, "Stay in plan mode", None);
 
         assert!(session.agent_runtime_state.unwrap().plan_mode.is_some());
     }
@@ -271,7 +333,7 @@ mod tests {
         let mut session = Session::new("sess-1", "test-model");
         let pending = make_pending("ConclusionWithOptions");
 
-        apply_plan_mode_transition(&mut session, &pending, "Approve");
+        apply_plan_mode_transition(&mut session, &pending, "Approve", None);
 
         assert!(session.agent_runtime_state.is_none());
     }
@@ -282,5 +344,22 @@ mod tests {
         assert!(is_exit_plan_mode_approved("Approve (Accept edits mode)"));
         assert!(!is_exit_plan_mode_approved("Stay in plan mode"));
         assert!(!is_exit_plan_mode_approved("Edit plan first"));
+    }
+
+    #[test]
+    fn extract_exit_plan_from_tool_result_message_reads_plan_payload() {
+        let mut session = Session::new("sess-1", "test-model");
+        let mut tool_message = bamboo_agent_core::Message::tool_result(
+            "call-1",
+            serde_json::json!({
+                "plan": "# Plan\n\n1. Step"
+            })
+            .to_string(),
+        );
+        tool_message.tool_success = Some(true);
+        session.add_message(tool_message);
+
+        let plan = extract_exit_plan_from_tool_result_message(&session, "call-1");
+        assert_eq!(plan.as_deref(), Some("# Plan\n\n1. Step"));
     }
 }

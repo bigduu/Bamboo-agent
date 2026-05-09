@@ -2,6 +2,8 @@ use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
 use crate::session_app::provider_model::session_effective_model_ref;
+use crate::session_app::respond::PlanModeTransition;
+use bamboo_agent_core::AgentEvent;
 
 use super::super::types::RespondRequest;
 
@@ -33,7 +35,7 @@ pub async fn submit_response(
         reasoning_effort: req.reasoning_effort,
     };
 
-    let (_session, user_response) =
+    let (_session, user_response, plan_mode_transition) =
         match crate::session_app::respond::submit_pending_response(state.as_ref(), input).await {
             Ok(result) => result,
             Err(error) => {
@@ -60,6 +62,36 @@ pub async fn submit_response(
                 };
             }
         };
+
+    if let Some(event) = plan_mode_transition.as_ref().map(|transition| match transition {
+        PlanModeTransition::Entered {
+            reason,
+            pre_permission_mode,
+            entered_at,
+            status,
+            plan_file_path,
+        } => AgentEvent::PlanModeEntered {
+            session_id: session_id.clone(),
+            reason: reason.clone(),
+            pre_permission_mode: pre_permission_mode.clone(),
+            entered_at: *entered_at,
+            status: *status,
+            plan_file_path: plan_file_path.clone(),
+        },
+        PlanModeTransition::Exited {
+            approved,
+            restored_mode,
+            plan,
+        } => AgentEvent::PlanModeExited {
+            session_id: session_id.clone(),
+            approved: *approved,
+            restored_mode: restored_mode.clone(),
+            plan: plan.clone(),
+        },
+    }) {
+        let tx = state.get_session_event_sender(&session_id).await;
+        let _ = tx.send(event);
+    }
 
     tracing::info!(
         "[{}] Response processed successfully, agent loop can resume",

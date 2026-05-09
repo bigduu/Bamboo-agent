@@ -282,6 +282,8 @@ pub struct ExecuteRequest {
     pub selected_skill_ids: Option<Vec<String>>,
     pub selected_skill_mode: Option<String>,
     pub image_fallback: Option<ImageFallbackConfig>,
+    /// Bamboo application data directory (typically `~/.bamboo`).
+    pub app_data_dir: Option<std::path::PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +331,7 @@ impl AgentRuntime {
             selected_skill_ids,
             selected_skill_mode,
             image_fallback,
+            app_data_dir,
         } = req;
         let tools = tools.unwrap_or_else(|| self.default_tools.clone());
         let llm = provider_override.unwrap_or_else(|| self.provider.clone());
@@ -370,6 +373,7 @@ impl AgentRuntime {
                 merged
             },
             image_fallback,
+            app_data_dir,
             prompt_memory_flags: config
                 .memory
                 .as_ref()

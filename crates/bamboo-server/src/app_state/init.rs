@@ -247,6 +247,7 @@ pub fn build_spawn_scheduler(
     external_child_runner: Option<Arc<dyn bamboo_engine::runtime::execution::ExternalChildRunner>>,
     provider_router: Option<Arc<bamboo_infrastructure::ProviderModelRouter>>,
     completion_handler: Option<Arc<dyn bamboo_engine::execution::ChildCompletionHandler>>,
+    app_data_dir: Option<std::path::PathBuf>,
 ) -> Arc<SpawnScheduler> {
     Arc::new(SpawnScheduler::new(SpawnContext {
         agent,
@@ -256,6 +257,7 @@ pub fn build_spawn_scheduler(
         session_event_senders,
         external_child_runner,
         provider_router,
+        app_data_dir,
         completion_handler,
     }))
 }
@@ -270,6 +272,7 @@ pub fn build_schedule_manager(
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     persistence: Arc<LockedSessionStore>,
     config: Arc<RwLock<Config>>,
+    app_data_dir: Option<std::path::PathBuf>,
 ) -> Arc<ScheduleManager> {
     let base_ctx = ScheduleContext {
         schedule_store,
@@ -279,6 +282,7 @@ pub fn build_schedule_manager(
         agent_runners,
         session_event_senders,
         persistence,
+        app_data_dir,
         trigger_engine: crate::schedules::default_trigger_engine(),
         resolve_run_config: Arc::new(|_| unimplemented!("replaced by build_schedule_context")),
     };

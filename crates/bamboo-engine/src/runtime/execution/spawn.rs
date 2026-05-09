@@ -64,6 +64,7 @@ pub struct SpawnContext {
     pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     pub external_child_runner: Option<Arc<dyn ExternalChildRunner>>,
     pub provider_router: Option<Arc<ProviderModelRouter>>,
+    pub app_data_dir: Option<std::path::PathBuf>,
     /// Optional application-layer completion hook. The engine still emits
     /// `SubAgentCompleted` to the parent stream itself; this hook lets the
     /// server persist parent wait state and resume the parent runner without
@@ -565,6 +566,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
                         selected_skill_ids: None,
                         selected_skill_mode: None,
                         image_fallback: None,
+                        app_data_dir: ctx.app_data_dir.clone(),
                     },
                 )
                 .await

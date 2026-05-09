@@ -700,6 +700,7 @@ mod tests {
             session_event_senders: session_event_senders.clone(),
             external_child_runner: None,
             provider_router: None,
+            app_data_dir: None,
             completion_handler: None,
         }));
 

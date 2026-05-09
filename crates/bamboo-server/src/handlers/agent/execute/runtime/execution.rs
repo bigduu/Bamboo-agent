@@ -37,6 +37,7 @@ pub(crate) struct SpawnAgentExecution {
     pub(crate) cancel_token: CancellationToken,
     pub(crate) mpsc_tx: mpsc::Sender<bamboo_agent_core::AgentEvent>,
     pub(crate) image_fallback: Option<ImageFallbackConfig>,
+    pub(crate) app_data_dir: Option<std::path::PathBuf>,
 }
 
 pub(super) fn execution_tool_surface(is_child_session: bool) -> ToolSurface {
@@ -97,6 +98,7 @@ pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
         cancel_token: args.cancel_token,
         mpsc_tx: args.mpsc_tx,
         image_fallback: args.image_fallback,
+        app_data_dir: args.app_data_dir,
         runners: args.state.agent_runners.clone(),
         sessions_cache: args.state.sessions.clone(),
     });

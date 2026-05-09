@@ -79,6 +79,11 @@ pub struct SessionIndexEntry {
     /// can display the question dialog badge without loading session.json.
     #[serde(default)]
     pub has_pending_question: bool,
+    /// Active plan mode runtime state mirrored into the index from
+    /// `session.agent_runtime_state.plan_mode`, so lightweight session-list/detail
+    /// APIs can surface plan mode without loading every session.json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_mode: Option<bamboo_domain::PlanModeState>,
     /// Last known run status for this session
     /// ("pending" | "running" | "completed" | "error" | "cancelled" | "skipped").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -346,6 +351,10 @@ impl SessionStoreV2 {
             .get("subagent_type")
             .cloned()
             .filter(|v| !v.trim().is_empty());
+        let plan_mode = session
+            .agent_runtime_state
+            .as_ref()
+            .and_then(|state| state.plan_mode.clone());
         self.update_index(|index| {
             index.sessions.insert(
                 session.id.clone(),
@@ -370,6 +379,7 @@ impl SessionStoreV2 {
                     message_count: session.messages.len(),
                     has_attachments,
                     has_pending_question: session.has_pending_question(),
+                    plan_mode,
                     last_run_status,
                     last_run_error,
                     token_usage: session.token_usage.clone(),

@@ -85,6 +85,12 @@ pub enum AgentEvent {
         reason: Option<String>,
         #[serde(default)]
         pre_permission_mode: Option<String>,
+        #[serde(default)]
+        entered_at: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        plan_file_path: Option<String>,
     },
     PlanModeExited {
         session_id: String,

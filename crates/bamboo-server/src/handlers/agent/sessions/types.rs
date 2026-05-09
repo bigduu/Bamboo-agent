@@ -48,6 +48,10 @@ pub struct SessionSummary {
     /// and from `session.has_pending_question()` for detail endpoints.
     #[serde(default)]
     pub has_pending_question: bool,
+    /// Active plan mode runtime state mirrored into the lightweight session summary.
+    /// Lets the frontend render plan-mode UI without loading full session history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_mode: Option<bamboo_domain::PlanModeState>,
     /// Number of child sessions currently running under this session.
     /// Computed dynamically at query time by scanning running sessions.
     #[serde(default)]
@@ -82,6 +86,7 @@ impl SessionSummary {
             token_usage: entry.token_usage,
             subagent_type: entry.subagent_type,
             has_pending_question: entry.has_pending_question,
+            plan_mode: entry.plan_mode,
             running_child_count: 0,
         }
     }
@@ -350,6 +355,7 @@ mod tests {
             token_usage: None,
             subagent_type: None,
             has_pending_question: false,
+            plan_mode: None,
             running_child_count: 0,
         };
 
@@ -388,6 +394,7 @@ mod tests {
             token_usage: None,
             subagent_type: None,
             has_pending_question: false,
+            plan_mode: None,
             running_child_count: 0,
         };
 
@@ -513,6 +520,7 @@ mod tests {
             token_usage: None,
             subagent_type: None,
             has_pending_question: false,
+            plan_mode: None,
             running_child_count: 0,
         };
 
