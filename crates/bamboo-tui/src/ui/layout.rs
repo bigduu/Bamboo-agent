@@ -86,7 +86,7 @@ pub fn render_status_info(f: &mut Frame, area: Rect, app: &App) {
 
     // Session
     if let Some(sid) = &app.chat.session_id {
-        let short = if sid.len() > 8 { &sid[..8] } else { sid };
+        let short: String = sid.chars().take(8).collect();
         spans.push(Span::styled(
             format!(" {}...", short),
             Style::default().fg(colors::INACTIVE),

@@ -577,8 +577,8 @@ fn validate_summary_quality(summary: &str, messages: &[Message]) -> SummaryQuali
     let decisions_mentioned = decisions
         .iter()
         .filter(|d| {
-            let check_len = d.len().min(50);
-            summary.contains(&d[..check_len])
+            let check_str: String = d.chars().take(50).collect();
+            summary.contains(&check_str)
         })
         .count();
     let decision_coverage = if decisions.is_empty() {

@@ -146,10 +146,11 @@ pub fn check_permissions(
         }
         "js_repl" => {
             let code = required_string_arg(args, "code")?;
-            let preview = if code.len() > 80 {
-                format!("{}...", &code[..80])
+            let preview: String = code.chars().take(80).collect();
+            let preview = if code.chars().count() > 80 {
+                format!("{}...", preview)
             } else {
-                code.to_string()
+                preview
             };
             Ok(Some(vec![PermissionContext::new(
                 PermissionType::ExecuteCommand,

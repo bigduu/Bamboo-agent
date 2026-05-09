@@ -73,11 +73,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(colors::INACTIVE)
         };
 
-        let id_short = if session.id.len() > 16 {
-            &session.id[..16]
-        } else {
-            &session.id
-        };
+        let id_short: String = session.id.chars().take(16).collect();
+        let id_short = id_short;
         let model = session
             .model
             .as_deref()
