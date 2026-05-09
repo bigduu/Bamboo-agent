@@ -375,7 +375,7 @@ async fn rerank_candidate_ids(
 
     let mut stream = context
         .llm
-        .chat_stream_with_options(&messages, &[], Some(200), model, Some(&options))
+        .chat_stream_with_options(&messages, &[], Some(8192), model, Some(&options))
         .await
         .map_err(|error| format!("rerank provider call failed: {error}"))?;
 
@@ -516,7 +516,9 @@ mod tests {
     use super::*;
     use crate::memory_store::DurableMemoryType;
     use async_trait::async_trait;
-    use bamboo_infrastructure::{LLMError, LLMStream};
+    use bamboo_infrastructure::llm::provider::LLMRequestOptions;
+    use bamboo_domain::ReasoningEffort;
+    use bamboo_infrastructure::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use futures::stream;
     use std::sync::Mutex;
     use tempfile::tempdir;
@@ -952,5 +954,90 @@ mod tests {
         assert_eq!(selection.candidates.len(), 2);
         assert_eq!(selection.candidates[0].id, lexical_first.frontmatter.id);
         assert_eq!(selection.candidates[1].id, lexical_second.frontmatter.id);
+    }
+
+    /// Provider that captures `max_output_tokens` and `reasoning_effort` from `chat_stream_with_options`.
+    #[derive(Default)]
+    struct RequestOptionsCaptureProvider {
+        captured_max_tokens: Mutex<Vec<Option<u32>>>,
+        captured_reasoning: Mutex<Vec<Option<ReasoningEffort>>>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for RequestOptionsCaptureProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("{\"ids\":[]}".to_string())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            messages: &[Message],
+            tools: &[bamboo_agent_core::ToolSchema],
+            max_output_tokens: Option<u32>,
+            model: &str,
+            options: Option<&LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            self.captured_max_tokens
+                .lock()
+                .expect("lock should not be poisoned")
+                .push(max_output_tokens);
+            self.captured_reasoning
+                .lock()
+                .expect("lock should not be poisoned")
+                .push(options.and_then(|o| o.reasoning_effort));
+            self.chat_stream(messages, tools, max_output_tokens, model)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn rerank_sufficient_max_tokens_for_high_reasoning() {
+        let provider = Arc::new(RequestOptionsCaptureProvider::default());
+        let candidates = vec![MemoryRecallCandidate {
+            id: "mem-1".to_string(),
+            score: 0.9,
+            title: "Test memory".to_string(),
+            scope: MemoryScope::Project,
+            project_key: Some("proj-1".to_string()),
+            status: DurableMemoryStatus::Active,
+            updated_at: "2026-05-08T00:00:00Z".to_string(),
+            summary: "A test durable memory entry".to_string(),
+        }];
+        let context = MemoryRecallRerankContext {
+            llm: provider.clone(),
+            model: "deepseek-v4-pro".to_string(),
+            session_id: Some("test-session".to_string()),
+        };
+
+        let _ = rerank_candidate_ids("test query", &candidates, 5, &context).await;
+
+        let captured_reasoning = provider
+            .captured_reasoning
+            .lock()
+            .expect("lock should not be poisoned");
+        let captured_max_tokens = provider
+            .captured_max_tokens
+            .lock()
+            .expect("lock should not be poisoned");
+        assert_eq!(
+            captured_reasoning.as_slice(),
+            [Some(ReasoningEffort::High)],
+            "rerank should request High reasoning"
+        );
+        let max_tokens = captured_max_tokens[0].expect("max_output_tokens should be set");
+        assert!(
+            max_tokens > 4096,
+            "max_output_tokens ({}) must exceed thinking budget (4096) to avoid truncation",
+            max_tokens
+        );
     }
 }

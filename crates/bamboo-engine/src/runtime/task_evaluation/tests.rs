@@ -172,6 +172,7 @@ async fn task_evaluation_uses_explicit_model_parameter_for_provider_request() {
 #[derive(Clone, Default)]
 struct RecordingRequestOptionsProvider {
     requested_reasoning: Arc<Mutex<Vec<Option<ReasoningEffort>>>>,
+    requested_max_tokens: Arc<Mutex<Vec<Option<u32>>>>,
 }
 
 impl RecordingRequestOptionsProvider {
@@ -211,6 +212,9 @@ impl LLMProvider for RecordingRequestOptionsProvider {
         if let Ok(mut values) = self.requested_reasoning.lock() {
             values.push(options.and_then(|o| o.reasoning_effort));
         }
+        if let Ok(mut values) = self.requested_max_tokens.lock() {
+            values.push(max_output_tokens);
+        }
         self.chat_stream(messages, tools, max_output_tokens, model)
             .await
     }
@@ -239,5 +243,38 @@ async fn task_evaluation_caps_reasoning_effort_to_high_for_lightweight_request()
     assert_eq!(
         provider.last_requested_reasoning(),
         Some(Some(ReasoningEffort::High))
+    );
+}
+
+#[tokio::test]
+async fn task_evaluation_sufficient_max_tokens_for_high_reasoning() {
+    let context = create_test_context();
+    let session = bamboo_agent_core::Session::new("test-session", "session-model");
+    let provider = Arc::new(RecordingRequestOptionsProvider::default());
+    let llm: Arc<dyn LLMProvider> = provider.clone();
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(4);
+
+    let _ = evaluate_task_progress(
+        &context,
+        &session,
+        llm,
+        &event_tx,
+        "test-session",
+        "gpt-5-mini",
+        Some(ReasoningEffort::High),
+    )
+    .await
+    .expect("evaluation request should succeed");
+
+    let captured = provider
+        .requested_max_tokens
+        .lock()
+        .expect("lock should not be poisoned");
+    let max_tokens = captured[0].expect("max_output_tokens should be set");
+    // ReasoningEffort::High targets 4096 thinking budget; max_tokens must leave room for output.
+    assert!(
+        max_tokens > 4096,
+        "max_output_tokens ({}) must exceed thinking budget (4096) to avoid truncation",
+        max_tokens
     );
 }

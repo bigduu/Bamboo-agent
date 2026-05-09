@@ -341,7 +341,7 @@ async fn collect_stream_text(
     };
 
     let mut stream = provider
-        .chat_stream_with_options(&messages, &[], None, model, Some(&options))
+        .chat_stream_with_options(&messages, &[], Some(8192), model, Some(&options))
         .await
         .map_err(|error| format!("auto-dream provider call failed: {error}"))?;
 

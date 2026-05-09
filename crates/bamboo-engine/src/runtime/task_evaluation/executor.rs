@@ -110,7 +110,7 @@ pub async fn evaluate_task_progress(
         request_purpose: Some("task_evaluation".to_string()),
     };
     match llm
-        .chat_stream_with_options(&messages, &tools, Some(500), model, Some(&request_options))
+        .chat_stream_with_options(&messages, &tools, Some(8192), model, Some(&request_options))
         .await
     {
         Ok(stream) => {

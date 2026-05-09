@@ -276,4 +276,19 @@ mod tests {
             .expect("default list_models should succeed");
         assert!(models.is_empty());
     }
+
+    #[test]
+    fn request_options_default_has_no_purpose() {
+        let opts = LLMRequestOptions::default();
+        assert!(opts.request_purpose.is_none());
+    }
+
+    #[test]
+    fn request_options_purpose_is_set_and_readable() {
+        let opts = LLMRequestOptions {
+            request_purpose: Some("title_generation".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(opts.request_purpose.as_deref(), Some("title_generation"));
+    }
 }

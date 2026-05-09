@@ -405,7 +405,7 @@ Guidelines:
         };
         let stream = self
             .llm
-            .chat_stream_with_options(messages, &[], None, &self.model, Some(&options))
+            .chat_stream_with_options(messages, &[], Some(8192), &self.model, Some(&options))
             .await
             .map_err(|e| {
                 crate::types::BudgetError::TokenCountError(format!(
@@ -790,6 +790,87 @@ mod tests {
             .lock()
             .expect("captured reasoning lock should not be poisoned");
         assert_eq!(captured.as_slice(), [Some(ReasoningEffort::High)]);
+    }
+
+    /// Provider that captures both `reasoning_effort` and `max_output_tokens`.
+    #[derive(Default)]
+    struct RequestOptionsCaptureProvider {
+        captured_reasoning: Mutex<Vec<Option<ReasoningEffort>>>,
+        captured_max_tokens: Mutex<Vec<Option<u32>>>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for RequestOptionsCaptureProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Ok(Box::pin(stream::iter(vec![
+                Ok::<LLMChunk, LLMError>(LLMChunk::Token("captured summary".to_string())),
+                Ok::<LLMChunk, LLMError>(LLMChunk::Done),
+            ])))
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            messages: &[Message],
+            tools: &[bamboo_agent_core::ToolSchema],
+            max_output_tokens: Option<u32>,
+            model: &str,
+            options: Option<&LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            self.captured_reasoning
+                .lock()
+                .expect("lock should not be poisoned")
+                .push(options.and_then(|o| o.reasoning_effort));
+            self.captured_max_tokens
+                .lock()
+                .expect("lock should not be poisoned")
+                .push(max_output_tokens);
+            self.chat_stream(messages, tools, max_output_tokens, model)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_summarizer_sufficient_max_tokens_for_high_reasoning() {
+        let provider = Arc::new(RequestOptionsCaptureProvider::default());
+        let summarizer = LlmSummarizer::new(
+            provider.clone(),
+            "gpt-5-mini".to_string(),
+            None,
+            Some("task list".to_string()),
+        );
+        let messages = vec![
+            Message::user("请总结最近三轮"),
+            Message::assistant("已完成第一步并准备第二步", None),
+        ];
+
+        let summary = summarizer
+            .summarize(&messages)
+            .await
+            .expect("summary generation should succeed");
+        assert_eq!(summary, "captured summary");
+
+        let captured_reasoning = provider
+            .captured_reasoning
+            .lock()
+            .expect("lock should not be poisoned");
+        let captured_max_tokens = provider
+            .captured_max_tokens
+            .lock()
+            .expect("lock should not be poisoned");
+        assert_eq!(captured_reasoning.as_slice(), [Some(ReasoningEffort::High)]);
+        let max_tokens = captured_max_tokens[0].expect("max_output_tokens should be set");
+        // ReasoningEffort::High targets 4096 thinking budget; max_tokens must leave room for output.
+        assert!(
+            max_tokens > 4096,
+            "max_output_tokens ({}) must exceed thinking budget (4096) to avoid truncation",
+            max_tokens
+        );
     }
 
     #[test]
