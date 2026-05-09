@@ -77,10 +77,36 @@ impl Drop for TitleGenGuard {
     }
 }
 
-/// Returns true when a session title is "untitled" (empty / whitespace / "New Session").
+/// Returns true when a session title is still a frontend-provided default / placeholder.
 pub fn is_untitled(title: &str) -> bool {
     let s = title.trim();
-    s.is_empty() || s == "New Session"
+    if s.is_empty() {
+        return true;
+    }
+
+    // Exact known frontend defaults/localized defaults.
+    if matches!(
+        s,
+        "New Session"
+            | "新建会话"
+            | "新建會話"
+            | "Nouvelle session"
+            | "新しいセッション"
+            | "नया सत्र"
+    ) {
+        return true;
+    }
+
+    // Frontend historically created prompt-scoped placeholder titles such as
+    // `New Session - Bodhi`, `New Session with Bodhi`, and the current
+    // localized/sidebar variant `New session with Bodhi`. Treat only these
+    // narrow, obvious default forms as untitled so clear custom titles are preserved.
+    s.strip_prefix("New Session - ")
+        .or_else(|| s.strip_prefix("New Session with "))
+        .or_else(|| s.strip_prefix("New session - "))
+        .or_else(|| s.strip_prefix("New session with "))
+        .map(|suffix| !suffix.trim().is_empty())
+        .unwrap_or(false)
 }
 
 async fn run_title_generation(

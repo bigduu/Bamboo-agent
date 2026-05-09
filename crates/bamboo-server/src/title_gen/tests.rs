@@ -8,8 +8,21 @@ fn test_is_untitled_handles_empty_and_default() {
     assert!(is_untitled("   "));
     assert!(is_untitled("New Session"));
     assert!(is_untitled("  New Session  "));
+    assert!(is_untitled("New Session - Bodhi"));
+    assert!(is_untitled("New Session with Bodhi"));
+    assert!(is_untitled("New session with Bodhi"));
+    assert!(is_untitled("新建会话"));
+    assert!(is_untitled("新建會話"));
+    assert!(is_untitled("Nouvelle session"));
+    assert!(is_untitled("新しいセッション"));
+    assert!(is_untitled("नया सत्र"));
+
     assert!(!is_untitled("My great chat"));
     assert!(!is_untitled("new session")); // case-sensitive on purpose
+    assert!(!is_untitled("New Session recap"));
+    assert!(!is_untitled("Bodhi session plan"));
+    assert!(!is_untitled("New Session with"));
+    assert!(!is_untitled("New Session -"));
 }
 
 #[test]

@@ -351,6 +351,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_generated_title_accepts_prompt_scoped_default_placeholder() {
+        let state = make_state().await;
+        seed_session(&state, "s1", "New session with Bodhi").await;
+
+        let result = SessionMetadataService::apply_generated_title(
+            &state,
+            "s1",
+            "Real Generated Title",
+            TitleSource::Auto,
+            false,
+        )
+        .await
+        .expect("ok");
+
+        let (applied, version) = result.expect("applied");
+        assert_eq!(applied, "Real Generated Title");
+        assert_eq!(version, 1);
+
+        let persisted = state.storage.load_session("s1").await.unwrap().unwrap();
+        assert_eq!(persisted.title, "Real Generated Title");
+        assert_eq!(persisted.title_version, 1);
+    }
+
+    #[tokio::test]
     async fn apply_generated_title_uses_correct_source_label() {
         let state = make_state().await;
         seed_session(&state, "s1", "New Session").await;
