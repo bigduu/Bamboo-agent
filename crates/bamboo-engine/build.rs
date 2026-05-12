@@ -3,6 +3,12 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+const BUILTIN_SKILL_WHITELIST: &[&str] = &["skill-creator"];
+
+fn is_builtin_skill_enabled(name: &str) -> bool {
+    BUILTIN_SKILL_WHITELIST.contains(&name)
+}
+
 fn collect_files(root: &Path, current: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     let mut entries = fs::read_dir(current)?
         .collect::<Result<Vec<_>, _>>()?
@@ -18,6 +24,11 @@ fn collect_files(root: &Path, current: &Path, out: &mut Vec<PathBuf>) -> io::Res
             .and_then(|value| value.to_str())
             .unwrap_or("");
         if file_name.starts_with('.') {
+            continue;
+        }
+
+        // Filter top-level skill directories against the whitelist
+        if path.is_dir() && root == current && !is_builtin_skill_enabled(file_name) {
             continue;
         }
 

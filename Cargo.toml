@@ -46,8 +46,6 @@ include = [
     "README.md",
     "build.rs",
     "src/**/*",
-    "builtin_skills/**/*",
-    "frontend_package/**/*",
 ]
 
 [dependencies]
