@@ -247,3 +247,181 @@ async fn test_execute_read_then_edit_with_same_session_id() {
         .expect("read updated file");
     assert_eq!(updated, "hi world");
 }
+
+#[actix_web::test]
+async fn test_execute_edit_tool_rejects_excessive_replace_all() {
+    let state = crate::e2e::common::create_test_app().await;
+
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .route("/v1/tools/execute", web::post().to(tools::execute_tool)),
+    )
+    .await;
+
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let test_file = temp_dir.path().join("edit_replace_all_guard.txt");
+    let content = (0..9).map(|_| "foo").collect::<Vec<_>>().join("\n") + "\n";
+    tokio::fs::write(&test_file, content)
+        .await
+        .expect("Failed to write test file");
+    let session_id = "tools-e2e-edit-replace-all-guard";
+
+    let read_req = test::TestRequest::post()
+        .uri("/v1/tools/execute")
+        .set_json(json!({
+            "tool_name": "read_file",
+            "session_id": session_id,
+            "parameters": [
+                {"name":"path","value": test_file.to_str().unwrap()}
+            ]
+        }))
+        .to_request();
+    let read_resp = test::call_service(&app, read_req).await;
+    assert!(read_resp.status().is_success());
+
+    let req = test::TestRequest::post()
+        .uri("/v1/tools/execute")
+        .set_json(json!({
+            "tool_name": "Edit",
+            "session_id": session_id,
+            "parameters": [
+                {"name":"file_path","value": test_file.to_str().unwrap()},
+                {"name":"old_string","value":"foo"},
+                {"name":"new_string","value":"bar"},
+                {"name":"replace_all","value":"true"}
+            ]
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert!(resp.status().is_client_error());
+
+    let body = test::read_body(resp).await;
+    let result: Value = serde_json::from_slice(&body).expect("Response should be valid JSON");
+    assert!(result["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("replace_all would modify"));
+}
+
+#[actix_web::test]
+async fn test_execute_edit_tool_rejects_replace_all_for_short_old_string() {
+    let state = crate::e2e::common::create_test_app().await;
+
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .route("/v1/tools/execute", web::post().to(tools::execute_tool)),
+    )
+    .await;
+
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let test_file = temp_dir
+        .path()
+        .join("edit_replace_all_short_old_string.txt");
+    tokio::fs::write(&test_file, "a\na\n")
+        .await
+        .expect("Failed to write test file");
+    let session_id = "tools-e2e-edit-replace-all-short-old-string";
+
+    let read_req = test::TestRequest::post()
+        .uri("/v1/tools/execute")
+        .set_json(json!({
+            "tool_name": "read_file",
+            "session_id": session_id,
+            "parameters": [
+                {"name":"path","value": test_file.to_str().unwrap()}
+            ]
+        }))
+        .to_request();
+    let read_resp = test::call_service(&app, read_req).await;
+    assert!(read_resp.status().is_success());
+
+    let req = test::TestRequest::post()
+        .uri("/v1/tools/execute")
+        .set_json(json!({
+            "tool_name": "Edit",
+            "session_id": session_id,
+            "parameters": [
+                {"name":"file_path","value": test_file.to_str().unwrap()},
+                {"name":"old_string","value":"a"},
+                {"name":"new_string","value":"b"},
+                {"name":"replace_all","value":"true"}
+            ]
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert!(resp.status().is_client_error());
+
+    let body = test::read_body(resp).await;
+    let result: Value = serde_json::from_slice(&body).expect("Response should be valid JSON");
+    assert!(result["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("non-whitespace characters"));
+}
+
+#[actix_web::test]
+async fn test_execute_edit_tool_patch_rejects_large_scope() {
+    let state = crate::e2e::common::create_test_app().await;
+
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .route("/v1/tools/execute", web::post().to(tools::execute_tool)),
+    )
+    .await;
+
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let test_file = temp_dir.path().join("edit_large_scope_patch.txt");
+    let old_block = (0..70)
+        .map(|idx| format!("line {idx}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let new_block = (0..70)
+        .map(|idx| format!("updated {idx}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    tokio::fs::write(&test_file, format!("{old_block}\n"))
+        .await
+        .expect("Failed to write test file");
+    let session_id = "tools-e2e-edit-large-scope-guard";
+
+    let read_req = test::TestRequest::post()
+        .uri("/v1/tools/execute")
+        .set_json(json!({
+            "tool_name": "read_file",
+            "session_id": session_id,
+            "parameters": [
+                {"name":"path","value": test_file.to_str().unwrap()}
+            ]
+        }))
+        .to_request();
+    let read_resp = test::call_service(&app, read_req).await;
+    assert!(read_resp.status().is_success());
+
+    let patch = format!("<<<<<<< SEARCH\n{old_block}\n=======\n{new_block}\n>>>>>>> REPLACE");
+    let req = test::TestRequest::post()
+        .uri("/v1/tools/execute")
+        .set_json(json!({
+            "tool_name": "Edit",
+            "session_id": session_id,
+            "parameters": [
+                {"name": "file_path", "value": test_file.to_str().unwrap()},
+                {"name": "patch", "value": patch}
+            ]
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert!(resp.status().is_client_error());
+
+    let body = test::read_body(resp).await;
+    let result: Value = serde_json::from_slice(&body).expect("Response should be valid JSON");
+    assert!(result["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("exceeding the safe limit"));
+}

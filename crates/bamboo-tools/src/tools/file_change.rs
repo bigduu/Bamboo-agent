@@ -238,6 +238,35 @@ pub fn build_file_change_payload_value(
     })
 }
 
+pub fn touched_line_count(previous_text: &str, updated_text: &str) -> usize {
+    if previous_text == updated_text {
+        return 0;
+    }
+
+    let old_lines = lines(previous_text);
+    let new_lines = lines(updated_text);
+
+    let mut prefix = 0usize;
+    let shared_len = old_lines.len().min(new_lines.len());
+    while prefix < shared_len && old_lines[prefix] == new_lines[prefix] {
+        prefix += 1;
+    }
+
+    let mut old_suffix = old_lines.len();
+    let mut new_suffix = new_lines.len();
+    while old_suffix > prefix
+        && new_suffix > prefix
+        && old_lines[old_suffix - 1] == new_lines[new_suffix - 1]
+    {
+        old_suffix -= 1;
+        new_suffix -= 1;
+    }
+
+    let removed_lines = old_suffix.saturating_sub(prefix);
+    let added_lines = new_suffix.saturating_sub(prefix);
+    added_lines.saturating_add(removed_lines)
+}
+
 fn build_unified_diff(file_path: &Path, previous_text: &str, updated_text: &str) -> Value {
     let old_lines = lines(previous_text);
     let new_lines = lines(updated_text);
@@ -377,5 +406,11 @@ mod tests {
         assert_eq!(diff["new_trailing_newline"], false);
         let unified = diff["unified"].as_str().unwrap_or_default();
         assert!(unified.contains("trailing newline"));
+    }
+
+    #[test]
+    fn touched_line_count_reports_added_plus_removed_lines() {
+        assert_eq!(touched_line_count("a\nb\nc\n", "a\nx\ny\nc\n"), 3);
+        assert_eq!(touched_line_count("same\n", "same\n"), 0);
     }
 }

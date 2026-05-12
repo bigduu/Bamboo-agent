@@ -11,6 +11,11 @@ use super::{content_diagnostics, file_change, read_tracker};
 const MAX_PATCH_BYTES: usize = 256 * 1024;
 const MAX_PATCH_BLOCKS: usize = 128;
 const MAX_PATCH_BLOCK_BYTES: usize = 64 * 1024;
+const MAX_SAFE_EDIT_SCOPE_LINES: usize = 120;
+const MAX_SAFE_REPLACE_ALL_OCCURRENCES: usize = 8;
+const MAX_SAFE_REPLACE_ALL_SCOPE_LINES: usize = 80;
+const MIN_REPLACE_ALL_NON_WHITESPACE_CHARS: usize = 2;
+const MIN_REPLACE_ALL_LINES: usize = 1;
 
 #[derive(Debug, Deserialize)]
 struct EditArgs {
@@ -36,6 +41,12 @@ struct ReplacementCandidate {
     replacement: String,
     start_line: usize,
     end_line: usize,
+}
+
+#[derive(Debug, Clone)]
+struct AppliedEdit {
+    updated: String,
+    replacements: usize,
 }
 
 impl EditTool {
@@ -67,6 +78,71 @@ impl EditTool {
 
     fn line_for_offset(line_starts: &[usize], offset: usize) -> usize {
         line_starts.partition_point(|line_start| *line_start <= offset)
+    }
+
+    fn has_candidate_containing_line(
+        candidates: &[ReplacementCandidate],
+        line_number: usize,
+    ) -> bool {
+        candidates.iter().any(|candidate| {
+            candidate.start_line <= line_number && line_number <= candidate.end_line
+        })
+    }
+
+    fn validate_replace_all_scope(old_string: &str) -> Result<(), ToolError> {
+        let non_whitespace_chars = old_string.chars().filter(|ch| !ch.is_whitespace()).count();
+        if non_whitespace_chars < MIN_REPLACE_ALL_NON_WHITESPACE_CHARS {
+            return Err(ToolError::InvalidArguments(format!(
+                "replace_all requires old_string to contain at least {} non-whitespace characters",
+                MIN_REPLACE_ALL_NON_WHITESPACE_CHARS
+            )));
+        }
+
+        let non_empty_lines = old_string
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        if non_empty_lines < MIN_REPLACE_ALL_LINES {
+            return Err(ToolError::InvalidArguments(
+                "replace_all requires old_string to contain at least one non-empty line"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn ensure_safe_scope(
+        replace_all: bool,
+        replacements: usize,
+        touched_lines: usize,
+    ) -> Result<(), ToolError> {
+        if replace_all && replacements > MAX_SAFE_REPLACE_ALL_OCCURRENCES {
+            return Err(ToolError::Execution(format!(
+                "replace_all would modify {} occurrences, exceeding the safe limit of {}; provide a more specific old_string or use patch mode",
+                replacements, MAX_SAFE_REPLACE_ALL_OCCURRENCES
+            )));
+        }
+
+        let max_scope = if replace_all {
+            MAX_SAFE_REPLACE_ALL_SCOPE_LINES
+        } else {
+            MAX_SAFE_EDIT_SCOPE_LINES
+        };
+
+        if touched_lines > max_scope {
+            let guidance = if replace_all {
+                "provide a more specific old_string or use patch mode"
+            } else {
+                "split the change into smaller patches or use Write for intentional full-file rewrites"
+            };
+            return Err(ToolError::Execution(format!(
+                "Edit would touch {} diff lines, exceeding the safe limit of {}; {}",
+                touched_lines, max_scope, guidance
+            )));
+        }
+
+        Ok(())
     }
 
     fn replacement_variants(
@@ -147,17 +223,15 @@ impl EditTool {
             .cloned()
             .collect::<Vec<_>>();
 
-        let pool = if containing.is_empty() {
-            candidates.to_vec()
-        } else {
-            containing
-        };
+        if containing.is_empty() {
+            return None;
+        }
 
         let mut best: Option<ReplacementCandidate> = None;
         let mut best_distance = usize::MAX;
         let mut tie = false;
 
-        for candidate in pool {
+        for candidate in containing {
             let distance = candidate.start_line.abs_diff(line_number);
             if distance < best_distance {
                 best_distance = distance;
@@ -181,7 +255,7 @@ impl EditTool {
         new_string: &str,
         replace_all: bool,
         line_number: Option<usize>,
-    ) -> Result<(String, usize), ToolError> {
+    ) -> Result<AppliedEdit, ToolError> {
         if old_string == new_string {
             return Err(ToolError::InvalidArguments(
                 "new_string must be different from old_string".to_string(),
@@ -216,51 +290,64 @@ impl EditTool {
 
         if !replace_all && candidates.len() != 1 && line_number.is_none() {
             return Err(ToolError::Execution(format!(
-                "old_string matched {} times; provide a more specific old_string, set line_number, use patch mode, or set replace_all=true",
+                "old_string matched {} times; provide a more specific old_string, set line_number, or use patch mode with additional context",
                 candidates.len()
             )));
         }
 
-        let updated = if replace_all {
+        if replace_all {
+            Self::validate_replace_all_scope(old_string)?;
             let variants = Self::replacement_variants(content, old_string, new_string);
-            let mut replaced = None;
-            let mut updated = None;
             for (search, replacement) in variants {
                 let matches = content.match_indices(&search).count();
                 if matches > 0 {
-                    replaced = Some(matches);
-                    updated = Some(content.replace(&search, &replacement));
-                    break;
+                    return Ok(AppliedEdit {
+                        updated: content.replace(&search, &replacement),
+                        replacements: matches,
+                    });
                 }
             }
-            return Ok((
-                updated.unwrap_or_else(|| content.to_string()),
-                replaced.unwrap_or(0),
-            ));
-        } else {
-            let chosen = if let Some(line) = line_number {
-                Self::choose_candidate_with_line_hint(&candidates, line).ok_or_else(|| {
-                    ToolError::Execution(format!(
-                        "old_string matched {} times and line_number={} was not unique; candidate start lines: {}. Provide a more specific old_string or patch context",
+
+            return Ok(AppliedEdit {
+                updated: content.to_string(),
+                replacements: 0,
+            });
+        }
+
+        let chosen = if let Some(line) = line_number {
+            match Self::choose_candidate_with_line_hint(&candidates, line) {
+                Some(candidate) => candidate,
+                None if Self::has_candidate_containing_line(&candidates, line) => {
+                    return Err(ToolError::Execution(format!(
+                        "old_string matched {} times and line_number={} was not unique among candidates containing that line; candidate start lines: {}. Provide a more specific old_string or patch context",
                         candidates.len(),
                         line,
                         Self::candidate_line_summary(&candidates),
-                    ))
-                })?
-            } else {
-                candidates[0].clone()
-            };
-
-            let mut next = String::with_capacity(
-                content.len().saturating_sub(chosen.matched_len) + chosen.replacement.len(),
-            );
-            next.push_str(&content[..chosen.start]);
-            next.push_str(&chosen.replacement);
-            next.push_str(&content[chosen.start + chosen.matched_len..]);
-            next
+                    )));
+                }
+                None => {
+                    return Err(ToolError::Execution(format!(
+                        "line_number={} did not match any old_string candidate; candidate start lines: {}. Provide a line_number within the target match or use patch context",
+                        line,
+                        Self::candidate_line_summary(&candidates),
+                    )));
+                }
+            }
+        } else {
+            candidates[0].clone()
         };
 
-        Ok((updated, 1))
+        let mut next = String::with_capacity(
+            content.len().saturating_sub(chosen.matched_len) + chosen.replacement.len(),
+        );
+        next.push_str(&content[..chosen.start]);
+        next.push_str(&chosen.replacement);
+        next.push_str(&content[chosen.start + chosen.matched_len..]);
+
+        Ok(AppliedEdit {
+            updated: next,
+            replacements: 1,
+        })
     }
 
     fn parse_patch_blocks(patch: &str) -> Result<Vec<(String, String)>, ToolError> {
@@ -337,7 +424,7 @@ impl EditTool {
         content: &str,
         patch: &str,
         line_number: Option<usize>,
-    ) -> Result<(String, usize), ToolError> {
+    ) -> Result<AppliedEdit, ToolError> {
         if let Some(line) = line_number {
             if line == 0 {
                 return Err(ToolError::InvalidArguments(
@@ -362,15 +449,26 @@ impl EditTool {
             let chosen = if candidates.len() == 1 {
                 candidates[0].clone()
             } else if let Some(line) = line_number {
-                Self::choose_candidate_with_line_hint(&candidates, line).ok_or_else(|| {
-                    ToolError::Execution(format!(
-                        "Patch block {} SEARCH content matched {} times and line_number={} was not unique; candidate start lines: {}. Add more context to make it unique",
-                        idx + 1,
-                        candidates.len(),
-                        line,
-                        Self::candidate_line_summary(&candidates),
-                    ))
-                })?
+                match Self::choose_candidate_with_line_hint(&candidates, line) {
+                    Some(candidate) => candidate,
+                    None if Self::has_candidate_containing_line(&candidates, line) => {
+                        return Err(ToolError::Execution(format!(
+                            "Patch block {} SEARCH content matched {} times and line_number={} was not unique among candidates containing that line; candidate start lines: {}. Add more context to make it unique",
+                            idx + 1,
+                            candidates.len(),
+                            line,
+                            Self::candidate_line_summary(&candidates),
+                        )));
+                    }
+                    None => {
+                        return Err(ToolError::Execution(format!(
+                            "Patch block {} line_number={} did not match any SEARCH candidate; candidate start lines: {}. Add more context or use a line within the target block",
+                            idx + 1,
+                            line,
+                            Self::candidate_line_summary(&candidates),
+                        )));
+                    }
+                }
             } else {
                 return Err(ToolError::Execution(format!(
                     "Patch block {} SEARCH content matched {} times; set line_number or add more context to make it unique",
@@ -389,7 +487,10 @@ impl EditTool {
             replacements += 1;
         }
 
-        Ok((updated, replacements))
+        Ok(AppliedEdit {
+            updated,
+            replacements,
+        })
     }
 }
 
@@ -499,7 +600,10 @@ impl Tool for EditTool {
         let line_number_hint = parsed.line_number;
         let used_patch_mode = patch.is_some();
 
-        let (updated, replacements, mode_label) = if let Some(patch_text) = patch {
+        let AppliedEdit {
+            updated,
+            replacements,
+        } = if let Some(patch_text) = patch {
             if Self::has_meaningful_optional_text(old_string)
                 || Self::has_meaningful_optional_text(new_string)
                 || requested_replace_all
@@ -509,8 +613,7 @@ impl Tool for EditTool {
                         .to_string(),
                 ));
             }
-            let (next, count) = Self::apply_patch_mode(&content, patch_text, parsed.line_number)?;
-            (next, count, "patch")
+            Self::apply_patch_mode(&content, patch_text, parsed.line_number)?
         } else {
             let old = old_string.ok_or_else(|| {
                 ToolError::InvalidArguments(
@@ -522,15 +625,18 @@ impl Tool for EditTool {
                     "new_string is required unless patch mode is used".to_string(),
                 )
             })?;
-            let (next, count) = Self::apply_single_replacement(
+            Self::apply_single_replacement(
                 &content,
                 old,
                 new,
                 requested_replace_all,
                 parsed.line_number,
-            )?;
-            (next, count, "legacy")
+            )?
         };
+        let mode_label = if used_patch_mode { "patch" } else { "legacy" };
+        let touched_lines = file_change::touched_line_count(&content, &updated);
+
+        Self::ensure_safe_scope(requested_replace_all, replacements, touched_lines)?;
 
         let checkpoint = file_change::create_checkpoint(path, Some(content.as_bytes())).await?;
 
@@ -561,6 +667,7 @@ impl Tool for EditTool {
             obj.insert("line_number_hint".to_string(), json!(line_number_hint));
             obj.insert("changed_bytes".to_string(), json!(changed_bytes));
             obj.insert("changed_lines".to_string(), json!(changed_lines));
+            obj.insert("touched_lines".to_string(), json!(touched_lines));
         }
         content_diagnostics::attach_file_diagnostics(&mut payload, path, &updated);
 
@@ -625,16 +732,82 @@ mod tests {
         let result = tool
             .execute(json!({
                 "file_path": file.path(),
-                "old_string": "a",
-                "new_string": "aa",
+                "old_string": "aa",
+                "new_string": "bb",
                 "replace_all": true
             }))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ToolError::Execution(_)) | Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn edit_replace_all_rejects_excessive_occurrence_count() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let content = (0..=MAX_SAFE_REPLACE_ALL_OCCURRENCES)
+            .map(|_| "foo")
+            .collect::<Vec<_>>()
+            .join("\n");
+        tokio::fs::write(file.path(), format!("{content}\n"))
             .await
             .unwrap();
 
-        assert!(result.success);
-        let updated = tokio::fs::read_to_string(file.path()).await.unwrap();
-        assert_eq!(updated, "aa\n");
+        let tool = EditTool::new();
+        let result = tool
+            .execute(json!({
+                "file_path": file.path(),
+                "old_string": "foo",
+                "new_string": "bar",
+                "replace_all": true
+            }))
+            .await;
+
+        assert!(
+            matches!(result, Err(ToolError::Execution(msg)) if msg.contains("replace_all would modify"))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_replace_all_rejects_too_short_old_string() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "a\na\n").await.unwrap();
+
+        let tool = EditTool::new();
+        let result = tool
+            .execute(json!({
+                "file_path": file.path(),
+                "old_string": "a",
+                "new_string": "b",
+                "replace_all": true
+            }))
+            .await;
+
+        assert!(
+            matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("non-whitespace characters"))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_replace_all_rejects_whitespace_only_old_string() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "  \n  \n").await.unwrap();
+
+        let tool = EditTool::new();
+        let result = tool
+            .execute(json!({
+                "file_path": file.path(),
+                "old_string": "  ",
+                "new_string": "x",
+                "replace_all": true
+            }))
+            .await;
+
+        assert!(
+            matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("non-whitespace characters") || msg.contains("non-empty line"))
+        );
     }
 
     #[tokio::test]
@@ -762,6 +935,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_legacy_mode_rejects_line_number_when_no_candidate_contains_it() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "foo\nbar\nfoo\n")
+            .await
+            .unwrap();
+
+        let tool = EditTool::new();
+        let result = tool
+            .execute(json!({
+                "file_path": file.path(),
+                "old_string": "foo",
+                "new_string": "baz",
+                "line_number": 2
+            }))
+            .await;
+
+        assert!(
+            matches!(result, Err(ToolError::Execution(msg)) if msg.contains("did not match any old_string candidate"))
+        );
+    }
+
+    #[tokio::test]
     async fn edit_legacy_mode_rejects_line_number_with_replace_all() {
         let file = tempfile::NamedTempFile::new().unwrap();
         tokio::fs::write(file.path(), "foo\nfoo\n").await.unwrap();
@@ -851,6 +1046,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_patch_mode_rejects_line_number_when_no_candidate_contains_it() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "x = 1;\ny = 0;\nx = 1;\n")
+            .await
+            .unwrap();
+
+        let tool = EditTool::new();
+        let result = tool
+            .execute(json!({
+                "file_path": file.path(),
+                "line_number": 2,
+                "patch": "<<<<<<< SEARCH\nx = 1;\n=======\nx = 2;\n>>>>>>> REPLACE"
+            }))
+            .await;
+
+        assert!(
+            matches!(result, Err(ToolError::Execution(msg)) if msg.contains("did not match any SEARCH candidate"))
+        );
+    }
+
+    #[tokio::test]
     async fn edit_patch_mode_rejects_ambiguous_search_block() {
         let file = tempfile::NamedTempFile::new().unwrap();
         tokio::fs::write(file.path(), "x = 1;\nx = 1;\n")
@@ -867,6 +1083,36 @@ mod tests {
 
         assert!(
             matches!(result, Err(ToolError::Execution(msg)) if msg.contains("matched 2 times"))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_patch_mode_rejects_large_scope_edits() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let old_block = (0..70)
+            .map(|idx| format!("line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new_block = (0..70)
+            .map(|idx| format!("updated {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        tokio::fs::write(file.path(), format!("{old_block}\n"))
+            .await
+            .unwrap();
+
+        let patch = format!("<<<<<<< SEARCH\n{old_block}\n=======\n{new_block}\n>>>>>>> REPLACE");
+
+        let tool = EditTool::new();
+        let result = tool
+            .execute(json!({
+                "file_path": file.path(),
+                "patch": patch
+            }))
+            .await;
+
+        assert!(
+            matches!(result, Err(ToolError::Execution(msg)) if msg.contains("exceeding the safe limit"))
         );
     }
 
@@ -992,8 +1238,10 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
         assert_eq!(payload["diagnostics"]["format"], "json");
         assert_eq!(payload["diagnostics"]["valid"], false);
+        assert_eq!(payload["touched_lines"], 2);
     }
 }
