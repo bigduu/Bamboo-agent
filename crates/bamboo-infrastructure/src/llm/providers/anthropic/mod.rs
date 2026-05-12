@@ -435,7 +435,31 @@ fn messages_to_anthropic_json(messages: &[Message]) -> (Option<Value>, Vec<Value
     for m in messages {
         match m.role {
             Role::System => system_parts.push(m.content.as_str()),
-            Role::User | Role::Assistant | Role::Tool => out.push(message_to_anthropic_json(m)),
+            Role::User | Role::Assistant | Role::Tool => {
+                let msg_json = message_to_anthropic_json(m);
+                // Merge consecutive Tool messages into the preceding user
+                // message so that all tool_results for a single assistant
+                // tool_use turn live in the *same* user message, as required
+                // by the Anthropic API.
+                if matches!(m.role, Role::Tool) {
+                    if let Some(last) = out.last_mut() {
+                        let last_role = last.get("role").and_then(|r| r.as_str());
+                        if last_role == Some("user") {
+                            if let Some(last_content) =
+                                last.get_mut("content").and_then(|c| c.as_array_mut())
+                            {
+                                if let Some(new_content) =
+                                    msg_json.get("content").and_then(|c| c.as_array())
+                                {
+                                    last_content.extend(new_content.iter().cloned());
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                out.push(msg_json);
+            }
         }
     }
 
@@ -469,6 +493,21 @@ fn message_to_anthropic_json(message: &Message) -> Value {
         }),
         Role::Assistant => {
             let mut blocks: Vec<Value> = Vec::new();
+
+            // When extended thinking was enabled, Anthropic requires the
+            // `thinking` content block to be present in every assistant
+            // message — including tool-call turns.  Without it the API
+            // returns HTTP 400:
+            //   "thinking is enabled but reasoning_content is missing in
+            //    assistant tool call message at index N"
+            if let Some(reasoning) = &message.reasoning {
+                if !reasoning.is_empty() {
+                    blocks.push(json!({
+                        "type": "thinking",
+                        "thinking": reasoning,
+                    }));
+                }
+            }
 
             if !message.content.is_empty() {
                 blocks.push(json!({
@@ -1627,6 +1666,70 @@ mod anthropic_request_building_edge_cases {
             super::build_anthropic_request(&messages, &[], "claude-test", 2048, false, None, None);
 
         assert_eq!(out["max_tokens"], 2048);
+    }
+
+    #[test]
+    fn assistant_reasoning_included_as_thinking_block() {
+        let messages = vec![Message::assistant_with_reasoning(
+            "Here is the answer.",
+            None,
+            Some("I thought about it.".to_string()),
+        )];
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        // Thinking block must come first
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "I thought about it.");
+        // Followed by the text block
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "Here is the answer.");
+    }
+
+    #[test]
+    fn assistant_reasoning_included_with_tool_calls() {
+        use bamboo_domain::{FunctionCall, ToolCall};
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "search".to_string(),
+                arguments: r#"{"q":"test"}"#.to_string(),
+            },
+        };
+        let messages = vec![Message::assistant_with_reasoning(
+            "",
+            Some(vec![tool_call]),
+            Some("Planning the search.".to_string()),
+        )];
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        // Thinking block first
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "Planning the search.");
+        // Tool use block second (no text because content is empty)
+        assert_eq!(content[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn assistant_empty_reasoning_omits_thinking_block() {
+        let messages = vec![Message::assistant_with_reasoning(
+            "Hello",
+            None,
+            Some(String::new()),
+        )];
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        // Only text block, no thinking block for empty reasoning
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
     }
 
     #[test]
