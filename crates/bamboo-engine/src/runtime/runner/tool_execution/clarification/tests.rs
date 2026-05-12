@@ -204,8 +204,18 @@ async fn maybe_handle_user_question_tool_persists_exit_plan_file_and_emits_updat
     let (tx, mut rx) = mpsc::channel(8);
     let mut session = Session::new("session-exit-plan", "model");
     session.agent_runtime_state = Some(AgentRuntimeState::new("run-1"));
-    session.agent_runtime_state.as_mut().unwrap().round.current_round = 5;
-    session.agent_runtime_state.as_mut().unwrap().round.last_round_id = Some("round-5".to_string());
+    session
+        .agent_runtime_state
+        .as_mut()
+        .unwrap()
+        .round
+        .current_round = 5;
+    session
+        .agent_runtime_state
+        .as_mut()
+        .unwrap()
+        .round
+        .last_round_id = Some("round-5".to_string());
     session.agent_runtime_state.as_mut().unwrap().plan_mode = Some(PlanModeState {
         entered_at: Utc::now(),
         pre_permission_mode: "default".to_string(),
@@ -262,7 +272,11 @@ async fn maybe_handle_user_question_tool_persists_exit_plan_file_and_emits_updat
         .plan_file_path
         .as_ref()
         .expect("plan file path should be recorded");
-    assert!(plan_file_path.contains("/plan/") || plan_file_path.ends_with("plan\\session-exit-plan.md") || plan_file_path.contains("\\plan\\"));
+    assert!(
+        plan_file_path.contains("/plan/")
+            || plan_file_path.ends_with("plan\\session-exit-plan.md")
+            || plan_file_path.contains("\\plan\\")
+    );
     let saved_plan = std::fs::read_to_string(plan_file_path).expect("saved plan file");
     assert_eq!(saved_plan, plan_body);
 
@@ -289,9 +303,16 @@ async fn maybe_handle_user_question_tool_persists_exit_plan_file_and_emits_updat
     assert_eq!(cursor.last_completed_task_id.as_deref(), Some("discovery"));
     assert_eq!(cursor.round_hint, Some(5));
     assert_eq!(cursor.round_id_hint.as_deref(), Some("round-5"));
-    assert_eq!(cursor.suspension_hook_point.as_deref(), Some("AfterToolExecution"));
+    assert_eq!(
+        cursor.suspension_hook_point.as_deref(),
+        Some("AfterToolExecution")
+    );
     assert_eq!(cursor.tool_call_boundary.as_deref(), Some("ExitPlanMode"));
-    assert!(cursor.resume_note.as_deref().unwrap_or("").contains("Resume"));
+    assert!(cursor
+        .resume_note
+        .as_deref()
+        .unwrap_or("")
+        .contains("Resume"));
 
     let first_event = rx.recv().await.expect("first event");
     assert!(matches!(first_event, AgentEvent::ToolComplete { .. }));

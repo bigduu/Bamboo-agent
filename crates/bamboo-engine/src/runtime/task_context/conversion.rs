@@ -2,6 +2,42 @@ use bamboo_domain::{TaskItem, TaskItemStatus, TaskList};
 
 use super::{TaskLoopContext, TaskLoopItem};
 
+fn clone_loop_item_into_task_item(loop_item: &TaskLoopItem) -> TaskItem {
+    TaskItem {
+        id: loop_item.id.clone(),
+        description: loop_item.description.clone(),
+        status: loop_item.status.clone(),
+        depends_on: loop_item.depends_on.clone(),
+        notes: loop_item.notes.clone(),
+        active_form: loop_item.active_form.clone(),
+        parent_id: loop_item.parent_id.clone(),
+        phase: loop_item.phase.clone(),
+        priority: loop_item.priority.clone(),
+        completion_criteria: loop_item.completion_criteria.clone(),
+        evidence: loop_item.evidence.clone(),
+        blockers: loop_item.blockers.clone(),
+        transitions: loop_item.transitions.clone(),
+    }
+}
+
+fn into_task_item(loop_item: TaskLoopItem) -> TaskItem {
+    TaskItem {
+        id: loop_item.id,
+        description: loop_item.description,
+        status: loop_item.status,
+        depends_on: loop_item.depends_on,
+        notes: loop_item.notes,
+        active_form: loop_item.active_form,
+        parent_id: loop_item.parent_id,
+        phase: loop_item.phase,
+        priority: loop_item.priority,
+        completion_criteria: loop_item.completion_criteria,
+        evidence: loop_item.evidence,
+        blockers: loop_item.blockers,
+        transitions: loop_item.transitions,
+    }
+}
+
 impl TaskLoopContext {
     /// Create `TaskLoopContext` from the session's task list.
     pub fn from_session(session: &bamboo_agent_core::Session) -> Option<Self> {
@@ -67,30 +103,32 @@ impl TaskLoopContext {
         })
     }
 
-    /// Convert back to `TaskList` for persistence.
-    pub fn into_task_list(self) -> TaskList {
+    /// Clone into a `TaskList`, preserving the provided title.
+    pub fn to_task_list_with_title(&self, title: impl Into<String>) -> TaskList {
         TaskList {
-            session_id: self.session_id,
-            title: "Agent Tasks".to_string(),
+            session_id: self.session_id.clone(),
+            title: title.into(),
             items: self
                 .items
-                .into_iter()
-                .map(|loop_item| TaskItem {
-                    id: loop_item.id,
-                    description: loop_item.description,
-                    status: loop_item.status,
-                    depends_on: loop_item.depends_on,
-                    notes: loop_item.notes,
-                    active_form: loop_item.active_form,
-                    parent_id: loop_item.parent_id,
-                    phase: loop_item.phase,
-                    priority: loop_item.priority,
-                    completion_criteria: loop_item.completion_criteria,
-                    evidence: loop_item.evidence,
-                    blockers: loop_item.blockers,
-                    transitions: loop_item.transitions,
-                })
+                .iter()
+                .map(clone_loop_item_into_task_item)
                 .collect(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+
+    /// Convert back to `TaskList` for persistence.
+    pub fn into_task_list(self) -> TaskList {
+        self.into_task_list_with_title("Agent Tasks")
+    }
+
+    /// Convert back to `TaskList` for persistence with an explicit title.
+    pub fn into_task_list_with_title(self, title: impl Into<String>) -> TaskList {
+        TaskList {
+            session_id: self.session_id,
+            title: title.into(),
+            items: self.items.into_iter().map(into_task_item).collect(),
             created_at: self.created_at,
             updated_at: self.updated_at,
         }

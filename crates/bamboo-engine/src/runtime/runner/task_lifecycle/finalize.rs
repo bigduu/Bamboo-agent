@@ -30,10 +30,15 @@ pub(super) async fn finalize_task_context(
     }
 
     let version = ctx.version;
+    let task_list_title = session
+        .task_list
+        .as_ref()
+        .map(|task_list| task_list.title.clone())
+        .unwrap_or_else(|| "Agent Tasks".to_string());
     session
         .metadata
         .insert("task_list_version".to_string(), version.to_string());
-    session.task_list = Some(ctx.into_task_list());
+    session.task_list = Some(ctx.into_task_list_with_title(task_list_title));
     session.updated_at = Utc::now();
 
     tracing::debug!(

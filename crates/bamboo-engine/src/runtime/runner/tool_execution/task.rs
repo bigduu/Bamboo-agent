@@ -8,6 +8,8 @@ use bamboo_agent_core::{AgentEvent, Session};
 mod progress;
 mod taskwrite;
 
+pub(in crate::runtime::runner) use taskwrite::persist_shared_task_list;
+
 pub(super) async fn track_task_progress(
     task_context: &mut Option<TaskLoopContext>,
     event_tx: &mpsc::Sender<AgentEvent>,

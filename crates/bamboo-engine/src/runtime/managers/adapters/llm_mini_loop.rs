@@ -122,10 +122,10 @@ impl MiniLoopExecutor for LLMMiniLoopExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_infrastructure::llm::provider::LLMRequestOptions;
-    use bamboo_domain::ReasoningEffort;
-    use bamboo_infrastructure::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use bamboo_agent_core::tools::ToolSchema;
+    use bamboo_domain::ReasoningEffort;
+    use bamboo_infrastructure::llm::provider::LLMRequestOptions;
+    use bamboo_infrastructure::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use futures::stream;
     use std::sync::{Arc, Mutex};
 

@@ -17,6 +17,7 @@ use crate::metrics::{
     TokenUsage as MetricsTokenUsage,
 };
 use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::runner::loop_execution::startup::{InFlightTaskEvaluation, LoopRunState};
 use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
 use crate::runtime::runner::session_setup::tool_schemas::resolve_available_tool_schemas_for_session;
 use crate::runtime::stream::handler::StreamHandlingOutput;
@@ -27,7 +28,6 @@ use bamboo_domain::session::runtime_state::{AgentStatusState, SuspensionState};
 use bamboo_infrastructure::LLMProvider;
 
 use super::super::to_event_token_usage;
-use super::startup::LoopRunState;
 use crate::runtime::runner::state_bridge;
 
 const MAX_LLM_TURN_ATTEMPTS: usize = 3;
@@ -102,6 +102,211 @@ fn record_turn_failure(
     );
 }
 
+async fn poll_completed_task_evaluation(state: &mut LoopRunState) {
+    let finished = state
+        .task_evaluation
+        .in_flight
+        .as_ref()
+        .is_some_and(|in_flight| in_flight.join_handle.is_finished());
+    if !finished {
+        return;
+    }
+
+    let Some(in_flight) = state.task_evaluation.in_flight.take() else {
+        return;
+    };
+
+    match in_flight.join_handle.await {
+        Ok(result) => {
+            state.task_evaluation.completed = Some(result);
+        }
+        Err(error) => {
+            tracing::warn!(
+                "[{}] Async task evaluation join failed for round {}: {}",
+                state.session_id,
+                in_flight.request.round_number,
+                error
+            );
+        }
+    }
+}
+
+async fn drain_in_flight_task_evaluation(state: &mut LoopRunState) {
+    if state.task_evaluation.completed.is_some() {
+        return;
+    }
+
+    let Some(in_flight) = state.task_evaluation.in_flight.take() else {
+        return;
+    };
+
+    match in_flight.join_handle.await {
+        Ok(result) => {
+            state.task_evaluation.completed = Some(result);
+        }
+        Err(error) => {
+            tracing::warn!(
+                "[{}] Async task evaluation join failed while draining round {}: {}",
+                state.session_id,
+                in_flight.request.round_number,
+                error
+            );
+        }
+    }
+}
+
+async fn apply_completed_task_evaluation(
+    session: &mut Session,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    config: &AgentLoopConfig,
+    state: &mut LoopRunState,
+) {
+    let Some(result) = state.task_evaluation.completed.take() else {
+        return;
+    };
+
+    let apply_outcome = crate::runtime::runner::task_lifecycle::apply_task_evaluation_result(
+        &mut state.task_context,
+        session,
+        &state.session_id,
+        result.clone(),
+    );
+
+    let synthetic_round_id = format!(
+        "{}-task-evaluation-round-{}",
+        state.session_id, result.round_number
+    );
+    crate::runtime::runner::metrics_lifecycle::record_round_started(
+        state.metrics_collector.as_ref(),
+        &synthetic_round_id,
+        &state.session_id,
+        result.model_name.as_str(),
+    );
+    crate::runtime::runner::metrics_lifecycle::record_round_completed(
+        state.metrics_collector.as_ref(),
+        &synthetic_round_id,
+        &state.session_id,
+        session.messages.len() as u32,
+        if apply_outcome.stale {
+            MetricsRoundStatus::Cancelled
+        } else {
+            MetricsRoundStatus::Success
+        },
+        apply_outcome.usage,
+        session
+            .token_usage
+            .as_ref()
+            .map(|usage| usage.prompt_cached_tool_outputs)
+            .unwrap_or(0)
+            .min(u32::MAX as usize) as u32,
+        session
+            .token_usage
+            .as_ref()
+            .map(|usage| usage.prompt_cached_tool_tokens_saved)
+            .unwrap_or(0),
+        None,
+    );
+
+    if !apply_outcome.stale && apply_outcome.applied_updates > 0 {
+        if let Some(ref ctx) = state.task_context {
+            let task_list_title = result
+                .task_list_title
+                .or_else(|| {
+                    session
+                        .task_list
+                        .as_ref()
+                        .map(|task_list| task_list.title.clone())
+                })
+                .unwrap_or_else(|| "Agent Tasks".to_string());
+            session
+                .metadata
+                .insert("task_list_version".to_string(), ctx.version.to_string());
+            let task_list = ctx.to_task_list_with_title(task_list_title);
+            session.set_task_list(task_list.clone());
+            crate::runtime::runner::tool_execution::persist_shared_task_list(
+                config,
+                session,
+                &result.shared_session_id,
+                &state.session_id,
+                &task_list,
+            )
+            .await;
+            let _ = event_tx
+                .send(AgentEvent::TaskListUpdated { task_list })
+                .await;
+        }
+    }
+}
+
+fn spawn_task_evaluation_request(
+    state: &mut LoopRunState,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    request: crate::runtime::runner::task_lifecycle::AsyncTaskEvaluationRequest,
+    llm: Arc<dyn LLMProvider>,
+) {
+    let task_round = request.round_number;
+    let session_id = state.session_id.clone();
+    let event_tx = event_tx.clone();
+    let request_for_spawn = request.clone();
+    let join_handle = tokio::spawn(async move {
+        crate::runtime::runner::task_lifecycle::execute_async_task_evaluation(
+            request_for_spawn,
+            llm,
+            event_tx,
+        )
+        .await
+    });
+
+    tracing::debug!(
+        "[{}] Spawned async task evaluation for round {}",
+        session_id,
+        task_round
+    );
+
+    state.task_evaluation.in_flight = Some(InFlightTaskEvaluation {
+        request,
+        join_handle,
+    });
+}
+
+fn spawn_task_evaluation_if_needed(
+    turn: usize,
+    session: &Session,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    config: &AgentLoopConfig,
+    state: &mut LoopRunState,
+    llm: Arc<dyn LLMProvider>,
+) -> Result<(), AgentError> {
+    let eval_model = config
+        .fast_model_name
+        .as_deref()
+        .or(config.model_name.as_deref());
+    let request = crate::runtime::runner::task_lifecycle::build_async_task_evaluation_request(
+        &state.task_context,
+        session,
+        &state.session_id,
+        turn + 1,
+        eval_model,
+        config.reasoning_effort,
+    )?;
+    let Some(request) = request else {
+        return Ok(());
+    };
+
+    if state.task_evaluation.in_flight.is_some() {
+        state.task_evaluation.queued_request = Some(request);
+        tracing::debug!(
+            "[{}] Queued latest async task evaluation snapshot for round {} while another evaluation is still in flight",
+            state.session_id,
+            turn + 1
+        );
+        return Ok(());
+    }
+
+    spawn_task_evaluation_request(state, event_tx, request, llm);
+    Ok(())
+}
+
 // ---- No-tool-calls path (from round_flow/no_tool_calls.rs) ----
 
 async fn handle_no_tool_calls(
@@ -137,6 +342,11 @@ async fn handle_no_tool_calls(
             .map(|usage| usage.prompt_cached_tool_outputs)
             .unwrap_or(0)
             .min(u32::MAX as usize) as u32,
+        session
+            .token_usage
+            .as_ref()
+            .map(|usage| usage.prompt_cached_tool_tokens_saved)
+            .unwrap_or(0),
         None,
     );
 
@@ -234,6 +444,11 @@ async fn handle_tool_calls_path(
                 .map(|usage| usage.prompt_cached_tool_outputs)
                 .unwrap_or(0)
                 .min(u32::MAX as usize) as u32,
+            session
+                .token_usage
+                .as_ref()
+                .map(|usage| usage.prompt_cached_tool_tokens_saved)
+                .unwrap_or(0),
             round_error,
         );
         return Ok(TurnOutcome {
@@ -252,35 +467,6 @@ async fn handle_tool_calls_path(
             })
         );
     }
-
-    let eval_model = config
-        .fast_model_name
-        .as_deref()
-        .or(config.model_name.as_deref());
-    let eval_provider = config
-        .background_model_provider
-        .clone()
-        .unwrap_or_else(|| llm.clone());
-    let task_evaluation_usage =
-        crate::runtime::runner::task_lifecycle::evaluate_round_task_progress(
-            task_context,
-            session,
-            eval_provider,
-            event_tx,
-            session_id,
-            turn + 1,
-            eval_model,
-            config.reasoning_effort,
-        )
-        .await?;
-
-    // Accumulate task evaluation usage into round usage
-    round_usage.prompt_tokens = round_usage
-        .prompt_tokens
-        .saturating_add(task_evaluation_usage.prompt_tokens);
-    round_usage.completion_tokens = round_usage
-        .completion_tokens
-        .saturating_add(task_evaluation_usage.completion_tokens);
 
     // ---- Dynamic model routing: classify task complexity ----
     // When features.dynamic_model_routing is enabled, evaluate task complexity
@@ -336,6 +522,11 @@ async fn handle_tool_calls_path(
             .map(|usage| usage.prompt_cached_tool_outputs)
             .unwrap_or(0)
             .min(u32::MAX as usize) as u32,
+        session
+            .token_usage
+            .as_ref()
+            .map(|usage| usage.prompt_cached_tool_tokens_saved)
+            .unwrap_or(0),
         round_error,
     );
 
@@ -360,6 +551,18 @@ pub(super) async fn run_pipeline(
     let mut turn_counter: u32 = 0;
 
     loop {
+        poll_completed_task_evaluation(state).await;
+        apply_completed_task_evaluation(session, event_tx, config, state).await;
+        if state.task_evaluation.in_flight.is_none() {
+            if let Some(request) = state.task_evaluation.queued_request.take() {
+                let eval_provider = config
+                    .background_model_provider
+                    .clone()
+                    .unwrap_or_else(|| llm.clone());
+                spawn_task_evaluation_request(state, event_tx, request, eval_provider);
+            }
+        }
+
         state.runtime_state.round.current_round = turn_counter;
 
         let round_id = format!("{}-round-{}", state.session_id, turn_counter + 1);
@@ -745,6 +948,25 @@ pub(super) async fn run_pipeline(
             break;
         }
 
+        if let Err(error) = spawn_task_evaluation_if_needed(
+            turn_counter as usize,
+            session,
+            event_tx,
+            config,
+            state,
+            config
+                .background_model_provider
+                .clone()
+                .unwrap_or_else(|| llm.clone()),
+        ) {
+            tracing::warn!(
+                "[{}] Failed to spawn async task evaluation after round {}: {}",
+                state.session_id,
+                turn_counter + 1,
+                error
+            );
+        }
+
         turn_counter += 1;
 
         // --- Guard against max_rounds ---
@@ -753,21 +975,21 @@ pub(super) async fn run_pipeline(
         }
     }
 
+    drain_in_flight_task_evaluation(state).await;
+    apply_completed_task_evaluation(session, event_tx, config, state).await;
+
     Ok(sent_complete)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::startup::OverflowRecoveryState;
-    use super::{
-        is_overflow_recoverable, map_turn_error_status,
-        should_retry_turn_error,
-    };
-    use crate::runtime::runner::state_bridge;
+    use super::{is_overflow_recoverable, map_turn_error_status, should_retry_turn_error};
     use crate::metrics::{
         RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
         TokenUsage as MetricsTokenUsage,
     };
+    use crate::runtime::runner::state_bridge;
     use bamboo_agent_core::storage::Storage;
     use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
     use std::collections::HashMap;
@@ -833,8 +1055,12 @@ mod tests {
         let mut running = persisted.clone();
         running.metadata.remove("pending_injected_messages");
 
-        state_bridge::merge_pending_injected_messages(&mut running, Some(&storage), Some(&persistence))
-            .await;
+        state_bridge::merge_pending_injected_messages(
+            &mut running,
+            Some(&storage),
+            Some(&persistence),
+        )
+        .await;
 
         assert_eq!(
             running
@@ -852,8 +1078,12 @@ mod tests {
         assert!(!saved.metadata.contains_key("pending_injected_messages"));
 
         let count_after_first_merge = running.messages.len();
-        state_bridge::merge_pending_injected_messages(&mut running, Some(&storage), Some(&persistence))
-            .await;
+        state_bridge::merge_pending_injected_messages(
+            &mut running,
+            Some(&storage),
+            Some(&persistence),
+        )
+        .await;
         assert_eq!(running.messages.len(), count_after_first_merge);
     }
 
@@ -1063,6 +1293,92 @@ mod tests {
                 assert_eq!(usage.prompt_tokens, 11);
                 assert_eq!(usage.completion_tokens, 7);
                 assert_eq!(usage.total_tokens, 18);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_completed_task_evaluation_updates_task_list_and_emits_event() {
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            Arc::new(TestPersistence(storage.clone()));
+        let mut session = Session::new("session-task-eval", "model");
+        session.set_task_list(bamboo_domain::TaskList {
+            session_id: "session-task-eval".to_string(),
+            title: "Eval Tasks".to_string(),
+            items: vec![bamboo_domain::TaskItem {
+                id: "task-1".to_string(),
+                description: "Do work".to_string(),
+                status: bamboo_domain::TaskItemStatus::InProgress,
+                ..bamboo_domain::TaskItem::default()
+            }],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        });
+        session
+            .metadata
+            .insert("task_list_version".to_string(), "1".to_string());
+
+        let mut state = super::super::startup::LoopRunState {
+            session_id: "session-task-eval".to_string(),
+            model_name: "model".to_string(),
+            metrics_collector: None,
+            debug_logger: crate::runtime::runner::logging::DebugLogger::new(false),
+            task_context: crate::runtime::task_context::TaskLoopContext::from_session(&session),
+            overflow_recovery: super::super::startup::OverflowRecoveryState::default(),
+            task_evaluation: super::super::startup::TaskEvaluationState {
+                in_flight: None,
+                completed: Some(
+                    crate::runtime::runner::task_lifecycle::AsyncTaskEvaluationResult {
+                        shared_session_id: "session-task-eval".to_string(),
+                        round_number: 1,
+                        based_on_task_context_version: 1,
+                        task_list_title: Some("Eval Tasks".to_string()),
+                        model_name: "fast-model".to_string(),
+                        evaluation_result: crate::runtime::task_evaluation::TaskEvaluationResult {
+                            needs_evaluation: true,
+                            updates: vec![crate::runtime::task_evaluation::TaskItemUpdate {
+                                item_id: "task-1".to_string(),
+                                status: bamboo_domain::TaskItemStatus::Completed,
+                                notes: Some("done".to_string()),
+                                evidence: Some("verified".to_string()),
+                                blocker: None,
+                                criteria_met: None,
+                            }],
+                            reasoning: "complete".to_string(),
+                            prompt_tokens: 4,
+                            completion_tokens: 2,
+                        },
+                    },
+                ),
+                queued_request: None,
+            },
+            runtime_state: bamboo_domain::AgentRuntimeState::new("session-task-eval"),
+        };
+        let config = crate::runtime::config::AgentLoopConfig {
+            storage: Some(storage.clone()),
+            persistence: Some(persistence),
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        super::apply_completed_task_evaluation(&mut session, &tx, &config, &mut state).await;
+
+        assert_eq!(
+            session.task_list.as_ref().unwrap().items[0].status,
+            bamboo_domain::TaskItemStatus::Completed
+        );
+        let event = rx
+            .recv()
+            .await
+            .expect("task update event should be emitted");
+        match event {
+            AgentEvent::TaskListUpdated { task_list } => {
+                assert_eq!(
+                    task_list.items[0].status,
+                    bamboo_domain::TaskItemStatus::Completed
+                );
             }
             other => panic!("unexpected event: {other:?}"),
         }

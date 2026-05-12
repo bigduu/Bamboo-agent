@@ -217,7 +217,10 @@ fn plan_content_summary(result_payload: &str) -> Option<String> {
     if summary.chars().count() <= 160 {
         Some(summary)
     } else {
-        Some(format!("{}...", summary.chars().take(160).collect::<String>()))
+        Some(format!(
+            "{}...",
+            summary.chars().take(160).collect::<String>()
+        ))
     }
 }
 

@@ -46,6 +46,20 @@ pub(super) async fn maybe_handle_taskwrite(
 
     // Keep the executing session in sync so this run's prompt context remains coherent.
     session.set_task_list(task_list.clone());
+    let next_version = task_context
+        .as_ref()
+        .map(|ctx| ctx.version.saturating_add(1))
+        .or_else(|| {
+            session
+                .metadata
+                .get("task_list_version")
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|value| value.saturating_add(1))
+        })
+        .unwrap_or(1);
+    session
+        .metadata
+        .insert("task_list_version".to_string(), next_version.to_string());
     tracing::info!(
         "[{}] Task updated shared task list '{}' with {} items",
         session_id,
@@ -53,7 +67,7 @@ pub(super) async fn maybe_handle_taskwrite(
         task_list.items.len()
     );
 
-    persist_task_list(config, session, &shared_session_id, session_id, &task_list).await;
+    persist_shared_task_list(config, session, &shared_session_id, session_id, &task_list).await;
 
     let _ = event_tx
         .send(AgentEvent::TaskListUpdated {
@@ -64,7 +78,7 @@ pub(super) async fn maybe_handle_taskwrite(
     reinitialize_task_context(task_context, session, session_id);
 }
 
-async fn persist_task_list(
+pub(in crate::runtime::runner) async fn persist_shared_task_list(
     config: &AgentLoopConfig,
     session: &mut Session,
     shared_session_id: &str,
@@ -87,6 +101,11 @@ async fn persist_task_list(
                 match storage.load_session(shared_session_id).await {
                     Ok(Some(mut root_session)) => {
                         root_session.set_task_list(task_list.clone());
+                        if let Some(version) = session.metadata.get("task_list_version") {
+                            root_session
+                                .metadata
+                                .insert("task_list_version".to_string(), version.clone());
+                        }
                         if let Err(error) =
                             persistence.save_runtime_session(&mut root_session).await
                         {

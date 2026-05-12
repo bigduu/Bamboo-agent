@@ -96,6 +96,7 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
         segments_removed: 0,
         compressed_message_ids: Vec::new(),
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
     };
 
     let llm = Arc::new(MockLlmProvider {
@@ -198,6 +199,7 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
         segments_removed: 0,
         compressed_message_ids: Vec::new(),
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
     };
 
     let llm = Arc::new(MockLlmProvider {
@@ -320,6 +322,7 @@ async fn execute_llm_stream_keeps_previous_response_id_when_local_summary_or_com
         segments_removed: 1,
         compressed_message_ids: vec!["msg_old_1".to_string(), "msg_old_2".to_string()],
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
     };
 
     let llm = Arc::new(MockLlmProvider {
@@ -406,6 +409,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
         segments_removed: 0,
         compressed_message_ids: Vec::new(),
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
     };
 
     let llm = Arc::new(MockLlmProvider {

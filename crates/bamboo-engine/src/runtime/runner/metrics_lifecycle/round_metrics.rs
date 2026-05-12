@@ -30,6 +30,7 @@ pub(in crate::runtime::runner) fn record_round_completed(
     round_status: MetricsRoundStatus,
     round_usage: MetricsTokenUsage,
     prompt_cached_tool_outputs: u32,
+    prompt_cached_tool_tokens_saved: u32,
     round_error: Option<String>,
 ) {
     let Some(metrics) = metrics_collector else {
@@ -41,6 +42,7 @@ pub(in crate::runtime::runner) fn record_round_completed(
         round_status,
         round_usage,
         prompt_cached_tool_outputs,
+        prompt_cached_tool_tokens_saved,
         round_error,
     );
     metrics.session_message_count(session_id.to_string(), message_count, Utc::now());
@@ -64,6 +66,7 @@ pub(in crate::runtime::runner) fn record_round_and_session_error(
         Utc::now(),
         round_status,
         MetricsTokenUsage::default(),
+        0,
         0,
         round_error,
     );

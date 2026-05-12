@@ -178,6 +178,31 @@ impl TaskLoopContext {
         }
     }
 
+    /// Apply an evaluated task update and report whether it changed the context.
+    pub fn apply_evaluated_update(
+        &mut self,
+        item_id: &str,
+        status: TaskItemStatus,
+        notes: Option<&str>,
+        evidence: Option<&str>,
+        blocker: Option<&str>,
+    ) -> bool {
+        let previous_version = self.version;
+        self.update_item_status(item_id, status);
+        if let Some(note) = notes.map(str::trim).filter(|note| !note.is_empty()) {
+            if let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) {
+                let previous_notes = item.notes.clone();
+                Self::append_item_notes(item, note);
+                if item.notes != previous_notes {
+                    self.updated_at = Utc::now();
+                    self.version += 1;
+                }
+            }
+        }
+        self.append_structured_feedback(item_id, evidence, blocker);
+        self.version != previous_version
+    }
+
     pub fn append_structured_feedback(
         &mut self,
         item_id: &str,

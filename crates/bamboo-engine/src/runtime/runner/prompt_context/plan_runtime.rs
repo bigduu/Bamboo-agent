@@ -106,7 +106,10 @@ fn active_task_summary(session: &Session) -> Option<String> {
 fn format_state_summary(state: &PlanStateArtifact) -> String {
     let mut lines = vec![
         format!("- updated_at: {}", state.updated_at.to_rfc3339()),
-        format!("- status: {}", state.status.as_deref().unwrap_or("(unknown)")),
+        format!(
+            "- status: {}",
+            state.status.as_deref().unwrap_or("(unknown)")
+        ),
     ];
     if let Some(active_task_id) = state.active_task_id.as_deref() {
         lines.push(format!("- active_task_id: {active_task_id}"));
@@ -124,10 +127,14 @@ fn format_state_summary(state: &PlanStateArtifact) -> String {
         lines.push(format!("- next_section_id: {next_section_id}"));
     }
     if let Some(last_completed_task_id) = state.last_completed_task_id.as_deref() {
-        lines.push(format!("- last_completed_task_id: {last_completed_task_id}"));
+        lines.push(format!(
+            "- last_completed_task_id: {last_completed_task_id}"
+        ));
     }
     if let Some(last_completed_section_id) = state.last_completed_section_id.as_deref() {
-        lines.push(format!("- last_completed_section_id: {last_completed_section_id}"));
+        lines.push(format!(
+            "- last_completed_section_id: {last_completed_section_id}"
+        ));
     }
     if let Some(round_hint) = state.round_hint {
         lines.push(format!("- round_hint: {round_hint}"));
@@ -162,13 +169,19 @@ fn format_cursor_summary(cursor: &PlanCursorArtifact) -> String {
         lines.push(format!("- next_section_id: {next_section_id}"));
     }
     if let Some(last_completed_task_id) = cursor.last_completed_task_id.as_deref() {
-        lines.push(format!("- last_completed_task_id: {last_completed_task_id}"));
+        lines.push(format!(
+            "- last_completed_task_id: {last_completed_task_id}"
+        ));
     }
     if let Some(last_completed_section_id) = cursor.last_completed_section_id.as_deref() {
-        lines.push(format!("- last_completed_section_id: {last_completed_section_id}"));
+        lines.push(format!(
+            "- last_completed_section_id: {last_completed_section_id}"
+        ));
     }
     if let Some(last_completed_checkpoint) = cursor.last_completed_checkpoint.as_deref() {
-        lines.push(format!("- last_completed_checkpoint: {last_completed_checkpoint}"));
+        lines.push(format!(
+            "- last_completed_checkpoint: {last_completed_checkpoint}"
+        ));
     }
     if let Some(round_hint) = cursor.round_hint {
         lines.push(format!("- round_hint: {round_hint}"));
@@ -263,7 +276,10 @@ fn collect_section_ids(
     let mut section_ids = Vec::new();
 
     if let Some(state_artifact) = state_artifact {
-        push_unique_term(&mut section_ids, state_artifact.active_section_id.as_deref());
+        push_unique_term(
+            &mut section_ids,
+            state_artifact.active_section_id.as_deref(),
+        );
         push_unique_term(&mut section_ids, state_artifact.next_section_id.as_deref());
         push_unique_term(
             &mut section_ids,
@@ -272,7 +288,10 @@ fn collect_section_ids(
     }
 
     if let Some(cursor_artifact) = cursor_artifact {
-        push_unique_term(&mut section_ids, cursor_artifact.current_section_id.as_deref());
+        push_unique_term(
+            &mut section_ids,
+            cursor_artifact.current_section_id.as_deref(),
+        );
         push_unique_term(&mut section_ids, cursor_artifact.next_section_id.as_deref());
         push_unique_term(
             &mut section_ids,
@@ -379,7 +398,11 @@ fn build_excerpt_from_ranges(lines: &[&str], ranges: &[(usize, usize)], budget: 
             break;
         }
 
-        let separator = if excerpt.is_empty() { "" } else { EXCERPT_SEPARATOR };
+        let separator = if excerpt.is_empty() {
+            ""
+        } else {
+            EXCERPT_SEPARATOR
+        };
         let separator_chars = separator.chars().count();
         if remaining_budget <= separator_chars {
             break;
@@ -409,7 +432,11 @@ fn fallback_excerpt(lines: &[&str]) -> String {
         return String::new();
     }
 
-    build_excerpt_from_ranges(lines, &[(0, lines.len() - 1)], SELECTIVE_PLAN_EXCERPT_CHAR_BUDGET)
+    build_excerpt_from_ranges(
+        lines,
+        &[(0, lines.len() - 1)],
+        SELECTIVE_PLAN_EXCERPT_CHAR_BUDGET,
+    )
 }
 
 fn section_matches_id(section: &PlanSection, section_id: &str) -> bool {
@@ -557,10 +584,7 @@ fn select_plan_content_for_prompt(
     }
 }
 
-fn build_plan_runtime_context(
-    session: &Session,
-    app_data_dir: Option<&Path>,
-) -> Option<String> {
+fn build_plan_runtime_context(session: &Session, app_data_dir: Option<&Path>) -> Option<String> {
     let plan_mode = session
         .agent_runtime_state
         .as_ref()
@@ -591,8 +615,8 @@ fn build_plan_runtime_context(
         store.read_sections(&session.id).ok().flatten()
     });
 
-    let active_task =
-        active_task_summary(session).unwrap_or_else(|| "- none identified from current task list".to_string());
+    let active_task = active_task_summary(session)
+        .unwrap_or_else(|| "- none identified from current task list".to_string());
 
     let mut context = format!(
         "=== DURABLE PLAN EXECUTION CONTEXT ===\n\
@@ -619,10 +643,17 @@ Current execution anchor from task list:\n{}\n",
 
     if let Some(sections_artifact) = sections_artifact.as_ref() {
         context.push_str("\nPlan section index:\n");
-        context.push_str(&format!("- indexed_sections: {}\n", sections_artifact.sections.len()));
+        context.push_str(&format!(
+            "- indexed_sections: {}\n",
+            sections_artifact.sections.len()
+        ));
     }
 
-    if let Some(plan) = plan_content.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+    if let Some(plan) = plan_content
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         let selection = select_plan_content_for_prompt(
             plan,
             session,
@@ -872,7 +903,10 @@ mod tests {
         let store = PlanStore::new(temp_dir.path()).expect("plan store");
         let session_id = "session-plan-runtime";
         store
-            .write_plan(session_id, "# Runtime Plan\n\n## t1\n- task_id: t1\n- Do thing")
+            .write_plan(
+                session_id,
+                "# Runtime Plan\n\n## t1\n- task_id: t1\n- Do thing",
+            )
             .expect("write plan");
         let mut state = PlanStateArtifact::new(session_id);
         state.status = Some("awaiting_approval".to_string());
@@ -898,10 +932,14 @@ mod tests {
         cursor.suspension_hook_point = Some("AfterToolExecution".to_string());
         cursor.tool_call_boundary = Some("ExitPlanMode".to_string());
         cursor.resume_note = Some("Continue with task t1".to_string());
-        store.write_cursor(session_id, &cursor).expect("write cursor");
+        store
+            .write_cursor(session_id, &cursor)
+            .expect("write cursor");
 
         let mut session = Session::new(session_id, "model");
-        session.messages.insert(0, Message::system("Base prompt".to_string()));
+        session
+            .messages
+            .insert(0, Message::system("Base prompt".to_string()));
         session.agent_runtime_state = Some(AgentRuntimeState::new("run-1"));
         session.agent_runtime_state.as_mut().unwrap().plan_mode = Some(PlanModeState {
             entered_at: Utc::now(),
@@ -929,7 +967,9 @@ mod tests {
             .iter()
             .find(|m| matches!(m.role, bamboo_agent_core::Role::System))
             .expect("system message");
-        assert!(system_msg.content.contains("DURABLE PLAN EXECUTION CONTEXT"));
+        assert!(system_msg
+            .content
+            .contains("DURABLE PLAN EXECUTION CONTEXT"));
         assert!(system_msg.content.contains("Machine plan state:"));
         assert!(system_msg.content.contains("last_completed_task_id: t0"));
         assert!(system_msg.content.contains("round_hint: 5"));
@@ -937,7 +977,9 @@ mod tests {
         assert!(system_msg.content.contains("current_task_ordinal: 2"));
         assert!(system_msg.content.contains("next_task_id: t2"));
         assert!(system_msg.content.contains("round_id_hint: round-5"));
-        assert!(system_msg.content.contains("tool_call_boundary: ExitPlanMode"));
+        assert!(system_msg
+            .content
+            .contains("tool_call_boundary: ExitPlanMode"));
         assert!(system_msg.content.contains("Plan section index:"));
         assert!(system_msg.content.contains("- mode: full"));
     }
@@ -960,7 +1002,9 @@ mod tests {
             .iter()
             .find(|m| matches!(m.role, bamboo_agent_core::Role::System))
             .expect("system message");
-        assert!(!system_msg.content.contains("BAMBOO_PLAN_RUNTIME_CONTEXT_START"));
+        assert!(!system_msg
+            .content
+            .contains("BAMBOO_PLAN_RUNTIME_CONTEXT_START"));
         assert!(system_msg.content.contains("Base prompt"));
     }
 }

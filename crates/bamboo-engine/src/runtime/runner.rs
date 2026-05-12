@@ -53,7 +53,6 @@ pub(super) fn to_event_token_usage(prompt_tokens: u64, completion_tokens: u64) -
 /// Result type for agent loop operations.
 pub type Result<T> = std::result::Result<T, AgentError>;
 
-#[allow(dead_code)]
 pub async fn run_agent_loop(
     session: &mut Session,
     initial_message: String,

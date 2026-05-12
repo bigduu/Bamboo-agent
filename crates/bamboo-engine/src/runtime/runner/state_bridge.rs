@@ -276,8 +276,7 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
         let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
             Arc::new(TestPersistence(storage.clone()));
-        let mut persisted =
-            Session::new_child("child-merge", "parent", "model", "Child");
+        let mut persisted = Session::new_child("child-merge", "parent", "model", "Child");
         persisted.add_message(bamboo_agent_core::Message::system("system"));
         persisted.add_message(bamboo_agent_core::Message::user("original task"));
         persisted.metadata.insert(
@@ -298,12 +297,8 @@ mod tests {
         let mut running = persisted.clone();
         running.metadata.remove(PENDING_INJECTED_MESSAGES_KEY);
 
-        let count = merge_pending_injected_messages(
-            &mut running,
-            Some(&storage),
-            Some(&persistence),
-        )
-        .await;
+        let count =
+            merge_pending_injected_messages(&mut running, Some(&storage), Some(&persistence)).await;
 
         assert_eq!(count, 1);
         assert_eq!(
@@ -322,12 +317,8 @@ mod tests {
         assert!(!saved.metadata.contains_key(PENDING_INJECTED_MESSAGES_KEY));
 
         // Second merge is a no-op
-        let count2 = merge_pending_injected_messages(
-            &mut running,
-            Some(&storage),
-            Some(&persistence),
-        )
-        .await;
+        let count2 =
+            merge_pending_injected_messages(&mut running, Some(&storage), Some(&persistence)).await;
         assert_eq!(count2, 0);
     }
 

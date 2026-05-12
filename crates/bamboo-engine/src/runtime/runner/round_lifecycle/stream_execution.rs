@@ -233,6 +233,7 @@ pub(super) async fn execute_llm_stream(
         truncation_occurred: prepared_context.truncation_occurred,
         segments_removed: prepared_context.segments_removed,
         prompt_cached_tool_outputs: prepared_context.prompt_cached_tool_outputs,
+        prompt_cached_tool_tokens_saved: prepared_context.prompt_cached_tool_tokens_saved,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
     };

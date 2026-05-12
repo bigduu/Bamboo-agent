@@ -1,41 +1,18 @@
 //! Task lifecycle helpers for the agent loop runner.
 
-use std::sync::Arc;
-
 use tokio::sync::mpsc;
 
-use crate::metrics::TokenUsage as MetricsTokenUsage;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
-use bamboo_agent_core::{AgentError, AgentEvent, Session};
-use bamboo_domain::ReasoningEffort;
-use bamboo_infrastructure::LLMProvider;
+use bamboo_agent_core::{AgentEvent, Session};
 
 mod evaluation;
 mod finalize;
 
-pub(super) async fn evaluate_round_task_progress(
-    task_context: &mut Option<TaskLoopContext>,
-    session: &mut Session,
-    llm: Arc<dyn LLMProvider>,
-    event_tx: &mpsc::Sender<AgentEvent>,
-    session_id: &str,
-    round_number: usize,
-    model_name: Option<&str>,
-    reasoning_effort: Option<ReasoningEffort>,
-) -> Result<MetricsTokenUsage, AgentError> {
-    evaluation::evaluate_round_task_progress(
-        task_context,
-        session,
-        llm,
-        event_tx,
-        session_id,
-        round_number,
-        model_name,
-        reasoning_effort,
-    )
-    .await
-}
+pub(in crate::runtime::runner) use evaluation::{
+    apply_task_evaluation_result, build_async_task_evaluation_request,
+    execute_async_task_evaluation, AsyncTaskEvaluationRequest, AsyncTaskEvaluationResult,
+};
 
 pub(super) async fn finalize_task_context(
     task_context: Option<TaskLoopContext>,

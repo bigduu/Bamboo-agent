@@ -1,5 +1,8 @@
 use crate::metrics::MetricsCollector;
 use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::runner::task_lifecycle::{
+    AsyncTaskEvaluationRequest, AsyncTaskEvaluationResult,
+};
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::Session;
@@ -33,6 +36,18 @@ impl OverflowRecoveryState {
     }
 }
 
+pub(super) struct InFlightTaskEvaluation {
+    pub(super) request: AsyncTaskEvaluationRequest,
+    pub(super) join_handle: tokio::task::JoinHandle<AsyncTaskEvaluationResult>,
+}
+
+#[derive(Default)]
+pub(super) struct TaskEvaluationState {
+    pub(super) in_flight: Option<InFlightTaskEvaluation>,
+    pub(super) completed: Option<AsyncTaskEvaluationResult>,
+    pub(super) queued_request: Option<AsyncTaskEvaluationRequest>,
+}
+
 pub(super) struct LoopRunState {
     pub(super) session_id: String,
     pub(super) model_name: String,
@@ -40,6 +55,7 @@ pub(super) struct LoopRunState {
     pub(super) debug_logger: DebugLogger,
     pub(super) task_context: Option<TaskLoopContext>,
     pub(super) overflow_recovery: OverflowRecoveryState,
+    pub(super) task_evaluation: TaskEvaluationState,
     /// Structured runtime state persisted alongside the session.
     pub(super) runtime_state: AgentRuntimeState,
 }
@@ -110,6 +126,7 @@ pub(super) async fn initialize_loop_state(
         debug_logger,
         task_context,
         overflow_recovery: OverflowRecoveryState::default(),
+        task_evaluation: TaskEvaluationState::default(),
         runtime_state,
     }
 }

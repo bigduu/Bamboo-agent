@@ -12,6 +12,7 @@ pub(super) fn record_session_resolution(
         metrics_collector,
         session_id,
         session.messages.len() as u32,
-        session.has_pending_question() || matches!(runtime_state.status, AgentStatusState::Suspended),
+        session.has_pending_question()
+            || matches!(runtime_state.status, AgentStatusState::Suspended),
     );
 }

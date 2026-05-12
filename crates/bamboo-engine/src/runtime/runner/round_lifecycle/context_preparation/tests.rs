@@ -124,6 +124,7 @@ async fn maybe_apply_host_context_compression_uses_fast_model_for_summary_reques
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
     });
@@ -185,6 +186,7 @@ async fn host_context_compression_skips_when_no_background_model_is_configured()
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
     });
@@ -547,6 +549,7 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
     });
@@ -632,6 +635,7 @@ async fn maybe_apply_host_context_compression_supports_mid_turn_phase() {
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
     });
@@ -716,6 +720,7 @@ async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
     });
@@ -793,6 +798,7 @@ async fn prepare_round_context_skips_host_auto_compression_below_trigger() {
         truncation_occurred: true,
         segments_removed: 4,
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
     });
@@ -873,6 +879,7 @@ async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
         truncation_occurred: false,
         segments_removed: 0,
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
     });
@@ -963,6 +970,7 @@ async fn multi_round_compression_cycle() {
         truncation_occurred: true,
         segments_removed: 3,
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
     });
@@ -1041,6 +1049,7 @@ async fn multi_round_compression_cycle() {
         truncation_occurred: true,
         segments_removed: 2,
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
     });
@@ -1294,6 +1303,7 @@ async fn pre_summarization_degradation_skips_llm_for_auto_triggered_compression(
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
     });
@@ -1378,6 +1388,7 @@ async fn tokens_saved_is_computed_from_compressed_messages() {
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
     });
