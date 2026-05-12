@@ -717,6 +717,7 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
         truncation_occurred: false,
         segments_removed: 0,
         prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
     });

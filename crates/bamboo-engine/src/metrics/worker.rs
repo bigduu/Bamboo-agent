@@ -153,6 +153,7 @@ impl MetricsWorker {
                         *status,
                         *usage,
                         0,
+                        0,
                         error.clone(),
                     )
                     .await?;

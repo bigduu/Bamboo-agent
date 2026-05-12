@@ -286,6 +286,8 @@ pub struct TokenBudgetUsage {
     #[serde(default)]
     pub prompt_cached_tool_outputs: usize,
     #[serde(default)]
+    pub prompt_cached_tool_tokens_saved: u32,
+    #[serde(default)]
     pub thinking_tokens: u32,
     #[serde(default)]
     pub cache_read_input_tokens: u32,

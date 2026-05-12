@@ -34,10 +34,12 @@ impl MetricsService {
     ) -> Result<(), MetricsError> {
         let awaiting_response_session_ids = sessions
             .into_iter()
-            .filter(|session| session.has_pending_question() || session
-                .agent_runtime_state
-                .as_ref()
-                .is_some_and(|state| matches!(state.status, bamboo_domain::AgentStatusState::Suspended)))
+            .filter(|session| {
+                session.has_pending_question()
+                    || session.agent_runtime_state.as_ref().is_some_and(|state| {
+                        matches!(state.status, bamboo_domain::AgentStatusState::Suspended)
+                    })
+            })
             .map(|session| session.id)
             .collect::<Vec<_>>();
 

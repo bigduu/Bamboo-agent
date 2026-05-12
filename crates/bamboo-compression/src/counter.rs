@@ -6,7 +6,6 @@
 //! lightweight fallback.
 
 use bamboo_agent_core::Message;
-use std::sync::Arc;
 use tiktoken_rs::o200k_base;
 use tiktoken_rs::CoreBPE;
 
@@ -121,9 +120,6 @@ impl TokenCounter for HeuristicTokenCounter {
         adjusted_tokens.ceil() as u32
     }
 }
-
-/// Arc-wrapped token counter for easy sharing.
-pub type SharedTokenCounter = Arc<dyn TokenCounter>;
 
 /// Accurate BPE-based token counter using OpenAI's o200k_base encoding.
 ///

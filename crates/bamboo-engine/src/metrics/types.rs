@@ -132,6 +132,9 @@ pub struct RoundMetrics {
     /// Number of tool outputs compacted into prompt-side cache summaries in this round.
     #[serde(default)]
     pub prompt_cached_tool_outputs: u32,
+    /// Tokens saved by prompt-side tool output compaction in this round.
+    #[serde(default)]
+    pub prompt_cached_tool_tokens_saved: u32,
     /// Number of context compression events applied during this round.
     #[serde(default)]
     pub compression_count: u32,
@@ -168,6 +171,9 @@ pub struct SessionMetrics {
     /// Total number of prompt-side cached tool outputs observed across rounds.
     #[serde(default)]
     pub prompt_cached_tool_outputs: u64,
+    /// Total tokens saved by prompt-side tool output compaction across all rounds.
+    #[serde(default)]
+    pub prompt_cached_tool_tokens_saved: u64,
     /// Total number of context compression events across all rounds.
     #[serde(default)]
     pub total_compression_events: u64,
@@ -221,12 +227,18 @@ pub struct MetricsSummary {
     /// Total number of prompt-side cached tool outputs.
     #[serde(default)]
     pub prompt_cached_tool_outputs: u64,
+    /// Total tokens saved by prompt-side tool output compaction.
+    #[serde(default)]
+    pub tool_context_tokens_saved: u64,
     /// Total number of context compression events.
     #[serde(default)]
     pub total_compression_events: u64,
     /// Total tokens saved by context compression.
     #[serde(default)]
     pub total_tokens_saved: u64,
+    /// Total tokens saved by non-tool context compression.
+    #[serde(default)]
+    pub non_tool_compression_tokens_saved: u64,
     /// Number of completed sessions in the selected range.
     #[serde(default)]
     pub completed_sessions: u64,
@@ -431,7 +443,10 @@ mod tests {
     #[test]
     fn test_session_status_as_str() {
         assert_eq!(SessionStatus::Running.as_str(), "running");
-        assert_eq!(SessionStatus::AwaitingResponse.as_str(), "awaiting_response");
+        assert_eq!(
+            SessionStatus::AwaitingResponse.as_str(),
+            "awaiting_response"
+        );
         assert_eq!(SessionStatus::Completed.as_str(), "completed");
         assert_eq!(SessionStatus::Error.as_str(), "error");
         assert_eq!(SessionStatus::Cancelled.as_str(), "cancelled");
@@ -463,7 +478,10 @@ mod tests {
 
     #[test]
     fn test_forward_status_from_db() {
-        assert_eq!(ForwardStatus::from_db("pending"), Some(ForwardStatus::Pending));
+        assert_eq!(
+            ForwardStatus::from_db("pending"),
+            Some(ForwardStatus::Pending)
+        );
         assert_eq!(
             ForwardStatus::from_db("success"),
             Some(ForwardStatus::Success)
@@ -526,6 +544,7 @@ mod tests {
             error: None,
             duration_ms: None,
             prompt_cached_tool_outputs: 0,
+            prompt_cached_tool_tokens_saved: 0,
             compression_count: 0,
             tokens_saved: 0,
         };
@@ -549,6 +568,7 @@ mod tests {
             message_count: 15,
             duration_ms: None,
             prompt_cached_tool_outputs: 0,
+            prompt_cached_tool_tokens_saved: 0,
             total_compression_events: 0,
             total_tokens_saved: 0,
         };
@@ -584,8 +604,10 @@ mod tests {
             total_tool_calls: 500,
             active_sessions: 5,
             prompt_cached_tool_outputs: 0,
+            tool_context_tokens_saved: 0,
             total_compression_events: 0,
             total_tokens_saved: 0,
+            non_tool_compression_tokens_saved: 0,
             completed_sessions: 80,
             awaiting_response_sessions: 10,
             error_sessions: 7,

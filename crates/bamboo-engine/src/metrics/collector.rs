@@ -36,6 +36,7 @@ enum CollectorCommand {
         status: RoundStatus,
         usage: TokenUsage,
         prompt_cached_tool_outputs: u32,
+        prompt_cached_tool_tokens_saved: u32,
         error: Option<String>,
     },
     ToolStarted {
@@ -142,6 +143,7 @@ impl MetricsCollector {
                         status,
                         usage,
                         prompt_cached_tool_outputs,
+                        prompt_cached_tool_tokens_saved,
                         error,
                     } => {
                         storage
@@ -151,6 +153,7 @@ impl MetricsCollector {
                                 status,
                                 usage,
                                 prompt_cached_tool_outputs,
+                                prompt_cached_tool_tokens_saved,
                                 error,
                             )
                             .await
@@ -316,6 +319,7 @@ impl MetricsCollector {
         status: RoundStatus,
         usage: TokenUsage,
         prompt_cached_tool_outputs: u32,
+        prompt_cached_tool_tokens_saved: u32,
         error: Option<String>,
     ) {
         let _ = self.tx.send(CollectorCommand::RoundCompleted {
@@ -324,6 +328,7 @@ impl MetricsCollector {
             status,
             usage,
             prompt_cached_tool_outputs,
+            prompt_cached_tool_tokens_saved,
             error,
         });
     }

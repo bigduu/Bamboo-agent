@@ -26,6 +26,8 @@ pub struct PreparedContext {
     pub compressed_message_ids: Vec<String>,
     /// Number of long tool outputs replaced with prompt-side cached summaries.
     pub prompt_cached_tool_outputs: usize,
+    /// Tokens saved by prompt-side tool output compaction in this preparation pass.
+    pub prompt_cached_tool_tokens_saved: u32,
 }
 
 /// Errors that can occur during budget management.

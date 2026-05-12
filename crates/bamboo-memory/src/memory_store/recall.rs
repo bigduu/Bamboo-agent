@@ -516,8 +516,8 @@ mod tests {
     use super::*;
     use crate::memory_store::DurableMemoryType;
     use async_trait::async_trait;
-    use bamboo_infrastructure::llm::provider::LLMRequestOptions;
     use bamboo_domain::ReasoningEffort;
+    use bamboo_infrastructure::llm::provider::LLMRequestOptions;
     use bamboo_infrastructure::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use futures::stream;
     use std::sync::Mutex;

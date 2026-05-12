@@ -211,6 +211,7 @@ pub fn prepare_hybrid_context(
         segments_removed: removed_count,
         compressed_message_ids,
         prompt_cached_tool_outputs: prompt_cache_result.compacted_tool_outputs,
+        prompt_cached_tool_tokens_saved: prompt_cache_result.tokens_saved,
     })
 }
 
@@ -326,6 +327,7 @@ struct SegmentSelectionResult {
 struct PromptCacheCompactionResult {
     messages: Vec<bamboo_agent_core::Message>,
     compacted_tool_outputs: usize,
+    tokens_saved: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -356,6 +358,7 @@ fn maybe_compact_old_tool_outputs_for_prompt(
         return PromptCacheCompactionResult {
             messages: active_messages,
             compacted_tool_outputs: 0,
+            tokens_saved: 0,
         };
     }
     let policy = prompt_cache_policy_from_budget(budget);
@@ -365,6 +368,7 @@ fn maybe_compact_old_tool_outputs_for_prompt(
         return PromptCacheCompactionResult {
             messages: active_messages,
             compacted_tool_outputs: 0,
+            tokens_saved: 0,
         };
     }
 
@@ -378,6 +382,7 @@ fn maybe_compact_old_tool_outputs_for_prompt(
         return PromptCacheCompactionResult {
             messages: active_messages,
             compacted_tool_outputs: 0,
+            tokens_saved: 0,
         };
     };
 
@@ -390,6 +395,7 @@ fn maybe_compact_old_tool_outputs_for_prompt(
         return PromptCacheCompactionResult {
             messages: active_messages,
             compacted_tool_outputs: 0,
+            tokens_saved: 0,
         };
     }
 
@@ -410,6 +416,7 @@ fn maybe_compact_old_tool_outputs_for_prompt(
         return PromptCacheCompactionResult {
             messages: active_messages,
             compacted_tool_outputs: 0,
+            tokens_saved: 0,
         };
     }
 
@@ -454,6 +461,7 @@ fn maybe_compact_old_tool_outputs_for_prompt(
     PromptCacheCompactionResult {
         messages: active_messages,
         compacted_tool_outputs: compacted_count,
+        tokens_saved: saved_tokens_total,
     }
 }
 

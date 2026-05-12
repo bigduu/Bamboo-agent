@@ -55,7 +55,8 @@ pub async fn v2_unified_summary(
             let total_requests = chat.total_sessions + forward.total_requests;
             let total_tokens = chat.total_tokens.total_tokens + forward.total_tokens.total_tokens;
             let total_success = chat.completed_sessions + forward.successful_requests;
-            let total_errors = chat.error_sessions + chat.cancelled_sessions + forward.failed_requests;
+            let total_errors =
+                chat.error_sessions + chat.cancelled_sessions + forward.failed_requests;
             let resolved_total = total_success + total_errors;
             let success_rate = if resolved_total > 0 {
                 (total_success as f64 / resolved_total as f64) * 100.0

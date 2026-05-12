@@ -238,7 +238,8 @@ impl PlanStore {
     }
 
     fn preferred_plan_file_path(&self, session_id: &str) -> PathBuf {
-        self.session_dir_path_internal(session_id).join(PLAN_FILE_NAME)
+        self.session_dir_path_internal(session_id)
+            .join(PLAN_FILE_NAME)
     }
 
     fn legacy_plan_file_path(&self, session_id: &str) -> PathBuf {
@@ -329,7 +330,8 @@ impl PlanStore {
             if ch.is_ascii_alphanumeric() {
                 normalized.push(ch.to_ascii_lowercase());
                 last_was_dash = false;
-            } else if (ch.is_whitespace() || matches!(ch, '-' | '_' | ':' | '.')) && !last_was_dash {
+            } else if (ch.is_whitespace() || matches!(ch, '-' | '_' | ':' | '.')) && !last_was_dash
+            {
                 normalized.push('-');
                 last_was_dash = true;
             }
@@ -354,7 +356,15 @@ impl PlanStore {
         if let Some((key, value)) = trimmed.split_once(':') {
             let key = key.trim();
             let value = value.trim();
-            if matches!(key, "- task_id" | "task_id" | "- current_step_id" | "current_step_id" | "- step_id" | "step_id") {
+            if matches!(
+                key,
+                "- task_id"
+                    | "task_id"
+                    | "- current_step_id"
+                    | "current_step_id"
+                    | "- step_id"
+                    | "step_id"
+            ) {
                 if !value.is_empty() {
                     anchors.push(value.to_string());
                 }
@@ -504,7 +514,10 @@ impl PlanStore {
     }
 
     /// Read the plan machine state artifact for the given session, if it exists.
-    pub fn read_state(&self, session_id: &str) -> Result<Option<PlanStateArtifact>, PlanStoreError> {
+    pub fn read_state(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<PlanStateArtifact>, PlanStoreError> {
         self.read_json_artifact(&self.state_file_path(session_id))
     }
 
@@ -640,7 +653,10 @@ mod tests {
         let (_tmp, store) = temp_store();
         let path = store.plan_file_path("some-session");
         assert!(path.starts_with(&store.plans_dir));
-        assert_eq!(path.file_name().and_then(|n| n.to_str()), Some(PLAN_FILE_NAME));
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some(PLAN_FILE_NAME)
+        );
         assert_eq!(path.parent().unwrap().parent().unwrap(), store.plans_dir());
     }
 
@@ -749,7 +765,10 @@ mod tests {
             .find(|section| section.id == "task-alpha")
             .expect("task-alpha section");
         assert_eq!(task_alpha.heading, "task-alpha");
-        assert!(task_alpha.anchor_terms.iter().any(|term| term == "task-alpha"));
+        assert!(task_alpha
+            .anchor_terms
+            .iter()
+            .any(|term| term == "task-alpha"));
 
         let step_alpha = sections
             .sections

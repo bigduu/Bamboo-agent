@@ -63,32 +63,35 @@ pub async fn submit_response(
             }
         };
 
-    if let Some(event) = plan_mode_transition.as_ref().map(|transition| match transition {
-        PlanModeTransition::Entered {
-            reason,
-            pre_permission_mode,
-            entered_at,
-            status,
-            plan_file_path,
-        } => AgentEvent::PlanModeEntered {
-            session_id: session_id.clone(),
-            reason: reason.clone(),
-            pre_permission_mode: pre_permission_mode.clone(),
-            entered_at: *entered_at,
-            status: *status,
-            plan_file_path: plan_file_path.clone(),
-        },
-        PlanModeTransition::Exited {
-            approved,
-            restored_mode,
-            plan,
-        } => AgentEvent::PlanModeExited {
-            session_id: session_id.clone(),
-            approved: *approved,
-            restored_mode: restored_mode.clone(),
-            plan: plan.clone(),
-        },
-    }) {
+    if let Some(event) = plan_mode_transition
+        .as_ref()
+        .map(|transition| match transition {
+            PlanModeTransition::Entered {
+                reason,
+                pre_permission_mode,
+                entered_at,
+                status,
+                plan_file_path,
+            } => AgentEvent::PlanModeEntered {
+                session_id: session_id.clone(),
+                reason: reason.clone(),
+                pre_permission_mode: pre_permission_mode.clone(),
+                entered_at: *entered_at,
+                status: *status,
+                plan_file_path: plan_file_path.clone(),
+            },
+            PlanModeTransition::Exited {
+                approved,
+                restored_mode,
+                plan,
+            } => AgentEvent::PlanModeExited {
+                session_id: session_id.clone(),
+                approved: *approved,
+                restored_mode: restored_mode.clone(),
+                plan: plan.clone(),
+            },
+        })
+    {
         let tx = state.get_session_event_sender(&session_id).await;
         let _ = tx.send(event);
     }
