@@ -108,7 +108,11 @@ impl AppState {
             let entries = session_store.list_index_entries().await;
             let mut sessions = Vec::new();
             for entry in entries {
-                if let Some(session) = session_store.load_session(&entry.id).await.map_err(AppError::StorageError)? {
+                if let Some(session) = session_store
+                    .load_session(&entry.id)
+                    .await
+                    .map_err(AppError::StorageError)?
+                {
                     sessions.push(session);
                 }
             }

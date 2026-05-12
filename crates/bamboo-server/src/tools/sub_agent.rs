@@ -1620,7 +1620,10 @@ mod tests {
 
         match err {
             ToolError::InvalidArguments(msg) => {
-                assert!(msg.contains("workspace"), "error should mention workspace: {msg}");
+                assert!(
+                    msg.contains("workspace"),
+                    "error should mention workspace: {msg}"
+                );
             }
             other => panic!("expected InvalidArguments error, got: {other:?}"),
         }

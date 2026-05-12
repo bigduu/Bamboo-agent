@@ -47,7 +47,6 @@ impl Default for SessionNoteTool {
 
 /// Deprecated compatibility alias for older code paths. The canonical tool type
 /// and registered tool name is [`SessionNoteTool`] / `session_note`.
-#[allow(dead_code)]
 pub type MemoryNoteTool = SessionNoteTool;
 
 #[async_trait]
