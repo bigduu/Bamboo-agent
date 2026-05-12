@@ -359,7 +359,11 @@ pub struct DefaultsConfig {
     pub code_review: Option<bamboo_domain::ProviderModelRef>,
     /// Default model for child SubAgent runs.
     /// Falls back to `fast`, then `chat` when unset.
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "sub_session")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "sub_session"
+    )]
     pub sub_agent: Option<bamboo_domain::ProviderModelRef>,
     /// Per-subagent-type model overrides.
     /// Key = subagent_type (e.g. "researcher", "coder"), Value = ProviderModelRef.

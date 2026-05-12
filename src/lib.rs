@@ -86,7 +86,6 @@ pub use error::{BambooError, Result};
 /// Main Bamboo server instance
 pub struct BambooServer {
     config: bamboo_infrastructure::Config,
-    #[allow(dead_code)]
     data_dir: PathBuf,
 }
 

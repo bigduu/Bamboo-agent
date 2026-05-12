@@ -105,7 +105,6 @@
 //! Google Gemini API compatible endpoints.
 
 pub mod app_state;
-pub mod claude_runner;
 pub mod config;
 pub mod config_manager;
 pub mod error;
@@ -118,7 +117,6 @@ pub mod metrics_service;
 pub mod model_config_helper;
 pub mod prompt_defaults;
 pub mod reloadable_provider;
-pub mod request_hooks;
 pub mod routes;
 pub mod schedule_app;
 pub mod schedules;

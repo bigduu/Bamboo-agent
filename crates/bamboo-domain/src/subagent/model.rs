@@ -99,10 +99,7 @@ pub struct UiHint {
 /// - [`ToolPolicy::Allowlist`] → returns every tool in `all_tool_names` that
 ///   is **not** on the allow list (complement).
 /// - [`ToolPolicy::Denylist`] → returns the tools on the deny list.
-pub fn disabled_tools_for_profile(
-    policy: &ToolPolicy,
-    all_tool_names: &[String],
-) -> Vec<String> {
+pub fn disabled_tools_for_profile(policy: &ToolPolicy, all_tool_names: &[String]) -> Vec<String> {
     match policy {
         ToolPolicy::Inherit => Vec::new(),
         ToolPolicy::Allowlist { allow } => {
@@ -236,9 +233,6 @@ mod tests {
         let policy = ToolPolicy::Denylist {
             deny: vec!["SubAgent".into()],
         };
-        assert_eq!(
-            disabled_tools_for_profile(&policy, &[]),
-            vec!["SubAgent"]
-        );
+        assert_eq!(disabled_tools_for_profile(&policy, &[]), vec!["SubAgent"]);
     }
 }

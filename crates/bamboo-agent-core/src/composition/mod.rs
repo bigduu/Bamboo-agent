@@ -39,9 +39,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
+pub use bamboo_domain::composition::Condition;
+
 // New expression DSL modules
-/// Condition predicates for workflow branching
-pub mod condition;
 /// Execution context and state management
 pub mod context;
 /// Workflow executor implementation
@@ -52,7 +52,6 @@ pub mod expr;
 pub mod parallel;
 
 // Re-export new DSL types
-pub use condition::Condition;
 pub use context::ExecutionContext;
 pub use executor::CompositionExecutor;
 pub use expr::{CompositionError, ToolExpr};
