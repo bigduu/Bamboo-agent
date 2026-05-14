@@ -87,53 +87,49 @@ use super::device_code::DeviceCodeResponse;
 /// - Various feature flags controlling available functionality
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CopilotConfig {
-    /// The Copilot API authentication token
     pub token: String,
-    /// Whether code annotations are enabled for this account
+    #[serde(default)]
     pub annotations_enabled: bool,
-    /// Whether Copilot Chat is enabled for this account
+    #[serde(default)]
     pub chat_enabled: bool,
-    /// Whether Copilot Chat is enabled for JetBrains IDEs
+    #[serde(default)]
     pub chat_jetbrains_enabled: bool,
-    /// Whether code quote feature is enabled
+    #[serde(default)]
     pub code_quote_enabled: bool,
-    /// Whether code review feature is enabled
+    #[serde(default)]
     pub code_review_enabled: bool,
-    /// Whether code search is enabled
+    #[serde(default)]
     pub codesearch: bool,
-    /// Whether .copilotignore file support is enabled
+    #[serde(default)]
     pub copilotignore_enabled: bool,
-    /// API endpoints for various Copilot services
+    #[serde(default)]
     pub endpoints: Endpoints,
-    /// Unix timestamp when this token expires
     pub expires_at: u64,
-    /// Whether this is an individual (vs enterprise) account
+    #[serde(default)]
     pub individual: bool,
-    /// User quota limit identifier, if applicable
     pub limited_user_quotas: Option<String>,
-    /// Date when user quota resets, if applicable
     pub limited_user_reset_date: Option<String>,
-    /// Whether 8k context prompts are enabled
+    #[serde(default)]
     pub prompt_8k: bool,
-    /// Public suggestions mode ("enabled", "disabled", etc.)
+    #[serde(default)]
     pub public_suggestions: String,
-    /// Recommended interval in seconds before refreshing token
     pub refresh_in: u64,
-    /// Service SKU identifier
+    #[serde(default)]
     pub sku: String,
-    /// Internal load testing flag
+    #[serde(default)]
     pub snippy_load_test_enabled: bool,
-    /// Telemetry mode ("enabled", "disabled", etc.)
+    #[serde(default)]
     pub telemetry: String,
-    /// Unique tracking identifier for analytics
+    #[serde(default)]
     pub tracking_id: String,
-    /// Whether VS Code Electron fetcher v2 is enabled
     #[serde(default)]
     pub vsc_electron_fetcher_v2: bool,
-    /// Whether Xcode support is enabled
+    #[serde(default)]
     pub xcode: bool,
-    /// Whether Xcode Chat is enabled
+    #[serde(default)]
     pub xcode_chat: bool,
+    #[serde(default, flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -165,6 +161,7 @@ mod tests {
                 origin_tracker: None,
                 proxy: None,
                 telemetry: None,
+                extra: Default::default(),
             },
             expires_at,
             individual: true,
@@ -180,6 +177,7 @@ mod tests {
             vsc_electron_fetcher_v2: false,
             xcode: false,
             xcode_chat: false,
+            extra: Default::default(),
         }
     }
 
@@ -262,16 +260,15 @@ mod tests {
 /// - `origin_tracker`: Endpoint for tracking request origins
 /// - `proxy`: Proxy endpoint for proxied requests
 /// - `telemetry`: Endpoint for sending telemetry data
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Endpoints {
-    /// Primary Copilot API endpoint (e.g., "https://api.githubcopilot.com")
     pub api: Option<String>,
-    /// Origin tracking service endpoint
+    #[serde(rename = "origin-tracker")]
     pub origin_tracker: Option<String>,
-    /// Proxy service endpoint for proxied API calls
     pub proxy: Option<String>,
-    /// Telemetry collection endpoint
     pub telemetry: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Access token response from GitHub OAuth.
@@ -1320,6 +1317,7 @@ mod retry_tests {
                 origin_tracker: None,
                 proxy: None,
                 telemetry: None,
+                extra: Default::default(),
             },
             expires_at,
             individual: true,
@@ -1335,6 +1333,7 @@ mod retry_tests {
             vsc_electron_fetcher_v2: false,
             xcode: false,
             xcode_chat: false,
+            extra: Default::default(),
         }
     }
 
