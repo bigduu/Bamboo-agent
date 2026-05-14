@@ -297,10 +297,8 @@ impl PlanStore {
 
         fs::rename(&temp_path, path)?;
 
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = File::open(parent) {
-                let _ = dir.sync_all();
-            }
+        if let Some(dir) = path.parent().and_then(|parent| File::open(parent).ok()) {
+            let _ = dir.sync_all();
         }
 
         Ok(())
@@ -364,10 +362,9 @@ impl PlanStore {
                     | "current_step_id"
                     | "- step_id"
                     | "step_id"
-            ) {
-                if !value.is_empty() {
-                    anchors.push(value.to_string());
-                }
+            ) && !value.is_empty()
+            {
+                anchors.push(value.to_string());
             }
         }
 
