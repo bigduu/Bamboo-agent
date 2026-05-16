@@ -42,6 +42,9 @@ pub trait ResumeExecutionPort: Send + Sync {
         event_sender: &broadcast::Sender<AgentEvent>,
     ) -> Option<RunnerReservation>;
 
+    /// Get the run_id of an existing runner if one exists.
+    async fn get_existing_runner_run_id(&self, session_id: &str) -> Option<String>;
+
     /// Get or create the long-lived broadcast sender for session events.
     async fn get_or_create_event_sender(&self, session_id: &str) -> broadcast::Sender<AgentEvent>;
 
@@ -97,7 +100,11 @@ pub async fn resume_session_execution(
     // Reserve runner slot.
     let event_sender = port.get_or_create_event_sender(session_id).await;
     let Some(reservation) = port.try_reserve_runner(session_id, &event_sender).await else {
-        return ResumeOutcome::AlreadyRunning;
+        // If already running, try to get the existing runner's run_id
+        let existing_run_id = port.get_existing_runner_run_id(session_id).await;
+        return ResumeOutcome::AlreadyRunning {
+            run_id: existing_run_id.unwrap_or_default(),
+        };
     };
 
     consume_pending_conclusion_with_options_resume(&mut session);
@@ -107,11 +114,13 @@ pub async fn resume_session_execution(
         session_id: session_id.to_string(),
         session,
         cancel_token: reservation.cancel_token,
-        run_id: reservation.run_id,
+        run_id: reservation.run_id.clone(),
         event_sender,
         config,
     })
     .await;
 
-    ResumeOutcome::Started
+    ResumeOutcome::Started {
+        run_id: reservation.run_id,
+    }
 }

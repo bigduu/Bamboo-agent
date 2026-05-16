@@ -92,6 +92,14 @@ async fn test_submit_response_updates_tool_result_and_clears_pending_question() 
     assert_eq!(body["success"], true);
     assert_eq!(body["response"], "A");
     assert_eq!(body["auto_resume_status"], "started");
+    assert!(
+        body["run_id"].as_str().is_some(),
+        "run_id should be present and be a string"
+    );
+    assert!(
+        !body["run_id"].as_str().unwrap().is_empty(),
+        "run_id should not be empty"
+    );
 
     let loaded = state
         .storage

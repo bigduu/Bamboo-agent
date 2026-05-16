@@ -136,6 +136,7 @@ pub async fn submit_response(
         "success": true,
         "message": "Response recorded. Agent loop will continue.",
         "response": user_response,
-        "auto_resume_status": auto_resume_outcome.as_str()
+        "auto_resume_status": auto_resume_outcome.status_str(),
+        "run_id": auto_resume_outcome.run_id()
     })))
 }

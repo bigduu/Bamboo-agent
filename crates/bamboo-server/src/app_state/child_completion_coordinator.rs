@@ -255,7 +255,7 @@ impl ChildCompletionCoordinator {
                 "child completion requested parent resume"
             );
 
-            if !matches!(outcome, ResumeOutcome::AlreadyRunning) {
+            if !matches!(outcome, ResumeOutcome::AlreadyRunning { .. }) {
                 return;
             }
         }
@@ -413,6 +413,11 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         event_sender: &broadcast::Sender<AgentEvent>,
     ) -> Option<RunnerReservation> {
         try_reserve_runner(&self.agent_runners, session_id, event_sender).await
+    }
+
+    async fn get_existing_runner_run_id(&self, session_id: &str) -> Option<String> {
+        let runners = self.agent_runners.read().await;
+        runners.get(session_id).map(|r| r.run_id.clone())
     }
 
     async fn get_or_create_event_sender(&self, session_id: &str) -> broadcast::Sender<AgentEvent> {

@@ -193,12 +193,12 @@ pub struct ResumeConfigSnapshot {
 }
 
 /// Outcome of a resume attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeOutcome {
     /// Execution spawned successfully.
-    Started,
+    Started { run_id: String },
     /// A runner is already active for this session.
-    AlreadyRunning,
+    AlreadyRunning { run_id: String },
     /// No pending user message, nothing to execute.
     Completed,
     /// Session not found.
@@ -206,12 +206,24 @@ pub enum ResumeOutcome {
 }
 
 impl ResumeOutcome {
+    /// Returns the status string (for backward compatibility)
     pub fn as_str(&self) -> &'static str {
+        self.status_str()
+    }
+
+    pub fn status_str(&self) -> &'static str {
         match self {
-            Self::Started => "started",
-            Self::AlreadyRunning => "already_running",
+            Self::Started { .. } => "started",
+            Self::AlreadyRunning { .. } => "already_running",
             Self::Completed => "completed",
             Self::NotFound => "error: session not found",
+        }
+    }
+
+    pub fn run_id(&self) -> Option<&String> {
+        match self {
+            Self::Started { run_id } | Self::AlreadyRunning { run_id } => Some(run_id),
+            _ => None,
         }
     }
 }

@@ -44,6 +44,11 @@ impl ResumeExecutionPort for AppStateResumeRef {
         try_reserve_runner(&self.0.agent_runners, session_id, event_sender).await
     }
 
+    async fn get_existing_runner_run_id(&self, session_id: &str) -> Option<String> {
+        let runners = self.0.agent_runners.read().await;
+        runners.get(session_id).map(|r| r.run_id.clone())
+    }
+
     async fn get_or_create_event_sender(&self, session_id: &str) -> broadcast::Sender<AgentEvent> {
         get_or_create_event_sender(&self.0.session_event_senders, session_id).await
     }
