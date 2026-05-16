@@ -132,7 +132,7 @@ pub(super) fn build_root_tools(
         agent_runners: agent_runners.clone(),
         session_event_senders,
         subagent_model_resolver,
-        config,
+        config: config.clone(),
         subagent_profiles,
         tool_names,
     });
@@ -151,6 +151,7 @@ pub(super) fn build_root_tools(
         schedule_manager,
         session_store.clone(),
         storage.clone(),
+        config,
     ));
     let tools_with_schedule: Arc<dyn ToolExecutor> = Arc::new(
         crate::tools::OverlayToolExecutor::new(tools_with_sub_agent, schedule_tasks_tool),

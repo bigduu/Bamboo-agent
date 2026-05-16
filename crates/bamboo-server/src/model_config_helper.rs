@@ -64,6 +64,23 @@ pub fn get_default_model_from_config(config: &Config) -> Result<String, LLMError
     get_default_model_for_provider(config, config.provider.as_str())
 }
 
+/// Get the schedule auto-execute model for the current provider from config.
+///
+/// Falls back from the provider fast model to the default chat model when no
+/// dedicated fast model is configured.
+pub fn get_schedule_model_from_config(config: &Config) -> Result<String, LLMError> {
+    config
+        .get_fast_model()
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+        .ok_or_else(|| {
+            LLMError::Auth(format!(
+                "No fast/default model configured for provider '{}'",
+                config.provider
+            ))
+        })
+}
+
 /// Get the fast/cheap model for a specific provider from config.
 pub fn get_fast_model_for_provider(config: &Config, provider_name: &str) -> Option<String> {
     let fast = match provider_name.trim() {
@@ -597,6 +614,92 @@ mod tests {
             get_fast_model_for_provider(&config, "openai").as_deref(),
             Some("gpt-4o-mini")
         );
+    }
+
+    #[test]
+    fn test_get_schedule_model_from_config_prefers_fast_model() {
+        let config = Config {
+            provider: "openai".to_string(),
+            defaults: None,
+            features: bamboo_infrastructure::FeatureFlags {
+                provider_model_ref: false,
+                ..Default::default()
+            },
+            providers: ProviderConfigs {
+                openai: Some(OpenAIConfig {
+                    api_key: "test".to_string(),
+                    api_key_encrypted: None,
+                    base_url: None,
+                    model: Some("gpt-4o".to_string()),
+                    fast_model: Some("gpt-4o-mini".to_string()),
+                    vision_model: None,
+                    reasoning_effort: None,
+                    responses_only_models: vec![],
+                    request_overrides: None,
+                    extra: Default::default(),
+                }),
+                ..ProviderConfigs::default()
+            },
+            ..Config::default()
+        };
+
+        let result = get_schedule_model_from_config(&config);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "gpt-4o-mini");
+    }
+
+    #[test]
+    fn test_get_schedule_model_from_config_falls_back_to_default_model() {
+        let config = Config {
+            provider: "openai".to_string(),
+            defaults: None,
+            features: bamboo_infrastructure::FeatureFlags {
+                provider_model_ref: false,
+                ..Default::default()
+            },
+            providers: ProviderConfigs {
+                openai: Some(OpenAIConfig {
+                    api_key: "test".to_string(),
+                    api_key_encrypted: None,
+                    base_url: None,
+                    model: Some("gpt-4o".to_string()),
+                    fast_model: None,
+                    vision_model: None,
+                    reasoning_effort: None,
+                    responses_only_models: vec![],
+                    request_overrides: None,
+                    extra: Default::default(),
+                }),
+                ..ProviderConfigs::default()
+            },
+            ..Config::default()
+        };
+
+        let result = get_schedule_model_from_config(&config);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "gpt-4o");
+    }
+
+    #[test]
+    fn test_get_schedule_model_from_config_prefers_defaults_fast_over_chat() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.features.provider_model_ref = true;
+        config.defaults = Some(DefaultsConfig {
+            chat: ProviderModelRef::new("openai", "gpt-chat"),
+            fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
+            vision: None,
+            memory_background: None,
+            planning: None,
+            search: None,
+            code_review: None,
+            sub_agent: None,
+            subagent_models: HashMap::new(),
+        });
+
+        let result = get_schedule_model_from_config(&config);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "gpt-fast");
     }
 
     #[test]

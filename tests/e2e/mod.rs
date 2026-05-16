@@ -3,6 +3,8 @@
 //! This module contains comprehensive end-to-end tests for all HTTP endpoints
 //! exposed by the Bamboo Agent server.
 
+#[path = "agent_api/schedules.rs"]
+mod agent_api_schedules;
 mod anthropic;
 mod chat;
 mod commands;

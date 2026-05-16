@@ -94,6 +94,25 @@ fn ctx_for_session<'a>(session_id: &'a str) -> ToolExecutionContext<'a> {
     }
 }
 
+fn clean_config(data_dir: &std::path::Path) -> Config {
+    Config::from_data_dir(Some(data_dir.to_path_buf()))
+}
+
+fn new_schedule_tasks_tool(
+    schedule_store: Arc<ScheduleStore>,
+    manager: Arc<ScheduleManager>,
+    store: Arc<SessionStoreV2>,
+    config: Config,
+) -> ScheduleTasksTool {
+    ScheduleTasksTool::new(
+        schedule_store,
+        manager,
+        store.clone(),
+        store,
+        Arc::new(RwLock::new(config)),
+    )
+}
+
 /// Build an `Agent` and a `ScheduleManager` for tests using the new `ScheduleContext` API.
 fn build_manager(
     dir: &std::path::Path,
@@ -127,11 +146,12 @@ fn build_manager(
 
     let agent = Arc::new(agent);
     let resolve_run_config = Arc::new(move |_job: &ScheduleRunJob| {
-        let model = config
-            .get_model()
-            .map(|m| m.trim().to_string())
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| "test-model".to_string());
+        let model =
+            bamboo_agent::server::model_config_helper::get_schedule_model_from_config(&config)
+                .ok()
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| "test-model".to_string());
         ResolvedRunConfig {
             model,
             reasoning_effort: None,
@@ -175,10 +195,10 @@ async fn schedule_tasks_requires_session_id() {
         schedule_store.clone(),
         store.clone(),
         Arc::new(DummyProvider),
-        Config::default(),
+        clean_config(dir.path()),
     );
 
-    let tool = ScheduleTasksTool::new(schedule_store, manager, store.clone(), store);
+    let tool = new_schedule_tasks_tool(schedule_store, manager, store, clean_config(dir.path()));
 
     let err = tool
         .execute_with_context(
@@ -203,10 +223,15 @@ async fn schedule_tasks_rejects_child_sessions() {
         schedule_store.clone(),
         store.clone(),
         Arc::new(DummyProvider),
-        Config::default(),
+        clean_config(dir.path()),
     );
 
-    let tool = ScheduleTasksTool::new(schedule_store, manager, store.clone(), store.clone());
+    let tool = new_schedule_tasks_tool(
+        schedule_store,
+        manager,
+        store.clone(),
+        clean_config(dir.path()),
+    );
 
     let mut child = Session::new("child-session", "test-model");
     child.kind = SessionKind::Child;
@@ -239,10 +264,15 @@ async fn schedule_tasks_rejects_invalid_create_arguments() {
         schedule_store.clone(),
         store.clone(),
         Arc::new(DummyProvider),
-        Config::default(),
+        clean_config(dir.path()),
     );
 
-    let tool = ScheduleTasksTool::new(schedule_store, manager, store.clone(), store.clone());
+    let tool = new_schedule_tasks_tool(
+        schedule_store,
+        manager,
+        store.clone(),
+        clean_config(dir.path()),
+    );
 
     let mut caller = Session::new("root-session", "test-model");
     caller.add_message(Message::user("hi".to_string()));
@@ -305,14 +335,14 @@ async fn schedule_tasks_rejects_invalid_patch_arguments() {
         schedule_store.clone(),
         store.clone(),
         Arc::new(DummyProvider),
-        Config::default(),
+        clean_config(dir.path()),
     );
 
-    let tool = ScheduleTasksTool::new(
+    let tool = new_schedule_tasks_tool(
         schedule_store.clone(),
         manager,
         store.clone(),
-        store.clone(),
+        clean_config(dir.path()),
     );
 
     let mut caller = Session::new("root-session", "test-model");
@@ -377,14 +407,14 @@ async fn schedule_tasks_crud_and_list_sessions() {
         schedule_store.clone(),
         store.clone(),
         Arc::new(DummyProvider),
-        Config::default(),
+        clean_config(dir.path()),
     );
 
-    let tool = ScheduleTasksTool::new(
+    let tool = new_schedule_tasks_tool(
         schedule_store.clone(),
         manager,
         store.clone(),
-        store.clone(),
+        clean_config(dir.path()),
     );
 
     // Create a caller root session (tool checks SessionKind::Root).
@@ -568,7 +598,7 @@ async fn schedule_run_non_auto_execute_completes_with_success_accounting() {
         schedule_store.clone(),
         store.clone(),
         Arc::new(DummyProvider),
-        Config::default(),
+        clean_config(dir.path()),
     );
 
     let claimed = schedule_store
@@ -615,7 +645,7 @@ async fn schedule_run_non_auto_execute_completes_with_success_accounting() {
 }
 
 #[tokio::test]
-async fn schedule_run_uses_config_get_model_fallback() {
+async fn schedule_run_uses_config_get_fast_then_default_fallback() {
     common::init_test_env();
     let dir = common::create_temp_dir();
     let store = Arc::new(SessionStoreV2::new(dir.path().to_path_buf()).await.unwrap());
@@ -637,12 +667,13 @@ async fn schedule_run_uses_config_get_model_fallback() {
         .await
         .unwrap();
 
-    // Copilot has a built-in get_model() fallback ("gpt-4o") even when not configured.
-    let mut cfg = Config::default();
+    // Copilot has no dedicated fast model configured here, so schedules should
+    // fall back from fast to the default chat model.
+    let mut cfg = clean_config(dir.path());
     cfg.provider = "copilot".to_string();
     let expected_model = cfg
-        .get_model()
-        .expect("copilot should always have a model fallback");
+        .get_fast_model()
+        .expect("copilot should have a schedule model fallback");
 
     let (_agent, manager) = build_manager(
         dir.path(),
@@ -747,7 +778,7 @@ async fn schedule_auto_execute_keeps_running_until_background_completion() {
         schedule_store.clone(),
         store.clone(),
         provider,
-        Config::default(),
+        clean_config(dir.path()),
     );
 
     let claimed = schedule_store

@@ -4,13 +4,15 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::handlers::agent::schedules::ScheduleView;
+use crate::model_config_helper::get_schedule_model_from_config;
 use crate::schedules::{
     ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore, ScheduleTrigger,
 };
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use bamboo_agent_core::{Session, SessionKind};
-use bamboo_infrastructure::SessionStoreV2;
+use bamboo_infrastructure::{Config, SessionStoreV2};
+use tokio::sync::RwLock;
 
 /// One tool for schedule CRUD + actions.
 ///
@@ -21,6 +23,7 @@ pub struct ScheduleTasksTool {
     schedule_manager: Arc<ScheduleManager>,
     session_store: Arc<SessionStoreV2>,
     storage: Arc<dyn Storage>,
+    config: Arc<RwLock<Config>>,
 }
 
 impl ScheduleTasksTool {
@@ -29,12 +32,14 @@ impl ScheduleTasksTool {
         schedule_manager: Arc<ScheduleManager>,
         session_store: Arc<SessionStoreV2>,
         storage: Arc<dyn Storage>,
+        config: Arc<RwLock<Config>>,
     ) -> Self {
         Self {
             schedule_store,
             schedule_manager,
             session_store,
             storage,
+            config,
         }
     }
 
@@ -48,6 +53,48 @@ impl ScheduleTasksTool {
                 "failed to load session {session_id}: {e}"
             ))),
         }
+    }
+
+    async fn validate_auto_execute_run_config(
+        &self,
+        run_config: &ScheduleRunConfig,
+    ) -> Result<(), ToolError> {
+        if !run_config.auto_execute {
+            return Ok(());
+        }
+
+        let has_task = run_config
+            .task_message
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .is_some();
+        if !has_task {
+            return Err(ToolError::InvalidArguments(
+                "run_config.task_message is required when auto_execute is true".to_string(),
+            ));
+        }
+
+        let has_explicit_model = run_config
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .is_some();
+        if has_explicit_model {
+            return Ok(());
+        }
+
+        let snapshot = self.config.read().await.clone();
+        let provider = snapshot.provider.clone();
+        get_schedule_model_from_config(&snapshot).map_err(|error| {
+            ToolError::InvalidArguments(format!(
+                "run_config.model not provided and no fast/default model configured for provider {}: {}",
+                provider, error
+            ))
+        })?;
+
+        Ok(())
     }
 }
 
@@ -226,20 +273,7 @@ impl Tool for ScheduleTasksTool {
                     ));
                 }
                 let run_config = run_config.unwrap_or_default();
-                if run_config.auto_execute {
-                    let has_task = run_config
-                        .task_message
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|v| !v.is_empty())
-                        .is_some();
-                    if !has_task {
-                        return Err(ToolError::InvalidArguments(
-                            "run_config.task_message is required when auto_execute is true"
-                                .to_string(),
-                        ));
-                    }
-                }
+                self.validate_auto_execute_run_config(&run_config).await?;
 
                 let created = self
                     .schedule_store
@@ -298,20 +332,7 @@ impl Tool for ScheduleTasksTool {
                 }
 
                 if let Some(cfg) = run_config.as_ref() {
-                    if cfg.auto_execute {
-                        let has_task = cfg
-                            .task_message
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|v| !v.is_empty())
-                            .is_some();
-                        if !has_task {
-                            return Err(ToolError::InvalidArguments(
-                                "run_config.task_message is required when auto_execute is true"
-                                    .to_string(),
-                            ));
-                        }
-                    }
+                    self.validate_auto_execute_run_config(cfg).await?;
                 }
 
                 let updated = self

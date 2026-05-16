@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 
 use crate::app_state::AppState;
 use crate::handlers::agent::schedules::types::{CreateScheduleRequest, PatchScheduleRequest};
-use crate::model_config_helper::get_default_model_from_config;
+use crate::model_config_helper::get_schedule_model_from_config;
 use crate::schedules::{MisFirePolicy, OverlapPolicy, ScheduleRunConfig, ScheduleTrigger};
 
 pub(super) fn validate_schedule_name(name: &str) -> Result<String, HttpResponse> {
@@ -228,10 +228,10 @@ pub(super) async fn validate_auto_execute_run_config(
     }
 
     let snapshot = state.config.read().await.clone();
-    if let Err(error) = get_default_model_from_config(&snapshot) {
+    if let Err(error) = get_schedule_model_from_config(&snapshot) {
         return Err(HttpResponse::BadRequest().json(serde_json::json!({
             "error": format!(
-                "run_config.model not provided and no default model configured for provider {}: {}",
+                "run_config.model not provided and no fast/default model configured for provider {}: {}",
                 snapshot.provider, error
             )
         })));

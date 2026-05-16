@@ -4,6 +4,7 @@
 //! provides [`build_schedule_context`] to construct a `ScheduleContext`
 //! with server-specific Config resolution baked in.
 
+use crate::model_config_helper::get_schedule_model_from_config;
 pub use crate::schedule_app::{
     ResolvedRunConfig, ScheduleContext, ScheduleManager, ScheduleRunJob,
 };
@@ -50,11 +51,7 @@ fn resolve_run_config_from_config(
     let model = if let Some(m) = requested_model {
         m
     } else {
-        config_snapshot
-            .get_model()
-            .map(|m| m.trim().to_string())
-            .filter(|m| !m.is_empty())
-            .unwrap_or_default()
+        get_schedule_model_from_config(&config_snapshot).unwrap_or_default()
     };
 
     let requested_reasoning_effort = job.run_config.reasoning_effort;
@@ -102,5 +99,86 @@ fn resolve_run_config_from_config(
         system_prompt,
         base_system_prompt: base_system_prompt.to_string(),
         workspace_path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_run_config_from_config;
+    use crate::schedule_app::ScheduleRunJob;
+    use bamboo_domain::{ProviderModelRef, ScheduleRunConfig};
+    use bamboo_infrastructure::{Config, DefaultsConfig, OpenAIConfig, ProviderConfigs};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn test_job() -> ScheduleRunJob {
+        ScheduleRunJob {
+            run_id: "run-1".to_string(),
+            schedule_id: "schedule-1".to_string(),
+            schedule_name: "nightly".to_string(),
+            run_config: ScheduleRunConfig::default(),
+            scheduled_for: chrono::Utc::now(),
+            claimed_at: chrono::Utc::now(),
+            was_catch_up: false,
+        }
+    }
+
+    #[test]
+    fn resolve_run_config_from_config_prefers_fast_model() {
+        let config = Config {
+            provider: "openai".to_string(),
+            defaults: None,
+            features: bamboo_infrastructure::FeatureFlags {
+                provider_model_ref: false,
+                ..Default::default()
+            },
+            providers: ProviderConfigs {
+                openai: Some(OpenAIConfig {
+                    api_key: "test".to_string(),
+                    api_key_encrypted: None,
+                    base_url: None,
+                    model: Some("gpt-4o".to_string()),
+                    fast_model: Some("gpt-4o-mini".to_string()),
+                    vision_model: None,
+                    reasoning_effort: None,
+                    responses_only_models: vec![],
+                    request_overrides: None,
+                    extra: Default::default(),
+                }),
+                ..ProviderConfigs::default()
+            },
+            ..Config::default()
+        };
+
+        let resolved = resolve_run_config_from_config(&test_job(), &Arc::new(RwLock::new(config)));
+        assert_eq!(resolved.model, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn resolve_run_config_from_config_falls_back_to_default_model_when_fast_missing() {
+        let config = Config {
+            provider: "openai".to_string(),
+            defaults: Some(DefaultsConfig {
+                chat: ProviderModelRef::new("openai", "gpt-chat"),
+                fast: None,
+                vision: None,
+                memory_background: None,
+                planning: None,
+                search: None,
+                code_review: None,
+                sub_agent: None,
+                subagent_models: HashMap::new(),
+            }),
+            features: bamboo_infrastructure::FeatureFlags {
+                provider_model_ref: true,
+                ..Default::default()
+            },
+            providers: ProviderConfigs::default(),
+            ..Config::default()
+        };
+
+        let resolved = resolve_run_config_from_config(&test_job(), &Arc::new(RwLock::new(config)));
+        assert_eq!(resolved.model, "gpt-chat");
     }
 }
