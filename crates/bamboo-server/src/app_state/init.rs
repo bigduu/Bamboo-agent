@@ -272,6 +272,7 @@ pub fn build_schedule_manager(
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     persistence: Arc<LockedSessionStore>,
     config: Arc<RwLock<Config>>,
+    provider_registry: Arc<bamboo_infrastructure::ProviderRegistry>,
     app_data_dir: Option<std::path::PathBuf>,
 ) -> Arc<ScheduleManager> {
     let base_ctx = ScheduleContext {
@@ -287,6 +288,8 @@ pub fn build_schedule_manager(
         resolve_run_config: Arc::new(|_| unimplemented!("replaced by build_schedule_context")),
     };
     Arc::new(ScheduleManager::new(build_schedule_context(
-        base_ctx, config,
+        base_ctx,
+        config,
+        provider_registry,
     )))
 }

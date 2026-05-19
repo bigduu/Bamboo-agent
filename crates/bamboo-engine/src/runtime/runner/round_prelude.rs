@@ -298,7 +298,7 @@ pub(crate) async fn prepare_round(
     _tools: &dyn ToolExecutor,
 ) -> Result<String, AgentError> {
     let runtime_context = PromptMemoryRuntimeContext {
-        llm,
+        llm: config.background_model_provider.clone().unwrap_or(llm),
         background_model_name: config.background_model_name.clone(),
     };
     refresh_round_prompt_context(

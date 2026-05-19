@@ -25,7 +25,9 @@ use bamboo_infrastructure::{Config, ProviderModelRouter, ProviderRegistry};
 use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
 
-use crate::model_config_helper::resolve_background_model;
+use crate::model_config_helper::{
+    resolve_background_model, resolve_fast_model, resolve_provider_type, resolve_task_summary_model,
+};
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::session_app::resume::{
     resume_session_execution, ResumeExecutionPort, ResumeSpawnRequest,
@@ -216,14 +218,39 @@ impl ChildCompletionCoordinator {
         let provider_name = session_effective_model_ref(session)
             .map(|model_ref| model_ref.provider)
             .unwrap_or_else(|| config_snapshot.provider.clone());
-        let resolved_bg =
+        let provider_type =
+            resolve_provider_type(config_snapshot, &provider_name, &self.provider_registry);
+        let resolved_fast =
+            resolve_fast_model(config_snapshot, &provider_name, &self.provider_registry);
+        let resolved_background =
             resolve_background_model(config_snapshot, &provider_name, &self.provider_registry);
+        let resolved_summarization =
+            resolve_task_summary_model(config_snapshot, &provider_name, &self.provider_registry);
 
         ResumeConfigSnapshot {
             provider_name,
-            fast_model: resolved_bg.as_ref().map(|model| model.model_name.clone()),
-            fast_model_ref: None,
-            background_model_provider: resolved_bg.map(|model| model.provider),
+            provider_type,
+            fast_model: resolved_fast.as_ref().map(|model| model.model_name.clone()),
+            fast_model_ref: config_snapshot
+                .defaults
+                .as_ref()
+                .and_then(|d| d.fast.clone()),
+            background_model: resolved_background
+                .as_ref()
+                .map(|model| model.model_name.clone()),
+            background_model_ref: config_snapshot
+                .defaults
+                .as_ref()
+                .and_then(|d| d.memory_background.clone()),
+            background_model_provider: resolved_background.map(|model| model.provider),
+            summarization_model: resolved_summarization
+                .as_ref()
+                .map(|model| model.model_name.clone()),
+            summarization_model_ref: config_snapshot
+                .defaults
+                .as_ref()
+                .and_then(|d| d.task_summary.clone()),
+            summarization_model_provider: resolved_summarization.map(|model| model.provider),
             disabled_tools: config_snapshot.disabled_tool_names(),
             disabled_skill_ids: config_snapshot.disabled_skill_ids(),
             image_fallback:
@@ -461,6 +488,13 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                     None
                 }
             });
+        let config_snapshot = self.config.read().await.clone();
+        let resolved_fast_provider = resolve_fast_model(
+            &config_snapshot,
+            &resolved_provider_name,
+            &self.provider_registry,
+        )
+        .map(|model| model.provider);
         let reasoning_effort = session.reasoning_effort;
         let reasoning_effort_source = session
             .metadata
@@ -478,9 +512,14 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             tools_override: Some(root_tools),
             provider_override,
             provider_name: Some(resolved_provider_name),
+            provider_type: config.provider_type.clone(),
             model,
             fast_model: config.fast_model,
+            fast_model_provider: resolved_fast_provider,
+            background_model: config.background_model,
             background_model_provider: config.background_model_provider,
+            summarization_model: config.summarization_model,
+            summarization_model_provider: config.summarization_model_provider,
             reasoning_effort,
             reasoning_effort_source,
             disabled_tools: Some(config.disabled_tools),

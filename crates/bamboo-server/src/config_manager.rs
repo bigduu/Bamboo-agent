@@ -20,6 +20,7 @@
 use serde_json::{Map, Value};
 
 use crate::error::AppError;
+use bamboo_infrastructure::patch::ProviderApiKeyIntents;
 use bamboo_infrastructure::Config;
 
 // Re-export pure domain logic from the config crate so server consumers
@@ -32,9 +33,9 @@ pub use bamboo_infrastructure::patch::{
 
 pub fn sync_provider_api_keys_encrypted_for_patch(
     config: &mut Config,
-    providers: &std::collections::BTreeSet<String>,
+    intents: &ProviderApiKeyIntents,
 ) -> Result<(), AppError> {
-    for name in providers.iter() {
+    for name in intents.providers.iter() {
         match name.as_str() {
             "openai" => {
                 if let Some(openai) = config.providers.openai.as_mut() {
@@ -84,7 +85,40 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                     };
                 }
             }
+            "bodhi" => {
+                if let Some(bodhi) = config.providers.bodhi.as_mut() {
+                    let api_key = bodhi.api_key.trim();
+                    bodhi.api_key_encrypted = if api_key.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            bamboo_infrastructure::encryption::encrypt(api_key).map_err(|e| {
+                                AppError::InternalError(anyhow::anyhow!(
+                                    "Failed to encrypt Bodhi api_key: {e}"
+                                ))
+                            })?,
+                        )
+                    };
+                }
+            }
             _ => {}
+        }
+    }
+
+    for instance_id in intents.provider_instances.iter() {
+        if let Some(instance) = config.provider_instances.get_mut(instance_id) {
+            let api_key = instance.api_key.trim();
+            instance.api_key_encrypted = if api_key.is_empty() {
+                None
+            } else {
+                Some(
+                    bamboo_infrastructure::encryption::encrypt(api_key).map_err(|e| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "Failed to encrypt provider instance api_key for '{instance_id}': {e}"
+                        ))
+                    })?,
+                )
+            };
         }
     }
 
@@ -113,6 +147,7 @@ pub fn build_merged_config(
         .map_err(|e| AppError::BadRequest(format!("Invalid configuration JSON: {e}")))?;
     new_config.hydrate_proxy_auth_from_encrypted();
     new_config.hydrate_provider_api_keys_from_encrypted();
+    new_config.hydrate_provider_instance_api_keys_from_encrypted();
     new_config.hydrate_mcp_secrets_from_encrypted();
     new_config.hydrate_env_vars_from_encrypted();
     new_config.normalize_tool_settings();

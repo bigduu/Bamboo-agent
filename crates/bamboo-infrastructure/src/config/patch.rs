@@ -14,31 +14,52 @@ pub fn is_masked_api_key(value: &str) -> bool {
     v.contains("***") || v.contains("...") || v == "****...****"
 }
 
-/// Extract provider names from a config patch that intend to set a new API key.
+/// Extract API-key update intents from a config patch.
+///
 /// Masked placeholders are ignored — they signal "keep existing key".
-pub fn provider_api_key_intents(
-    patch_obj: &Map<String, Value>,
-) -> std::collections::BTreeSet<String> {
-    let mut providers = std::collections::BTreeSet::new();
-    let Some(root) = patch_obj.get("providers").and_then(|v| v.as_object()) else {
-        return providers;
-    };
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderApiKeyIntents {
+    pub providers: std::collections::BTreeSet<String>,
+    pub provider_instances: std::collections::BTreeSet<String>,
+}
 
-    for (provider_name, provider_patch) in root.iter() {
-        let Some(obj) = provider_patch.as_object() else {
-            continue;
-        };
-        let Some(api_key) = obj.get("api_key").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        // Ignore masked placeholders; those are "preserve existing" signals from the UI.
-        if is_masked_api_key(api_key) {
-            continue;
+pub fn provider_api_key_intents(patch_obj: &Map<String, Value>) -> ProviderApiKeyIntents {
+    let mut intents = ProviderApiKeyIntents::default();
+
+    if let Some(root) = patch_obj.get("providers").and_then(|v| v.as_object()) {
+        for (provider_name, provider_patch) in root.iter() {
+            let Some(obj) = provider_patch.as_object() else {
+                continue;
+            };
+            let Some(api_key) = obj.get("api_key").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if is_masked_api_key(api_key) {
+                continue;
+            }
+            intents.providers.insert(provider_name.clone());
         }
-        providers.insert(provider_name.clone());
     }
 
-    providers
+    if let Some(root) = patch_obj
+        .get("provider_instances")
+        .and_then(|v| v.as_object())
+    {
+        for (instance_id, instance_patch) in root.iter() {
+            let Some(obj) = instance_patch.as_object() else {
+                continue;
+            };
+            let Some(api_key) = obj.get("api_key").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if is_masked_api_key(api_key) {
+                continue;
+            }
+            intents.provider_instances.insert(instance_id.clone());
+        }
+    }
+
+    intents
 }
 
 /// Reload strategy to apply after a config patch.
@@ -77,7 +98,13 @@ pub fn domains_for_root_patch(patch_obj: &Map<String, Value>) -> DomainChanges {
     for key in patch_obj.keys() {
         match key.as_str() {
             // Provider domain
-            "provider" | "providers" | "model" => changes.provider = true,
+            "provider"
+            | "providers"
+            | "provider_instances"
+            | "default_provider_instance"
+            | "model"
+            | "defaults"
+            | "features" => changes.provider = true,
 
             // Proxy domain
             "http_proxy"
@@ -145,6 +172,18 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
     {
         for (_provider_name, provider_cfg) in providers.iter_mut() {
             let Some(obj) = provider_cfg.as_object_mut() else {
+                continue;
+            };
+            obj.remove("api_key_encrypted");
+        }
+    }
+
+    if let Some(provider_instances) = patch_obj
+        .get_mut("provider_instances")
+        .and_then(|v| v.as_object_mut())
+    {
+        for (_instance_id, instance_cfg) in provider_instances.iter_mut() {
+            let Some(obj) = instance_cfg.as_object_mut() else {
                 continue;
             };
             obj.remove("api_key_encrypted");
@@ -220,44 +259,76 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
 /// The UI sends masked values (e.g. `****...****`) to indicate "do not change this key".
 /// This function resolves those back to the existing plain-text key from the live config.
 pub fn preserve_masked_provider_api_keys(patch_obj: &mut Map<String, Value>, current: &Config) {
-    let Some(patch_providers) = patch_obj
+    if let Some(patch_providers) = patch_obj
         .get_mut("providers")
         .and_then(|v| v.as_object_mut())
-    else {
-        return;
-    };
+    {
+        for (provider_name, provider_patch) in patch_providers.iter_mut() {
+            let Some(patch_cfg_obj) = provider_patch.as_object_mut() else {
+                continue;
+            };
 
-    for (provider_name, provider_patch) in patch_providers.iter_mut() {
-        let Some(patch_cfg_obj) = provider_patch.as_object_mut() else {
-            continue;
-        };
+            let Some(api_key) = patch_cfg_obj.get("api_key").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !is_masked_api_key(api_key) {
+                continue;
+            }
 
-        let Some(api_key) = patch_cfg_obj.get("api_key").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if !is_masked_api_key(api_key) {
-            continue;
-        }
+            let existing_plain = match provider_name.as_str() {
+                "openai" => current.providers.openai.as_ref().map(|c| c.api_key.clone()),
+                "anthropic" => current
+                    .providers
+                    .anthropic
+                    .as_ref()
+                    .map(|c| c.api_key.clone()),
+                "gemini" => current.providers.gemini.as_ref().map(|c| c.api_key.clone()),
+                "bodhi" => current.providers.bodhi.as_ref().map(|c| c.api_key.clone()),
+                _ => None,
+            };
 
-        let existing_plain = match provider_name.as_str() {
-            "openai" => current.providers.openai.as_ref().map(|c| c.api_key.clone()),
-            "anthropic" => current
-                .providers
-                .anthropic
-                .as_ref()
-                .map(|c| c.api_key.clone()),
-            "gemini" => current.providers.gemini.as_ref().map(|c| c.api_key.clone()),
-            _ => None,
-        };
-
-        if let Some(existing_plain) = existing_plain {
-            if !existing_plain.trim().is_empty() {
-                patch_cfg_obj.insert("api_key".to_string(), Value::String(existing_plain));
+            if let Some(existing_plain) = existing_plain {
+                if !existing_plain.trim().is_empty() {
+                    patch_cfg_obj.insert("api_key".to_string(), Value::String(existing_plain));
+                } else {
+                    patch_cfg_obj.remove("api_key");
+                }
             } else {
                 patch_cfg_obj.remove("api_key");
             }
-        } else {
-            patch_cfg_obj.remove("api_key");
+        }
+    }
+
+    if let Some(patch_instances) = patch_obj
+        .get_mut("provider_instances")
+        .and_then(|v| v.as_object_mut())
+    {
+        for (instance_id, instance_patch) in patch_instances.iter_mut() {
+            let Some(patch_cfg_obj) = instance_patch.as_object_mut() else {
+                continue;
+            };
+
+            let Some(api_key) = patch_cfg_obj.get("api_key").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !is_masked_api_key(api_key) {
+                continue;
+            }
+
+            let existing_plain = current
+                .provider_instances
+                .get(instance_id)
+                .map(|instance| instance.api_key.clone());
+
+            if let Some(existing_plain) = existing_plain {
+                if !existing_plain.trim().is_empty() {
+                    patch_cfg_obj.insert("api_key".to_string(), Value::String(existing_plain));
+                } else {
+                    patch_cfg_obj.remove("api_key");
+                }
+            } else {
+                patch_cfg_obj.remove("api_key");
+            }
         }
     }
 }
@@ -303,15 +374,40 @@ mod tests {
     }
 
     #[test]
+    fn domains_for_root_patch_detects_provider_instances() {
+        let patch = json!({
+            "provider_instances": {
+                "openai-work": { "provider_type": "openai" }
+            },
+            "default_provider_instance": "openai-work",
+            "defaults": {
+                "chat": { "provider": "openai-work", "model": "gpt-4o" }
+            },
+            "features": {
+                "provider_model_ref": true
+            }
+        });
+
+        let domains = domains_for_root_patch(patch.as_object().unwrap());
+        assert!(domains.provider);
+    }
+
+    #[test]
     fn provider_api_key_intents_ignores_masked_placeholders() {
         let patch = json!({
             "providers": {
                 "openai": { "api_key": "****...****" },
                 "gemini": { "api_key": "sk-real" }
+            },
+            "provider_instances": {
+                "work-openai": { "api_key": "****...****" },
+                "personal-openai": { "api_key": "sk-live" }
             }
         });
         let intents = provider_api_key_intents(patch.as_object().unwrap());
-        assert!(intents.contains("gemini"));
-        assert!(!intents.contains("openai"));
+        assert!(intents.providers.contains("gemini"));
+        assert!(!intents.providers.contains("openai"));
+        assert!(intents.provider_instances.contains("personal-openai"));
+        assert!(!intents.provider_instances.contains("work-openai"));
     }
 }

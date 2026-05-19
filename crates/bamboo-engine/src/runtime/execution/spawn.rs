@@ -284,11 +284,16 @@ fn resolve_child_provider_override(
     router: Option<&Arc<ProviderModelRouter>>,
     session: &Session,
     model: &str,
-) -> (Option<Arc<dyn LLMProvider>>, Option<String>) {
+) -> (Option<Arc<dyn LLMProvider>>, Option<String>, Option<String>) {
     let model_ref = child_model_ref(session, model);
     let provider_name = model_ref
         .as_ref()
         .map(|model_ref| model_ref.provider.clone());
+    let provider_type = if let (Some(router), Some(model_ref)) = (router, model_ref.as_ref()) {
+        router.provider_type_for(model_ref)
+    } else {
+        provider_name.clone()
+    };
     let provider = router.and_then(|router| {
         let model_ref = model_ref.as_ref()?;
         match router.route(model_ref) {
@@ -305,7 +310,7 @@ fn resolve_child_provider_override(
             }
         }
     });
-    (provider, provider_name)
+    (provider, provider_name, provider_type)
 }
 
 async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
@@ -543,7 +548,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
                 ))
             }
         } else {
-            let (provider_override, provider_name) =
+            let (provider_override, provider_name, provider_type) =
                 resolve_child_provider_override(provider_router.as_ref(), &session, &model);
             let disabled_tools: Option<std::collections::BTreeSet<String>> =
                 job.disabled_tools.map(|v| v.into_iter().collect());
@@ -558,8 +563,13 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
                         provider_override,
                         model: Some(model.clone()),
                         provider_name,
+                        provider_type,
+                        fast_model: None,
+                        fast_model_provider: None,
                         background_model: None,
                         background_model_provider: None,
+                        summarization_model: None,
+                        summarization_model_provider: None,
                         reasoning_effort: None,
                         disabled_tools,
                         disabled_skill_ids: None,

@@ -4,9 +4,7 @@ use std::path::Path;
 use std::path::PathBuf;
 #[cfg(not(target_os = "windows"))]
 use std::process::Stdio;
-#[cfg(target_os = "windows")]
-use std::sync::OnceLock;
-use std::sync::{LazyLock, RwLock};
+use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 #[cfg(not(target_os = "windows"))]
@@ -149,11 +147,19 @@ const UNIX_SHELL_ENV_FALLBACK_TTL: Duration = Duration::from_secs(10);
 const UNIX_SHELL_ENV_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(not(target_os = "windows"))]
-static UNIX_SHELL_ENV_CACHE: LazyLock<RwLock<Option<CachedUnixShellEnvironment>>> =
-    LazyLock::new(|| RwLock::new(None));
+static UNIX_SHELL_ENV_CACHE: OnceLock<RwLock<Option<CachedUnixShellEnvironment>>> = OnceLock::new();
 #[cfg(not(target_os = "windows"))]
-static UNIX_SHELL_ENV_REFRESH_LOCK: LazyLock<AsyncMutex<()>> =
-    LazyLock::new(|| AsyncMutex::new(()));
+static UNIX_SHELL_ENV_REFRESH_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+
+#[cfg(not(target_os = "windows"))]
+fn unix_shell_env_cache() -> &'static RwLock<Option<CachedUnixShellEnvironment>> {
+    UNIX_SHELL_ENV_CACHE.get_or_init(|| RwLock::new(None))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unix_shell_env_refresh_lock() -> &'static AsyncMutex<()> {
+    UNIX_SHELL_ENV_REFRESH_LOCK.get_or_init(|| AsyncMutex::new(()))
+}
 
 pub async fn build_command_environment(
     overrides: &HashMap<String, String>,
@@ -771,7 +777,7 @@ fn preferred_unix_env_import_shell() -> Option<PathBuf> {
 
 #[cfg(not(target_os = "windows"))]
 fn read_cached_unix_shell_environment() -> Option<ImportedCommandEnvironment> {
-    let guard = UNIX_SHELL_ENV_CACHE.read().ok()?;
+    let guard = unix_shell_env_cache().read().ok()?;
     let cached = guard.as_ref()?;
     if Instant::now() < cached.expires_at {
         Some(cached.imported.clone())
@@ -787,7 +793,7 @@ fn write_cached_unix_shell_environment(imported: ImportedCommandEnvironment) {
         CommandEnvironmentSource::InheritedProcess => UNIX_SHELL_ENV_FALLBACK_TTL,
     };
     let expires_at = Instant::now() + ttl;
-    if let Ok(mut guard) = UNIX_SHELL_ENV_CACHE.write() {
+    if let Ok(mut guard) = unix_shell_env_cache().write() {
         *guard = Some(CachedUnixShellEnvironment {
             imported,
             expires_at,
@@ -801,7 +807,7 @@ async fn imported_unix_shell_environment_cached() -> ImportedCommandEnvironment 
         return cached;
     }
 
-    let _refresh = UNIX_SHELL_ENV_REFRESH_LOCK.lock().await;
+    let _refresh = unix_shell_env_refresh_lock().lock().await;
     if let Some(cached) = read_cached_unix_shell_environment() {
         return cached;
     }
@@ -881,7 +887,7 @@ async fn import_unix_shell_environment() -> Result<ImportedCommandEnvironment, S
 #[cfg(any(test, feature = "test-utils"))]
 pub fn clear_command_environment_cache_for_tests() {
     #[cfg(not(target_os = "windows"))]
-    if let Ok(mut guard) = UNIX_SHELL_ENV_CACHE.write() {
+    if let Ok(mut guard) = unix_shell_env_cache().write() {
         *guard = None;
     }
 }

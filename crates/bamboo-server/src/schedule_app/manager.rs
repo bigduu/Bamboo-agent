@@ -35,9 +35,17 @@ pub struct ScheduleRunJob {
 /// The schedule crate delegates model/prompt/workspace resolution to the
 /// caller via [`ScheduleContext::resolve_run_config`] so that server-specific
 /// concerns (Config, filesystem prompt templates) stay out of the crate.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedRunConfig {
     pub model: String,
+    pub provider_name: Option<String>,
+    pub provider_type: Option<String>,
+    pub fast_model: Option<String>,
+    pub fast_model_provider: Option<Arc<dyn bamboo_infrastructure::LLMProvider>>,
+    pub background_model: Option<String>,
+    pub background_model_provider: Option<Arc<dyn bamboo_infrastructure::LLMProvider>>,
+    pub summarization_model: Option<String>,
+    pub summarization_model_provider: Option<Arc<dyn bamboo_infrastructure::LLMProvider>>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub system_prompt: String,
     pub base_system_prompt: String,
@@ -324,6 +332,14 @@ async fn run_schedule_job(
     let agent_runners_for_status = ctx.agent_runners.clone();
     let sessions_cache = ctx.sessions_cache.clone();
     let model = resolved.model.clone();
+    let provider_name = resolved.provider_name.clone();
+    let provider_type = resolved.provider_type.clone();
+    let fast_model = resolved.fast_model.clone();
+    let fast_model_provider = resolved.fast_model_provider.clone();
+    let background_model = resolved.background_model.clone();
+    let background_model_provider = resolved.background_model_provider.clone();
+    let summarization_model = resolved.summarization_model.clone();
+    let summarization_model_provider = resolved.summarization_model_provider.clone();
     let reasoning_effort = resolved.reasoning_effort;
 
     tokio::spawn(async move {
@@ -344,9 +360,14 @@ async fn run_schedule_job(
                     tools: Some(tools),
                     provider_override: None,
                     model: Some(model.clone()),
-                    provider_name: None,
-                    background_model: None,
-                    background_model_provider: None,
+                    provider_name,
+                    provider_type,
+                    fast_model,
+                    fast_model_provider,
+                    background_model,
+                    background_model_provider,
+                    summarization_model,
+                    summarization_model_provider,
                     reasoning_effort,
                     disabled_tools: None,
                     disabled_skill_ids: None,

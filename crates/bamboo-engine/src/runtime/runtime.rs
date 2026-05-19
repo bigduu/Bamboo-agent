@@ -269,11 +269,19 @@ pub struct ExecuteRequest {
     // -- Optional overrides (None → config defaults) ----------------------
     pub model: Option<String>,
     pub provider_name: Option<String>,
+    pub provider_type: Option<String>,
+    /// When `None`, falls back to `Config::get_fast_model()`.
+    pub fast_model: Option<String>,
+    /// Optional provider override for lightweight fast-model calls.
+    pub fast_model_provider: Option<Arc<dyn LLMProvider>>,
     /// When `None`, falls back to `Config::get_memory_background_model()`.
     pub background_model: Option<String>,
-    /// Optional provider override for background/fast model calls.
-    /// When set, compression/summarization use this provider instead of the shared `llm`.
+    /// Optional provider override for memory/background model calls.
     pub background_model_provider: Option<Arc<dyn LLMProvider>>,
+    /// When `None`, falls back to `Config::get_task_summary_model()`.
+    pub summarization_model: Option<String>,
+    /// Optional provider override for task summarization / compression calls.
+    pub summarization_model_provider: Option<Arc<dyn LLMProvider>>,
     pub reasoning_effort: Option<ReasoningEffort>,
     /// When `None`, falls back to `Config::disabled_tool_names()`.
     pub disabled_tools: Option<BTreeSet<String>>,
@@ -323,8 +331,13 @@ impl AgentRuntime {
             provider_override,
             model,
             provider_name,
+            provider_type,
+            fast_model,
+            fast_model_provider,
             background_model,
             background_model_provider,
+            summarization_model,
+            summarization_model_provider,
             reasoning_effort,
             disabled_tools,
             disabled_skill_ids,
@@ -349,10 +362,10 @@ impl AgentRuntime {
             attachment_reader: Some(self.attachment_reader.clone()),
             metrics_collector: Some(self.metrics_collector.clone()),
             model_name: model,
-            fast_model_name: background_model.clone().or_else(|| config.get_fast_model()),
+            fast_model_name: fast_model.or_else(|| config.get_fast_model()),
+            fast_model_provider,
             background_model_name: background_model
                 .or_else(|| config.get_memory_background_model()),
-            background_model_provider,
             planning_model_name: config
                 .defaults
                 .as_ref()
@@ -363,7 +376,13 @@ impl AgentRuntime {
                 .as_ref()
                 .and_then(|d| d.search.as_ref().or(d.fast.as_ref()))
                 .map(|r| r.model.clone()),
+            compression_instructions: None,
+            summarization_model_name: summarization_model
+                .or_else(|| config.get_task_summary_model()),
+            background_model_provider,
+            summarization_model_provider,
             provider_name: Some(provider_name.unwrap_or_else(|| config.provider.clone())),
+            provider_type,
             reasoning_effort,
             disabled_tools: {
                 let mut merged = config.disabled_tool_names();

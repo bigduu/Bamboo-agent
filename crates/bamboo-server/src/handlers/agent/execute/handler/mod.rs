@@ -10,8 +10,8 @@ use super::runtime::{
 use super::{ExecuteRequest, ExecuteSyncInfo, ExecuteSyncReason};
 use crate::app_state::AppState;
 use crate::model_config_helper::{
-    get_default_model_for_provider, get_memory_background_model_for_provider,
-    get_reasoning_effort_for_provider,
+    get_default_model_for_provider, get_reasoning_effort_for_provider, resolve_background_model,
+    resolve_fast_model, resolve_provider_type, resolve_task_summary_model,
 };
 use crate::session_app::provider_model::session_effective_model_ref;
 
@@ -51,6 +51,27 @@ pub async fn handler(
         .or(req.provider.as_deref())
         .unwrap_or(config_snapshot.provider.as_str());
 
+    let requested_provider_type = resolve_provider_type(
+        &config_snapshot,
+        requested_provider,
+        &state.provider_registry,
+    );
+    let resolved_fast = resolve_fast_model(
+        &config_snapshot,
+        requested_provider,
+        &state.provider_registry,
+    );
+    let resolved_background = resolve_background_model(
+        &config_snapshot,
+        requested_provider,
+        &state.provider_registry,
+    );
+    let resolved_summarization = resolve_task_summary_model(
+        &config_snapshot,
+        requested_provider,
+        &state.provider_registry,
+    );
+
     let config = crate::session_app::types::ExecutionConfigSnapshot {
         default_model: get_default_model_for_provider(&config_snapshot, requested_provider).ok(),
         default_model_ref: config_snapshot.defaults.as_ref().map(|d| d.chat.clone()),
@@ -61,11 +82,24 @@ pub async fn handler(
         disabled_tools: disabled_tools_vec.clone(),
         disabled_skill_ids: disabled_skill_ids_vec.clone(),
         provider_name: requested_provider.to_string(),
-        fast_model: get_memory_background_model_for_provider(&config_snapshot, requested_provider),
+        provider_type: requested_provider_type.clone(),
+        fast_model: resolved_fast.as_ref().map(|m| m.model_name.clone()),
         fast_model_ref: config_snapshot
             .defaults
             .as_ref()
             .and_then(|d| d.fast.clone()),
+        background_model: resolved_background.as_ref().map(|m| m.model_name.clone()),
+        background_model_ref: config_snapshot
+            .defaults
+            .as_ref()
+            .and_then(|d| d.memory_background.clone()),
+        summarization_model: resolved_summarization
+            .as_ref()
+            .map(|m| m.model_name.clone()),
+        summarization_model_ref: config_snapshot
+            .defaults
+            .as_ref()
+            .and_then(|d| d.task_summary.clone()),
         image_fallback: image_fallback.clone(),
         provider_model_ref_enabled: config_snapshot.features.provider_model_ref,
     };
@@ -168,13 +202,26 @@ pub async fn handler(
             let resolved_provider_name = session_effective_model_ref(&session)
                 .map(|model_ref| model_ref.provider)
                 .unwrap_or_else(|| config.provider_name.clone());
-            let resolved_bg = crate::model_config_helper::resolve_background_model(
+            let resolved_provider_type = crate::model_config_helper::resolve_provider_type(
                 &config_snapshot,
                 &resolved_provider_name,
                 &state.provider_registry,
             );
-            let resolved_background_model = resolved_bg.as_ref().map(|m| m.model_name.clone());
-            let resolved_bg_provider = resolved_bg.map(|m| m.provider);
+            let resolved_fast = resolve_fast_model(
+                &config_snapshot,
+                &resolved_provider_name,
+                &state.provider_registry,
+            );
+            let resolved_background = resolve_background_model(
+                &config_snapshot,
+                &resolved_provider_name,
+                &state.provider_registry,
+            );
+            let resolved_summarization = resolve_task_summary_model(
+                &config_snapshot,
+                &resolved_provider_name,
+                &state.provider_registry,
+            );
 
             // Build sync info before moving session into SpawnAgentExecution.
             let sync_info = build_sync_info_from_session(&session);
@@ -206,10 +253,17 @@ pub async fn handler(
                 session,
                 is_child_session,
                 provider_name: resolved_provider_name,
+                provider_type: resolved_provider_type,
                 provider_override: None,
                 model: effective_model,
-                fast_model: resolved_background_model,
-                background_model_provider: resolved_bg_provider,
+                fast_model: resolved_fast.as_ref().map(|m| m.model_name.clone()),
+                fast_model_provider: resolved_fast.map(|m| m.provider),
+                background_model: resolved_background.as_ref().map(|m| m.model_name.clone()),
+                background_model_provider: resolved_background.map(|m| m.provider),
+                summarization_model: resolved_summarization
+                    .as_ref()
+                    .map(|m| m.model_name.clone()),
+                summarization_model_provider: resolved_summarization.map(|m| m.provider),
                 reasoning_effort: effective_reasoning_effort,
                 reasoning_effort_source: reasoning_source.to_string(),
                 disabled_tools,

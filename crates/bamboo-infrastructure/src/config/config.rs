@@ -53,7 +53,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 
 use crate::keyword_masking::KeywordMaskingConfig;
 use crate::model_mapping::{AnthropicModelMapping, GeminiModelMapping};
@@ -211,9 +211,24 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defaults: Option<DefaultsConfig>,
 
-    /// Provider-specific configurations
+    /// Provider-specific configurations (legacy, single-instance per type).
     #[serde(default)]
     pub providers: ProviderConfigs,
+
+    /// Multi-instance provider configurations keyed by instance id.
+    ///
+    /// When `provider_instances` is non-empty, the registry and router prefer
+    /// instance ids as routing keys. Legacy `providers` / `provider` fields are
+    /// still supported for backward compatibility; see
+    /// [`Config::synthesize_legacy_instances`].
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub provider_instances: HashMap<String, ProviderInstanceConfig>,
+
+    /// The default provider instance id used when a request does not specify one.
+    ///
+    /// When set, this takes precedence over the legacy `provider` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider_instance: Option<String>,
 
     /// HTTP server configuration
     #[serde(default)]
@@ -341,6 +356,8 @@ pub struct DefaultsConfig {
     pub chat: bamboo_domain::ProviderModelRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast: Option<bamboo_domain::ProviderModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_summary: Option<bamboo_domain::ProviderModelRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bamboo_domain::ProviderModelRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -793,6 +810,100 @@ fn default_provider() -> String {
     "anthropic".to_string()
 }
 
+// ─── Provider Instance Configuration ──────────────────────────────────
+
+/// Configuration for a single provider instance.
+///
+/// Multiple instances of the same provider type (e.g. two OpenAI accounts)
+/// can coexist. Each instance is identified by a stable `instance_id` that
+/// is used as the routing key in [`ProviderModelRef::provider`] and the
+/// provider registry.
+///
+/// # Example (config.json)
+///
+/// ```json
+/// {
+///   "provider_instances": {
+///     "openai-work": {
+///       "provider_type": "openai",
+///       "label": "OpenAI (Work)",
+///       "api_key": "sk-...",
+///       "model": "gpt-4o"
+///     },
+///     "openai-personal": {
+///       "provider_type": "openai",
+///       "label": "OpenAI (Personal)",
+///       "api_key": "sk-...",
+///       "base_url": "https://api.openai.com/v1",
+///       "model": "gpt-4o-mini"
+///     }
+///   },
+///   "default_provider_instance": "openai-work"
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderInstanceConfig {
+    /// Which provider backend this instance targets.
+    ///
+    /// Must be one of [`AVAILABLE_PROVIDERS`]: `"openai"`, `"anthropic"`,
+    /// `"gemini"`, `"copilot"`, `"bodhi"`.
+    pub provider_type: String,
+
+    /// Human-readable label shown in the UI / catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+
+    /// API key (plaintext in memory, encrypted at rest via `api_key_encrypted`).
+    #[serde(default, skip_serializing)]
+    pub api_key: String,
+
+    /// Encrypted API key (nonce:ciphertext). Written to disk; decrypted into
+    /// `api_key` on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_encrypted: Option<String>,
+
+    /// Custom base URL override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+
+    /// Default chat model for this instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Fast/cheap model for lightweight tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_model: Option<String>,
+
+    /// Vision-capable model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_model: Option<String>,
+
+    /// Default reasoning effort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
+
+    /// Models that must use the Responses API upstream (OpenAI only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub responses_only_models: Vec<String>,
+
+    /// Optional request overrides (headers/body patches/model rules).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_overrides: Option<RequestOverridesConfig>,
+
+    /// Whether this instance is enabled. Disabled instances are skipped
+    /// during registry construction.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Provider-type-specific extra fields preserved through (de)serialization.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// Returns the default server port (9562)
 fn default_port() -> u16 {
     9562
@@ -894,11 +1005,17 @@ pub struct PromptSafeEnvVarEntry {
 /// Global cache of user-managed env vars for injection into child processes.
 ///
 /// Updated whenever the config is loaded or reloaded via [`Config::publish_env_vars`].
-static ENV_VARS_CACHE: std::sync::LazyLock<RwLock<HashMap<String, String>>> =
-    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+static ENV_VARS_CACHE: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
 
-static PROMPT_SAFE_ENV_VARS_CACHE: std::sync::LazyLock<RwLock<Vec<PromptSafeEnvVarEntry>>> =
-    std::sync::LazyLock::new(|| RwLock::new(Vec::new()));
+static PROMPT_SAFE_ENV_VARS_CACHE: OnceLock<RwLock<Vec<PromptSafeEnvVarEntry>>> = OnceLock::new();
+
+fn env_vars_cache() -> &'static RwLock<HashMap<String, String>> {
+    ENV_VARS_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn prompt_safe_env_vars_cache() -> &'static RwLock<Vec<PromptSafeEnvVarEntry>> {
+    PROMPT_SAFE_ENV_VARS_CACHE.get_or_init(|| RwLock::new(Vec::new()))
+}
 
 impl Config {
     /// Load configuration from file with environment variable overrides
@@ -942,6 +1059,7 @@ impl Config {
                     .map(|mut config| {
                         config.hydrate_proxy_auth_from_encrypted();
                         config.hydrate_provider_api_keys_from_encrypted();
+                        config.hydrate_provider_instance_api_keys_from_encrypted();
                         config.hydrate_mcp_secrets_from_encrypted();
                         config.hydrate_env_vars_from_encrypted();
                         config.normalize_tool_settings();
@@ -963,6 +1081,8 @@ impl Config {
         config.hydrate_proxy_auth_from_encrypted();
         // Decrypt encrypted provider API keys into in-memory plaintext form.
         config.hydrate_provider_api_keys_from_encrypted();
+        // Decrypt encrypted provider-instance API keys into in-memory plaintext form.
+        config.hydrate_provider_instance_api_keys_from_encrypted();
         // Decrypt encrypted MCP secrets into in-memory plaintext form.
         config.hydrate_mcp_secrets_from_encrypted();
         // Decrypt encrypted env vars into in-memory plaintext form.
@@ -1091,6 +1211,35 @@ impl Config {
             _ => None,
         };
         fast.or_else(|| self.get_model())
+    }
+
+    /// Get the configured task summarization model.
+    ///
+    /// When `features.provider_model_ref` is enabled, reads from
+    /// `defaults.task_summary` before falling back through
+    /// `defaults.memory_background` → `defaults.fast` → `defaults.chat`.
+    ///
+    /// This is used for conversation/task summarization and context compression.
+    pub fn get_task_summary_model(&self) -> Option<String> {
+        if self.features.provider_model_ref {
+            if let Some(model_ref) = self
+                .defaults
+                .as_ref()
+                .and_then(|d| d.task_summary.as_ref())
+                .or_else(|| {
+                    self.defaults
+                        .as_ref()
+                        .and_then(|d| d.memory_background.as_ref())
+                })
+                .or_else(|| self.defaults.as_ref().and_then(|d| d.fast.as_ref()))
+                .or_else(|| self.defaults.as_ref().map(|d| &d.chat))
+            {
+                return Some(model_ref.model.clone());
+            }
+        }
+
+        self.get_memory_background_model()
+            .or_else(|| self.get_model())
     }
 
     /// Get the configured memory/background summarization model.
@@ -1274,6 +1423,21 @@ impl Config {
         self.skills.disabled = self.disabled_skill_ids().into_iter().collect();
     }
 
+    /// Return the effective default provider key.
+    ///
+    /// Prefers `default_provider_instance` when set; falls back to the
+    /// legacy `provider` string.
+    pub fn effective_default_provider(&self) -> &str {
+        self.default_provider_instance
+            .as_deref()
+            .unwrap_or(&self.provider)
+    }
+
+    /// Whether provider instances are configured (new multi-instance path).
+    pub fn has_provider_instances(&self) -> bool {
+        !self.provider_instances.is_empty()
+    }
+
     /// Populate `proxy_auth` (plaintext) from `proxy_auth_encrypted` if present.
     ///
     /// Many parts of the code rely on `proxy_auth` being hydrated in-memory so
@@ -1448,6 +1612,40 @@ impl Config {
             };
         }
 
+        Ok(())
+    }
+
+    /// Hydrate plaintext `api_key` fields on provider instances from their
+    /// encrypted counterparts.
+    pub fn hydrate_provider_instance_api_keys_from_encrypted(&mut self) {
+        for (id, instance) in self.provider_instances.iter_mut() {
+            if instance.api_key.trim().is_empty() {
+                if let Some(encrypted) = instance.api_key_encrypted.as_deref() {
+                    match crate::encryption::decrypt(encrypted) {
+                        Ok(value) => instance.api_key = value,
+                        Err(e) => {
+                            tracing::warn!(instance_id = id, "Failed to decrypt api_key: {}", e)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-encrypt all provider instance API keys and write back to
+    /// `api_key_encrypted`. Used before persisting to disk.
+    pub fn refresh_provider_instance_api_keys_encrypted(&mut self) -> Result<()> {
+        for (id, instance) in self.provider_instances.iter_mut() {
+            let api_key = instance.api_key.trim();
+            instance.api_key_encrypted = if api_key.is_empty() {
+                None
+            } else {
+                Some(crate::encryption::encrypt(api_key).context(format!(
+                    "Failed to encrypt api_key for provider instance '{}'",
+                    id
+                ))?)
+            };
+        }
         Ok(())
     }
 
@@ -1636,13 +1834,13 @@ impl Config {
     /// Update the global env vars cache (called on config load / reload).
     pub fn publish_env_vars(&self) {
         let map = self.env_vars_as_map();
-        let mut env_guard = ENV_VARS_CACHE
+        let mut env_guard = env_vars_cache()
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *env_guard = map;
 
         let prompt_safe = self.prompt_safe_env_vars();
-        let mut prompt_guard = PROMPT_SAFE_ENV_VARS_CACHE
+        let mut prompt_guard = prompt_safe_env_vars_cache()
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *prompt_guard = prompt_safe;
@@ -1650,7 +1848,7 @@ impl Config {
 
     /// Read the current env vars snapshot (called by Bash tool at process spawn time).
     pub fn current_env_vars() -> HashMap<String, String> {
-        ENV_VARS_CACHE
+        env_vars_cache()
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
@@ -1658,7 +1856,7 @@ impl Config {
 
     /// Read the current prompt-safe env var snapshot (names + metadata only; no secret values).
     pub fn current_prompt_safe_env_vars() -> Vec<PromptSafeEnvVarEntry> {
-        PROMPT_SAFE_ENV_VARS_CACHE
+        prompt_safe_env_vars_cache()
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
@@ -1674,6 +1872,8 @@ impl Config {
             headless_auth: false,
             provider: default_provider(),
             providers: ProviderConfigs::default(),
+            provider_instances: HashMap::new(),
+            default_provider_instance: None,
             server: ServerConfig::default(),
             keyword_masking: KeywordMaskingConfig::default(),
             anthropic_model_mapping: AnthropicModelMapping::default(),
@@ -1720,6 +1920,7 @@ impl Config {
         to_save.extra.remove("model");
         to_save.refresh_proxy_auth_encrypted()?;
         to_save.refresh_provider_api_keys_encrypted()?;
+        to_save.refresh_provider_instance_api_keys_encrypted()?;
         to_save.refresh_env_vars_encrypted()?;
         to_save.sanitize_env_vars_for_disk();
         to_save.normalize_tool_settings();

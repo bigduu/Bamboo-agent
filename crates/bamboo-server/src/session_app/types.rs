@@ -1,5 +1,3 @@
-//! Value types for session use cases.
-
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -21,8 +19,13 @@ pub struct ExecutionConfigSnapshot {
     pub disabled_tools: Vec<String>,
     pub disabled_skill_ids: Vec<String>,
     pub provider_name: String,
+    pub provider_type: Option<String>,
     pub fast_model: Option<String>,
     pub fast_model_ref: Option<ProviderModelRef>,
+    pub background_model: Option<String>,
+    pub background_model_ref: Option<ProviderModelRef>,
+    pub summarization_model: Option<String>,
+    pub summarization_model_ref: Option<ProviderModelRef>,
     pub image_fallback: Option<ImageFallbackConfig>,
     pub provider_model_ref_enabled: bool,
 }
@@ -184,9 +187,15 @@ pub struct SubmitResponseOutcome {
 #[derive(Clone)]
 pub struct ResumeConfigSnapshot {
     pub provider_name: String,
+    pub provider_type: Option<String>,
     pub fast_model: Option<String>,
     pub fast_model_ref: Option<ProviderModelRef>,
+    pub background_model: Option<String>,
+    pub background_model_ref: Option<ProviderModelRef>,
     pub background_model_provider: Option<Arc<dyn LLMProvider>>,
+    pub summarization_model: Option<String>,
+    pub summarization_model_ref: Option<ProviderModelRef>,
+    pub summarization_model_provider: Option<Arc<dyn LLMProvider>>,
     pub disabled_tools: BTreeSet<String>,
     pub disabled_skill_ids: BTreeSet<String>,
     pub image_fallback: Option<ImageFallbackConfig>,

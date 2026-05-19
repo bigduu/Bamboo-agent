@@ -97,22 +97,17 @@ pub struct AgentLoopConfig {
     pub metrics_collector: Option<MetricsCollector>,
     /// Model name used for metrics attribution
     pub model_name: Option<String>,
-    /// Fast/cheap model for lightweight tasks (task evaluation, search, etc.)
-    /// and background work (context compression, summarization).
-    ///
-    /// This is the same concept as `background_model_name` — both refer to the
-    /// same cheap model. The separate field exists only because different call
-    /// sites have different fallback requirements (foreground tasks may fall back
-    /// to `model_name`, while background tasks must not).
+    /// Fast/cheap model for lightweight tasks (task evaluation, search, etc.).
     ///
     /// Call sites may fall back to `model_name` when this is unset.
     pub fast_model_name: Option<String>,
-    /// Fast/cheap model for background summarization and context compression.
+    /// Optional provider override for lightweight fast-model LLM calls.
+    pub fast_model_provider: Option<Arc<dyn LLMProvider>>,
+    /// Fast/cheap model for memory/background tasks.
     ///
-    /// This is the same model as `fast_model_name` (both are resolved from the
-    /// same `resolve_background_model` source). The separate field exists because
-    /// background tasks must not silently fall back to the main interaction model.
+    /// This must not silently fall back to the main interaction model.
     pub background_model_name: Option<String>,
+
     /// Model for planning/coordination tasks (task decomposition, architecture).
     /// Falls back to `model_name` when unset.
     pub planning_model_name: Option<String>,
@@ -126,13 +121,25 @@ pub struct AgentLoopConfig {
     pub compression_instructions: Option<String>,
     /// Dedicated model for summarization. Falls back to `background_model_name`.
     pub summarization_model_name: Option<String>,
-    /// Optional provider override for background/fast model LLM calls.
+    /// Optional provider override for memory/background model LLM calls.
     ///
-    /// When set, context compression, summarization, and other background
-    /// model calls use this provider instead of the shared agent loop provider.
+    /// When set, memory recall rerank and other memory/background tasks use this
+    /// provider instead of the shared agent loop provider.
     pub background_model_provider: Option<Arc<dyn LLMProvider>>,
-    /// Provider name used for provider-specific request behavior.
+    /// Optional provider override for summarization / context compression calls.
+    ///
+    /// When set, conversation/task summarization uses this provider instead of
+    /// the shared agent loop provider.
+    pub summarization_model_provider: Option<Arc<dyn LLMProvider>>,
+    /// Provider routing key used for provider-specific request behavior.
+    ///
+    /// In multi-instance mode this may be the instance id.
     pub provider_name: Option<String>,
+    /// Underlying provider type (for example `openai`, `anthropic`, `copilot`).
+    ///
+    /// This is distinct from `provider_name` so provider-specific behavior can
+    /// remain correct when routing keys are instance ids.
+    pub provider_type: Option<String>,
     /// Optional request-time reasoning effort override.
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Bamboo application data directory (typically `~/.bamboo`).
@@ -188,13 +195,16 @@ impl Default for AgentLoopConfig {
             metrics_collector: None,
             model_name: None,
             fast_model_name: None,
+            fast_model_provider: None,
             background_model_name: None,
             planning_model_name: None,
             search_model_name: None,
             compression_instructions: None,
             summarization_model_name: None,
             background_model_provider: None,
+            summarization_model_provider: None,
             provider_name: None,
+            provider_type: None,
             reasoning_effort: None,
             app_data_dir: None,
             disabled_tools: BTreeSet::new(),

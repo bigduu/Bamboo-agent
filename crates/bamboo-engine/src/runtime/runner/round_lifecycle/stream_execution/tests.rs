@@ -123,6 +123,7 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
         "test-model",
         None,
         None,
+        None,
         "session-stream-1",
     )
     .await
@@ -228,6 +229,7 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
         &[],
         128,
         "test-model",
+        Some("openai"),
         Some("openai"),
         None,
         "session-stream-2",
@@ -352,6 +354,7 @@ async fn execute_llm_stream_keeps_previous_response_id_when_local_summary_or_com
         128,
         "test-model",
         Some("openai"),
+        Some("openai"),
         None,
         "session-stream-2b",
     )
@@ -439,6 +442,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
         128,
         "test-model",
         Some("copilot"),
+        Some("copilot"),
         None,
         "session-stream-3",
     )
@@ -486,6 +490,82 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
             .expect("session_id lock")
             .as_deref(),
         Some("session-stream-3")
+    );
+    assert!(!session
+        .metadata
+        .contains_key("responses.previous_response_id"));
+}
+
+#[tokio::test]
+async fn execute_llm_stream_disables_previous_response_id_for_copilot_instance_provider_type() {
+    let mut session = Session::new("session-stream-4", "test-model");
+    session.metadata.insert(
+        "responses.previous_response_id".to_string(),
+        "resp_prev".to_string(),
+    );
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("system"),
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: TokenUsageBreakdown {
+            system_tokens: 10,
+            summary_tokens: 0,
+            window_tokens: 12,
+            total_tokens: 22,
+            budget_limit: 100,
+        },
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let llm = Arc::new(MockLlmProvider {
+        chunks: vec![
+            LLMChunk::ResponseId("resp_next".to_string()),
+            LLMChunk::Token("done".to_string()),
+            LLMChunk::Done,
+        ],
+        requested_messages: Mutex::new(Vec::new()),
+        requested_session_id: Mutex::new(None),
+        requested_previous_response_id: Mutex::new(None),
+        requested_reasoning_summary: Mutex::new(None),
+        requested_store: Mutex::new(None),
+        requested_include: Mutex::new(None),
+        requested_text_verbosity: Mutex::new(None),
+    });
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+
+    let (_stream_output, _duration) = execute_llm_stream(
+        &mut session,
+        &llm_dyn,
+        &event_tx,
+        &CancellationToken::new(),
+        &prepared_context,
+        400_000,
+        &[],
+        128,
+        "test-model",
+        Some("copilot-instance"),
+        Some("copilot"),
+        None,
+        "session-stream-4",
+    )
+    .await
+    .expect("execute llm stream");
+
+    assert_eq!(
+        llm.requested_previous_response_id
+            .lock()
+            .expect("previous_response_id lock")
+            .as_deref(),
+        None
     );
     assert!(!session
         .metadata

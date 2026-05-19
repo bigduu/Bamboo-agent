@@ -66,6 +66,7 @@ pub(crate) async fn execute_llm_round(
         prepared.budget.max_output_tokens,
         model,
         config.provider_name.as_deref(),
+        config.provider_type.as_deref(),
         config.reasoning_effort,
         session_id,
     )

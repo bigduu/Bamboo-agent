@@ -5,13 +5,18 @@
 //! time) for accurate counts. `HeuristicTokenCounter` remains available as a
 //! lightweight fallback.
 
+use std::sync::OnceLock;
+
 use bamboo_agent_core::Message;
 use tiktoken_rs::o200k_base;
 use tiktoken_rs::CoreBPE;
 
 /// Cached BPE encoder — initialized once, reused across all count_text calls.
-static O200K_ENCODER: std::sync::LazyLock<CoreBPE> =
-    std::sync::LazyLock::new(|| o200k_base().unwrap());
+static O200K_ENCODER: OnceLock<CoreBPE> = OnceLock::new();
+
+fn o200k_encoder() -> &'static CoreBPE {
+    O200K_ENCODER.get_or_init(|| o200k_base().unwrap())
+}
 
 /// Trait for token counting implementations.
 pub trait TokenCounter: Send + Sync {
@@ -184,7 +189,7 @@ impl TokenCounter for TiktokenTokenCounter {
         if text.is_empty() {
             return 0;
         }
-        let tokens = O200K_ENCODER.encode_with_special_tokens(text);
+        let tokens = o200k_encoder().encode_with_special_tokens(text);
         tokens.len() as u32
     }
 }

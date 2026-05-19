@@ -35,44 +35,40 @@ impl AppState {
     pub async fn reload_provider(&self) -> Result<(), bamboo_infrastructure::LLMError> {
         let config = self.config.read().await.clone();
 
-        let configured_model = match config.provider.as_str() {
-            "copilot" => config
-                .providers
-                .copilot
-                .as_ref()
-                .and_then(|p| p.model.as_ref()),
-            "openai" => config
-                .providers
-                .openai
-                .as_ref()
-                .and_then(|p| p.model.as_ref()),
-            "anthropic" => config
-                .providers
-                .anthropic
-                .as_ref()
-                .and_then(|p| p.model.as_ref()),
-            "gemini" => config
-                .providers
-                .gemini
-                .as_ref()
-                .and_then(|p| p.model.as_ref()),
-            _ => None,
-        };
+        self.provider_registry
+            .reload_from_config(&config, self.app_data_dir.clone())
+            .await?;
 
+        let default_provider_name = self.provider_registry.default_provider_name();
         tracing::info!(
-            "Reloading provider: type={}, model={:?}",
-            config.provider,
-            configured_model
+            default_provider = %default_provider_name,
+            legacy_provider = %config.provider,
+            has_provider_instances = config.has_provider_instances(),
+            "Reloading provider runtime from current config"
         );
 
-        let new_provider =
-            bamboo_infrastructure::create_provider_with_dir(&config, self.app_data_dir.clone())
-                .await?;
+        let new_provider = self.provider_registry.get_default().unwrap_or_else(|| {
+            let message = if config.has_provider_instances() {
+                format!(
+                    "Default provider instance '{}' is not available or failed to initialize",
+                    default_provider_name
+                )
+            } else {
+                format!(
+                    "Provider '{}' is not available or failed to initialize",
+                    config.provider
+                )
+            };
+            Arc::new(UnconfiguredProvider { message }) as Arc<dyn LLMProvider>
+        });
 
         let mut provider = self.provider.write().await;
         *provider = new_provider;
 
-        tracing::info!("Provider reloaded successfully to: {}", config.provider);
+        tracing::info!(
+            default_provider = %default_provider_name,
+            "Provider reloaded successfully"
+        );
         Ok(())
     }
 

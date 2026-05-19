@@ -7,6 +7,35 @@ use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_infrastructure::Config;
 use bamboo_infrastructure::{LLMError, ProviderModelRouter, ProviderRegistry, ResolvedModel};
 
+/// Resolve the underlying provider type for a provider routing key.
+///
+/// In legacy mode the routing key is already the provider type (for example
+/// `"openai"` or `"copilot"`). In multi-instance mode the routing key may be an
+/// instance id (for example `"copilot-work"`), so we first consult configured
+/// provider instances, then the live registry metadata, and finally fall back to
+/// the key itself for backward compatibility.
+pub fn resolve_provider_type(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Option<String> {
+    let trimmed = provider_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    config
+        .provider_instances
+        .get(trimmed)
+        .map(|instance| instance.provider_type.clone())
+        .or_else(|| {
+            provider_registry
+                .get_metadata(trimmed)
+                .map(|meta| meta.provider_type)
+        })
+        .or_else(|| Some(trimmed.to_string()))
+}
+
 /// Get the default model for a specific provider from config.
 pub fn get_default_model_for_provider(
     config: &Config,
@@ -159,6 +188,18 @@ pub fn get_reasoning_effort_for_provider(
     }
 }
 
+/// Get the task summarization model for the current provider from config.
+///
+/// Used for conversation/task summarization and context compression.
+pub fn get_task_summary_model_from_config(config: &Config) -> Result<String, LLMError> {
+    config.get_task_summary_model().ok_or_else(|| {
+        LLMError::Auth(format!(
+            "No task summary model configured for provider '{}'",
+            config.provider
+        ))
+    })
+}
+
 /// Get the memory/background summarization model for the current provider from config.
 ///
 /// Used for lightweight memory tasks like session summarization and reflection.
@@ -183,6 +224,38 @@ pub fn get_vision_model_from_config(config: &Config) -> Result<String, LLMError>
             config.provider
         ))
     })
+}
+
+/// Resolve the task summarization model for conversation/task compression.
+///
+/// Fallback chain:
+/// 1. `defaults.task_summary` (ProviderModelRef, routed via registry)
+/// 2. `defaults.memory_background` / `defaults.fast` / legacy memory background
+/// 3. `defaults.chat` / legacy default model
+pub fn resolve_task_summary_model(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Option<ResolvedModel> {
+    if config.features.provider_model_ref {
+        if let Some(model_ref) = config
+            .defaults
+            .as_ref()
+            .and_then(|d| d.task_summary.as_ref())
+        {
+            if let Ok(provider) =
+                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
+            {
+                return Some(ResolvedModel {
+                    provider,
+                    model_name: model_ref.model.clone(),
+                });
+            }
+        }
+    }
+
+    resolve_background_model(config, provider_name, provider_registry)
+        .or_else(|| resolve_default_chat_model(config, provider_name, provider_registry))
 }
 
 /// Resolve the background/fast summarization model considering both
@@ -688,6 +761,7 @@ mod tests {
         config.defaults = Some(DefaultsConfig {
             chat: ProviderModelRef::new("openai", "gpt-chat"),
             fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
+            task_summary: None,
             vision: None,
             memory_background: None,
             planning: None,
@@ -737,6 +811,7 @@ mod tests {
         config.defaults = Some(DefaultsConfig {
             chat: ProviderModelRef::new("openai", "gpt-chat"),
             fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
+            task_summary: None,
             vision: None,
             memory_background: None,
             planning: None,
@@ -760,6 +835,7 @@ mod tests {
         config.defaults = Some(DefaultsConfig {
             chat: ProviderModelRef::new("openai", "gpt-chat"),
             fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
+            task_summary: None,
             vision: None,
             memory_background: None,
             planning: None,

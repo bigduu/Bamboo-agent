@@ -256,7 +256,7 @@ async fn maybe_apply_host_context_compression_with_budget(
         .filter(|value| !value.is_empty())
     else {
         tracing::warn!(
-            "[{}] {} context compression skipped: no background/fast summarization model configured",
+            "[{}] {} context compression skipped: no summarization/background model configured",
             session_id,
             phase_label,
         );
@@ -289,9 +289,13 @@ async fn maybe_apply_host_context_compression_with_budget(
         .map(String::from)
         .or(base_instructions);
 
-    let bg_provider = config.background_model_provider.as_ref().unwrap_or(llm);
+    let summary_provider = config
+        .summarization_model_provider
+        .as_ref()
+        .or(config.background_model_provider.as_ref())
+        .unwrap_or(llm);
     let summarizer = LlmSummarizer::new(
-        Arc::clone(bg_provider),
+        Arc::clone(summary_provider),
         summary_model.to_string(),
         existing_summary.clone(),
         task_list_prompt,
@@ -340,7 +344,7 @@ async fn maybe_apply_host_context_compression_with_budget(
         0.0
     };
     plan.compression_ratio = compression_ratio;
-    plan.model_used = config.background_model_name.clone();
+    plan.model_used = Some(summary_model.to_string());
     plan.latency_ms = latency_ms;
 
     let compressed_count = apply_compression_plan(session, plan.clone());

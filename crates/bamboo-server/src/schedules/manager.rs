@@ -4,10 +4,16 @@
 //! provides [`build_schedule_context`] to construct a `ScheduleContext`
 //! with server-specific Config resolution baked in.
 
-use crate::model_config_helper::get_schedule_model_from_config;
+use std::sync::Arc;
+
+use crate::model_config_helper::{
+    get_schedule_model_from_config, resolve_background_model, resolve_fast_model,
+    resolve_provider_type, resolve_task_summary_model,
+};
 pub use crate::schedule_app::{
     ResolvedRunConfig, ScheduleContext, ScheduleManager, ScheduleRunJob,
 };
+use bamboo_infrastructure::ProviderRegistry;
 
 /// Build a [`ScheduleContext`] with server-specific config resolution.
 ///
@@ -17,6 +23,7 @@ pub use crate::schedule_app::{
 pub fn build_schedule_context(
     base: ScheduleContext,
     config: std::sync::Arc<tokio::sync::RwLock<bamboo_infrastructure::Config>>,
+    provider_registry: Arc<ProviderRegistry>,
 ) -> ScheduleContext {
     ScheduleContext {
         schedule_store: base.schedule_store,
@@ -29,7 +36,7 @@ pub fn build_schedule_context(
         trigger_engine: base.trigger_engine,
         persistence: base.persistence,
         resolve_run_config: std::sync::Arc::new(move |job: &ScheduleRunJob| {
-            resolve_run_config_from_config(job, &config)
+            resolve_run_config_from_config(job, &config, &provider_registry)
         }),
     }
 }
@@ -37,6 +44,7 @@ pub fn build_schedule_context(
 fn resolve_run_config_from_config(
     job: &ScheduleRunJob,
     config: &std::sync::Arc<tokio::sync::RwLock<bamboo_infrastructure::Config>>,
+    provider_registry: &Arc<ProviderRegistry>,
 ) -> ResolvedRunConfig {
     let config_snapshot = config.try_read().map(|g| g.clone()).unwrap_or_default();
 
@@ -53,6 +61,30 @@ fn resolve_run_config_from_config(
     } else {
         get_schedule_model_from_config(&config_snapshot).unwrap_or_default()
     };
+
+    let provider_name = Some(config_snapshot.effective_default_provider().to_string());
+    let provider_type = provider_name
+        .as_deref()
+        .and_then(|name| resolve_provider_type(&config_snapshot, name, provider_registry));
+
+    let capability_provider_name = provider_name
+        .as_deref()
+        .unwrap_or(config_snapshot.effective_default_provider());
+    let resolved_fast = resolve_fast_model(
+        &config_snapshot,
+        capability_provider_name,
+        provider_registry,
+    );
+    let resolved_background = resolve_background_model(
+        &config_snapshot,
+        capability_provider_name,
+        provider_registry,
+    );
+    let resolved_summarization = resolve_task_summary_model(
+        &config_snapshot,
+        capability_provider_name,
+        provider_registry,
+    );
 
     let requested_reasoning_effort = job.run_config.reasoning_effort;
     let reasoning_effort = requested_reasoning_effort.or(config_snapshot.get_reasoning_effort());
@@ -95,6 +127,16 @@ fn resolve_run_config_from_config(
 
     ResolvedRunConfig {
         model,
+        provider_name,
+        provider_type,
+        fast_model: resolved_fast.as_ref().map(|m| m.model_name.clone()),
+        fast_model_provider: resolved_fast.map(|m| m.provider),
+        background_model: resolved_background.as_ref().map(|m| m.model_name.clone()),
+        background_model_provider: resolved_background.map(|m| m.provider),
+        summarization_model: resolved_summarization
+            .as_ref()
+            .map(|m| m.model_name.clone()),
+        summarization_model_provider: resolved_summarization.map(|m| m.provider),
         reasoning_effort,
         system_prompt,
         base_system_prompt: base_system_prompt.to_string(),
@@ -107,7 +149,9 @@ mod tests {
     use super::resolve_run_config_from_config;
     use crate::schedule_app::ScheduleRunJob;
     use bamboo_domain::{ProviderModelRef, ScheduleRunConfig};
-    use bamboo_infrastructure::{Config, DefaultsConfig, OpenAIConfig, ProviderConfigs};
+    use bamboo_infrastructure::{
+        Config, DefaultsConfig, OpenAIConfig, ProviderConfigs, ProviderRegistry,
+    };
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -151,7 +195,12 @@ mod tests {
             ..Config::default()
         };
 
-        let resolved = resolve_run_config_from_config(&test_job(), &Arc::new(RwLock::new(config)));
+        let registry = Arc::new(ProviderRegistry::new(
+            Default::default(),
+            "openai".to_string(),
+        ));
+        let resolved =
+            resolve_run_config_from_config(&test_job(), &Arc::new(RwLock::new(config)), &registry);
         assert_eq!(resolved.model, "gpt-4o-mini");
     }
 
@@ -162,6 +211,7 @@ mod tests {
             defaults: Some(DefaultsConfig {
                 chat: ProviderModelRef::new("openai", "gpt-chat"),
                 fast: None,
+                task_summary: None,
                 vision: None,
                 memory_background: None,
                 planning: None,
@@ -178,7 +228,12 @@ mod tests {
             ..Config::default()
         };
 
-        let resolved = resolve_run_config_from_config(&test_job(), &Arc::new(RwLock::new(config)));
+        let registry = Arc::new(ProviderRegistry::new(
+            Default::default(),
+            "openai".to_string(),
+        ));
+        let resolved =
+            resolve_run_config_from_config(&test_job(), &Arc::new(RwLock::new(config)), &registry);
         assert_eq!(resolved.model, "gpt-chat");
     }
 }

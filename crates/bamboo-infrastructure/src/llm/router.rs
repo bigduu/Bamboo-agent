@@ -27,6 +27,23 @@ impl ProviderModelRouter {
             ))
         })
     }
+
+    /// Resolve the canonical provider type for a given model reference.
+    ///
+    /// In multi-instance mode `target.provider` may be an instance id, so this
+    /// consults registry metadata first and falls back to the raw provider key
+    /// for backward compatibility.
+    pub fn provider_type_for(&self, target: &ProviderModelRef) -> Option<String> {
+        let provider = target.provider.trim();
+        if provider.is_empty() {
+            return None;
+        }
+
+        self.registry
+            .get_metadata(provider)
+            .map(|meta| meta.provider_type)
+            .or_else(|| Some(provider.to_string()))
+    }
 }
 
 #[cfg(test)]

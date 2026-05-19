@@ -25,6 +25,36 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
         }
     }
 
+    if let Some(provider_instances) = root
+        .get_mut("provider_instances")
+        .and_then(|v| v.as_object_mut())
+    {
+        for (instance_id, instance_cfg) in provider_instances.iter_mut() {
+            let Some(instance_obj) = instance_cfg.as_object_mut() else {
+                continue;
+            };
+
+            instance_obj.remove("api_key_encrypted");
+
+            let is_configured = config
+                .provider_instances
+                .get(instance_id)
+                .map(|instance| {
+                    !instance.api_key.trim().is_empty() || instance.api_key_encrypted.is_some()
+                })
+                .unwrap_or(false);
+
+            if is_configured {
+                instance_obj.insert(
+                    "api_key".to_string(),
+                    Value::String("****...****".to_string()),
+                );
+            } else {
+                instance_obj.remove("api_key");
+            }
+        }
+    }
+
     mcp::redact_mcp_for_api(root, config);
 
     if let Some(access_control) = root

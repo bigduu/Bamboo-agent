@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use actix_web::{web, HttpResponse};
 use serde_json::Value;
 
@@ -8,7 +6,7 @@ use crate::{
     app_state::{AppState, ConfigUpdateEffects},
     error::AppError,
 };
-use bamboo_infrastructure::Config;
+use bamboo_infrastructure::{patch::ProviderApiKeyIntents, Config};
 
 use super::super::types::UpdateProviderRequest;
 
@@ -69,13 +67,23 @@ fn build_provider_patch(payload: &UpdateProviderRequest) -> serde_json::Map<Stri
             serde_json::to_value(defaults).expect("DefaultsConfig should serialize"),
         );
     }
+    let mut features_patch = serde_json::Map::new();
+    if let Some(enabled) = payload.features.provider_model_ref {
+        features_patch.insert("provider_model_ref".to_string(), Value::Bool(enabled));
+    }
+    if let Some(enabled) = payload.features.dynamic_model_routing {
+        features_patch.insert("dynamic_model_routing".to_string(), Value::Bool(enabled));
+    }
+    if !features_patch.is_empty() {
+        patch_obj.insert("features".to_string(), Value::Object(features_patch));
+    }
     patch_obj
 }
 
 fn apply_provider_patch(
     current: &Config,
     mut patch_obj: serde_json::Map<String, Value>,
-    api_key_intents: &BTreeSet<String>,
+    api_key_intents: &ProviderApiKeyIntents,
 ) -> Result<Config, AppError> {
     config_manager::preserve_masked_provider_api_keys(&mut patch_obj, current);
     let mut new_config = config_manager::build_merged_config(current, patch_obj)?;
@@ -110,6 +118,7 @@ mod tests {
             provider: "openai".to_string(),
             providers: serde_json::json!({"openai":{"model":"gpt-4.1"}}),
             defaults: None,
+            features: Default::default(),
         };
 
         let patch = build_provider_patch(&request);
@@ -135,6 +144,10 @@ mod tests {
                     provider: "openai".to_string(),
                     model: "qwen3.6-plus".to_string(),
                 }),
+                task_summary: Some(bamboo_domain::ProviderModelRef {
+                    provider: "anthropic".to_string(),
+                    model: "claude-3-7-sonnet".to_string(),
+                }),
                 vision: None,
                 memory_background: None,
                 planning: None,
@@ -143,6 +156,7 @@ mod tests {
                 sub_agent: None,
                 subagent_models: std::collections::HashMap::new(),
             }),
+            features: Default::default(),
         };
 
         let patch = build_provider_patch(&request);
@@ -150,8 +164,28 @@ mod tests {
             patch.get("defaults"),
             Some(&serde_json::json!({
                 "chat": {"provider":"copilot", "model":"gpt-5.5"},
-                "fast": {"provider":"openai", "model":"qwen3.6-plus"}
+                "fast": {"provider":"openai", "model":"qwen3.6-plus"},
+                "task_summary": {"provider":"anthropic", "model":"claude-3-7-sonnet"}
             }))
+        );
+    }
+
+    #[test]
+    fn build_provider_patch_includes_feature_flags_patch() {
+        let request = UpdateProviderRequest {
+            provider: "openai".to_string(),
+            providers: serde_json::json!({}),
+            defaults: None,
+            features: crate::handlers::settings::provider::types::UpdateFeatureFlagsRequest {
+                provider_model_ref: Some(true),
+                dynamic_model_routing: None,
+            },
+        };
+
+        let patch = build_provider_patch(&request);
+        assert_eq!(
+            patch.get("features"),
+            Some(&serde_json::json!({"provider_model_ref": true}))
         );
     }
 }

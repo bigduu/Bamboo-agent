@@ -52,11 +52,15 @@ impl WebFetchTool {
                     || ipv4.is_unspecified()
             }
             IpAddr::V6(ipv6) => {
+                let segments = ipv6.segments();
+                let first = segments[0];
+                let is_unique_local = (first & 0xfe00) == 0xfc00;
+                let is_unicast_link_local = (first & 0xffc0) == 0xfe80;
                 ipv6.is_loopback()
                     || ipv6.is_multicast()
                     || ipv6.is_unspecified()
-                    || ipv6.is_unique_local()
-                    || ipv6.is_unicast_link_local()
+                    || is_unique_local
+                    || is_unicast_link_local
             }
         }
     }

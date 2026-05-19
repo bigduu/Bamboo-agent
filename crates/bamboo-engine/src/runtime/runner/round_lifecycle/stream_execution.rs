@@ -31,8 +31,8 @@ fn continuation_messages(messages: &[Message]) -> Option<&[Message]> {
     (!continuation.is_empty()).then_some(continuation)
 }
 
-fn provider_supports_previous_response_id(provider_name: Option<&str>) -> bool {
-    !matches!(provider_name.map(str::trim), Some("copilot"))
+fn provider_supports_previous_response_id(provider_type: Option<&str>) -> bool {
+    !matches!(provider_type.map(str::trim), Some("copilot"))
 }
 
 fn format_reqwest_transport_error(error: &reqwest::Error) -> String {
@@ -143,11 +143,12 @@ pub(super) async fn execute_llm_stream(
     max_output_tokens: u32,
     model: &str,
     provider_name: Option<&str>,
+    provider_type: Option<&str>,
     reasoning_effort: Option<ReasoningEffort>,
     session_id: &str,
 ) -> Result<(crate::runtime::stream::handler::StreamHandlingOutput, u128), AgentError> {
     let llm_started_at = std::time::Instant::now();
-    let supports_previous_response_id = provider_supports_previous_response_id(provider_name);
+    let supports_previous_response_id = provider_supports_previous_response_id(provider_type);
     let previous_response_id = if supports_previous_response_id {
         session_previous_response_id(session)
     } else {

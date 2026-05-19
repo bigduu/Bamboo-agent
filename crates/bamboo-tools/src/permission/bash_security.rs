@@ -4,7 +4,7 @@
 //! semantic-level security analysis. Detects eval-like builtins,
 //! dangerous node types, and command substitution patterns.
 
-use std::sync::LazyLock;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 // ---- Constants ----
@@ -95,13 +95,17 @@ const MAX_NODE_COUNT: usize = 50_000;
 
 // ---- Static parser ----
 
-static PARSER: LazyLock<std::sync::Mutex<tree_sitter::Parser>> = LazyLock::new(|| {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_bash::LANGUAGE.into())
-        .expect("failed to set bash language");
-    std::sync::Mutex::new(parser)
-});
+static PARSER: OnceLock<std::sync::Mutex<tree_sitter::Parser>> = OnceLock::new();
+
+fn parser() -> &'static std::sync::Mutex<tree_sitter::Parser> {
+    PARSER.get_or_init(|| {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_bash::LANGUAGE.into())
+            .expect("failed to set bash language");
+        std::sync::Mutex::new(parser)
+    })
+}
 
 // ---- Analysis result ----
 
@@ -219,7 +223,7 @@ pub fn analyze_command(command: &str) -> BashSecurityAnalysis {
 
     // Phase 2: Parse with tree-sitter
     let tree = {
-        let mut parser = match PARSER.lock() {
+        let mut parser = match parser().lock() {
             Ok(p) => p,
             Err(_) => {
                 warnings.push(BashWarning {

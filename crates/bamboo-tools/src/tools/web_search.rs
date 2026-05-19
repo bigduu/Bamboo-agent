@@ -5,7 +5,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
@@ -29,8 +29,11 @@ struct CachedSearch {
     expires_at: Instant,
 }
 
-static SEARCH_CACHE: LazyLock<RwLock<HashMap<String, CachedSearch>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+static SEARCH_CACHE: OnceLock<RwLock<HashMap<String, CachedSearch>>> = OnceLock::new();
+
+fn search_cache() -> &'static RwLock<HashMap<String, CachedSearch>> {
+    SEARCH_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
 
 pub struct WebSearchTool;
 
@@ -57,7 +60,7 @@ impl WebSearchTool {
     }
 
     fn try_cache(key: &str) -> Option<serde_json::Value> {
-        let cache = SEARCH_CACHE.read();
+        let cache = search_cache().read();
         let entry = cache.get(key)?;
         if entry.expires_at > Instant::now() {
             Some(entry.results.clone())
@@ -67,7 +70,7 @@ impl WebSearchTool {
     }
 
     fn put_cache(key: String, results: serde_json::Value) {
-        let mut cache = SEARCH_CACHE.write();
+        let mut cache = search_cache().write();
         cache.insert(
             key,
             CachedSearch {

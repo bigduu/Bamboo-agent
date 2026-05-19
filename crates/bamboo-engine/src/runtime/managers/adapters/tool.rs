@@ -59,8 +59,14 @@ impl ToolManager for DefaultToolManager {
             config,
             task_context,
             &self.llm,
-            config.background_model_name.as_deref(),
-            config.background_model_provider.as_ref(),
+            config
+                .summarization_model_name
+                .as_deref()
+                .or(config.background_model_name.as_deref()),
+            config
+                .summarization_model_provider
+                .as_ref()
+                .or(config.background_model_provider.as_ref()),
             tool_schemas,
         )
         .await?;

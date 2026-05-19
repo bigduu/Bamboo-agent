@@ -6,7 +6,9 @@
 //! `AppStateResumeRef` is a newtype wrapper around `Data<AppState>` to satisfy
 //! Rust's orphan rules (can't impl a foreign trait on a foreign type).
 
-use crate::model_config_helper::get_memory_background_model_for_provider;
+use crate::model_config_helper::{
+    resolve_background_model, resolve_fast_model, resolve_provider_type, resolve_task_summary_model,
+};
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
 use async_trait::async_trait;
@@ -67,13 +69,49 @@ impl ResumeExecutionPort for AppStateResumeRef {
         let resolved_provider_name = session_effective_model_ref(&session)
             .map(|model_ref| model_ref.provider)
             .unwrap_or(config.provider_name);
-        let resolved_bg_provider = config.background_model_provider.clone();
-        let resolved_fast_model = if let Some(fast_model) = config.fast_model {
-            Some(fast_model)
-        } else {
-            let config_snapshot = self.0.config.read().await.clone();
-            get_memory_background_model_for_provider(&config_snapshot, &resolved_provider_name)
-        };
+        let config_snapshot = self.0.config.read().await.clone();
+        let resolved_provider_type = resolve_provider_type(
+            &config_snapshot,
+            &resolved_provider_name,
+            &self.0.provider_registry,
+        );
+        let resolved_fast = resolve_fast_model(
+            &config_snapshot,
+            &resolved_provider_name,
+            &self.0.provider_registry,
+        );
+        let resolved_background = resolve_background_model(
+            &config_snapshot,
+            &resolved_provider_name,
+            &self.0.provider_registry,
+        );
+        let resolved_summarization = resolve_task_summary_model(
+            &config_snapshot,
+            &resolved_provider_name,
+            &self.0.provider_registry,
+        );
+        let resolved_fast_model = config
+            .fast_model
+            .clone()
+            .or_else(|| resolved_fast.as_ref().map(|m| m.model_name.clone()));
+        let resolved_fast_provider = resolved_fast.map(|m| m.provider);
+        let resolved_background_model = config
+            .background_model
+            .clone()
+            .or_else(|| resolved_background.as_ref().map(|m| m.model_name.clone()));
+        let resolved_bg_provider = config
+            .background_model_provider
+            .clone()
+            .or_else(|| resolved_background.map(|m| m.provider));
+        let resolved_summarization_model = config.summarization_model.clone().or_else(|| {
+            resolved_summarization
+                .as_ref()
+                .map(|m| m.model_name.clone())
+        });
+        let resolved_summarization_provider = config
+            .summarization_model_provider
+            .clone()
+            .or_else(|| resolved_summarization.map(|m| m.provider));
         let is_child_session = session.kind == bamboo_agent_core::SessionKind::Child;
         let reasoning_effort = session.reasoning_effort;
         let reasoning_effort_source = session
@@ -95,10 +133,15 @@ impl ResumeExecutionPort for AppStateResumeRef {
             session,
             is_child_session,
             provider_name: resolved_provider_name,
+            provider_type: resolved_provider_type,
             provider_override: None,
             model,
             fast_model: resolved_fast_model,
+            fast_model_provider: resolved_fast_provider,
+            background_model: resolved_background_model,
             background_model_provider: resolved_bg_provider,
+            summarization_model: resolved_summarization_model,
+            summarization_model_provider: resolved_summarization_provider,
             reasoning_effort,
             reasoning_effort_source,
             disabled_tools: config.disabled_tools,

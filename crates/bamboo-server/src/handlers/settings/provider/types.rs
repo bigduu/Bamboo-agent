@@ -16,6 +16,14 @@ pub(super) struct ProviderConfigResponse {
     pub(super) features: bamboo_infrastructure::FeatureFlags,
 }
 
+#[derive(Deserialize, Default)]
+pub struct UpdateFeatureFlagsRequest {
+    #[serde(default)]
+    pub provider_model_ref: Option<bool>,
+    #[serde(default)]
+    pub dynamic_model_routing: Option<bool>,
+}
+
 /// Request body for updating provider configuration.
 #[derive(Deserialize)]
 pub struct UpdateProviderRequest {
@@ -27,6 +35,9 @@ pub struct UpdateProviderRequest {
     /// Default model assignments for specific capabilities.
     #[serde(default)]
     pub defaults: Option<bamboo_infrastructure::DefaultsConfig>,
+    /// Optional feature-flag patch to merge into config.features.
+    #[serde(default)]
+    pub features: UpdateFeatureFlagsRequest,
 }
 
 #[cfg(test)]
@@ -70,6 +81,7 @@ mod tests {
                 model: "gpt-4o".to_string(),
             },
             fast: None,
+            task_summary: None,
             vision: None,
             memory_background: None,
             planning: None,
@@ -98,6 +110,7 @@ mod tests {
         assert_eq!(req.provider, "anthropic");
         assert!(req.providers["anthropic"]["api_key"].is_string());
         assert!(req.defaults.is_none());
+        assert!(req.features.provider_model_ref.is_none());
     }
 
     #[test]
@@ -132,5 +145,17 @@ mod tests {
             req.defaults.as_ref().map(|defaults| &defaults.chat.model),
             Some(&"gpt-5.5".to_string())
         );
+    }
+
+    #[test]
+    fn test_update_provider_request_with_features_patch() {
+        let json = r#"{
+            "provider":"openai",
+            "features":{"provider_model_ref":true}
+        }"#;
+        let req: UpdateProviderRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.provider, "openai");
+        assert_eq!(req.features.provider_model_ref, Some(true));
+        assert_eq!(req.features.dynamic_model_routing, None);
     }
 }

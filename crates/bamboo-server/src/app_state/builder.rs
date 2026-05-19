@@ -51,21 +51,41 @@ impl AppState {
         // Load config from the specified data directory
         let config = Config::from_data_dir(Some(bamboo_home_dir.clone()));
 
-        // Create provider with direct access (no HTTP proxy)
-        let provider =
-            match bamboo_infrastructure::create_provider_with_dir(&config, bamboo_home_dir.clone())
-                .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    // Keep the server usable for configuration/UI even when provider init fails,
-                    // but do not silently fall back to a different provider.
-                    tracing::error!("Failed to create provider: {}.", e);
-                    Arc::new(UnconfiguredProvider {
-                        message: e.to_string(),
-                    })
-                }
+        let provider_registry = match bamboo_infrastructure::ProviderRegistry::from_config(
+            &config,
+            bamboo_home_dir.clone(),
+        )
+        .await
+        {
+            Ok(registry) => Arc::new(registry),
+            Err(e) => {
+                tracing::error!("Failed to create provider registry: {}", e);
+                Arc::new(
+                    bamboo_infrastructure::ProviderRegistry::from_config(
+                        &Config::default(),
+                        bamboo_home_dir.clone(),
+                    )
+                    .await
+                    .expect("Cannot create even an empty provider registry"),
+                )
+            }
+        };
+
+        let provider = provider_registry.get_default().unwrap_or_else(|| {
+            let default_provider_name = provider_registry.default_provider_name();
+            let message = if config.has_provider_instances() {
+                format!(
+                    "Default provider instance '{}' is not available or failed to initialize",
+                    default_provider_name
+                )
+            } else {
+                format!(
+                    "Provider '{}' is not available or failed to initialize",
+                    config.provider
+                )
             };
+            Arc::new(UnconfiguredProvider { message }) as Arc<dyn LLMProvider>
+        });
 
         Self::new_with_provider(bamboo_home_dir, config, provider).await
     }
@@ -265,6 +285,7 @@ impl AppState {
             session_event_senders.clone(),
             persistence.clone(),
             config.clone(),
+            provider_registry.clone(),
             Some(data_dir.clone()),
         );
 

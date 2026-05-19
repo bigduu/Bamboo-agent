@@ -192,6 +192,27 @@ fn bamboo_v1_scope() -> impl HttpServiceFactory {
             "/bamboo/provider-catalog/fetch-models",
             web::post().to(settings::fetch_catalog_models),
         )
+        // ── Provider Instance CRUD ────────────────────────────────────
+        .route(
+            "/bamboo/settings/provider-instances",
+            web::get().to(settings::list_provider_instances),
+        )
+        .route(
+            "/bamboo/settings/provider-instances",
+            web::post().to(settings::create_provider_instance),
+        )
+        .route(
+            "/bamboo/settings/provider-instances/{instance_id}",
+            web::put().to(settings::update_provider_instance),
+        )
+        .route(
+            "/bamboo/settings/provider-instances/{instance_id}",
+            web::delete().to(settings::delete_provider_instance),
+        )
+        .route(
+            "/bamboo/settings/provider-instances/default",
+            web::post().to(settings::set_default_provider_instance),
+        )
 }
 
 /// Configure Bamboo internal `/v1/*` routes.

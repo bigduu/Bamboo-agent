@@ -154,6 +154,14 @@ fn build_manager(
                 .unwrap_or_else(|| "test-model".to_string());
         ResolvedRunConfig {
             model,
+            provider_name: None,
+            provider_type: None,
+            fast_model: None,
+            fast_model_provider: None,
+            background_model: None,
+            background_model_provider: None,
+            summarization_model: None,
+            summarization_model_provider: None,
             reasoning_effort: None,
             system_prompt: String::new(),
             base_system_prompt: String::new(),

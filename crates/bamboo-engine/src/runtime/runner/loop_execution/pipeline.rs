@@ -405,8 +405,13 @@ async fn handle_tool_calls_path(
         config,
         task_context,
         &llm,
-        compression_model.as_deref(),
-        config.background_model_provider.as_ref(),
+        compression_model
+            .as_deref()
+            .or(config.background_model_name.as_deref()),
+        config
+            .summarization_model_provider
+            .as_ref()
+            .or(config.background_model_provider.as_ref()),
         &tool_schemas,
     )
     .await?;
@@ -482,7 +487,7 @@ async fn handle_tool_calls_path(
             .as_deref()
             .or(config.model_name.as_deref());
         let _classifier_provider = config
-            .background_model_provider
+            .fast_model_provider
             .clone()
             .unwrap_or_else(|| llm.clone());
 
@@ -556,7 +561,7 @@ pub(super) async fn run_pipeline(
         if state.task_evaluation.in_flight.is_none() {
             if let Some(request) = state.task_evaluation.queued_request.take() {
                 let eval_provider = config
-                    .background_model_provider
+                    .fast_model_provider
                     .clone()
                     .unwrap_or_else(|| llm.clone());
                 spawn_task_evaluation_request(state, event_tx, request, eval_provider);
@@ -570,7 +575,10 @@ pub(super) async fn run_pipeline(
 
         // --- Prompt context refresh ---
         let runtime_context = PromptMemoryRuntimeContext {
-            llm: llm.clone(),
+            llm: config
+                .background_model_provider
+                .clone()
+                .unwrap_or_else(|| llm.clone()),
             background_model_name: config.background_model_name.clone(),
         };
         crate::runtime::runner::round_prelude::refresh_round_prompt_context(
@@ -955,7 +963,7 @@ pub(super) async fn run_pipeline(
             config,
             state,
             config
-                .background_model_provider
+                .fast_model_provider
                 .clone()
                 .unwrap_or_else(|| llm.clone()),
         ) {

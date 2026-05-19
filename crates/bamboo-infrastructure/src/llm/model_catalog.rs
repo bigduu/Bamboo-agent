@@ -24,22 +24,22 @@ impl ModelCatalogService {
         let mut providers = Vec::new();
         let mut models = Vec::new();
 
-        for name in self.registry.provider_names() {
+        for meta in self.registry.provider_metadata() {
             providers.push(ProviderDescriptor {
-                id: name.clone(),
-                display_name: display_name_for_provider(&name),
+                id: meta.id.clone(),
+                display_name: meta.display_name.clone(),
                 enabled: true,
-                authenticated: self.registry.get(&name).is_some(),
+                authenticated: self.registry.get(&meta.id).is_some(),
             });
 
-            if let Some(provider) = self.registry.get(&name) {
+            if let Some(provider) = self.registry.get(&meta.id) {
                 match provider.list_model_info().await {
                     Ok(info_list) => {
                         for info in info_list {
                             models.push(ProviderModelDescriptor {
-                                reference: ProviderModelRef::new(&name, &info.id),
+                                reference: ProviderModelRef::new(&meta.id, &info.id),
                                 display_name: info.id.clone(),
-                                provider_display_name: display_name_for_provider(&name),
+                                provider_display_name: meta.display_name.clone(),
                                 capabilities: ModelCapabilities::default(),
                                 source: Some(ModelSource::Upstream),
                                 discovered_at: None,
@@ -47,7 +47,7 @@ impl ModelCatalogService {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(provider = &name, error = %e, "Failed to list models");
+                        tracing::warn!(provider = &meta.id, error = %e, "Failed to list models");
                     }
                 }
             }
@@ -69,6 +69,11 @@ impl ModelCatalogService {
             .registry
             .get(provider_name)
             .ok_or_else(|| format!("Provider '{}' not found", provider_name))?;
+        let provider_display_name = self
+            .registry
+            .get_metadata(provider_name)
+            .map(|meta| meta.display_name)
+            .unwrap_or_else(|| display_name_for_provider(provider_name));
 
         let info_list = provider
             .list_model_info()
@@ -80,7 +85,7 @@ impl ModelCatalogService {
             .map(|info| ProviderModelDescriptor {
                 reference: ProviderModelRef::new(provider_name, &info.id),
                 display_name: info.id.clone(),
-                provider_display_name: display_name_for_provider(provider_name),
+                provider_display_name: provider_display_name.clone(),
                 capabilities: ModelCapabilities::default(),
                 source: Some(ModelSource::Upstream),
                 discovered_at: None,

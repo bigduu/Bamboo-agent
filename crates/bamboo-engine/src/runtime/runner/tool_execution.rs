@@ -310,7 +310,7 @@ async fn maybe_apply_mid_turn_context_compression_after_tool(
     event_tx: &mpsc::Sender<AgentEvent>,
     session_id: &str,
     model_name: Option<&str>,
-    _background_model_provider: Option<&Arc<dyn LLMProvider>>,
+    _compression_model_provider: Option<&Arc<dyn LLMProvider>>,
     tool_schemas: &[ToolSchema],
 ) -> Result<(), AgentError> {
     let Some(model_name) = model_name else {
@@ -351,7 +351,7 @@ pub(crate) async fn execute_round_tool_calls(
     task_context: &mut Option<TaskLoopContext>,
     llm: &Arc<dyn LLMProvider>,
     compression_model_name: Option<&str>,
-    background_model_provider: Option<&Arc<dyn LLMProvider>>,
+    compression_model_provider: Option<&Arc<dyn LLMProvider>>,
     tool_schemas: &[ToolSchema],
 ) -> Result<RoundToolExecutionResult, AgentError> {
     let mut state = RoundExecutionState::default();
@@ -411,7 +411,7 @@ pub(crate) async fn execute_round_tool_calls(
                         event_tx,
                         session_id,
                         compression_model_name,
-                        background_model_provider,
+                        compression_model_provider,
                         tool_schemas,
                     )
                     .await?;
@@ -449,7 +449,7 @@ pub(crate) async fn execute_round_tool_calls(
                     event_tx,
                     session_id,
                     compression_model_name,
-                    background_model_provider,
+                    compression_model_provider,
                     tool_schemas,
                 )
                 .await?;
@@ -606,7 +606,7 @@ pub(crate) async fn execute_round_tool_calls(
                     event_tx,
                     session_id,
                     compression_model_name,
-                    background_model_provider,
+                    compression_model_provider,
                     tool_schemas,
                 )
                 .await?;
@@ -645,7 +645,7 @@ pub(crate) async fn execute_round_tool_calls(
             event_tx,
             session_id,
             compression_model_name,
-            background_model_provider,
+            compression_model_provider,
             tool_schemas,
         )
         .await?;
