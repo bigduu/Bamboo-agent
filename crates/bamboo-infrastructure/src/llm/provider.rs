@@ -73,6 +73,14 @@ impl ProviderModelInfo {
 pub struct ResponsesRequestOptions {
     /// Optional top-level instructions for Responses API requests.
     pub instructions: Option<String>,
+    /// Optional message list to serialize into the Responses API `input` array.
+    ///
+    /// When omitted, providers fall back to the generic `messages` slice passed
+    /// to `chat_stream_with_options`. This lets the engine provide a
+    /// Responses-specific input view (for example, without a duplicated stable
+    /// system message) while preserving backward compatibility for non-Responses
+    /// callers and providers.
+    pub input_messages: Option<Vec<Message>>,
     /// Optional reasoning summary control for Responses API requests
     /// (e.g. "auto", "concise", "detailed").
     pub reasoning_summary: Option<String>,

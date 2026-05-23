@@ -193,6 +193,66 @@ pub fn tools_to_responses_json(tools: &[ToolSchema]) -> Vec<Value> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponsesInputSource {
+    Explicit,
+    Generic,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ResponsesInputSelection<'a> {
+    pub input_messages: &'a [Message],
+    pub source: ResponsesInputSource,
+    pub fallback_removed_duplicate_system: bool,
+    pub original_len: usize,
+    pub effective_len: usize,
+}
+
+pub fn select_responses_input_messages<'a>(
+    messages: &'a [Message],
+    responses_options: Option<&'a ResponsesRequestOptions>,
+) -> ResponsesInputSelection<'a> {
+    let instructions = responses_options
+        .and_then(|opts| opts.instructions.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (response_input_messages, source) = match responses_options
+        .and_then(|opts| opts.input_messages.as_deref())
+    {
+        Some(input_messages) => (input_messages, ResponsesInputSource::Explicit),
+        None => (messages, ResponsesInputSource::Generic),
+    };
+
+    let mut effective_messages = response_input_messages;
+    let mut fallback_removed_duplicate_system = false;
+    if let Some(instructions) = instructions {
+        if matches!(source, ResponsesInputSource::Generic) {
+            if let Some(first) = response_input_messages.first() {
+                if matches!(first.role, Role::System) && first.content.trim() == instructions {
+                    tracing::info!(
+                        input_source = match source {
+                            ResponsesInputSource::Explicit => "explicit",
+                            ResponsesInputSource::Generic => "generic",
+                        },
+                        original_len = response_input_messages.len(),
+                        "Responses input fallback removed duplicated leading system message matching top-level instructions"
+                    );
+                    effective_messages = &response_input_messages[1..];
+                    fallback_removed_duplicate_system = true;
+                }
+            }
+        }
+    }
+
+    ResponsesInputSelection {
+        input_messages: effective_messages,
+        source,
+        fallback_removed_duplicate_system,
+        original_len: response_input_messages.len(),
+        effective_len: effective_messages.len(),
+    }
+}
+
 /// Build a standard Responses API streaming request body.
 pub fn build_responses_body(
     model: &str,
@@ -203,17 +263,20 @@ pub fn build_responses_body(
     responses_options: Option<&ResponsesRequestOptions>,
     parallel_tool_calls: Option<bool>,
 ) -> Value {
+    let instructions = responses_options
+        .and_then(|opts| opts.instructions.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let input_selection = select_responses_input_messages(messages, responses_options);
+    let effective_messages = input_selection.input_messages;
+
     let mut body = json!({
         "model": model,
-        "input": messages_to_responses_input_json(messages),
+        "input": messages_to_responses_input_json(effective_messages),
         "stream": true,
     });
 
-    if let Some(instructions) = responses_options
-        .and_then(|opts| opts.instructions.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(instructions) = instructions {
         body["instructions"] = json!(instructions);
     }
 
@@ -1260,6 +1323,7 @@ mod tests {
             Some(ReasoningEffort::High),
             Some(&ResponsesRequestOptions {
                 instructions: Some("You are helpful".to_string()),
+                input_messages: None,
                 reasoning_summary: Some("detailed".to_string()),
                 include: Some(vec!["reasoning.encrypted_content".to_string()]),
                 store: Some(true),
@@ -1286,6 +1350,196 @@ mod tests {
     fn build_responses_body_with_parallel_tool_calls() {
         let body = build_responses_body("gpt-5.4", &[], &[], None, None, None, Some(false));
         assert_eq!(body["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn build_responses_body_deduplicates_matching_leading_system_message() {
+        let messages = vec![
+            Message::system("Stable instructions"),
+            Message::user("Current task snapshot"),
+        ];
+        let body = build_responses_body(
+            "gpt-5.4",
+            &messages,
+            &[],
+            None,
+            None,
+            Some(&ResponsesRequestOptions {
+                instructions: Some("Stable instructions".to_string()),
+                ..Default::default()
+            }),
+            None,
+        );
+
+        assert_eq!(body["instructions"], "Stable instructions");
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "Current task snapshot");
+    }
+
+    #[test]
+    fn build_responses_body_prefers_explicit_input_messages_over_generic_messages() {
+        let generic_messages = vec![
+            Message::system("Stable instructions"),
+            Message::user("Generic conversation"),
+        ];
+        let explicit_input_messages = vec![Message::user("Responses-specific input")];
+
+        let body = build_responses_body(
+            "gpt-5.4",
+            &generic_messages,
+            &[],
+            None,
+            None,
+            Some(&ResponsesRequestOptions {
+                instructions: Some("Stable instructions".to_string()),
+                input_messages: Some(explicit_input_messages),
+                ..Default::default()
+            }),
+            None,
+        );
+
+        assert_eq!(body["instructions"], "Stable instructions");
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "Responses-specific input");
+    }
+
+    #[test]
+    fn build_responses_body_continuation_keeps_explicit_input_messages_with_previous_response_id() {
+        let generic_messages = vec![
+            Message::system("Stable instructions"),
+            Message::user("Generic conversation should not become responses input"),
+        ];
+        let explicit_input_messages = vec![
+            Message::user("Dynamic context block"),
+            Message::user("Latest continuation turn"),
+        ];
+
+        let body = build_responses_body(
+            "gpt-5.4",
+            &generic_messages,
+            &[],
+            None,
+            None,
+            Some(&ResponsesRequestOptions {
+                instructions: Some("Stable instructions".to_string()),
+                input_messages: Some(explicit_input_messages),
+                previous_response_id: Some("resp_123".to_string()),
+                ..Default::default()
+            }),
+            None,
+        );
+
+        assert_eq!(body["instructions"], "Stable instructions");
+        assert_eq!(body["previous_response_id"], "resp_123");
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "Dynamic context block");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"], "Latest continuation turn");
+        assert!(input.iter().all(|item| item["role"] != "system"));
+    }
+
+    #[test]
+    fn build_responses_body_continuation_preserves_tool_loop_items_from_explicit_input_messages() {
+        let generic_messages = vec![
+            Message::system("Stable instructions"),
+            Message::user("Generic turn should not be used"),
+        ];
+        let explicit_input_messages = vec![
+            Message::user("Dynamic context"),
+            Message::assistant(
+                "calling tool",
+                Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "search".to_string(),
+                        arguments: r#"{"q":"zenith"}"#.to_string(),
+                    },
+                }]),
+            ),
+            Message::tool_result("call_1", "tool output"),
+            Message::user("Continue after tool"),
+        ];
+
+        let body = build_responses_body(
+            "gpt-5.4",
+            &generic_messages,
+            &[],
+            None,
+            None,
+            Some(&ResponsesRequestOptions {
+                instructions: Some("Stable instructions".to_string()),
+                input_messages: Some(explicit_input_messages),
+                previous_response_id: Some("resp_tool".to_string()),
+                ..Default::default()
+            }),
+            None,
+        );
+
+        assert_eq!(body["previous_response_id"], "resp_tool");
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 5);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "call_1");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_1");
+        assert_eq!(input[4]["type"], "message");
+        assert_eq!(input[4]["role"], "user");
+        assert_eq!(input[4]["content"], "Continue after tool");
+    }
+
+    #[test]
+    fn select_responses_input_messages_only_uses_duplicate_system_fallback_for_generic_messages() {
+        let generic_messages = vec![
+            Message::system("Stable instructions"),
+            Message::user("Generic conversation"),
+        ];
+        let explicit_input_messages = vec![
+            Message::system("Stable instructions"),
+            Message::user("Explicit responses input"),
+        ];
+
+        let generic_options = ResponsesRequestOptions {
+            instructions: Some("Stable instructions".to_string()),
+            ..Default::default()
+        };
+        let generic_selection = select_responses_input_messages(
+            &generic_messages,
+            Some(&generic_options),
+        );
+        assert_eq!(generic_selection.source, ResponsesInputSource::Generic);
+        assert!(generic_selection.fallback_removed_duplicate_system);
+        assert_eq!(generic_selection.original_len, 2);
+        assert_eq!(generic_selection.effective_len, 1);
+        assert_eq!(generic_selection.input_messages[0].content, "Generic conversation");
+
+        let explicit_options = ResponsesRequestOptions {
+            instructions: Some("Stable instructions".to_string()),
+            input_messages: Some(explicit_input_messages),
+            ..Default::default()
+        };
+        let explicit_selection = select_responses_input_messages(
+            &generic_messages,
+            Some(&explicit_options),
+        );
+        assert_eq!(explicit_selection.source, ResponsesInputSource::Explicit);
+        assert!(
+            !explicit_selection.fallback_removed_duplicate_system,
+            "explicit input_messages should be treated as already-curated Responses input"
+        );
+        assert_eq!(explicit_selection.original_len, 2);
+        assert_eq!(explicit_selection.effective_len, 2);
+        assert_eq!(explicit_selection.input_messages[0].role, Role::System);
     }
 
     #[test]

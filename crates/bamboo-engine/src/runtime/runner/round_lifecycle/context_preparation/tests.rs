@@ -6,10 +6,10 @@ use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 use bamboo_agent_core::{
     AgentEvent, CompressionTriggerType, Message, Role, Session, TokenBudgetUsage,
 };
-use bamboo_compression::{BudgetStrategy, TokenBudget, TokenCounter};
-use bamboo_domain::MessagePart;
+use bamboo_compression::{BudgetStrategy, TokenBudget};
+use bamboo_domain::{TaskItem, TaskItemStatus, TaskList};
 use bamboo_infrastructure::models::{ContentPart, ImageUrl};
-use bamboo_infrastructure::provider::{LLMProvider, LLMStream};
+use bamboo_infrastructure::provider::{LLMProvider, LLMRequestOptions, LLMStream};
 use bamboo_infrastructure::{LLMChunk, LLMError};
 use futures::stream;
 use tokio::sync::mpsc;
@@ -43,6 +43,22 @@ fn system_prompt(session: &Session) -> String {
         .unwrap_or_default()
 }
 
+fn sample_task_list(session_id: &str, status: TaskItemStatus) -> TaskList {
+    TaskList {
+        session_id: session_id.to_string(),
+        title: "Compression Tasks".to_string(),
+        items: vec![TaskItem {
+            id: "task_1".to_string(),
+            description: "Unify compression context".to_string(),
+            status,
+            notes: "Ensure unified context blocks reach summarization".to_string(),
+            ..TaskItem::default()
+        }],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
 struct RecordingLlmProvider {
     models: Arc<Mutex<Vec<String>>>,
 }
@@ -74,6 +90,51 @@ fn recording_llm() -> (Arc<dyn LLMProvider>, Arc<Mutex<Vec<String>>>) {
         models: Arc::clone(&models),
     });
     (llm, models)
+}
+
+struct PromptCaptureLlmProvider {
+    requests: Arc<Mutex<Vec<Vec<Message>>>>,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for PromptCaptureLlmProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _tools: &[bamboo_agent_core::tools::ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> bamboo_infrastructure::provider::Result<LLMStream> {
+        self.requests
+            .lock()
+            .expect("captured request lock should not be poisoned")
+            .push(messages.to_vec());
+
+        Ok(Box::pin(stream::iter(vec![
+            Ok::<LLMChunk, LLMError>(LLMChunk::Token("summary".to_string())),
+            Ok::<LLMChunk, LLMError>(LLMChunk::Done),
+        ])))
+    }
+
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[bamboo_agent_core::tools::ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        _options: Option<&LLMRequestOptions>,
+    ) -> bamboo_infrastructure::provider::Result<LLMStream> {
+        self.chat_stream(messages, tools, max_output_tokens, model)
+            .await
+    }
+}
+
+fn prompt_capture_llm() -> (Arc<dyn LLMProvider>, Arc<Mutex<Vec<Vec<Message>>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let llm: Arc<dyn LLMProvider> = Arc::new(PromptCaptureLlmProvider {
+        requests: Arc::clone(&requests),
+    });
+    (llm, requests)
 }
 
 #[tokio::test]
@@ -665,6 +726,203 @@ async fn maybe_apply_host_context_compression_supports_mid_turn_phase() {
         !session.compression_events.is_empty(),
         "mid-turn compression should persist a compression event"
     );
+}
+
+#[tokio::test]
+async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_summary_prompt() {
+    let mut session = Session::new("session-cp-mid-turn-context-blocks", "test-model");
+    session.token_budget = Some(TokenBudget {
+        max_context_tokens: 1200,
+        max_output_tokens: 200,
+        strategy: BudgetStrategy::Hybrid {
+            window_size: 20,
+            enable_summarization: true,
+        },
+        safety_margin: 0,
+        compression_trigger_percent: 80,
+        compression_target_percent: 50,
+        working_reserve_tokens: 0,
+        fallback_trigger_percent: 75,
+        prompt_cache_min_tool_output_chars: 1_200,
+        prompt_cache_head_chars: 280,
+        prompt_cache_tail_chars: 180,
+        prompt_cache_recent_user_turns: 2,
+        prompt_cache_recent_tool_chains: 2,
+        max_tool_output_tokens: 0,
+    });
+    session.set_task_list(sample_task_list(&session.id, TaskItemStatus::InProgress));
+    session.force_manual_compression = Some("Keep only active work".to_string());
+    session.messages.push(Message::system(
+        "System prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\nSession memory note\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->\n\n<!-- BAMBOO_PLAN_MODE_START -->\nPlan mode is active\n<!-- BAMBOO_PLAN_MODE_END -->\n\n<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_START -->\nDurable plan execution state\n<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_END -->"
+            .to_string(),
+    ));
+    for index in 0..12 {
+        session.messages.push(Message::user(format!(
+            "User message {} {}",
+            index,
+            "alpha beta gamma delta epsilon zeta ".repeat(8)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "Assistant response {} {}",
+                index,
+                "analysis plan files checks and next steps ".repeat(8)
+            ),
+            None,
+        ));
+    }
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: 100,
+        summary_tokens: 0,
+        window_tokens: 850,
+        total_tokens: 950,
+        max_context_tokens: 1200,
+        budget_limit: 1000,
+        truncation_occurred: true,
+        segments_removed: 8,
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
+    });
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+    let (llm, requests) = prompt_capture_llm();
+
+    let applied = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "session-cp-mid-turn-context-blocks",
+        &[],
+        &llm,
+        None,
+        "mid-turn",
+    )
+    .await
+    .expect("mid-turn host compression should run");
+
+    assert!(applied, "expected mid-turn compression to be applied");
+
+    let requests = requests
+        .lock()
+        .expect("captured request lock should not be poisoned");
+    let prompt = requests
+        .last()
+        .and_then(|messages| messages.iter().find(|m| matches!(m.role, Role::User)))
+        .map(|message| message.content.clone())
+        .expect("summary prompt user message should be captured");
+
+    assert!(prompt.contains("## Compression Context Blocks"));
+    assert!(prompt.contains("type: task_snapshot"));
+    assert!(prompt.contains("type: external_memory"));
+    assert!(prompt.contains("type: plan_mode_state"));
+    assert!(prompt.contains("type: plan_runtime_state"));
+    assert!(prompt.contains("Current Task List"));
+    assert!(prompt.contains("External Memory (Persistent)"));
+    assert!(prompt.contains("Plan Mode State"));
+    assert!(prompt.contains("Durable Plan Execution Context"));
+}
+
+#[tokio::test]
+async fn pre_turn_host_context_compression_includes_available_context_blocks_in_summary_prompt() {
+    let mut session = Session::new("session-cp-pre-turn-context-blocks", "test-model");
+    session.token_budget = Some(TokenBudget {
+        max_context_tokens: 1200,
+        max_output_tokens: 200,
+        strategy: BudgetStrategy::Hybrid {
+            window_size: 20,
+            enable_summarization: true,
+        },
+        safety_margin: 0,
+        compression_trigger_percent: 80,
+        compression_target_percent: 50,
+        working_reserve_tokens: 0,
+        fallback_trigger_percent: 75,
+        prompt_cache_min_tool_output_chars: 1_200,
+        prompt_cache_head_chars: 280,
+        prompt_cache_tail_chars: 180,
+        prompt_cache_recent_user_turns: 2,
+        prompt_cache_recent_tool_chains: 2,
+        max_tool_output_tokens: 0,
+    });
+    session.set_task_list(sample_task_list(&session.id, TaskItemStatus::Pending));
+    session.messages.push(Message::system(
+        "System prompt\n\n<!-- BAMBOO_PLAN_MODE_START -->\nPlan mode is active\n<!-- BAMBOO_PLAN_MODE_END -->\n\n<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_START -->\nDurable plan execution state\n<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_END -->"
+            .to_string(),
+    ));
+    for index in 0..12 {
+        session.messages.push(Message::user(format!(
+            "User message {} {}",
+            index,
+            "alpha beta gamma delta epsilon zeta ".repeat(8)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "Assistant response {} {}",
+                index,
+                "analysis plan files checks and next steps ".repeat(8)
+            ),
+            None,
+        ));
+    }
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: 100,
+        summary_tokens: 0,
+        window_tokens: 900,
+        total_tokens: 1000,
+        max_context_tokens: 1200,
+        budget_limit: 1200,
+        truncation_occurred: true,
+        segments_removed: 8,
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
+    });
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+    let (llm, requests) = prompt_capture_llm();
+
+    let applied = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "session-cp-pre-turn-context-blocks",
+        &[],
+        &llm,
+        None,
+        "pre-turn",
+    )
+    .await
+    .expect("pre-turn host compression should run");
+
+    assert!(applied, "expected pre-turn compression to be applied");
+
+    let requests = requests
+        .lock()
+        .expect("captured request lock should not be poisoned");
+    let prompt = requests
+        .last()
+        .and_then(|messages| messages.iter().find(|m| matches!(m.role, Role::User)))
+        .map(|message| message.content.clone())
+        .expect("summary prompt user message should be captured");
+
+    assert!(prompt.contains("## Compression Context Blocks"));
+    assert!(prompt.contains("type: task_snapshot"));
+    assert!(prompt.contains("type: plan_mode_state"));
+    assert!(prompt.contains("type: plan_runtime_state"));
+    assert!(prompt.contains("Current Task List"));
+    assert!(prompt.contains("Plan Mode State"));
+    assert!(prompt.contains("Durable Plan Execution Context"));
 }
 
 #[tokio::test]

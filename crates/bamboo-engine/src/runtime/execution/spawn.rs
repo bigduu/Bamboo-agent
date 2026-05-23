@@ -571,6 +571,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
                         summarization_model: None,
                         summarization_model_provider: None,
                         reasoning_effort: None,
+                        auxiliary_model_resolver: None,
                         disabled_tools,
                         disabled_skill_ids: None,
                         selected_skill_ids: None,

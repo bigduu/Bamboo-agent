@@ -17,7 +17,9 @@ use crate::metrics::{
     TokenUsage as MetricsTokenUsage,
 };
 use crate::runtime::config::AgentLoopConfig;
-use crate::runtime::runner::loop_execution::startup::{InFlightTaskEvaluation, LoopRunState};
+use crate::runtime::runner::loop_execution::startup::{
+    resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState,
+};
 use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
 use crate::runtime::runner::session_setup::tool_schemas::resolve_available_tool_schemas_for_session;
 use crate::runtime::stream::handler::StreamHandlingOutput;
@@ -277,10 +279,11 @@ fn spawn_task_evaluation_if_needed(
     state: &mut LoopRunState,
     llm: Arc<dyn LLMProvider>,
 ) -> Result<(), AgentError> {
-    let eval_model = config
+    let eval_model = state
+        .auxiliary_models
         .fast_model_name
         .as_deref()
-        .or(config.model_name.as_deref());
+        .or(Some(state.model_name.as_str()));
     let request = crate::runtime::runner::task_lifecycle::build_async_task_evaluation_request(
         &state.task_context,
         session,
@@ -305,6 +308,13 @@ fn spawn_task_evaluation_if_needed(
 
     spawn_task_evaluation_request(state, event_tx, request, llm);
     Ok(())
+}
+
+fn refresh_auxiliary_models_for_round(state: &mut LoopRunState, config: &AgentLoopConfig) {
+    state.auxiliary_models = resolve_auxiliary_models(config);
+    state.runtime_state.llm.fast_model_name = state.auxiliary_models.fast_model_name.clone();
+    state.runtime_state.llm.background_model_name =
+        state.auxiliary_models.background_model_name.clone();
 }
 
 // ---- No-tool-calls path (from round_flow/no_tool_calls.rs) ----
@@ -370,6 +380,8 @@ async fn handle_tool_calls_path(
     metrics_collector: Option<&MetricsCollector>,
     tools: &Arc<dyn ToolExecutor>,
     config: &AgentLoopConfig,
+    auxiliary_models: &crate::runtime::config::AuxiliaryModelConfig,
+    model_name: &str,
     task_context: &mut Option<TaskLoopContext>,
     llm: Arc<dyn LLMProvider>,
 ) -> Result<TurnOutcome, AgentError> {
@@ -381,9 +393,7 @@ async fn handle_tool_calls_path(
         reasoning,
     ));
 
-    let compression_model = config
-        .model_name
-        .clone()
+    let compression_model = Some(model_name.to_string())
         .or_else(|| (!session.model.trim().is_empty()).then_some(session.model.trim().to_string()));
     if compression_model.is_none() {
         tracing::warn!(
@@ -407,11 +417,11 @@ async fn handle_tool_calls_path(
         &llm,
         compression_model
             .as_deref()
-            .or(config.background_model_name.as_deref()),
-        config
+            .or(auxiliary_models.background_model_name.as_deref()),
+        auxiliary_models
             .summarization_model_provider
             .as_ref()
-            .or(config.background_model_provider.as_ref()),
+            .or(auxiliary_models.background_model_provider.as_ref()),
         &tool_schemas,
     )
     .await?;
@@ -482,11 +492,11 @@ async fn handle_tool_calls_path(
         let round_tool_calls = &stream_output.tool_calls;
 
         // Use the fast model for classification.
-        let classifier_model = config
+        let classifier_model = auxiliary_models
             .fast_model_name
             .as_deref()
-            .or(config.model_name.as_deref());
-        let _classifier_provider = config
+            .or(Some(model_name));
+        let _classifier_provider = auxiliary_models
             .fast_model_provider
             .clone()
             .unwrap_or_else(|| llm.clone());
@@ -556,11 +566,13 @@ pub(super) async fn run_pipeline(
     let mut turn_counter: u32 = 0;
 
     loop {
+        refresh_auxiliary_models_for_round(state, config);
         poll_completed_task_evaluation(state).await;
         apply_completed_task_evaluation(session, event_tx, config, state).await;
         if state.task_evaluation.in_flight.is_none() {
             if let Some(request) = state.task_evaluation.queued_request.take() {
-                let eval_provider = config
+                let eval_provider = state
+                    .auxiliary_models
                     .fast_model_provider
                     .clone()
                     .unwrap_or_else(|| llm.clone());
@@ -575,11 +587,12 @@ pub(super) async fn run_pipeline(
 
         // --- Prompt context refresh ---
         let runtime_context = PromptMemoryRuntimeContext {
-            llm: config
+            llm: state
+                .auxiliary_models
                 .background_model_provider
                 .clone()
                 .unwrap_or_else(|| llm.clone()),
-            background_model_name: config.background_model_name.clone(),
+            background_model_name: state.auxiliary_models.background_model_name.clone(),
         };
         crate::runtime::runner::round_prelude::refresh_round_prompt_context(
             session,
@@ -815,6 +828,8 @@ pub(super) async fn run_pipeline(
                 state.metrics_collector.as_ref(),
                 &tools,
                 config,
+                &state.auxiliary_models,
+                &state.model_name,
                 &mut state.task_context,
                 llm.clone(),
             )
@@ -962,7 +977,8 @@ pub(super) async fn run_pipeline(
             event_tx,
             config,
             state,
-            config
+            state
+                .auxiliary_models
                 .fast_model_provider
                 .clone()
                 .unwrap_or_else(|| llm.clone()),
@@ -1362,6 +1378,7 @@ mod tests {
                 ),
                 queued_request: None,
             },
+            auxiliary_models: crate::runtime::config::AuxiliaryModelConfig::default(),
             runtime_state: bamboo_domain::AgentRuntimeState::new("session-task-eval"),
         };
         let config = crate::runtime::config::AgentLoopConfig {

@@ -23,3 +23,6 @@ pub use types::{
     PromptMemoryObservability, PromptSnapshot, PromptSnapshotExternalMemoryParts, Role, Session,
     SessionKind,
 };
+pub use bamboo_domain::{
+    ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
+};

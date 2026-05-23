@@ -5,7 +5,7 @@
 //! policy is satisfied.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -62,6 +62,23 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
 
 fn is_error_like(status: &str) -> bool {
     matches!(status, "error" | "timeout" | "cancelled")
+}
+
+fn read_config_snapshot(config: &Arc<RwLock<Config>>, cached_config: &StdRwLock<Config>) -> Config {
+    if let Ok(config_guard) = config.try_read() {
+        let snapshot = config_guard.clone();
+
+        if let Ok(mut cached_guard) = cached_config.try_write() {
+            *cached_guard = snapshot.clone();
+        }
+
+        snapshot
+    } else {
+        cached_config
+            .try_read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
 }
 
 fn wait_policy_satisfied(
@@ -505,6 +522,37 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         let (mpsc_tx, _forwarder) =
             create_event_forwarder(session_id.clone(), event_sender, self.agent_runners.clone());
 
+        let config_handle = self.config.clone();
+        let cached_config = Arc::new(StdRwLock::new(config_snapshot.clone()));
+        let provider_registry = self.provider_registry.clone();
+        let provider_name_for_aux = resolved_provider_name.clone();
+        let auxiliary_model_resolver = std::sync::Arc::new(move || {
+            let config_snapshot = read_config_snapshot(&config_handle, cached_config.as_ref());
+            let resolved_fast =
+                resolve_fast_model(&config_snapshot, &provider_name_for_aux, &provider_registry);
+            let resolved_background = resolve_background_model(
+                &config_snapshot,
+                &provider_name_for_aux,
+                &provider_registry,
+            );
+            let resolved_summarization = resolve_task_summary_model(
+                &config_snapshot,
+                &provider_name_for_aux,
+                &provider_registry,
+            );
+            bamboo_engine::AuxiliaryModelConfig {
+                fast_model_name: resolved_fast.as_ref().map(|m| m.model_name.clone()),
+                fast_model_provider: resolved_fast.map(|m| m.provider),
+                background_model_name: resolved_background.as_ref().map(|m| m.model_name.clone()),
+                planning_model_name: None,
+                search_model_name: None,
+                summarization_model_name: resolved_summarization
+                    .as_ref()
+                    .map(|m| m.model_name.clone()),
+                background_model_provider: resolved_background.map(|m| m.provider),
+                summarization_model_provider: resolved_summarization.map(|m| m.provider),
+            }
+        });
         spawn_session_execution(SessionExecutionArgs {
             agent: self.agent.clone(),
             session_id,
@@ -522,6 +570,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             summarization_model_provider: config.summarization_model_provider,
             reasoning_effort,
             reasoning_effort_source,
+            auxiliary_model_resolver: Some(auxiliary_model_resolver),
             disabled_tools: Some(config.disabled_tools),
             disabled_skill_ids: Some(config.disabled_skill_ids),
             selected_skill_ids: None,
@@ -648,5 +697,45 @@ mod tests {
         assert!(!message.content.contains("Child final response:"));
         assert!(!message.content.contains("Child error:"));
         assert!(message.content.contains("Resume the parent task"));
+    }
+
+    #[test]
+    fn read_config_snapshot_refreshes_cached_snapshot_from_live_config() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+        runtime.block_on(async {
+            let config = Arc::new(RwLock::new(Config::default()));
+            config.write().await.provider = "copilot".to_string();
+            let cached_config = StdRwLock::new(Config::default());
+
+            let snapshot = read_config_snapshot(&config, &cached_config);
+
+            assert_eq!(snapshot.provider, "copilot");
+            assert_eq!(
+                cached_config
+                    .read()
+                    .expect("cached snapshot lock")
+                    .provider,
+                "copilot"
+            );
+        });
+    }
+
+    #[test]
+    fn read_config_snapshot_uses_cached_snapshot_when_live_lock_is_busy() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+        runtime.block_on(async {
+            let mut cached_snapshot = Config::default();
+            cached_snapshot.provider = "cached-provider".to_string();
+
+            let config = Arc::new(RwLock::new(Config::default()));
+            let cached_config = StdRwLock::new(cached_snapshot);
+            let _write_guard = config.write().await;
+
+            let snapshot = read_config_snapshot(&config, &cached_config);
+
+            assert_eq!(snapshot.provider, "cached-provider");
+        });
     }
 }

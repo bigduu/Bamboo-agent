@@ -22,7 +22,10 @@ use super::common::openai_compat::{
     messages_to_openai_compat_json, parse_openai_compat_sse_data_lenient,
     tools_to_openai_compat_json,
 };
-use super::common::openai_responses::{build_responses_body, ResponsesSseParser};
+use super::common::openai_responses::{
+    build_responses_body, select_responses_input_messages, ResponsesInputSource,
+    ResponsesSseParser,
+};
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
 use super::common::sse::llm_stream_from_sse;
@@ -595,6 +598,12 @@ impl CopilotProvider {
             );
         }
         effective_responses_options.store = Some(false);
+        let input_selection =
+            select_responses_input_messages(messages, Some(&effective_responses_options));
+        let input_source = match input_selection.source {
+            ResponsesInputSource::Explicit => "explicit",
+            ResponsesInputSource::Generic => "generic",
+        };
         let mut body = build_responses_body(
             model,
             messages,
@@ -617,7 +626,7 @@ impl CopilotProvider {
             model
         );
         tracing::info!(
-            "[{}] Copilot request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose={}",
+            "[{}] Copilot request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} input_source={} input_messages_before={} input_messages_after={} duplicate_system_fallback={} purpose={}",
             session_log_id,
             model,
             reasoning_effort
@@ -628,6 +637,10 @@ impl CopilotProvider {
             max_output_tokens
                 .map(|tokens| tokens.to_string())
                 .unwrap_or_else(|| "none".to_string()),
+            input_source,
+            input_selection.original_len,
+            input_selection.effective_len,
+            input_selection.fallback_removed_duplicate_system,
             request_purpose
         );
 
@@ -823,13 +836,16 @@ impl CopilotProvider {
 
                 let request_body_bytes = serde_json::to_vec(&body).map(|v| v.len()).unwrap_or(0);
                 tracing::error!(
-                    "[{}] Copilot Responses API error: HTTP {} - {} (request_id={}, model='{}', messages={}, tools={}, request_body_bytes={}, max_output_tokens={:?}, reasoning_effort={:?})",
+                    "[{}] Copilot Responses API error: HTTP {} - {} (request_id={}, model='{}', input_source={}, input_messages_before={}, input_messages_after={}, duplicate_system_fallback={}, tools={}, request_body_bytes={}, max_output_tokens={:?}, reasoning_effort={:?})",
                     session_log_id,
                     status,
                     text,
                     request_id,
                     model,
-                    messages.len(),
+                    input_source,
+                    input_selection.original_len,
+                    input_selection.effective_len,
+                    input_selection.fallback_removed_duplicate_system,
                     tools.len(),
                     request_body_bytes,
                     max_output_tokens,
@@ -1503,6 +1519,7 @@ impl LLMProvider for CopilotProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bamboo_domain::FunctionSchema;
 
     // Helper to skip tests in CODEX_SANDBOX environment
     fn should_skip() -> bool {
@@ -1709,6 +1726,113 @@ mod tests {
             "conversation-agent"
         );
         assert_eq!(CopilotProvider::infer_request_initiator(&messages), "agent");
+    }
+
+    #[test]
+    fn build_llm_headers_uses_panel_intent_for_plain_user_turn() {
+        let provider = CopilotProvider::with_token("test_token");
+        let messages = vec![Message::system("Stable instructions"), Message::user("hello")];
+        let headers = provider
+            .build_llm_headers(
+                "test_token",
+                &messages,
+                &[],
+                request_overrides::ENDPOINT_RESPONSES,
+                Some("gpt-4o"),
+            )
+            .expect("headers");
+
+        assert_eq!(headers.get("openai-intent").unwrap(), "conversation-panel");
+        assert_eq!(headers.get("x-initiator").unwrap(), "user");
+    }
+
+    #[test]
+    fn build_llm_headers_switches_to_agent_intent_for_tool_enabled_user_turn() {
+        let provider = CopilotProvider::with_token("test_token");
+        let messages = vec![Message::system("Stable instructions"), Message::user("run a tool")];
+        let tools = vec![ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "search".to_string(),
+                description: "Search".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+        }];
+        let headers = provider
+            .build_llm_headers(
+                "test_token",
+                &messages,
+                &tools,
+                request_overrides::ENDPOINT_RESPONSES,
+                Some("gpt-4o"),
+            )
+            .expect("headers");
+
+        assert_eq!(headers.get("openai-intent").unwrap(), "conversation-agent");
+        assert_eq!(headers.get("x-initiator").unwrap(), "user");
+    }
+
+    #[test]
+    fn copilot_responses_forces_store_false_before_building_body() {
+        let mut effective_responses_options = ResponsesRequestOptions {
+            store: Some(true),
+            instructions: Some("Stable instructions".to_string()),
+            ..Default::default()
+        };
+        if effective_responses_options.store == Some(true) {
+            effective_responses_options.store = Some(false);
+        }
+
+        let body = build_responses_body(
+            "gpt-4o",
+            &[Message::user("hello")],
+            &[],
+            None,
+            None,
+            Some(&effective_responses_options),
+            None,
+        );
+
+        assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn detects_previous_response_id_unsupported_errors_for_copilot_responses() {
+        assert!(CopilotProvider::looks_like_previous_response_id_unsupported_error(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            r#"{"error":{"message":"previous_response_id has unsupported_value for this model"}}"#,
+        ));
+        assert!(!CopilotProvider::looks_like_previous_response_id_unsupported_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"invalid input without continuation semantics"}}"#,
+        ));
+    }
+
+    #[test]
+    fn copilot_reasoning_and_previous_response_id_fallback_detectors_do_not_overlap() {
+        assert!(CopilotProvider::looks_like_reasoning_unsupported_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "reasoning_effort is not supported for this model",
+        ));
+        assert!(
+            !CopilotProvider::looks_like_previous_response_id_unsupported_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                "reasoning_effort is not supported for this model",
+            ),
+            "reasoning fallback classifier should not misclassify as previous_response_id fallback"
+        );
+
+        assert!(CopilotProvider::looks_like_previous_response_id_unsupported_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "previous_response_id unsupported_value",
+        ));
+        assert!(
+            !CopilotProvider::looks_like_reasoning_unsupported_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                "previous_response_id unsupported_value",
+            ),
+            "previous_response_id fallback classifier should not misclassify as reasoning fallback"
+        );
     }
 
     // ============================================

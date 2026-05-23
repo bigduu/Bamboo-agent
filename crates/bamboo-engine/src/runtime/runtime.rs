@@ -22,7 +22,9 @@ use bamboo_infrastructure::config::PermissionMode;
 use bamboo_infrastructure::Config;
 use bamboo_infrastructure::LLMProvider;
 
-use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, PromptMemoryFlags};
+use crate::runtime::config::{
+    AgentLoopConfig, AuxiliaryModelConfig, ImageFallbackConfig, PromptMemoryFlags,
+};
 use crate::runtime::hooks::HookRunner;
 use crate::runtime::managers::{
     LifecycleManager, LlmManager, MemoryManager, PromptManager, ToolManager,
@@ -283,6 +285,10 @@ pub struct ExecuteRequest {
     /// Optional provider override for task summarization / compression calls.
     pub summarization_model_provider: Option<Arc<dyn LLMProvider>>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Optional per-round resolver for auxiliary model settings that should be
+    /// re-read from live global config between rounds.
+    pub auxiliary_model_resolver:
+        Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
     /// When `None`, falls back to `Config::disabled_tool_names()`.
     pub disabled_tools: Option<BTreeSet<String>>,
     /// When `None`, falls back to `Config::disabled_skill_ids()`.
@@ -339,6 +345,7 @@ impl AgentRuntime {
             summarization_model,
             summarization_model_provider,
             reasoning_effort,
+            auxiliary_model_resolver,
             disabled_tools,
             disabled_skill_ids,
             selected_skill_ids,
@@ -384,6 +391,7 @@ impl AgentRuntime {
             provider_name: Some(provider_name.unwrap_or_else(|| config.provider.clone())),
             provider_type,
             reasoning_effort,
+            auxiliary_model_resolver,
             disabled_tools: {
                 let mut merged = config.disabled_tool_names();
                 if let Some(dt) = disabled_tools {

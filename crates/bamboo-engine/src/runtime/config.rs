@@ -16,6 +16,18 @@ use bamboo_infrastructure::LLMProvider;
 use bamboo_infrastructure::MemoryConfig;
 use bamboo_tools::ToolRegistry;
 
+#[derive(Clone, Default)]
+pub struct AuxiliaryModelConfig {
+    pub fast_model_name: Option<String>,
+    pub fast_model_provider: Option<Arc<dyn LLMProvider>>,
+    pub background_model_name: Option<String>,
+    pub planning_model_name: Option<String>,
+    pub search_model_name: Option<String>,
+    pub summarization_model_name: Option<String>,
+    pub background_model_provider: Option<Arc<dyn LLMProvider>>,
+    pub summarization_model_provider: Option<Arc<dyn LLMProvider>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFallbackMode {
     Placeholder,
@@ -174,6 +186,13 @@ pub struct AgentLoopConfig {
     /// When true, the pipeline classifies complexity at each round end and
     /// stores the result in session metadata.
     pub features_dynamic_model_routing: bool,
+    /// Optional per-round resolver for auxiliary model settings that should
+    /// follow live global config rather than stay frozen for the whole run.
+    ///
+    /// The main chat model remains session/request scoped; this hook is only
+    /// for fast/background/planning/search/summarization helpers.
+    pub auxiliary_model_resolver:
+        Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
 }
 
 impl Default for AgentLoopConfig {
@@ -230,6 +249,7 @@ impl Default for AgentLoopConfig {
             parallel_batch_timeout_secs: 300,
             permission_mode: None,
             features_dynamic_model_routing: false,
+            auxiliary_model_resolver: None,
         }
     }
 }

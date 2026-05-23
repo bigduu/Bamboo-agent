@@ -1,8 +1,17 @@
 use async_trait::async_trait;
 
+use super::prompt_envelope::{
+    assemble_prompt_envelope, envelope_to_responses_view, StablePromptFrame,
+};
+use bamboo_agent_core::{
+    ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
+};
+use super::prompt_setup::build_stable_prompt_frame;
 use super::tool_schemas::resolve_available_tool_schemas_for_session;
+use bamboo_agent_core::agent::types::{TaskItem, TaskItemStatus, TaskList};
 use bamboo_agent_core::tools::{FunctionSchema, ToolCall, ToolExecutor, ToolResult, ToolSchema};
 use bamboo_agent_core::{Message, Session};
+use chrono::Utc;
 
 const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str =
     "copilot_conclusion_with_options_enhancement_enabled";
@@ -676,4 +685,123 @@ fn prompt_assembly_report_component_values_match_sections() {
     );
     assert_eq!(report.component_lengths_value(), expected_lengths);
     assert_eq!(report.section_layout_value(), expected_layout);
+}
+
+#[test]
+fn build_stable_prompt_frame_includes_base_and_stable_contexts() {
+    let _lock = crate::runtime::tests::env_cache_lock_acquire();
+    let config_with_env = bamboo_infrastructure::Config {
+        env_vars: vec![bamboo_infrastructure::EnvVarEntry {
+            name: "TEST_PROMPT_ENVELOPE_TOKEN".to_string(),
+            value: "hidden-value".to_string(),
+            secret: true,
+            value_encrypted: None,
+            description: Some("Prompt envelope token".to_string()),
+        }],
+        ..bamboo_infrastructure::Config::default()
+    };
+    config_with_env.publish_env_vars();
+
+    let workspace = std::env::temp_dir().join("bamboo-prompt-envelope-workspace");
+    let system_prompt = format!(
+        "Base system\n\n{}\nWorkspace path: {}\n{}\n{}",
+        crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER,
+        workspace.display(),
+        crate::runtime::context::WORKSPACE_CONTEXT_END_MARKER,
+        crate::runtime::context::workspace_prompt_guidance(),
+    );
+
+    let config = crate::runtime::config::AgentLoopConfig {
+        system_prompt: Some(system_prompt),
+        ..Default::default()
+    };
+    let mut session = Session::new("session-stable-frame-1", "model");
+    session
+        .metadata
+        .insert("skill.context".to_string(), "## Skill\nUse the skill".to_string());
+
+    let stable = build_stable_prompt_frame(&session, &config, &[], &std::collections::BTreeSet::new());
+
+    assert!(stable.stable_instructions.contains("Base system"));
+    assert!(stable
+        .stable_instructions
+        .contains("Workspace path:"));
+    assert!(stable
+        .stable_instructions
+        .contains("environment variables were explicitly configured by the user inside Bodhi"));
+    assert!(stable.stable_prefix_messages.is_empty());
+}
+
+
+#[test]
+fn build_stable_prompt_frame_strips_round_dynamic_prompt_blocks() {
+    let _lock = crate::runtime::tests::env_cache_lock_acquire();
+    let workspace = std::env::temp_dir().join("bamboo-prompt-envelope-workspace-dynamic");
+    let system_prompt = format!(
+        "Base system\n\n{}\nWorkspace path: {}\n{}\n{}\n\n<!-- BAMBOO_TASK_LIST_START -->\n## Current Task List: Agent Tasks\n[/] task-1: do the thing\n<!-- BAMBOO_TASK_LIST_END -->\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\nExternal memory snapshot\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->\n\n<!-- BAMBOO_PLAN_MODE_START -->\nPLAN MODE ACTIVE\n<!-- BAMBOO_PLAN_MODE_END -->\n\n<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_START -->\nPlan runtime snapshot\n<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_END -->",
+        crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER,
+        workspace.display(),
+        crate::runtime::context::WORKSPACE_CONTEXT_END_MARKER,
+        crate::runtime::context::workspace_prompt_guidance(),
+    );
+
+    let config = crate::runtime::config::AgentLoopConfig {
+        system_prompt: Some(system_prompt),
+        ..Default::default()
+    };
+    let mut session = Session::new("session-stable-frame-2", "model");
+    session
+        .metadata
+        .insert("skill.context".to_string(), "## Skill\nUse the skill".to_string());
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Agent Tasks".to_string(),
+        items: vec![TaskItem {
+            id: "task-1".to_string(),
+            description: "do the thing".to_string(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+        "Older work was compressed.",
+        2,
+        80,
+    ));
+
+    let stable =
+        build_stable_prompt_frame(&session, &config, &[], &std::collections::BTreeSet::new());
+
+    assert!(stable.stable_instructions.contains("Base system"));
+    assert!(stable.stable_instructions.contains("Workspace path:"));
+    assert!(!stable.stable_instructions.contains("Current Task List"));
+    assert!(!stable.stable_instructions.contains("External memory snapshot"));
+    assert!(!stable.stable_instructions.contains("PLAN MODE ACTIVE"));
+    assert!(!stable.stable_instructions.contains("Plan runtime snapshot"));
+}
+
+#[test]
+fn prompt_envelope_skeleton_can_render_responses_view() {
+    let stable = StablePromptFrame::new("Stable instructions", vec![Message::user("stable prefix")]);
+    let envelope = assemble_prompt_envelope(
+        stable,
+        vec![ContextBlock::new(
+            ContextBlockType::TaskSnapshot,
+            ContextBlockPriority::High,
+            ContextBlockStability::RoundDynamic,
+            "Current Task Snapshot",
+            "- build prompt envelope skeleton",
+        )],
+        vec![Message::user("latest user turn")],
+    );
+
+    let view = envelope_to_responses_view(&envelope);
+
+    assert_eq!(view.instructions.as_deref(), Some("Stable instructions"));
+    assert_eq!(view.input_messages.len(), 3);
+    assert!(view.input_messages[1]
+        .content
+        .contains("BAMBOO_CONTEXT_BLOCK_START"));
 }

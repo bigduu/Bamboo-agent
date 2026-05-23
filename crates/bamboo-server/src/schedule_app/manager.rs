@@ -12,7 +12,7 @@ use bamboo_engine::execution::{
     create_event_forwarder, finalize_runner, get_or_create_event_sender, try_reserve_runner,
     AgentRunner, RunnerReservation,
 };
-use bamboo_engine::ExecuteRequest;
+use bamboo_engine::{AuxiliaryModelConfig, ExecuteRequest};
 use bamboo_infrastructure::LockedSessionStore;
 
 use super::store::{ClaimedScheduleRun, ScheduleStore};
@@ -350,6 +350,23 @@ async fn run_schedule_job(
             .map(|m| m.content.clone())
             .unwrap_or_default();
 
+        let aux_fast_model = fast_model.clone();
+        let aux_fast_provider = fast_model_provider.clone();
+        let aux_background_model = background_model.clone();
+        let aux_background_provider = background_model_provider.clone();
+        let aux_summarization_model = summarization_model.clone();
+        let aux_summarization_provider = summarization_model_provider.clone();
+        let auxiliary_model_resolver = Arc::new(move || AuxiliaryModelConfig {
+            fast_model_name: aux_fast_model.clone(),
+            fast_model_provider: aux_fast_provider.clone(),
+            background_model_name: aux_background_model.clone(),
+            planning_model_name: None,
+            search_model_name: None,
+            summarization_model_name: aux_summarization_model.clone(),
+            background_model_provider: aux_background_provider.clone(),
+            summarization_model_provider: aux_summarization_provider.clone(),
+        });
+
         let result = agent_runtime
             .execute(
                 &mut session,
@@ -369,6 +386,7 @@ async fn run_schedule_job(
                     summarization_model,
                     summarization_model_provider,
                     reasoning_effort,
+                    auxiliary_model_resolver: Some(auxiliary_model_resolver),
                     disabled_tools: None,
                     disabled_skill_ids: None,
                     selected_skill_ids: None,

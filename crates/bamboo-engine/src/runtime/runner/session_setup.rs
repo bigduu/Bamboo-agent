@@ -11,17 +11,17 @@ use crate::skills::runtime_metadata::{
     SKILL_RUNTIME_SELECTION_TRACE_KEY,
 };
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{Message, Session};
+use bamboo_agent_core::{Message, PromptSnapshot, Session};
 use bamboo_tools::exposure::activated_discoverable_tools;
 
 use super::logging::DebugLogger;
 
 pub(crate) mod compaction;
+pub(crate) mod prompt_envelope;
 pub(crate) mod prompt_setup;
 pub(crate) mod skill_context;
 pub(crate) mod tool_schemas;
 
-pub(crate) use bamboo_agent_core::PromptSnapshot;
 
 pub fn read_prompt_snapshot(session: &Session) -> Option<PromptSnapshot> {
     prompt_setup::read_prompt_snapshot_metadata(session)

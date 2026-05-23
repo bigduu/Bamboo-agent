@@ -987,3 +987,92 @@ async fn inject_external_memory_uses_model_rerank_for_relevant_memories_when_ena
         ["rerank-fast-model"]
     );
 }
+
+#[tokio::test]
+async fn inject_external_memory_uses_latest_background_model_on_repeated_refresh() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let workspace = temp_dir.path().join("workspace-rerank-reload");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+
+    let lexical_first = store
+        .write_memory(
+            bamboo_memory::memory_store::MemoryScope::Project,
+            Some(project_key.as_str()),
+            bamboo_memory::memory_store::DurableMemoryType::Feedback,
+            "Release freeze checklist",
+            "Generic release freeze checklist for shipping work.",
+            &["release".to_string(), "freeze".to_string()],
+            Some("session-rerank-reload"),
+            "main-model",
+            false,
+        )
+        .await
+        .expect("save lexical-first memory");
+    let reranked_first = store
+        .write_memory(
+            bamboo_memory::memory_store::MemoryScope::Project,
+            Some(project_key.as_str()),
+            bamboo_memory::memory_store::DurableMemoryType::Feedback,
+            "Mobile launch blocker",
+            "This durable note captures the release freeze decision for the mobile app and should be preferred for mobile freeze requests.",
+            &["mobile".to_string(), "launch".to_string()],
+            Some("session-rerank-reload"),
+            "main-model",
+            false,
+        )
+        .await
+        .expect("save reranked-first memory");
+
+    let provider = StaticResponseProvider::new(format!(
+        "{{\"ids\":[\"{}\",\"{}\"]}}",
+        reranked_first.frontmatter.id, lexical_first.frontmatter.id
+    ));
+    let requested_models = provider.requested_models.clone();
+
+    let mut session = bamboo_agent_core::Session::new("session-rerank-reload", "test-model");
+    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
+    session.metadata.insert(
+        "workspace_path".to_string(),
+        workspace.to_string_lossy().to_string(),
+    );
+    session.add_message(bamboo_agent_core::Message::user(
+        "release freeze for mobile launch",
+    ));
+
+    let runtime_context_v1 = super::PromptMemoryRuntimeContext {
+        llm: Arc::new(provider.clone()),
+        background_model_name: Some("bg-1".to_string()),
+    };
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::runtime::config::PromptMemoryFlags {
+            relevant_recall_rerank: true,
+            ..crate::runtime::config::PromptMemoryFlags::default()
+        },
+        Some(&runtime_context_v1),
+    )
+    .await;
+
+    let runtime_context_v2 = super::PromptMemoryRuntimeContext {
+        llm: Arc::new(provider.clone()),
+        background_model_name: Some("bg-2".to_string()),
+    };
+    super::inject_external_memory_into_system_message_with_store(
+        &mut session,
+        &store,
+        crate::runtime::config::PromptMemoryFlags {
+            relevant_recall_rerank: true,
+            ..crate::runtime::config::PromptMemoryFlags::default()
+        },
+        Some(&runtime_context_v2),
+    )
+    .await;
+
+    assert_eq!(
+        requested_models.lock().expect("lock poisoned").as_slice(),
+        ["bg-1", "bg-2"]
+    );
+}

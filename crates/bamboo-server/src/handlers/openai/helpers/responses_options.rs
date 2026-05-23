@@ -100,6 +100,7 @@ pub(super) fn parse_responses_request_options(
 
     ResponsesRequestOptions {
         instructions: None,
+        input_messages: None,
         reasoning_summary: parse_reasoning_summary(parameters),
         include,
         store: parameters.get("store").and_then(|value| value.as_bool()),
@@ -133,6 +134,8 @@ mod tests {
         .expect("valid params");
 
         let parsed = parse_responses_request_options(&params);
+        assert_eq!(parsed.instructions, None);
+        assert!(parsed.input_messages.is_none());
         assert_eq!(parsed.reasoning_summary.as_deref(), Some("detailed"));
         assert_eq!(
             parsed.include,

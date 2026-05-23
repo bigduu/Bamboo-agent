@@ -296,29 +296,37 @@ pub struct GeminiRequestBuilder;
 
 impl ToProvider<GeminiRequest> for Vec<Message> {
     fn to_provider(&self) -> ProtocolResult<GeminiRequest> {
-        let mut system_instruction = None;
+        let mut system_texts = Vec::new();
         let mut contents = Vec::new();
 
         for msg in self {
             match msg.role {
                 Role::System => {
-                    // System messages become system_instruction
-                    system_instruction = Some(GeminiContent {
-                        role: "system".to_string(),
-                        parts: vec![GeminiPart {
-                            text: Some(msg.content.clone()),
-                            inline_data: None,
-                            file_data: None,
-                            function_call: None,
-                            function_response: None,
-                        }],
-                    });
+                    let trimmed = msg.content.trim();
+                    if !trimmed.is_empty() {
+                        system_texts.push(trimmed.to_string());
+                    }
                 }
                 _ => {
                     contents.push(msg.to_provider()?);
                 }
             }
         }
+
+        let system_instruction = if system_texts.is_empty() {
+            None
+        } else {
+            Some(GeminiContent {
+                role: "system".to_string(),
+                parts: vec![GeminiPart {
+                    text: Some(system_texts.join("\n\n")),
+                    inline_data: None,
+                    file_data: None,
+                    function_call: None,
+                    function_response: None,
+                }],
+            })
+        };
 
         Ok(GeminiRequest {
             contents,
@@ -753,6 +761,28 @@ mod tests {
         assert_eq!(sys.role, "system");
         assert_eq!(sys.parts[0].text, Some("You are helpful".to_string()));
 
+        assert_eq!(request.contents.len(), 1);
+        assert_eq!(request.contents[0].role, "user");
+    }
+
+    #[test]
+    fn test_multiple_system_messages_are_joined() {
+        let messages = vec![
+            Message::system("You are helpful"),
+            Message::system("Use tools when needed"),
+            Message::user("Hello"),
+        ];
+
+        let request: GeminiRequest = messages.to_provider().unwrap();
+
+        let sys = request
+            .system_instruction
+            .expect("system instruction should be present");
+        assert_eq!(sys.role, "system");
+        assert_eq!(
+            sys.parts[0].text.as_deref(),
+            Some("You are helpful\n\nUse tools when needed")
+        );
         assert_eq!(request.contents.len(), 1);
         assert_eq!(request.contents[0].role, "user");
     }

@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::runtime::config::AgentLoopConfig;
+use super::prompt_envelope::StablePromptFrame;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
     parse_prompt_external_memory_sections, Message, PromptMemoryObservability, PromptSnapshot,
@@ -8,7 +9,11 @@ use bamboo_agent_core::{
 };
 use bamboo_tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder};
 
-use super::super::prompt_context::merge_system_prompt_with_contexts;
+use super::super::prompt_context::{
+    merge_system_prompt_with_contexts, strip_existing_external_memory,
+    strip_existing_plan_mode_instructions, strip_existing_plan_runtime_context,
+    strip_existing_task_list,
+};
 
 const RUNTIME_PROMPT_COMPOSER_VERSION: &str = "bamboo.runtime-system-prompt.v3";
 const RUNTIME_PROMPT_VERSION_KEY: &str = "runtime_prompt_composer_version";
@@ -250,6 +255,48 @@ pub(crate) fn resolve_base_prompt_for_language<'a>(
                 .map(|message| message.content.as_str())
         })
         .unwrap_or_default()
+}
+
+pub(crate) fn build_stable_prompt_frame(
+    session: &Session,
+    config: &AgentLoopConfig,
+    tool_schemas: &[ToolSchema],
+    activated_discoverable_tools: &BTreeSet<String>,
+) -> StablePromptFrame {
+    let raw_base_prompt = resolve_base_prompt_for_language(config, session).to_string();
+    let workspace_context = extract_workspace_context(&raw_base_prompt);
+    let instruction_context = workspace_context
+        .as_deref()
+        .and_then(workspace_path_from_context)
+        .and_then(crate::runtime::context::instruction::build_instruction_prompt_context);
+    let env_context = extract_env_context(&raw_base_prompt)
+        .or_else(crate::runtime::context::build_env_prompt_context);
+    let base_prompt = normalize_base_prompt(&raw_base_prompt);
+
+    let skill_context = session
+        .metadata
+        .get("skill.context")
+        .map(String::as_str)
+        .unwrap_or_default();
+
+    let tool_guide_context = build_tool_guide_context(
+        config,
+        tool_schemas,
+        &raw_base_prompt,
+        session.id.as_str(),
+        activated_discoverable_tools,
+    );
+
+    let stable_instructions = merge_with_optional_contexts(
+        &base_prompt,
+        workspace_context.as_deref(),
+        instruction_context.as_deref(),
+        env_context.as_deref(),
+        skill_context,
+        &tool_guide_context,
+    );
+
+    StablePromptFrame::new(stable_instructions, Vec::new())
 }
 
 pub(crate) fn build_tool_guide_context(
@@ -543,7 +590,11 @@ fn normalize_base_prompt(prompt: &str) -> String {
     let without_workspace = strip_workspace_context(prompt);
     let without_instruction = strip_instruction_context(&without_workspace);
     let without_env = strip_env_context(&without_instruction);
-    merge_system_prompt_with_contexts(&without_env, "", "")
+    let without_external_memory = strip_existing_external_memory(&without_env);
+    let without_task_list = strip_existing_task_list(&without_external_memory);
+    let without_plan_mode = strip_existing_plan_mode_instructions(&without_task_list);
+    let without_plan_runtime = strip_existing_plan_runtime_context(&without_plan_mode);
+    merge_system_prompt_with_contexts(&without_plan_runtime, "", "")
 }
 
 fn merge_with_optional_contexts(

@@ -1,6 +1,10 @@
 use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::runner::session_setup::prompt_envelope::{
+    build_external_memory_context_block_from_messages, build_plan_mode_context_block_from_messages,
+    build_plan_runtime_context_block_from_messages, build_task_list_context_block,
+};
 use bamboo_agent_core::tools::ToolSchema;
-use bamboo_agent_core::{AgentError, AgentEvent, CompressionTriggerType, Role, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, CompressionTriggerType, ContextBlock, Role, Session};
 use bamboo_compression::{
     apply_compression_plan, build_forced_compression_plan_with_summary,
     estimate_context_compression_exposure, prepare_hybrid_context, summary_source_messages,
@@ -122,6 +126,23 @@ fn degrade_prompt_context_sections_for_overflow(session: &mut Session) -> Option
     }
 
     None
+}
+
+fn build_compression_context_blocks(session: &Session) -> Vec<ContextBlock> {
+    let mut blocks = Vec::new();
+    if let Some(block) = build_task_list_context_block(session) {
+        blocks.push(block);
+    }
+    if let Some(block) = build_external_memory_context_block_from_messages(&session.messages) {
+        blocks.push(block);
+    }
+    if let Some(block) = build_plan_runtime_context_block_from_messages(&session.messages) {
+        blocks.push(block);
+    }
+    if let Some(block) = build_plan_mode_context_block_from_messages(&session.messages) {
+        blocks.push(block);
+    }
+    blocks
 }
 
 async fn maybe_apply_host_context_compression_with_budget(
@@ -263,15 +284,12 @@ async fn maybe_apply_host_context_compression_with_budget(
         emit_context_compression_status(event_tx, phase_label, "skipped_no_background_model").await;
         return Ok(false);
     };
+
     let existing_summary = session
         .conversation_summary
         .as_ref()
         .map(|summary| summary.content.clone());
-    let task_list_prompt = session
-        .task_list
-        .as_ref()
-        .map(|_| session.format_task_list_for_prompt())
-        .filter(|value| !value.trim().is_empty());
+    let compression_context_blocks = build_compression_context_blocks(session);
 
     let base_instructions = session
         .compression_instructions
@@ -298,8 +316,9 @@ async fn maybe_apply_host_context_compression_with_budget(
         Arc::clone(summary_provider),
         summary_model.to_string(),
         existing_summary.clone(),
-        task_list_prompt,
+        None,
     )
+    .with_context_blocks(compression_context_blocks)
     .with_custom_instructions(compression_instructions)
     .with_summary_mode(if existing_summary.is_some() {
         bamboo_compression::SummaryMode::IncrementalMerge

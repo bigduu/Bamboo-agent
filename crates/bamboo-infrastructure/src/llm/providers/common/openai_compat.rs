@@ -359,6 +359,36 @@ mod tests {
     }
 
     #[test]
+    fn build_openai_compat_body_keeps_system_messages_in_messages_array() {
+        let messages = vec![
+            Message::system("Stable instructions"),
+            Message::user("Hello"),
+        ];
+        let tools: Vec<ToolSchema> = Vec::new();
+
+        let body = super::build_openai_compat_body(
+            "gpt-4o-mini",
+            &messages,
+            &tools,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let serialized_messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(serialized_messages.len(), 2);
+        assert_eq!(serialized_messages[0]["role"], "system");
+        assert_eq!(serialized_messages[0]["content"], "Stable instructions");
+        assert_eq!(serialized_messages[1]["role"], "user");
+        assert_eq!(serialized_messages[1]["content"], "Hello");
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("input").is_none());
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("store").is_none());
+    }
+
+    #[test]
     fn parse_openai_compat_sse_data_strict_content_delta_yields_token() {
         let data = r#"{"id":"chatcmpl_1","choices":[{"delta":{"content":"Hello"}}]}"#;
 

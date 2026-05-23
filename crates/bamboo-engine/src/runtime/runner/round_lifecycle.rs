@@ -57,6 +57,7 @@ pub(crate) async fn execute_llm_round(
 
     let (stream_output, llm_duration) = stream_execution::execute_llm_stream(
         session,
+        config,
         llm,
         event_tx,
         cancel_token,

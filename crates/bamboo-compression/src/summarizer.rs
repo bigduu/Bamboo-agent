@@ -4,7 +4,9 @@
 //! key information from earlier context.
 
 use async_trait::async_trait;
-use bamboo_agent_core::{Message, Role};
+use bamboo_agent_core::{
+    ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, Message, Role,
+};
 use bamboo_domain::ReasoningEffort;
 use bamboo_infrastructure::LLMChunk;
 use bamboo_infrastructure::{LLMProvider, LLMRequestOptions};
@@ -229,9 +231,8 @@ pub struct LlmSummarizer {
     model: String,
     /// Optional existing summary to build upon (incremental summarization).
     existing_summary: Option<String>,
-    /// Optional current task list prompt so summary generation can distinguish
-    /// active vs completed/obsolete work using the session's source of truth.
-    task_list_prompt: Option<String>,
+    /// Structured runtime context blocks that should inform summarization.
+    context_blocks: Vec<ContextBlock>,
     /// Optional user-provided instructions that override/extend the default summary focus.
     custom_instructions: Option<String>,
     /// Controls how the summarizer handles existing summaries.
@@ -245,14 +246,34 @@ impl LlmSummarizer {
         existing_summary: Option<String>,
         task_list_prompt: Option<String>,
     ) -> Self {
+        let context_blocks = task_list_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|task_list| {
+                vec![ContextBlock::new(
+                    ContextBlockType::TaskSnapshot,
+                    ContextBlockPriority::High,
+                    ContextBlockStability::RoundDynamic,
+                    "Current Task List",
+                    task_list,
+                )]
+            })
+            .unwrap_or_default();
+
         Self {
             llm,
             model,
             existing_summary,
-            task_list_prompt,
+            context_blocks,
             custom_instructions: None,
             summary_mode: SummaryMode::default(),
         }
+    }
+
+    pub fn with_context_blocks(mut self, context_blocks: Vec<ContextBlock>) -> Self {
+        self.context_blocks = context_blocks;
+        self
     }
 
     pub fn with_custom_instructions(mut self, instructions: Option<String>) -> Self {
@@ -313,15 +334,19 @@ Guidelines:
             user_content.push_str("\n\n---\n\n");
         }
 
-        if let Some(task_list_prompt) = self
-            .task_list_prompt
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            user_content.push_str("## Current Task List\n\n");
-            user_content.push_str(task_list_prompt);
-            user_content.push_str("\n\n---\n\n");
+        if !self.context_blocks.is_empty() {
+            user_content.push_str("## Compression Context Blocks\n\n");
+            for block in &self.context_blocks {
+                user_content.push_str(&format!(
+                    "### {}\n- type: {}\n- priority: {}\n- stability: {}\n\n{}\n\n",
+                    block.title.trim(),
+                    block.block_type.as_str(),
+                    block.priority.as_str(),
+                    block.stability.as_str(),
+                    block.content.trim(),
+                ));
+            }
+            user_content.push_str("---\n\n");
         }
 
         if let Some(ref instructions) = self.custom_instructions {
@@ -444,6 +469,7 @@ impl std::fmt::Debug for LlmSummarizer {
         f.debug_struct("LlmSummarizer")
             .field("model", &self.model)
             .field("has_existing_summary", &self.existing_summary.is_some())
+            .field("context_block_count", &self.context_blocks.len())
             .finish()
     }
 }
@@ -697,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_summarizer_prompt_includes_task_list_and_state_sections() {
+    fn llm_summarizer_prompt_includes_context_blocks_and_state_sections() {
         let summarizer = LlmSummarizer::new(
             Arc::new(DummyProvider),
             "gpt-4o-mini".to_string(),
@@ -706,7 +732,23 @@ mod tests {
                 "## Current Task List\n[/] task_1: Fix compression bounce\n[x] task_0: Analyze bug"
                     .to_string(),
             ),
-        );
+        )
+        .with_context_blocks(vec![
+            ContextBlock::new(
+                ContextBlockType::TaskSnapshot,
+                ContextBlockPriority::High,
+                ContextBlockStability::RoundDynamic,
+                "Current Task List",
+                "[/] task_1: Fix compression bounce",
+            ),
+            ContextBlock::new(
+                ContextBlockType::ExternalMemory,
+                ContextBlockPriority::Medium,
+                ContextBlockStability::RoundDynamic,
+                "External Memory (Persistent)",
+                "Session note body",
+            ),
+        ]);
         let messages = vec![
             Message::user("继续做压缩修复"),
             Message::assistant("我先检查 trigger 与 target", None),
@@ -715,7 +757,13 @@ mod tests {
         let prompt_messages = summarizer.build_summarization_messages(&messages);
         assert_eq!(prompt_messages.len(), 2);
         assert_eq!(prompt_messages[0].role, Role::System);
-        assert!(prompt_messages[1].content.contains("## Current Task List"));
+        assert!(prompt_messages[1]
+            .content
+            .contains("## Compression Context Blocks"));
+        assert!(prompt_messages[1].content.contains("Current Task List"));
+        assert!(prompt_messages[1]
+            .content
+            .contains("External Memory (Persistent)"));
         assert!(prompt_messages[1]
             .content
             .contains("Current active objective"));

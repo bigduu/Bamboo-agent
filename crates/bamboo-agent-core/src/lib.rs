@@ -10,6 +10,9 @@ pub mod workspace_state;
 pub use agent::events::{AgentEvent, TitleSource, TokenUsage};
 pub use agent::hooks::AgentHook;
 pub use agent::types::{parse_prompt_external_memory_sections, PromptSnapshotExternalMemoryParts};
+pub use bamboo_domain::{
+    ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
+};
 pub use agent::types::{
     CompressionEvent, CompressionTriggerType, ConversationSummary, ImageOcrLine, ImageOcrResult,
     ImageUrlRef, Message, MessageContent, MessagePart, MessagePhase, PendingQuestion,

@@ -3010,6 +3010,7 @@ mod tests {
         config.defaults = Some(DefaultsConfig {
             chat: bamboo_domain::ProviderModelRef::new("anthropic", "claude-3-7-sonnet"),
             fast: None,
+            task_summary: None,
             vision: None,
             memory_background: None,
             planning: None,
@@ -3042,6 +3043,7 @@ mod tests {
         config.defaults = Some(DefaultsConfig {
             chat: bamboo_domain::ProviderModelRef::new("anthropic", "claude-3-7-sonnet"),
             fast: None,
+            task_summary: None,
             vision: None,
             memory_background: None,
             planning: None,
@@ -3077,6 +3079,7 @@ mod tests {
                 "anthropic",
                 "claude-3-5-haiku",
             )),
+            task_summary: None,
             vision: None,
             memory_background: None,
             planning: None,
@@ -3115,6 +3118,7 @@ mod tests {
                 "anthropic",
                 "claude-3-5-haiku",
             )),
+            task_summary: None,
             vision: None,
             memory_background: None,
             planning: None,
@@ -3138,6 +3142,7 @@ mod tests {
         config.defaults = Some(DefaultsConfig {
             chat: bamboo_domain::ProviderModelRef::new("anthropic", "claude-3-7-sonnet"),
             fast: None,
+            task_summary: None,
             vision: None,
             memory_background: None,
             planning: None,
@@ -3176,6 +3181,7 @@ mod tests {
                 "openai",
                 "gpt-4o-mini",
             )),
+            task_summary: None,
             vision: None,
             memory_background: Some(bamboo_domain::ProviderModelRef::new(
                 "anthropic",
@@ -3205,6 +3211,7 @@ mod tests {
                 "anthropic",
                 "claude-3-5-haiku",
             )),
+            task_summary: None,
             vision: None,
             memory_background: None,
             planning: None,
@@ -3243,6 +3250,7 @@ mod tests {
                 "anthropic",
                 "claude-3-5-haiku",
             )),
+            task_summary: None,
             vision: None,
             memory_background: Some(bamboo_domain::ProviderModelRef::new(
                 "anthropic",

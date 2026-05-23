@@ -73,6 +73,14 @@ pub(super) fn strip_existing_task_list(prompt: &str) -> String {
     task::strip_existing_task_list(prompt)
 }
 
+pub(super) fn strip_existing_plan_mode_instructions(prompt: &str) -> String {
+    plan_mode::strip_existing_plan_mode_instructions(prompt)
+}
+
+pub(super) fn strip_existing_plan_runtime_context(prompt: &str) -> String {
+    plan_runtime::strip_existing_plan_runtime_context(prompt)
+}
+
 pub(crate) fn inject_plan_mode_instructions(session: &mut bamboo_agent_core::Session) {
     plan_mode::inject_plan_mode_instructions(session);
 }

@@ -877,7 +877,6 @@ mod tests {
 
     #[test]
     fn plan_mode_allows_read_only_tools_via_classify() {
-        use super::PLAN_MODE_EXEMPT_TOOLS;
 
         // Read-only tools should pass through plan mode
         let read_only_tools = [
@@ -1108,7 +1107,7 @@ mod tests {
         use super::detect_manual_compression_request;
         use bamboo_agent_core::tools::FunctionCall;
         use bamboo_agent_core::tools::ToolCall;
-        use bamboo_agent_core::{Message, Role, Session};
+        use bamboo_agent_core::{Message, Session};
 
         let mut session = Session::new("s1", "m1");
 

@@ -21,7 +21,10 @@ use bamboo_domain::ToolSchema;
 
 use super::common::model_fetcher;
 use super::common::openai_compat::{build_openai_compat_body, parse_openai_compat_sse_data_strict};
-use super::common::openai_responses::{build_responses_body, ResponsesSseParser};
+use super::common::openai_responses::{
+    build_responses_body, select_responses_input_messages, ResponsesInputSource,
+    ResponsesSseParser,
+};
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
 use super::common::sse::llm_stream_from_sse;
@@ -163,6 +166,11 @@ impl OpenAIProvider {
         request_purpose: &str,
         session_log_id: &str,
     ) -> Result<LLMStream> {
+        let input_selection = select_responses_input_messages(messages, responses_options);
+        let input_source = match input_selection.source {
+            ResponsesInputSource::Explicit => "explicit",
+            ResponsesInputSource::Generic => "generic",
+        };
         let mut body = build_responses_body(
             model,
             messages,
@@ -179,7 +187,7 @@ impl OpenAIProvider {
             Some(model),
         );
         tracing::info!(
-            "[{}] OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} [{}]",
+            "[{}] OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} input_source={} input_messages_before={} input_messages_after={} duplicate_system_fallback={} [{}]",
             session_log_id,
             model,
             reasoning_effort
@@ -190,6 +198,10 @@ impl OpenAIProvider {
             max_output_tokens
                 .map(|tokens| tokens.to_string())
                 .unwrap_or_else(|| "none".to_string()),
+            input_source,
+            input_selection.original_len,
+            input_selection.effective_len,
+            input_selection.fallback_removed_duplicate_system,
             request_purpose
         );
 

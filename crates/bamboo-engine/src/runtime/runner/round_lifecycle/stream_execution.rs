@@ -4,6 +4,19 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::runner::prompt_context::{
+    strip_existing_external_memory, strip_existing_plan_mode_instructions,
+    strip_existing_plan_runtime_context, strip_existing_task_list,
+};
+use crate::runtime::runner::session_setup::prompt_envelope::{
+    assemble_prompt_envelope, build_conversation_summary_context_block,
+    build_external_memory_context_block_from_messages,
+    build_plan_mode_context_block_from_messages,
+    build_plan_runtime_context_block_from_messages, build_task_list_context_block,
+    envelope_to_chat_messages, envelope_to_responses_view,
+};
+use crate::runtime::runner::session_setup::prompt_setup::build_stable_prompt_frame;
 use bamboo_agent_core::agent::events::TokenBudgetUsage;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
@@ -11,8 +24,10 @@ use bamboo_compression::PreparedContext;
 use bamboo_domain::ReasoningEffort;
 use bamboo_infrastructure::provider::ResponsesRequestOptions;
 use bamboo_infrastructure::{LLMProvider, LLMRequestOptions};
+use bamboo_tools::exposure::activated_discoverable_tools;
 
 const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
+const CONVERSATION_SUMMARY_START_MARKER: &str = "<!-- CONVERSATION_SUMMARY_START -->";
 
 fn session_previous_response_id(session: &Session) -> Option<&str> {
     session
@@ -132,8 +147,124 @@ fn is_llm_overflow_error(message: &str) -> bool {
         .any(|pattern| normalized.contains(pattern))
 }
 
+fn is_conversation_summary_message(message: &Message) -> bool {
+    matches!(message.role, Role::System)
+        && message.content.contains(CONVERSATION_SUMMARY_START_MARKER)
+}
+
+fn derive_system_remainder_message(message: &Message, stable_instructions: &str) -> Option<Message> {
+    if !matches!(message.role, Role::System) || is_conversation_summary_message(message) {
+        return None;
+    }
+
+    let without_external_memory = strip_existing_external_memory(&message.content);
+    let without_task_list = strip_existing_task_list(&without_external_memory);
+    let without_plan_mode = strip_existing_plan_mode_instructions(&without_task_list);
+    let without_plan_runtime = strip_existing_plan_runtime_context(&without_plan_mode);
+    let trimmed = without_plan_runtime.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let stable_trimmed = stable_instructions.trim();
+    if stable_trimmed.is_empty() {
+        return Some(Message::system(trimmed.to_string()));
+    }
+
+    if trimmed == stable_trimmed {
+        return None;
+    }
+
+    if let Some(remainder) = trimmed.strip_prefix(stable_trimmed) {
+        let remainder = remainder.trim();
+        return (!remainder.is_empty()).then(|| Message::system(remainder.to_string()));
+    }
+
+    Some(Message::system(trimmed.to_string()))
+}
+
+struct PreparedRequestEnvelope {
+    chat_messages: Vec<Message>,
+    responses_input_messages: Vec<Message>,
+    system_remainder_messages: Vec<Message>,
+    dynamic_context_messages: Vec<Message>,
+    conversation_messages: Vec<Message>,
+    instructions: Option<String>,
+    envelope_observability: crate::runtime::runner::session_setup::prompt_envelope::PromptEnvelopeObservability,
+}
+
+fn build_request_envelope(
+    session: &Session,
+    prepared_context: &PreparedContext,
+    config: &AgentLoopConfig,
+    tool_schemas: &[ToolSchema],
+) -> PreparedRequestEnvelope {
+    let activated = activated_discoverable_tools(session);
+    let stable_frame = build_stable_prompt_frame(session, config, tool_schemas, &activated);
+    let stable_instructions = stable_frame.stable_instructions.clone();
+
+    let mut dynamic_blocks = Vec::new();
+    if let Some(block) =
+        build_external_memory_context_block_from_messages(&prepared_context.messages)
+    {
+        dynamic_blocks.push(block);
+    }
+    if let Some(block) = build_task_list_context_block(session) {
+        dynamic_blocks.push(block);
+    }
+    if let Some(block) = build_plan_runtime_context_block_from_messages(&prepared_context.messages)
+    {
+        dynamic_blocks.push(block);
+    }
+    if let Some(block) = build_plan_mode_context_block_from_messages(&prepared_context.messages) {
+        dynamic_blocks.push(block);
+    }
+    if let Some(block) = build_conversation_summary_context_block(session) {
+        dynamic_blocks.push(block);
+    }
+
+    let mut system_remainder_messages = Vec::new();
+    let mut conversation_messages = Vec::new();
+    for message in &prepared_context.messages {
+        if matches!(message.role, Role::System) {
+            if let Some(remainder_message) =
+                derive_system_remainder_message(message, &stable_instructions)
+            {
+                system_remainder_messages.push(remainder_message);
+            }
+        } else {
+            conversation_messages.push(message.clone());
+        }
+    }
+
+    let mut envelope_conversation_messages = system_remainder_messages.clone();
+    envelope_conversation_messages.extend(conversation_messages.clone());
+
+    let envelope = assemble_prompt_envelope(
+        stable_frame,
+        dynamic_blocks,
+        envelope_conversation_messages,
+    );
+    let responses_view = envelope_to_responses_view(&envelope);
+    let chat_messages = envelope_to_chat_messages(&envelope);
+    let responses_input_messages = responses_view.input_messages;
+    let instructions = responses_view.instructions;
+    let envelope_observability = envelope.observability.clone();
+
+    PreparedRequestEnvelope {
+        chat_messages,
+        responses_input_messages,
+        system_remainder_messages,
+        dynamic_context_messages: envelope.dynamic_context_messages.clone(),
+        conversation_messages,
+        instructions,
+        envelope_observability,
+    }
+}
+
 pub(super) async fn execute_llm_stream(
     session: &mut Session,
+    config: &AgentLoopConfig,
     llm: &Arc<dyn LLMProvider>,
     event_tx: &mpsc::Sender<AgentEvent>,
     cancel_token: &CancellationToken,
@@ -154,18 +285,31 @@ pub(super) async fn execute_llm_stream(
     } else {
         None
     };
-    let request_messages = if previous_response_id.is_some() {
-        continuation_messages(&prepared_context.messages)
-            .unwrap_or(prepared_context.messages.as_slice())
+
+    let prepared_envelope = build_request_envelope(session, prepared_context, config, tool_schemas);
+    let request_messages_buf = if previous_response_id.is_some() {
+        let mut delta_messages = prepared_envelope.system_remainder_messages.clone();
+        delta_messages.extend(prepared_envelope.dynamic_context_messages.clone());
+        if let Some(conversation_delta) = continuation_messages(&prepared_envelope.conversation_messages)
+        {
+            delta_messages.extend_from_slice(conversation_delta);
+        } else {
+            delta_messages.extend(prepared_envelope.conversation_messages.clone());
+        }
+        delta_messages
     } else {
-        prepared_context.messages.as_slice()
+        prepared_envelope.chat_messages.clone()
     };
+    let request_messages = request_messages_buf.as_slice();
+
     let mut responses_options = ResponsesRequestOptions {
         store: Some(false),
         // Encourage the model to emit visible narration alongside tool calls.
         text_verbosity: Some("high".to_string()),
         reasoning_summary: Some("auto".to_string()),
         include: Some(vec!["reasoning.encrypted_content".to_string()]),
+        instructions: prepared_envelope.instructions.clone(),
+        input_messages: Some(prepared_envelope.responses_input_messages.clone()),
         ..Default::default()
     };
     if let Some(response_id) = previous_response_id {
@@ -191,18 +335,21 @@ pub(super) async fn execute_llm_stream(
             session_id,
             response_id,
             request_messages.len(),
-            prepared_context.messages.len()
+            request_messages_buf.len()
         );
     }
 
     tracing::info!(
-        "[{}] LLM request: model={}, parallel_tool_calls={:?}, reasoning_effort={:?}, tools={}, messages={}",
+        "[{}] LLM request: model={}, parallel_tool_calls={:?}, reasoning_effort={:?}, tools={}, messages={}, responses_input_messages={}, dynamic_context_messages={}, envelope_blocks={:?}",
         session_id,
         model,
         request_options.parallel_tool_calls,
         request_options.reasoning_effort,
         tool_schemas.len(),
         request_messages.len(),
+        prepared_envelope.responses_input_messages.len(),
+        prepared_envelope.envelope_observability.dynamic_context_message_count,
+        prepared_envelope.envelope_observability.included_block_types,
     );
     let stream = llm
         .chat_stream_with_options(
@@ -262,6 +409,17 @@ pub(super) async fn execute_llm_stream(
     if let Some(ref mut usage) = session.token_usage {
         usage.thinking_tokens = stream_output.thinking_tokens as u32;
         usage.cache_read_input_tokens = stream_output.cache_read_input_tokens as u32;
+    }
+
+    if let Some(usage) = session.token_usage.clone() {
+        let final_budget_event = AgentEvent::TokenBudgetUpdated { usage };
+        if let Err(error) = event_tx.send(final_budget_event).await {
+            tracing::warn!(
+                "[{}] Failed to send final token budget event: {}",
+                session_id,
+                error
+            );
+        }
     }
 
     if stream_output.cache_creation_input_tokens > 0 || stream_output.cache_read_input_tokens > 0 {
