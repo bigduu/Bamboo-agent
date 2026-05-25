@@ -35,7 +35,11 @@ pub(super) fn convert_gemini_tools(
                                 .description
                                 .clone()
                                 .unwrap_or_default(),
-                            parameters: function_declaration.parameters.clone(),
+                            parameters: function_declaration
+                                .parameters_json_schema
+                                .clone()
+                                .or(function_declaration.parameters.clone())
+                                .unwrap_or(serde_json::Value::Null),
                         },
                     };
                     all_schemas.push(schema);

@@ -14,12 +14,14 @@ fn convert_gemini_tools_flattens_function_declarations() {
             GeminiFunctionDeclaration {
                 name: "a".to_string(),
                 description: Some("A".to_string()),
-                parameters: serde_json::json!({"type":"object"}),
+                parameters_json_schema: Some(serde_json::json!({"type":"object"})),
+                parameters: None,
             },
             GeminiFunctionDeclaration {
                 name: "b".to_string(),
                 description: None,
-                parameters: serde_json::json!({"type":"object"}),
+                parameters_json_schema: None,
+                parameters: Some(serde_json::json!({"type":"object"})),
             },
         ],
     }];

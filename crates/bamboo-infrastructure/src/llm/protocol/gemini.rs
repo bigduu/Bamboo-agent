@@ -153,7 +153,25 @@ pub struct GeminiFunctionDeclaration {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub parameters: Value,
+    /// Full JSON Schema for function parameters, sent as `parametersJsonSchema`.
+    /// This field supports the complete JSON Schema spec (including
+    /// `additionalProperties`, `anyOf`, `$ref`, etc.) unlike the older
+    /// `parameters` field which only accepts an OpenAPI 3.0.3 subset.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "parametersJsonSchema",
+        alias = "parameters_json_schema"
+    )]
+    pub parameters_json_schema: Option<Value>,
+    /// Legacy OpenAPI 3.0.3 `parameters` field. Accepted on deserialization
+    /// for backwards compatibility but not serialized by the internal →
+    /// Gemini direction.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "parameters",
+        alias = "parameters"
+    )]
+    pub parameters: Option<Value>,
 }
 
 /// Gemini response format
@@ -274,12 +292,17 @@ impl FromProvider<GeminiTool> for ToolSchema {
             .next()
             .ok_or_else(|| ProtocolError::InvalidToolCall("Empty tool declarations".to_string()))?;
 
+        let parameters = func
+            .parameters_json_schema
+            .or(func.parameters)
+            .unwrap_or(Value::Null);
+
         Ok(ToolSchema {
             schema_type: "function".to_string(),
             function: FunctionSchema {
                 name: func.name,
                 description: func.description.unwrap_or_default(),
-                parameters: func.parameters,
+                parameters,
             },
         })
     }
@@ -434,7 +457,8 @@ impl ToProvider<GeminiTool> for ToolSchema {
             function_declarations: vec![GeminiFunctionDeclaration {
                 name: self.function.name.clone(),
                 description: Some(self.function.description.clone()),
-                parameters: self.function.parameters.clone(),
+                parameters_json_schema: Some(self.function.parameters.clone()),
+                parameters: None,
             }],
         })
     }
@@ -452,7 +476,8 @@ impl ToProvider<Vec<GeminiTool>> for Vec<ToolSchema> {
             .map(|schema| GeminiFunctionDeclaration {
                 name: schema.function.name.clone(),
                 description: Some(schema.function.description.clone()),
-                parameters: schema.function.parameters.clone(),
+                parameters_json_schema: Some(schema.function.parameters.clone()),
+                parameters: None,
             })
             .collect();
 
@@ -806,12 +831,13 @@ mod tests {
             function_declarations: vec![GeminiFunctionDeclaration {
                 name: "search".to_string(),
                 description: Some("Search the web".to_string()),
-                parameters: serde_json::json!({
+                parameters_json_schema: Some(serde_json::json!({
                     "type": "object",
                     "properties": {
                         "q": { "type": "string" }
                     }
-                }),
+                })),
+                parameters: None,
             }],
         };
 
@@ -884,6 +910,214 @@ mod tests {
 
         let result: ProtocolResult<Message> = Message::from_provider(gemini);
         assert!(matches!(result, Err(ProtocolError::InvalidRole(_))));
+    }
+
+    #[test]
+    fn test_to_provider_uses_parameters_json_schema_field() {
+        let tool = ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "bash".to_string(),
+                description: "Run a command".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" }
+                    },
+                    "required": ["command"],
+                    "additionalProperties": false
+                }),
+            },
+        };
+
+        let gemini_tool: GeminiTool = tool.to_provider().unwrap();
+        let decl = &gemini_tool.function_declarations[0];
+
+        // Must use parametersJsonSchema, NOT the legacy parameters field
+        assert!(
+            decl.parameters_json_schema.is_some(),
+            "parameters_json_schema should be set"
+        );
+        assert!(
+            decl.parameters.is_none(),
+            "legacy parameters field should be None"
+        );
+
+        // additionalProperties should be preserved (Gemini accepts it in this field)
+        let schema = decl.parameters_json_schema.as_ref().unwrap();
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["command"]["type"], "string");
+    }
+
+    #[test]
+    fn test_to_provider_serializes_as_parameters_json_schema() {
+        let tool = ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        };
+
+        let gemini_tool: GeminiTool = tool.to_provider().unwrap();
+        let json = serde_json::to_string(&gemini_tool).unwrap();
+
+        assert!(
+            json.contains("parametersJsonSchema"),
+            "serialized JSON should use 'parametersJsonSchema', got: {json}"
+        );
+        assert!(
+            !json.contains("\"parameters\":"),
+            "legacy 'parameters' field should not appear in output, got: {json}"
+        );
+        assert!(
+            json.contains("additionalProperties"),
+            "additionalProperties should be preserved in parametersJsonSchema, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_batch_to_provider_uses_parameters_json_schema() {
+        let tools = vec![
+            ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: "bash".to_string(),
+                    description: "Run".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": { "command": { "type": "string" } },
+                        "additionalProperties": false
+                    }),
+                },
+            },
+            ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: "read".to_string(),
+                    description: "Read".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "options": {
+                                "type": "object",
+                                "properties": {
+                                    "encoding": { "type": "string" }
+                                },
+                                "additionalProperties": false
+                            }
+                        },
+                        "additionalProperties": false
+                    }),
+                },
+            },
+        ];
+
+        let gemini_tools: Vec<GeminiTool> = tools.to_provider().unwrap();
+        let serialized = serde_json::to_string(&gemini_tools).unwrap();
+
+        assert!(
+            serialized.contains("parametersJsonSchema"),
+            "should use parametersJsonSchema, got: {serialized}"
+        );
+        assert!(
+            serialized.contains("additionalProperties"),
+            "additionalProperties should be preserved, got: {serialized}"
+        );
+    }
+
+    #[test]
+    fn test_from_provider_prefers_parameters_json_schema_over_parameters() {
+        let tool_with_both = GeminiTool {
+            function_declarations: vec![GeminiFunctionDeclaration {
+                name: "search".to_string(),
+                description: Some("Search".to_string()),
+                parameters_json_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "q": { "type": "string" } }
+                })),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "query": { "type": "string" } }
+                })),
+            }],
+        };
+
+        let schema: ToolSchema = ToolSchema::from_provider(tool_with_both).unwrap();
+        // Should pick parametersJsonSchema
+        assert_eq!(schema.function.parameters["properties"]["q"]["type"], "string");
+    }
+
+    #[test]
+    fn test_from_provider_falls_back_to_legacy_parameters() {
+        let legacy_tool = GeminiTool {
+            function_declarations: vec![GeminiFunctionDeclaration {
+                name: "legacy".to_string(),
+                description: Some("Legacy tool".to_string()),
+                parameters_json_schema: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "x": { "type": "integer" } }
+                })),
+            }],
+        };
+
+        let schema: ToolSchema = ToolSchema::from_provider(legacy_tool).unwrap();
+        assert_eq!(schema.function.parameters["properties"]["x"]["type"], "integer");
+    }
+
+    #[test]
+    fn test_from_provider_handles_empty_parameters() {
+        let tool_no_params = GeminiTool {
+            function_declarations: vec![GeminiFunctionDeclaration {
+                name: "ping".to_string(),
+                description: Some("Ping".to_string()),
+                parameters_json_schema: None,
+                parameters: None,
+            }],
+        };
+
+        let schema: ToolSchema = ToolSchema::from_provider(tool_no_params).unwrap();
+        assert_eq!(schema.function.name, "ping");
+        assert!(schema.function.parameters.is_null());
+    }
+
+    #[test]
+    fn test_tool_roundtrip_preserves_additional_properties() {
+        let tool = ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "edit".to_string(),
+                description: "Edit a file".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": { "type": "string" }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+            },
+        };
+
+        // Internal → Gemini
+        let gemini: GeminiTool = tool.to_provider().unwrap();
+
+        // Gemini → Internal
+        let roundtrip: ToolSchema = ToolSchema::from_provider(gemini).unwrap();
+
+        assert_eq!(roundtrip.function.name, "edit");
+        assert_eq!(roundtrip.function.parameters["additionalProperties"], false);
+        assert_eq!(roundtrip.function.parameters["required"], serde_json::json!(["path"]));
     }
 
     #[test]
