@@ -40,7 +40,10 @@ pub(super) fn inject_goal_into_system_message(session: &mut Session, goal: Optio
                         base_prompt.trim_end(),
                     );
                 }
-                tracing::debug!("Injected session goal into system message ({} chars)", goal.len());
+                tracing::debug!(
+                    "Injected session goal into system message ({} chars)",
+                    goal.len()
+                );
             }
             None => {
                 system_message.content = base_prompt;
@@ -52,7 +55,10 @@ pub(super) fn inject_goal_into_system_message(session: &mut Session, goal: Optio
             0,
             Message::system(format!("{GOAL_START_MARKER}\n{section}\n{GOAL_END_MARKER}")),
         );
-        tracing::debug!("Created system message with session goal ({} chars)", goal.len());
+        tracing::debug!(
+            "Created system message with session goal ({} chars)",
+            goal.len()
+        );
     }
 }
 

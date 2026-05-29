@@ -849,5 +849,4 @@ mod tests {
         provider.release_agent_loop();
         sleep(Duration::from_millis(50)).await;
     }
-
 }

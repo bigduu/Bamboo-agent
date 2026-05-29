@@ -550,9 +550,11 @@ pub(crate) fn apply_gold_evaluation_result(
     );
     session.updated_at = Utc::now();
 
-    let mut usage = MetricsTokenUsage::default();
-    usage.prompt_tokens = result.prompt_tokens;
-    usage.completion_tokens = result.completion_tokens;
+    let mut usage = MetricsTokenUsage {
+        prompt_tokens: result.prompt_tokens,
+        completion_tokens: result.completion_tokens,
+        ..Default::default()
+    };
     usage.recompute_total();
     usage
 }
@@ -591,7 +593,10 @@ mod tests {
             parsed.missing_information,
             vec!["API key".to_string(), "Database URL".to_string()]
         );
-        assert_eq!(parsed.next_action.as_deref(), Some("Ask the user for the API key"));
+        assert_eq!(
+            parsed.next_action.as_deref(),
+            Some("Ask the user for the API key")
+        );
     }
 
     #[test]
