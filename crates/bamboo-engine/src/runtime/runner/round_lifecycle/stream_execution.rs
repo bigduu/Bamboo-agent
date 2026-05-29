@@ -191,9 +191,16 @@ struct PreparedRequestEnvelope {
     system_remainder_messages: Vec<Message>,
     dynamic_context_messages: Vec<Message>,
     conversation_messages: Vec<Message>,
+    /// Per-round volatile context (recalled memory, task list, plan state),
+    /// rendered as messages and placed after the conversation history so it
+    /// never sits inside the cached prefix.
+    volatile_context_messages: Vec<Message>,
     instructions: Option<String>,
     envelope_observability:
         crate::runtime::runner::session_setup::prompt_envelope::PromptEnvelopeObservability,
+    /// Prompt-cache plan for this request (cacheable system/tools plus rolling
+    /// summary and conversation-tail breakpoints).
+    cache_plan: PromptCachePlan,
 }
 
 fn build_request_envelope(
@@ -206,25 +213,36 @@ fn build_request_envelope(
     let stable_frame = build_stable_prompt_frame(session, config, tool_schemas, &activated);
     let stable_instructions = stable_frame.stable_instructions.clone();
 
-    let mut dynamic_blocks = Vec::new();
+    // Per-round volatile context (recalled memory, task list, plan state) is
+    // placed AFTER the conversation history so it never sits inside the cached
+    // prefix and invalidates it each round. The conversation summary stays at the
+    // front: it represents older history and changes only on re-summarization, so
+    // it is cache-friendly there and gets its own (mostly stable) breakpoint.
+    let mut front_blocks = Vec::new();
+    let mut volatile_blocks = Vec::new();
     if let Some(block) =
         build_external_memory_context_block_from_messages(&prepared_context.messages)
     {
-        dynamic_blocks.push(block);
+        volatile_blocks.push(block);
     }
     if let Some(block) = build_task_list_context_block(session) {
-        dynamic_blocks.push(block);
+        volatile_blocks.push(block);
     }
     if let Some(block) = build_plan_runtime_context_block_from_messages(&prepared_context.messages)
     {
-        dynamic_blocks.push(block);
+        volatile_blocks.push(block);
     }
     if let Some(block) = build_plan_mode_context_block_from_messages(&prepared_context.messages) {
-        dynamic_blocks.push(block);
+        volatile_blocks.push(block);
     }
     if let Some(block) = build_conversation_summary_context_block(session) {
-        dynamic_blocks.push(block);
+        front_blocks.push(block);
     }
+
+    let volatile_context_messages: Vec<Message> = volatile_blocks
+        .iter()
+        .map(|block| block.render_runtime_context_message())
+        .collect();
 
     let mut system_remainder_messages = Vec::new();
     let mut conversation_messages = Vec::new();
@@ -242,14 +260,46 @@ fn build_request_envelope(
 
     let mut envelope_conversation_messages = system_remainder_messages.clone();
     envelope_conversation_messages.extend(conversation_messages.clone());
+    // Last message of the cached region (before the volatile context appended
+    // below). A rolling breakpoint here lets the growing conversation cache
+    // incrementally turn over turn.
+    let conversation_breakpoint_id = envelope_conversation_messages
+        .last()
+        .map(|message| message.id.clone());
 
     let envelope =
-        assemble_prompt_envelope(stable_frame, dynamic_blocks, envelope_conversation_messages);
+        assemble_prompt_envelope(stable_frame, front_blocks, envelope_conversation_messages);
+    // The only front block is the conversation summary (if present); its rendered
+    // message id becomes the summary breakpoint.
+    let summary_breakpoint_id = envelope
+        .dynamic_context_messages
+        .last()
+        .map(|message| message.id.clone());
+
     let responses_view = envelope_to_responses_view(&envelope);
-    let chat_messages = envelope_to_chat_messages(&envelope);
-    let responses_input_messages = responses_view.input_messages;
+    let mut chat_messages = envelope_to_chat_messages(&envelope);
+    chat_messages.extend(volatile_context_messages.clone());
+    let mut responses_input_messages = responses_view.input_messages;
+    responses_input_messages.extend(volatile_context_messages.clone());
     let instructions = responses_view.instructions;
     let envelope_observability = envelope.observability.clone();
+
+    // tools + system + (summary) + (conversation tail) — at most the
+    // 4-breakpoint Anthropic budget. Providers without explicit breakpoints
+    // (OpenAI/Gemini/Copilot) still benefit from the stable-prefix ordering.
+    let mut breakpoint_message_ids = Vec::new();
+    if let Some(id) = summary_breakpoint_id {
+        breakpoint_message_ids.push(id);
+    }
+    if let Some(id) = conversation_breakpoint_id {
+        breakpoint_message_ids.push(id);
+    }
+    let cache_plan = PromptCachePlan {
+        cache_tools: true,
+        cache_system: true,
+        breakpoint_message_ids,
+        ..PromptCachePlan::default()
+    };
 
     PreparedRequestEnvelope {
         chat_messages,
@@ -257,8 +307,10 @@ fn build_request_envelope(
         system_remainder_messages,
         dynamic_context_messages: envelope.dynamic_context_messages.clone(),
         conversation_messages,
+        volatile_context_messages,
         instructions,
         envelope_observability,
+        cache_plan,
     }
 }
 
@@ -297,6 +349,9 @@ pub(super) async fn execute_llm_stream(
         } else {
             delta_messages.extend(prepared_envelope.conversation_messages.clone());
         }
+        // Volatile context is re-sent each turn (it changes every round) and
+        // belongs at the tail, matching the non-delta ordering.
+        delta_messages.extend(prepared_envelope.volatile_context_messages.clone());
         delta_messages
     } else {
         prepared_envelope.chat_messages.clone()
@@ -316,27 +371,20 @@ pub(super) async fn execute_llm_stream(
     if let Some(response_id) = previous_response_id {
         responses_options.previous_response_id = Some(response_id.to_string());
     }
-    // Cache the stable system prompt and tool definitions. The prompt envelope
-    // keeps per-round volatile content (task list, recalled memory, plan state)
-    // in separate context-block messages rather than inside the system prompt,
-    // so the system block is byte-stable across rounds and a system/tools cache
-    // breakpoint reliably hits — giving a stable, non-zero cache read instead of
-    // one that swings with whatever happened to match. (Deeper conversation-tail
-    // caching additionally requires reordering volatile context after the
-    // conversation, which is left as a follow-up because it interacts with the
-    // Responses API previous_response_id delta path.)
-    let cache_plan = PromptCachePlan {
-        cache_tools: true,
-        cache_system: true,
-        ..PromptCachePlan::default()
-    };
+    // Cache plan computed by the envelope: stable system prompt + tool
+    // definitions, plus rolling summary and conversation-tail breakpoints. The
+    // envelope keeps per-round volatile content (task list, recalled memory, plan
+    // state) in trailing context-block messages, so everything up to the
+    // conversation-tail breakpoint is byte-stable across rounds and caches
+    // incrementally — a stable, growing cache read instead of one that swings or
+    // drops to zero.
     let request_options = LLMRequestOptions {
         session_id: Some(session_id.to_string()),
         reasoning_effort,
         parallel_tool_calls: Some(true),
         responses: Some(responses_options),
         request_purpose: Some("agent_loop".to_string()),
-        cache: Some(cache_plan),
+        cache: Some(prepared_envelope.cache_plan.clone()),
     };
 
     if !supports_previous_response_id {

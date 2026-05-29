@@ -366,15 +366,17 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
         .clone();
     assert_eq!(requested_messages.len(), 3);
     assert!(matches!(requested_messages[0].role, Role::System));
+    // Conversation history precedes the volatile context, which is appended at
+    // the tail so it stays out of the cacheable prefix.
     assert!(matches!(requested_messages[1].role, Role::User));
-    assert!(requested_messages[1]
+    assert_eq!(requested_messages[1].content, "continue");
+    assert!(matches!(requested_messages[2].role, Role::User));
+    assert!(requested_messages[2]
         .content
         .contains("context_type: task_snapshot"));
-    assert!(requested_messages[1]
+    assert!(requested_messages[2]
         .content
         .contains("Implement task block wiring"));
-    assert!(matches!(requested_messages[2].role, Role::User));
-    assert_eq!(requested_messages[2].content, "continue");
     assert_eq!(
         llm.requested_instructions
             .lock()
@@ -382,6 +384,50 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
             .as_deref(),
         Some("system")
     );
+}
+
+#[test]
+fn build_request_envelope_tails_volatile_context_and_sets_cache_breakpoints() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-cache-plan", "test-model");
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Agent Tasks".to_string(),
+        items: vec![TaskItem {
+            id: "task-1".to_string(),
+            description: "Cacheable task".to_string(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    let config = test_config("system");
+    let last_user = Message::user("continue");
+    let last_user_id = last_user.id.clone();
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), last_user],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    // Volatile task context is rendered and placed at the very tail, out of the
+    // cacheable prefix.
+    assert_eq!(envelope.volatile_context_messages.len(), 1);
+    let last = envelope.chat_messages.last().expect("chat messages present");
+    assert!(last.content.contains("context_type: task_snapshot"));
+
+    // Plan caches system + tools and puts a rolling breakpoint on the last
+    // conversation message (just before the volatile tail).
+    assert!(envelope.cache_plan.cache_system);
+    assert!(envelope.cache_plan.cache_tools);
+    assert!(envelope.cache_plan.is_breakpoint(&last_user_id));
 }
 
 #[tokio::test]
@@ -560,13 +606,15 @@ async fn execute_llm_stream_continuation_includes_external_memory_dynamic_block(
         .lock()
         .expect("messages lock")
         .clone();
+    // Volatile context (external memory) is re-sent in the delta but now at the
+    // tail, after the conversation continuation.
     assert_eq!(requested_messages.len(), 2);
-    assert!(matches!(requested_messages[0].role, Role::User));
-    assert!(requested_messages[0]
+    assert!(matches!(requested_messages[0].role, Role::Tool));
+    assert!(matches!(requested_messages[1].role, Role::User));
+    assert!(requested_messages[1]
         .content
         .contains("context_type: external_memory"));
-    assert!(requested_messages[0].content.contains("Session note body"));
-    assert!(matches!(requested_messages[1].role, Role::Tool));
+    assert!(requested_messages[1].content.contains("Session note body"));
 }
 
 #[tokio::test]
@@ -627,20 +675,22 @@ async fn execute_llm_stream_continuation_includes_plan_mode_and_runtime_dynamic_
         .lock()
         .expect("messages lock")
         .clone();
+    // Conversation continuation first, then the volatile plan blocks at the tail
+    // (in push order: plan_runtime, then plan_mode).
     assert_eq!(requested_messages.len(), 3);
-    assert!(matches!(requested_messages[0].role, Role::User));
-    assert!(requested_messages[0]
-        .content
-        .contains("context_type: plan_runtime_state"));
-    assert!(requested_messages[0]
-        .content
-        .contains("DURABLE PLAN EXECUTION CONTEXT"));
+    assert!(matches!(requested_messages[0].role, Role::Tool));
     assert!(matches!(requested_messages[1].role, Role::User));
     assert!(requested_messages[1]
         .content
+        .contains("context_type: plan_runtime_state"));
+    assert!(requested_messages[1]
+        .content
+        .contains("DURABLE PLAN EXECUTION CONTEXT"));
+    assert!(matches!(requested_messages[2].role, Role::User));
+    assert!(requested_messages[2]
+        .content
         .contains("context_type: plan_mode_state"));
-    assert!(requested_messages[1].content.contains("PLAN MODE ACTIVE"));
-    assert!(matches!(requested_messages[2].role, Role::Tool));
+    assert!(requested_messages[2].content.contains("PLAN MODE ACTIVE"));
 }
 
 #[tokio::test]
