@@ -111,9 +111,25 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> imp
         .filter(|message| !crate::session_app::execute::is_hidden_from_ui(message))
         .collect();
 
-    HttpResponse::Ok().json(serde_json::json!({
+    // Include the session-level gold config so the frontend can update its
+    // local session summary after sync-recovery without an extra round-trip.
+    let gold_config = session
+        .metadata
+        .get(crate::model_config_helper::GOLD_CONFIG_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<bamboo_engine::config::GoldConfig>(raw).ok());
+
+    let mut response = serde_json::json!({
         "session_id": session_id,
         "messages": messages,
         "compression_events": session.compression_events
-    }))
+    });
+
+    if let Some(gc) = gold_config {
+        response
+            .as_object_mut()
+            .unwrap()
+            .insert("gold_config".to_string(), serde_json::to_value(gc).unwrap());
+    }
+
+    HttpResponse::Ok().json(response)
 }

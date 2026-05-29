@@ -543,7 +543,11 @@ mod tests {
         // Header values cannot contain newlines.
         let v = resolve_csp_header_value(Some("default-src 'self'\nscript-src 'self'"));
         let rendered = v.to_str().expect("header should be valid utf-8");
-        assert!(rendered.contains("connect-src 'self' ws: wss: http://bodhi.bigduu.com:9562 https://bodhi.bigduu.com:9562;"));
+        assert!(rendered.contains("connect-src 'self' ws: wss:"));
+        assert!(rendered.contains("http://127.0.0.1:*"));
+        assert!(rendered.contains("http://localhost:*"));
+        assert!(rendered.contains("http://bodhi.bigduu.com:9562"));
+        assert!(rendered.contains("https://bodhi.bigduu.com:9562"));
         assert!(rendered.contains("style-src 'self' 'unsafe-inline'"));
     }
 

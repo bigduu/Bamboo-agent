@@ -1,6 +1,7 @@
 use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
+use crate::model_config_helper::normalize_gold_config_json;
 use crate::session_app::metadata::{MetadataError, SessionMetadataService};
 use crate::session_app::provider_model::{
     derive_model_ref, persist_legacy_model_provider, persist_model_ref,
@@ -40,6 +41,41 @@ pub async fn patch_session(
 
     if let Some(pinned) = req.pinned {
         match SessionMetadataService::set_pinned(state.get_ref(), &session_id, pinned).await {
+            Ok(_) => {}
+            Err(MetadataError::NotFound(id)) => {
+                return Ok(HttpResponse::NotFound().json(serde_json::json!({
+                    "error": "Session not found",
+                    "session_id": id
+                })));
+            }
+            Err(err) => {
+                return Err(actix_web::error::ErrorInternalServerError(err.to_string()));
+            }
+        }
+    }
+
+    if req.gold_config.is_some() {
+        let gold_config_json = match req
+            .gold_config
+            .as_ref()
+            .map(normalize_gold_config_json)
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+                    "error": "Invalid gold_config",
+                    "message": error.to_string()
+                })));
+            }
+        };
+        match SessionMetadataService::set_gold_config_json(
+            state.get_ref(),
+            &session_id,
+            gold_config_json,
+        )
+        .await
+        {
             Ok(_) => {}
             Err(MetadataError::NotFound(id)) => {
                 return Ok(HttpResponse::NotFound().json(serde_json::json!({

@@ -1,9 +1,10 @@
 use bamboo_agent_core::Message;
 use bamboo_agent_core::PendingQuestion;
+use bamboo_agent_core::PendingQuestionSource;
 use bamboo_agent_core::Session;
 
 use crate::session_app::respond::{
-    update_or_append_tool_result_message, validate_pending_response,
+    update_or_append_tool_result_message, validate_pending_response, ResponseSource,
 };
 
 fn pending_question(allow_custom: bool) -> PendingQuestion {
@@ -13,6 +14,7 @@ fn pending_question(allow_custom: bool) -> PendingQuestion {
         question: "Pick one".to_string(),
         options: vec!["A".to_string(), "B".to_string()],
         allow_custom,
+        source: PendingQuestionSource::PauseTool,
     }
 }
 
@@ -35,11 +37,12 @@ fn update_or_append_tool_result_message_updates_existing_message() {
     let mut session = Session::new("session-1", "test-model");
     session.add_message(Message::tool_result("tool-1", "placeholder"));
 
-    let updated = update_or_append_tool_result_message(&mut session, "tool-1", "A");
+    let updated =
+        update_or_append_tool_result_message(&mut session, "tool-1", "A", ResponseSource::Human);
 
     assert!(updated);
     assert_eq!(session.messages.len(), 1);
-    assert_eq!(session.messages[0].content, "User selected: A");
+    assert_eq!(session.messages[0].content, "Selected response: A");
 }
 
 #[test]
@@ -47,10 +50,11 @@ fn update_or_append_tool_result_message_appends_when_placeholder_is_missing() {
     let mut session = Session::new("session-1", "test-model");
     session.add_message(Message::assistant("no tool result", None));
 
-    let updated = update_or_append_tool_result_message(&mut session, "tool-1", "B");
+    let updated =
+        update_or_append_tool_result_message(&mut session, "tool-1", "B", ResponseSource::Human);
 
     assert!(!updated);
     assert_eq!(session.messages.len(), 2);
     assert_eq!(session.messages[1].tool_call_id.as_deref(), Some("tool-1"));
-    assert_eq!(session.messages[1].content, "User selected: B");
+    assert_eq!(session.messages[1].content, "Selected response: B");
 }

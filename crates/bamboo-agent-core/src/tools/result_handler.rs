@@ -9,7 +9,7 @@ use crate::tools::{
     convert_from_standard_result, AgenticToolResult, ToolCall, ToolError, ToolExecutionContext,
     ToolExecutor, ToolResult,
 };
-use crate::{AgentEvent, Message, Session};
+use crate::{AgentEvent, Message, PendingQuestionSource, Session};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolHandlingOutcome {
@@ -246,12 +246,16 @@ pub async fn handle_tool_result_with_agentic_support(
             ToolHandlingOutcome::Continue
         }
         AgenticToolResult::NeedClarification { question, options } => {
-            send_clarification_request(event_tx, question.clone(), options).await;
+            send_clarification_request(
+                event_tx,
+                question.clone(),
+                options.clone(),
+                Some(tool_call.id.clone()),
+                Some(tool_call.function.name.clone()),
+            )
+            .await;
 
-            session.add_message(Message::tool_result(
-                tool_call.id.clone(),
-                format!("Clarification needed: {question}"),
-            ));
+            persist_agentic_clarification(session, tool_call, question, options);
 
             ToolHandlingOutcome::AwaitingClarification
         }
@@ -269,16 +273,44 @@ pub async fn handle_tool_result_with_agentic_support(
     }
 }
 
+fn persist_agentic_clarification(
+    session: &mut Session,
+    tool_call: &ToolCall,
+    question: String,
+    options: Option<Vec<String>>,
+) {
+    let normalized_options = options.unwrap_or_default();
+    session.set_pending_question_with_source(
+        tool_call.id.clone(),
+        tool_call.function.name.clone(),
+        question.clone(),
+        normalized_options,
+        true,
+        PendingQuestionSource::AgenticClarification,
+    );
+    session.metadata.insert(
+        "runtime.suspend_reason".to_string(),
+        "awaiting_clarification".to_string(),
+    );
+    session.add_message(Message::tool_result(
+        tool_call.id.clone(),
+        format!("Clarification needed: {question}"),
+    ));
+}
+
 pub async fn send_clarification_request(
     event_tx: &mpsc::Sender<AgentEvent>,
     question: String,
     options: Option<Vec<String>>,
+    tool_call_id: Option<String>,
+    tool_name: Option<String>,
 ) {
     let _ = event_tx
         .send(AgentEvent::NeedClarification {
             question,
             options,
-            tool_call_id: None,
+            tool_call_id,
+            tool_name,
             allow_custom: true,
         })
         .await;
@@ -361,11 +393,15 @@ pub async fn execute_sub_actions(
                         ));
                     }
                     Some(AgenticToolResult::NeedClarification { question, options }) => {
-                        send_clarification_request(event_tx, question.clone(), options).await;
-                        session.add_message(Message::tool_result(
-                            action.id.clone(),
-                            format!("Clarification needed: {question}"),
-                        ));
+                        send_clarification_request(
+                            event_tx,
+                            question.clone(),
+                            options.clone(),
+                            Some(action.id.clone()),
+                            Some(action.function.name.clone()),
+                        )
+                        .await;
+                        persist_agentic_clarification(session, &action, question, options);
                         return ToolHandlingOutcome::AwaitingClarification;
                     }
                     Some(AgenticToolResult::NeedMoreActions {

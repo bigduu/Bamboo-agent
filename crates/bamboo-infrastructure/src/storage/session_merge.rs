@@ -39,6 +39,8 @@ use bamboo_domain::RuntimeSessionPersistence;
 use dashmap::DashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+const AUTHORITATIVE_METADATA_KEYS: &[&str] = &["gold_config"];
+
 // ── LockedSessionStore ────────────────────────────────────────────────
 
 /// Wraps a [`Storage`] implementation with per-session write serialization.
@@ -135,6 +137,13 @@ async fn merge_authoritative_metadata_into_stale(
             session.title = latest.title;
             session.title_version = latest.title_version;
             session.pinned = latest.pinned;
+            for key in AUTHORITATIVE_METADATA_KEYS {
+                if let Some(value) = latest.metadata.get(*key) {
+                    session.metadata.insert((*key).to_string(), value.clone());
+                } else {
+                    session.metadata.remove(*key);
+                }
+            }
             session.metadata_version = latest.metadata_version;
         }
     }

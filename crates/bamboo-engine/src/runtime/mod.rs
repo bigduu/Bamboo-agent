@@ -5,6 +5,7 @@ pub mod complexity_classifier;
 pub mod config;
 pub mod context;
 pub mod execution;
+pub mod gold_evaluation;
 pub mod hooks;
 pub mod managers;
 pub mod runner;
@@ -16,7 +17,7 @@ pub mod task_evaluation;
 pub use agent::{Agent, AgentBuilder};
 pub use bamboo_domain::RuntimeSessionPersistence;
 pub use complexity_classifier::{ComplexityClassifier, TaskComplexity};
-pub use config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
+pub use config::{AgentLoopConfig, GoldConfig, ImageFallbackConfig, ImageFallbackMode};
 pub use execution::runner_state::{AgentRunner, AgentStatus};
 pub use hooks::HookRunner;
 pub use managers::{

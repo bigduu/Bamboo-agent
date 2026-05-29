@@ -18,6 +18,7 @@ use crate::model_config_helper::{
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::tools::ToolSurface;
 
+use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::agent_spawn::SessionExecutionArgs;
 use bamboo_engine::{AuxiliaryModelConfig, ImageFallbackConfig};
 use bamboo_infrastructure::{Config, LLMProvider};
@@ -46,6 +47,7 @@ pub(crate) struct SpawnAgentExecution {
     pub(crate) cancel_token: CancellationToken,
     pub(crate) mpsc_tx: mpsc::Sender<bamboo_agent_core::AgentEvent>,
     pub(crate) image_fallback: Option<ImageFallbackConfig>,
+    pub(crate) gold_config: Option<GoldConfig>,
     pub(crate) app_data_dir: Option<std::path::PathBuf>,
 }
 
@@ -90,14 +92,18 @@ pub(crate) fn make_auxiliary_model_resolver(
 ) -> Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync> {
     let config = state.config.clone();
     let cached_config = Arc::new(StdRwLock::new(
-        config.try_read().map(|guard| guard.clone()).unwrap_or_default(),
+        config
+            .try_read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default(),
     ));
     let provider_registry = state.provider_registry.clone();
     let provider_name = provider_name.to_string();
 
     Arc::new(move || {
         let config_snapshot = read_config_snapshot(&config, cached_config.as_ref());
-        let resolved_fast = resolve_fast_model(&config_snapshot, &provider_name, &provider_registry);
+        let resolved_fast =
+            resolve_fast_model(&config_snapshot, &provider_name, &provider_registry);
         let resolved_background =
             resolve_background_model(&config_snapshot, &provider_name, &provider_registry);
         let resolved_summarization =
@@ -173,6 +179,7 @@ pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
         cancel_token: args.cancel_token,
         mpsc_tx: args.mpsc_tx,
         image_fallback: args.image_fallback,
+        gold_config: args.gold_config,
         app_data_dir: args.app_data_dir,
         runners: args.state.agent_runners.clone(),
         sessions_cache: args.state.sessions.clone(),
@@ -198,10 +205,7 @@ mod tests {
 
             assert_eq!(snapshot.provider, "copilot");
             assert_eq!(
-                cached_config
-                    .read()
-                    .expect("cached snapshot lock")
-                    .provider,
+                cached_config.read().expect("cached snapshot lock").provider,
                 "copilot"
             );
         });

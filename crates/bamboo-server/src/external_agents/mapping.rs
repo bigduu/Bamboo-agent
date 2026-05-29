@@ -142,6 +142,7 @@ impl A2AEventMapper {
                     question,
                     options: None,
                     tool_call_id: None,
+                    tool_name: None,
                     allow_custom: true,
                 });
             }
@@ -151,6 +152,7 @@ impl A2AEventMapper {
                     question,
                     options: None,
                     tool_call_id: None,
+                    tool_name: None,
                     allow_custom: true,
                 });
             }

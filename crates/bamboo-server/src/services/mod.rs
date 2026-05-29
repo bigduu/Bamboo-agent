@@ -6,4 +6,5 @@
 pub mod auto_dream;
 pub mod frontend_package;
 pub mod gemini_model_mapping_service;
+pub mod gold_auto_answer;
 pub mod skill_service;

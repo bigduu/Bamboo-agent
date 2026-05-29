@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::ProviderModelRef;
+use bamboo_engine::config::GoldConfig;
 use bamboo_infrastructure::SessionIndexEntry;
+
+use crate::model_config_helper::parse_session_gold_config;
 
 #[derive(Debug, Serialize)]
 pub struct SessionSummary {
@@ -56,6 +59,8 @@ pub struct SessionSummary {
     /// Computed dynamically at query time by scanning running sessions.
     #[serde(default)]
     pub running_child_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gold_config: Option<GoldConfig>,
 }
 
 impl SessionSummary {
@@ -88,6 +93,7 @@ impl SessionSummary {
             has_pending_question: entry.has_pending_question,
             plan_mode: entry.plan_mode,
             running_child_count: 0,
+            gold_config: parse_session_gold_config(entry.gold_config_json.as_deref()),
         }
     }
 }
@@ -135,6 +141,8 @@ pub struct CreateSessionRequest {
     pub model_ref: Option<ProviderModelRef>,
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub gold_config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,6 +209,8 @@ pub struct PatchSessionRequest {
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     pub clear_reasoning_effort: Option<bool>,
+    #[serde(default)]
+    pub gold_config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,6 +269,7 @@ mod tests {
             provider: None,
             model_ref: None,
             reasoning_effort: None,
+            gold_config: None,
         };
 
         let debug_str = format!("{:?}", req);
@@ -357,6 +368,7 @@ mod tests {
             has_pending_question: false,
             plan_mode: None,
             running_child_count: 0,
+            gold_config: None,
         };
 
         let response = CreateSessionResponse { session: summary };
@@ -396,6 +408,7 @@ mod tests {
             has_pending_question: false,
             plan_mode: None,
             running_child_count: 0,
+            gold_config: None,
         };
 
         let response = GetSessionResponse { session: summary };
@@ -522,6 +535,7 @@ mod tests {
             has_pending_question: false,
             plan_mode: None,
             running_child_count: 0,
+            gold_config: None,
         };
 
         let debug_str = format!("{:?}", summary);

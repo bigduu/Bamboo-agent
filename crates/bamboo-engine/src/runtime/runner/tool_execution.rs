@@ -877,7 +877,6 @@ mod tests {
 
     #[test]
     fn plan_mode_allows_read_only_tools_via_classify() {
-
         // Read-only tools should pass through plan mode
         let read_only_tools = [
             "Read",

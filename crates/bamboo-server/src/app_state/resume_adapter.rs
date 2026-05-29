@@ -7,7 +7,8 @@
 //! Rust's orphan rules (can't impl a foreign trait on a foreign type).
 
 use crate::model_config_helper::{
-    resolve_background_model, resolve_fast_model, resolve_provider_type, resolve_task_summary_model,
+    resolve_background_model, resolve_fast_model, resolve_gold_config, resolve_provider_type,
+    resolve_task_summary_model, GOLD_CONFIG_METADATA_KEY,
 };
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
@@ -121,11 +122,25 @@ impl ResumeExecutionPort for AppStateResumeRef {
             .unwrap_or_default();
 
         let image_fallback = config.image_fallback.clone();
+        let gold_config = resolve_gold_config(
+            &config_snapshot,
+            session
+                .metadata
+                .get(GOLD_CONFIG_METADATA_KEY)
+                .map(String::as_str),
+        )
+        .or(config.gold_config.clone());
 
         let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel::<bamboo_agent_core::AgentEvent>(100);
 
         let state = self.0.clone();
-        spawn_event_forwarder(state.clone(), session_id.clone(), mpsc_rx, event_sender);
+        spawn_event_forwarder(
+            state.clone(),
+            session_id.clone(),
+            mpsc_rx,
+            event_sender,
+            gold_config.clone(),
+        );
 
         spawn_agent_execution(SpawnAgentExecution {
             state: state.clone(),
@@ -149,6 +164,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
             cancel_token,
             mpsc_tx,
             image_fallback,
+            gold_config,
             app_data_dir: Some(state.app_data_dir.clone()),
         });
     }

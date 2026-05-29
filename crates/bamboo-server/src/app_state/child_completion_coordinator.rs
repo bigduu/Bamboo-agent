@@ -26,7 +26,8 @@ use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
 
 use crate::model_config_helper::{
-    resolve_background_model, resolve_fast_model, resolve_provider_type, resolve_task_summary_model,
+    resolve_background_model, resolve_fast_model, resolve_gold_config, resolve_provider_type,
+    resolve_task_summary_model, GOLD_CONFIG_METADATA_KEY,
 };
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::session_app::resume::{
@@ -276,6 +277,13 @@ impl ChildCompletionCoordinator {
                 )
                 .ok()
                 .flatten(),
+            gold_config: resolve_gold_config(
+                config_snapshot,
+                session
+                    .metadata
+                    .get(GOLD_CONFIG_METADATA_KEY)
+                    .map(String::as_str),
+            ),
         }
     }
 
@@ -518,6 +526,14 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             .get("reasoning_effort_source")
             .cloned()
             .unwrap_or_default();
+        let gold_config = resolve_gold_config(
+            &config_snapshot,
+            session
+                .metadata
+                .get(GOLD_CONFIG_METADATA_KEY)
+                .map(String::as_str),
+        )
+        .or(config.gold_config.clone());
 
         let (mpsc_tx, _forwarder) =
             create_event_forwarder(session_id.clone(), event_sender, self.agent_runners.clone());
@@ -578,6 +594,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             cancel_token,
             mpsc_tx,
             image_fallback: config.image_fallback,
+            gold_config,
             app_data_dir: Some(self.app_data_dir.clone()),
             runners: self.agent_runners.clone(),
             sessions_cache: self.sessions.clone(),
@@ -712,10 +729,7 @@ mod tests {
 
             assert_eq!(snapshot.provider, "copilot");
             assert_eq!(
-                cached_config
-                    .read()
-                    .expect("cached snapshot lock")
-                    .provider,
+                cached_config.read().expect("cached snapshot lock").provider,
                 "copilot"
             );
         });

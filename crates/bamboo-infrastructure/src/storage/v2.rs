@@ -63,6 +63,10 @@ pub struct SessionIndexEntry {
     pub model_ref: Option<ProviderModelRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Raw session-level Gold config JSON mirrored from `session.metadata["gold_config"]`.
+    /// Kept as a string here to avoid making infrastructure depend on bamboo-engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gold_config_json: Option<String>,
     /// If the session was created by a schedule, store the schedule id here for fast filtering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_schedule_id: Option<String>,
@@ -351,6 +355,11 @@ impl SessionStoreV2 {
             .get("subagent_type")
             .cloned()
             .filter(|v| !v.trim().is_empty());
+        let gold_config_json = session
+            .metadata
+            .get("gold_config")
+            .cloned()
+            .filter(|v| !v.trim().is_empty());
         let plan_mode = session
             .agent_runtime_state
             .as_ref()
@@ -371,6 +380,7 @@ impl SessionStoreV2 {
                     model: session.model.clone(),
                     model_ref: session.model_ref.clone(),
                     reasoning_effort: session.reasoning_effort,
+                    gold_config_json,
                     created_by_schedule_id,
                     schedule_run_id,
                     created_at: session.created_at,

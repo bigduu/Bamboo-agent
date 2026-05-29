@@ -2,6 +2,12 @@ use actix_web::{web, HttpResponse, Responder};
 
 use super::{ChatRequest, ChatResponse};
 use crate::app_state::AppState;
+use crate::model_config_helper::{
+    parse_session_gold_config, resolve_gold_config, GOLD_CONFIG_METADATA_KEY,
+};
+use crate::session_app::chat::{parse_goal_command, GoalCommand};
+use crate::session_app::metadata::SessionMetadataService;
+use bamboo_engine::config::GoldConfig;
 
 mod images;
 mod request;
@@ -25,29 +31,6 @@ mod tests;
 /// This endpoint accepts a user message and creates or updates a chat session.
 /// After calling this endpoint, use the returned `stream_url` to execute
 /// the agent and receive events.
-///
-/// # HTTP Method
-///
-/// `POST /api/v1/chat`
-///
-/// # Request Body
-///
-/// JSON-encoded [`ChatRequest`]
-///
-/// # Response
-///
-/// - `201 Created` - Chat message created successfully, returns [`ChatResponse`]
-/// - `400 Bad Request` - Missing required `model` field
-/// - `500 Internal Server Error` - Failed to load or save session
-///
-/// # Workflow
-///
-/// 1. Validates that `model` is provided and non-empty
-/// 2. Loads existing session from memory or storage, or creates a new one
-/// 3. Builds system prompt from `base_prompt`, `enhance_prompt`, and `workspace_path`
-/// 4. Adds the user message to the session
-/// 5. Persists the session to storage
-/// 6. Returns session ID and stream URL for subsequent execution
 pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) -> impl Responder {
     let session_id = request::resolve_session_id(req.session_id.as_deref());
     let model = match request::validate_and_normalize_model(req.model.as_str()) {
@@ -101,6 +84,11 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         }
     };
 
+    // ---- Goal command interception ----
+    if let Some(goal_cmd) = parse_goal_command(&req.message) {
+        return handle_goal_command(state.as_ref(), &session_id, &goal_cmd).await;
+    }
+
     // Image handling stays in the handler layer (depends on AppState attachment reader).
     if let Err(response) =
         images::append_user_message(&state, &mut session, &req.message, req.images.as_deref()).await
@@ -115,6 +103,178 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         session_id: session_id.clone(),
         stream_url: format!("/api/v1/events/{}", session_id),
         status: "streaming".to_string(),
+        goal_command: None,
+    })
+}
+
+/// Additional response payload for `/goal` control commands.
+#[derive(Debug, serde::Serialize)]
+pub struct GoalCommandResponse {
+    /// The action taken: "status", "off", "clear", "on", "set_prompt", "on_no_prompt".
+    pub action: String,
+    /// Whether the frontend should proceed with execute after this response.
+    pub should_execute: bool,
+    /// The updated (or current) gold config for this session.
+    pub gold_config: Option<GoldConfig>,
+}
+
+/// Handle a parsed `/goal` command by updating session metadata and optionally
+/// injecting a hidden resume message to trigger the Gold mini-loop.
+async fn handle_goal_command(
+    state: &AppState,
+    session_id: &str,
+    cmd: &GoalCommand,
+) -> HttpResponse {
+    let config_snapshot = state.config.read().await.clone();
+
+    // Load current session to read the existing gold_config override.
+    let session = match state.load_session_merged(session_id).await {
+        Some(s) => s,
+        None => {
+            return HttpResponse::NotFound().json(serde_json::json!({
+                "error": "Session not found",
+                "session_id": session_id
+            }));
+        }
+    };
+
+    // Resolve the current effective gold config (session override → global default).
+    let current_json = session.metadata.get(GOLD_CONFIG_METADATA_KEY).cloned();
+    let current_effective = resolve_gold_config(&config_snapshot, current_json.as_deref());
+
+    let (new_config, should_resume) = match cmd {
+        GoalCommand::Status => {
+            let response_config = current_effective.clone();
+            return HttpResponse::Ok().json(ChatResponse {
+                session_id: session_id.to_string(),
+                stream_url: format!("/api/v1/events/{}", session_id),
+                status: "accepted".to_string(),
+                goal_command: Some(GoalCommandResponse {
+                    action: "status".to_string(),
+                    should_execute: false,
+                    gold_config: response_config,
+                }),
+            });
+        }
+        GoalCommand::Off => {
+            let mut cfg = current_effective.unwrap_or_default();
+            cfg.enabled = false;
+            cfg.auto_answer_enabled = false;
+            cfg.auto_continue_enabled = false;
+            (cfg, false)
+        }
+        GoalCommand::Clear => {
+            let mut cfg = current_effective.unwrap_or_default();
+            cfg.enabled = false;
+            cfg.auto_answer_enabled = false;
+            cfg.auto_continue_enabled = false;
+            cfg.goal = None;
+            cfg.evaluation_prompt = None;
+            (cfg, false)
+        }
+        GoalCommand::On => {
+            let mut cfg = current_effective.unwrap_or_default();
+            let has_prompt = cfg.effective_goal().is_some();
+            if !has_prompt {
+                return HttpResponse::Ok().json(ChatResponse {
+                    session_id: session_id.to_string(),
+                    stream_url: format!("/api/v1/events/{}", session_id),
+                    status: "accepted".to_string(),
+                    goal_command: Some(GoalCommandResponse {
+                        action: "on_no_prompt".to_string(),
+                        should_execute: false,
+                        gold_config: Some(cfg),
+                    }),
+                });
+            }
+            cfg.enabled = true;
+            cfg.auto_answer_enabled = true;
+            cfg.auto_continue_enabled = true;
+            (cfg, false)
+        }
+        GoalCommand::SetPrompt(prompt) => {
+            let mut cfg = current_effective.unwrap_or_default();
+            cfg.enabled = true;
+            cfg.auto_answer_enabled = true;
+            cfg.auto_continue_enabled = true;
+            cfg.goal = Some(prompt.clone());
+            (cfg, true)
+        }
+    };
+
+    // Serialize the new config and persist via authoritative metadata writer.
+    let new_json = serde_json::to_string(&new_config).ok();
+    match SessionMetadataService::set_gold_config_json(state, session_id, new_json.clone()).await {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(session_id = %session_id, "Failed to persist gold_config: {e}");
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("Failed to update goal config: {e}")
+            }));
+        }
+    }
+
+    // For `/goal <prompt>`, inject a runtime instruction that opens a brief
+    // goal-clarification turn, and reset gold auto-continue counters so the
+    // mini-loop starts fresh.
+    if should_resume {
+        if let Some(mut session) = state.load_session_merged(session_id).await {
+            // Reset gold auto-continue runtime state.
+            session.metadata.remove("gold.auto_continue_count");
+            session.metadata.remove("gold.last_continue_requested_at");
+            session.metadata.remove("gold.last_evaluation");
+            session.metadata.remove("gold.last_decision");
+            session.metadata.remove("gold.last_confidence");
+
+            // Reset runtime suspension so execute can proceed.
+            if let Some(runtime_state) = session.agent_runtime_state.as_mut() {
+                runtime_state.status = bamboo_domain::AgentStatusState::Idle;
+                runtime_state.suspension = None;
+                runtime_state.waiting_for_children = None;
+            }
+            session.metadata.remove("runtime.suspend_reason");
+
+            // Read the goal text back so we can echo it into the discussion turn.
+            let goal_text = parse_session_gold_config(new_json.as_deref())
+                .as_ref()
+                .and_then(|cfg| cfg.effective_goal().map(str::to_string))
+                .unwrap_or_default();
+
+            // Inject a runtime instruction that asks the agent to discuss the
+            // goal with the user before executing. The instruction itself is
+            // hidden from the UI; the agent's visible reply IS the discussion.
+            let instruction = format!(
+                "The user has set a session goal:\n\n{goal_text}\n\nBefore taking any action, briefly confirm your understanding of this goal, surface any ambiguities or assumptions, and outline how you plan to achieve it. If anything is genuinely unclear or you need a decision from the user, ask them now. Otherwise, state your plan and begin working toward the goal."
+            );
+            let mut resume_msg = bamboo_domain::Message::user(instruction);
+            resume_msg.metadata = Some(serde_json::json!({
+                "hidden_from_ui": true,
+                "runtime_kind": "gold_goal_resume"
+            }));
+            session.add_message(resume_msg);
+
+            state.save_and_cache_session(&mut session).await;
+        }
+    }
+
+    // Parse back the persisted config for the response.
+    let response_config = parse_session_gold_config(new_json.as_deref());
+
+    HttpResponse::Ok().json(ChatResponse {
+        session_id: session_id.to_string(),
+        stream_url: format!("/api/v1/events/{}", session_id),
+        status: "accepted".to_string(),
+        goal_command: Some(GoalCommandResponse {
+            action: match cmd {
+                GoalCommand::Off => "off".to_string(),
+                GoalCommand::Clear => "clear".to_string(),
+                GoalCommand::On => "on".to_string(),
+                GoalCommand::SetPrompt(_) => "set_prompt".to_string(),
+                GoalCommand::Status => unreachable!(),
+            },
+            should_execute: should_resume,
+            gold_config: response_config,
+        }),
     })
 }
 

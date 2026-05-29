@@ -39,6 +39,7 @@ use chrono::Utc;
 
 use crate::app_state::AppState;
 use crate::events::publish_replayable_session_event;
+use crate::model_config_helper::GOLD_CONFIG_METADATA_KEY;
 use crate::title_gen::is_untitled;
 
 /// Errors returned by [`SessionMetadataService`].
@@ -194,6 +195,57 @@ impl SessionMetadataService {
         publish_replayable_session_event(state, session_id, event).await;
 
         Ok(Some(pinned))
+    }
+
+    /// Set or clear the session-level Gold configuration JSON.
+    ///
+    /// This is an authoritative session metadata write: it bumps
+    /// `metadata_version` so runtime saves with stale session structs do not
+    /// overwrite the user's current-session Gold settings.
+    pub async fn set_gold_config_json(
+        state: &AppState,
+        session_id: &str,
+        gold_config_json: Option<String>,
+    ) -> Result<MetadataChange<Option<String>>, MetadataError> {
+        let normalized = gold_config_json.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+        let _guard = state.persistence.acquire_lock(session_id).await;
+        let mut session = load_latest(state, session_id).await?;
+        let current = session
+            .metadata
+            .get(GOLD_CONFIG_METADATA_KEY)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if current == normalized {
+            return Ok(None);
+        }
+
+        if let Some(value) = normalized.as_ref() {
+            session
+                .metadata
+                .insert(GOLD_CONFIG_METADATA_KEY.to_string(), value.clone());
+        } else {
+            session.metadata.remove(GOLD_CONFIG_METADATA_KEY);
+        }
+        session.metadata_version = session.metadata_version.saturating_add(1);
+        session.updated_at = Utc::now();
+
+        state
+            .persistence
+            .storage()
+            .save_session(&session)
+            .await
+            .map_err(|e| MetadataError::Storage(format!("save_session: {e}")))?;
+        refresh_in_memory_cache(state, session_id, session).await;
+
+        Ok(Some(normalized))
     }
 }
 

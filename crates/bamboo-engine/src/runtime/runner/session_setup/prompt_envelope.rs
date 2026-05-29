@@ -77,7 +77,10 @@ pub(crate) fn assemble_prompt_envelope(
         conversation_message_count: conversation_messages.len(),
         stable_prefix_hash: None,
         dynamic_context_hash: None,
-        included_block_types: dynamic_blocks.iter().map(|block| block.block_type).collect(),
+        included_block_types: dynamic_blocks
+            .iter()
+            .map(|block| block.block_type)
+            .collect(),
     };
 
     PromptEnvelope {
@@ -97,7 +100,9 @@ pub(crate) fn envelope_to_chat_messages(envelope: &PromptEnvelope) -> Vec<Messag
     let mut messages = Vec::new();
 
     if !envelope.stable_instructions.trim().is_empty() {
-        messages.push(Message::system(envelope.stable_instructions.trim().to_string()));
+        messages.push(Message::system(
+            envelope.stable_instructions.trim().to_string(),
+        ));
     }
 
     messages.extend(envelope.stable_prefix_messages.clone());
@@ -309,9 +314,7 @@ mod tests {
         assert_eq!(rendered.role, Role::User);
         assert!(rendered.content.contains("BAMBOO_CONTEXT_BLOCK_START"));
         assert!(rendered.content.contains("context_type: task_snapshot"));
-        assert!(rendered
-            .content
-            .contains("It is not a new user request."));
+        assert!(rendered.content.contains("It is not a new user request."));
         assert!(rendered.never_compress);
         assert!(rendered.metadata.is_some());
     }
@@ -353,7 +356,10 @@ mod tests {
 
         let messages = envelope_to_chat_messages(&envelope);
 
-        assert!(matches!(messages.first().map(|m| &m.role), Some(Role::System)));
+        assert!(matches!(
+            messages.first().map(|m| &m.role),
+            Some(Role::System)
+        ));
         assert_eq!(messages.len(), 4);
     }
 
@@ -462,8 +468,8 @@ mod tests {
             120,
         ));
 
-        let block = build_conversation_summary_context_block(&session)
-            .expect("summary block should exist");
+        let block =
+            build_conversation_summary_context_block(&session).expect("summary block should exist");
 
         assert_eq!(block.block_type, ContextBlockType::ConversationSummary);
         assert_eq!(block.priority, ContextBlockPriority::Medium);

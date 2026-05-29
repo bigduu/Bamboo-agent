@@ -8,6 +8,7 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Message, Role, Session};
 use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::{
     create_event_forwarder, finalize_runner, get_or_create_event_sender, try_reserve_runner,
     AgentRunner, RunnerReservation,
@@ -47,6 +48,7 @@ pub struct ResolvedRunConfig {
     pub summarization_model: Option<String>,
     pub summarization_model_provider: Option<Arc<dyn bamboo_infrastructure::LLMProvider>>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub gold_config: Option<GoldConfig>,
     pub system_prompt: String,
     pub base_system_prompt: String,
     pub workspace_path: Option<String>,
@@ -341,6 +343,7 @@ async fn run_schedule_job(
     let summarization_model = resolved.summarization_model.clone();
     let summarization_model_provider = resolved.summarization_model_provider.clone();
     let reasoning_effort = resolved.reasoning_effort;
+    let gold_config = resolved.gold_config.clone();
 
     tokio::spawn(async move {
         let initial_message = session
@@ -392,6 +395,7 @@ async fn run_schedule_job(
                     selected_skill_ids: None,
                     selected_skill_mode: None,
                     image_fallback: None,
+                    gold_config,
                     app_data_dir: ctx.app_data_dir.clone(),
                 },
             )

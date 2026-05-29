@@ -8,6 +8,7 @@ use bamboo_agent_core::composition::CompositionExecutor;
 use bamboo_agent_core::storage::AttachmentReader;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolSchema;
+use bamboo_agent_core::GoldConfidence;
 use bamboo_compression::TokenBudget;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::RuntimeSessionPersistence;
@@ -15,6 +16,7 @@ use bamboo_infrastructure::config::PermissionMode;
 use bamboo_infrastructure::LLMProvider;
 use bamboo_infrastructure::MemoryConfig;
 use bamboo_tools::ToolRegistry;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default)]
 pub struct AuxiliaryModelConfig {
@@ -26,6 +28,96 @@ pub struct AuxiliaryModelConfig {
     pub summarization_model_name: Option<String>,
     pub background_model_provider: Option<Arc<dyn LLMProvider>>,
     pub summarization_model_provider: Option<Arc<dyn LLMProvider>>,
+}
+
+fn default_gold_max_output_tokens() -> u32 {
+    1024
+}
+
+fn default_gold_max_auto_continuations() -> u32 {
+    3
+}
+
+fn default_gold_min_confidence() -> GoldConfidence {
+    GoldConfidence::Medium
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GoldConfig {
+    /// Master switch for Gold observe-only evaluation.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Independent switch for Phase 2 low-risk auto-answer.
+    ///
+    /// Kept separate from `enabled` so Phase 1 observe-only users do not
+    /// implicitly opt into automatic clarification responses.
+    #[serde(default)]
+    pub auto_answer_enabled: bool,
+    /// Independent switch for Phase 3 server-side auto-continue.
+    ///
+    /// Kept separate from both `enabled` and `auto_answer_enabled` so users can
+    /// opt into terminal auto-resume explicitly without enabling other Gold
+    /// automation behaviors.
+    #[serde(default)]
+    pub auto_continue_enabled: bool,
+    /// Optional dedicated model for Gold evaluation. Falls back to fast model,
+    /// then the main chat model when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    /// The user's goal for this session.
+    ///
+    /// Unlike `evaluation_prompt` (which only tunes the *judge*), the goal is
+    /// surfaced to the *main* executing agent as a persistent system-prompt
+    /// block so it actively works toward it. The Gold evaluator also measures
+    /// progress against this text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    /// Optional custom prompt suffix appended to the built-in Gold evaluator
+    /// prompt. This tunes the judge only; it does not set the goal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_prompt: Option<String>,
+    /// Output token limit for the Gold evaluator call.
+    #[serde(default = "default_gold_max_output_tokens")]
+    pub max_output_tokens: u32,
+    /// Maximum number of automatic Gold continuations allowed per session.
+    #[serde(default = "default_gold_max_auto_continuations")]
+    pub max_auto_continuations: u32,
+    /// Minimum evaluator confidence required before Gold auto-continues or
+    /// auto-answers. Defaults to `medium` so the loop fires on reasonably
+    /// confident verdicts rather than only `high`.
+    #[serde(default = "default_gold_min_confidence")]
+    pub min_auto_continue_confidence: GoldConfidence,
+}
+
+impl Default for GoldConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_answer_enabled: false,
+            auto_continue_enabled: false,
+            model_name: None,
+            goal: None,
+            evaluation_prompt: None,
+            max_output_tokens: default_gold_max_output_tokens(),
+            max_auto_continuations: default_gold_max_auto_continuations(),
+            min_auto_continue_confidence: default_gold_min_confidence(),
+        }
+    }
+}
+
+impl GoldConfig {
+    /// The session goal text, falling back to the legacy `evaluation_prompt`
+    /// for sessions created before the dedicated `goal` field existed.
+    ///
+    /// Returns `None` when neither field holds non-empty text.
+    pub fn effective_goal(&self) -> Option<&str> {
+        self.goal
+            .as_deref()
+            .or(self.evaluation_prompt.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +274,11 @@ pub struct AgentLoopConfig {
     pub parallel_batch_timeout_secs: u64,
     /// Permission mode for this execution (default: None = use PermissionConfig's mode).
     pub permission_mode: Option<PermissionMode>,
+    /// Optional Gold observe-only evaluator configuration.
+    ///
+    /// When `None` or `enabled == false`, Gold evaluation is disabled and the
+    /// existing execute/respond/resume loop remains unchanged.
+    pub gold_config: Option<GoldConfig>,
     /// Enable dynamic per-round model routing based on task complexity.
     /// When true, the pipeline classifies complexity at each round end and
     /// stores the result in session metadata.
@@ -191,8 +288,7 @@ pub struct AgentLoopConfig {
     ///
     /// The main chat model remains session/request scoped; this hook is only
     /// for fast/background/planning/search/summarization helpers.
-    pub auxiliary_model_resolver:
-        Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
+    pub auxiliary_model_resolver: Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
 }
 
 impl Default for AgentLoopConfig {
@@ -248,9 +344,22 @@ impl Default for AgentLoopConfig {
             per_tool_timeout_secs: 120,
             parallel_batch_timeout_secs: 300,
             permission_mode: None,
+            gold_config: None,
             features_dynamic_model_routing: false,
             auxiliary_model_resolver: None,
         }
+    }
+}
+
+impl AgentLoopConfig {
+    /// The active session goal to surface to the main agent, or `None` when
+    /// Gold is disabled or no goal is set. Falls back to the legacy
+    /// `evaluation_prompt` for back-compat via [`GoldConfig::effective_goal`].
+    pub fn active_goal(&self) -> Option<&str> {
+        self.gold_config
+            .as_ref()
+            .filter(|cfg| cfg.enabled)
+            .and_then(GoldConfig::effective_goal)
     }
 }
 

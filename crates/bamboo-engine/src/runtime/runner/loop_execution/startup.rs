@@ -1,5 +1,6 @@
 use crate::metrics::MetricsCollector;
 use crate::runtime::config::{AgentLoopConfig, AuxiliaryModelConfig};
+use crate::runtime::gold_evaluation::{AsyncGoldEvaluationRequest, AsyncGoldEvaluationResult};
 use crate::runtime::runner::task_lifecycle::{
     AsyncTaskEvaluationRequest, AsyncTaskEvaluationResult,
 };
@@ -41,11 +42,23 @@ pub(super) struct InFlightTaskEvaluation {
     pub(super) join_handle: tokio::task::JoinHandle<AsyncTaskEvaluationResult>,
 }
 
+pub(super) struct InFlightGoldEvaluation {
+    pub(super) request: AsyncGoldEvaluationRequest,
+    pub(super) join_handle: tokio::task::JoinHandle<AsyncGoldEvaluationResult>,
+}
+
 #[derive(Default)]
 pub(super) struct TaskEvaluationState {
     pub(super) in_flight: Option<InFlightTaskEvaluation>,
     pub(super) completed: Option<AsyncTaskEvaluationResult>,
     pub(super) queued_request: Option<AsyncTaskEvaluationRequest>,
+}
+
+#[derive(Default)]
+pub(super) struct GoldEvaluationState {
+    pub(super) in_flight: Option<InFlightGoldEvaluation>,
+    pub(super) completed: Option<AsyncGoldEvaluationResult>,
+    pub(super) queued_request: Option<AsyncGoldEvaluationRequest>,
 }
 
 pub(super) struct LoopRunState {
@@ -56,6 +69,7 @@ pub(super) struct LoopRunState {
     pub(super) task_context: Option<TaskLoopContext>,
     pub(super) overflow_recovery: OverflowRecoveryState,
     pub(super) task_evaluation: TaskEvaluationState,
+    pub(super) gold_evaluation: GoldEvaluationState,
     pub(super) auxiliary_models: AuxiliaryModelConfig,
     /// Structured runtime state persisted alongside the session.
     pub(super) runtime_state: AgentRuntimeState,
@@ -147,6 +161,7 @@ pub(super) async fn initialize_loop_state(
         task_context,
         overflow_recovery: OverflowRecoveryState::default(),
         task_evaluation: TaskEvaluationState::default(),
+        gold_evaluation: GoldEvaluationState::default(),
         auxiliary_models,
         runtime_state,
     }

@@ -22,7 +22,6 @@ pub(crate) mod prompt_setup;
 pub(crate) mod skill_context;
 pub(crate) mod tool_schemas;
 
-
 pub fn read_prompt_snapshot(session: &Session) -> Option<PromptSnapshot> {
     prompt_setup::read_prompt_snapshot_metadata(session)
 }

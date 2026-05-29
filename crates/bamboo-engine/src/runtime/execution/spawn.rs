@@ -577,6 +577,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
                         selected_skill_ids: None,
                         selected_skill_mode: None,
                         image_fallback: None,
+                        gold_config: None,
                         app_data_dir: ctx.app_data_dir.clone(),
                     },
                 )

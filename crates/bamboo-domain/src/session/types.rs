@@ -249,6 +249,17 @@ impl Message {
 }
 
 /// A pending question waiting for user response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingQuestionSource {
+    #[default]
+    PauseTool,
+    AgenticClarification,
+    ExternalAgent,
+    Gold,
+}
+
+/// A pending question waiting for user response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingQuestion {
     pub tool_call_id: String,
@@ -258,6 +269,8 @@ pub struct PendingQuestion {
     pub question: String,
     pub options: Vec<String>,
     pub allow_custom: bool,
+    #[serde(default)]
+    pub source: PendingQuestionSource,
 }
 
 /// Summary of conversation context for budget management.
@@ -759,12 +772,32 @@ impl Session {
         options: Vec<String>,
         allow_custom: bool,
     ) {
+        self.set_pending_question_with_source(
+            tool_call_id,
+            tool_name,
+            question,
+            options,
+            allow_custom,
+            PendingQuestionSource::PauseTool,
+        );
+    }
+
+    pub fn set_pending_question_with_source(
+        &mut self,
+        tool_call_id: String,
+        tool_name: String,
+        question: String,
+        options: Vec<String>,
+        allow_custom: bool,
+        source: PendingQuestionSource,
+    ) {
         self.pending_question = Some(PendingQuestion {
             tool_call_id,
             tool_name,
             question,
             options,
             allow_custom,
+            source,
         });
         self.updated_at = Utc::now();
     }

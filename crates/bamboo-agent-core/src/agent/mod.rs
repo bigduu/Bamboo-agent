@@ -15,6 +15,9 @@ pub mod hooks;
 /// Agent core types (Session, Message, etc.)
 pub mod types;
 
+pub use bamboo_domain::{
+    ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
+};
 pub use error::AgentError;
 pub use events::{AgentEvent, TokenUsage};
 pub use hooks::AgentHook;
@@ -22,7 +25,4 @@ pub use types::{
     parse_prompt_external_memory_sections, Message, MessageContent, MessagePhase,
     PromptMemoryObservability, PromptSnapshot, PromptSnapshotExternalMemoryParts, Role, Session,
     SessionKind,
-};
-pub use bamboo_domain::{
-    ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
 };

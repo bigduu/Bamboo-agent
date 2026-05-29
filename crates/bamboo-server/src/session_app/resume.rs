@@ -11,7 +11,7 @@ use bamboo_domain::Session;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use super::execute::{consume_pending_conclusion_with_options_resume, has_pending_user_message};
+use super::execute::{consume_pending_clarification_resume, has_pending_user_message};
 use super::types::{ResumeConfigSnapshot, ResumeOutcome};
 use bamboo_engine::execution::runner_lifecycle::RunnerReservation;
 
@@ -107,7 +107,7 @@ pub async fn resume_session_execution(
         };
     };
 
-    consume_pending_conclusion_with_options_resume(&mut session);
+    consume_pending_clarification_resume(&mut session);
     port.save_and_cache_session(&mut session).await;
 
     port.spawn_resume_execution(ResumeSpawnRequest {

@@ -11,7 +11,8 @@ use super::{ExecuteRequest, ExecuteSyncInfo, ExecuteSyncReason};
 use crate::app_state::AppState;
 use crate::model_config_helper::{
     get_default_model_for_provider, get_reasoning_effort_for_provider, resolve_background_model,
-    resolve_fast_model, resolve_provider_type, resolve_task_summary_model,
+    resolve_fast_model, resolve_gold_config, resolve_provider_type, resolve_task_summary_model,
+    GOLD_CONFIG_METADATA_KEY,
 };
 use crate::session_app::provider_model::session_effective_model_ref;
 
@@ -101,6 +102,7 @@ pub async fn handler(
             .as_ref()
             .and_then(|d| d.task_summary.clone()),
         image_fallback: image_fallback.clone(),
+        gold_config: resolve_gold_config(&config_snapshot, None),
         provider_model_ref_enabled: config_snapshot.features.provider_model_ref,
     };
 
@@ -238,6 +240,14 @@ pub async fn handler(
                 reasoning_source
             );
 
+            let gold_config = resolve_gold_config(
+                &config_snapshot,
+                session
+                    .metadata
+                    .get(GOLD_CONFIG_METADATA_KEY)
+                    .map(String::as_str),
+            );
+
             // Create mpsc channel for agent loop.
             let (mpsc_tx, mpsc_rx) = mpsc::channel::<bamboo_agent_core::AgentEvent>(100);
 
@@ -246,6 +256,7 @@ pub async fn handler(
                 session_id.clone(),
                 mpsc_rx,
                 session_tx.clone(),
+                gold_config.clone(),
             );
             spawn_agent_execution(SpawnAgentExecution {
                 state: state.clone(),
@@ -271,6 +282,7 @@ pub async fn handler(
                 cancel_token,
                 mpsc_tx,
                 image_fallback,
+                gold_config,
                 app_data_dir: Some(state.app_data_dir.clone()),
             });
 
