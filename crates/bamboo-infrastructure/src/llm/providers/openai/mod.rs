@@ -22,8 +22,7 @@ use bamboo_domain::ToolSchema;
 use super::common::model_fetcher;
 use super::common::openai_compat::{build_openai_compat_body, parse_openai_compat_sse_data_strict};
 use super::common::openai_responses::{
-    build_responses_body, select_responses_input_messages, ResponsesInputSource,
-    ResponsesSseParser,
+    build_responses_body, select_responses_input_messages, ResponsesInputSource, ResponsesSseParser,
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;

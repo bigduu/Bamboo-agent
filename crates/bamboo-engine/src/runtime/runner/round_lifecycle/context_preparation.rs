@@ -4,7 +4,9 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
     build_plan_runtime_context_block_from_messages, build_task_list_context_block,
 };
 use bamboo_agent_core::tools::ToolSchema;
-use bamboo_agent_core::{AgentError, AgentEvent, CompressionTriggerType, ContextBlock, Role, Session};
+use bamboo_agent_core::{
+    AgentError, AgentEvent, CompressionTriggerType, ContextBlock, Role, Session,
+};
 use bamboo_compression::{
     apply_compression_plan, build_forced_compression_plan_with_summary,
     estimate_context_compression_exposure, prepare_hybrid_context, summary_source_messages,

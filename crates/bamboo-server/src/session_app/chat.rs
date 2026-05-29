@@ -262,6 +262,64 @@ fn persist_selected_skill_ids_metadata(
     }
 }
 
+// ---- Goal command parsing ----
+
+/// Parsed result of a `/goal` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalCommand {
+    /// `/goal status` or bare `/goal` — read-only status query.
+    Status,
+    /// `/goal off` or `/goal disable` or `/goal disabled`.
+    Off,
+    /// `/goal clear` or `/goal reset`.
+    Clear,
+    /// `/goal on` or `/goal enable` or `/goal enabled`.
+    On,
+    /// `/goal <prompt text>` — set the goal evaluation prompt and enable.
+    SetPrompt(String),
+}
+
+/// Attempt to parse a `/goal` command from the raw user message.
+/// Returns `None` if the message is not a `/goal` command.
+pub fn parse_goal_command(message: &str) -> Option<GoalCommand> {
+    let trimmed = message.trim();
+    if !trimmed.to_ascii_lowercase().starts_with("/goal") {
+        return None;
+    }
+    // Ensure "/goal" is followed by end-of-string or whitespace (not "/goalpost").
+    let rest = &trimmed[5..]; // skip "/goal"
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+
+    let arg = rest.trim().to_ascii_lowercase();
+
+    if arg.is_empty() {
+        return Some(GoalCommand::Status);
+    }
+
+    match arg.as_str() {
+        "status" => Some(GoalCommand::Status),
+        "off" | "disable" | "disabled" => Some(GoalCommand::Off),
+        "clear" | "reset" => Some(GoalCommand::Clear),
+        "on" | "enable" | "enabled" => Some(GoalCommand::On),
+        _ => {
+            // Everything else is treated as the goal prompt text.
+            // Use the original (non-lowercased) arg to preserve casing.
+            let prompt = trimmed
+                .strip_prefix("/goal")
+                .unwrap_or(trimmed)
+                .trim()
+                .to_string();
+            if prompt.is_empty() {
+                Some(GoalCommand::Status)
+            } else {
+                Some(GoalCommand::SetPrompt(prompt))
+            }
+        }
+    }
+}
+
 fn extract_skill_ids_from_hint(message: &str) -> Vec<String> {
     const HINT_PREFIX: &str = "[User explicitly selected skill:";
     let mut extracted = Vec::new();

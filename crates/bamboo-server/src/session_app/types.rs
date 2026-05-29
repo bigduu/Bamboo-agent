@@ -4,6 +4,7 @@ use std::sync::Arc;
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::ProviderModelRef;
 use bamboo_domain::Session;
+use bamboo_engine::config::GoldConfig;
 use bamboo_engine::ImageFallbackConfig;
 use bamboo_infrastructure::LLMProvider;
 
@@ -27,6 +28,7 @@ pub struct ExecutionConfigSnapshot {
     pub summarization_model: Option<String>,
     pub summarization_model_ref: Option<ProviderModelRef>,
     pub image_fallback: Option<ImageFallbackConfig>,
+    pub gold_config: Option<GoldConfig>,
     pub provider_model_ref_enabled: bool,
 }
 
@@ -199,6 +201,7 @@ pub struct ResumeConfigSnapshot {
     pub disabled_tools: BTreeSet<String>,
     pub disabled_skill_ids: BTreeSet<String>,
     pub image_fallback: Option<ImageFallbackConfig>,
+    pub gold_config: Option<GoldConfig>,
 }
 
 /// Outcome of a resume attempt.

@@ -130,8 +130,8 @@ pub async fn prepare_execute(
         }
     }
 
-    // ---- Consume pending conclusion with options resume ----
-    consume_pending_conclusion_with_options_resume(&mut session);
+    // ---- Consume pending clarification resume markers ----
+    consume_pending_clarification_resume(&mut session);
 
     Ok(ExecutePreparationOutcome::Ready {
         session: Box::new(session),
@@ -296,9 +296,12 @@ fn validate_image_fallback_for_session(
     Ok(())
 }
 
+const CLARIFICATION_RESUME_PENDING_KEY: &str = "clarification_resume_pending";
+const CONCLUSION_WITH_OPTIONS_RESUME_PENDING_KEY: &str = "conclusion_with_options_resume_pending";
+
 /// Whether the session has resumable user work (pending tool response, retry, or last message is from user).
 pub fn has_pending_user_message(session: &Session) -> bool {
-    if has_pending_conclusion_with_options_resume(session) || has_pending_retry_resume(session) {
+    if has_pending_clarification_resume(session) || has_pending_retry_resume(session) {
         return true;
     }
     session
@@ -308,19 +311,29 @@ pub fn has_pending_user_message(session: &Session) -> bool {
         .unwrap_or(false)
 }
 
-pub fn consume_pending_conclusion_with_options_resume(session: &mut Session) {
+pub fn consume_pending_clarification_resume(session: &mut Session) {
+    session.metadata.remove(CLARIFICATION_RESUME_PENDING_KEY);
     session
         .metadata
-        .remove("conclusion_with_options_resume_pending");
+        .remove(CONCLUSION_WITH_OPTIONS_RESUME_PENDING_KEY);
     session.metadata.remove("retry_resume_pending");
     session.metadata.remove("retry_resume_reason");
 }
 
-pub fn has_pending_conclusion_with_options_resume(session: &Session) -> bool {
+pub fn has_pending_clarification_resume(session: &Session) -> bool {
     session
         .metadata
-        .get("conclusion_with_options_resume_pending")
+        .get(CLARIFICATION_RESUME_PENDING_KEY)
+        .or_else(|| {
+            session
+                .metadata
+                .get(CONCLUSION_WITH_OPTIONS_RESUME_PENDING_KEY)
+        })
         .is_some_and(|value| value == "true")
+}
+
+pub fn has_pending_conclusion_with_options_resume(session: &Session) -> bool {
+    has_pending_clarification_resume(session)
 }
 
 pub fn has_pending_retry_resume(session: &Session) -> bool {
@@ -328,6 +341,10 @@ pub fn has_pending_retry_resume(session: &Session) -> bool {
         .metadata
         .get("retry_resume_pending")
         .is_some_and(|value| value == "true")
+}
+
+pub fn consume_pending_conclusion_with_options_resume(session: &mut Session) {
+    consume_pending_clarification_resume(session)
 }
 
 /// Returns true if the message is flagged `metadata.hidden_from_ui == true`.
@@ -358,7 +375,8 @@ pub(crate) fn is_hidden_from_ui(message: &Message) -> bool {
 // only genuine user turns and skip system-injected resume messages.
 
 /// Returns true if the message was synthesized by the runtime to resume a
-/// suspended root session (child completion, retry, conclusion-with-options).
+/// suspended root session (child completion, retry, conclusion-with-options,
+/// gold auto-continue).
 ///
 /// Such messages have one or both of the following stable markers:
 /// - `metadata.hidden_from_ui == true`
@@ -386,6 +404,9 @@ pub fn is_system_resume_message(message: &Message) -> bool {
         Some("child_completion_resume")
             | Some("retry_resume")
             | Some("conclusion_with_options_resume")
+            | Some("clarification_resume")
+            | Some("gold_continue_resume")
+            | Some("gold_goal_resume")
     )
 }
 
@@ -1071,6 +1092,8 @@ mod tests {
             "child_completion_resume",
             "retry_resume",
             "conclusion_with_options_resume",
+            "gold_continue_resume",
+            "gold_goal_resume",
         ] {
             let msg =
                 make_user_with_metadata("runtime", serde_json::json!({ "runtime_kind": kind }));

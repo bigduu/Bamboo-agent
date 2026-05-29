@@ -9,7 +9,14 @@ use super::provider_model::{derive_model_ref, persist_legacy_model_provider, per
 use super::repository::SessionAccess;
 use super::types::RespondInput;
 
+const CLARIFICATION_RESUME_PENDING_KEY: &str = "clarification_resume_pending";
 const CONCLUSION_WITH_OPTIONS_RESUME_PENDING_KEY: &str = "conclusion_with_options_resume_pending";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseSource {
+    Human,
+    Gold,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanModeTransition {
@@ -34,6 +41,14 @@ pub enum PlanModeTransition {
 pub async fn submit_pending_response(
     repo: &dyn SessionAccess,
     input: RespondInput,
+) -> Result<(Session, String, Option<PlanModeTransition>), RespondError> {
+    submit_pending_response_with_source(repo, input, ResponseSource::Human).await
+}
+
+pub async fn submit_pending_response_with_source(
+    repo: &dyn SessionAccess,
+    input: RespondInput,
+    response_source: ResponseSource,
 ) -> Result<(Session, String, Option<PlanModeTransition>), RespondError> {
     // ---- Load session (merged for respond to pick up in-memory pending question) ----
     let mut session = repo
@@ -64,8 +79,12 @@ pub async fn submit_pending_response(
     let reviewed_plan = extract_exit_plan_from_tool_result_message(&session, &tool_call_id);
 
     // ---- Update or append tool result message ----
-    let found =
-        update_or_append_tool_result_message(&mut session, &tool_call_id, &input.user_response);
+    let found = update_or_append_tool_result_message(
+        &mut session,
+        &tool_call_id,
+        &input.user_response,
+        response_source,
+    );
     if found {
         tracing::info!(
             "[{}] Updated existing tool result message",
@@ -85,6 +104,11 @@ pub async fn submit_pending_response(
 
     // ---- Clear pending question and set resume marker ----
     session.clear_pending_question();
+    session.metadata.remove("runtime.suspend_reason");
+    session.metadata.insert(
+        CLARIFICATION_RESUME_PENDING_KEY.to_string(),
+        "true".to_string(),
+    );
     session.metadata.insert(
         CONCLUSION_WITH_OPTIONS_RESUME_PENDING_KEY.to_string(),
         "true".to_string(),
@@ -212,10 +236,11 @@ pub fn update_or_append_tool_result_message(
     session: &mut Session,
     tool_call_id: &str,
     user_response: &str,
+    response_source: ResponseSource,
 ) -> bool {
     for message in &mut session.messages {
         if message.tool_call_id.as_deref() == Some(tool_call_id) {
-            message.content = selected_message_content(user_response);
+            message.content = selected_message_content(user_response, response_source);
             message.tool_success = Some(true);
             return true;
         }
@@ -223,14 +248,17 @@ pub fn update_or_append_tool_result_message(
 
     session.add_message(bamboo_agent_core::Message::tool_result_with_status(
         tool_call_id,
-        selected_message_content(user_response),
+        selected_message_content(user_response, response_source),
         true,
     ));
     false
 }
 
-fn selected_message_content(user_response: &str) -> String {
-    format!("User selected: {}", user_response)
+fn selected_message_content(user_response: &str, response_source: ResponseSource) -> String {
+    match response_source {
+        ResponseSource::Human => format!("Selected response: {}", user_response),
+        ResponseSource::Gold => format!("Auto-selected response (gold): {}", user_response),
+    }
 }
 
 fn extract_exit_plan_from_tool_result_message(
@@ -261,6 +289,7 @@ mod tests {
             question: "Question?".to_string(),
             options: vec!["A".to_string(), "B".to_string()],
             allow_custom: false,
+            source: bamboo_agent_core::PendingQuestionSource::PauseTool,
         }
     }
 

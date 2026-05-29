@@ -30,6 +30,7 @@ pub(super) async fn emit_need_clarification_event(
     event_tx: &mpsc::Sender<AgentEvent>,
     payload: &UserQuestionPayload,
     tool_call_id: &str,
+    tool_name: &str,
 ) {
     let _ = event_tx
         .send(AgentEvent::NeedClarification {
@@ -40,6 +41,7 @@ pub(super) async fn emit_need_clarification_event(
                 Some(payload.options.clone())
             },
             tool_call_id: Some(tool_call_id.to_string()),
+            tool_name: Some(tool_name.to_string()),
             allow_custom: payload.allow_custom,
         })
         .await;

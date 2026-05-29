@@ -65,6 +65,8 @@ use serde::{Deserialize, Serialize};
 /// - `TaskListCompleted` - All items completed
 /// - `TaskEvaluationStarted` - Task evaluation began
 /// - `TaskEvaluationCompleted` - Task evaluation finished
+/// - `GoldEvaluationStarted` - Gold observe-only evaluation began
+/// - `GoldEvaluationCompleted` - Gold observe-only evaluation finished
 ///
 /// ## Context Management
 /// - `TokenBudgetUpdated` - Context budget changed
@@ -181,6 +183,9 @@ pub enum AgentEvent {
         /// Tool call identifier that triggered this clarification
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
+        /// Tool name that triggered this clarification, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
         /// Whether the user can provide a free-text response
         #[serde(default = "default_allow_custom")]
         allow_custom: bool,
@@ -233,6 +238,32 @@ pub enum AgentEvent {
         /// Number of items updated
         updates_count: usize,
         /// Evaluation reasoning
+        reasoning: String,
+    },
+
+    /// Emitted when gold observe-only evaluation starts.
+    GoldEvaluationStarted {
+        /// Session identifier
+        session_id: String,
+        /// Evaluation checkpoint
+        checkpoint: GoldCheckpoint,
+        /// Current iteration / round number associated with the evaluation
+        iteration: u32,
+    },
+
+    /// Emitted when gold observe-only evaluation completes.
+    GoldEvaluationCompleted {
+        /// Session identifier
+        session_id: String,
+        /// Evaluation checkpoint
+        checkpoint: GoldCheckpoint,
+        /// Current iteration / round number associated with the evaluation
+        iteration: u32,
+        /// Gold decision for the current checkpoint
+        decision: GoldDecision,
+        /// Confidence in the decision
+        confidence: GoldConfidence,
+        /// Short reasoning summary
         reasoning: String,
     },
 
@@ -440,6 +471,79 @@ fn default_allow_custom() -> bool {
     true
 }
 
+/// Gold evaluation checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoldCheckpoint {
+    PostRound,
+    Terminal,
+}
+
+impl GoldCheckpoint {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PostRound => "post_round",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+/// Gold evaluator decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoldDecision {
+    Continue,
+    Achieved,
+    Blocked,
+    NeedInput,
+    Exhausted,
+}
+
+impl GoldDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Achieved => "achieved",
+            Self::Blocked => "blocked",
+            Self::NeedInput => "need_input",
+            Self::Exhausted => "exhausted",
+        }
+    }
+}
+
+/// Confidence level for a Gold evaluation result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoldConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+impl GoldConfidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    /// Ordinal rank for threshold comparisons (`Low` < `Medium` < `High`).
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::Medium => 1,
+            Self::High => 2,
+        }
+    }
+
+    /// Whether this confidence meets or exceeds the given floor.
+    pub fn meets(self, floor: GoldConfidence) -> bool {
+        self.rank() >= floor.rank()
+    }
+}
+
 /// Source that triggered a session title update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -517,6 +621,50 @@ mod tests {
     }
 
     #[test]
+    fn gold_evaluation_completed_serializes_with_gold_type_and_fields() {
+        let event = AgentEvent::GoldEvaluationCompleted {
+            session_id: "session-1".to_string(),
+            checkpoint: GoldCheckpoint::PostRound,
+            iteration: 3,
+            decision: GoldDecision::Continue,
+            confidence: GoldConfidence::Medium,
+            reasoning: "Need one more iteration".to_string(),
+        };
+
+        let value = serde_json::to_value(event).expect("event should serialize");
+        assert_eq!(value["type"], "gold_evaluation_completed");
+        assert_eq!(value["checkpoint"], "post_round");
+        assert_eq!(value["iteration"], 3);
+        assert_eq!(value["decision"], "continue");
+        assert_eq!(value["confidence"], "medium");
+        assert_eq!(value["reasoning"], "Need one more iteration");
+    }
+
+    #[test]
+    fn gold_evaluation_started_deserializes() {
+        let json = serde_json::json!({
+            "type": "gold_evaluation_started",
+            "session_id": "session-1",
+            "checkpoint": "terminal",
+            "iteration": 7
+        });
+
+        let event: AgentEvent = serde_json::from_value(json).expect("should deserialize");
+        match event {
+            AgentEvent::GoldEvaluationStarted {
+                session_id,
+                checkpoint,
+                iteration,
+            } => {
+                assert_eq!(session_id, "session-1");
+                assert_eq!(checkpoint, GoldCheckpoint::Terminal);
+                assert_eq!(iteration, 7);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
     fn context_compression_status_serializes_with_phase_and_status() {
         let event = AgentEvent::ContextCompressionStatus {
             phase: "mid-turn".to_string(),
@@ -535,6 +683,7 @@ mod tests {
             question: "Continue?".to_string(),
             options: Some(vec!["Yes".to_string(), "No".to_string()]),
             tool_call_id: Some("tool-1".to_string()),
+            tool_name: Some("conclusion_with_options".to_string()),
             allow_custom: false,
         };
 
@@ -543,6 +692,7 @@ mod tests {
         assert_eq!(value["question"], "Continue?");
         assert_eq!(value["options"], serde_json::json!(["Yes", "No"]));
         assert_eq!(value["tool_call_id"], "tool-1");
+        assert_eq!(value["tool_name"], "conclusion_with_options");
         assert_eq!(value["allow_custom"], false);
     }
 
@@ -561,11 +711,13 @@ mod tests {
                 question,
                 options,
                 tool_call_id,
+                tool_name,
                 allow_custom,
             } => {
                 assert_eq!(question, "Continue?");
                 assert_eq!(options, Some(vec!["Yes".to_string(), "No".to_string()]));
                 assert_eq!(tool_call_id, None);
+                assert_eq!(tool_name, None);
                 assert!(allow_custom); // default_allow_custom returns true
             }
             other => panic!("unexpected event: {other:?}"),
@@ -586,11 +738,13 @@ mod tests {
                 question,
                 options,
                 tool_call_id,
+                tool_name,
                 allow_custom,
             } => {
                 assert_eq!(question, "Pick one");
                 assert_eq!(options, None);
                 assert_eq!(tool_call_id, None);
+                assert_eq!(tool_name, None);
                 assert!(!allow_custom);
             }
             other => panic!("unexpected event: {other:?}"),

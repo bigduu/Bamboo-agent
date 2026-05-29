@@ -216,12 +216,11 @@ pub fn select_responses_input_messages<'a>(
         .and_then(|opts| opts.instructions.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let (response_input_messages, source) = match responses_options
-        .and_then(|opts| opts.input_messages.as_deref())
-    {
-        Some(input_messages) => (input_messages, ResponsesInputSource::Explicit),
-        None => (messages, ResponsesInputSource::Generic),
-    };
+    let (response_input_messages, source) =
+        match responses_options.and_then(|opts| opts.input_messages.as_deref()) {
+            Some(input_messages) => (input_messages, ResponsesInputSource::Explicit),
+            None => (messages, ResponsesInputSource::Generic),
+        };
 
     let mut effective_messages = response_input_messages;
     let mut fallback_removed_duplicate_system = false;
@@ -1513,25 +1512,24 @@ mod tests {
             instructions: Some("Stable instructions".to_string()),
             ..Default::default()
         };
-        let generic_selection = select_responses_input_messages(
-            &generic_messages,
-            Some(&generic_options),
-        );
+        let generic_selection =
+            select_responses_input_messages(&generic_messages, Some(&generic_options));
         assert_eq!(generic_selection.source, ResponsesInputSource::Generic);
         assert!(generic_selection.fallback_removed_duplicate_system);
         assert_eq!(generic_selection.original_len, 2);
         assert_eq!(generic_selection.effective_len, 1);
-        assert_eq!(generic_selection.input_messages[0].content, "Generic conversation");
+        assert_eq!(
+            generic_selection.input_messages[0].content,
+            "Generic conversation"
+        );
 
         let explicit_options = ResponsesRequestOptions {
             instructions: Some("Stable instructions".to_string()),
             input_messages: Some(explicit_input_messages),
             ..Default::default()
         };
-        let explicit_selection = select_responses_input_messages(
-            &generic_messages,
-            Some(&explicit_options),
-        );
+        let explicit_selection =
+            select_responses_input_messages(&generic_messages, Some(&explicit_options));
         assert_eq!(explicit_selection.source, ResponsesInputSource::Explicit);
         assert!(
             !explicit_selection.fallback_removed_duplicate_system,

@@ -4,8 +4,11 @@
 use std::sync::Arc;
 
 use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_engine::config::GoldConfig;
 use bamboo_infrastructure::Config;
 use bamboo_infrastructure::{LLMError, ProviderModelRouter, ProviderRegistry, ResolvedModel};
+
+pub const GOLD_CONFIG_METADATA_KEY: &str = "gold_config";
 
 /// Resolve the underlying provider type for a provider routing key.
 ///
@@ -34,6 +37,37 @@ pub fn resolve_provider_type(
                 .map(|meta| meta.provider_type)
         })
         .or_else(|| Some(trimmed.to_string()))
+}
+
+pub fn parse_session_gold_config(session_gold_config_json: Option<&str>) -> Option<GoldConfig> {
+    let raw = session_gold_config_json?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<GoldConfig>(raw).ok()
+}
+
+pub fn normalize_gold_config_json(value: &serde_json::Value) -> Result<String, serde_json::Error> {
+    let parsed = serde_json::from_value::<GoldConfig>(value.clone())?;
+    serde_json::to_string(&parsed)
+}
+
+pub fn resolve_global_gold_config(config: &Config) -> Option<GoldConfig> {
+    config
+        .extra
+        .get("gold")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<GoldConfig>(value).ok())
+}
+
+pub fn resolve_gold_config(
+    config: &Config,
+    session_gold_config_json: Option<&str>,
+) -> Option<GoldConfig> {
+    if session_gold_config_json.is_some() {
+        return parse_session_gold_config(session_gold_config_json);
+    }
+    resolve_global_gold_config(config)
 }
 
 /// Get the default model for a specific provider from config.

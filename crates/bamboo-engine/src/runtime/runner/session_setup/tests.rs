@@ -3,13 +3,13 @@ use async_trait::async_trait;
 use super::prompt_envelope::{
     assemble_prompt_envelope, envelope_to_responses_view, StablePromptFrame,
 };
-use bamboo_agent_core::{
-    ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
-};
 use super::prompt_setup::build_stable_prompt_frame;
 use super::tool_schemas::resolve_available_tool_schemas_for_session;
 use bamboo_agent_core::agent::types::{TaskItem, TaskItemStatus, TaskList};
 use bamboo_agent_core::tools::{FunctionSchema, ToolCall, ToolExecutor, ToolResult, ToolSchema};
+use bamboo_agent_core::{
+    ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
+};
 use bamboo_agent_core::{Message, Session};
 use chrono::Utc;
 
@@ -716,22 +716,21 @@ fn build_stable_prompt_frame_includes_base_and_stable_contexts() {
         ..Default::default()
     };
     let mut session = Session::new("session-stable-frame-1", "model");
-    session
-        .metadata
-        .insert("skill.context".to_string(), "## Skill\nUse the skill".to_string());
+    session.metadata.insert(
+        "skill.context".to_string(),
+        "## Skill\nUse the skill".to_string(),
+    );
 
-    let stable = build_stable_prompt_frame(&session, &config, &[], &std::collections::BTreeSet::new());
+    let stable =
+        build_stable_prompt_frame(&session, &config, &[], &std::collections::BTreeSet::new());
 
     assert!(stable.stable_instructions.contains("Base system"));
-    assert!(stable
-        .stable_instructions
-        .contains("Workspace path:"));
+    assert!(stable.stable_instructions.contains("Workspace path:"));
     assert!(stable
         .stable_instructions
         .contains("environment variables were explicitly configured by the user inside Bodhi"));
     assert!(stable.stable_prefix_messages.is_empty());
 }
-
 
 #[test]
 fn build_stable_prompt_frame_strips_round_dynamic_prompt_blocks() {
@@ -750,9 +749,10 @@ fn build_stable_prompt_frame_strips_round_dynamic_prompt_blocks() {
         ..Default::default()
     };
     let mut session = Session::new("session-stable-frame-2", "model");
-    session
-        .metadata
-        .insert("skill.context".to_string(), "## Skill\nUse the skill".to_string());
+    session.metadata.insert(
+        "skill.context".to_string(),
+        "## Skill\nUse the skill".to_string(),
+    );
     session.task_list = Some(TaskList {
         session_id: session.id.clone(),
         title: "Agent Tasks".to_string(),
@@ -777,14 +777,17 @@ fn build_stable_prompt_frame_strips_round_dynamic_prompt_blocks() {
     assert!(stable.stable_instructions.contains("Base system"));
     assert!(stable.stable_instructions.contains("Workspace path:"));
     assert!(!stable.stable_instructions.contains("Current Task List"));
-    assert!(!stable.stable_instructions.contains("External memory snapshot"));
+    assert!(!stable
+        .stable_instructions
+        .contains("External memory snapshot"));
     assert!(!stable.stable_instructions.contains("PLAN MODE ACTIVE"));
     assert!(!stable.stable_instructions.contains("Plan runtime snapshot"));
 }
 
 #[test]
 fn prompt_envelope_skeleton_can_render_responses_view() {
-    let stable = StablePromptFrame::new("Stable instructions", vec![Message::user("stable prefix")]);
+    let stable =
+        StablePromptFrame::new("Stable instructions", vec![Message::user("stable prefix")]);
     let envelope = assemble_prompt_envelope(
         stable,
         vec![ContextBlock::new(

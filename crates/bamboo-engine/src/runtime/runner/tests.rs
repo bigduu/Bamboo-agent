@@ -235,8 +235,14 @@ async fn agent_loop_refreshes_fast_model_between_rounds_for_task_evaluation() {
 
     let provider = Arc::new(RecordingRoundProvider {
         queue: Mutex::new(vec![
-            vec![Ok(LLMChunk::ToolCalls(vec![tool_call("call-1")])), Ok(LLMChunk::Done)],
-            vec![Ok(LLMChunk::ToolCalls(vec![tool_call("call-2")])), Ok(LLMChunk::Done)],
+            vec![
+                Ok(LLMChunk::ToolCalls(vec![tool_call("call-1")])),
+                Ok(LLMChunk::Done),
+            ],
+            vec![
+                Ok(LLMChunk::ToolCalls(vec![tool_call("call-2")])),
+                Ok(LLMChunk::Done),
+            ],
             vec![Ok(LLMChunk::Token("done".to_string())), Ok(LLMChunk::Done)],
         ]),
         fast_models: Mutex::new(Vec::new()),
@@ -280,5 +286,8 @@ async fn agent_loop_refreshes_fast_model_between_rounds_for_task_evaluation() {
     .expect("agent loop should succeed");
 
     let fast_models = provider.fast_models.lock().await.clone();
-    assert_eq!(fast_models, vec!["fast-2".to_string(), "fast-3".to_string()]);
+    assert_eq!(
+        fast_models,
+        vec!["fast-2".to_string(), "fast-3".to_string()]
+    );
 }

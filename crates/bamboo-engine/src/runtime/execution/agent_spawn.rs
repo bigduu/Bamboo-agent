@@ -15,7 +15,7 @@ use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_domain::ReasoningEffort;
 use bamboo_infrastructure::LLMProvider;
 
-use crate::runtime::config::ImageFallbackConfig;
+use crate::runtime::config::{GoldConfig, ImageFallbackConfig};
 use crate::runtime::execution::runner_lifecycle::finalize_runner;
 use crate::runtime::execution::runner_state::AgentRunner;
 use crate::runtime::Agent;
@@ -63,6 +63,7 @@ pub struct SessionExecutionArgs {
     pub cancel_token: CancellationToken,
     pub mpsc_tx: mpsc::Sender<AgentEvent>,
     pub image_fallback: Option<ImageFallbackConfig>,
+    pub gold_config: Option<GoldConfig>,
     pub app_data_dir: Option<std::path::PathBuf>,
 
     // Post-execution resources.
@@ -109,6 +110,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 cancel_token,
                 mpsc_tx,
                 image_fallback,
+                gold_config,
                 app_data_dir,
                 runners,
                 sessions_cache,
@@ -162,6 +164,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                         selected_skill_ids,
                         selected_skill_mode,
                         image_fallback,
+                        gold_config,
                         app_data_dir,
                     },
                 )

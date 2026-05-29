@@ -1053,7 +1053,10 @@ mod tests {
 
         let schema: ToolSchema = ToolSchema::from_provider(tool_with_both).unwrap();
         // Should pick parametersJsonSchema
-        assert_eq!(schema.function.parameters["properties"]["q"]["type"], "string");
+        assert_eq!(
+            schema.function.parameters["properties"]["q"]["type"],
+            "string"
+        );
     }
 
     #[test]
@@ -1071,7 +1074,10 @@ mod tests {
         };
 
         let schema: ToolSchema = ToolSchema::from_provider(legacy_tool).unwrap();
-        assert_eq!(schema.function.parameters["properties"]["x"]["type"], "integer");
+        assert_eq!(
+            schema.function.parameters["properties"]["x"]["type"],
+            "integer"
+        );
     }
 
     #[test]
@@ -1117,7 +1123,10 @@ mod tests {
 
         assert_eq!(roundtrip.function.name, "edit");
         assert_eq!(roundtrip.function.parameters["additionalProperties"], false);
-        assert_eq!(roundtrip.function.parameters["required"], serde_json::json!(["path"]));
+        assert_eq!(
+            roundtrip.function.parameters["required"],
+            serde_json::json!(["path"])
+        );
     }
 
     #[test]

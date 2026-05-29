@@ -9,6 +9,7 @@ use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::ProviderModelRef;
 
 use super::provider_model::{persist_legacy_model_provider, persist_model_ref};
+use crate::model_config_helper::GOLD_CONFIG_METADATA_KEY;
 
 /// Request-level input for session creation.
 pub struct CreateSessionInput {
@@ -18,6 +19,7 @@ pub struct CreateSessionInput {
     pub model: Option<String>,
     pub model_ref: Option<ProviderModelRef>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub gold_config_json: Option<String>,
 }
 
 /// Configuration defaults for session creation.
@@ -46,6 +48,11 @@ pub fn build_new_session(input: &CreateSessionInput, config: &CreateSessionConfi
     }
     session.reasoning_effort =
         resolve_reasoning_effort(input.reasoning_effort, config.default_reasoning_effort);
+    if let Some(gold_config_json) = trimmed_non_empty(input.gold_config_json.as_deref()) {
+        session
+            .metadata
+            .insert(GOLD_CONFIG_METADATA_KEY.to_string(), gold_config_json);
+    }
 
     if let Some(title) = trimmed_non_empty(input.title.as_deref()) {
         session.title = title;
@@ -155,6 +162,7 @@ mod tests {
             model: Some("gpt-5".to_string()),
             model_ref: None,
             reasoning_effort: Some(ReasoningEffort::High),
+            gold_config_json: None,
         };
         let session = build_new_session(&input, &default_config());
 
@@ -182,6 +190,7 @@ mod tests {
             model: Some("gpt-5".to_string()),
             model_ref: None,
             reasoning_effort: None,
+            gold_config_json: None,
         };
         let session = build_new_session(&input, &default_config());
 
@@ -208,6 +217,7 @@ mod tests {
             model: Some("gpt-5".to_string()),
             model_ref: None,
             reasoning_effort: None,
+            gold_config_json: None,
         };
         let session = build_new_session(&input, &config);
 
@@ -229,6 +239,7 @@ mod tests {
             model: Some("gpt-5".to_string()),
             model_ref: None,
             reasoning_effort: None,
+            gold_config_json: None,
         };
         let session = build_new_session(&input, &default_config());
 
@@ -247,6 +258,7 @@ mod tests {
             model: Some("ignored-compat-model".to_string()),
             model_ref: Some(ProviderModelRef::new("anthropic", "claude-3-7-sonnet")),
             reasoning_effort: None,
+            gold_config_json: None,
         };
         let session = build_new_session(&input, &default_config());
 

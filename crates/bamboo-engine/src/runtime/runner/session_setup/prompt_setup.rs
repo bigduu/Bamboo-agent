@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-use crate::runtime::config::AgentLoopConfig;
 use super::prompt_envelope::StablePromptFrame;
+use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
     parse_prompt_external_memory_sections, Message, PromptMemoryObservability, PromptSnapshot,

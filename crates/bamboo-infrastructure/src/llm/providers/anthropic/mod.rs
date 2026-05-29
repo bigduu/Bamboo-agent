@@ -1343,7 +1343,9 @@ mod anthropic_request_building {
         assert_eq!(built_messages.len(), 2);
         assert_eq!(built_messages[0]["role"], "assistant");
         assert_eq!(built_messages[1]["role"], "user");
-        let tool_result_blocks = built_messages[1]["content"].as_array().expect("content array");
+        let tool_result_blocks = built_messages[1]["content"]
+            .as_array()
+            .expect("content array");
         assert_eq!(tool_result_blocks.len(), 2);
         assert_eq!(tool_result_blocks[0]["type"], "tool_result");
         assert_eq!(tool_result_blocks[0]["tool_use_id"], "call_1");
@@ -1353,7 +1355,10 @@ mod anthropic_request_building {
 
     #[test]
     fn tool_result_does_not_merge_into_regular_user_message() {
-        let messages = vec![Message::user("normal user text"), Message::tool_result("call_1", "OK")];
+        let messages = vec![
+            Message::user("normal user text"),
+            Message::tool_result("call_1", "OK"),
+        ];
 
         let out =
             super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
@@ -1390,7 +1395,10 @@ mod anthropic_request_building {
         let built_messages = out["messages"].as_array().expect("messages array");
         assert_eq!(built_messages.len(), 5);
         assert_eq!(built_messages[0]["role"], "user");
-        assert_eq!(built_messages[0]["content"][0]["text"], "dynamic context block");
+        assert_eq!(
+            built_messages[0]["content"][0]["text"],
+            "dynamic context block"
+        );
         assert_eq!(built_messages[1]["role"], "user");
         assert_eq!(built_messages[1]["content"][0]["text"], "conversation turn");
         assert_eq!(built_messages[2]["role"], "assistant");

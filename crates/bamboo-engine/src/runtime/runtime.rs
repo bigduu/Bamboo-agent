@@ -23,7 +23,7 @@ use bamboo_infrastructure::Config;
 use bamboo_infrastructure::LLMProvider;
 
 use crate::runtime::config::{
-    AgentLoopConfig, AuxiliaryModelConfig, ImageFallbackConfig, PromptMemoryFlags,
+    AgentLoopConfig, AuxiliaryModelConfig, GoldConfig, ImageFallbackConfig, PromptMemoryFlags,
 };
 use crate::runtime::hooks::HookRunner;
 use crate::runtime::managers::{
@@ -287,8 +287,7 @@ pub struct ExecuteRequest {
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Optional per-round resolver for auxiliary model settings that should be
     /// re-read from live global config between rounds.
-    pub auxiliary_model_resolver:
-        Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
+    pub auxiliary_model_resolver: Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
     /// When `None`, falls back to `Config::disabled_tool_names()`.
     pub disabled_tools: Option<BTreeSet<String>>,
     /// When `None`, falls back to `Config::disabled_skill_ids()`.
@@ -296,6 +295,7 @@ pub struct ExecuteRequest {
     pub selected_skill_ids: Option<Vec<String>>,
     pub selected_skill_mode: Option<String>,
     pub image_fallback: Option<ImageFallbackConfig>,
+    pub gold_config: Option<GoldConfig>,
     /// Bamboo application data directory (typically `~/.bamboo`).
     pub app_data_dir: Option<std::path::PathBuf>,
 }
@@ -351,6 +351,7 @@ impl AgentRuntime {
             selected_skill_ids,
             selected_skill_mode,
             image_fallback,
+            gold_config,
             app_data_dir,
         } = req;
         let tools = tools.unwrap_or_else(|| self.default_tools.clone());
@@ -412,6 +413,7 @@ impl AgentRuntime {
                 .as_ref()
                 .and_then(|state| state.plan_mode.as_ref())
                 .map(|_| PermissionMode::Plan),
+            gold_config,
             ..Default::default()
         };
 

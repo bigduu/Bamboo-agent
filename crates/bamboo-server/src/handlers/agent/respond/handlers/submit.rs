@@ -1,7 +1,9 @@
 use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
-use crate::model_config_helper::resolve_provider_type;
+use crate::model_config_helper::{
+    resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
+};
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::session_app::respond::PlanModeTransition;
 use bamboo_agent_core::AgentEvent;
@@ -156,6 +158,13 @@ pub async fn submit_response(
         )
         .ok()
         .flatten(),
+        gold_config: resolve_gold_config(
+            &config_snapshot,
+            _session
+                .metadata
+                .get(GOLD_CONFIG_METADATA_KEY)
+                .map(String::as_str),
+        ),
     };
 
     let auto_resume_outcome = crate::session_app::resume::resume_session_execution(

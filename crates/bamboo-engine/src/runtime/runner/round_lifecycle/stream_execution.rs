@@ -11,8 +11,7 @@ use crate::runtime::runner::prompt_context::{
 };
 use crate::runtime::runner::session_setup::prompt_envelope::{
     assemble_prompt_envelope, build_conversation_summary_context_block,
-    build_external_memory_context_block_from_messages,
-    build_plan_mode_context_block_from_messages,
+    build_external_memory_context_block_from_messages, build_plan_mode_context_block_from_messages,
     build_plan_runtime_context_block_from_messages, build_task_list_context_block,
     envelope_to_chat_messages, envelope_to_responses_view,
 };
@@ -152,7 +151,10 @@ fn is_conversation_summary_message(message: &Message) -> bool {
         && message.content.contains(CONVERSATION_SUMMARY_START_MARKER)
 }
 
-fn derive_system_remainder_message(message: &Message, stable_instructions: &str) -> Option<Message> {
+fn derive_system_remainder_message(
+    message: &Message,
+    stable_instructions: &str,
+) -> Option<Message> {
     if !matches!(message.role, Role::System) || is_conversation_summary_message(message) {
         return None;
     }
@@ -190,7 +192,8 @@ struct PreparedRequestEnvelope {
     dynamic_context_messages: Vec<Message>,
     conversation_messages: Vec<Message>,
     instructions: Option<String>,
-    envelope_observability: crate::runtime::runner::session_setup::prompt_envelope::PromptEnvelopeObservability,
+    envelope_observability:
+        crate::runtime::runner::session_setup::prompt_envelope::PromptEnvelopeObservability,
 }
 
 fn build_request_envelope(
@@ -240,11 +243,8 @@ fn build_request_envelope(
     let mut envelope_conversation_messages = system_remainder_messages.clone();
     envelope_conversation_messages.extend(conversation_messages.clone());
 
-    let envelope = assemble_prompt_envelope(
-        stable_frame,
-        dynamic_blocks,
-        envelope_conversation_messages,
-    );
+    let envelope =
+        assemble_prompt_envelope(stable_frame, dynamic_blocks, envelope_conversation_messages);
     let responses_view = envelope_to_responses_view(&envelope);
     let chat_messages = envelope_to_chat_messages(&envelope);
     let responses_input_messages = responses_view.input_messages;
@@ -290,7 +290,8 @@ pub(super) async fn execute_llm_stream(
     let request_messages_buf = if previous_response_id.is_some() {
         let mut delta_messages = prepared_envelope.system_remainder_messages.clone();
         delta_messages.extend(prepared_envelope.dynamic_context_messages.clone());
-        if let Some(conversation_delta) = continuation_messages(&prepared_envelope.conversation_messages)
+        if let Some(conversation_delta) =
+            continuation_messages(&prepared_envelope.conversation_messages)
         {
             delta_messages.extend_from_slice(conversation_delta);
         } else {

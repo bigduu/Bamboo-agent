@@ -190,11 +190,16 @@ async fn run_title_generation(
 
 /// Extract the first user message's text, preferring `Text` parts when
 /// `content_parts` is set. Truncates to `MAX_USER_TEXT_FOR_TITLE` characters.
+/// Skips hidden runtime resume messages so internal system messages don't
+/// pollute generated titles.
 fn first_user_text(session: &Session) -> Option<String> {
     let msg = session
         .messages
         .iter()
-        .find(|m| matches!(m.role, Role::User))?;
+        .find(|m| {
+            matches!(m.role, Role::User)
+                && !crate::session_app::execute::is_system_resume_message(m)
+        })?;
     let raw = if let Some(parts) = msg.content_parts.as_ref() {
         let joined: String = parts
             .iter()

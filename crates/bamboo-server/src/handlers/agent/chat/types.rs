@@ -55,6 +55,7 @@ pub struct ChatImage {
 /// * `session_id` - The session identifier for subsequent API calls
 /// * `stream_url` - URL endpoint to stream agent events (SSE)
 /// * `status` - Current status of the chat session
+/// * `goal_command` - Present when the message was a `/goal` control command
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {
     /// Unique session identifier for this conversation
@@ -63,6 +64,9 @@ pub struct ChatResponse {
     pub stream_url: String,
     /// Current session status (e.g., "streaming")
     pub status: String,
+    /// Present when the message was a `/goal` control command handled server-side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_command: Option<super::handler::GoalCommandResponse>,
 }
 
 #[cfg(test)]
@@ -177,11 +181,13 @@ mod tests {
             session_id: "sess-456".to_string(),
             stream_url: "/stream/sess-456".to_string(),
             status: "streaming".to_string(),
+            goal_command: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("sess-456"));
         assert!(json.contains("/stream/sess-456"));
         assert!(json.contains("streaming"));
+        assert!(!json.contains("goal_command"));
     }
 
     #[test]
@@ -190,6 +196,7 @@ mod tests {
             session_id: "test".to_string(),
             stream_url: "/stream".to_string(),
             status: "active".to_string(),
+            goal_command: None,
         };
         let debug_str = format!("{:?}", resp);
         assert!(debug_str.contains("ChatResponse"));

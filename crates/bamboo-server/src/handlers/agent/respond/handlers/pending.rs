@@ -28,7 +28,9 @@ pub async fn get_pending_question(
             "question": pending.question,
             "options": pending.options,
             "allow_custom": pending.allow_custom,
-            "tool_call_id": pending.tool_call_id
+            "tool_call_id": pending.tool_call_id,
+            "tool_name": pending.tool_name,
+            "source": pending.source,
         }))),
         None => Ok(HttpResponse::Ok().json(serde_json::json!({
             "has_pending_question": false

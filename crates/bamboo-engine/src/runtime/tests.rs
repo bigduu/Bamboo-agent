@@ -81,17 +81,41 @@ async fn need_clarification_sends_event() {
     .await;
 
     assert_eq!(outcome, ToolHandlingOutcome::AwaitingClarification);
+    let pending = session
+        .pending_question
+        .as_ref()
+        .expect("agentic clarification should persist pending question");
+    assert_eq!(pending.tool_call_id, "call_parent");
+    assert_eq!(pending.tool_name, "smart_tool");
+    assert_eq!(pending.question, "Which file should I inspect?");
+    assert_eq!(
+        pending.options,
+        vec!["src/main.rs".to_string(), "src/lib.rs".to_string()]
+    );
+    assert_eq!(
+        session
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(String::as_str),
+        Some("awaiting_clarification")
+    );
 
     let event = event_rx.recv().await.expect("missing clarification event");
     match event {
         AgentEvent::NeedClarification {
-            question, options, ..
+            question,
+            options,
+            tool_call_id,
+            tool_name,
+            ..
         } => {
             assert_eq!(question, "Which file should I inspect?");
             assert_eq!(
                 options,
                 Some(vec!["src/main.rs".to_string(), "src/lib.rs".to_string()])
             );
+            assert_eq!(tool_call_id.as_deref(), Some("call_parent"));
+            assert_eq!(tool_name.as_deref(), Some("smart_tool"));
         }
         other => panic!("unexpected event: {other:?}"),
     }

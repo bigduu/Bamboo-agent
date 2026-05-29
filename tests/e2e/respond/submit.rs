@@ -111,7 +111,7 @@ async fn test_submit_response_updates_tool_result_and_clears_pending_question() 
     assert!(loaded
         .messages
         .iter()
-        .any(|message| message.content == "User selected: A"));
+        .any(|message| message.content == "Selected response: A"));
     assert!(!loaded.messages.iter().any(|message| message
         .content
         .contains("I chose 'A' in response to: Pick one")));

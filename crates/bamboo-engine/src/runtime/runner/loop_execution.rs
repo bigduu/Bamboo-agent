@@ -9,6 +9,7 @@ use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_infrastructure::LLMProvider;
 
+mod gold;
 mod pipeline;
 mod startup;
 

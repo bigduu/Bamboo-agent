@@ -30,6 +30,11 @@ use bamboo_domain::session::runtime_state::{AgentStatusState, SuspensionState};
 use bamboo_infrastructure::LLMProvider;
 
 use super::super::to_event_token_usage;
+use super::gold::{
+    apply_completed_gold_evaluation, apply_gold_terminal_continue, drain_in_flight_gold_evaluation,
+    evaluate_gold_terminal, poll_completed_gold_evaluation, spawn_gold_evaluation_if_needed,
+    start_queued_gold_evaluation_if_idle, GoldTerminalDecision,
+};
 use crate::runtime::runner::state_bridge;
 
 const MAX_LLM_TURN_ATTEMPTS: usize = 3;
@@ -319,6 +324,7 @@ fn refresh_auxiliary_models_for_round(state: &mut LoopRunState, config: &AgentLo
 
 // ---- No-tool-calls path (from round_flow/no_tool_calls.rs) ----
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_no_tool_calls(
     content: String,
     reasoning: Option<String>,
@@ -330,14 +336,56 @@ async fn handle_no_tool_calls(
     metrics_collector: Option<&MetricsCollector>,
     round_id: &str,
     session_id: &str,
+    config: &AgentLoopConfig,
+    task_context: &Option<TaskLoopContext>,
+    eval_model: &str,
+    iteration: u32,
+    llm: Arc<dyn LLMProvider>,
 ) -> TurnOutcome {
     session.add_message(Message::assistant_with_reasoning(content, None, reasoning));
 
-    let _ = event_tx
-        .send(AgentEvent::Complete {
-            usage: to_event_token_usage(prompt_tokens, completion_tokens),
-        })
-        .await;
+    // Terminal Gold gate: when a goal is set with auto-continue, decide whether
+    // to keep working toward it INSTEAD of completing. Running this inside the
+    // loop means the run emits a single terminal `Complete` only when Gold is
+    // truly done — keeping `is_running` accurate and the SSE stream open.
+    let decision = evaluate_gold_terminal(
+        session,
+        task_context,
+        config,
+        eval_model,
+        config.reasoning_effort,
+        session_id,
+        iteration,
+        llm,
+        event_tx,
+    )
+    .await;
+
+    let outcome = match decision {
+        GoldTerminalDecision::Continue(result) => {
+            let next_count = apply_gold_terminal_continue(session, config, &result);
+            tracing::info!(
+                "[{}] Gold terminal gate: continuing toward goal (continuation {})",
+                session_id,
+                next_count
+            );
+            TurnOutcome {
+                should_break: false,
+                sent_complete: false,
+            }
+        }
+        GoldTerminalDecision::Stop => {
+            let _ = event_tx
+                .send(AgentEvent::Complete {
+                    usage: to_event_token_usage(prompt_tokens, completion_tokens),
+                })
+                .await;
+            TurnOutcome {
+                should_break: true,
+                sent_complete: true,
+            }
+        }
+    };
 
     crate::runtime::runner::metrics_lifecycle::record_round_completed(
         metrics_collector,
@@ -360,10 +408,7 @@ async fn handle_no_tool_calls(
         None,
     );
 
-    TurnOutcome {
-        should_break: true,
-        sent_complete: true,
-    }
+    outcome
 }
 
 // ---- Tool-calls path (from round_flow/tool_calls.rs) ----
@@ -579,6 +624,17 @@ pub(super) async fn run_pipeline(
                 spawn_task_evaluation_request(state, event_tx, request, eval_provider);
             }
         }
+        poll_completed_gold_evaluation(state).await;
+        apply_completed_gold_evaluation(session, config, state).await;
+        start_queued_gold_evaluation_if_idle(
+            state,
+            event_tx,
+            state
+                .auxiliary_models
+                .fast_model_provider
+                .clone()
+                .unwrap_or_else(|| llm.clone()),
+        );
 
         state.runtime_state.round.current_round = turn_counter;
 
@@ -599,6 +655,7 @@ pub(super) async fn run_pipeline(
             config.prompt_memory_flags,
             Some(&runtime_context),
             config.app_data_dir.as_deref(),
+            config.active_goal(),
         )
         .await;
 
@@ -798,6 +855,11 @@ pub(super) async fn run_pipeline(
             if stream_output.tool_calls.is_empty() {
                 let reasoning = (!stream_output.reasoning_content.trim().is_empty())
                     .then_some(stream_output.reasoning_content);
+                let eval_model = state
+                    .auxiliary_models
+                    .fast_model_name
+                    .clone()
+                    .unwrap_or_else(|| state.model_name.clone());
                 turn_outcome = Some(
                     handle_no_tool_calls(
                         stream_output.content,
@@ -810,6 +872,11 @@ pub(super) async fn run_pipeline(
                         state.metrics_collector.as_ref(),
                         &round_id,
                         &state.session_id,
+                        config,
+                        &state.task_context,
+                        &eval_model,
+                        turn_counter + 1,
+                        llm.clone(),
                     )
                     .await,
                 );
@@ -907,61 +974,74 @@ pub(super) async fn run_pipeline(
         state.runtime_state.memory.overflow_recovery_consecutive =
             state.overflow_recovery.consecutive_recoveries as u32;
 
-        if session
+        match session
             .metadata
             .get("runtime.suspend_reason")
-            .is_some_and(|reason| reason == "waiting_for_children")
+            .map(String::as_str)
         {
-            state.runtime_state.status = AgentStatusState::Suspended;
-            state.runtime_state.suspension = Some(SuspensionState {
-                reason: "waiting_for_children".to_string(),
-                suspended_at: Utc::now(),
-                resumable: true,
-                hook_point: Some("AfterToolExecution".to_string()),
-            });
+            Some("awaiting_clarification") => {
+                state.runtime_state.status = AgentStatusState::Suspended;
+                state.runtime_state.suspension = Some(SuspensionState {
+                    reason: "awaiting_clarification".to_string(),
+                    suspended_at: Utc::now(),
+                    resumable: true,
+                    hook_point: Some("AfterToolExecution".to_string()),
+                });
+            }
+            Some("waiting_for_children") => {
+                state.runtime_state.status = AgentStatusState::Suspended;
+                state.runtime_state.suspension = Some(SuspensionState {
+                    reason: "waiting_for_children".to_string(),
+                    suspended_at: Utc::now(),
+                    resumable: true,
+                    hook_point: Some("AfterToolExecution".to_string()),
+                });
 
-            // The SubAgent adapter registers durable wait details against the
-            // persisted parent while the runner still owns this local session
-            // snapshot. Merge those details before final save so we do not
-            // clobber them when this suspended runner tears down.
-            if let Some(storage) = config.storage.as_ref() {
-                if let Ok(Some(persisted)) = storage.load_session(&state.session_id).await {
-                    if let Some(runtime_state) = persisted.agent_runtime_state {
-                        state.runtime_state.waiting_for_children =
-                            runtime_state.waiting_for_children;
-                    }
-
-                    // If a very fast child completed before this suspended
-                    // parent runner finished saving, the coordinator may have
-                    // already appended a hidden runtime resume message. Preserve
-                    // it so finalization does not overwrite the pending resume.
-                    let existing_ids: std::collections::HashSet<String> = session
-                        .messages
-                        .iter()
-                        .map(|message| message.id.clone())
-                        .collect();
-                    let mut appended = 0usize;
-                    for message in persisted.messages {
-                        let hidden_runtime_resume = message
-                            .metadata
-                            .as_ref()
-                            .and_then(|metadata| metadata.get("runtime_kind"))
-                            .and_then(|value| value.as_str())
-                            .is_some_and(|kind| kind == "child_completion_resume");
-                        if hidden_runtime_resume && !existing_ids.contains(message.id.as_str()) {
-                            session.messages.push(message);
-                            appended += 1;
+                // The SubAgent adapter registers durable wait details against the
+                // persisted parent while the runner still owns this local session
+                // snapshot. Merge those details before final save so we do not
+                // clobber them when this suspended runner tears down.
+                if let Some(storage) = config.storage.as_ref() {
+                    if let Ok(Some(persisted)) = storage.load_session(&state.session_id).await {
+                        if let Some(runtime_state) = persisted.agent_runtime_state {
+                            state.runtime_state.waiting_for_children =
+                                runtime_state.waiting_for_children;
                         }
-                    }
-                    if appended > 0 {
-                        tracing::info!(
-                            "[{}] Preserved {} hidden child-completion resume message(s) during parent suspension save",
-                            state.session_id,
-                            appended
-                        );
+
+                        // If a very fast child completed before this suspended
+                        // parent runner finished saving, the coordinator may have
+                        // already appended a hidden runtime resume message. Preserve
+                        // it so finalization does not overwrite the pending resume.
+                        let existing_ids: std::collections::HashSet<String> = session
+                            .messages
+                            .iter()
+                            .map(|message| message.id.clone())
+                            .collect();
+                        let mut appended = 0usize;
+                        for message in persisted.messages {
+                            let hidden_runtime_resume = message
+                                .metadata
+                                .as_ref()
+                                .and_then(|metadata| metadata.get("runtime_kind"))
+                                .and_then(|value| value.as_str())
+                                .is_some_and(|kind| kind == "child_completion_resume");
+                            if hidden_runtime_resume && !existing_ids.contains(message.id.as_str())
+                            {
+                                session.messages.push(message);
+                                appended += 1;
+                            }
+                        }
+                        if appended > 0 {
+                            tracing::info!(
+                                "[{}] Preserved {} hidden child-completion resume message(s) during parent suspension save",
+                                state.session_id,
+                                appended
+                            );
+                        }
                     }
                 }
             }
+            _ => {}
         }
 
         state_bridge::write_runtime_state(session, &state.runtime_state);
@@ -990,6 +1070,25 @@ pub(super) async fn run_pipeline(
                 error
             );
         }
+        if let Err(error) = spawn_gold_evaluation_if_needed(
+            turn_counter as usize,
+            session,
+            event_tx,
+            config,
+            state,
+            state
+                .auxiliary_models
+                .fast_model_provider
+                .clone()
+                .unwrap_or_else(|| llm.clone()),
+        ) {
+            tracing::warn!(
+                "[{}] Failed to spawn async Gold evaluation after round {}: {}",
+                state.session_id,
+                turn_counter + 1,
+                error
+            );
+        }
 
         turn_counter += 1;
 
@@ -1001,6 +1100,8 @@ pub(super) async fn run_pipeline(
 
     drain_in_flight_task_evaluation(state).await;
     apply_completed_task_evaluation(session, event_tx, config, state).await;
+    drain_in_flight_gold_evaluation(state).await;
+    apply_completed_gold_evaluation(session, config, state).await;
 
     Ok(sent_complete)
 }
@@ -1016,9 +1117,184 @@ mod tests {
     use crate::runtime::runner::state_bridge;
     use bamboo_agent_core::storage::Storage;
     use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
+    use bamboo_infrastructure::{LLMChunk, LLMError, LLMProvider, LLMStream};
+    use futures::stream;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    /// Minimal provider for terminal-gate tests. Never actually invoked when Gold
+    /// is disabled (the gate short-circuits before any LLM call).
+    struct StubProvider;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for StubProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
+        }
+    }
+
+    /// Provider that returns a `report_gold_evaluation` tool call so the terminal
+    /// gate inside `handle_no_tool_calls` can be driven end to end.
+    struct ScriptedGoldProvider {
+        decision: &'static str,
+        confidence: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for ScriptedGoldProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let arguments = format!(
+                r#"{{"decision":"{}","confidence":"{}","reasoning":"gate test"}}"#,
+                self.decision, self.confidence
+            );
+            let call = bamboo_agent_core::tools::ToolCall {
+                id: "gold-call-1".to_string(),
+                tool_type: "function".to_string(),
+                function: bamboo_agent_core::tools::FunctionCall {
+                    name: "report_gold_evaluation".to_string(),
+                    arguments,
+                },
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![call])),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    fn gold_continue_config() -> crate::runtime::config::AgentLoopConfig {
+        crate::runtime::config::AgentLoopConfig {
+            gold_config: Some(crate::runtime::config::GoldConfig {
+                enabled: true,
+                auto_continue_enabled: true,
+                goal: Some("finish the task".to_string()),
+                max_auto_continuations: 3,
+                ..crate::runtime::config::GoldConfig::default()
+            }),
+            ..crate::runtime::config::AgentLoopConfig::default()
+        }
+    }
+
+    fn round_usage() -> MetricsTokenUsage {
+        MetricsTokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+        }
+    }
+
+    /// THE bug-fix invariant: when Gold decides to continue at the terminal
+    /// point, the runner must NOT emit `Complete` (which closes the SSE stream
+    /// and locks the frontend). Instead it injects a hidden continuation message
+    /// and keeps looping.
+    #[tokio::test]
+    async fn no_tool_calls_does_not_complete_when_gold_continues() {
+        let mut session = Session::new("session-1", "model");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let outcome = super::handle_no_tool_calls(
+            "tentative answer".to_string(),
+            None,
+            5,
+            5,
+            round_usage(),
+            &mut session,
+            &tx,
+            None,
+            "round-1",
+            "session-1",
+            &gold_continue_config(),
+            &None,
+            "model",
+            1,
+            Arc::new(ScriptedGoldProvider {
+                decision: "continue",
+                confidence: "high",
+            }),
+        )
+        .await;
+
+        // The run keeps going: no break, no terminal Complete.
+        assert!(!outcome.should_break);
+        assert!(!outcome.sent_complete);
+
+        // Assistant message + hidden gold continuation message were appended.
+        assert_eq!(session.messages.len(), 2);
+        let last = session.messages.last().unwrap();
+        assert!(matches!(last.role, bamboo_agent_core::Role::User));
+        let metadata = last.metadata.as_ref().expect("runtime metadata");
+        assert_eq!(
+            metadata.get("runtime_kind").and_then(|v| v.as_str()),
+            Some("gold_continue_resume")
+        );
+
+        // Drain events: a Gold evaluation was emitted, but NO Complete.
+        drop(tx);
+        let mut saw_complete = false;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::Complete { .. }) {
+                saw_complete = true;
+            }
+        }
+        assert!(!saw_complete, "Complete must not be emitted on gold continue");
+    }
+
+    /// Counterpart: when Gold reports the goal achieved, the run completes
+    /// normally with a single terminal `Complete`.
+    #[tokio::test]
+    async fn no_tool_calls_completes_when_gold_achieved() {
+        let mut session = Session::new("session-1", "model");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let outcome = super::handle_no_tool_calls(
+            "final answer".to_string(),
+            None,
+            5,
+            5,
+            round_usage(),
+            &mut session,
+            &tx,
+            None,
+            "round-1",
+            "session-1",
+            &gold_continue_config(),
+            &None,
+            "model",
+            1,
+            Arc::new(ScriptedGoldProvider {
+                decision: "achieved",
+                confidence: "high",
+            }),
+        )
+        .await;
+
+        assert!(outcome.should_break);
+        assert!(outcome.sent_complete);
+        // Only the assistant message — no hidden continuation injected.
+        assert_eq!(session.messages.len(), 1);
+
+        drop(tx);
+        let mut saw_complete = false;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::Complete { .. }) {
+                saw_complete = true;
+            }
+        }
+        assert!(saw_complete, "Complete must be emitted when gold is achieved");
+    }
 
     #[derive(Default)]
     struct TestStorage {
@@ -1295,6 +1571,11 @@ mod tests {
             None,
             "round-1",
             "session-1",
+            &crate::runtime::config::AgentLoopConfig::default(),
+            &None,
+            "model",
+            1,
+            Arc::new(StubProvider),
         )
         .await;
 
@@ -1378,6 +1659,7 @@ mod tests {
                 ),
                 queued_request: None,
             },
+            gold_evaluation: super::super::startup::GoldEvaluationState::default(),
             auxiliary_models: crate::runtime::config::AuxiliaryModelConfig::default(),
             runtime_state: bamboo_domain::AgentRuntimeState::new("session-task-eval"),
         };

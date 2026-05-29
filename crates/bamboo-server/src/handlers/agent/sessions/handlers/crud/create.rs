@@ -2,6 +2,7 @@ use actix_web::{web, HttpResponse, Result};
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use crate::model_config_helper::normalize_gold_config_json;
 use bamboo_agent_core::Session;
 
 use super::super::super::types::{CreateSessionRequest, CreateSessionResponse, SessionSummary};
@@ -15,8 +16,28 @@ pub async fn create_session(
     let global_default_prompt =
         crate::prompt_defaults::read_global_default_system_prompt_template();
     let config_snapshot = state.config.read().await.clone();
+    let gold_config_json = match req
+        .gold_config
+        .as_ref()
+        .map(normalize_gold_config_json)
+        .transpose()
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "Invalid gold_config",
+                "message": error.to_string()
+            })));
+        }
+    };
 
-    let session = build_new_session(&id, &req, global_default_prompt.as_str(), &config_snapshot);
+    let session = build_new_session(
+        &id,
+        &req,
+        gold_config_json,
+        global_default_prompt.as_str(),
+        &config_snapshot,
+    );
 
     state
         .storage
@@ -45,6 +66,7 @@ pub async fn create_session(
 fn build_new_session(
     id: &str,
     req: &CreateSessionRequest,
+    gold_config_json: Option<String>,
     global_default_prompt: &str,
     config: &bamboo_infrastructure::Config,
 ) -> Session {
@@ -59,6 +81,7 @@ fn build_new_session(
         model: req.model.clone(),
         model_ref: req.model_ref.clone(),
         reasoning_effort: req.reasoning_effort,
+        gold_config_json,
     };
     let create_config = CreateSessionConfig {
         default_model: config.get_model(),

@@ -23,8 +23,7 @@ use super::common::openai_compat::{
     tools_to_openai_compat_json,
 };
 use super::common::openai_responses::{
-    build_responses_body, select_responses_input_messages, ResponsesInputSource,
-    ResponsesSseParser,
+    build_responses_body, select_responses_input_messages, ResponsesInputSource, ResponsesSseParser,
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
@@ -1731,7 +1730,10 @@ mod tests {
     #[test]
     fn build_llm_headers_uses_panel_intent_for_plain_user_turn() {
         let provider = CopilotProvider::with_token("test_token");
-        let messages = vec![Message::system("Stable instructions"), Message::user("hello")];
+        let messages = vec![
+            Message::system("Stable instructions"),
+            Message::user("hello"),
+        ];
         let headers = provider
             .build_llm_headers(
                 "test_token",
@@ -1749,7 +1751,10 @@ mod tests {
     #[test]
     fn build_llm_headers_switches_to_agent_intent_for_tool_enabled_user_turn() {
         let provider = CopilotProvider::with_token("test_token");
-        let messages = vec![Message::system("Stable instructions"), Message::user("run a tool")];
+        let messages = vec![
+            Message::system("Stable instructions"),
+            Message::user("run a tool"),
+        ];
         let tools = vec![ToolSchema {
             schema_type: "function".to_string(),
             function: FunctionSchema {
@@ -1798,14 +1803,18 @@ mod tests {
 
     #[test]
     fn detects_previous_response_id_unsupported_errors_for_copilot_responses() {
-        assert!(CopilotProvider::looks_like_previous_response_id_unsupported_error(
-            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-            r#"{"error":{"message":"previous_response_id has unsupported_value for this model"}}"#,
-        ));
-        assert!(!CopilotProvider::looks_like_previous_response_id_unsupported_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"{"error":{"message":"invalid input without continuation semantics"}}"#,
-        ));
+        assert!(
+            CopilotProvider::looks_like_previous_response_id_unsupported_error(
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                r#"{"error":{"message":"previous_response_id has unsupported_value for this model"}}"#,
+            )
+        );
+        assert!(
+            !CopilotProvider::looks_like_previous_response_id_unsupported_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":{"message":"invalid input without continuation semantics"}}"#,
+            )
+        );
     }
 
     #[test]
@@ -1822,10 +1831,12 @@ mod tests {
             "reasoning fallback classifier should not misclassify as previous_response_id fallback"
         );
 
-        assert!(CopilotProvider::looks_like_previous_response_id_unsupported_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            "previous_response_id unsupported_value",
-        ));
+        assert!(
+            CopilotProvider::looks_like_previous_response_id_unsupported_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                "previous_response_id unsupported_value",
+            )
+        );
         assert!(
             !CopilotProvider::looks_like_reasoning_unsupported_error(
                 reqwest::StatusCode::BAD_REQUEST,

@@ -7,19 +7,21 @@ pub mod tools;
 pub mod workspace_state;
 
 // Re-export commonly used types (mirrors current agent/core/mod.rs)
-pub use agent::events::{AgentEvent, TitleSource, TokenUsage};
+pub use agent::events::{
+    AgentEvent, GoldCheckpoint, GoldConfidence, GoldDecision, TitleSource, TokenUsage,
+};
 pub use agent::hooks::AgentHook;
 pub use agent::types::{parse_prompt_external_memory_sections, PromptSnapshotExternalMemoryParts};
-pub use bamboo_domain::{
-    ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
-};
 pub use agent::types::{
     CompressionEvent, CompressionTriggerType, ConversationSummary, ImageOcrLine, ImageOcrResult,
     ImageUrlRef, Message, MessageContent, MessagePart, MessagePhase, PendingQuestion,
-    PromptMemoryObservability, PromptSnapshot, Role, Session, SessionKind,
+    PendingQuestionSource, PromptMemoryObservability, PromptSnapshot, Role, Session, SessionKind,
 };
 pub use agent::AgentError;
 pub use bamboo_domain::TokenBudgetUsage;
+pub use bamboo_domain::{
+    ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
+};
 pub use storage::Storage;
 pub use tools::{
     classify_tool, execute_tool_call, finalize_tool_calls, handle_tool_result_with_agentic_support,

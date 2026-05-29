@@ -1,6 +1,7 @@
 //! System prompt context helpers used by the agent loop runner.
 
 mod external_memory;
+mod goal;
 mod plan_mode;
 mod plan_runtime;
 mod system_sections;
@@ -67,6 +68,13 @@ pub(super) fn strip_existing_env_context(prompt: &str) -> String {
 
 pub(crate) fn inject_task_list_into_system_message(session: &mut bamboo_agent_core::Session) {
     task::inject_task_list_into_system_message(session);
+}
+
+pub(crate) fn inject_goal_into_system_message(
+    session: &mut bamboo_agent_core::Session,
+    goal: Option<&str>,
+) {
+    goal::inject_goal_into_system_message(session, goal);
 }
 
 pub(super) fn strip_existing_task_list(prompt: &str) -> String {

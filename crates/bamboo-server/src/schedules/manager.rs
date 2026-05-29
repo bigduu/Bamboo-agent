@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::model_config_helper::{
     get_schedule_model_from_config, resolve_background_model, resolve_fast_model,
-    resolve_provider_type, resolve_task_summary_model,
+    resolve_gold_config, resolve_provider_type, resolve_task_summary_model,
 };
 pub use crate::schedule_app::{
     ResolvedRunConfig, ScheduleContext, ScheduleManager, ScheduleRunJob,
@@ -138,6 +138,7 @@ fn resolve_run_config_from_config(
             .map(|m| m.model_name.clone()),
         summarization_model_provider: resolved_summarization.map(|m| m.provider),
         reasoning_effort,
+        gold_config: resolve_gold_config(&config_snapshot, None),
         system_prompt,
         base_system_prompt: base_system_prompt.to_string(),
         workspace_path,

@@ -163,6 +163,7 @@ fn build_manager(
             summarization_model: None,
             summarization_model_provider: None,
             reasoning_effort: None,
+            gold_config: None,
             system_prompt: String::new(),
             base_system_prompt: String::new(),
             workspace_path: None,

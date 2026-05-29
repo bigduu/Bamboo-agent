@@ -19,7 +19,6 @@ fn isolate_prompt_safe_env_cache() -> MutexGuard<'static, ()> {
     guard
 }
 
-
 struct MockLlmProvider {
     chunks: Vec<LLMChunk>,
     requested_messages: Mutex<Vec<Message>>,
@@ -121,7 +120,9 @@ fn usage(summary_tokens: u32, total_tokens: u32) -> TokenUsageBreakdown {
     TokenUsageBreakdown {
         system_tokens: 10,
         summary_tokens,
-        window_tokens: total_tokens.saturating_sub(10).saturating_sub(summary_tokens),
+        window_tokens: total_tokens
+            .saturating_sub(10)
+            .saturating_sub(summary_tokens),
         total_tokens,
         budget_limit: 100,
     }
@@ -275,7 +276,11 @@ async fn execute_llm_stream_emits_final_budget_event_with_stream_usage() {
     .await
     .expect("execute llm stream");
 
-    match event_rx.recv().await.expect("initial budget event expected") {
+    match event_rx
+        .recv()
+        .await
+        .expect("initial budget event expected")
+    {
         AgentEvent::TokenBudgetUpdated { usage } => {
             assert_eq!(usage.thinking_tokens, 0);
             assert_eq!(usage.cache_read_input_tokens, 0);
@@ -711,7 +716,10 @@ async fn execute_llm_stream_keeps_previous_response_id_when_local_summary_or_com
         .content
         .contains("Older work has been summarized locally."));
     assert!(matches!(requested_messages[1].role, Role::User));
-    assert_eq!(requested_messages[1].content, "continue from the compressed state");
+    assert_eq!(
+        requested_messages[1].content,
+        "continue from the compressed state"
+    );
     assert!(matches!(requested_messages[2].role, Role::Tool));
     assert_eq!(
         llm.requested_previous_response_id

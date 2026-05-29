@@ -288,14 +288,25 @@ pub(super) async fn maybe_handle_user_question_tool(
             .await;
     }
 
-    emit_need_clarification_event(event_tx, &question_payload, &tool_call.id).await;
+    emit_need_clarification_event(
+        event_tx,
+        &question_payload,
+        &tool_call.id,
+        &tool_call.function.name,
+    )
+    .await;
 
-    session.set_pending_question(
+    session.set_pending_question_with_source(
         tool_call.id.clone(),
         tool_call.function.name.clone(),
         question_payload.question,
         question_payload.options,
         question_payload.allow_custom,
+        bamboo_agent_core::PendingQuestionSource::PauseTool,
+    );
+    session.metadata.insert(
+        "runtime.suspend_reason".to_string(),
+        "awaiting_clarification".to_string(),
     );
 
     persist_session_after_question(config, session, session_id).await;

@@ -57,9 +57,14 @@ async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events(
         .as_ref()
         .expect("pending question should be set");
     assert_eq!(pending.tool_call_id, "ask-1");
+    assert_eq!(pending.tool_name, "conclusion_with_options");
     assert_eq!(pending.question, "Continue?");
     assert_eq!(pending.options, vec!["Yes".to_string(), "No".to_string()]);
     assert!(!pending.allow_custom);
+    assert_eq!(
+        pending.source,
+        bamboo_agent_core::PendingQuestionSource::PauseTool
+    );
 
     let first_event = rx.recv().await.expect("first event");
     match first_event {
@@ -79,11 +84,13 @@ async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events(
             question,
             options,
             tool_call_id,
+            tool_name,
             allow_custom,
         } => {
             assert_eq!(question, "Continue?");
             assert_eq!(options, Some(vec!["Yes".to_string(), "No".to_string()]));
             assert_eq!(tool_call_id, Some("ask-1".to_string()));
+            assert_eq!(tool_name, Some("conclusion_with_options".to_string()));
             assert!(!allow_custom);
         }
         other => panic!("unexpected second event: {other:?}"),
@@ -141,12 +148,17 @@ async fn maybe_handle_user_question_tool_handles_request_permissions() {
         .as_ref()
         .expect("pending question should be set for request_permissions");
     assert_eq!(pending.tool_call_id, "perm-1");
+    assert_eq!(pending.tool_name, "request_permissions");
     assert!(pending.question.contains("Permission Request"));
     assert_eq!(
         pending.options,
         vec!["Approve".to_string(), "Deny".to_string()]
     );
     assert!(!pending.allow_custom);
+    assert_eq!(
+        pending.source,
+        bamboo_agent_core::PendingQuestionSource::PauseTool
+    );
 
     let first_event = rx.recv().await.expect("first event");
     assert!(matches!(first_event, AgentEvent::ToolComplete { .. }));
@@ -157,6 +169,7 @@ async fn maybe_handle_user_question_tool_handles_request_permissions() {
             question,
             options,
             tool_call_id,
+            tool_name,
             allow_custom,
         } => {
             assert!(question.contains("Permission Request"));
@@ -165,6 +178,7 @@ async fn maybe_handle_user_question_tool_handles_request_permissions() {
                 Some(vec!["Approve".to_string(), "Deny".to_string()])
             );
             assert_eq!(tool_call_id, Some("perm-1".to_string()));
+            assert_eq!(tool_name, Some("request_permissions".to_string()));
             assert!(!allow_custom);
         }
         other => panic!("unexpected second event: {other:?}"),
