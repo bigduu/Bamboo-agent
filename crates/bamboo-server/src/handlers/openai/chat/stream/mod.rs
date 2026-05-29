@@ -65,6 +65,7 @@ pub(super) async fn handle_streaming_chat(
                 parallel_tool_calls,
                 responses: None,
                 request_purpose: Some("openai_compat".to_string()),
+                cache: None,
             }),
         )
         .await

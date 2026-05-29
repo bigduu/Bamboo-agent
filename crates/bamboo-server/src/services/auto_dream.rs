@@ -338,6 +338,7 @@ async fn collect_stream_text(
         parallel_tool_calls: None,
         responses: None,
         request_purpose: Some("auto_dream".to_string()),
+        cache: None,
     };
 
     let mut stream = provider

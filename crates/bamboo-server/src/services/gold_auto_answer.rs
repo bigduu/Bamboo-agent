@@ -389,6 +389,7 @@ async fn evaluate_gold_auto_answer_question(
         parallel_tool_calls: None,
         responses: None,
         request_purpose: Some("gold_auto_answer".to_string()),
+        cache: None,
     };
 
     let stream = provider

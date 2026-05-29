@@ -81,6 +81,7 @@ impl MiniLoopExecutor for LLMMiniLoopExecutor {
             parallel_tool_calls: None,
             responses: None,
             request_purpose: Some("mini_loop".to_string()),
+            cache: None,
         };
         let stream = self
             .provider

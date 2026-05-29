@@ -371,6 +371,7 @@ async fn rerank_candidate_ids(
         parallel_tool_calls: None,
         responses: None,
         request_purpose: Some("memory_rerank".to_string()),
+        cache: None,
     };
 
     let mut stream = context

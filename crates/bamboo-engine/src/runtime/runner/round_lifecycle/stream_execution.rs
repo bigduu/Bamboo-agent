@@ -22,7 +22,7 @@ use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
 use bamboo_compression::PreparedContext;
 use bamboo_domain::ReasoningEffort;
 use bamboo_infrastructure::provider::ResponsesRequestOptions;
-use bamboo_infrastructure::{LLMProvider, LLMRequestOptions};
+use bamboo_infrastructure::{LLMProvider, LLMRequestOptions, PromptCachePlan};
 use bamboo_tools::exposure::activated_discoverable_tools;
 
 const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
@@ -316,12 +316,27 @@ pub(super) async fn execute_llm_stream(
     if let Some(response_id) = previous_response_id {
         responses_options.previous_response_id = Some(response_id.to_string());
     }
+    // Cache the stable system prompt and tool definitions. The prompt envelope
+    // keeps per-round volatile content (task list, recalled memory, plan state)
+    // in separate context-block messages rather than inside the system prompt,
+    // so the system block is byte-stable across rounds and a system/tools cache
+    // breakpoint reliably hits — giving a stable, non-zero cache read instead of
+    // one that swings with whatever happened to match. (Deeper conversation-tail
+    // caching additionally requires reordering volatile context after the
+    // conversation, which is left as a follow-up because it interacts with the
+    // Responses API previous_response_id delta path.)
+    let cache_plan = PromptCachePlan {
+        cache_tools: true,
+        cache_system: true,
+        ..PromptCachePlan::default()
+    };
     let request_options = LLMRequestOptions {
         session_id: Some(session_id.to_string()),
         reasoning_effort,
         parallel_tool_calls: Some(true),
         responses: Some(responses_options),
         request_purpose: Some("agent_loop".to_string()),
+        cache: Some(cache_plan),
     };
 
     if !supports_previous_response_id {

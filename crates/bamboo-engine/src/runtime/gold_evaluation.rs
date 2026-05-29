@@ -184,6 +184,7 @@ pub async fn evaluate_gold(
         parallel_tool_calls: None,
         responses: None,
         request_purpose: Some("gold_evaluation".to_string()),
+        cache: None,
     };
 
     match llm

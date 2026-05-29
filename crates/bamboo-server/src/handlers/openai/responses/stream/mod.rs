@@ -48,6 +48,7 @@ pub(super) async fn handle_streaming_response(
         parallel_tool_calls: prepared.parallel_tool_calls,
         responses: Some(prepared.responses_options.clone()),
         request_purpose: Some("openai_compat".to_string()),
+        cache: None,
     };
     let stream_result = provider
         .chat_stream_with_options(

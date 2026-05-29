@@ -46,6 +46,7 @@ pub(super) async fn handle_non_streaming_complete(
                 parallel_tool_calls: None,
                 responses: None,
                 request_purpose: Some("anthropic_compat".to_string()),
+                cache: None,
             }),
         )
         .await
