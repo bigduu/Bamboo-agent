@@ -27,6 +27,10 @@ pub struct GeminiStreamState {
     pub thinking_parts_count: usize,
     /// Approximate characters contained in thought text chunks.
     pub thinking_text_chars: usize,
+    /// Whether prompt-cache usage has already been emitted for this stream.
+    /// Gemini reports `usageMetadata` cumulatively; emitting once (on the final,
+    /// content-free chunk) keeps the downstream accumulator from over-counting.
+    cache_usage_emitted: bool,
 }
 
 impl GeminiStreamState {
@@ -36,6 +40,20 @@ impl GeminiStreamState {
         self.next_tool_id += 1;
         id
     }
+}
+
+/// Emit a [`LLMChunk::CacheUsage`] once, from a Gemini chunk's `usageMetadata`
+/// (`cachedContentTokenCount`). Used at content-free return points so cache
+/// reporting never displaces actual content tokens.
+fn take_gemini_cache_usage(state: &mut GeminiStreamState, value: &Value) -> Option<LLMChunk> {
+    if state.cache_usage_emitted {
+        return None;
+    }
+    let chunk = value
+        .get("usageMetadata")
+        .and_then(crate::llm::cache::cache_usage_from_gemini_usage)?;
+    state.cache_usage_emitted = true;
+    Some(chunk)
 }
 
 /// Parse a single Gemini SSE event into an optional [`LLMChunk`].
@@ -98,7 +116,7 @@ pub fn parse_gemini_sse_event(
         })?;
 
     if candidates.is_empty() {
-        return Ok(None);
+        return Ok(take_gemini_cache_usage(state, &value));
     }
 
     // Get the first candidate (Gemini typically returns one)
@@ -114,7 +132,7 @@ pub fn parse_gemini_sse_event(
     // Extract content
     let content = match candidate.get("content") {
         Some(c) => c,
-        None => return Ok(None),
+        None => return Ok(take_gemini_cache_usage(state, &value)),
     };
 
     // Extract parts array
@@ -124,7 +142,7 @@ pub fn parse_gemini_sse_event(
     };
 
     if parts.is_empty() {
-        return Ok(None);
+        return Ok(take_gemini_cache_usage(state, &value));
     }
 
     // Process the first part (Gemini typically sends one part per chunk)

@@ -88,6 +88,10 @@ pub fn build_openai_compat_body(
         "model": model,
         "messages": messages_to_openai_compat_json(messages),
         "stream": true,
+        // Ask for a final usage chunk so we can report prompt-cache hits
+        // (`prompt_tokens_details.cached_tokens`). Standard OpenAI-compatible APIs
+        // ignore options they do not support.
+        "stream_options": { "include_usage": true },
         "tools": tools_to_openai_compat_json(tools),
     });
 
@@ -116,7 +120,12 @@ pub fn build_openai_compat_body(
 pub struct OpenAICompatStreamChunk {
     #[allow(dead_code)]
     id: Option<String>,
+    #[serde(default)]
     choices: Vec<OpenAICompatChoice>,
+    /// Present only when `stream_options.include_usage` is requested; OpenAI-
+    /// compatible APIs send it in a final chunk that has empty `choices`.
+    #[serde(default)]
+    usage: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +163,14 @@ struct OpenAICompatFunctionDelta {
 
 /// Convert a single OpenAI-compatible stream chunk into an [`LLMChunk`].
 pub fn parse_openai_compat_chunk(chunk: OpenAICompatStreamChunk) -> LLMChunk {
+    // Final usage chunk (empty choices): surface provider-side prompt cache hits
+    // so the cache badge works for OpenAI-compatible providers too.
+    if let Some(usage) = &chunk.usage {
+        if let Some(cache_chunk) = crate::llm::cache::cache_usage_from_openai_usage(usage) {
+            return cache_chunk;
+        }
+    }
+
     let Some(choice) = chunk.choices.first() else {
         return LLMChunk::Token(String::new());
     };
@@ -415,6 +432,34 @@ mod tests {
                 assert_eq!(calls[0].function.arguments, r#"{"q":"test"}"#);
             }
             other => panic!("expected LLMChunk::ToolCalls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_openai_compat_usage_chunk_yields_cache_usage() {
+        // Final usage chunk with empty choices and cached prompt tokens.
+        let data = r#"{"id":"chatcmpl_1","choices":[],"usage":{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":768}}}"#;
+
+        let chunk = super::parse_openai_compat_sse_data_strict(data).unwrap();
+
+        match chunk {
+            LLMChunk::CacheUsage {
+                cache_read_input_tokens,
+                ..
+            } => assert_eq!(cache_read_input_tokens, 768),
+            other => panic!("expected LLMChunk::CacheUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_openai_compat_usage_chunk_without_cache_yields_empty_token() {
+        let data = r#"{"id":"chatcmpl_1","choices":[],"usage":{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":0}}}"#;
+
+        let chunk = super::parse_openai_compat_sse_data_strict(data).unwrap();
+
+        match chunk {
+            LLMChunk::Token(token) => assert!(token.is_empty()),
+            other => panic!("expected empty LLMChunk::Token, got {other:?}"),
         }
     }
 

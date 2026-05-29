@@ -23,6 +23,7 @@ use reqwest::{header::HeaderMap, Client};
 use serde_json::{json, Value};
 
 use crate::config::RequestOverridesConfig;
+use crate::llm::cache::{CacheTtl, PromptCachePlan, MAX_ANTHROPIC_CACHE_BREAKPOINTS};
 use crate::llm::provider::LLMRequestOptions;
 use crate::llm::provider::{LLMError, LLMProvider, LLMStream, Result};
 use crate::llm::providers::common::model_fetcher;
@@ -146,6 +147,10 @@ impl LLMProvider for AnthropicProvider {
             .or(self.default_reasoning_effort);
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
+        let cache_plan = options.and_then(|o| o.cache.as_ref());
+        let extended_cache_ttl = cache_plan
+            .map(|plan| plan.ttl == CacheTtl::Extended)
+            .unwrap_or(false);
         let reasoning_source = if request_reasoning_effort.is_some() {
             "request"
         } else if self.default_reasoning_effort.is_some() {
@@ -163,7 +168,7 @@ impl LLMProvider for AnthropicProvider {
 
         tracing::debug!("Anthropic provider using model: {}", model);
 
-        let mut body = build_anthropic_request(
+        let mut body = build_anthropic_request_with_cache(
             messages,
             tools,
             model,
@@ -171,6 +176,7 @@ impl LLMProvider for AnthropicProvider {
             true,
             reasoning_effort,
             parallel_tool_calls,
+            cache_plan,
         );
         request_overrides::apply_overrides_to_body(
             &mut body,
@@ -200,7 +206,14 @@ impl LLMProvider for AnthropicProvider {
             max_tokens,
             request_purpose
         );
-        let headers = self.build_headers(request_overrides::ENDPOINT_MESSAGES, Some(model))?;
+        let mut headers = self.build_headers(request_overrides::ENDPOINT_MESSAGES, Some(model))?;
+        if extended_cache_ttl {
+            // 1-hour prompt cache TTL is gated behind a beta header.
+            headers.insert(
+                "anthropic-beta",
+                reqwest::header::HeaderValue::from_static("extended-cache-ttl-2025-04-11"),
+            );
+        }
 
         let mut response = self
             .client
@@ -223,7 +236,7 @@ impl LLMProvider for AnthropicProvider {
                     model
                 );
 
-                let mut fallback_body = build_anthropic_request(
+                let mut fallback_body = build_anthropic_request_with_cache(
                     messages,
                     tools,
                     model,
@@ -231,6 +244,7 @@ impl LLMProvider for AnthropicProvider {
                     true,
                     None,
                     parallel_tool_calls,
+                    cache_plan,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -325,19 +339,89 @@ pub fn build_anthropic_request(
     reasoning_effort: Option<ReasoningEffort>,
     parallel_tool_calls: Option<bool>,
 ) -> Value {
-    let (system, mut anthropic_messages) = messages_to_anthropic_json(messages);
+    build_anthropic_request_with_cache(
+        messages,
+        tools,
+        model,
+        max_tokens,
+        stream,
+        reasoning_effort,
+        parallel_tool_calls,
+        None,
+    )
+}
 
-    // Add cache_control to conversation summary message blocks.
-    add_cache_control_to_summary_blocks(&mut anthropic_messages);
+/// Build an Anthropic Messages API request body, placing prompt-cache
+/// breakpoints according to a provider-agnostic [`PromptCachePlan`].
+///
+/// When `cache` is `None`, falls back to caching the stable system prompt and
+/// tool definitions (always safe, since both are constant across a session).
+/// Message-level breakpoints require the engine's knowledge of which messages
+/// end a stable prefix, so they are opt-in via the plan's
+/// `breakpoint_message_ids`. The total number of `cache_control` markers is
+/// clamped to [`MAX_ANTHROPIC_CACHE_BREAKPOINTS`]; when there are more
+/// candidates than the budget, the breakpoints nearest the end of the
+/// conversation win (they cover the largest stable prefix).
+pub fn build_anthropic_request_with_cache(
+    messages: &[Message],
+    tools: &[ToolSchema],
+    model: &str,
+    max_tokens: u32,
+    stream: bool,
+    reasoning_effort: Option<ReasoningEffort>,
+    parallel_tool_calls: Option<bool>,
+    cache: Option<&PromptCachePlan>,
+) -> Value {
+    let default_plan = PromptCachePlan {
+        cache_tools: true,
+        cache_system: true,
+        ..PromptCachePlan::default()
+    };
+    let plan = cache.unwrap_or(&default_plan);
+    let ttl = plan.ttl;
+
+    let (mut system, mut anthropic_messages, message_ids) = messages_to_anthropic_json(messages);
+
+    // Anthropic honors at most MAX_ANTHROPIC_CACHE_BREAKPOINTS `cache_control`
+    // markers per request. Spend the budget on the most stable regions first
+    // (tools, then system), then on conversation breakpoints nearest the end.
+    let mut budget = MAX_ANTHROPIC_CACHE_BREAKPOINTS;
 
     let mut tools_json = tools_to_anthropic_json(tools);
-    // Add cache_control to the last tool definition so tool definitions
-    // are cached across turns.
-    if let Some(last_tool) = tools_json.last_mut() {
-        last_tool
-            .as_object_mut()
-            .expect("tool definition is always a JSON object")
-            .insert("cache_control".to_string(), json!({"type": "ephemeral"}));
+    if plan.cache_tools && budget > 0 {
+        if let Some(last_tool) = tools_json.last_mut().and_then(|t| t.as_object_mut()) {
+            last_tool.insert("cache_control".to_string(), cache_control_value(ttl));
+            budget -= 1;
+        }
+    }
+
+    if plan.cache_system && budget > 0 {
+        if let Some(last_block) = system
+            .as_mut()
+            .and_then(|s| s.as_array_mut())
+            .and_then(|blocks| blocks.last_mut())
+            .and_then(|block| block.as_object_mut())
+        {
+            last_block.insert("cache_control".to_string(), cache_control_value(ttl));
+            budget -= 1;
+        }
+    }
+
+    if budget > 0 && !plan.breakpoint_message_ids.is_empty() {
+        let mut breakpoint_indices: Vec<usize> = message_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, id)| plan.is_breakpoint(id).then_some(idx))
+            .collect();
+        // Keep only the breakpoints closest to the end of the conversation.
+        if breakpoint_indices.len() > budget {
+            breakpoint_indices = breakpoint_indices.split_off(breakpoint_indices.len() - budget);
+        }
+        for idx in breakpoint_indices {
+            if let Some(message) = anthropic_messages.get_mut(idx) {
+                add_cache_control_to_last_block(message, ttl);
+            }
+        }
     }
 
     let mut body = json!({
@@ -368,39 +452,24 @@ pub fn build_anthropic_request(
     body
 }
 
-/// Find messages whose text content contains the conversation summary marker and
-/// add `cache_control: {"type": "ephemeral"}` to their text blocks.
-fn add_cache_control_to_summary_blocks(messages: &mut [Value]) {
-    for msg in messages.iter_mut() {
-        let content = msg.get("content");
-        let Some(content) = content else { continue };
-        // Check if any text block in this message contains a summary marker.
-        let has_summary = if content.is_array() {
-            content.as_array().unwrap().iter().any(|block| {
-                block
-                    .get("text")
-                    .and_then(|t| t.as_str())
-                    .is_some_and(|t| t.contains("CONVERSATION_SUMMARY_START"))
-            })
-        } else {
-            content
-                .as_str()
-                .is_some_and(|t| t.contains("CONVERSATION_SUMMARY_START"))
-        };
-        if !has_summary {
-            continue;
-        }
-        // Add cache_control to text blocks in this message.
-        if let Some(blocks) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
-            for block in blocks.iter_mut() {
-                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    block
-                        .as_object_mut()
-                        .expect("content block is always a JSON object")
-                        .insert("cache_control".to_string(), json!({"type": "ephemeral"}));
-                }
-            }
-        }
+/// Build a `cache_control` value, honoring an optional extended TTL.
+fn cache_control_value(ttl: CacheTtl) -> Value {
+    match ttl.anthropic_ttl() {
+        Some(ttl) => json!({"type": "ephemeral", "ttl": ttl}),
+        None => json!({"type": "ephemeral"}),
+    }
+}
+
+/// Add a `cache_control` breakpoint to the last content block of an Anthropic
+/// message, creating an incremental cache point at that conversation turn.
+fn add_cache_control_to_last_block(message: &mut Value, ttl: CacheTtl) {
+    if let Some(last_block) = message
+        .get_mut("content")
+        .and_then(|c| c.as_array_mut())
+        .and_then(|blocks| blocks.last_mut())
+        .and_then(|block| block.as_object_mut())
+    {
+        last_block.insert("cache_control".to_string(), cache_control_value(ttl));
     }
 }
 
@@ -428,9 +497,15 @@ fn anthropic_thinking_from_effort(
     }))
 }
 
-fn messages_to_anthropic_json(messages: &[Message]) -> (Option<Value>, Vec<Value>) {
+/// Convert internal messages to the Anthropic wire shape.
+///
+/// Returns the optional `system` block array, the message array, and a parallel
+/// vector of the originating message id for each output message (so the caller
+/// can place cache breakpoints by id, robust to the tool-result merging below).
+fn messages_to_anthropic_json(messages: &[Message]) -> (Option<Value>, Vec<Value>, Vec<String>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut out: Vec<Value> = Vec::new();
+    let mut out_ids: Vec<String> = Vec::new();
 
     for m in messages {
         match m.role {
@@ -440,7 +515,8 @@ fn messages_to_anthropic_json(messages: &[Message]) -> (Option<Value>, Vec<Value
                 // Merge consecutive Tool messages into the preceding user
                 // message so that all tool_results for a single assistant
                 // tool_use turn live in the *same* user message, as required
-                // by the Anthropic API.
+                // by the Anthropic API. The merged-into message keeps its
+                // original id, so a breakpoint placed on that turn still maps.
                 if matches!(m.role, Role::Tool) {
                     if let Some(last) = out.last_mut() {
                         let last_role = last.get("role").and_then(|r| r.as_str());
@@ -466,29 +542,22 @@ fn messages_to_anthropic_json(messages: &[Message]) -> (Option<Value>, Vec<Value
                     }
                 }
                 out.push(msg_json);
+                out_ids.push(m.id.clone());
             }
         }
     }
 
+    // The system prompt's cache breakpoint is applied by the caller based on the
+    // cache plan, since whether the system prompt is stable enough to cache is a
+    // policy decision, not a serialization detail.
     let system = if system_parts.is_empty() {
         None
     } else {
         let joined = system_parts.join("\n\n");
-        let mut blocks: Vec<Value> = vec![json!({
-            "type": "text",
-            "text": joined,
-        })];
-        // Mark the last system block as a cache breakpoint so the system prompt
-        // benefits from Anthropic's prompt caching.
-        if let Some(last) = blocks.last_mut() {
-            last.as_object_mut()
-                .expect("system block is always a JSON object")
-                .insert("cache_control".to_string(), json!({"type": "ephemeral"}));
-        }
-        Some(json!(blocks))
+        Some(json!([{ "type": "text", "text": joined }]))
     };
 
-    (system, out)
+    (system, out, out_ids)
 }
 
 fn message_to_anthropic_json(message: &Message) -> Value {
@@ -1260,29 +1329,184 @@ mod anthropic_request_building {
     }
 
     #[test]
-    fn conversation_summary_message_gets_cache_control() {
-        let messages = vec![
-            Message::user("Hi"),
-            Message::user("<!-- CONVERSATION_SUMMARY_START -->\nOld context here\n<!-- CONVERSATION_SUMMARY_END -->"),
-            Message::assistant("Got it", None),
-        ];
+    fn plan_places_cache_breakpoint_on_message_by_id() {
+        let flagged = Message::user("Old context here");
+        let flagged_id = flagged.id.clone();
+        let messages = vec![Message::user("Hi"), flagged, Message::assistant("Got it", None)];
+        let plan = crate::llm::cache::PromptCachePlan {
+            breakpoint_message_ids: vec![flagged_id],
+            ..Default::default()
+        };
 
-        let out =
-            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
 
         let msgs = out["messages"].as_array().unwrap();
-        // First message (Hi) has no cache_control on its text block.
-        let first_content = msgs[0]["content"].as_array().unwrap();
-        assert!(first_content[0].get("cache_control").is_none());
-
-        // Second message (summary) has cache_control on text blocks.
-        let second_content = msgs[1]["content"].as_array().unwrap();
-        assert_eq!(second_content[0]["cache_control"]["type"], "ephemeral");
-
-        // Third message (assistant) is not affected.
+        // Only the message whose id is in the plan gets a cache breakpoint.
+        assert!(msgs[0]["content"].as_array().unwrap()[0]
+            .get("cache_control")
+            .is_none());
+        assert_eq!(
+            msgs[1]["content"].as_array().unwrap()[0]["cache_control"]["type"],
+            "ephemeral"
+        );
         assert!(msgs[2]["content"].as_array().unwrap()[0]
             .get("cache_control")
             .is_none());
+    }
+
+    #[test]
+    fn breakpoint_survives_tool_result_merge_by_id() {
+        // The first tool result of a turn creates a user message; subsequent
+        // tool results merge into it (keeping the first result's id). A
+        // breakpoint placed on that turn's id must still land on the merged
+        // message even though it now holds multiple tool_result blocks.
+        let assistant = Message::assistant(
+            "",
+            Some(vec![
+                ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "f".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                },
+                ToolCall {
+                    id: "call_2".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "g".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                },
+            ]),
+        );
+        let first_result = Message::tool_result("call_1", "output one");
+        let first_result_id = first_result.id.clone();
+        let messages = vec![
+            assistant,
+            first_result,
+            Message::tool_result("call_2", "output two"),
+        ];
+        let plan = crate::llm::cache::PromptCachePlan {
+            breakpoint_message_ids: vec![first_result_id],
+            ..Default::default()
+        };
+
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "both tool results merge into one user message");
+        let user = &msgs[1];
+        assert_eq!(user["role"], "user");
+        let blocks = user["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "both tool results present in merged message");
+        assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn extended_ttl_emits_one_hour_cache_control() {
+        let plan = crate::llm::cache::PromptCachePlan {
+            cache_system: true,
+            ttl: crate::llm::cache::CacheTtl::Extended,
+            ..Default::default()
+        };
+        let messages = vec![Message::system("Stable prompt"), Message::user("Hi")];
+
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+
+        assert_eq!(out["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(out["system"][0]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn cache_breakpoints_are_clamped_to_provider_budget() {
+        // tools + system + 6 flagged messages, but only 4 breakpoints are
+        // allowed, so 2 messages (the last two) keep their markers.
+        let mut messages = vec![Message::system("Stable prompt")];
+        let mut flagged_ids = Vec::new();
+        for i in 0..6 {
+            let m = Message::user(format!("turn {i}"));
+            flagged_ids.push(m.id.clone());
+            messages.push(m);
+        }
+        let plan = crate::llm::cache::PromptCachePlan {
+            cache_tools: true,
+            cache_system: true,
+            breakpoint_message_ids: flagged_ids,
+            ..Default::default()
+        };
+
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &sample_tools(),
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+
+        let tool_breaks = out["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t.get("cache_control").is_some())
+            .count();
+        let system_breaks = out["system"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b.get("cache_control").is_some())
+            .count();
+        let message_breaks = out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m["content"]
+                    .as_array()
+                    .and_then(|blocks| blocks.last())
+                    .map(|b| b.get("cache_control").is_some())
+                    .unwrap_or(false)
+            })
+            .count();
+
+        assert_eq!(tool_breaks, 1);
+        assert_eq!(system_breaks, 1);
+        assert_eq!(message_breaks, 2, "only the remaining budget of 2 message breakpoints");
+        assert!(
+            tool_breaks + system_breaks + message_breaks
+                <= super::MAX_ANTHROPIC_CACHE_BREAKPOINTS
+        );
     }
 
     #[test]
