@@ -2,7 +2,9 @@ use actix_web::{web, HttpResponse, Responder};
 
 use super::{ChatRequest, ChatResponse};
 use crate::app_state::AppState;
-use crate::model_config_helper::{parse_session_gold_config, resolve_gold_config, GOLD_CONFIG_METADATA_KEY};
+use crate::model_config_helper::{
+    parse_session_gold_config, resolve_gold_config, GOLD_CONFIG_METADATA_KEY,
+};
 use crate::session_app::chat::{parse_goal_command, GoalCommand};
 use crate::session_app::metadata::SessionMetadataService;
 use bamboo_engine::config::GoldConfig;

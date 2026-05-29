@@ -445,10 +445,7 @@ mod tests {
         provider: Arc<dyn LLMProvider>,
     ) -> GoldTerminalDecision {
         let (tx, _rx) = mpsc::channel(8);
-        evaluate_gold_terminal(
-            session, &None, config, "model", None, "s", 1, provider, &tx,
-        )
-        .await
+        evaluate_gold_terminal(session, &None, config, "model", None, "s", 1, provider, &tx).await
     }
 
     fn continue_result() -> GoldEvaluationResult {

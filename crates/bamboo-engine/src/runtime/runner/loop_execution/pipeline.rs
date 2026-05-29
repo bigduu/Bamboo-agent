@@ -1249,7 +1249,10 @@ mod tests {
                 saw_complete = true;
             }
         }
-        assert!(!saw_complete, "Complete must not be emitted on gold continue");
+        assert!(
+            !saw_complete,
+            "Complete must not be emitted on gold continue"
+        );
     }
 
     /// Counterpart: when Gold reports the goal achieved, the run completes
@@ -1293,7 +1296,10 @@ mod tests {
                 saw_complete = true;
             }
         }
-        assert!(saw_complete, "Complete must be emitted when gold is achieved");
+        assert!(
+            saw_complete,
+            "Complete must be emitted when gold is achieved"
+        );
     }
 
     #[derive(Default)]

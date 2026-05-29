@@ -721,9 +721,9 @@ fn canonicalize_option(raw_answer: &str, options: &[String]) -> Option<String> {
 fn normalize_answer_key(value: &str) -> String {
     value
         .trim()
-        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'))
+        .trim_matches(['"', '\'', '`'])
         .trim()
-        .trim_end_matches(|ch: char| matches!(ch, '.' | '。' | '!' | '！' | '?' | '？'))
+        .trim_end_matches(['.', '。', '!', '！', '?', '？'])
         .trim()
         .to_ascii_lowercase()
 }
