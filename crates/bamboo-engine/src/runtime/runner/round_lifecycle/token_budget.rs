@@ -180,8 +180,10 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_runtime_limit_uses_copilot_metadata() {
-        let mut config = AgentLoopConfig::default();
-        config.provider_type = Some("copilot".to_string());
+        let config = AgentLoopConfig {
+            provider_type: Some("copilot".to_string()),
+            ..Default::default()
+        };
 
         let provider = MetadataProvider {
             models: vec![ProviderModelInfo {
@@ -200,8 +202,10 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_runtime_limit_ignores_non_copilot_provider() {
-        let mut config = AgentLoopConfig::default();
-        config.provider_type = Some("openai".to_string());
+        let config = AgentLoopConfig {
+            provider_type: Some("openai".to_string()),
+            ..Default::default()
+        };
 
         let provider = MetadataProvider {
             models: vec![ProviderModelInfo {
@@ -217,8 +221,10 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_runtime_limit_requires_context_tokens() {
-        let mut config = AgentLoopConfig::default();
-        config.provider_type = Some("copilot".to_string());
+        let config = AgentLoopConfig {
+            provider_type: Some("copilot".to_string()),
+            ..Default::default()
+        };
 
         let provider = MetadataProvider {
             models: vec![ProviderModelInfo {
@@ -253,8 +259,10 @@ mod tests {
             }
         }
 
-        let mut config = AgentLoopConfig::default();
-        config.provider_type = Some("copilot".to_string());
+        let config = AgentLoopConfig {
+            provider_type: Some("copilot".to_string()),
+            ..Default::default()
+        };
 
         let limit =
             resolve_provider_runtime_limit(&config, &FailingProvider, "gpt-5.3-codex").await;

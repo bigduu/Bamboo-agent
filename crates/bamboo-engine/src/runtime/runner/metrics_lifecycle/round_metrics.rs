@@ -22,6 +22,7 @@ pub(in crate::runtime::runner) fn record_round_started(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::runtime::runner) fn record_round_completed(
     metrics_collector: Option<&MetricsCollector>,
     round_id: &str,

@@ -130,6 +130,16 @@ pub mod title_gen;
 pub mod tools;
 pub mod workflow;
 
+// Re-export commonly used types
+pub use app_state::{AgentRunner, AgentStatus, AppState};
+pub use config::{build_cors, build_security_headers};
+pub use error::AppError;
+pub use routes::{
+    agent_routes, anthropic_routes, bamboo_v1_routes, configure_routes,
+    configure_routes_with_rate_limiting, gemini_routes, openai_prefixed_routes,
+};
+pub use server::{run, run_with_bind, run_with_bind_and_static, WebService};
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -145,13 +155,3 @@ pub(crate) mod test_support {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
-
-// Re-export commonly used types
-pub use app_state::{AgentRunner, AgentStatus, AppState};
-pub use config::{build_cors, build_security_headers};
-pub use error::AppError;
-pub use routes::{
-    agent_routes, anthropic_routes, bamboo_v1_routes, configure_routes,
-    configure_routes_with_rate_limiting, gemini_routes, openai_prefixed_routes,
-};
-pub use server::{run, run_with_bind, run_with_bind_and_static, WebService};

@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn test_put_and_get() {
         let store = ApprovalStore::new();
-        store.put(&("Bash", "cargo test"), ApprovalDecision::Approved);
+        store.put(("Bash", "cargo test"), ApprovalDecision::Approved);
         let decision = store.get(&("Bash", "cargo test")).unwrap();
         assert_eq!(decision, ApprovalDecision::Approved);
         assert!(decision.is_approved());
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn test_denied_not_approved() {
         let store = ApprovalStore::new();
-        store.put(&"dangerous_op", ApprovalDecision::Denied);
+        store.put("dangerous_op", ApprovalDecision::Denied);
         let decision = store.get(&"dangerous_op").unwrap();
         assert!(!decision.is_approved());
     }
@@ -223,8 +223,8 @@ mod tests {
     #[test]
     fn test_different_keys_independent() {
         let store = ApprovalStore::new();
-        store.put(&("Bash", "echo hi"), ApprovalDecision::Approved);
-        store.put(&("Bash", "rm -rf /"), ApprovalDecision::Denied);
+        store.put(("Bash", "echo hi"), ApprovalDecision::Approved);
+        store.put(("Bash", "rm -rf /"), ApprovalDecision::Denied);
 
         assert!(store.get(&("Bash", "echo hi")).unwrap().is_approved());
         assert!(!store.get(&("Bash", "rm -rf /")).unwrap().is_approved());
@@ -234,8 +234,8 @@ mod tests {
     #[test]
     fn test_check_all_all_approved() {
         let store = ApprovalStore::new();
-        store.put(&"/tmp/a.rs", ApprovalDecision::Approved);
-        store.put(&"/tmp/b.rs", ApprovalDecision::ApprovedForSession);
+        store.put("/tmp/a.rs", ApprovalDecision::Approved);
+        store.put("/tmp/b.rs", ApprovalDecision::ApprovedForSession);
 
         let keys = vec!["/tmp/a.rs", "/tmp/b.rs"];
         let decision = store.check_all(&keys).unwrap();
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn test_check_all_missing_key() {
         let store = ApprovalStore::new();
-        store.put(&"/tmp/a.rs", ApprovalDecision::Approved);
+        store.put("/tmp/a.rs", ApprovalDecision::Approved);
         // /tmp/c.rs is not in the store
 
         let keys = vec!["/tmp/a.rs", "/tmp/c.rs"];
@@ -256,8 +256,8 @@ mod tests {
     #[test]
     fn test_check_all_denied_key() {
         let store = ApprovalStore::new();
-        store.put(&"/tmp/a.rs", ApprovalDecision::Approved);
-        store.put(&"/tmp/b.rs", ApprovalDecision::Denied);
+        store.put("/tmp/a.rs", ApprovalDecision::Approved);
+        store.put("/tmp/b.rs", ApprovalDecision::Denied);
 
         let keys = vec!["/tmp/a.rs", "/tmp/b.rs"];
         assert!(store.check_all(&keys).is_none());
@@ -279,8 +279,8 @@ mod tests {
     #[test]
     fn test_clear() {
         let store = ApprovalStore::new();
-        store.put(&"a", ApprovalDecision::Approved);
-        store.put(&"b", ApprovalDecision::Denied);
+        store.put("a", ApprovalDecision::Approved);
+        store.put("b", ApprovalDecision::Denied);
         assert_eq!(store.len(), 2);
 
         store.clear();
@@ -291,17 +291,17 @@ mod tests {
     #[test]
     fn test_overwrite() {
         let store = ApprovalStore::new();
-        store.put(&"cmd", ApprovalDecision::Denied);
+        store.put("cmd", ApprovalDecision::Denied);
         assert!(!store.get(&"cmd").unwrap().is_approved());
 
-        store.put(&"cmd", ApprovalDecision::ApprovedForSession);
+        store.put("cmd", ApprovalDecision::ApprovedForSession);
         assert!(store.get(&"cmd").unwrap().is_approved());
     }
 
     #[tokio::test]
     async fn test_with_cached_approval_cache_hit() {
         let store = ApprovalStore::new();
-        store.put(&"key1", ApprovalDecision::Approved);
+        store.put("key1", ApprovalDecision::Approved);
 
         let decision = with_cached_approval(&store, vec!["key1"], || async {
             panic!("should not be called — cache hit");
@@ -340,7 +340,7 @@ mod tests {
     #[tokio::test]
     async fn test_with_cached_approval_multi_key() {
         let store = ApprovalStore::new();
-        store.put(&"file_a", ApprovalDecision::Approved);
+        store.put("file_a", ApprovalDecision::Approved);
         // file_b is missing
 
         let decision = with_cached_approval(&store, vec!["file_a", "file_b"], || async {

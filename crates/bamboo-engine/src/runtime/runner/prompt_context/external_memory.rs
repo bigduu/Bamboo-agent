@@ -668,6 +668,7 @@ fn build_external_memory_render_parts(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_prompt_memory_observability(
     prompt_memory_flags: PromptMemoryFlags,
     resolved_project_key: Option<String>,

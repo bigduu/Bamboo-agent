@@ -1752,23 +1752,25 @@ mod tests {
     #[test]
     fn publish_env_vars_updates_prompt_safe_snapshot_without_secret_values() {
         let _lock = crate::test_support::env_cache_lock_acquire();
-        let mut config = Config::default();
-        config.env_vars = vec![
-            EnvVarEntry {
-                name: "SECRET_TOKEN".to_string(),
-                value: "top-secret".to_string(),
-                secret: true,
-                value_encrypted: None,
-                description: Some("Service token".to_string()),
-            },
-            EnvVarEntry {
-                name: "API_BASE".to_string(),
-                value: "https://internal.example".to_string(),
-                secret: false,
-                value_encrypted: None,
-                description: Some("Internal API base".to_string()),
-            },
-        ];
+        let config = Config {
+            env_vars: vec![
+                EnvVarEntry {
+                    name: "SECRET_TOKEN".to_string(),
+                    value: "top-secret".to_string(),
+                    secret: true,
+                    value_encrypted: None,
+                    description: Some("Service token".to_string()),
+                },
+                EnvVarEntry {
+                    name: "API_BASE".to_string(),
+                    value: "https://internal.example".to_string(),
+                    secret: false,
+                    value_encrypted: None,
+                    description: Some("Internal API base".to_string()),
+                },
+            ],
+            ..Default::default()
+        };
 
         config.publish_env_vars();
 
@@ -1928,7 +1930,6 @@ mod tests {
                 relevant_recall_rerank: true,
                 project_first_dream: false,
                 dream_refine_mode: true,
-                ..MemoryConfig::default()
             }),
             ..Config::default()
         };
@@ -1974,10 +1975,12 @@ mod tests {
         let target = temp_home.path.join("workspace-default");
         std::fs::create_dir_all(&target).expect("default work area dir should exist");
 
-        let mut config = Config::default();
-        config.default_work_area = Some(DefaultWorkAreaConfig {
-            path: Some("~/workspace-default".to_string()),
-        });
+        let config = Config {
+            default_work_area: Some(DefaultWorkAreaConfig {
+                path: Some("~/workspace-default".to_string()),
+            }),
+            ..Default::default()
+        };
 
         assert_eq!(config.get_default_work_area_path(), Some(target));
     }
@@ -1988,10 +1991,12 @@ mod tests {
         let temp_home = TempHome::new();
         let _home = EnvVarGuard::set("HOME", temp_home.path.to_string_lossy().as_ref());
 
-        let mut config = Config::default();
-        config.default_work_area = Some(DefaultWorkAreaConfig {
-            path: Some("~/missing-default-work-area".to_string()),
-        });
+        let config = Config {
+            default_work_area: Some(DefaultWorkAreaConfig {
+                path: Some("~/missing-default-work-area".to_string()),
+            }),
+            ..Default::default()
+        };
 
         assert!(config.get_default_work_area_path().is_none());
     }
@@ -2403,37 +2408,39 @@ mod tests {
 
     #[test]
     fn env_vars_as_map_includes_only_non_empty_values() {
-        let mut config = Config::default();
-        config.env_vars = vec![
-            EnvVarEntry {
-                name: "A".to_string(),
-                value: "val_a".to_string(),
-                secret: false,
-                value_encrypted: None,
-                description: None,
-            },
-            EnvVarEntry {
-                name: "B".to_string(),
-                value: "".to_string(), // empty → should be excluded
-                secret: true,
-                value_encrypted: None,
-                description: None,
-            },
-            EnvVarEntry {
-                name: "C".to_string(),
-                value: "  ".to_string(), // whitespace-only → excluded
-                secret: false,
-                value_encrypted: None,
-                description: None,
-            },
-            EnvVarEntry {
-                name: "D".to_string(),
-                value: "val_d".to_string(),
-                secret: true,
-                value_encrypted: Some("enc".to_string()),
-                description: Some("desc".to_string()),
-            },
-        ];
+        let config = Config {
+            env_vars: vec![
+                EnvVarEntry {
+                    name: "A".to_string(),
+                    value: "val_a".to_string(),
+                    secret: false,
+                    value_encrypted: None,
+                    description: None,
+                },
+                EnvVarEntry {
+                    name: "B".to_string(),
+                    value: "".to_string(), // empty → should be excluded
+                    secret: true,
+                    value_encrypted: None,
+                    description: None,
+                },
+                EnvVarEntry {
+                    name: "C".to_string(),
+                    value: "  ".to_string(), // whitespace-only → excluded
+                    secret: false,
+                    value_encrypted: None,
+                    description: None,
+                },
+                EnvVarEntry {
+                    name: "D".to_string(),
+                    value: "val_d".to_string(),
+                    secret: true,
+                    value_encrypted: Some("enc".to_string()),
+                    description: Some("desc".to_string()),
+                },
+            ],
+            ..Default::default()
+        };
 
         let map = config.env_vars_as_map();
         assert_eq!(map.len(), 2);
@@ -2445,23 +2452,25 @@ mod tests {
 
     #[test]
     fn sanitize_env_vars_for_disk_clears_secret_plaintext() {
-        let mut config = Config::default();
-        config.env_vars = vec![
-            EnvVarEntry {
-                name: "PLAIN".to_string(),
-                value: "visible".to_string(),
-                secret: false,
-                value_encrypted: None,
-                description: None,
-            },
-            EnvVarEntry {
-                name: "SECRET".to_string(),
-                value: "hidden_value".to_string(),
-                secret: true,
-                value_encrypted: Some("enc_data".to_string()),
-                description: None,
-            },
-        ];
+        let mut config = Config {
+            env_vars: vec![
+                EnvVarEntry {
+                    name: "PLAIN".to_string(),
+                    value: "visible".to_string(),
+                    secret: false,
+                    value_encrypted: None,
+                    description: None,
+                },
+                EnvVarEntry {
+                    name: "SECRET".to_string(),
+                    value: "hidden_value".to_string(),
+                    secret: true,
+                    value_encrypted: Some("enc_data".to_string()),
+                    description: None,
+                },
+            ],
+            ..Default::default()
+        };
 
         config.sanitize_env_vars_for_disk();
 
@@ -2471,23 +2480,25 @@ mod tests {
 
     #[test]
     fn sanitize_env_vars_for_disk_preserves_encrypted() {
-        let mut config = Config::default();
-        config.env_vars = vec![
-            EnvVarEntry {
-                name: "OPEN".to_string(),
-                value: "val".to_string(),
-                secret: false,
-                value_encrypted: None,
-                description: None,
-            },
-            EnvVarEntry {
-                name: "HIDDEN".to_string(),
-                value: "real_secret".to_string(),
-                secret: true,
-                value_encrypted: Some("enc".to_string()),
-                description: None,
-            },
-        ];
+        let mut config = Config {
+            env_vars: vec![
+                EnvVarEntry {
+                    name: "OPEN".to_string(),
+                    value: "val".to_string(),
+                    secret: false,
+                    value_encrypted: None,
+                    description: None,
+                },
+                EnvVarEntry {
+                    name: "HIDDEN".to_string(),
+                    value: "real_secret".to_string(),
+                    secret: true,
+                    value_encrypted: Some("enc".to_string()),
+                    description: None,
+                },
+            ],
+            ..Default::default()
+        };
 
         config.sanitize_env_vars_for_disk();
 
@@ -2500,23 +2511,25 @@ mod tests {
 
     #[test]
     fn refresh_env_vars_encrypted_round_trip() {
-        let mut config = Config::default();
-        config.env_vars = vec![
-            EnvVarEntry {
-                name: "TOKEN".to_string(),
-                value: "my-secret-token".to_string(),
-                secret: true,
-                value_encrypted: None,
-                description: Some("A token".to_string()),
-            },
-            EnvVarEntry {
-                name: "PLAIN_VAR".to_string(),
-                value: "hello".to_string(),
-                secret: false,
-                value_encrypted: None,
-                description: None,
-            },
-        ];
+        let mut config = Config {
+            env_vars: vec![
+                EnvVarEntry {
+                    name: "TOKEN".to_string(),
+                    value: "my-secret-token".to_string(),
+                    secret: true,
+                    value_encrypted: None,
+                    description: Some("A token".to_string()),
+                },
+                EnvVarEntry {
+                    name: "PLAIN_VAR".to_string(),
+                    value: "hello".to_string(),
+                    secret: false,
+                    value_encrypted: None,
+                    description: None,
+                },
+            ],
+            ..Default::default()
+        };
 
         // Encrypt
         config
@@ -2544,14 +2557,16 @@ mod tests {
 
     #[test]
     fn publish_and_current_env_vars_round_trip() {
-        let mut config = Config::default();
-        config.env_vars = vec![EnvVarEntry {
-            name: "TEST_PUBLISH".to_string(),
-            value: "pub_value".to_string(),
-            secret: false,
-            value_encrypted: None,
-            description: None,
-        }];
+        let config = Config {
+            env_vars: vec![EnvVarEntry {
+                name: "TEST_PUBLISH".to_string(),
+                value: "pub_value".to_string(),
+                secret: false,
+                value_encrypted: None,
+                description: None,
+            }],
+            ..Default::default()
+        };
 
         for _ in 0..10 {
             config.publish_env_vars();
@@ -2565,14 +2580,16 @@ mod tests {
 
     #[test]
     fn hydrate_skips_non_secret_entries() {
-        let mut config = Config::default();
-        config.env_vars = vec![EnvVarEntry {
-            name: "PLAIN".to_string(),
-            value: "original".to_string(),
-            secret: false,
-            value_encrypted: Some("should-be-ignored".to_string()),
-            description: None,
-        }];
+        let mut config = Config {
+            env_vars: vec![EnvVarEntry {
+                name: "PLAIN".to_string(),
+                value: "original".to_string(),
+                secret: false,
+                value_encrypted: Some("should-be-ignored".to_string()),
+                description: None,
+            }],
+            ..Default::default()
+        };
 
         config.hydrate_env_vars_from_encrypted();
         // Non-secret entry should keep its original value
@@ -2592,23 +2609,25 @@ mod tests {
 
     #[test]
     fn serde_round_trip_with_env_vars() {
-        let mut config = Config::default();
-        config.env_vars = vec![
-            EnvVarEntry {
-                name: "KEY1".to_string(),
-                value: "val1".to_string(),
-                secret: false,
-                value_encrypted: None,
-                description: Some("First key".to_string()),
-            },
-            EnvVarEntry {
-                name: "KEY2".to_string(),
-                value: "".to_string(), // on-disk secret has no plaintext
-                secret: true,
-                value_encrypted: Some("enc123".to_string()),
-                description: None,
-            },
-        ];
+        let config = Config {
+            env_vars: vec![
+                EnvVarEntry {
+                    name: "KEY1".to_string(),
+                    value: "val1".to_string(),
+                    secret: false,
+                    value_encrypted: None,
+                    description: Some("First key".to_string()),
+                },
+                EnvVarEntry {
+                    name: "KEY2".to_string(),
+                    value: "".to_string(), // on-disk secret has no plaintext
+                    secret: true,
+                    value_encrypted: Some("enc123".to_string()),
+                    description: None,
+                },
+            ],
+            ..Default::default()
+        };
 
         let json = serde_json::to_string(&config).unwrap();
         let restored: Config = serde_json::from_str(&json).unwrap();
@@ -2628,6 +2647,8 @@ mod tests {
     // ---- defaults.* model resolution tests ----
 
     #[test]
+    // fields set conditionally below
+    #[allow(clippy::field_reassign_with_default)]
     fn get_model_prefers_defaults_chat_when_provider_model_ref_enabled() {
         let mut config = Config::default();
         config.provider = "openai".to_string();
@@ -2661,6 +2682,8 @@ mod tests {
     }
 
     #[test]
+    // fields set conditionally below
+    #[allow(clippy::field_reassign_with_default)]
     fn get_model_ignores_defaults_chat_when_provider_model_ref_disabled() {
         let mut config = Config::default();
         config.provider = "openai".to_string();
@@ -2694,6 +2717,8 @@ mod tests {
     }
 
     #[test]
+    // fields set conditionally below
+    #[allow(clippy::field_reassign_with_default)]
     fn get_fast_model_prefers_defaults_fast_when_provider_model_ref_enabled() {
         let mut config = Config::default();
         config.provider = "openai".to_string();
@@ -2733,6 +2758,8 @@ mod tests {
     }
 
     #[test]
+    // fields set conditionally below
+    #[allow(clippy::field_reassign_with_default)]
     fn get_fast_model_ignores_defaults_fast_when_provider_model_ref_disabled() {
         let mut config = Config::default();
         config.provider = "openai".to_string();
@@ -2772,6 +2799,8 @@ mod tests {
     }
 
     #[test]
+    // fields set conditionally below
+    #[allow(clippy::field_reassign_with_default)]
     fn get_fast_model_falls_back_to_defaults_chat_when_fast_unset() {
         let mut config = Config::default();
         config.provider = "openai".to_string();
@@ -2796,6 +2825,8 @@ mod tests {
     }
 
     #[test]
+    // fields set conditionally below
+    #[allow(clippy::field_reassign_with_default)]
     fn get_memory_background_model_prefers_defaults_memory_background() {
         let mut config = Config::default();
         config.provider = "openai".to_string();
@@ -2838,6 +2869,8 @@ mod tests {
     }
 
     #[test]
+    // fields set conditionally below
+    #[allow(clippy::field_reassign_with_default)]
     fn get_memory_background_model_falls_back_to_defaults_fast_when_memory_background_unset() {
         let mut config = Config::default();
         config.provider = "openai".to_string();
@@ -2865,6 +2898,8 @@ mod tests {
     }
 
     #[test]
+    // fields set conditionally below
+    #[allow(clippy::field_reassign_with_default)]
     fn get_memory_background_model_ignores_defaults_when_provider_model_ref_disabled() {
         let mut config = Config::default();
         config.provider = "openai".to_string();

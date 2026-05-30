@@ -74,7 +74,6 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         };
 
         let id_short: String = session.id.chars().take(16).collect();
-        let id_short = id_short;
         let model = session
             .model
             .as_deref()

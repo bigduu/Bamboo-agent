@@ -630,6 +630,7 @@ fn merge_with_optional_contexts(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_enhancement_prompt(
     base_system_prompt: &str,
     effective_system_prompt: &str,

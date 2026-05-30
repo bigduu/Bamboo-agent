@@ -206,7 +206,7 @@ mod tests {
         // "Hello, world!" = 13 chars -> 13/4 * 1.1 ≈ 3.57 -> 4 tokens
         let tokens = counter.count_text("Hello, world!");
         assert!(
-            tokens >= 3 && tokens <= 5,
+            (3..=5).contains(&tokens),
             "Expected ~4 tokens, got {}",
             tokens
         );
@@ -305,7 +305,7 @@ mod tests {
         let tokens = counter.count_text("Hello, world!");
         // "Hello, world!" is 4 tokens with o200k_base
         assert!(
-            tokens >= 3 && tokens <= 6,
+            (3..=6).contains(&tokens),
             "Expected ~4 tokens, got {}",
             tokens
         );
@@ -323,7 +323,7 @@ mod tests {
         // CJK text: each character is typically 1-2 tokens
         let tokens = counter.count_text("你好世界");
         assert!(
-            tokens >= 2 && tokens <= 8,
+            (2..=8).contains(&tokens),
             "Expected 2-8 tokens, got {}",
             tokens
         );

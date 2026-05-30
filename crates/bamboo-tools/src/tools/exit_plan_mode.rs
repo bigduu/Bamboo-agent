@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn exit_plan_mode_default_impl() {
-        let tool = ExitPlanModeTool::default();
+        let tool = ExitPlanModeTool;
         assert_eq!(tool.name(), "ExitPlanMode");
     }
 

@@ -105,11 +105,11 @@ impl PermissionStorage {
             .await
             .map_err(|e| PermissionStorageError::WriteError {
                 path: self.config_path(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                source: std::io::Error::other(e.to_string()),
             })?
             .map_err(|e| PermissionStorageError::WriteError {
                 path: self.config_path(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                source: std::io::Error::other(e.to_string()),
             })?;
 
         // Best-effort backup legacy file.
@@ -164,11 +164,11 @@ impl PermissionStorage {
             .await
             .map_err(|e| PermissionStorageError::WriteError {
                 path: self.config_path(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                source: std::io::Error::other(e.to_string()),
             })?
             .map_err(|e| PermissionStorageError::WriteError {
                 path: self.config_path(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                source: std::io::Error::other(e.to_string()),
             })?;
 
         Ok(())

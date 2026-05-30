@@ -238,6 +238,7 @@ pub async fn init_schedule_store(data_dir: &PathBuf) -> Result<Arc<ScheduleStore
 }
 
 /// Build sub-session spawn scheduler.
+#[allow(clippy::too_many_arguments)]
 pub fn build_spawn_scheduler(
     agent: Arc<Agent>,
     child_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
@@ -263,6 +264,7 @@ pub fn build_spawn_scheduler(
 }
 
 /// Build schedule manager with minimal tool surface for background automation.
+#[allow(clippy::too_many_arguments)]
 pub fn build_schedule_manager(
     schedule_store: Arc<ScheduleStore>,
     agent: Arc<Agent>,

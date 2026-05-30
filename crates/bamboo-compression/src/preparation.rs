@@ -817,7 +817,7 @@ fn segment_contains_assistant_text(segment: &MessageSegment) -> bool {
             && message
                 .tool_calls
                 .as_ref()
-                .map_or(true, |calls| calls.is_empty())
+                .is_none_or(|calls| calls.is_empty())
     })
 }
 
@@ -1095,7 +1095,7 @@ mod tests {
         let has_tool_call = prepared.messages.iter().any(|m| {
             m.tool_calls
                 .as_ref()
-                .map_or(false, |tc| tc.iter().any(|c| c.id == "call_1"))
+                .is_some_and(|tc| tc.iter().any(|c| c.id == "call_1"))
         });
         let has_tool_result = prepared
             .messages
@@ -1444,7 +1444,7 @@ mod tests {
                 && message
                     .tool_calls
                     .as_ref()
-                    .map_or(true, |calls| calls.is_empty())
+                    .is_none_or(|calls| calls.is_empty())
                 && message.content.contains("Final answer")
         });
         let tool_results_kept = prepared

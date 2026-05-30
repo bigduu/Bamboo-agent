@@ -7,9 +7,11 @@ use super::validation::provider_validation_issue;
 
 #[test]
 fn provider_validation_issue_returns_missing_key_path_for_unconfigured_openai() {
-    let mut config = Config::default();
-    config.provider = "openai".to_string();
-    config.providers = ProviderConfigs::default();
+    let config = Config {
+        provider: "openai".to_string(),
+        providers: ProviderConfigs::default(),
+        ..Default::default()
+    };
 
     let (path, message) = provider_validation_issue(&config, "invalid".to_string());
     assert_eq!(path, "providers.openai.api_key");
@@ -18,21 +20,25 @@ fn provider_validation_issue_returns_missing_key_path_for_unconfigured_openai() 
 
 #[test]
 fn provider_validation_issue_returns_provider_path_when_openai_key_present() {
-    let mut config = Config::default();
-    config.provider = "openai".to_string();
-    config.providers = ProviderConfigs::default();
-    config.providers.openai = Some(OpenAIConfig {
-        api_key: "sk-test".to_string(),
-        api_key_encrypted: None,
-        base_url: None,
-        model: None,
-        fast_model: None,
-        vision_model: None,
-        reasoning_effort: None,
-        responses_only_models: vec![],
-        request_overrides: None,
-        extra: BTreeMap::new(),
-    });
+    let config = Config {
+        provider: "openai".to_string(),
+        providers: ProviderConfigs {
+            openai: Some(OpenAIConfig {
+                api_key: "sk-test".to_string(),
+                api_key_encrypted: None,
+                base_url: None,
+                model: None,
+                fast_model: None,
+                vision_model: None,
+                reasoning_effort: None,
+                responses_only_models: vec![],
+                request_overrides: None,
+                extra: BTreeMap::new(),
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
 
     let (path, message) = provider_validation_issue(&config, "invalid provider setup".to_string());
     assert_eq!(path, "provider");

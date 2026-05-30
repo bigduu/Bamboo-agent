@@ -680,28 +680,28 @@ mod tests {
             completion_tokens: 50,
             total_tokens: 150,
         };
-        let cloned = usage.clone();
+        let cloned = usage;
         assert_eq!(usage.prompt_tokens, cloned.prompt_tokens);
     }
 
     #[test]
     fn test_round_status_clone() {
         let status = RoundStatus::Success;
-        let cloned = status.clone();
+        let cloned = status;
         assert_eq!(status, cloned);
     }
 
     #[test]
     fn test_session_status_clone() {
         let status = SessionStatus::Completed;
-        let cloned = status.clone();
+        let cloned = status;
         assert_eq!(status, cloned);
     }
 
     #[test]
     fn test_forward_status_clone() {
         let status = ForwardStatus::Pending;
-        let cloned = status.clone();
+        let cloned = status;
         assert_eq!(status, cloned);
     }
 

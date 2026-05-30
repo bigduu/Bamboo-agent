@@ -13,7 +13,7 @@ const VACUUM_MIN_DB_BYTES: u64 = 256 * 1024 * 1024;
 const VACUUM_MIN_PURGED_ROWS: usize = 500;
 
 fn to_io_error(message: impl Into<String>) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, message.into())
+    std::io::Error::other(message.into())
 }
 
 #[derive(Debug, Clone)]

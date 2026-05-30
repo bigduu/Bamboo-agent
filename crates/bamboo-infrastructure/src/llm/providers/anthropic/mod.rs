@@ -362,6 +362,7 @@ pub fn build_anthropic_request(
 /// clamped to [`MAX_ANTHROPIC_CACHE_BREAKPOINTS`]; when there are more
 /// candidates than the budget, the breakpoints nearest the end of the
 /// conversation win (they cover the largest stable prefix).
+#[allow(clippy::too_many_arguments)]
 pub fn build_anthropic_request_with_cache(
     messages: &[Message],
     tools: &[ToolSchema],

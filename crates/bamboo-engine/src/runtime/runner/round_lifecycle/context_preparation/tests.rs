@@ -129,6 +129,7 @@ impl LLMProvider for PromptCaptureLlmProvider {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn prompt_capture_llm() -> (Arc<dyn LLMProvider>, Arc<Mutex<Vec<Vec<Message>>>>) {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let llm: Arc<dyn LLMProvider> = Arc::new(PromptCaptureLlmProvider {

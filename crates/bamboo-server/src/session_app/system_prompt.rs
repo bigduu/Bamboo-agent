@@ -181,10 +181,7 @@ fn extract_wrapped_section(prompt: &str, start_marker: &str, end_marker: &str) -
 fn strip_wrapped_sections(prompt: &str, start_marker: &str, end_marker: &str) -> String {
     let mut current = prompt.to_string();
 
-    loop {
-        let Some(start_idx) = current.find(start_marker) else {
-            break;
-        };
+    while let Some(start_idx) = current.find(start_marker) {
         let search_from = start_idx + start_marker.len();
         let Some(end_rel_idx) = current[search_from..].find(end_marker) else {
             break;

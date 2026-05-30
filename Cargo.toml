@@ -15,7 +15,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-rust-version = "1.82"
+rust-version = "1.84"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -28,7 +28,7 @@ thiserror = "1"
 name = "bamboo-agent"
 version = "2026.4.24"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.84"
 license = "MIT"
 authors = ["mugeng.du@gmail.com"]
 description = "A fully self-contained AI agent backend framework with built-in web services, multi-LLM provider support, and comprehensive tool execution"

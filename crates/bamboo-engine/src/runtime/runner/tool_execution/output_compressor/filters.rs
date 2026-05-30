@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn collapse_duplicate_lines_basic() {
         let input = "frame 1\nframe 1\nframe 1\nframe 2\n";
-        let result = collapse_duplicate_lines(&input, 3);
+        let result = collapse_duplicate_lines(input, 3);
         assert!(result.contains("2 identical lines collapsed"));
         assert!(result.contains("frame 1\n"));
         assert!(result.contains("frame 2"));
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn collapse_duplicate_lines_below_window() {
         let input = "a\na\nb\n";
-        let result = collapse_duplicate_lines(&input, 3);
+        let result = collapse_duplicate_lines(input, 3);
         assert!(!result.contains("collapsed"));
         assert_eq!(result, input);
     }
@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn collapse_duplicate_lines_multiple_groups() {
         let input = "x\nx\nx\ny\nz\nz\nz\n";
-        let result = collapse_duplicate_lines(&input, 3);
+        let result = collapse_duplicate_lines(input, 3);
         assert!(result.contains("2 identical lines collapsed"));
         assert!(result.contains("x\n"));
         assert!(result.contains("y"));
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn collapse_duplicate_lines_preserves_non_duplicate_content() {
         let input = "line 1\nline 2\nline 3\nline 4\n";
-        let result = collapse_duplicate_lines(&input, 3);
+        let result = collapse_duplicate_lines(input, 3);
         assert_eq!(result, input);
     }
 

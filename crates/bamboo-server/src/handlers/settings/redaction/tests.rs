@@ -8,23 +8,24 @@ use bamboo_infrastructure::{Config, OpenAIConfig, ProviderConfigs};
 use super::{redact_config_for_api, redact_providers_for_api};
 
 fn config_with_openai_key() -> Config {
-    let mut config = Config::default();
-    config.providers = ProviderConfigs {
-        openai: Some(OpenAIConfig {
-            api_key: String::new(),
-            api_key_encrypted: Some("enc-key".to_string()),
-            base_url: None,
-            model: None,
-            fast_model: None,
-            vision_model: None,
-            reasoning_effort: None,
-            responses_only_models: vec![],
-            request_overrides: None,
-            extra: BTreeMap::new(),
-        }),
-        ..ProviderConfigs::default()
-    };
-    config
+    Config {
+        providers: ProviderConfigs {
+            openai: Some(OpenAIConfig {
+                api_key: String::new(),
+                api_key_encrypted: Some("enc-key".to_string()),
+                base_url: None,
+                model: None,
+                fast_model: None,
+                vision_model: None,
+                reasoning_effort: None,
+                responses_only_models: vec![],
+                request_overrides: None,
+                extra: BTreeMap::new(),
+            }),
+            ..ProviderConfigs::default()
+        },
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -55,8 +56,10 @@ fn redact_config_masks_configured_provider_and_removes_proxy_encrypted_keys() {
 
 #[test]
 fn redact_providers_removes_unconfigured_api_key_fields() {
-    let mut config = Config::default();
-    config.providers = ProviderConfigs::default();
+    let config = Config {
+        providers: ProviderConfigs::default(),
+        ..Default::default()
+    };
     let input = json!({
         "openai": {
             "api_key": "sk-test",

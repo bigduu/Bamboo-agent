@@ -789,10 +789,13 @@ mod tests {
 
     #[test]
     fn test_get_schedule_model_from_config_prefers_defaults_fast_over_chat() {
-        let mut config = Config::default();
-        config.provider = "openai".to_string();
-        config.features.provider_model_ref = true;
-        config.defaults = Some(DefaultsConfig {
+        let config = Config {
+            provider: "openai".to_string(),
+            features: bamboo_infrastructure::FeatureFlags {
+                provider_model_ref: true,
+                ..Default::default()
+            },
+            defaults: Some(DefaultsConfig {
             chat: ProviderModelRef::new("openai", "gpt-chat"),
             fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
             task_summary: None,
@@ -803,7 +806,9 @@ mod tests {
             code_review: None,
             sub_agent: None,
             subagent_models: HashMap::new(),
-        });
+        }),
+            ..Default::default()
+        };
 
         let result = get_schedule_model_from_config(&config);
         assert!(result.is_ok());
@@ -839,10 +844,13 @@ mod tests {
     }
     #[test]
     fn resolve_subagent_model_ref_prefers_sub_agent_over_fast() {
-        let mut config = Config::default();
-        config.provider = "openai".to_string();
-        config.features.provider_model_ref = true;
-        config.defaults = Some(DefaultsConfig {
+        let config = Config {
+            provider: "openai".to_string(),
+            features: bamboo_infrastructure::FeatureFlags {
+                provider_model_ref: true,
+                ..Default::default()
+            },
+            defaults: Some(DefaultsConfig {
             chat: ProviderModelRef::new("openai", "gpt-chat"),
             fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
             task_summary: None,
@@ -853,7 +861,9 @@ mod tests {
             code_review: None,
             sub_agent: Some(ProviderModelRef::new("openai", "gpt-sub-agent")),
             subagent_models: HashMap::new(),
-        });
+        }),
+            ..Default::default()
+        };
 
         let resolved = resolve_subagent_model_ref(&config, "openai", &test_registry(), "coder")
             .expect("sub-agent model should resolve");
@@ -863,10 +873,13 @@ mod tests {
 
     #[test]
     fn resolve_subagent_model_ref_falls_back_to_fast_when_sub_agent_unset() {
-        let mut config = Config::default();
-        config.provider = "openai".to_string();
-        config.features.provider_model_ref = true;
-        config.defaults = Some(DefaultsConfig {
+        let config = Config {
+            provider: "openai".to_string(),
+            features: bamboo_infrastructure::FeatureFlags {
+                provider_model_ref: true,
+                ..Default::default()
+            },
+            defaults: Some(DefaultsConfig {
             chat: ProviderModelRef::new("openai", "gpt-chat"),
             fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
             task_summary: None,
@@ -877,7 +890,9 @@ mod tests {
             code_review: None,
             sub_agent: None,
             subagent_models: HashMap::new(),
-        });
+        }),
+            ..Default::default()
+        };
 
         let resolved = resolve_subagent_model_ref(&config, "openai", &test_registry(), "coder")
             .expect("fast model should resolve");

@@ -237,7 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn sleep_tool_default_impl() {
-        let tool = SleepTool::default();
+        let tool = SleepTool;
         let result = tool.execute(json!({"seconds": 0.001})).await.unwrap();
         assert!(result.success);
     }

@@ -146,7 +146,7 @@ mod tests {
 
     #[tokio::test]
     async fn sse_parser_skips_done_marker() {
-        let sse_body = concat!("data: [DONE]\n\n",);
+        let sse_body = "data: [DONE]\n\n";
         let mut stream = stream_response_from_sse(make_sse_response(sse_body));
         assert!(stream.next().await.is_none());
     }

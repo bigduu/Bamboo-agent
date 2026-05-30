@@ -191,6 +191,8 @@ mod tests {
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
 
+    // fields set conditionally below
+    #[allow(clippy::field_reassign_with_default)]
     fn configured_config() -> Config {
         let mut config = Config::default();
         config.proxy_auth = Some(ProxyAuth {

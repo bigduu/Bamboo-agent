@@ -24,6 +24,7 @@ use bamboo_infrastructure::SessionStoreV2;
 use super::init::PermissionChecker;
 use super::{AgentRunner, ScheduleManager, ScheduleStore, SpawnScheduler};
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_base_tools(
     config: Arc<RwLock<Config>>,
     permission_checker: Arc<PermissionChecker>,

@@ -9,6 +9,7 @@ pub mod gold_evaluation;
 pub mod hooks;
 pub mod managers;
 pub mod runner;
+#[allow(clippy::module_inception)]
 pub mod runtime;
 pub mod stream;
 pub mod task_context;

@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn enum_clone() {
         let effort = ReasoningEffort::Medium;
-        let cloned = effort.clone();
+        let cloned = effort;
         assert_eq!(effort, cloned);
     }
 

@@ -283,21 +283,18 @@ impl App {
             let mut reader = EventStream::new();
             while let Some(event) = reader.next().await {
                 match event {
-                    Ok(Event::Key(key)) => {
-                        if tx.send(AppEvent::Key(key)).is_err() {
+                    Ok(Event::Key(key))
+                        if tx.send(AppEvent::Key(key)).is_err() => {
                             break;
                         }
-                    }
-                    Ok(Event::Mouse(mouse)) => {
-                        if tx.send(AppEvent::Mouse(mouse)).is_err() {
+                    Ok(Event::Mouse(mouse))
+                        if tx.send(AppEvent::Mouse(mouse)).is_err() => {
                             break;
                         }
-                    }
-                    Ok(Event::Resize(w, h)) => {
-                        if tx.send(AppEvent::Resize(w, h)).is_err() {
+                    Ok(Event::Resize(w, h))
+                        if tx.send(AppEvent::Resize(w, h)).is_err() => {
                             break;
                         }
-                    }
                     _ => {}
                 }
             }
@@ -723,12 +720,11 @@ impl App {
 
     async fn handle_sessions_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
-            KeyCode::Down => {
-                if !self.sessions.sessions.is_empty() {
+            KeyCode::Down
+                if !self.sessions.sessions.is_empty() => {
                     self.sessions.selected =
                         (self.sessions.selected + 1).min(self.sessions.sessions.len() - 1);
                 }
-            }
             KeyCode::Up => {
                 self.sessions.selected = self.sessions.selected.saturating_sub(1);
             }
@@ -758,11 +754,10 @@ impl App {
 
     async fn handle_mcp_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
-            KeyCode::Down => {
-                if !self.mcp.servers.is_empty() {
+            KeyCode::Down
+                if !self.mcp.servers.is_empty() => {
                     self.mcp.selected = (self.mcp.selected + 1).min(self.mcp.servers.len() - 1);
                 }
-            }
             KeyCode::Up => {
                 self.mcp.selected = self.mcp.selected.saturating_sub(1);
             }
@@ -796,12 +791,11 @@ impl App {
 
     async fn handle_schedules_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
-            KeyCode::Down => {
-                if !self.schedules.schedules.is_empty() {
+            KeyCode::Down
+                if !self.schedules.schedules.is_empty() => {
                     self.schedules.selected =
                         (self.schedules.selected + 1).min(self.schedules.schedules.len() - 1);
                 }
-            }
             KeyCode::Up => {
                 self.schedules.selected = self.schedules.selected.saturating_sub(1);
             }
@@ -825,12 +819,11 @@ impl App {
 
     async fn handle_skills_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
-            KeyCode::Down => {
-                if !self.skills.skills.is_empty() {
+            KeyCode::Down
+                if !self.skills.skills.is_empty() => {
                     self.skills.selected =
                         (self.skills.selected + 1).min(self.skills.skills.len() - 1);
                 }
-            }
             KeyCode::Up => {
                 self.skills.selected = self.skills.selected.saturating_sub(1);
             }

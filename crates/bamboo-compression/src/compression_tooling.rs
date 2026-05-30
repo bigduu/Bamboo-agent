@@ -1424,7 +1424,7 @@ mod tests {
         )
         .expect("plan should build");
 
-        assert!(plan.compressed_message_ids.len() > 0);
+        assert!(!plan.compressed_message_ids.is_empty());
 
         let compressed_count = apply_compression_plan(&mut session, plan);
         assert!(compressed_count > 0);

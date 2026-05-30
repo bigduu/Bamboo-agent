@@ -1865,7 +1865,7 @@ mod tests {
                 &["confirmed".to_string()],
                 Some("session-2"),
                 "main-model",
-                &[source.frontmatter.id.clone()],
+                std::slice::from_ref(&source.frontmatter.id),
             )
             .await
             .unwrap()
@@ -1968,7 +1968,7 @@ mod tests {
                 &[],
                 Some("session-2"),
                 "main-model",
-                &[superseded.frontmatter.id.clone()],
+                std::slice::from_ref(&superseded.frontmatter.id),
             )
             .await
             .unwrap();
@@ -1977,7 +1977,7 @@ mod tests {
             .mark_memory_contradicted(
                 &target.frontmatter.id,
                 Some("proj-1"),
-                &[contradiction.frontmatter.id.clone()],
+                std::slice::from_ref(&contradiction.frontmatter.id),
                 Some("conflicting newer information"),
                 Some("session-3"),
                 "main-model",

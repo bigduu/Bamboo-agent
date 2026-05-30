@@ -93,6 +93,7 @@ fn estimate_completion_tokens(content: &str, tool_calls: &[ToolCall]) -> u64 {
     u64::from(counter.count_text(&completion_surface))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_async_gold_evaluation_request(
     task_context: &Option<TaskLoopContext>,
     session: &Session,

@@ -16,12 +16,14 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_max_entries_is_usize() {
         assert!(MAX_ENTRIES > 0);
         assert!(MAX_ENTRIES <= 10000); // Reasonable upper bound
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_max_pattern_length_is_usize() {
         assert!(MAX_PATTERN_LENGTH > 0);
         assert!(MAX_PATTERN_LENGTH <= 10000); // Reasonable upper bound
@@ -33,6 +35,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_max_entries_is_reasonable() {
         // Should be large enough to hold useful number of patterns
         assert!(MAX_ENTRIES >= 10);
@@ -41,6 +44,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_max_pattern_length_is_reasonable() {
         // Should be long enough for meaningful patterns
         assert!(MAX_PATTERN_LENGTH >= 10);

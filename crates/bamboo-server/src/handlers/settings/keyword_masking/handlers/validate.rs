@@ -91,7 +91,7 @@ mod tests {
 
         let body: serde_json::Value = test::read_body_json(resp).await;
         assert_eq!(body["valid"], false);
-        assert!(body["errors"].as_array().unwrap().len() > 0);
+        assert!(!body["errors"].as_array().unwrap().is_empty());
     }
 
     #[actix_web::test]

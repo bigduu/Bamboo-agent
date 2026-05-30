@@ -861,10 +861,6 @@ mod tests {
     #[test]
     fn plan_mode_blocks_mutating_tools_via_classify() {
         use super::PLAN_MODE_EXEMPT_TOOLS;
-        use bamboo_infrastructure::config::PermissionMode;
-
-        let mut config = crate::runtime::config::AgentLoopConfig::default();
-        config.permission_mode = Some(PermissionMode::Plan);
 
         let mutating_tools = ["Write", "Edit", "Bash", "NotebookEdit", "KillShell"];
         for name in &mutating_tools {
@@ -912,8 +908,10 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(100);
         let mut session = Session::new("test-session", "test-model");
         let tools = builtin_tools();
-        let mut config = crate::runtime::config::AgentLoopConfig::default();
-        config.permission_mode = Some(PermissionMode::Plan);
+        let config = crate::runtime::config::AgentLoopConfig {
+            permission_mode: Some(PermissionMode::Plan),
+            ..Default::default()
+        };
 
         let mut state = RoundExecutionState::default();
         let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
@@ -963,8 +961,10 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(100);
         let mut session = Session::new("test-session", "test-model");
         let tools = builtin_tools();
-        let mut config = crate::runtime::config::AgentLoopConfig::default();
-        config.permission_mode = Some(PermissionMode::Plan);
+        let config = crate::runtime::config::AgentLoopConfig {
+            permission_mode: Some(PermissionMode::Plan),
+            ..Default::default()
+        };
 
         let mut state = RoundExecutionState::default();
         let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
@@ -1017,8 +1017,10 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(100);
         let mut session = Session::new("test-session", "test-model");
         let tools = builtin_tools();
-        let mut config = crate::runtime::config::AgentLoopConfig::default();
-        config.permission_mode = Some(PermissionMode::Plan);
+        let config = crate::runtime::config::AgentLoopConfig {
+            permission_mode: Some(PermissionMode::Plan),
+            ..Default::default()
+        };
 
         let mut state = RoundExecutionState::default();
         let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);

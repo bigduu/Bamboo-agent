@@ -28,6 +28,7 @@ pub(crate) struct RoundLlmExecutionOutput {
     pub round_usage: MetricsTokenUsage,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_llm_round(
     session: &mut Session,
     config: &AgentLoopConfig,

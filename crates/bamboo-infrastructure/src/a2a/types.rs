@@ -477,8 +477,8 @@ mod tests {
         assert!(resp.artifact_update.is_some());
         let update = resp.artifact_update.unwrap();
         assert_eq!(update.artifact.artifact_id, "art-1");
-        assert_eq!(update.append, false);
-        assert_eq!(update.last_chunk, true);
+        assert!(!update.append);
+        assert!(update.last_chunk);
     }
 
     #[test]

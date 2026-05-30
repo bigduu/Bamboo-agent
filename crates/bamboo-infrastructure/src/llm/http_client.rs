@@ -47,8 +47,10 @@ mod tests {
 
     #[test]
     fn proxy_attaches_no_proxy_loopback_list() {
-        let mut cfg = Config::default();
-        cfg.http_proxy = "http://proxy.example.com:8080".to_string();
+        let cfg = Config {
+            http_proxy: "http://proxy.example.com:8080".to_string(),
+            ..Default::default()
+        };
 
         let proxy = build_proxy(&cfg).unwrap().expect("proxy");
         let dbg = format!("{proxy:?}");

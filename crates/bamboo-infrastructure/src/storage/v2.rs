@@ -30,7 +30,7 @@ use bamboo_domain::AttachmentReader;
 use bamboo_domain::Storage;
 
 fn other_io_error(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, message.into())
+    io::Error::other(message.into())
 }
 
 fn validate_session_id(session_id: &str) -> io::Result<()> {
@@ -839,7 +839,7 @@ mod tests {
     use tempfile::TempDir;
 
     async fn create_temp_storage() -> io::Result<(SessionStoreV2, TempDir)> {
-        let temp_dir = TempDir::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
         let bamboo_home = temp_dir.path().to_path_buf();
         let storage = SessionStoreV2::new(bamboo_home).await?;
         Ok((storage, temp_dir))
@@ -847,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_creates_sessions_directory() -> io::Result<()> {
-        let temp_dir = TempDir::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
         let bamboo_home = temp_dir.path().to_path_buf();
         let sessions_dir = bamboo_home.join("sessions");
 
@@ -860,7 +860,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_creates_index_file() -> io::Result<()> {
-        let temp_dir = TempDir::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
         let bamboo_home = temp_dir.path().to_path_buf();
         let index_path = bamboo_home.join("sessions.json");
 

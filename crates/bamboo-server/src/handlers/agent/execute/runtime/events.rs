@@ -832,7 +832,7 @@ mod tests {
                 && message.content == "Auto-selected response (gold): OK"
                 && message.tool_success == Some(true)
         }));
-        assert!(after.metadata.get("gold.auto_continue_count").is_none());
+        assert!(!after.metadata.contains_key("gold.auto_continue_count"));
         assert!(!after.messages.iter().any(|message| {
             message
                 .metadata

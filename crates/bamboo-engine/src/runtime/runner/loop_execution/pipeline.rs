@@ -1095,6 +1095,34 @@ pub(super) async fn run_pipeline(
     Ok(sent_complete)
 }
 
+/// Heuristic task complexity classification based on tool call names.
+///
+/// This is used when `features.dynamic_model_routing` is enabled but
+/// `MiniLoopExecutor` is not wired through the runner.
+fn heuristic_complexity(
+    tool_calls: &[bamboo_agent_core::tools::ToolCall],
+) -> crate::runtime::complexity_classifier::TaskComplexity {
+    use crate::runtime::complexity_classifier::TaskComplexity;
+
+    let simple_tools = ["Read", "Glob", "Grep", "Bash"];
+    let complex_tools = ["Agent", "SubAgent", "TodoWrite"];
+
+    let names: Vec<&str> = tool_calls
+        .iter()
+        .map(|tc| tc.function.name.as_str())
+        .collect();
+
+    if names.iter().any(|n| complex_tools.contains(n)) {
+        return TaskComplexity::Complex;
+    }
+
+    if names.iter().all(|n| simple_tools.contains(n)) && !names.is_empty() {
+        return TaskComplexity::Simple;
+    }
+
+    TaskComplexity::Standard
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::startup::OverflowRecoveryState;
@@ -1690,7 +1718,7 @@ mod tests {
 
     #[test]
     fn test_build_round_id() {
-        let id = format!("{}-round-{}", "session-123", 0 + 1);
+        let id = format!("{}-round-{}", "session-123", 1);
         assert_eq!(id, "session-123-round-1");
 
         let id = format!("{}-round-{}", "test", 4 + 1);
@@ -1737,32 +1765,4 @@ mod tests {
         assert_eq!(usage.completion_tokens, u64::MAX);
         assert_eq!(usage.total_tokens, u64::MAX);
     }
-}
-
-/// Heuristic task complexity classification based on tool call names.
-///
-/// This is used when `features.dynamic_model_routing` is enabled but
-/// `MiniLoopExecutor` is not wired through the runner.
-fn heuristic_complexity(
-    tool_calls: &[bamboo_agent_core::tools::ToolCall],
-) -> crate::runtime::complexity_classifier::TaskComplexity {
-    use crate::runtime::complexity_classifier::TaskComplexity;
-
-    let simple_tools = ["Read", "Glob", "Grep", "Bash"];
-    let complex_tools = ["Agent", "SubAgent", "TodoWrite"];
-
-    let names: Vec<&str> = tool_calls
-        .iter()
-        .map(|tc| tc.function.name.as_str())
-        .collect();
-
-    if names.iter().any(|n| complex_tools.contains(n)) {
-        return TaskComplexity::Complex;
-    }
-
-    if names.iter().all(|n| simple_tools.contains(n)) && !names.is_empty() {
-        return TaskComplexity::Simple;
-    }
-
-    TaskComplexity::Standard
 }

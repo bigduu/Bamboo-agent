@@ -147,6 +147,7 @@ fn build_compression_context_blocks(session: &Session) -> Vec<ContextBlock> {
     blocks
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn maybe_apply_host_context_compression_with_budget(
     session: &mut Session,
     config: &AgentLoopConfig,
@@ -463,6 +464,7 @@ async fn maybe_apply_host_context_compression_with_budget(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn maybe_apply_host_context_compression(
     session: &mut Session,
     config: &AgentLoopConfig,

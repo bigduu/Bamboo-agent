@@ -16,7 +16,7 @@ use bamboo_domain::{
 };
 
 fn other_io_error(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, message.into())
+    io::Error::other(message.into())
 }
 
 async fn atomic_write_json(path: &Path, bytes: Vec<u8>) -> io::Result<()> {

@@ -326,6 +326,7 @@ pub trait MetricsStorage: Send + Sync {
     /// * `status` - Final round status (success or failed)
     /// * `usage` - Token consumption during this round
     /// * `error` - Error message if the round failed, None on success
+    #[allow(clippy::too_many_arguments)]
     async fn complete_round(
         &self,
         round_id: &str,

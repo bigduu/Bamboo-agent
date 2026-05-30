@@ -813,7 +813,7 @@ test foo::qux ... ok
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
 ";
         // Pad to exceed MIN_COMPRESS_LEN
-        let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
+        let padding = "x".repeat(MIN_COMPRESS_LEN);
         let full_stdout = format!("{}{}", stdout, padding);
         let input = make_bash_json(&full_stdout, "", 0);
         let result = compress(&input, CompressionTier::Standard);
@@ -839,7 +839,7 @@ test e ... ignored
 
 test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.50s
 ";
-        let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
+        let padding = "x".repeat(MIN_COMPRESS_LEN);
         let full_stdout = format!("{}{}", stdout, padding);
         let input = make_bash_json(&full_stdout, "", 0);
         let result = compress(&input, CompressionTier::Standard);
@@ -870,7 +870,7 @@ failures:
 
 test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
 ";
-        let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
+        let padding = "x".repeat(MIN_COMPRESS_LEN);
         let full_stdout = format!("{}{}", stdout, padding);
         let input = make_bash_json(&full_stdout, "", 1);
         let result = compress(&input, CompressionTier::Standard);
@@ -904,7 +904,7 @@ test lib_b::c ... ok
 
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
 ";
-        let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
+        let padding = "x".repeat(MIN_COMPRESS_LEN);
         let full_stdout = format!("{}{}", stdout, padding);
         let input = make_bash_json(&full_stdout, "", 0);
         let result = compress(&input, CompressionTier::Standard);
@@ -1268,7 +1268,7 @@ running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ";
-        let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
+        let padding = "x".repeat(MIN_COMPRESS_LEN);
         let full_stdout = format!("{}{}", stdout, padding);
         let input = make_bash_json(&full_stdout, "", 0);
         let result = compress(&input, CompressionTier::Standard);
@@ -1286,7 +1286,7 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
             ));
         }
         stdout.push_str("\ntest result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n");
-        let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
+        let padding = "x".repeat(MIN_COMPRESS_LEN);
         let full_stdout = format!("{}{}", stdout, padding);
         let input = make_bash_json(&full_stdout, "", 0);
         let result = compress(&input, CompressionTier::Standard);
@@ -1307,7 +1307,7 @@ test c ... ignored
 
 test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ";
-        let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
+        let padding = "x".repeat(MIN_COMPRESS_LEN);
         let full_stdout = format!("{}{}", stdout, padding);
         let input = make_bash_json(&full_stdout, "", 0);
         let result = compress(&input, CompressionTier::Standard);
@@ -1325,7 +1325,7 @@ test foo::bar ... FAILED
 
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
 ";
-        let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
+        let padding = "x".repeat(MIN_COMPRESS_LEN);
         let full_stdout = format!("{}{}", stdout, padding);
         let input = make_bash_json(&full_stdout, "", 101);
         let result = compress(&input, CompressionTier::Standard);
@@ -1348,7 +1348,7 @@ test lib_b::b ... FAILED
 
 test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
 ";
-        let padding = "x".repeat(MIN_COMPRESS_LEN as usize);
+        let padding = "x".repeat(MIN_COMPRESS_LEN);
         let full_stdout = format!("{}{}", stdout, padding);
         let input = make_bash_json(&full_stdout, "", 101);
         let result = compress(&input, CompressionTier::Standard);

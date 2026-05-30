@@ -281,7 +281,7 @@ mod tests {
         };
 
         // Can clone (Copy implies Clone)
-        let _cloned = ctx.clone();
+        let _cloned = ctx;
 
         // Can copy
         let copied = ctx;

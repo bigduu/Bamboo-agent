@@ -524,6 +524,7 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
 
+    #[allow(clippy::too_many_arguments)]
     fn item(
         id: &str,
         title: &str,

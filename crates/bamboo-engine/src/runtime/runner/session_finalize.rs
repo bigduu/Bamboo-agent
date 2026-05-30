@@ -14,6 +14,7 @@ mod completion_metrics;
 use completion_event::send_complete_event_if_needed;
 use completion_metrics::record_session_resolution;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn finalize_session(
     task_context: Option<TaskLoopContext>,
     session: &mut Session,

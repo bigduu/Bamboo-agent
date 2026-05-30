@@ -613,13 +613,10 @@ mod tests {
         // Drain events — at least the manual event must be emitted.
         let mut saw_manual = false;
         let mut events: Vec<AgentEvent> = Vec::new();
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_millis(100), subscriber.recv())
-                .await
-            {
-                Ok(Ok(e)) => events.push(e),
-                _ => break,
-            }
+        while let Ok(Ok(e)) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), subscriber.recv()).await
+        {
+            events.push(e);
         }
         for e in &events {
             if let AgentEvent::SessionTitleUpdated { source, .. } = e {

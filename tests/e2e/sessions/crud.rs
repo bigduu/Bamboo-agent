@@ -1,3 +1,6 @@
+// Test env-lock is a std Mutex intentionally held across .await to serialize env access.
+#![allow(clippy::await_holding_lock)]
+
 use actix_web::{test, web, App};
 use bamboo_agent::server::app_state::{AgentRunner, AgentStatus};
 use bamboo_agent::server::handlers::agent::sessions;

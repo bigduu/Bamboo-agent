@@ -444,11 +444,12 @@ Untracked files:
 
     #[test]
     fn git_diff_full_reduces_context() {
-        let mut lines = Vec::new();
-        lines.push("diff --git a/src/main.rs b/src/main.rs".to_string());
-        lines.push("--- a/src/main.rs".to_string());
-        lines.push("+++ b/src/main.rs".to_string());
-        lines.push("@@ -1,20 +1,20 @@".to_string());
+        let mut lines = vec![
+            "diff --git a/src/main.rs b/src/main.rs".to_string(),
+            "--- a/src/main.rs".to_string(),
+            "+++ b/src/main.rs".to_string(),
+            "@@ -1,20 +1,20 @@".to_string(),
+        ];
         // Add 10 context lines, then a change, then 10 more context
         for i in 0..10 {
             lines.push(format!(" context line {}", i));

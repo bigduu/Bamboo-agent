@@ -224,6 +224,7 @@ fn plan_content_summary(result_payload: &str) -> Option<String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn maybe_handle_user_question_tool(
     tool_call: &ToolCall,
     result: &ToolResult,

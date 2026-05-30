@@ -228,10 +228,10 @@ mod tests {
         let workspace_path = workspace.path().to_str().unwrap();
 
         // Create a directory with different case
-        let case_diff_path = if workspace_path.ends_with("test") {
-            format!("{}T", &workspace_path[..workspace_path.len() - 4])
+        let case_diff_path = if let Some(prefix) = workspace_path.strip_suffix("test") {
+            format!("{prefix}T")
         } else {
-            format!("{}X", workspace_path)
+            format!("{workspace_path}X")
         };
 
         // These are different paths on case-sensitive filesystems
@@ -270,11 +270,10 @@ mod tests {
         // After normalization, this should be outside workspace
         // Note: This test depends on filesystem canonicalization
         // It may pass or fail depending on whether the path can be canonicalized
-        let result = path_is_within_workspace(outside_path, workspace_path);
         // The behavior depends on whether canonicalization works
         // We're testing that the function doesn't panic
         // The actual result may vary based on filesystem
-        assert!(result == true || result == false); // Test doesn't crash
+        let _result = path_is_within_workspace(outside_path, workspace_path);
     }
 
     #[test]

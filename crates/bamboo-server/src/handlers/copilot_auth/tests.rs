@@ -1,24 +1,29 @@
 use actix_web::http::StatusCode;
-use bamboo_infrastructure::config::CopilotConfig;
+use bamboo_infrastructure::config::{CopilotConfig, ProviderConfigs};
 use bamboo_infrastructure::Config;
 
 use super::{client::resolve_headless_auth, status_logout::auth_status_from_token_content};
 
 #[test]
 fn resolve_headless_auth_prefers_provider_specific_value() {
-    let mut config = Config::default();
-    config.headless_auth = false;
-    config.providers.copilot = Some(CopilotConfig {
-        enabled: true,
-        headless_auth: true,
-        model: None,
-        fast_model: None,
-        vision_model: None,
-        reasoning_effort: None,
-        responses_only_models: Vec::new(),
-        request_overrides: None,
-        extra: Default::default(),
-    });
+    let config = Config {
+        headless_auth: false,
+        providers: ProviderConfigs {
+            copilot: Some(CopilotConfig {
+                enabled: true,
+                headless_auth: true,
+                model: None,
+                fast_model: None,
+                vision_model: None,
+                reasoning_effort: None,
+                responses_only_models: Vec::new(),
+                request_overrides: None,
+                extra: Default::default(),
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
 
     assert!(resolve_headless_auth(&config));
 }

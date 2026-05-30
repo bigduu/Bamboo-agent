@@ -202,6 +202,20 @@ fn first_present_string_arg<'a>(
     )))
 }
 
+/// Check tool rules against allowed and denied tool patterns.
+///
+/// Deny rules take precedence over allow rules.
+/// Returns `Some(true)` if allowed, `Some(false)` if denied, `None` if no rules match.
+pub fn check_tool_rules(
+    tool_name: &str,
+    args: &Value,
+    allowed_tools: &[String],
+    denied_tools: &[String],
+) -> Option<bool> {
+    let rule_set = PermissionRuleSet::from_rules(allowed_tools, denied_tools);
+    rule_set.match_tool_call(tool_name, args)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -322,18 +336,4 @@ mod tests {
         assert_eq!(contexts[0].permission_type, PermissionType::HttpRequest);
         assert_eq!(contexts[0].resource, "duckduckgo.com");
     }
-}
-
-/// Check tool rules against allowed and denied tool patterns.
-///
-/// Deny rules take precedence over allow rules.
-/// Returns `Some(true)` if allowed, `Some(false)` if denied, `None` if no rules match.
-pub fn check_tool_rules(
-    tool_name: &str,
-    args: &Value,
-    allowed_tools: &[String],
-    denied_tools: &[String],
-) -> Option<bool> {
-    let rule_set = PermissionRuleSet::from_rules(allowed_tools, denied_tools);
-    rule_set.match_tool_call(tool_name, args)
 }

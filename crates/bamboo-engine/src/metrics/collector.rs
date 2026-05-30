@@ -312,6 +312,7 @@ impl MetricsCollector {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn round_completed(
         &self,
         round_id: impl Into<String>,
@@ -425,6 +426,7 @@ impl MetricsCollector {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn context_compressed(
         &self,
         session_id: impl Into<String>,
