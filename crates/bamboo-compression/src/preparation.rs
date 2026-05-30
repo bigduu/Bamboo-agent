@@ -11,6 +11,15 @@ use crate::types::{
 use bamboo_agent_core::{Message, Role, Session};
 use std::collections::{HashMap, HashSet};
 
+// Safety ceilings on the budget-configurable prompt-cache policy values. These
+// bound otherwise user-supplied settings so a misconfiguration cannot make
+// prompt-side compaction pathological:
+// - MIN_TOOL_OUTPUT_CHARS (200k): never treat an output below this as compactable
+//   even if a config sets a higher floor; keeps the threshold within one window.
+// - EXCERPT_CHARS (20k): hard cap on a single head/tail excerpt so the "compacted"
+//   summary can never approach the size of the original output.
+// - RECENT_USER_TURNS / RECENT_TOOL_CHAINS (64): cap how many recent turns/chains
+//   are protected from compaction so the protected set stays a small suffix.
 const PROMPT_CACHE_MAX_MIN_TOOL_OUTPUT_CHARS: usize = 200_000;
 const PROMPT_CACHE_MAX_EXCERPT_CHARS: usize = 20_000;
 const PROMPT_CACHE_MAX_RECENT_USER_TURNS: usize = 64;
@@ -76,10 +85,14 @@ pub fn prepare_hybrid_context(
         counter,
         summary_tokens,
     );
+    let total_tokens_after_cache = prompt_cache_result.total_tokens_after;
     let active_messages = prompt_cache_result.messages;
 
-    // Compact verbose old assistant analysis messages (lightweight head/tail excerpt).
-    let active_messages = maybe_compact_old_assistant_analysis(active_messages, budget);
+    // Compact verbose old assistant analysis messages (lightweight head/tail
+    // excerpt). Only when context is actually under pressure — the post-cache
+    // total tells us whether prompt-side tool compaction already relieved it.
+    let active_messages =
+        maybe_compact_old_assistant_analysis(active_messages, budget, total_tokens_after_cache);
 
     // 1. Extract system messages (always included) - takes ownership, no clone needed
     let (system_messages, mut segments) = segmenter.segment_with_system(active_messages);
@@ -328,6 +341,9 @@ struct PromptCacheCompactionResult {
     messages: Vec<bamboo_agent_core::Message>,
     compacted_tool_outputs: usize,
     tokens_saved: u32,
+    /// Best-known total context tokens (messages + summary) after this step.
+    /// Used by downstream compaction passes to gate on actual context pressure.
+    total_tokens_after: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -354,22 +370,27 @@ fn maybe_compact_old_tool_outputs_for_prompt(
     counter: &dyn TokenCounter,
     summary_tokens: u32,
 ) -> PromptCacheCompactionResult {
+    // Count the active window once. This is the single source of truth for the
+    // post-step total reported to downstream compaction passes.
+    let mut total_tokens = counter
+        .count_messages(&active_messages)
+        .saturating_add(summary_tokens);
+
+    let no_op = |messages: Vec<bamboo_agent_core::Message>, total: u32| PromptCacheCompactionResult {
+        messages,
+        compacted_tool_outputs: 0,
+        tokens_saved: 0,
+        total_tokens_after: total,
+    };
+
     if active_messages.is_empty() {
-        return PromptCacheCompactionResult {
-            messages: active_messages,
-            compacted_tool_outputs: 0,
-            tokens_saved: 0,
-        };
+        return no_op(active_messages, total_tokens);
     }
     let policy = prompt_cache_policy_from_budget(budget);
 
     let context_window = budget.max_context_tokens;
     if context_window == 0 {
-        return PromptCacheCompactionResult {
-            messages: active_messages,
-            compacted_tool_outputs: 0,
-            tokens_saved: 0,
-        };
+        return no_op(active_messages, total_tokens);
     }
 
     // Keep the configured number of latest user turns unmodified when
@@ -379,24 +400,12 @@ fn maybe_compact_old_tool_outputs_for_prompt(
     let Some(protected_turn_start) =
         recent_user_turn_start_index(&active_messages, policy.recent_user_turns)
     else {
-        return PromptCacheCompactionResult {
-            messages: active_messages,
-            compacted_tool_outputs: 0,
-            tokens_saved: 0,
-        };
+        return no_op(active_messages, total_tokens);
     };
 
     let trigger_limit = budget.compression_trigger_context_tokens();
-    let mut total_tokens = counter
-        .count_messages(&active_messages)
-        .saturating_add(summary_tokens);
-
     if total_tokens <= trigger_limit {
-        return PromptCacheCompactionResult {
-            messages: active_messages,
-            compacted_tool_outputs: 0,
-            tokens_saved: 0,
-        };
+        return no_op(active_messages, total_tokens);
     }
 
     let usage_before = (total_tokens as f64 / context_window as f64) * 100.0;
@@ -413,20 +422,12 @@ fn maybe_compact_old_tool_outputs_for_prompt(
     );
 
     if candidates.is_empty() {
-        return PromptCacheCompactionResult {
-            messages: active_messages,
-            compacted_tool_outputs: 0,
-            tokens_saved: 0,
-        };
+        return no_op(active_messages, total_tokens);
     }
 
     // Compact highest-yield candidates first so we minimize how many messages
     // are rewritten while still getting below the trigger threshold.
-    candidates.sort_by(|a, b| {
-        b.saved_tokens
-            .cmp(&a.saved_tokens)
-            .then_with(|| a.index.cmp(&b.index))
-    });
+    sort_prompt_cache_candidates(&mut candidates);
 
     let mut compacted_count = 0usize;
     let mut saved_tokens_total = 0u32;
@@ -462,7 +463,19 @@ fn maybe_compact_old_tool_outputs_for_prompt(
         messages: active_messages,
         compacted_tool_outputs: compacted_count,
         tokens_saved: saved_tokens_total,
+        total_tokens_after: total_tokens,
     }
+}
+
+/// Order prompt-cache candidates highest-yield first (ties broken by original
+/// position). Both the savings estimate and the apply pass compact in this
+/// order, so they must share it to stay consistent.
+fn sort_prompt_cache_candidates(candidates: &mut [PromptCacheCandidate]) {
+    candidates.sort_by(|a, b| {
+        b.saved_tokens
+            .cmp(&a.saved_tokens)
+            .then_with(|| a.index.cmp(&b.index))
+    });
 }
 
 /// Estimate how many tokens prompt cache compaction could save without modifying any messages.
@@ -474,7 +487,7 @@ pub fn estimate_prompt_cache_savings(
     session: &Session,
     budget: &TokenBudget,
     counter: &dyn TokenCounter,
-    _summary_tokens: u32,
+    summary_tokens: u32,
 ) -> u32 {
     let active_messages = crate::compression_tooling::active_messages_for_budget(session);
     if active_messages.is_empty() {
@@ -490,10 +503,23 @@ pub fn estimate_prompt_cache_savings(
     else {
         return 0;
     };
+
+    // The apply pass (maybe_compact_old_tool_outputs_for_prompt) only compacts
+    // when over the trigger and stops as soon as it drops back below it. Mirror
+    // that exactly here so the microcompact-first decision does not over-estimate
+    // savings and skip a summarization that was actually required.
+    let trigger_limit = budget.compression_trigger_context_tokens();
+    let mut total_tokens = counter
+        .count_messages(&active_messages)
+        .saturating_add(summary_tokens);
+    if total_tokens <= trigger_limit {
+        return 0;
+    }
+
     let tool_call_names = tool_call_name_index(&active_messages);
     let protected_recent_calls =
         collect_recent_tool_call_ids(&active_messages, policy.recent_tool_chains);
-    let candidates = build_prompt_cache_candidates(
+    let mut candidates = build_prompt_cache_candidates(
         &active_messages,
         protected_turn_start,
         &protected_recent_calls,
@@ -501,10 +527,19 @@ pub fn estimate_prompt_cache_savings(
         policy,
         counter,
     );
-    candidates
-        .iter()
-        .map(|c| c.saved_tokens)
-        .fold(0u32, u32::saturating_add)
+    sort_prompt_cache_candidates(&mut candidates);
+
+    let mut saved_tokens_total = 0u32;
+    for candidate in candidates {
+        if total_tokens <= trigger_limit {
+            break;
+        }
+        saved_tokens_total = saved_tokens_total.saturating_add(candidate.saved_tokens);
+        total_tokens = total_tokens
+            .saturating_sub(candidate.old_tokens)
+            .saturating_add(candidate.new_tokens);
+    }
+    saved_tokens_total
 }
 
 fn build_prompt_cache_candidates(
@@ -543,7 +578,6 @@ fn build_prompt_cache_candidates(
 
         let cached_summary = build_cached_tool_output_summary(
             tool_name,
-            tool_call_id,
             &message.content,
             policy.head_chars,
             policy.tail_chars,
@@ -670,15 +704,25 @@ fn prompt_cache_policy_from_budget(budget: &TokenBudget) -> PromptCachePolicy {
 
 fn build_cached_tool_output_summary(
     tool_name: &str,
-    tool_call_id: &str,
     content: &str,
     head_chars: usize,
     tail_chars: usize,
 ) -> String {
-    let head = take_first_chars(content, head_chars);
-    let tail = take_last_chars(content, tail_chars);
     let line_count = content.lines().count();
     let char_count = content.chars().count();
+
+    // Scale the preserved excerpt with the output size so large outputs keep a
+    // meaningful slice instead of a fixed sliver: ~2% head + ~1% tail, floored
+    // at the configured sizes and capped so the summary can never rival the
+    // original. (A 200K-char output keeps ~4K+2K instead of 280+180.)
+    let head_chars = (char_count / 50)
+        .max(head_chars)
+        .min(PROMPT_CACHE_MAX_EXCERPT_CHARS);
+    let tail_chars = (char_count / 100)
+        .max(tail_chars)
+        .min(PROMPT_CACHE_MAX_EXCERPT_CHARS);
+    let head = take_first_chars(content, head_chars);
+    let tail = take_last_chars(content, tail_chars);
 
     let semantic_section = if char_count > 5000 {
         let excerpt = extract_semantic_lines(content, 300);
@@ -691,10 +735,12 @@ fn build_cached_tool_output_summary(
         String::new()
     };
 
+    // tool_call_id is intentionally omitted: the message retains it in its
+    // structured `tool_call_id` field, so repeating it in the text only wastes
+    // tokens. The model correlates calls via the structured field.
     format!(
         "{PROMPT_CACHE_MARKER}\n\
 tool: {tool_name}\n\
-tool_call_id: {tool_call_id}\n\
 original_chars: {char_count}\n\
 original_lines: {line_count}\n\
 head_excerpt:\n\
@@ -800,25 +846,40 @@ fn segment_contains_skill_tool_chain(segment: &MessageSegment) -> bool {
 /// Replaces them with head/tail excerpts similar to prompt-side tool cache.
 /// This is applied at context preparation time only — original messages
 /// remain intact in the session store.
+///
+/// `total_tokens` is the current context total (messages + summary). Compaction
+/// only runs when that exceeds the compression trigger: below the trigger there
+/// is no pressure, and discarding earlier reasoning/analysis would degrade the
+/// model for no benefit.
 fn maybe_compact_old_assistant_analysis(
     messages: Vec<Message>,
     budget: &TokenBudget,
+    total_tokens: u32,
 ) -> Vec<Message> {
     const MIN_CHARS: usize = 2000;
     const HEAD_CHARS: usize = 400;
     const TAIL_CHARS: usize = 200;
 
-    let protected_turn_start =
+    // Pressure gate: leave analysis intact unless the context is actually over
+    // the trigger threshold.
+    let trigger_limit = budget.compression_trigger_context_tokens();
+    if total_tokens <= trigger_limit {
+        return messages;
+    }
+
+    // Match the tool-cache path: when there are fewer than the configured number
+    // of user turns, protect everything (compact nothing) rather than treating
+    // the whole conversation as old.
+    let Some(protected_turn_start) =
         recent_user_turn_start_index(&messages, budget.prompt_cache_recent_user_turns as usize)
-            .unwrap_or(messages.len());
+    else {
+        return messages;
+    };
 
     messages
         .into_iter()
         .enumerate()
         .map(|(index, mut message)| {
-            if message.compression_level > 0 {
-                return message;
-            }
             if index >= protected_turn_start {
                 return message;
             }
@@ -832,11 +893,11 @@ fn maybe_compact_old_assistant_analysis(
             {
                 return message;
             }
-            if message.content.len() < MIN_CHARS {
+            let original_chars = message.content.chars().count();
+            if original_chars < MIN_CHARS {
                 return message;
             }
 
-            let original_chars = message.content.chars().count();
             let head = take_first_chars(&message.content, HEAD_CHARS);
             let tail = take_last_chars(&message.content, TAIL_CHARS);
             message.content = format!(
@@ -847,7 +908,6 @@ fn maybe_compact_old_assistant_analysis(
                  tail_excerpt:\n{tail}\n\
                  note: Full analysis remains in session history. This compact summary is for context efficiency."
             );
-            message.compression_level = 1;
             message
         })
         .collect()
@@ -1854,7 +1914,7 @@ mod tests {
     #[test]
     fn cached_summary_includes_semantic_excerpt_for_large_output() {
         let content = "normal line\n".repeat(600); // ~7200 chars
-        let summary = build_cached_tool_output_summary("Bash", "call_1", &content, 280, 180);
+        let summary = build_cached_tool_output_summary("Bash", &content, 280, 180);
         // No matching patterns → no semantic_excerpt
         assert!(
             !summary.contains("semantic_excerpt"),
@@ -1873,7 +1933,7 @@ mod tests {
         for i in 500..1000 {
             content.push_str(&format!("more output {i}\n"));
         }
-        let summary = build_cached_tool_output_summary("Bash", "call_2", &content, 280, 180);
+        let summary = build_cached_tool_output_summary("Bash", &content, 280, 180);
         assert!(
             summary.contains("semantic_excerpt"),
             "large output with errors should have semantic_excerpt"
@@ -1885,6 +1945,333 @@ mod tests {
         assert!(
             summary.contains("warning: unused variable"),
             "semantic excerpt should contain the warning line"
+        );
+    }
+
+    #[test]
+    fn assistant_analysis_not_compacted_below_trigger() {
+        // Context well under the trigger: verbose old analysis must be left intact
+        // (no pressure → no value in discarding reasoning).
+        let mut budget =
+            TokenBudget::with_safety_margin(1000, 100, BudgetStrategy::Window { size: 50 }, 0);
+        budget.compression_trigger_percent = 80; // trigger = 800 tokens
+
+        let big_analysis = "analysis ".repeat(400); // ~3600 chars, > MIN_CHARS
+        let messages = vec![
+            Message::user("u1"),
+            Message::assistant(big_analysis.clone(), None),
+            Message::user("u2"),
+            Message::user("u3"),
+        ];
+
+        // total_tokens (500) <= trigger (800): gate should short-circuit.
+        let result = maybe_compact_old_assistant_analysis(messages, &budget, 500);
+
+        assert_eq!(
+            result[1].content, big_analysis,
+            "old assistant analysis must not be compacted when context is below the trigger"
+        );
+    }
+
+    #[test]
+    fn assistant_analysis_compacted_above_trigger() {
+        let mut budget =
+            TokenBudget::with_safety_margin(1000, 100, BudgetStrategy::Window { size: 50 }, 0);
+        budget.compression_trigger_percent = 80; // trigger = 800 tokens
+
+        let big_analysis = "analysis ".repeat(400); // ~3600 chars, > MIN_CHARS
+        let messages = vec![
+            Message::user("u1"),
+            Message::assistant(big_analysis.clone(), None),
+            Message::user("u2"),
+            Message::user("u3"),
+        ];
+
+        // total_tokens (900) > trigger (800): older analysis should be compacted.
+        let result = maybe_compact_old_assistant_analysis(messages, &budget, 900);
+
+        assert!(
+            result[1].content.contains("[compacted_assistant_analysis]"),
+            "old assistant analysis should be compacted once context exceeds the trigger"
+        );
+        assert!(
+            result[1].content.len() < big_analysis.len(),
+            "compacted analysis should be smaller than the original"
+        );
+    }
+
+    #[test]
+    fn estimate_prompt_cache_savings_matches_applied_savings_with_early_stop() {
+        // Two old compactable tool outputs, but compacting the larger one alone
+        // drops the context back under the trigger. The estimate must reflect the
+        // same early stop as the apply pass (i.e. only the larger candidate),
+        // otherwise microcompact-first would skip a required summarization.
+        let small_tool_output = "small-output ".repeat(120);
+        let large_tool_output = "large-output ".repeat(240);
+
+        let counter = DeterministicCounter::new(6)
+            .with_message_token("System", 20)
+            .with_message_token("Turn one", 15)
+            .with_message_token("Read smaller file", 10)
+            .with_message_token(small_tool_output.clone(), 120)
+            .with_message_token("Read larger file", 10)
+            .with_message_token(large_tool_output.clone(), 280)
+            .with_message_token("Early analysis", 10)
+            .with_message_token("Turn two", 15)
+            .with_message_token("Read recent files 1", 10)
+            .with_message_token("recent-output-1", 8)
+            .with_message_token("Second turn analysis", 10)
+            .with_message_token("Turn three", 15)
+            .with_message_token("Read recent files 2", 10)
+            .with_message_token("recent-output-2", 8)
+            .with_message_token("Current conclusion", 10);
+
+        let mut budget =
+            TokenBudget::with_safety_margin(650, 100, BudgetStrategy::Window { size: 60 }, 0);
+        budget.compression_trigger_percent = 80;
+
+        let messages = vec![
+            Message::system("System"),
+            Message::user("Turn one"),
+            Message::assistant(
+                "Read smaller file",
+                Some(vec![create_named_tool_call("call_small", "Read")]),
+            ),
+            Message::tool_result("call_small", small_tool_output.clone()),
+            Message::assistant(
+                "Read larger file",
+                Some(vec![create_named_tool_call("call_large", "Read")]),
+            ),
+            Message::tool_result("call_large", large_tool_output.clone()),
+            Message::assistant("Early analysis", None),
+            Message::user("Turn two"),
+            Message::assistant(
+                "Read recent files 1",
+                Some(vec![create_named_tool_call("call_recent_one", "Read")]),
+            ),
+            Message::tool_result("call_recent_one", "recent-output-1"),
+            Message::assistant("Second turn analysis", None),
+            Message::user("Turn three"),
+            Message::assistant(
+                "Read recent files 2",
+                Some(vec![create_named_tool_call("call_recent_two", "Read")]),
+            ),
+            Message::tool_result("call_recent_two", "recent-output-2"),
+            Message::assistant("Current conclusion", None),
+        ];
+
+        let session = make_session_with_messages(messages);
+
+        let estimated = estimate_prompt_cache_savings(&session, &budget, &counter, 0);
+        let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
+
+        assert_eq!(
+            prepared.prompt_cached_tool_outputs, 1,
+            "only the largest candidate should be compacted to satisfy the trigger"
+        );
+        assert!(estimated > 0, "estimate should report the savings it found");
+        assert_eq!(
+            estimated, prepared.prompt_cached_tool_tokens_saved,
+            "savings estimate must equal the savings actually applied (same early-stop loop)"
+        );
+    }
+
+    #[test]
+    fn estimate_prompt_cache_savings_is_zero_below_trigger() {
+        let old_tool_output = "old-read-output ".repeat(120);
+
+        let counter = DeterministicCounter::new(6)
+            .with_message_token("System", 20)
+            .with_message_token("User turn 1", 15)
+            .with_message_token("Reading old files", 10)
+            .with_message_token(old_tool_output.clone(), 220)
+            .with_message_token("Old analysis", 10)
+            .with_message_token("User turn 2", 15)
+            .with_message_token("Current conclusion", 10);
+
+        // Large context window so the small conversation stays well below trigger.
+        let mut budget =
+            TokenBudget::with_safety_margin(100_000, 100, BudgetStrategy::Window { size: 60 }, 0);
+        budget.compression_trigger_percent = 80;
+
+        let messages = vec![
+            Message::system("System"),
+            Message::user("User turn 1"),
+            Message::assistant(
+                "Reading old files",
+                Some(vec![create_named_tool_call("call_old", "Read")]),
+            ),
+            Message::tool_result("call_old", old_tool_output.clone()),
+            Message::assistant("Old analysis", None),
+            Message::user("User turn 2"),
+            Message::assistant("Current conclusion", None),
+        ];
+        let session = make_session_with_messages(messages);
+
+        assert_eq!(
+            estimate_prompt_cache_savings(&session, &budget, &counter, 0),
+            0,
+            "no savings should be reported when context is below the trigger"
+        );
+    }
+
+    #[test]
+    fn cached_summary_omits_redundant_tool_call_id() {
+        let content = "line\n".repeat(100);
+        let summary = build_cached_tool_output_summary("Read", &content, 280, 180);
+        assert!(
+            !summary.contains("tool_call_id"),
+            "tool_call_id is carried in the structured field and should not be duplicated in text"
+        );
+        assert!(summary.contains("tool: Read"));
+    }
+
+    #[test]
+    fn assistant_analysis_not_compacted_when_fewer_user_turns_than_configured() {
+        // With fewer user turns than prompt_cache_recent_user_turns, the protected
+        // window covers the whole conversation, so nothing should be compacted —
+        // even above the trigger. (Matches the tool-cache path's behaviour.)
+        let mut budget =
+            TokenBudget::with_safety_margin(1000, 100, BudgetStrategy::Window { size: 50 }, 0);
+        budget.compression_trigger_percent = 80; // trigger = 800
+        // default prompt_cache_recent_user_turns is 2; provide only one user turn.
+
+        let big_analysis = "analysis ".repeat(400);
+        let messages = vec![
+            Message::user("only-user-turn"),
+            Message::assistant(big_analysis.clone(), None),
+        ];
+
+        // Well above trigger, but only one user turn exists.
+        let result = maybe_compact_old_assistant_analysis(messages, &budget, 950);
+
+        assert_eq!(
+            result[1].content, big_analysis,
+            "analysis must be preserved when there are fewer user turns than the protected window"
+        );
+    }
+
+    #[test]
+    fn prepare_hybrid_context_gates_assistant_analysis_on_post_cache_total() {
+        // Integration test: verifies prepare_hybrid_context threads the real
+        // post-tool-cache total into the assistant-analysis pass, compacting an
+        // old verbose analysis only when the whole context is over the trigger.
+        let big_analysis = "analysis-detail ".repeat(300); // > MIN_CHARS (2000)
+
+        // Counter weights chosen so the active window sits above the 800-token
+        // trigger but below the 1000-token hard limit (no truncation).
+        let counter = DeterministicCounter::new(6)
+            .with_message_token("System", 20)
+            .with_message_token("u1", 6)
+            .with_message_token(big_analysis.clone(), 760)
+            .with_message_token("u2", 6)
+            .with_message_token("u3", 6);
+
+        let mut budget =
+            TokenBudget::with_safety_margin(1000, 100, BudgetStrategy::Window { size: 60 }, 0);
+        budget.compression_trigger_percent = 80; // trigger = 800
+
+        let messages = vec![
+            Message::system("System"),
+            Message::user("u1"),
+            Message::assistant(big_analysis.clone(), None),
+            Message::user("u2"),
+            Message::user("u3"),
+        ];
+        let session = make_session_with_messages(messages);
+        let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
+
+        assert!(
+            !prepared.truncation_occurred,
+            "test should exercise analysis compaction, not hard-limit truncation"
+        );
+        assert!(
+            prepared
+                .messages
+                .iter()
+                .any(|m| m.content.contains("[compacted_assistant_analysis]")),
+            "old assistant analysis should be compacted when post-cache total exceeds the trigger"
+        );
+    }
+
+    #[test]
+    fn prepare_hybrid_context_preserves_assistant_analysis_below_trigger() {
+        // Same shape as above, but total stays under the trigger: the verbose
+        // analysis must be passed through verbatim.
+        let big_analysis = "analysis-detail ".repeat(300); // > MIN_CHARS (2000)
+
+        let counter = DeterministicCounter::new(6)
+            .with_message_token("System", 20)
+            .with_message_token("u1", 6)
+            .with_message_token(big_analysis.clone(), 100)
+            .with_message_token("u2", 6)
+            .with_message_token("u3", 6);
+
+        let mut budget =
+            TokenBudget::with_safety_margin(1000, 100, BudgetStrategy::Window { size: 60 }, 0);
+        budget.compression_trigger_percent = 80; // trigger = 800; total here ~138
+
+        let messages = vec![
+            Message::system("System"),
+            Message::user("u1"),
+            Message::assistant(big_analysis.clone(), None),
+            Message::user("u2"),
+            Message::user("u3"),
+        ];
+        let session = make_session_with_messages(messages);
+        let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
+
+        assert!(
+            prepared
+                .messages
+                .iter()
+                .any(|m| m.content == big_analysis),
+            "assistant analysis should be untouched when context is below the trigger"
+        );
+        assert!(
+            prepared
+                .messages
+                .iter()
+                .all(|m| !m.content.contains("[compacted_assistant_analysis]")),
+            "no analysis should be compacted below the trigger"
+        );
+    }
+
+    #[test]
+    fn cached_summary_excerpt_respects_max_cap() {
+        // Output far larger than the cap: proportional sizing (head 2% / tail 1%)
+        // would request 60k/30k chars, but both must be clamped to the 20k cap so
+        // the summary can never approach the original size.
+        let content = "x".repeat(3_000_000);
+        let summary = build_cached_tool_output_summary("Bash", &content, 280, 180);
+        let summary_len = summary.chars().count();
+
+        // Uncapped this would be ~90k chars of excerpt; capped it is ~40k + overhead.
+        assert!(
+            summary_len < 2 * PROMPT_CACHE_MAX_EXCERPT_CHARS + 1000,
+            "excerpt must be clamped to PROMPT_CACHE_MAX_EXCERPT_CHARS (got {summary_len} chars)"
+        );
+        assert!(
+            summary_len < content.chars().count(),
+            "summary must remain smaller than the original"
+        );
+    }
+
+    #[test]
+    fn cached_summary_excerpt_scales_with_large_output() {
+        // ~60k chars: proportional sizing should preserve far more than the
+        // fixed 280/180 floor (head ~2%, tail ~1%).
+        let content = "x".repeat(60_000);
+        let summary = build_cached_tool_output_summary("Bash", &content, 280, 180);
+        // head ~= 60000/50 = 1200, tail ~= 60000/100 = 600 → summary clearly
+        // larger than the fixed-floor (~460) version, but still far below original.
+        assert!(
+            summary.chars().count() > 1500,
+            "large output should retain a proportional excerpt, not a fixed sliver"
+        );
+        assert!(
+            summary.chars().count() < content.chars().count(),
+            "summary must remain smaller than the original output"
         );
     }
 }
