@@ -55,21 +55,25 @@ pub(crate) async fn execute_llm_round(
         .as_deref()
         .ok_or_else(|| AgentError::LLM("model_name is required in AgentLoopConfig".to_string()))?;
 
+    let frame = stream_execution::LlmStreamFrame {
+        event_tx,
+        cancel_token,
+        session_id,
+        model,
+        provider_name: config.provider_name.as_deref(),
+        provider_type: config.provider_type.as_deref(),
+        reasoning_effort: config.reasoning_effort,
+        max_context_tokens: prepared.budget.max_context_tokens,
+        max_output_tokens: prepared.budget.max_output_tokens,
+    };
+
     let (stream_output, llm_duration) = stream_execution::execute_llm_stream(
         session,
         config,
         llm,
-        event_tx,
-        cancel_token,
         &prepared.prepared_context,
-        prepared.budget.max_context_tokens,
         tool_schemas,
-        prepared.budget.max_output_tokens,
-        model,
-        config.provider_name.as_deref(),
-        config.provider_type.as_deref(),
-        config.reasoning_effort,
-        session_id,
+        &frame,
     )
     .await?;
 

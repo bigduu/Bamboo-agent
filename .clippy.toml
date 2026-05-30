@@ -8,7 +8,7 @@
 # - BambooConfig - Legacy config format, replaced by core::Config
 
 # Allow these lints globally
-msrv = "1.70"
+msrv = "1.82"
 
 # Temporary: Allow MSRV violations until we update MSRV or refactor code
 # These are pre-existing issues, not introduced by recent changes

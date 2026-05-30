@@ -2,6 +2,7 @@
 name = "bamboo-cli"
 version = "2026.4.24"
 edition = "2021"
+rust-version.workspace = true
 license = "MIT"
 authors = ["mugeng.du@gmail.com"]
 description = "CLI tool for interacting with the Bamboo agent server"

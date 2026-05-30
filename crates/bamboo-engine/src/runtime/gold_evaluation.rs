@@ -16,6 +16,18 @@ use crate::runtime::config::GoldConfig;
 use crate::runtime::stream::handler::consume_llm_stream_silent;
 use crate::runtime::task_context::TaskLoopContext;
 
+/// Evaluation-scoped frame bundling parameters that identify and configure a
+/// single gold evaluation pass.  Passed into [`evaluate_gold`] to keep its
+/// parameter count below the clippy threshold.
+pub struct GoldEvalFrame<'a> {
+    pub event_tx: &'a mpsc::Sender<AgentEvent>,
+    pub session_id: &'a str,
+    pub model: &'a str,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub checkpoint: GoldCheckpoint,
+    pub iteration: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct GoldEvaluationResult {
     pub checkpoint: GoldCheckpoint,
@@ -123,12 +135,14 @@ pub(crate) async fn execute_async_gold_evaluation(
         request.task_context_snapshot.as_ref(),
         &request.gold_config,
         llm,
-        &event_tx,
-        &request.session_id,
-        &request.model_name,
-        request.reasoning_effort,
-        request.checkpoint,
-        request.round_number as u32,
+        &GoldEvalFrame {
+            event_tx: &event_tx,
+            session_id: &request.session_id,
+            model: &request.model_name,
+            reasoning_effort: request.reasoning_effort,
+            checkpoint: request.checkpoint,
+            iteration: request.round_number as u32,
+        },
     )
     .await
     {
@@ -158,13 +172,16 @@ pub async fn evaluate_gold(
     task_context: Option<&TaskLoopContext>,
     config: &GoldConfig,
     llm: Arc<dyn LLMProvider>,
-    event_tx: &mpsc::Sender<AgentEvent>,
-    session_id: &str,
-    model: &str,
-    reasoning_effort: Option<ReasoningEffort>,
-    checkpoint: GoldCheckpoint,
-    iteration: u32,
+    frame: &GoldEvalFrame<'_>,
 ) -> Result<GoldEvaluationResult, AgentError> {
+    // Bind frame fields as locals so the rest of the function body stays unchanged.
+    let event_tx = frame.event_tx;
+    let session_id = frame.session_id;
+    let model = frame.model;
+    let reasoning_effort = frame.reasoning_effort;
+    let checkpoint = frame.checkpoint;
+    let iteration = frame.iteration;
+
     let _ = event_tx
         .send(AgentEvent::GoldEvaluationStarted {
             session_id: session_id.to_string(),

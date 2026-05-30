@@ -25,6 +25,21 @@ use bamboo_infrastructure::provider::ResponsesRequestOptions;
 use bamboo_infrastructure::{LLMProvider, LLMRequestOptions, PromptCachePlan};
 use bamboo_tools::exposure::activated_discoverable_tools;
 
+/// LLM-stream frame bundling per-request identification, observability, and
+/// model configuration parameters.  Passed into [`execute_llm_stream`] to
+/// keep its parameter count below the clippy threshold.
+pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
+    pub event_tx: &'a mpsc::Sender<AgentEvent>,
+    pub cancel_token: &'a CancellationToken,
+    pub session_id: &'a str,
+    pub model: &'a str,
+    pub provider_name: Option<&'a str>,
+    pub provider_type: Option<&'a str>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub max_context_tokens: u32,
+    pub max_output_tokens: u32,
+}
+
 const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
 const CONVERSATION_SUMMARY_START_MARKER: &str = "<!-- CONVERSATION_SUMMARY_START -->";
 
@@ -318,18 +333,21 @@ pub(super) async fn execute_llm_stream(
     session: &mut Session,
     config: &AgentLoopConfig,
     llm: &Arc<dyn LLMProvider>,
-    event_tx: &mpsc::Sender<AgentEvent>,
-    cancel_token: &CancellationToken,
     prepared_context: &PreparedContext,
-    max_context_tokens: u32,
     tool_schemas: &[ToolSchema],
-    max_output_tokens: u32,
-    model: &str,
-    provider_name: Option<&str>,
-    provider_type: Option<&str>,
-    reasoning_effort: Option<ReasoningEffort>,
-    session_id: &str,
+    frame: &LlmStreamFrame<'_>,
 ) -> Result<(crate::runtime::stream::handler::StreamHandlingOutput, u128), AgentError> {
+    // Bind frame fields as locals so the rest of the function body stays unchanged.
+    let event_tx = frame.event_tx;
+    let cancel_token = frame.cancel_token;
+    let max_context_tokens = frame.max_context_tokens;
+    let max_output_tokens = frame.max_output_tokens;
+    let model = frame.model;
+    let provider_name = frame.provider_name;
+    let provider_type = frame.provider_type;
+    let reasoning_effort = frame.reasoning_effort;
+    let session_id = frame.session_id;
+
     let llm_started_at = std::time::Instant::now();
     let supports_previous_response_id = provider_supports_previous_response_id(provider_type);
     let previous_response_id = if supports_previous_response_id {

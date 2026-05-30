@@ -8,7 +8,7 @@ async fn test_validate_config_patch_reports_domain_errors() {
     // Invalid proxy URL should be reported under proxy domain.
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/config/validate")
-        .set_json(&json!({
+        .set_json(json!({
             "http_proxy": "http://"
         }))
         .to_request();
@@ -17,12 +17,12 @@ async fn test_validate_config_patch_reports_domain_errors() {
     let body = test::read_body(resp).await;
     let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(result["valid"], false);
-    assert!(result["errors"]["proxy"].as_array().unwrap().len() >= 1);
+    assert!(!result["errors"]["proxy"].as_array().unwrap().is_empty());
 
     // Invalid setup shape should be reported under setup domain.
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/config/validate")
-        .set_json(&json!({
+        .set_json(json!({
             "setup": "nope"
         }))
         .to_request();
@@ -31,5 +31,5 @@ async fn test_validate_config_patch_reports_domain_errors() {
     let body = test::read_body(resp).await;
     let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(result["valid"], false);
-    assert!(result["errors"]["setup"].as_array().unwrap().len() >= 1);
+    assert!(!result["errors"]["setup"].as_array().unwrap().is_empty());
 }

@@ -61,7 +61,7 @@ async fn test_create_and_get_workflow() {
 
     let create_req = test::TestRequest::post()
         .uri("/v1/bamboo/workflows")
-        .set_json(&json!({
+        .set_json(json!({
             "name": "test-workflow",
             "content": "# Test Workflow\n\nThis is a test workflow."
         }))
@@ -112,7 +112,7 @@ async fn test_delete_workflow() {
 
     let create_req = test::TestRequest::post()
         .uri("/v1/bamboo/workflows")
-        .set_json(&json!({
+        .set_json(json!({
             "name": "workflow-to-delete",
             "content": "# Workflow to Delete"
         }))

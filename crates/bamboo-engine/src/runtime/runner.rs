@@ -20,6 +20,7 @@ mod logging;
 mod loop_execution;
 mod metrics_lifecycle;
 pub(crate) mod prompt_context;
+pub(crate) mod round_frame;
 pub(crate) mod round_lifecycle;
 pub(crate) mod round_prelude;
 pub(crate) mod session_finalize;

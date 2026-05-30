@@ -47,7 +47,7 @@ async fn test_update_provider_config() {
 
     let update_req = test::TestRequest::post()
         .uri("/v1/bamboo/settings/provider")
-        .set_json(&json!({
+        .set_json(json!({
             "provider": "openai",
             "providers": {
                 "openai": {
@@ -102,7 +102,7 @@ async fn test_provider_config_masks_api_keys() {
 
     let set_req = test::TestRequest::post()
         .uri("/v1/bamboo/settings/provider")
-        .set_json(&json!({
+        .set_json(json!({
             "provider": "anthropic",
             "providers": {
                 "anthropic": {

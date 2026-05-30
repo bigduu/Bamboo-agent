@@ -57,16 +57,18 @@ impl LifecycleManager for DefaultLifecycleManager {
         crate::runtime::runner::round_prelude::prepare_round(
             session,
             task_context,
-            round,
-            max_rounds,
-            cancel_token,
-            metrics_collector,
-            session_id,
-            model_name,
-            false, // debug logging handled at runner level, not via adapter
             config,
             self.llm.clone(),
             tools,
+            &crate::runtime::runner::round_prelude::RoundPreludeFrame {
+                round,
+                max_rounds,
+                debug_enabled: false, // debug logging handled at runner level, not via adapter
+                cancel_token,
+                metrics_collector,
+                session_id,
+                model_name,
+            },
         )
         .await
     }

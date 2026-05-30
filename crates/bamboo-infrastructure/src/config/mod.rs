@@ -12,6 +12,7 @@
 
 #[allow(clippy::module_inception)]
 pub mod config;
+pub mod config_crypto;
 pub mod encryption;
 pub mod keyword_masking;
 pub mod model_mapping;

@@ -414,21 +414,13 @@ async fn handle_no_tool_calls(
 // ---- Tool-calls path (from round_flow/tool_calls.rs) ----
 
 async fn handle_tool_calls_path(
-    turn: usize,
-    round_id: &str,
-    session_id: &str,
-    debug_enabled: bool,
+    frame: &crate::runtime::runner::round_frame::RoundFrame<'_>,
     stream_output: StreamHandlingOutput,
     mut round_usage: MetricsTokenUsage,
     session: &mut Session,
-    event_tx: &mpsc::Sender<AgentEvent>,
-    metrics_collector: Option<&MetricsCollector>,
-    tools: &Arc<dyn ToolExecutor>,
-    config: &AgentLoopConfig,
     auxiliary_models: &crate::runtime::config::AuxiliaryModelConfig,
     model_name: &str,
     task_context: &mut Option<TaskLoopContext>,
-    llm: Arc<dyn LLMProvider>,
 ) -> Result<TurnOutcome, AgentError> {
     let reasoning = (!stream_output.reasoning_content.trim().is_empty())
         .then_some(stream_output.reasoning_content);
@@ -443,23 +435,16 @@ async fn handle_tool_calls_path(
     if compression_model.is_none() {
         tracing::warn!(
             "[{}] Skipping mid-turn context compression after tool execution: missing model name",
-            session_id
+            frame.session_id
         );
     }
-    let tool_schemas = resolve_available_tool_schemas_for_session(config, tools.as_ref(), session);
+    let tool_schemas = resolve_available_tool_schemas_for_session(frame.config, frame.tools.as_ref(), session);
 
     let tool_execution = crate::runtime::runner::tool_execution::execute_round_tool_calls(
         &stream_output.tool_calls,
-        event_tx,
-        metrics_collector,
-        session_id,
-        round_id,
-        turn,
+        frame,
         session,
-        tools,
-        config,
         task_context,
-        &llm,
         compression_model
             .as_deref()
             .or(auxiliary_models.background_model_name.as_deref()),
@@ -492,9 +477,9 @@ async fn handle_tool_calls_path(
 
     if awaiting_clarification || waiting_for_children {
         crate::runtime::runner::metrics_lifecycle::record_round_completed(
-            metrics_collector,
-            round_id,
-            session_id,
+            frame.metrics_collector,
+            frame.round_id,
+            frame.session_id,
             session.messages.len() as u32,
             round_status,
             round_usage,
@@ -517,12 +502,12 @@ async fn handle_tool_calls_path(
         });
     }
 
-    if debug_enabled {
+    if frame.debug_enabled {
         tracing::debug!(
             "[{}] round_complete: {}",
-            session_id,
+            frame.session_id,
             serde_json::json!({
-                "round": turn + 1,
+                "round": frame.turn + 1,
                 "message_count": session.messages.len(),
             })
         );
@@ -532,7 +517,7 @@ async fn handle_tool_calls_path(
     // When features.dynamic_model_routing is enabled, evaluate task complexity
     // at the end of each round using the fast model. Store the result in session
     // metadata for downstream consumers (subagents, scheduling, etc.).
-    let _complexity = if config.features_dynamic_model_routing {
+    let _complexity = if frame.config.features_dynamic_model_routing {
         // Collect tool call names from this round for classification.
         let round_tool_calls = &stream_output.tool_calls;
 
@@ -544,7 +529,7 @@ async fn handle_tool_calls_path(
         let _classifier_provider = auxiliary_models
             .fast_model_provider
             .clone()
-            .unwrap_or_else(|| llm.clone());
+            .unwrap_or_else(|| frame.llm.clone());
 
         if let Some(_model) = classifier_model {
             // Heuristic-based classification. For full LLM-backed classification,
@@ -552,8 +537,8 @@ async fn handle_tool_calls_path(
             let complexity = heuristic_complexity(round_tool_calls);
             tracing::info!(
                 "[{}] Dynamic model routing: round {} complexity={:?}",
-                session_id,
-                turn + 1,
+                frame.session_id,
+                frame.turn + 1,
                 complexity
             );
             session.metadata.insert(
@@ -570,9 +555,9 @@ async fn handle_tool_calls_path(
     round_usage.recompute_total();
 
     crate::runtime::runner::metrics_lifecycle::record_round_completed(
-        metrics_collector,
-        round_id,
-        session_id,
+        frame.metrics_collector,
+        frame.round_id,
+        frame.session_id,
         session.messages.len() as u32,
         round_status,
         round_usage,
@@ -883,22 +868,26 @@ pub(super) async fn run_pipeline(
                 break;
             }
 
+            let frame = crate::runtime::runner::round_frame::RoundFrame {
+                session_id: &state.session_id,
+                round_id: &round_id,
+                turn: turn_counter as usize,
+                debug_enabled: state.debug_logger.enabled,
+                event_tx,
+                metrics_collector: state.metrics_collector.as_ref(),
+                config,
+                llm: &llm,
+                tools: &tools,
+            };
+
             match handle_tool_calls_path(
-                turn_counter as usize,
-                &round_id,
-                &state.session_id,
-                state.debug_logger.enabled,
+                &frame,
                 stream_output,
                 llm_output.round_usage,
                 session,
-                event_tx,
-                state.metrics_collector.as_ref(),
-                &tools,
-                config,
                 &state.auxiliary_models,
                 &state.model_name,
                 &mut state.task_context,
-                llm.clone(),
             )
             .await
             {

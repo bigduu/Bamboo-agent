@@ -17,7 +17,7 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     // This MUST NOT fail with provider validation errors.
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/config")
-        .set_json(&json!({
+        .set_json(json!({
             "provider": "anthropic",
             "http_proxy": "http://proxy:8080"
         }))
@@ -28,7 +28,7 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     // 2) Persist proxy auth (optional) and mark setup complete.
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/proxy-auth")
-        .set_json(&json!({
+        .set_json(json!({
             "username": "user",
             "password": "pass"
         }))
@@ -51,7 +51,7 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     // Attempt to inject proxy_auth_encrypted via permissive endpoint - must be ignored.
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/config")
-        .set_json(&json!({
+        .set_json(json!({
             "proxy_auth_encrypted": "deadbeef:deadbeef"
         }))
         .to_request();
@@ -79,7 +79,7 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     // 3) Strict provider endpoint: invalid provider config => 400.
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/settings/provider")
-        .set_json(&json!({
+        .set_json(json!({
             "provider": "openai",
             "providers": { "openai": { "model": "gpt-4" } }
         }))
@@ -98,7 +98,7 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     // 4) Strict provider endpoint: valid provider config => 200 and persists encrypted key.
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/settings/provider")
-        .set_json(&json!({
+        .set_json(json!({
             "provider": "openai",
             "providers": { "openai": { "api_key": "sk-test-key", "model": "gpt-4" } }
         }))
@@ -122,7 +122,7 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     // Attempt to inject api_key_encrypted via permissive endpoint - must be ignored.
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/config")
-        .set_json(&json!({
+        .set_json(json!({
             "providers": { "openai": { "api_key_encrypted": "deadbeef" } }
         }))
         .to_request();
@@ -150,7 +150,7 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     // Ensure the permissive endpoint merges without clobbering prior provider/setup state.
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/config")
-        .set_json(&json!({
+        .set_json(json!({
             "https_proxy": "http://proxy:8080",
             "keyword_masking": { "entries": [] }
         }))
@@ -180,7 +180,7 @@ async fn test_bamboo_config_persists_disabled_skills() {
 
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/config")
-        .set_json(&json!({
+        .set_json(json!({
             "skills": {
                 "disabled": [" pdf ", "skill-creator", "pdf"]
             }

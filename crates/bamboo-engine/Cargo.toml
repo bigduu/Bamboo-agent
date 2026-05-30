@@ -2,6 +2,7 @@
 name = "bamboo-engine"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 description = "Execution engine and orchestration for the Bamboo agent framework"
 license = "MIT"
 

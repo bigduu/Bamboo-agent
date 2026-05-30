@@ -70,12 +70,14 @@ pub(super) async fn evaluate_gold_terminal(
         task_context.as_ref(),
         gold_config,
         llm,
-        event_tx,
-        session_id,
-        model_name,
-        reasoning_effort,
-        GoldCheckpoint::Terminal,
-        iteration,
+        &crate::runtime::gold_evaluation::GoldEvalFrame {
+            event_tx,
+            session_id,
+            model: model_name,
+            reasoning_effort,
+            checkpoint: GoldCheckpoint::Terminal,
+            iteration,
+        },
     )
     .await
     {

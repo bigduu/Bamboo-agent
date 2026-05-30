@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::execute_llm_stream;
+use super::LlmStreamFrame;
 use bamboo_agent_core::agent::types::{ConversationSummary, TaskItem, TaskItemStatus, TaskList};
 use bamboo_agent_core::{AgentEvent, Message, Role, Session};
 use bamboo_compression::{PreparedContext, TokenUsageBreakdown};
@@ -152,18 +153,20 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
         &mut session,
         &config,
         &llm_dyn,
-        &event_tx,
-        &CancellationToken::new(),
         &prepared_context,
-        400_000,
         &[],
-        128,
-        "test-model",
-        None,
-        None,
-        None,
-        "session-stream-1",
-    )
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-1",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+        },
+        )
     .await
     .expect("execute llm stream");
 
@@ -261,18 +264,20 @@ async fn execute_llm_stream_emits_final_budget_event_with_stream_usage() {
         &mut session,
         &config,
         &llm_dyn,
-        &event_tx,
-        &CancellationToken::new(),
         &prepared_context,
-        400_000,
         &[],
-        128,
-        "test-model",
-        None,
-        None,
-        None,
-        "session-stream-final-budget",
-    )
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-final-budget",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+        },
+        )
     .await
     .expect("execute llm stream");
 
@@ -344,18 +349,20 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
         &mut session,
         &config,
         &llm_dyn,
-        &event_tx,
-        &CancellationToken::new(),
         &prepared_context,
-        400_000,
         &[],
-        128,
-        "test-model",
-        Some("openai"),
-        Some("openai"),
-        None,
-        "session-stream-task",
-    )
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-task",
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+        },
+        )
     .await
     .expect("execute llm stream");
 
@@ -467,18 +474,20 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
         &mut session,
         &config,
         &llm_dyn,
-        &event_tx,
-        &CancellationToken::new(),
         &prepared_context,
-        400_000,
         &[],
-        128,
-        "test-model",
-        Some("openai"),
-        Some("openai"),
-        None,
-        "session-stream-2",
-    )
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-2",
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+        },
+        )
     .await
     .expect("execute llm stream");
 
@@ -586,18 +595,20 @@ async fn execute_llm_stream_continuation_includes_external_memory_dynamic_block(
         &mut session,
         &config,
         &llm_dyn,
-        &event_tx,
-        &CancellationToken::new(),
         &prepared_context,
-        400_000,
         &[],
-        128,
-        "test-model",
-        Some("openai"),
-        Some("openai"),
-        None,
-        "session-stream-2a",
-    )
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-2a",
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+        },
+        )
     .await
     .expect("execute llm stream");
 
@@ -655,18 +666,20 @@ async fn execute_llm_stream_continuation_includes_plan_mode_and_runtime_dynamic_
         &mut session,
         &config,
         &llm_dyn,
-        &event_tx,
-        &CancellationToken::new(),
         &prepared_context,
-        400_000,
         &[],
-        128,
-        "test-model",
-        Some("openai"),
-        Some("openai"),
-        None,
-        "session-stream-2plan",
-    )
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-2plan",
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+        },
+        )
     .await
     .expect("execute llm stream");
 
@@ -737,18 +750,20 @@ async fn execute_llm_stream_keeps_previous_response_id_when_local_summary_or_com
         &mut session,
         &config,
         &llm_dyn,
-        &event_tx,
-        &CancellationToken::new(),
         &prepared_context,
-        400_000,
         &[],
-        128,
-        "test-model",
-        Some("openai"),
-        Some("openai"),
-        None,
-        "session-stream-2b",
-    )
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-2b",
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+        },
+        )
     .await
     .expect("execute llm stream");
 
@@ -831,18 +846,20 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
         &mut session,
         &config,
         &llm_dyn,
-        &event_tx,
-        &CancellationToken::new(),
         &prepared_context,
-        400_000,
         &[],
-        128,
-        "test-model",
-        Some("copilot"),
-        Some("copilot"),
-        None,
-        "session-stream-3",
-    )
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-3",
+            model: "test-model",
+            provider_name: Some("copilot"),
+            provider_type: Some("copilot"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+        },
+        )
     .await
     .expect("execute llm stream");
 
@@ -938,18 +955,20 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot_instance_p
         &mut session,
         &config,
         &llm_dyn,
-        &event_tx,
-        &CancellationToken::new(),
         &prepared_context,
-        400_000,
         &[],
-        128,
-        "test-model",
-        Some("copilot-instance"),
-        Some("copilot"),
-        None,
-        "session-stream-4",
-    )
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-4",
+            model: "test-model",
+            provider_name: Some("copilot-instance"),
+            provider_type: Some("copilot"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+        },
+        )
     .await
     .expect("execute llm stream");
 

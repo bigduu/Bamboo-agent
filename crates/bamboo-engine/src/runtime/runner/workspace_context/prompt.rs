@@ -72,10 +72,7 @@ fn strip_existing_workspace_context(prompt: &str) -> String {
 
 fn strip_wrapped_workspace_context(prompt: &str) -> String {
     let mut current = prompt.to_string();
-    loop {
-        let Some(start_idx) = current.find(WORKSPACE_CONTEXT_START_MARKER) else {
-            break;
-        };
+    while let Some(start_idx) = current.find(WORKSPACE_CONTEXT_START_MARKER) {
         let search_from = start_idx + WORKSPACE_CONTEXT_START_MARKER.len();
         let Some(end_rel_idx) = current[search_from..].find(WORKSPACE_CONTEXT_END_MARKER) else {
             break;

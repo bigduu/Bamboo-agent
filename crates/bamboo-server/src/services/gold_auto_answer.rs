@@ -352,12 +352,14 @@ async fn evaluate_gold_state_for_pending_question(
         task_context.as_ref(),
         gold_config,
         provider,
-        &event_tx,
-        session_id,
-        &model,
-        session.reasoning_effort,
-        bamboo_agent_core::GoldCheckpoint::Terminal,
-        iteration,
+        &bamboo_engine::runtime::gold_evaluation::GoldEvalFrame {
+            event_tx: &event_tx,
+            session_id,
+            model: &model,
+            reasoning_effort: session.reasoning_effort,
+            checkpoint: bamboo_agent_core::GoldCheckpoint::Terminal,
+            iteration,
+        },
     )
     .await
     .map_err(|error| error.to_string());

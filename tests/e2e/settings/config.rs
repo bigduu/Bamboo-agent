@@ -68,7 +68,7 @@ async fn test_set_bamboo_config() {
 
     let set_req = test::TestRequest::post()
         .uri("/v1/bamboo/config")
-        .set_json(&json!({
+        .set_json(json!({
             "provider": "openai",
             "http_proxy": "http://proxy:8080",
             "providers": {
@@ -117,7 +117,7 @@ async fn test_set_bamboo_config_allows_incomplete_provider_config() {
 
     let set_req = test::TestRequest::post()
         .uri("/v1/bamboo/config")
-        .set_json(&json!({
+        .set_json(json!({
             "provider": "anthropic",
             "http_proxy": "http://proxy:8080"
         }))
@@ -159,7 +159,7 @@ async fn test_set_proxy_auth_does_not_fail_when_provider_unconfigured() {
 
     let set_req = test::TestRequest::post()
         .uri("/v1/bamboo/config")
-        .set_json(&json!({
+        .set_json(json!({
             "provider": "anthropic"
         }))
         .to_request();
@@ -168,7 +168,7 @@ async fn test_set_proxy_auth_does_not_fail_when_provider_unconfigured() {
 
     let auth_req = test::TestRequest::post()
         .uri("/v1/bamboo/proxy-auth")
-        .set_json(&json!({
+        .set_json(json!({
             "username": "user",
             "password": "pass"
         }))
@@ -197,7 +197,7 @@ async fn test_update_bamboo_config_merges() {
 
     let set_req1 = test::TestRequest::post()
         .uri("/v1/bamboo/config")
-        .set_json(&json!({
+        .set_json(json!({
             "provider": "openai",
             "field1": "value1",
             "providers": {
@@ -213,7 +213,7 @@ async fn test_update_bamboo_config_merges() {
 
     let set_req2 = test::TestRequest::post()
         .uri("/v1/bamboo/config")
-        .set_json(&json!({
+        .set_json(json!({
             "provider": "anthropic",
             "field2": "value2",
             "providers": {

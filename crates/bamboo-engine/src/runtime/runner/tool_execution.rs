@@ -340,20 +340,23 @@ async fn maybe_apply_mid_turn_context_compression_after_tool(
 
 pub(crate) async fn execute_round_tool_calls(
     tool_calls: &[ToolCall],
-    event_tx: &mpsc::Sender<AgentEvent>,
-    metrics_collector: Option<&MetricsCollector>,
-    session_id: &str,
-    round_id: &str,
-    round: usize,
+    frame: &crate::runtime::runner::round_frame::RoundFrame<'_>,
     session: &mut Session,
-    tools: &Arc<dyn ToolExecutor>,
-    config: &AgentLoopConfig,
     task_context: &mut Option<TaskLoopContext>,
-    llm: &Arc<dyn LLMProvider>,
     compression_model_name: Option<&str>,
     compression_model_provider: Option<&Arc<dyn LLMProvider>>,
     tool_schemas: &[ToolSchema],
 ) -> Result<RoundToolExecutionResult, AgentError> {
+    // Bind frame fields as locals so the rest of the function body stays unchanged.
+    let event_tx = frame.event_tx;
+    let metrics_collector = frame.metrics_collector;
+    let session_id = frame.session_id;
+    let round_id = frame.round_id;
+    let round = frame.turn;
+    let tools = frame.tools;
+    let config = frame.config;
+    let llm = frame.llm;
+
     let mut state = RoundExecutionState::default();
     let mut policy_guard = policy::ToolPolicyGuard::new(
         config.max_tool_calls_per_round,

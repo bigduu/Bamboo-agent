@@ -12,7 +12,7 @@ async fn test_save_workflow_with_invalid_name() {
 
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/workflows")
-        .set_json(&json!({
+        .set_json(json!({
             "name": "../../../etc/passwd",
             "content": "malicious content"
         }))
@@ -34,7 +34,7 @@ async fn test_update_provider_with_invalid_provider() {
 
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/settings/provider")
-        .set_json(&json!({
+        .set_json(json!({
             "provider": "invalid-provider-name",
             "providers": {}
         }))

@@ -21,6 +21,19 @@ use super::prompt_context::{
 use super::session_setup::prompt_setup::{persist_prompt_snapshot_metadata, PromptAssemblyReport};
 use bamboo_agent_core::PromptSnapshot;
 
+/// Round-prelude frame bundling per-round identification and observability
+/// parameters.  Passed into [`prepare_round`] to keep its parameter count
+/// below the clippy threshold.
+pub(crate) struct RoundPreludeFrame<'a> {
+    pub round: usize,
+    pub max_rounds: usize,
+    pub debug_enabled: bool,
+    pub cancel_token: &'a CancellationToken,
+    pub metrics_collector: Option<&'a MetricsCollector>,
+    pub session_id: &'a str,
+    pub model_name: &'a str,
+}
+
 // ---- prompt_updates functions ----
 
 const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
@@ -289,17 +302,20 @@ fn wrapped_section_len(prompt: &str, start_marker: &str, end_marker: &str) -> us
 pub(crate) async fn prepare_round(
     session: &mut Session,
     task_context: &mut Option<TaskLoopContext>,
-    round: usize,
-    max_rounds: usize,
-    cancel_token: &CancellationToken,
-    metrics_collector: Option<&MetricsCollector>,
-    session_id: &str,
-    model_name: &str,
-    debug_enabled: bool,
     config: &AgentLoopConfig,
     llm: Arc<dyn LLMProvider>,
     _tools: &dyn ToolExecutor,
+    frame: &RoundPreludeFrame<'_>,
 ) -> Result<String, AgentError> {
+    // Bind frame fields as locals so the rest of the function body stays unchanged.
+    let round = frame.round;
+    let max_rounds = frame.max_rounds;
+    let cancel_token = frame.cancel_token;
+    let metrics_collector = frame.metrics_collector;
+    let session_id = frame.session_id;
+    let model_name = frame.model_name;
+    let debug_enabled = frame.debug_enabled;
+
     let runtime_context = PromptMemoryRuntimeContext {
         llm: config.background_model_provider.clone().unwrap_or(llm),
         background_model_name: config.background_model_name.clone(),

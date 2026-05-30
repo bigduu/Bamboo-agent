@@ -47,18 +47,23 @@ impl ToolManager for DefaultToolManager {
         task_context: &mut Option<TaskLoopContext>,
         tool_schemas: &[ToolSchema],
     ) -> Result<ToolRoundResult, AgentError> {
-        let result = crate::runtime::runner::tool_execution::execute_round_tool_calls(
-            tool_calls,
-            event_tx,
-            metrics_collector,
+        let frame = crate::runtime::runner::round_frame::RoundFrame {
             session_id,
             round_id,
-            round,
-            session,
-            &self.tools,
+            turn: round,
+            debug_enabled: false,
+            event_tx,
+            metrics_collector,
             config,
+            llm: &self.llm,
+            tools: &self.tools,
+        };
+
+        let result = crate::runtime::runner::tool_execution::execute_round_tool_calls(
+            tool_calls,
+            &frame,
+            session,
             task_context,
-            &self.llm,
             config
                 .summarization_model_name
                 .as_deref()
