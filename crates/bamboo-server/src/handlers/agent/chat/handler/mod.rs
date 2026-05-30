@@ -33,6 +33,13 @@ mod tests;
 /// the agent and receive events.
 pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) -> impl Responder {
     let session_id = request::resolve_session_id(req.session_id.as_deref());
+    tracing::debug!(
+        "[{}] Chat requested: message_len={}, is_goal_command={}, image_count={}",
+        session_id,
+        req.message.len(),
+        parse_goal_command(&req.message).is_some(),
+        req.images.as_ref().map(|i| i.len()).unwrap_or(0),
+    );
     let model = match request::validate_and_normalize_model(req.model.as_str()) {
         Ok(model) => model,
         Err(response) => return response,
@@ -86,6 +93,11 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
 
     // ---- Goal command interception ----
     if let Some(goal_cmd) = parse_goal_command(&req.message) {
+        tracing::debug!(
+            "[{}] Chat intercepted as /goal command: {:?}",
+            session_id,
+            goal_cmd
+        );
         return handle_goal_command(state.as_ref(), &session_id, &goal_cmd).await;
     }
 
@@ -98,6 +110,13 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
 
     // Re-save to persist image attachments (if any).
     state.save_and_cache_session(&mut session).await;
+
+    tracing::debug!(
+        "[{}] Chat turn persisted: messages={}, last_role={:?} -> client should now POST /execute",
+        session_id,
+        session.messages.len(),
+        session.messages.last().map(|m| format!("{:?}", m.role)),
+    );
 
     HttpResponse::Created().json(ChatResponse {
         session_id: session_id.clone(),

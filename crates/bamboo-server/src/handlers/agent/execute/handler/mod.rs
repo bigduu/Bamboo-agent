@@ -33,6 +33,16 @@ pub async fn handler(
     req: web::Json<ExecuteRequest>,
 ) -> HttpResponse {
     let session_id = path.into_inner();
+    tracing::debug!(
+        "[{}] Execute requested: model={:?}, model_ref={:?}, reasoning_effort={:?}, has_client_sync={}",
+        session_id,
+        req.model,
+        req.model_ref
+            .as_ref()
+            .map(|m| format!("{}/{}", m.provider, m.model)),
+        req.reasoning_effort,
+        req.client_sync.is_some(),
+    );
 
     // ---- Build execution config snapshot from server config ----
     let config_snapshot = state.config.read().await.clone();
@@ -167,8 +177,20 @@ pub async fn handler(
             let session_tx = state.get_session_event_sender(&session_id).await;
             let (cancel_token, run_id) =
                 match reserve_runner(state.get_ref(), &session_id, &session_tx).await {
-                    RunnerReservation::Started(token, rid) => (token, rid),
+                    RunnerReservation::Started(token, rid) => {
+                        tracing::debug!(
+                            "[{}] Execute Ready -> runner reserved & STARTING (run_id={})",
+                            session_id,
+                            rid
+                        );
+                        (token, rid)
+                    }
                     RunnerReservation::AlreadyRunning(rid) => {
+                        tracing::debug!(
+                            "[{}] Execute Ready -> runner AlreadyRunning (run_id={}); not spawning",
+                            session_id,
+                            rid
+                        );
                         let sync_info = build_sync_info_from_session(&session);
                         return already_running_response(&session_id, sync_info, Some(rid));
                     }
@@ -311,6 +333,11 @@ pub async fn handler(
             reason,
             server_snapshot,
         } => {
+            tracing::debug!(
+                "[{}] Execute SyncMismatch (reason={:?}); returning completed/need_sync without starting a runner",
+                session_id,
+                reason
+            );
             state
                 .metrics_service
                 .collector()

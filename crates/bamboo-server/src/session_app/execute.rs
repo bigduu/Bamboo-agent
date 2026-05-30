@@ -35,6 +35,27 @@ pub async fn prepare_execute(
 
     // ---- Client sync check ----
     if let Some(reason) = evaluate_client_sync(input.client_sync.as_ref(), &server_snapshot) {
+        match input.client_sync.as_ref() {
+            Some(cs) => tracing::debug!(
+                "[{}] Execute sync MISMATCH reason={:?}: client(count={}, last_id={:?}, pending_q={}, pq_tool={:?}) vs server(count={}, last_id={:?}, pending_q={}, pq_tool={:?}); total_messages_in_session={}",
+                input.session_id,
+                reason,
+                cs.client_message_count,
+                cs.client_last_message_id,
+                cs.client_has_pending_question,
+                cs.client_pending_question_tool_call_id,
+                server_snapshot.message_count,
+                server_snapshot.last_message_id,
+                server_snapshot.has_pending_question,
+                server_snapshot.pending_question_tool_call_id,
+                session.messages.len(),
+            ),
+            None => tracing::debug!(
+                "[{}] Execute sync MISMATCH reason={:?} but no client_sync was sent",
+                input.session_id,
+                reason
+            ),
+        }
         return Ok(ExecutePreparationOutcome::SyncMismatch {
             reason,
             server_snapshot,

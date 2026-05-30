@@ -63,10 +63,22 @@ pub async fn handler(
     // event stream, we must keep the SSE stream open even if the parent runner is not running.
     let runner_status = runner_snapshot.as_ref().map(|runner| runner.status.clone());
     let should_attempt_terminal = !matches!(runner_status, Some(AgentStatus::Running));
+    tracing::debug!(
+        "[{}] Events decision: runner_present={}, runner_status={:?}, should_attempt_terminal={}, critical_events_to_replay={}",
+        session_id,
+        runner_snapshot.is_some(),
+        runner_status,
+        should_attempt_terminal,
+        critical_events_to_replay.len(),
+    );
     if should_attempt_terminal {
         if let Some(terminal_event) =
             terminal_event_if_ready(&state, &session_id, runner_status).await
         {
+            tracing::debug!(
+                "[{}] Events -> ONE-SHOT terminal stream (closing immediately); the client will treat this as a finished run",
+                session_id,
+            );
             return terminal_response(
                 budget_event_to_replay,
                 critical_events_to_replay,
@@ -75,5 +87,9 @@ pub async fn handler(
         }
     }
 
+    tracing::debug!(
+        "[{}] Events -> LIVE stream opened (kept open, awaiting runner events)",
+        session_id,
+    );
     live_stream_response(budget_event_to_replay, critical_events_to_replay, receiver)
 }

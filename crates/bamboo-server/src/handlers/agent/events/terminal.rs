@@ -16,12 +16,52 @@ pub(super) async fn terminal_event_if_ready(
         _ => None,
     };
 
+    // Diagnostic snapshot of the inputs that decide terminal-vs-live. This is the
+    // key signal for "subscribed repeatedly but never executes": if the last
+    // message is not a User message (and nothing is suspended/pending), the
+    // session looks "finished" so we emit a one-shot terminal and the client
+    // reconnects — even though the user expected a run to start.
+    if let Some(session) = session.as_ref() {
+        let last_role = session.messages.last().map(|m| format!("{:?}", m.role));
+        let runtime_status = session
+            .agent_runtime_state
+            .as_ref()
+            .map(|rt| format!("{:?}", rt.status));
+        tracing::debug!(
+            "[{}] terminal_event_if_ready: messages={}, last_role={:?}, has_pending_question={}, runtime_status={:?}, runner_status={:?}",
+            session_id,
+            session.messages.len(),
+            last_role,
+            session.has_pending_question(),
+            runtime_status,
+            runner_status,
+        );
+    } else {
+        tracing::debug!(
+            "[{}] terminal_event_if_ready: session could not be loaded from storage (runner_status={:?})",
+            session_id,
+            runner_status,
+        );
+    }
+
     if session_prevents_terminal_event(session.as_ref()) {
+        tracing::debug!(
+            "[{}] terminal_event_if_ready -> None (pending user message / pending question / suspended) -> LIVE stream",
+            session_id,
+        );
         return None;
     }
     if has_running_child(state, session_id).await {
+        tracing::debug!(
+            "[{}] terminal_event_if_ready -> None (running child session) -> LIVE stream",
+            session_id,
+        );
         return None;
     }
+    tracing::debug!(
+        "[{}] terminal_event_if_ready -> Some(terminal): no pending user message, not suspended, no running child",
+        session_id,
+    );
     Some(terminal_event_for_status(runner_status))
 }
 

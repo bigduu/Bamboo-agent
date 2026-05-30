@@ -122,11 +122,18 @@ impl AppState {
 
         match (memory_session, storage_session) {
             (Some(memory), Some(storage)) => {
-                let chosen = if should_prefer_storage(&memory, &storage) {
-                    storage
-                } else {
-                    memory
-                };
+                let prefer_storage = should_prefer_storage(&memory, &storage);
+                tracing::debug!(
+                    "[{}] load_session_merged: memory={} msgs (updated_at={}), storage={} msgs (updated_at={}), prefer_storage={} -> chose {} msgs",
+                    session_id,
+                    memory.messages.len(),
+                    memory.updated_at,
+                    storage.messages.len(),
+                    storage.updated_at,
+                    prefer_storage,
+                    if prefer_storage { storage.messages.len() } else { memory.messages.len() },
+                );
+                let chosen = if prefer_storage { storage } else { memory };
                 let mut sessions = self.sessions.write().await;
                 sessions.insert(session_id.to_string(), chosen.clone());
                 Some(chosen)
