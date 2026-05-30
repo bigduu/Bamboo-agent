@@ -2,6 +2,7 @@ use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_infrastructure::config::OpenAIConfig;
 
 mod crud;
+mod patch_message_safety;
 
 fn openai_config_with(model: &str, reasoning_effort: Option<ReasoningEffort>) -> OpenAIConfig {
     OpenAIConfig {

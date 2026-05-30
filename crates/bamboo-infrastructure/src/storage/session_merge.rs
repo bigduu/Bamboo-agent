@@ -105,8 +105,69 @@ impl LockedSessionStore {
     /// server-side paths where an authoritative write may race with this save.
     pub async fn merge_save_runtime(&self, session: &mut Session) -> std::io::Result<()> {
         let _guard = self.acquire_lock(&session.id).await;
+
+        // DIAGNOSTIC: merge_save_runtime overwrites the whole `messages` array
+        // (it only merges authoritative metadata, not messages). If the incoming
+        // session is stale (fewer messages than what is already on disk), this save
+        // silently reverts a concurrent append (e.g. a just-persisted user message).
+        // Log a SHRINK warning so we can identify the stale writer.
+        let existing_message_count = self
+            .storage
+            .load_session(&session.id)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.messages.len());
+        let incoming_message_count = session.messages.len();
+        if existing_message_count.is_some_and(|existing| existing > incoming_message_count) {
+            tracing::warn!(
+                "[{}] merge_save_runtime SHRINK: disk has {:?} messages, saving {} (last_role={:?}, updated_at={}); a stale writer is reverting a concurrent append",
+                session.id,
+                existing_message_count,
+                incoming_message_count,
+                session.messages.last().map(|m| format!("{:?}", m.role)),
+                session.updated_at,
+            );
+        } else {
+            tracing::debug!(
+                "[{}] merge_save_runtime: disk={:?} messages, saving {} (updated_at={})",
+                session.id,
+                existing_message_count,
+                incoming_message_count,
+                session.updated_at,
+            );
+        }
+
         merge_authoritative_metadata_into_stale(&self.storage, session).await;
         self.storage.save_session(session).await
+    }
+
+    /// Apply a config-only mutation to a session without ever clobbering its
+    /// `messages` (or other concurrently-written state).
+    ///
+    /// Unlike [`Self::merge_save_runtime`], the caller does NOT pass a session
+    /// snapshot. Instead this loads the **latest** session from storage *inside*
+    /// the per-session lock, applies `mutate` (intended for small config fields
+    /// like `model_ref` / `reasoning_effort`), and saves. Because the load and
+    /// save both happen under the lock, a concurrent append (e.g. `POST /chat`
+    /// adding a user message) can never be reverted by this write.
+    ///
+    /// Returns the saved session, or `None` if it does not exist.
+    pub async fn update_runtime_config<F>(
+        &self,
+        session_id: &str,
+        mutate: F,
+    ) -> std::io::Result<Option<Session>>
+    where
+        F: FnOnce(&mut Session),
+    {
+        let _guard = self.acquire_lock(session_id).await;
+        let Some(mut session) = self.storage.load_session(session_id).await? else {
+            return Ok(None);
+        };
+        mutate(&mut session);
+        self.storage.save_session(&session).await?;
+        Ok(Some(session))
     }
 }
 
@@ -187,6 +248,110 @@ mod tests {
 
     fn fresh(id: &str) -> Session {
         Session::new(id.to_string(), "test-model".to_string())
+    }
+
+    // ── update_runtime_config: config patches must never clobber messages ──
+
+    #[tokio::test]
+    async fn update_runtime_config_preserves_concurrently_appended_messages() {
+        use bamboo_domain::session::types::Message;
+        use bamboo_domain::ReasoningEffort;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "cfg-preserve";
+
+        // Persisted baseline: one user + one assistant turn.
+        let mut initial = fresh(session_id);
+        initial.add_message(Message::user("hello"));
+        initial.add_message(Message::assistant("hi", None));
+        storage.save_session(&initial).await.unwrap();
+
+        // Simulate `POST /chat` appending a new user message to disk.
+        let mut after_chat = storage.load_session(session_id).await.unwrap().unwrap();
+        after_chat.add_message(Message::user("second question"));
+        storage.save_session(&after_chat).await.unwrap();
+        assert_eq!(after_chat.messages.len(), 3);
+
+        // A config-only patch must load the freshest session and preserve the
+        // appended message (this is the regression that broke message sending on
+        // existing sessions).
+        let updated = store
+            .update_runtime_config(session_id, |s| {
+                s.reasoning_effort = Some(ReasoningEffort::Max);
+            })
+            .await
+            .unwrap()
+            .expect("session exists");
+
+        assert_eq!(updated.reasoning_effort, Some(ReasoningEffort::Max));
+        assert_eq!(
+            updated.messages.len(),
+            3,
+            "config patch must not revert a concurrently-appended message"
+        );
+
+        let on_disk = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(on_disk.messages.len(), 3);
+        assert_eq!(on_disk.reasoning_effort, Some(ReasoningEffort::Max));
+    }
+
+    #[tokio::test]
+    async fn update_runtime_config_returns_none_for_missing_session() {
+        use bamboo_domain::ReasoningEffort;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage);
+        let result = store
+            .update_runtime_config("does-not-exist", |s| {
+                s.reasoning_effort = Some(ReasoningEffort::Low);
+            })
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn merge_save_runtime_overwrites_messages_from_stale_snapshot() {
+        // Characterization of the bug that motivated `update_runtime_config`:
+        // `merge_save_runtime` writes the caller's `messages` verbatim, so a
+        // stale snapshot reverts a concurrent append. Config-only writers must
+        // therefore use `update_runtime_config`, never `merge_save_runtime`.
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "stale-clobber";
+
+        // A handler loads the session (1 message) …
+        let mut baseline = fresh(session_id);
+        baseline.add_message(Message::user("hello"));
+        storage.save_session(&baseline).await.unwrap();
+        let mut stale_snapshot = storage.load_session(session_id).await.unwrap().unwrap();
+
+        // … then `POST /chat` appends a second message to disk …
+        let mut after_chat = storage.load_session(session_id).await.unwrap().unwrap();
+        after_chat.add_message(Message::user("second"));
+        storage.save_session(&after_chat).await.unwrap();
+        assert_eq!(
+            storage
+                .load_session(session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .messages
+                .len(),
+            2
+        );
+
+        // … and the stale handler saves via merge_save_runtime -> append reverted.
+        store.merge_save_runtime(&mut stale_snapshot).await.unwrap();
+        let after = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.messages.len(),
+            1,
+            "merge_save_runtime clobbers concurrent appends — this is why config patches must use update_runtime_config"
+        );
     }
 
     // ── Free-function merge tests (updated for metadata-group) ──────

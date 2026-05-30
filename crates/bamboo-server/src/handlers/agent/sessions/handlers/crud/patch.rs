@@ -96,52 +96,57 @@ pub async fn patch_session(
         || req.clear_reasoning_effort.unwrap_or(false);
 
     if touches_non_metadata {
-        let Some(mut session) = state
-            .storage
-            .load_session(&session_id)
-            .await
-            .map_err(|error| {
-                actix_web::error::ErrorInternalServerError(format!(
-                    "Failed to load session: {error}"
-                ))
-            })?
-        else {
-            return Ok(HttpResponse::NotFound().json(serde_json::json!({
-                "error": "Session not found",
-                "session_id": session_id
-            })));
-        };
-
         let request_model_ref = derive_model_ref(
             req.model_ref.as_ref(),
             req.provider.as_deref(),
             req.model.as_deref(),
         );
-        if let Some(model_ref) = request_model_ref.as_ref() {
-            persist_model_ref(&mut session, model_ref);
-        } else {
-            persist_legacy_model_provider(
-                &mut session,
-                req.model.as_deref(),
-                req.provider.as_deref(),
-            );
-        }
-        if req.clear_reasoning_effort.unwrap_or(false) {
-            session.reasoning_effort = None;
-        } else if let Some(reasoning_effort) = req.reasoning_effort {
-            session.reasoning_effort = Some(reasoning_effort);
-        }
-        session.updated_at = chrono::Utc::now();
 
-        state
+        // Apply ONLY the config fields, loading the freshest session under the
+        // per-session lock. This must never rewrite `messages`: a config patch
+        // (e.g. model/reasoning-effort) can race a concurrent `POST /chat` that
+        // just appended a user message, and a full-session save from a stale
+        // snapshot would silently revert that append (lost-write bug).
+        let updated = state
             .persistence
-            .merge_save_runtime(&mut session)
+            .update_runtime_config(&session_id, |session| {
+                if let Some(model_ref) = request_model_ref.as_ref() {
+                    persist_model_ref(session, model_ref);
+                } else {
+                    persist_legacy_model_provider(
+                        session,
+                        req.model.as_deref(),
+                        req.provider.as_deref(),
+                    );
+                }
+                if req.clear_reasoning_effort.unwrap_or(false) {
+                    session.reasoning_effort = None;
+                } else if let Some(reasoning_effort) = req.reasoning_effort {
+                    session.reasoning_effort = Some(reasoning_effort);
+                }
+                session.updated_at = chrono::Utc::now();
+            })
             .await
             .map_err(|error| {
                 actix_web::error::ErrorInternalServerError(format!(
                     "Failed to save session: {error}"
                 ))
             })?;
+
+        let Some(session) = updated else {
+            return Ok(HttpResponse::NotFound().json(serde_json::json!({
+                "error": "Session not found",
+                "session_id": session_id
+            })));
+        };
+
+        tracing::debug!(
+            "[{}] patch_session config update saved under lock: messages preserved={}, model_changed={}, reasoning_changed={}",
+            session_id,
+            session.messages.len(),
+            req.model_ref.is_some() || req.model.is_some() || req.provider.is_some(),
+            req.reasoning_effort.is_some() || req.clear_reasoning_effort.unwrap_or(false),
+        );
 
         let mut sessions = state.sessions.write().await;
         sessions.insert(session_id.clone(), session);
