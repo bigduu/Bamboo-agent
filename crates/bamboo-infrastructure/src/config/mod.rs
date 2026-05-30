@@ -29,19 +29,3 @@ pub use model_mapping::*;
 pub use paths::*;
 pub use provider_instance::synthesize_legacy_instances;
 pub use settings::PermissionMode;
-
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    pub(crate) fn env_cache_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    pub(crate) fn env_cache_lock_acquire() -> MutexGuard<'static, ()> {
-        env_cache_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}

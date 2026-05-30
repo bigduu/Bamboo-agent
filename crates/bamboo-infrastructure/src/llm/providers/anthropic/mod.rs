@@ -1140,7 +1140,6 @@ pub fn parse_anthropic_sse_event(
 mod anthropic_request_building {
     use crate::models::{ContentPart, ImageUrl};
     use bamboo_domain::Message;
-    use bamboo_domain::MessagePart;
     use bamboo_domain::{FunctionCall, ToolCall};
     use bamboo_domain::{FunctionSchema, ToolSchema};
 

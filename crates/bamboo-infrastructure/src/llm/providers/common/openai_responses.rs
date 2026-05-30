@@ -1306,7 +1306,6 @@ impl ResponsesSseParser {
 mod tests {
     use super::*;
     use crate::llm::models::{ContentPart, ImageUrl};
-    use bamboo_domain::MessagePart;
     use bamboo_domain::MessagePhase;
     use bamboo_domain::{FunctionCall, ToolCall};
     use bamboo_domain::{FunctionSchema, ToolSchema};

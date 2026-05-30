@@ -488,23 +488,6 @@ async fn resolve_gold_provider_and_model(
     Ok((state.get_provider().await, model))
 }
 
-fn gold_model_name(session: &Session, gold_config: &GoldConfig) -> Option<String> {
-    gold_config
-        .model_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            let model = session.model.trim();
-            if model.is_empty() || model == "unknown" {
-                None
-            } else {
-                Some(model.to_string())
-            }
-        })
-}
-
 fn normalize_lightweight_reasoning_effort(
     reasoning_effort: Option<ReasoningEffort>,
 ) -> Option<ReasoningEffort> {
