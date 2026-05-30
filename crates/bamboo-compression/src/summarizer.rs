@@ -427,6 +427,7 @@ Guidelines:
             parallel_tool_calls: None,
             responses: None,
             request_purpose: Some("compression".to_string()),
+            cache: None,
         };
         let stream = self
             .llm

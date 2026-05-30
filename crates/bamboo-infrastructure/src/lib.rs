@@ -58,6 +58,7 @@ pub use llm::{
 };
 pub use llm::{AnthropicProvider, CopilotProvider, GeminiProvider, OpenAIProvider};
 pub use llm::{LLMChunk, LLMError, LLMProvider, LLMRequestOptions, LLMStream};
+pub use llm::{CacheTtl, PromptCachePlan};
 pub use process::process_utils::{
     build_command_environment, decode_process_line_lossy, hide_window_for_std_command,
     hide_window_for_tokio_command, preferred_bash_shell, render_command_line,

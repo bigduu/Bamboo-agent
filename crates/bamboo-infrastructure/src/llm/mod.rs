@@ -1,5 +1,6 @@
 //! LLM provider abstraction and integration for Bamboo.
 
+pub mod cache;
 pub mod error;
 pub mod http_client;
 pub mod model_catalog;
@@ -23,6 +24,7 @@ pub mod api {
     }
 }
 
+pub use cache::{CacheTtl, PromptCachePlan};
 pub use crate::config::Config;
 pub use error::ProxyAuthRequiredError;
 pub use model_catalog::ModelCatalogService;

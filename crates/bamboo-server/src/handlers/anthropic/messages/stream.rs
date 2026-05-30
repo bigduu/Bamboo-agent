@@ -49,6 +49,7 @@ pub(super) async fn handle_streaming_messages(
                 parallel_tool_calls: None,
                 responses: None,
                 request_purpose: Some("anthropic_compat".to_string()),
+                cache: None,
             }),
         )
         .await;

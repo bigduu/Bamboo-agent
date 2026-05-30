@@ -114,6 +114,11 @@ pub struct LLMRequestOptions {
     pub responses: Option<ResponsesRequestOptions>,
     /// Purpose of this request for observability (e.g., "agent_loop", "task_evaluation").
     pub request_purpose: Option<String>,
+    /// Provider-agnostic prompt-cache plan describing the stable, cacheable
+    /// prefix of this request. Providers render it in their own dialect
+    /// (Anthropic `cache_control` breakpoints; OpenAI/Gemini rely on the stable
+    /// prefix automatically). `None` means "no explicit cache hints".
+    pub cache: Option<crate::llm::cache::PromptCachePlan>,
 }
 
 /// Trait for LLM provider implementations

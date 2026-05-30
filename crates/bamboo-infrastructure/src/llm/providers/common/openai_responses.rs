@@ -1285,6 +1285,15 @@ impl ResponsesSseParser {
                     .and_then(|response| response.get("usage"))
                     .or_else(|| v.get("usage"));
                 self.log_reasoning_summary_if_needed(usage);
+                // Surface provider-side prompt cache hits so the same accounting
+                // and frontend badge work for the Responses API. `Done` is only an
+                // informational log downstream (the stream terminates on EOF), so
+                // emitting CacheUsage here in its place is safe.
+                if let Some(cache_chunk) =
+                    usage.and_then(crate::llm::cache::cache_usage_from_openai_usage)
+                {
+                    return Ok(Some(cache_chunk));
+                }
                 Ok(Some(LLMChunk::Done))
             }
 
