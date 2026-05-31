@@ -32,7 +32,7 @@ pub mod subagent;
 pub use mcp_config::*;
 pub use provider_catalog::*;
 pub use provider_model_ref::ProviderModelRef;
-pub use reasoning::ReasoningEffort;
+pub use reasoning::{ReasoningEffort, DEFAULT_REASONING_EFFORT};
 pub use schedule::*;
 pub use session::*;
 pub use storage::*;

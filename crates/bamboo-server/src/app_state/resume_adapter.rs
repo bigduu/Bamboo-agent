@@ -6,9 +6,9 @@
 //! `AppStateResumeRef` is a newtype wrapper around `Data<AppState>` to satisfy
 //! Rust's orphan rules (can't impl a foreign trait on a foreign type).
 
+use crate::model_areas::resolve_global_area_models;
 use crate::model_config_helper::{
-    resolve_background_model, resolve_fast_model, resolve_gold_config, resolve_provider_type,
-    resolve_task_summary_model, GOLD_CONFIG_METADATA_KEY,
+    resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
 };
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
@@ -76,17 +76,8 @@ impl ResumeExecutionPort for AppStateResumeRef {
             &resolved_provider_name,
             &self.0.provider_registry,
         );
-        let resolved_fast = resolve_fast_model(
-            &config_snapshot,
-            &resolved_provider_name,
-            &self.0.provider_registry,
-        );
-        let resolved_background = resolve_background_model(
-            &config_snapshot,
-            &resolved_provider_name,
-            &self.0.provider_registry,
-        );
-        let resolved_summarization = resolve_task_summary_model(
+        // Auxiliary models are global (config-derived), never session-bound.
+        let areas = resolve_global_area_models(
             &config_snapshot,
             &resolved_provider_name,
             &self.0.provider_registry,
@@ -94,25 +85,24 @@ impl ResumeExecutionPort for AppStateResumeRef {
         let resolved_fast_model = config
             .fast_model
             .clone()
-            .or_else(|| resolved_fast.as_ref().map(|m| m.model_name.clone()));
-        let resolved_fast_provider = resolved_fast.map(|m| m.provider);
+            .or_else(|| areas.fast.as_ref().map(|m| m.model_name.clone()));
+        let resolved_fast_provider = areas.fast.map(|m| m.provider);
         let resolved_background_model = config
             .background_model
             .clone()
-            .or_else(|| resolved_background.as_ref().map(|m| m.model_name.clone()));
+            .or_else(|| areas.background.as_ref().map(|m| m.model_name.clone()));
         let resolved_bg_provider = config
             .background_model_provider
             .clone()
-            .or_else(|| resolved_background.map(|m| m.provider));
-        let resolved_summarization_model = config.summarization_model.clone().or_else(|| {
-            resolved_summarization
-                .as_ref()
-                .map(|m| m.model_name.clone())
-        });
+            .or_else(|| areas.background.map(|m| m.provider));
+        let resolved_summarization_model = config
+            .summarization_model
+            .clone()
+            .or_else(|| areas.summarization.as_ref().map(|m| m.model_name.clone()));
         let resolved_summarization_provider = config
             .summarization_model_provider
             .clone()
-            .or_else(|| resolved_summarization.map(|m| m.provider));
+            .or_else(|| areas.summarization.map(|m| m.provider));
         let is_child_session = session.kind == bamboo_agent_core::SessionKind::Child;
         let reasoning_effort = session.reasoning_effort;
         let reasoning_effort_source = session

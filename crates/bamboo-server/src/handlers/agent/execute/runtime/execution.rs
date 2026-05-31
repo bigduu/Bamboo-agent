@@ -11,10 +11,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::app_state::AppState;
-use crate::model_config_helper::{
-    resolve_background_model, resolve_fast_model, resolve_planning_model, resolve_search_model,
-    resolve_task_summary_model,
-};
+use crate::model_areas::resolve_global_area_models;
+use crate::model_config_helper::{resolve_planning_model, resolve_search_model};
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::tools::ToolSurface;
 
@@ -102,28 +100,22 @@ pub(crate) fn make_auxiliary_model_resolver(
 
     Arc::new(move || {
         let config_snapshot = read_config_snapshot(&config, cached_config.as_ref());
-        let resolved_fast =
-            resolve_fast_model(&config_snapshot, &provider_name, &provider_registry);
-        let resolved_background =
-            resolve_background_model(&config_snapshot, &provider_name, &provider_registry);
-        let resolved_summarization =
-            resolve_task_summary_model(&config_snapshot, &provider_name, &provider_registry);
+        // Auxiliary models are global (config-derived), never session-bound.
+        let areas = resolve_global_area_models(&config_snapshot, &provider_name, &provider_registry);
         let resolved_planning =
             resolve_planning_model(&config_snapshot, &provider_name, &provider_registry);
         let resolved_search =
             resolve_search_model(&config_snapshot, &provider_name, &provider_registry);
 
         AuxiliaryModelConfig {
-            fast_model_name: resolved_fast.as_ref().map(|m| m.model_name.clone()),
-            fast_model_provider: resolved_fast.map(|m| m.provider),
-            background_model_name: resolved_background.as_ref().map(|m| m.model_name.clone()),
+            fast_model_name: areas.fast.as_ref().map(|m| m.model_name.clone()),
+            fast_model_provider: areas.fast.map(|m| m.provider),
+            background_model_name: areas.background.as_ref().map(|m| m.model_name.clone()),
             planning_model_name: resolved_planning.as_ref().map(|m| m.model_name.clone()),
             search_model_name: resolved_search.as_ref().map(|m| m.model_name.clone()),
-            summarization_model_name: resolved_summarization
-                .as_ref()
-                .map(|m| m.model_name.clone()),
-            background_model_provider: resolved_background.map(|m| m.provider),
-            summarization_model_provider: resolved_summarization.map(|m| m.provider),
+            summarization_model_name: areas.summarization.as_ref().map(|m| m.model_name.clone()),
+            background_model_provider: areas.background.map(|m| m.provider),
+            summarization_model_provider: areas.summarization.map(|m| m.provider),
         }
     })
 }

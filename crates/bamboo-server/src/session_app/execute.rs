@@ -78,20 +78,15 @@ pub async fn prepare_execute(
     };
 
     // ---- Resolve reasoning effort cascade: session → request → provider default ----
-    let effective_reasoning_effort = session
-        .reasoning_effort
-        .or(input.request_reasoning_effort)
-        .or(config.default_reasoning_effort);
-
-    // ---- Reasoning source ----
-    let reasoning_effort_source = if session.reasoning_effort.is_some() {
-        "session"
-    } else if input.request_reasoning_effort.is_some() {
-        "request"
-    } else if config.default_reasoning_effort.is_some() {
-        "provider_default"
-    } else {
-        "none"
+    // Single shared cascade (see `crate::model_areas`). Stays `Option` so
+    // non-reasoning models send no reasoning parameter.
+    let (effective_reasoning_effort, reasoning_effort_source) = {
+        let (effort, source) = crate::model_areas::resolve_effective_reasoning_effort(
+            session.reasoning_effort,
+            input.request_reasoning_effort,
+            config.default_reasoning_effort,
+        );
+        (effort, source.as_str())
     };
 
     // ---- Image fallback validation ----

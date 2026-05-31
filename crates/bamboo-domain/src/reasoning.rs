@@ -14,6 +14,20 @@ pub enum ReasoningEffort {
     Max,
 }
 
+/// The single canonical fallback used when no reasoning effort is configured
+/// anywhere in the resolution chain (session → request → provider default).
+///
+/// This is the ONE place the `"medium"` default is defined. Every site that
+/// needs a concrete terminal default must reference this constant rather than
+/// hardcoding a level, so the frontend display and the backend stay in lockstep.
+pub const DEFAULT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Medium;
+
+impl Default for ReasoningEffort {
+    fn default() -> Self {
+        DEFAULT_REASONING_EFFORT
+    }
+}
+
 impl ReasoningEffort {
     /// Parse a case-insensitive string into [`ReasoningEffort`].
     pub fn parse(value: &str) -> Option<Self> {

@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
+use crate::model_areas::resolve_global_area_models;
 use crate::model_config_helper::{
-    get_schedule_model_from_config, resolve_background_model, resolve_fast_model,
-    resolve_gold_config, resolve_provider_type, resolve_task_summary_model,
+    get_schedule_model_from_config, resolve_gold_config, resolve_provider_type,
 };
 pub use crate::schedule_app::{
     ResolvedRunConfig, ScheduleContext, ScheduleManager, ScheduleRunJob,
@@ -71,21 +71,9 @@ fn resolve_run_config_from_config(
     let capability_provider_name = provider_name
         .as_deref()
         .unwrap_or(config_snapshot.effective_default_provider());
-    let resolved_fast = resolve_fast_model(
-        &config_snapshot,
-        capability_provider_name,
-        provider_registry,
-    );
-    let resolved_background = resolve_background_model(
-        &config_snapshot,
-        capability_provider_name,
-        provider_registry,
-    );
-    let resolved_summarization = resolve_task_summary_model(
-        &config_snapshot,
-        capability_provider_name,
-        provider_registry,
-    );
+    // Auxiliary models are global (config-derived), never session-bound.
+    let areas =
+        resolve_global_area_models(&config_snapshot, capability_provider_name, provider_registry);
 
     let requested_reasoning_effort = job.run_config.reasoning_effort;
     let reasoning_effort = requested_reasoning_effort.or(config_snapshot.get_reasoning_effort());
@@ -130,14 +118,12 @@ fn resolve_run_config_from_config(
         model,
         provider_name,
         provider_type,
-        fast_model: resolved_fast.as_ref().map(|m| m.model_name.clone()),
-        fast_model_provider: resolved_fast.map(|m| m.provider),
-        background_model: resolved_background.as_ref().map(|m| m.model_name.clone()),
-        background_model_provider: resolved_background.map(|m| m.provider),
-        summarization_model: resolved_summarization
-            .as_ref()
-            .map(|m| m.model_name.clone()),
-        summarization_model_provider: resolved_summarization.map(|m| m.provider),
+        fast_model: areas.fast.as_ref().map(|m| m.model_name.clone()),
+        fast_model_provider: areas.fast.map(|m| m.provider),
+        background_model: areas.background.as_ref().map(|m| m.model_name.clone()),
+        background_model_provider: areas.background.map(|m| m.provider),
+        summarization_model: areas.summarization.as_ref().map(|m| m.model_name.clone()),
+        summarization_model_provider: areas.summarization.map(|m| m.provider),
         reasoning_effort,
         gold_config: resolve_gold_config(&config_snapshot, None),
         system_prompt,

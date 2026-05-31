@@ -25,9 +25,9 @@ use bamboo_infrastructure::{Config, ProviderModelRouter, ProviderRegistry};
 use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
 
+use crate::model_areas::resolve_global_area_models;
 use crate::model_config_helper::{
-    resolve_background_model, resolve_fast_model, resolve_gold_config, resolve_provider_type,
-    resolve_task_summary_model, GOLD_CONFIG_METADATA_KEY,
+    resolve_fast_model, resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
 };
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::session_app::resume::{
@@ -241,37 +241,24 @@ impl ChildCompletionCoordinator {
             .unwrap_or_else(|| config_snapshot.provider.clone());
         let provider_type =
             resolve_provider_type(config_snapshot, &provider_name, &self.provider_registry);
-        let resolved_fast =
-            resolve_fast_model(config_snapshot, &provider_name, &self.provider_registry);
-        let resolved_background =
-            resolve_background_model(config_snapshot, &provider_name, &self.provider_registry);
-        let resolved_summarization =
-            resolve_task_summary_model(config_snapshot, &provider_name, &self.provider_registry);
+        // Auxiliary models are global (config-derived), never session-bound.
+        let areas =
+            resolve_global_area_models(config_snapshot, &provider_name, &self.provider_registry);
 
         ResumeConfigSnapshot {
             provider_name,
             provider_type,
-            fast_model: resolved_fast.as_ref().map(|model| model.model_name.clone()),
-            fast_model_ref: config_snapshot
-                .defaults
-                .as_ref()
-                .and_then(|d| d.fast.clone()),
-            background_model: resolved_background
-                .as_ref()
-                .map(|model| model.model_name.clone()),
-            background_model_ref: config_snapshot
-                .defaults
-                .as_ref()
-                .and_then(|d| d.memory_background.clone()),
-            background_model_provider: resolved_background.map(|model| model.provider),
-            summarization_model: resolved_summarization
+            fast_model: areas.fast.as_ref().map(|model| model.model_name.clone()),
+            fast_model_ref: areas.fast_ref.clone(),
+            background_model: areas.background.as_ref().map(|model| model.model_name.clone()),
+            background_model_ref: areas.background_ref.clone(),
+            background_model_provider: areas.background.map(|model| model.provider),
+            summarization_model: areas
+                .summarization
                 .as_ref()
                 .map(|model| model.model_name.clone()),
-            summarization_model_ref: config_snapshot
-                .defaults
-                .as_ref()
-                .and_then(|d| d.task_summary.clone()),
-            summarization_model_provider: resolved_summarization.map(|model| model.provider),
+            summarization_model_ref: areas.summarization_ref.clone(),
+            summarization_model_provider: areas.summarization.map(|model| model.provider),
             disabled_tools: config_snapshot.disabled_tool_names(),
             disabled_skill_ids: config_snapshot.disabled_skill_ids(),
             image_fallback:
@@ -551,29 +538,24 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         let provider_name_for_aux = resolved_provider_name.clone();
         let auxiliary_model_resolver = std::sync::Arc::new(move || {
             let config_snapshot = read_config_snapshot(&config_handle, cached_config.as_ref());
-            let resolved_fast =
-                resolve_fast_model(&config_snapshot, &provider_name_for_aux, &provider_registry);
-            let resolved_background = resolve_background_model(
-                &config_snapshot,
-                &provider_name_for_aux,
-                &provider_registry,
-            );
-            let resolved_summarization = resolve_task_summary_model(
+            // Auxiliary models are global (config-derived), never session-bound.
+            let areas = resolve_global_area_models(
                 &config_snapshot,
                 &provider_name_for_aux,
                 &provider_registry,
             );
             bamboo_engine::AuxiliaryModelConfig {
-                fast_model_name: resolved_fast.as_ref().map(|m| m.model_name.clone()),
-                fast_model_provider: resolved_fast.map(|m| m.provider),
-                background_model_name: resolved_background.as_ref().map(|m| m.model_name.clone()),
+                fast_model_name: areas.fast.as_ref().map(|m| m.model_name.clone()),
+                fast_model_provider: areas.fast.map(|m| m.provider),
+                background_model_name: areas.background.as_ref().map(|m| m.model_name.clone()),
                 planning_model_name: None,
                 search_model_name: None,
-                summarization_model_name: resolved_summarization
+                summarization_model_name: areas
+                    .summarization
                     .as_ref()
                     .map(|m| m.model_name.clone()),
-                background_model_provider: resolved_background.map(|m| m.provider),
-                summarization_model_provider: resolved_summarization.map(|m| m.provider),
+                background_model_provider: areas.background.map(|m| m.provider),
+                summarization_model_provider: areas.summarization.map(|m| m.provider),
             }
         });
         spawn_session_execution(SessionExecutionArgs {

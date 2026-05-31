@@ -114,17 +114,8 @@ pub async fn submit_response(
         &resolved_provider_name,
         &state.provider_registry,
     );
-    let resolved_fast = crate::model_config_helper::resolve_fast_model(
-        &config_snapshot,
-        &resolved_provider_name,
-        &state.provider_registry,
-    );
-    let resolved_background = crate::model_config_helper::resolve_background_model(
-        &config_snapshot,
-        &resolved_provider_name,
-        &state.provider_registry,
-    );
-    let resolved_summarization = crate::model_config_helper::resolve_task_summary_model(
+    // Auxiliary models are global (config-derived), never session-bound.
+    let areas = crate::model_areas::resolve_global_area_models(
         &config_snapshot,
         &resolved_provider_name,
         &state.provider_registry,
@@ -132,25 +123,14 @@ pub async fn submit_response(
     let resume_config = crate::session_app::types::ResumeConfigSnapshot {
         provider_name: resolved_provider_name.clone(),
         provider_type: resolved_provider_type,
-        fast_model: resolved_fast.as_ref().map(|m| m.model_name.clone()),
-        fast_model_ref: config_snapshot
-            .defaults
-            .as_ref()
-            .and_then(|d| d.fast.clone()),
-        background_model: resolved_background.as_ref().map(|m| m.model_name.clone()),
-        background_model_ref: config_snapshot
-            .defaults
-            .as_ref()
-            .and_then(|d| d.memory_background.clone()),
-        background_model_provider: resolved_background.map(|m| m.provider),
-        summarization_model: resolved_summarization
-            .as_ref()
-            .map(|m| m.model_name.clone()),
-        summarization_model_ref: config_snapshot
-            .defaults
-            .as_ref()
-            .and_then(|d| d.task_summary.clone()),
-        summarization_model_provider: resolved_summarization.map(|m| m.provider),
+        fast_model: areas.fast.as_ref().map(|m| m.model_name.clone()),
+        fast_model_ref: areas.fast_ref.clone(),
+        background_model: areas.background.as_ref().map(|m| m.model_name.clone()),
+        background_model_ref: areas.background_ref.clone(),
+        background_model_provider: areas.background.map(|m| m.provider),
+        summarization_model: areas.summarization.as_ref().map(|m| m.model_name.clone()),
+        summarization_model_ref: areas.summarization_ref.clone(),
+        summarization_model_provider: areas.summarization.map(|m| m.provider),
         disabled_tools: config_snapshot.disabled_tool_names(),
         disabled_skill_ids: config_snapshot.disabled_skill_ids(),
         image_fallback: crate::handlers::agent::execute::image_fallback::resolve_image_fallback(

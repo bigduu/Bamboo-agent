@@ -9,10 +9,10 @@ use super::runtime::{
 };
 use super::{ExecuteRequest, ExecuteSyncInfo, ExecuteSyncReason};
 use crate::app_state::AppState;
+use crate::model_areas::resolve_global_area_models;
 use crate::model_config_helper::{
-    get_default_model_for_provider, get_reasoning_effort_for_provider, resolve_background_model,
-    resolve_fast_model, resolve_gold_config, resolve_provider_type, resolve_task_summary_model,
-    GOLD_CONFIG_METADATA_KEY,
+    get_default_model_for_provider, get_reasoning_effort_for_provider, resolve_gold_config,
+    resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
 };
 use crate::session_app::provider_model::session_effective_model_ref;
 
@@ -67,17 +67,10 @@ pub async fn handler(
         requested_provider,
         &state.provider_registry,
     );
-    let resolved_fast = resolve_fast_model(
-        &config_snapshot,
-        requested_provider,
-        &state.provider_registry,
-    );
-    let resolved_background = resolve_background_model(
-        &config_snapshot,
-        requested_provider,
-        &state.provider_registry,
-    );
-    let resolved_summarization = resolve_task_summary_model(
+    // Auxiliary (non-chat) models are global: resolved from config for the
+    // requested provider, never from the session. One call replaces the
+    // fast/background/summarization trio.
+    let areas = resolve_global_area_models(
         &config_snapshot,
         requested_provider,
         &state.provider_registry,
@@ -94,23 +87,12 @@ pub async fn handler(
         disabled_skill_ids: disabled_skill_ids_vec.clone(),
         provider_name: requested_provider.to_string(),
         provider_type: requested_provider_type.clone(),
-        fast_model: resolved_fast.as_ref().map(|m| m.model_name.clone()),
-        fast_model_ref: config_snapshot
-            .defaults
-            .as_ref()
-            .and_then(|d| d.fast.clone()),
-        background_model: resolved_background.as_ref().map(|m| m.model_name.clone()),
-        background_model_ref: config_snapshot
-            .defaults
-            .as_ref()
-            .and_then(|d| d.memory_background.clone()),
-        summarization_model: resolved_summarization
-            .as_ref()
-            .map(|m| m.model_name.clone()),
-        summarization_model_ref: config_snapshot
-            .defaults
-            .as_ref()
-            .and_then(|d| d.task_summary.clone()),
+        fast_model: areas.fast.as_ref().map(|m| m.model_name.clone()),
+        fast_model_ref: areas.fast_ref.clone(),
+        background_model: areas.background.as_ref().map(|m| m.model_name.clone()),
+        background_model_ref: areas.background_ref.clone(),
+        summarization_model: areas.summarization.as_ref().map(|m| m.model_name.clone()),
+        summarization_model_ref: areas.summarization_ref.clone(),
         image_fallback: image_fallback.clone(),
         gold_config: resolve_gold_config(&config_snapshot, None),
         provider_model_ref_enabled: config_snapshot.features.provider_model_ref,
@@ -231,17 +213,10 @@ pub async fn handler(
                 &resolved_provider_name,
                 &state.provider_registry,
             );
-            let resolved_fast = resolve_fast_model(
-                &config_snapshot,
-                &resolved_provider_name,
-                &state.provider_registry,
-            );
-            let resolved_background = resolve_background_model(
-                &config_snapshot,
-                &resolved_provider_name,
-                &state.provider_registry,
-            );
-            let resolved_summarization = resolve_task_summary_model(
+            // Auxiliary models for the spawn: global config, keyed to the
+            // session's resolved provider for fallback — never session-derived
+            // model values. One call replaces the trio.
+            let areas = resolve_global_area_models(
                 &config_snapshot,
                 &resolved_provider_name,
                 &state.provider_registry,
@@ -289,14 +264,12 @@ pub async fn handler(
                 provider_type: resolved_provider_type,
                 provider_override: None,
                 model: effective_model,
-                fast_model: resolved_fast.as_ref().map(|m| m.model_name.clone()),
-                fast_model_provider: resolved_fast.map(|m| m.provider),
-                background_model: resolved_background.as_ref().map(|m| m.model_name.clone()),
-                background_model_provider: resolved_background.map(|m| m.provider),
-                summarization_model: resolved_summarization
-                    .as_ref()
-                    .map(|m| m.model_name.clone()),
-                summarization_model_provider: resolved_summarization.map(|m| m.provider),
+                fast_model: areas.fast.as_ref().map(|m| m.model_name.clone()),
+                fast_model_provider: areas.fast.map(|m| m.provider),
+                background_model: areas.background.as_ref().map(|m| m.model_name.clone()),
+                background_model_provider: areas.background.map(|m| m.provider),
+                summarization_model: areas.summarization.as_ref().map(|m| m.model_name.clone()),
+                summarization_model_provider: areas.summarization.map(|m| m.provider),
                 reasoning_effort: effective_reasoning_effort,
                 reasoning_effort_source: reasoning_source.to_string(),
                 disabled_tools,
