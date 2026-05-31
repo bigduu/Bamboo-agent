@@ -183,6 +183,7 @@ fn build_manager(
             String,
             broadcast::Sender<AgentEvent>,
         >::new())),
+        account_feed_inbox: None,
         app_data_dir: None,
         trigger_engine: bamboo_agent::server::schedules::default_trigger_engine(),
         resolve_run_config,
