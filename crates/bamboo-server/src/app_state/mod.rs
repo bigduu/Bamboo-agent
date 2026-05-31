@@ -262,6 +262,14 @@ pub struct AppState {
     /// - sub-session forwarding (child -> parent)
     pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
 
+    /// Account-scoped durable change feed (powers `GET /api/v1/stream`).
+    ///
+    /// Unlike `session_event_senders`, this is a single account-wide sink: all
+    /// durable change events (message appended, session metadata, task updates,
+    /// terminal status) across every session are sequenced, journaled to disk,
+    /// and broadcast here for resumable multi-client sync.
+    pub account_sink: Arc<crate::events::AccountEventSink>,
+
     /// Registry for tracking external processes.
     pub process_registry: Arc<ProcessRegistry>,
 

@@ -63,6 +63,13 @@ pub(crate) fn spawn_event_forwarder(
                     }
                 }
 
+                // Mirror durable change events onto the account-wide feed
+                // (sequenced + journaled) for resumable multi-client sync. The
+                // sink filters ephemeral events (tokens, etc.) internally, so
+                // this is near-free for the hot path. `session_id` is passed
+                // explicitly so terminal events (which carry no id) still route.
+                state.account_sink.record(Some(&session_id), &event);
+
                 // Always forward to the broadcast channel regardless of subscriber count.
                 // The broadcast channel's internal capacity (1000 slots) buffers events so
                 // that late or temporarily-disconnected subscribers can catch up when they
@@ -345,7 +352,11 @@ mod tests {
     }
 
     async fn wait_for_resume_activity(state: &AppState, session_id: &str) -> AgentStatus {
-        timeout(Duration::from_secs(5), async {
+        // Generous timeout: this polls for an async gold resume that races
+        // through several LLM round-trips. Under the full parallel test suite
+        // (16 threads), a tight 5s budget can starve and flake; 30s only
+        // affects the genuine-hang detection ceiling, not the happy path.
+        timeout(Duration::from_secs(30), async {
             loop {
                 let marker_consumed = state
                     .load_session_merged(session_id)
@@ -371,7 +382,9 @@ mod tests {
     }
 
     async fn wait_for_provider_purpose(provider: &ScriptedProvider, purpose: &str) {
-        timeout(Duration::from_secs(5), async {
+        // See `wait_for_resume_activity`: generous ceiling to avoid flaking
+        // under full-suite scheduling pressure.
+        timeout(Duration::from_secs(30), async {
             loop {
                 if provider
                     .request_purposes()
@@ -534,6 +547,66 @@ mod tests {
             ),
             "cached event should be TaskListUpdated"
         );
+    }
+
+    #[tokio::test]
+    async fn event_forwarder_mirrors_durable_events_to_account_feed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize");
+        let state = actix_web::web::Data::new(state);
+
+        let session_id = "test-account-feed";
+        {
+            use bamboo_engine::runtime::execution::runner_state::AgentRunner;
+            let mut runner = AgentRunner::new();
+            runner.status = bamboo_engine::runtime::execution::runner_state::AgentStatus::Running;
+            state
+                .agent_runners
+                .write()
+                .await
+                .insert(session_id.to_string(), runner);
+        }
+
+        let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
+        let (session_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
+        spawn_event_forwarder(state.clone(), session_id.to_string(), mpsc_rx, session_tx, None);
+
+        // A durable change event...
+        mpsc_tx.send(task_list_updated()).await.unwrap();
+        // ...and an ephemeral one that must NOT be journaled.
+        mpsc_tx
+            .send(AgentEvent::Token {
+                content: "noise".into(),
+            })
+            .await
+            .unwrap();
+        // A terminal event (carries no session_id of its own) must still route.
+        mpsc_tx
+            .send(AgentEvent::Complete {
+                usage: Default::default(),
+            })
+            .await
+            .unwrap();
+        drop(mpsc_tx);
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        let journaled =
+            crate::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+        // Only the two durable events (TaskListUpdated, Complete) were journaled.
+        assert_eq!(journaled.len(), 2, "ephemeral Token must be excluded");
+        assert!(matches!(
+            journaled[0].event,
+            AgentEvent::TaskListUpdated { .. }
+        ));
+        assert!(matches!(journaled[1].event, AgentEvent::Complete { .. }));
+        // The terminal event routed to the right session via caller context.
+        assert_eq!(journaled[1].session_id.as_deref(), Some(session_id));
+        // Sequence numbers are monotonic and 1-based.
+        assert_eq!(journaled[0].seq, 1);
+        assert_eq!(journaled[1].seq, 2);
     }
 
     #[tokio::test]

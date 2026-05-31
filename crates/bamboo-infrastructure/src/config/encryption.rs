@@ -412,7 +412,7 @@ pub fn decrypt(encrypted: &str) -> Result<String> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     struct EnvVarGuard {
@@ -443,9 +443,10 @@ mod tests {
         }
     }
 
+    // Delegate to the single crate-wide test lock (see `config::tests::env_lock`)
+    // so encryption tests serialize with all other env-mutating tests.
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::test_support::env_cache_lock()
     }
 
     struct EnvPathGuard {

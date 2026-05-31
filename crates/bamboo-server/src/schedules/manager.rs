@@ -32,6 +32,7 @@ pub fn build_schedule_context(
         sessions_cache: base.sessions_cache,
         agent_runners: base.agent_runners,
         session_event_senders: base.session_event_senders,
+        account_feed_inbox: base.account_feed_inbox,
         app_data_dir: base.app_data_dir,
         trigger_engine: base.trigger_engine,
         persistence: base.persistence,

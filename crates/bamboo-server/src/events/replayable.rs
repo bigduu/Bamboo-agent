@@ -54,6 +54,11 @@ pub async fn publish_replayable_session_event(
         }
     }
 
+    // Mirror onto the account-wide change feed (sequenced + journaled). The
+    // sink filters ephemeral events internally; metadata events published here
+    // (title/pinned) are durable and will be sequenced.
+    state.account_sink.record(Some(session_id), &event);
+
     let sender = state.get_session_event_sender(session_id).await;
     let _ = sender.send(event);
 }

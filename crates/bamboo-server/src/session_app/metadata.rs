@@ -49,6 +49,25 @@ pub enum MetadataError {
     NotFound(String),
     #[error("storage error: {0}")]
     Storage(String),
+    /// The caller's `If-Match` precondition (expected `metadata_version`) did
+    /// not match the current persisted version — a concurrent write won.
+    #[error("version conflict: expected {expected}, current {current}")]
+    VersionConflict { expected: u64, current: u64 },
+}
+
+/// Enforce an optional `If-Match` precondition against the freshly-loaded
+/// session, inside the per-session lock (so it is race-free against concurrent
+/// authoritative writes). The single `metadata_version` is the session ETag.
+fn ensure_if_match(session: &Session, if_match: Option<u64>) -> Result<(), MetadataError> {
+    if let Some(expected) = if_match {
+        if session.metadata_version != expected {
+            return Err(MetadataError::VersionConflict {
+                expected,
+                current: session.metadata_version,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Outcome of a metadata mutation.
@@ -68,6 +87,7 @@ impl SessionMetadataService {
         state: &AppState,
         session_id: &str,
         new_title: &str,
+        if_match: Option<u64>,
     ) -> Result<MetadataChange<(String, u64)>, MetadataError> {
         let trimmed = new_title.trim();
         if trimmed.is_empty() {
@@ -78,6 +98,7 @@ impl SessionMetadataService {
         let _guard = state.persistence.acquire_lock(session_id).await;
 
         let mut session = load_latest(state, session_id).await?;
+        ensure_if_match(&session, if_match)?;
         if session.title == trimmed {
             return Ok(None);
         }
@@ -166,11 +187,13 @@ impl SessionMetadataService {
         state: &AppState,
         session_id: &str,
         pinned: bool,
+        if_match: Option<u64>,
     ) -> Result<MetadataChange<bool>, MetadataError> {
         // Lock: serialise with runtime saves and other metadata writes.
         let _guard = state.persistence.acquire_lock(session_id).await;
 
         let mut session = load_latest(state, session_id).await?;
+        ensure_if_match(&session, if_match)?;
         if session.pinned == pinned {
             return Ok(None);
         }
@@ -206,6 +229,7 @@ impl SessionMetadataService {
         state: &AppState,
         session_id: &str,
         gold_config_json: Option<String>,
+        if_match: Option<u64>,
     ) -> Result<MetadataChange<Option<String>>, MetadataError> {
         let normalized = gold_config_json.and_then(|value| {
             let trimmed = value.trim();
@@ -218,6 +242,7 @@ impl SessionMetadataService {
 
         let _guard = state.persistence.acquire_lock(session_id).await;
         let mut session = load_latest(state, session_id).await?;
+        ensure_if_match(&session, if_match)?;
         let current = session
             .metadata
             .get(GOLD_CONFIG_METADATA_KEY)
@@ -298,7 +323,7 @@ mod tests {
         let sender = state.get_session_event_sender("s1").await;
         let mut subscriber = sender.subscribe();
 
-        let result = SessionMetadataService::set_title(&state, "s1", "  Hello  ")
+        let result = SessionMetadataService::set_title(&state, "s1", "  Hello  ", None)
             .await
             .expect("set_title ok");
         let (applied_title, version) = result.expect("change applied");
@@ -339,7 +364,7 @@ mod tests {
         let sender = state.get_session_event_sender("s1").await;
         let mut subscriber = sender.subscribe();
 
-        let result = SessionMetadataService::set_title(&state, "s1", "Same")
+        let result = SessionMetadataService::set_title(&state, "s1", "Same", None)
             .await
             .expect("ok");
         assert!(result.is_none());
@@ -465,7 +490,7 @@ mod tests {
         let sender = state.get_session_event_sender("s1").await;
         let mut subscriber = sender.subscribe();
 
-        let result = SessionMetadataService::set_pinned(&state, "s1", true)
+        let result = SessionMetadataService::set_pinned(&state, "s1", true, None)
             .await
             .expect("ok");
         assert_eq!(result, Some(true));
@@ -494,16 +519,57 @@ mod tests {
         let state = make_state().await;
         seed_session(&state, "s1", "Title").await;
 
-        let result = SessionMetadataService::set_pinned(&state, "s1", false)
+        let result = SessionMetadataService::set_pinned(&state, "s1", false, None)
             .await
             .expect("ok");
         assert!(result.is_none());
     }
 
     #[tokio::test]
+    async fn set_title_honors_matching_if_match() {
+        let state = make_state().await;
+        seed_session(&state, "s1", "New Session").await; // metadata_version == 0
+
+        let result = SessionMetadataService::set_title(&state, "s1", "Renamed", Some(0))
+            .await
+            .expect("matching precondition applies");
+        assert_eq!(result.expect("applied").1, 1);
+
+        let persisted = state.storage.load_session("s1").await.unwrap().unwrap();
+        assert_eq!(persisted.metadata_version, 1);
+    }
+
+    #[tokio::test]
+    async fn set_title_rejects_stale_if_match() {
+        let state = make_state().await;
+        seed_session(&state, "s1", "New Session").await; // metadata_version == 0
+
+        // Bump the version once so the stale precondition (0) no longer matches.
+        SessionMetadataService::set_pinned(&state, "s1", true, None)
+            .await
+            .expect("ok")
+            .expect("applied");
+
+        let err = SessionMetadataService::set_title(&state, "s1", "Nope", Some(0))
+            .await
+            .expect_err("stale precondition must conflict");
+        match err {
+            MetadataError::VersionConflict { expected, current } => {
+                assert_eq!(expected, 0);
+                assert_eq!(current, 1);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        // The title must not have changed.
+        let persisted = state.storage.load_session("s1").await.unwrap().unwrap();
+        assert_eq!(persisted.title, "New Session");
+    }
+
+    #[tokio::test]
     async fn set_title_returns_not_found_for_unknown_session() {
         let state = make_state().await;
-        let err = SessionMetadataService::set_title(&state, "missing", "x")
+        let err = SessionMetadataService::set_title(&state, "missing", "x", None)
             .await
             .unwrap_err();
         assert!(matches!(err, MetadataError::NotFound(_)));
@@ -523,8 +589,8 @@ mod tests {
         let state_b = state.clone();
 
         let (a, b) = tokio::join!(
-            SessionMetadataService::set_title(&state_a, "c1", "Title A"),
-            SessionMetadataService::set_title(&state_b, "c1", "Title B"),
+            SessionMetadataService::set_title(&state_a, "c1", "Title A", None),
+            SessionMetadataService::set_title(&state_b, "c1", "Title B", None),
         );
 
         let a = a.expect("A ok").expect("A applied");
@@ -584,7 +650,7 @@ mod tests {
 
         let manual = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            SessionMetadataService::set_title(&state_manual, "m1", "Manual Override").await
+            SessionMetadataService::set_title(&state_manual, "m1", "Manual Override", None).await
         });
 
         let gen = tokio::spawn(async move {
@@ -636,7 +702,7 @@ mod tests {
         let state = make_state().await;
         seed_session(&state, "p1", "Title").await;
 
-        SessionMetadataService::set_pinned(&state, "p1", true)
+        SessionMetadataService::set_pinned(&state, "p1", true, None)
             .await
             .expect("ok")
             .expect("applied");

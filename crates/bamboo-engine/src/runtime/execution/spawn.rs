@@ -70,6 +70,10 @@ pub struct SpawnContext {
     /// server persist parent wait state and resume the parent runner without
     /// introducing an engine -> AppState dependency.
     pub completion_handler: Option<Arc<dyn ChildCompletionHandler>>,
+    /// Optional inbox to the account-wide change feed. When present, durable
+    /// change events from child-session execution are mirrored onto the feed
+    /// for resumable multi-client sync.
+    pub account_feed_inbox: Option<super::event_forwarder::AccountFeedInbox>,
 }
 
 #[derive(Clone)]
@@ -488,6 +492,7 @@ async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
         job.child_session_id.clone(),
         child_tx.clone(),
         ctx.agent_runners.clone(),
+        ctx.account_feed_inbox.clone(),
     );
 
     // Child liveness is owned by the child runner. The parent wait state can

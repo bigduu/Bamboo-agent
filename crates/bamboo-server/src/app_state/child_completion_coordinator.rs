@@ -192,6 +192,7 @@ pub struct ChildCompletionCoordinator {
     provider_registry: Arc<ProviderRegistry>,
     provider_router: Arc<ProviderModelRouter>,
     app_data_dir: std::path::PathBuf,
+    account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
     root_tools: Arc<RwLock<Option<Arc<dyn ToolExecutor>>>>,
 }
 
@@ -208,6 +209,7 @@ impl ChildCompletionCoordinator {
         provider_registry: Arc<ProviderRegistry>,
         provider_router: Arc<ProviderModelRouter>,
         app_data_dir: std::path::PathBuf,
+        account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
     ) -> Self {
         Self {
             storage,
@@ -220,6 +222,7 @@ impl ChildCompletionCoordinator {
             provider_registry,
             provider_router,
             app_data_dir,
+            account_feed_inbox,
             root_tools: Arc::new(RwLock::new(None)),
         }
     }
@@ -535,8 +538,12 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         )
         .or(config.gold_config.clone());
 
-        let (mpsc_tx, _forwarder) =
-            create_event_forwarder(session_id.clone(), event_sender, self.agent_runners.clone());
+        let (mpsc_tx, _forwarder) = create_event_forwarder(
+            session_id.clone(),
+            event_sender,
+            self.agent_runners.clone(),
+            self.account_feed_inbox.clone(),
+        );
 
         let config_handle = self.config.clone();
         let cached_config = Arc::new(StdRwLock::new(config_snapshot.clone()));

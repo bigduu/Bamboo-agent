@@ -1597,7 +1597,7 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct EnvVarGuard {
@@ -1662,9 +1662,11 @@ mod tests {
         }
     }
 
+    // Delegate to the single crate-wide test lock so env-mutating tests across
+    // `config`, `encryption`, and `paths` serialize against one another (they
+    // all mutate the same process-global env / static caches).
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::test_support::env_cache_lock()
     }
 
     /// Acquire the environment lock, recovering from poison if a previous test failed

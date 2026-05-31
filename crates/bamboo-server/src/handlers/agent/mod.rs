@@ -18,4 +18,5 @@ pub mod respond;
 pub mod schedules;
 pub mod sessions;
 pub mod stop;
+pub mod stream;
 pub mod task;

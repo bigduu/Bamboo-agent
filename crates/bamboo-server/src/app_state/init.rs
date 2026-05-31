@@ -249,6 +249,7 @@ pub fn build_spawn_scheduler(
     provider_router: Option<Arc<bamboo_infrastructure::ProviderModelRouter>>,
     completion_handler: Option<Arc<dyn bamboo_engine::execution::ChildCompletionHandler>>,
     app_data_dir: Option<std::path::PathBuf>,
+    account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
 ) -> Arc<SpawnScheduler> {
     Arc::new(SpawnScheduler::new(SpawnContext {
         agent,
@@ -260,6 +261,7 @@ pub fn build_spawn_scheduler(
         provider_router,
         app_data_dir,
         completion_handler,
+        account_feed_inbox,
     }))
 }
 
@@ -276,6 +278,7 @@ pub fn build_schedule_manager(
     config: Arc<RwLock<Config>>,
     provider_registry: Arc<bamboo_infrastructure::ProviderRegistry>,
     app_data_dir: Option<std::path::PathBuf>,
+    account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
 ) -> Arc<ScheduleManager> {
     let base_ctx = ScheduleContext {
         schedule_store,
@@ -284,6 +287,7 @@ pub fn build_schedule_manager(
         sessions_cache: sessions,
         agent_runners,
         session_event_senders,
+        account_feed_inbox,
         persistence,
         app_data_dir,
         trigger_engine: crate::schedules::default_trigger_engine(),

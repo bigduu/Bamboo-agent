@@ -1,4 +1,4 @@
-use actix_web::{web, HttpResponse, Result};
+use actix_web::{web, HttpRequest, HttpResponse, Result};
 
 use crate::app_state::AppState;
 use crate::model_config_helper::normalize_gold_config_json;
@@ -10,6 +10,28 @@ use crate::session_app::provider_model::{
 use super::super::super::types::PatchSessionRequest;
 use super::query::get_session;
 
+/// Parse an `If-Match` header value into the expected `metadata_version`.
+/// Accepts a bare integer or a (weak) quoted ETag: `7`, `"7"`, `W/"7"`.
+fn parse_if_match(req: &HttpRequest) -> Option<u64> {
+    let raw = req.headers().get(actix_web::http::header::IF_MATCH)?;
+    let s = raw.to_str().ok()?.trim();
+    let s = s.strip_prefix("W/").unwrap_or(s).trim();
+    let s = s.trim_matches('"');
+    s.parse::<u64>().ok()
+}
+
+/// 412 Precondition Failed, advertising the current version as the ETag so the
+/// client can refetch, reapply its change, and retry.
+fn precondition_failed(session_id: &str, current: u64) -> HttpResponse {
+    HttpResponse::PreconditionFailed()
+        .insert_header((actix_web::http::header::ETAG, format!("\"{current}\"")))
+        .json(serde_json::json!({
+            "error": "Version conflict: the session was modified by another client",
+            "session_id": session_id,
+            "current_version": current,
+        }))
+}
+
 /// `PATCH /api/v1/sessions/{session_id}`
 ///
 /// Title and pinned are routed through [`SessionMetadataService`] so they go
@@ -17,21 +39,40 @@ use super::query::get_session;
 /// → locked save → cache → publish_replayable_session_event). Non-metadata
 /// fields (`model_ref`, `reasoning_effort`) are written via the locked
 /// metadata-merge path to avoid clobbering concurrent UI edits.
+///
+/// An optional `If-Match: "<metadata_version>"` header enforces optimistic
+/// concurrency: the precondition is checked inside the per-session lock (so it
+/// is race-free) and a mismatch returns `412`. The precondition is applied to
+/// the first authoritative write in the patch (each write bumps the version),
+/// matching single-field PATCH usage.
 pub async fn patch_session(
     state: web::Data<AppState>,
     path: web::Path<String>,
+    http_req: HttpRequest,
     req: web::Json<PatchSessionRequest>,
 ) -> Result<HttpResponse> {
     let session_id = path.into_inner();
+    // Consumed by the first authoritative setter invoked (see `.take()` below).
+    let mut precondition = parse_if_match(&http_req);
 
     if let Some(title) = req.title.as_ref() {
-        match SessionMetadataService::set_title(state.get_ref(), &session_id, title).await {
+        match SessionMetadataService::set_title(
+            state.get_ref(),
+            &session_id,
+            title,
+            precondition.take(),
+        )
+        .await
+        {
             Ok(_) => {}
             Err(MetadataError::NotFound(id)) => {
                 return Ok(HttpResponse::NotFound().json(serde_json::json!({
                     "error": "Session not found",
                     "session_id": id
                 })));
+            }
+            Err(MetadataError::VersionConflict { current, .. }) => {
+                return Ok(precondition_failed(&session_id, current));
             }
             Err(err) => {
                 return Err(actix_web::error::ErrorInternalServerError(err.to_string()));
@@ -40,13 +81,23 @@ pub async fn patch_session(
     }
 
     if let Some(pinned) = req.pinned {
-        match SessionMetadataService::set_pinned(state.get_ref(), &session_id, pinned).await {
+        match SessionMetadataService::set_pinned(
+            state.get_ref(),
+            &session_id,
+            pinned,
+            precondition.take(),
+        )
+        .await
+        {
             Ok(_) => {}
             Err(MetadataError::NotFound(id)) => {
                 return Ok(HttpResponse::NotFound().json(serde_json::json!({
                     "error": "Session not found",
                     "session_id": id
                 })));
+            }
+            Err(MetadataError::VersionConflict { current, .. }) => {
+                return Ok(precondition_failed(&session_id, current));
             }
             Err(err) => {
                 return Err(actix_web::error::ErrorInternalServerError(err.to_string()));
@@ -73,6 +124,7 @@ pub async fn patch_session(
             state.get_ref(),
             &session_id,
             gold_config_json,
+            precondition.take(),
         )
         .await
         {
@@ -82,6 +134,9 @@ pub async fn patch_session(
                     "error": "Session not found",
                     "session_id": id
                 })));
+            }
+            Err(MetadataError::VersionConflict { current, .. }) => {
+                return Ok(precondition_failed(&session_id, current));
             }
             Err(err) => {
                 return Err(actix_web::error::ErrorInternalServerError(err.to_string()));
@@ -152,5 +207,137 @@ pub async fn patch_session(
         sessions.insert(session_id.clone(), session);
     }
 
-    get_session(state, web::Path::from(session_id)).await
+    // Advertise the new ETag (metadata_version) so clients can send it back as
+    // `If-Match` on their next write.
+    let etag = state
+        .persistence
+        .storage()
+        .load_session(&session_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.metadata_version);
+
+    let mut response = get_session(state, web::Path::from(session_id)).await?;
+    if let Some(version) = etag {
+        if let Ok(value) =
+            actix_web::http::header::HeaderValue::from_str(&format!("\"{version}\""))
+        {
+            response
+                .headers_mut()
+                .insert(actix_web::http::header::ETAG, value);
+        }
+    }
+    Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use actix_web::{http::header, http::StatusCode, test, web, App};
+    use serde_json::Value;
+    use tempfile::tempdir;
+
+    use crate::routes::configure_routes;
+    use crate::AppState;
+
+    async fn new_state() -> web::Data<AppState> {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        )
+    }
+
+    macro_rules! create_session {
+        ($app:expr) => {{
+            let resp = test::call_service(
+                &$app,
+                test::TestRequest::post()
+                    .uri("/api/v1/sessions")
+                    .set_json(serde_json::json!({ "title": "Etag test" }))
+                    .to_request(),
+            )
+            .await;
+            let body: Value = test::read_body_json(resp).await;
+            body["session"]["id"].as_str().unwrap().to_string()
+        }};
+    }
+
+    #[actix_web::test]
+    async fn patch_with_matching_if_match_succeeds_and_bumps_etag() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new().app_data(state.clone()).configure(configure_routes),
+        )
+        .await;
+        let id = create_session!(app);
+
+        // GET exposes the current ETag ("0").
+        let get = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .to_request(),
+        )
+        .await;
+        let etag = get.headers().get(header::ETAG).unwrap().to_str().unwrap().to_string();
+        assert_eq!(etag, "\"0\"");
+
+        // PATCH with If-Match: "0" succeeds and returns the bumped ETag.
+        let patch = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .insert_header((header::IF_MATCH, etag))
+                .set_json(serde_json::json!({ "title": "Renamed" }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(patch.status(), StatusCode::OK);
+        assert_eq!(
+            patch.headers().get(header::ETAG).unwrap().to_str().unwrap(),
+            "\"1\""
+        );
+    }
+
+    #[actix_web::test]
+    async fn patch_with_stale_if_match_returns_412() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new().app_data(state.clone()).configure(configure_routes),
+        )
+        .await;
+        let id = create_session!(app);
+
+        // Advance the version once (no precondition).
+        let first = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .set_json(serde_json::json!({ "pinned": true }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // A stale If-Match ("0") must now be rejected with 412 + current ETag.
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({ "title": "Should Fail" }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            stale.headers().get(header::ETAG).unwrap().to_str().unwrap(),
+            "\"1\""
+        );
+        let body: Value = test::read_body_json(stale).await;
+        assert_eq!(body["current_version"], 1);
+    }
 }

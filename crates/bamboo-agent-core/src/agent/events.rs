@@ -418,6 +418,44 @@ pub enum AgentEvent {
         updated_at: chrono::DateTime<chrono::Utc>,
     },
 
+    /// A new session was created.
+    ///
+    /// Change-feed event: durable, journaled, carried on the account `/stream`
+    /// feed so other clients can insert the session into their list without a
+    /// full `GET /sessions` poll.
+    SessionCreated {
+        session_id: String,
+        title: String,
+        kind: bamboo_domain::SessionKind,
+        created_at: chrono::DateTime<chrono::Utc>,
+    },
+
+    /// A session was deleted.
+    ///
+    /// Change-feed event: durable, journaled. Clients remove the session from
+    /// their local list on receipt.
+    SessionDeleted { session_id: String },
+
+    /// A session's message history was cleared (session kept).
+    ///
+    /// Change-feed event: durable, journaled. Clients drop cached messages for
+    /// the session and refetch lazily.
+    SessionCleared { session_id: String },
+
+    /// A message was appended to a session.
+    ///
+    /// Change-feed event: durable, journaled. The `seq` assigned to this event
+    /// on the account feed is the message's feed coordinate (used by
+    /// `GET /history/{id}?since={seq}` to compute deltas). `content` is the
+    /// plain-text body matching what `/history` returns to the UI.
+    MessageAppended {
+        session_id: String,
+        message_id: String,
+        role: bamboo_domain::Role,
+        content: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+    },
+
     /// Execution run has started and the runner is now active.
     ///
     /// Emitted as the first event after a runner reservation succeeds,
@@ -465,6 +503,89 @@ pub enum AgentEvent {
         /// Error message
         message: String,
     },
+}
+
+impl AgentEvent {
+    /// Returns the session this event pertains to, when it carries one.
+    ///
+    /// Used by the account change-feed to route each event to the right
+    /// client-side session without a per-session connection. For sub-agent
+    /// events the *parent* session id is returned (that is the session a client
+    /// observes in its list). Pure streaming/diagnostic variants (`Token`,
+    /// `Complete`, …) return `None`; those are ephemeral and never ride the
+    /// account feed anyway.
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            AgentEvent::TaskListUpdated { task_list } => Some(task_list.session_id.as_str()),
+            AgentEvent::TaskListItemProgress { session_id, .. }
+            | AgentEvent::TaskListCompleted { session_id, .. }
+            | AgentEvent::TaskEvaluationStarted { session_id, .. }
+            | AgentEvent::TaskEvaluationCompleted { session_id, .. }
+            | AgentEvent::GoldEvaluationStarted { session_id, .. }
+            | AgentEvent::GoldEvaluationCompleted { session_id, .. }
+            | AgentEvent::PlanModeEntered { session_id, .. }
+            | AgentEvent::PlanModeExited { session_id, .. }
+            | AgentEvent::PlanFileUpdated { session_id, .. }
+            | AgentEvent::RunnerProgress { session_id, .. }
+            | AgentEvent::SessionTitleUpdated { session_id, .. }
+            | AgentEvent::SessionPinnedUpdated { session_id, .. }
+            | AgentEvent::SessionCreated { session_id, .. }
+            | AgentEvent::SessionDeleted { session_id, .. }
+            | AgentEvent::SessionCleared { session_id, .. }
+            | AgentEvent::MessageAppended { session_id, .. }
+            | AgentEvent::ExecutionStarted { session_id, .. } => Some(session_id.as_str()),
+            AgentEvent::SubAgentStarted {
+                parent_session_id, ..
+            }
+            | AgentEvent::SubAgentEvent {
+                parent_session_id, ..
+            }
+            | AgentEvent::SubAgentHeartbeat {
+                parent_session_id, ..
+            }
+            | AgentEvent::SubAgentCompleted {
+                parent_session_id, ..
+            } => Some(parent_session_id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Whether this event belongs on the durable account change feed.
+    ///
+    /// Durable change events are low-volume, journaled to disk, and resumable
+    /// via the account `/stream` feed. Ephemeral events — token-by-token
+    /// streaming (`Token`/`ReasoningToken`/`ToolToken`), heartbeats, live
+    /// budget/pressure gauges, and raw forwarded sub-agent events — return
+    /// `false`: they stay exclusively on the per-session `/events/{id}` stream.
+    /// Keeping them off the journal and the multiplexed feed is the core
+    /// data-transfer win. This method lives in core so both the server and the
+    /// engine forwarder can filter before cloning onto the feed.
+    pub fn is_durable_change(&self) -> bool {
+        matches!(
+            self,
+            AgentEvent::MessageAppended { .. }
+                | AgentEvent::SessionCreated { .. }
+                | AgentEvent::SessionDeleted { .. }
+                | AgentEvent::SessionCleared { .. }
+                | AgentEvent::SessionTitleUpdated { .. }
+                | AgentEvent::SessionPinnedUpdated { .. }
+                | AgentEvent::TaskListUpdated { .. }
+                | AgentEvent::TaskListItemProgress { .. }
+                | AgentEvent::TaskListCompleted { .. }
+                | AgentEvent::TaskEvaluationCompleted { .. }
+                | AgentEvent::PlanModeEntered { .. }
+                | AgentEvent::PlanModeExited { .. }
+                | AgentEvent::PlanFileUpdated { .. }
+                | AgentEvent::SubAgentStarted { .. }
+                | AgentEvent::SubAgentCompleted { .. }
+                | AgentEvent::NeedClarification { .. }
+                | AgentEvent::ToolApprovalRequested { .. }
+                | AgentEvent::ExecutionStarted { .. }
+                | AgentEvent::Complete { .. }
+                | AgentEvent::Cancelled { .. }
+                | AgentEvent::Error { .. }
+        )
+    }
 }
 
 fn default_allow_custom() -> bool {

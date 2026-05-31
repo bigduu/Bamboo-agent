@@ -52,6 +52,18 @@ pub async fn create_session(
         sessions.insert(id.clone(), session.clone());
     }
 
+    // Publish onto the account change feed so other clients insert the new
+    // session into their list without polling `GET /sessions`.
+    state.account_sink.record(
+        Some(&id),
+        &bamboo_agent_core::AgentEvent::SessionCreated {
+            session_id: id.clone(),
+            title: session.title.clone(),
+            kind: session.kind,
+            created_at: session.created_at,
+        },
+    );
+
     match state.session_store.get_index_entry(&id).await {
         Some(entry) => Ok(HttpResponse::Ok().json(CreateSessionResponse {
             session: SessionSummary::from_entry(entry, false),

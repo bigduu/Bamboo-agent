@@ -32,6 +32,15 @@ pub async fn clear_session(
         })));
     }
 
+    // Publish onto the account change feed so other clients drop their cached
+    // messages for this session and refetch lazily.
+    state.account_sink.record(
+        Some(&session_id),
+        &bamboo_agent_core::AgentEvent::SessionCleared {
+            session_id: session_id.clone(),
+        },
+    );
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "session_id": session_id
@@ -189,6 +198,16 @@ pub async fn cleanup_sessions(
                 senders.remove(session_id);
             }
         }
+        // Publish onto the account change feed so other clients drop the
+        // cleaned-up sessions from their list.
+        for session_id in &result.deleted_session_ids {
+            state.account_sink.record(
+                Some(session_id),
+                &bamboo_agent_core::AgentEvent::SessionDeleted {
+                    session_id: session_id.clone(),
+                },
+            );
+        }
     }
 
     Ok(HttpResponse::Ok().json(result))
@@ -329,6 +348,68 @@ mod tests {
             .expect("read project dream")
             .expect("project dream should exist");
         assert!(project_dream.contains("HTTP project dream generated"));
+    }
+
+    #[actix_web::test]
+    async fn lifecycle_mutations_publish_change_feed_events() {
+        use crate::events::journal;
+
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![]));
+        let app_state = build_test_app_state(temp_dir.path().to_path_buf(), provider).await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(app_state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        // Create a session via the route.
+        let create = test::TestRequest::post()
+            .uri("/api/v1/sessions")
+            .set_json(serde_json::json!({ "title": "Feed test" }))
+            .to_request();
+        let resp = test::call_service(&app, create).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        let session_id = body["session"]["id"].as_str().expect("session id").to_string();
+
+        // Clear it.
+        let clear = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{session_id}/clear"))
+            .to_request();
+        assert_eq!(test::call_service(&app, clear).await.status(), StatusCode::OK);
+
+        // Delete it.
+        let delete = test::TestRequest::delete()
+            .uri(&format!("/api/v1/sessions/{session_id}"))
+            .to_request();
+        assert_eq!(test::call_service(&app, delete).await.status(), StatusCode::OK);
+
+        // Let the single writer task drain.
+        for _ in 0..100 {
+            if app_state.account_sink.latest_seq() >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let events = journal::read_since(app_state.account_sink.events_dir(), 0).unwrap();
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|ce| match &ce.event {
+                bamboo_agent_core::AgentEvent::SessionCreated { .. } => "created",
+                bamboo_agent_core::AgentEvent::SessionCleared { .. } => "cleared",
+                bamboo_agent_core::AgentEvent::SessionDeleted { .. } => "deleted",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["created", "cleared", "deleted"], "events: {kinds:?}");
+        // All carry the right session id and monotonic seq.
+        assert!(events.iter().all(|ce| ce.session_id.as_deref() == Some(session_id.as_str())));
+        assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 
     #[actix_web::test]

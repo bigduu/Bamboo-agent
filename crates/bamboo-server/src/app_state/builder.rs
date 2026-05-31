@@ -199,6 +199,15 @@ impl AppState {
         let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
+        // Account-scoped durable change feed. Opening the journal recovers the
+        // max seq so the sequence counter stays monotonic across restarts.
+        let account_sink = crate::events::AccountEventSink::new(data_dir.join("events"))
+            .map_err(|e| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "failed to initialize account change-feed journal: {e}"
+                ))
+            })?;
+
         // Subagent profile registry: built-ins + user/project/env overrides.
         // Loaded here (rather than further down) so we can wrap the child
         // tool executor with `PolicyAwareToolExecutor` before it is handed
@@ -254,6 +263,7 @@ impl AppState {
                 provider_registry.clone(),
                 provider_router.clone(),
                 data_dir.clone(),
+                Some(account_sink.inbox()),
             ),
         );
 
@@ -271,6 +281,7 @@ impl AppState {
             Some(provider_router.clone()),
             Some(child_completion_coordinator.clone()),
             Some(data_dir.clone()),
+            Some(account_sink.inbox()),
         );
 
         let tools_with_task = base_tools.clone();
@@ -287,6 +298,7 @@ impl AppState {
             config.clone(),
             provider_registry.clone(),
             Some(data_dir.clone()),
+            Some(account_sink.inbox()),
         );
 
         crate::services::auto_dream::spawn_auto_dream_task(
@@ -366,6 +378,7 @@ impl AppState {
             metrics_service,
             agent_runners,
             session_event_senders,
+            account_sink,
             process_registry,
             metrics_bus: None, // Will be set by server if needed
             agent,

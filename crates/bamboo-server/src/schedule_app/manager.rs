@@ -63,6 +63,8 @@ pub struct ScheduleContext {
     pub sessions_cache: Arc<RwLock<HashMap<String, Session>>>,
     pub agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
+    /// Optional inbox to the account-wide change feed (durable multi-client sync).
+    pub account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
     pub app_data_dir: Option<std::path::PathBuf>,
     pub trigger_engine: DynTriggerEngine,
     /// Adapter-provided callback that resolves model, system prompt, workspace path
@@ -321,6 +323,7 @@ async fn run_schedule_job(
         session_id.clone(),
         session_tx.clone(),
         ctx.agent_runners.clone(),
+        ctx.account_feed_inbox.clone(),
     );
 
     // Run agent loop in background.

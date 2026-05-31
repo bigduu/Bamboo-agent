@@ -14,15 +14,38 @@ use bamboo_agent_core::AgentEvent;
 
 use super::runner_state::AgentRunner;
 
+/// Inbox to the account-wide change feed: `(session_id, event)` before the
+/// writer assigns a seq. Threaded as `Option` so engine-internal callers that
+/// have no feed (tests, standalone embeddings) can pass `None`. Defined here so
+/// the engine stays free of any `bamboo-server` dependency.
+pub type AccountFeedInbox = mpsc::Sender<(Option<String>, AgentEvent)>;
+
+/// Forward a durable change event onto the account feed, if an inbox is wired.
+///
+/// Ephemeral events (tokens, heartbeats, …) are filtered out before any clone,
+/// so this is near-free on the hot path. `session_id` is supplied explicitly so
+/// terminal events (which carry no id) still route to the right session.
+fn mirror_to_account_feed(inbox: &Option<AccountFeedInbox>, session_id: &str, event: &AgentEvent) {
+    if let Some(inbox) = inbox {
+        if event.is_durable_change() {
+            let _ = inbox.try_send((Some(session_id.to_string()), event.clone()));
+        }
+    }
+}
+
 /// Create an MPSC channel for agent events and spawn a forwarding task
 /// that relays events to the broadcast sender while tracking runner
 /// diagnostic fields for live visibility.
+///
+/// `account_feed_inbox`, when present, also mirrors durable change events onto
+/// the account-wide feed for resumable multi-client sync.
 ///
 /// Returns `(mpsc_tx, forwarder_handle)`.
 pub fn create_event_forwarder(
     session_id: String,
     broadcast_tx: broadcast::Sender<AgentEvent>,
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+    account_feed_inbox: Option<AccountFeedInbox>,
 ) -> (mpsc::Sender<AgentEvent>, tokio::task::JoinHandle<()>) {
     let (mpsc_tx, mut mpsc_rx) = mpsc::channel::<AgentEvent>(100);
 
@@ -37,6 +60,7 @@ pub fn create_event_forwarder(
                     session_id: session_id.clone(),
                     started_at: Utc::now().to_rfc3339(),
                 };
+                mirror_to_account_feed(&account_feed_inbox, &session_id, &started_event);
                 let _ = broadcast_tx.send(started_event);
             }
         }
@@ -68,6 +92,7 @@ pub fn create_event_forwarder(
                     }
                 }
             }
+            mirror_to_account_feed(&account_feed_inbox, &session_id, &event);
             let _ = broadcast_tx.send(event);
         }
     });

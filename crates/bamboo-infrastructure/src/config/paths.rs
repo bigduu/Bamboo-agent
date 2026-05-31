@@ -104,6 +104,14 @@ pub fn sessions_dir() -> PathBuf {
     bamboo_dir().join("sessions")
 }
 
+/// Get the change-feed event journal directory (`{bamboo_dir}/events`).
+///
+/// Holds the durable JSONL journal for the account change feed
+/// (`GET /api/v1/stream`).
+pub fn events_dir() -> PathBuf {
+    bamboo_dir().join("events")
+}
+
 /// Load JSON config file
 pub fn load_config_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     if !path.exists() {
@@ -177,11 +185,9 @@ mod tests {
 
     #[test]
     fn test_resolve_bamboo_dir_prefers_env() {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("ENV_LOCK poisoned");
+        // Single crate-wide test lock: serialize with all other tests that
+        // mutate the process-global `BAMBOO_DATA_DIR` env / state.
+        let _guard = crate::test_support::env_cache_lock_acquire();
 
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let bamboo_home = temp_dir.path().to_string_lossy().to_string();
@@ -242,18 +248,20 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let test_dir = temp_dir.path().join("test_bamboo");
 
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("ENV_LOCK poisoned");
+        // Single crate-wide test lock: serialize with all other tests that
+        // mutate the process-global `BAMBOO_DATA_DIR` env / state.
+        let _guard = crate::test_support::env_cache_lock_acquire();
 
         // Save and set env
         let original = std::env::var_os("BAMBOO_DATA_DIR");
         std::env::set_var("BAMBOO_DATA_DIR", &test_dir);
 
-        // Reset global state
-        let _ = BAMBOO_DATA_DIR.set(test_dir.clone());
+        // NOTE: do NOT call `BAMBOO_DATA_DIR.set(...)` here. That OnceLock is
+        // process-global and cannot be reset, so seeding it with this test's
+        // tempdir (which is deleted at test end) permanently poisons
+        // `bamboo_dir()` for every later test in the binary — a cross-test
+        // flake. `ensure_bamboo_dir()` resolves via the env var we set above
+        // (the OnceLock stays unset), so this test is self-contained.
 
         let result = ensure_bamboo_dir();
         assert!(result.is_ok());

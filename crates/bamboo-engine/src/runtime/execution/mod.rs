@@ -25,7 +25,7 @@ pub use agent_spawn::{
     log_base_system_prompt_snapshot, spawn_session_execution, SessionExecutionArgs,
 };
 pub use child_completion::{ChildCompletion, ChildCompletionHandler};
-pub use event_forwarder::create_event_forwarder;
+pub use event_forwarder::{create_event_forwarder, AccountFeedInbox};
 pub use runner_lifecycle::{
     finalize_runner, status_from_execution_result, try_reserve_runner, RunnerReservation,
 };

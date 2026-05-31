@@ -116,6 +116,16 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Res
     };
 
     if deleted_from_storage || removed_from_memory || cancelled_in_flight || cancelled_runner {
+        // Publish onto the account change feed so other clients drop the
+        // deleted session(s) from their list without polling.
+        for id in ids_to_cancel.iter() {
+            state.account_sink.record(
+                Some(id),
+                &bamboo_agent_core::AgentEvent::SessionDeleted {
+                    session_id: id.clone(),
+                },
+            );
+        }
         tracing::info!(
             "[{}] Session deleted successfully (storage: {}, memory: {}, cancelled: {}, runner_cancelled: {})",
             session_id,

@@ -111,6 +111,22 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     // Re-save to persist image attachments (if any).
     state.save_and_cache_session(&mut session).await;
 
+    // Publish the user message onto the account change feed so other clients
+    // see it without reloading history. The feed seq becomes the message's
+    // delta coordinate for `GET /history?since`.
+    if let Some(msg) = session.messages.last() {
+        state.account_sink.record(
+            Some(&session_id),
+            &bamboo_agent_core::AgentEvent::MessageAppended {
+                session_id: session_id.clone(),
+                message_id: msg.id.clone(),
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+                created_at: msg.created_at,
+            },
+        );
+    }
+
     tracing::debug!(
         "[{}] Chat turn persisted: messages={}, last_role={:?} -> client should now POST /execute",
         session_id,
@@ -223,7 +239,9 @@ async fn handle_goal_command(
 
     // Serialize the new config and persist via authoritative metadata writer.
     let new_json = serde_json::to_string(&new_config).ok();
-    match SessionMetadataService::set_gold_config_json(state, session_id, new_json.clone()).await {
+    match SessionMetadataService::set_gold_config_json(state, session_id, new_json.clone(), None)
+        .await
+    {
         Ok(_) => {}
         Err(e) => {
             tracing::error!(session_id = %session_id, "Failed to persist gold_config: {e}");

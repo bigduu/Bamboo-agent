@@ -702,6 +702,7 @@ mod tests {
             provider_router: None,
             app_data_dir: None,
             completion_handler: None,
+            account_feed_inbox: None,
         }));
 
         let test_profiles = std::sync::Arc::new(

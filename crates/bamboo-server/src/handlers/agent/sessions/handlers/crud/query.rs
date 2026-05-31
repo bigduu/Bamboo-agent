@@ -55,7 +55,25 @@ pub async fn get_session(
                 .count() as u32;
             let mut summary = SessionSummary::from_entry(entry, is_running);
             summary.running_child_count = running_child_count;
-            Ok(HttpResponse::Ok().json(GetSessionResponse { session: summary }))
+
+            // Surface the session ETag (`metadata_version`) so clients can send
+            // it back as `If-Match` on metadata writes (optimistic concurrency).
+            let etag = state
+                .storage
+                .load_session(&session_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|s| s.metadata_version);
+
+            let mut response = HttpResponse::Ok();
+            if let Some(version) = etag {
+                response.insert_header((
+                    actix_web::http::header::ETAG,
+                    format!("\"{version}\""),
+                ));
+            }
+            Ok(response.json(GetSessionResponse { session: summary }))
         }
         None => Ok(HttpResponse::NotFound().json(serde_json::json!({
             "error": "Session not found",
