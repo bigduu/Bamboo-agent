@@ -146,6 +146,10 @@ impl BambooServer {
 pub struct BambooBuilder {
     config: bamboo_infrastructure::Config,
     data_dir: PathBuf,
+    /// When `Some(debug)`, [`build`](Self::build) installs Bamboo's shared logging
+    /// policy (file + stdout). `None` leaves logging untouched. Opt-in by design:
+    /// a library must not install a global subscriber unless the host asks for it.
+    logging: Option<bool>,
 }
 
 impl BambooBuilder {
@@ -154,6 +158,7 @@ impl BambooBuilder {
         Self {
             config: bamboo_infrastructure::Config::new(),
             data_dir: bamboo_infrastructure::paths::bamboo_dir(),
+            logging: None,
         }
     }
 
@@ -207,12 +212,33 @@ impl BambooBuilder {
         self
     }
 
+    /// Opt in to Bamboo's shared logging policy.
+    ///
+    /// When enabled, [`build`](Self::build) installs file + stdout logging rooted
+    /// at the builder's `data_dir` (daily-rotating files under `{data_dir}/logs`,
+    /// date-based retention, `RUST_LOG`-overridable level). Pass `debug = true`
+    /// (typically `cfg!(debug_assertions)`) to default to the `debug` level;
+    /// otherwise `info`.
+    ///
+    /// This is **opt-in**: by default a `BambooBuilder` never installs a global
+    /// subscriber, so embedding applications keep full control of their own
+    /// logging. Standalone or quick-start hosts can call this for a one-liner
+    /// setup. Installation is idempotent — if a subscriber is already set (e.g.
+    /// the host configured one), this is a no-op rather than an error.
+    pub fn with_default_logging(mut self, debug: bool) -> Self {
+        self.logging = Some(debug);
+        self
+    }
+
     /// Build the BambooServer instance
     ///
     /// # Returns
     ///
     /// A Result containing the configured BambooServer or an error
     pub fn build(self) -> Result<BambooServer> {
+        if let Some(debug) = self.logging {
+            bamboo_infrastructure::logging::init_logging_with_home(&self.data_dir, debug);
+        }
         Ok(BambooServer::new_with_data_dir(self.config, self.data_dir))
     }
 }

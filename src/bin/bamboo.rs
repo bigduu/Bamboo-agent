@@ -55,14 +55,27 @@ enum Commands {
 async fn main() {
     let cli = Cli::parse();
 
-    // Initialize logging.
-    tracing_subscriber::fmt()
-        .with_target(true)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Initialize logging (file + stdout, with rotation).
+    // Use debug level in debug builds, info in release.
+    let debug = cfg!(debug_assertions);
+    match cli.command {
+        Commands::Serve { ref data_dir, .. } => {
+            let home = data_dir
+                .clone()
+                .unwrap_or_else(bamboo_infrastructure::paths::resolve_bamboo_dir);
+            bamboo_agent::server::logging::init_logging_with_home(&home, debug);
+        }
+        Commands::Config { .. } => {
+            // No file logging for config subcommand; stdout only.
+            tracing_subscriber::fmt()
+                .with_target(true)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .init();
+        }
+    }
 
     match cli.command {
         Commands::Serve {
