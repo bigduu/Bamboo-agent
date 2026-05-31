@@ -192,34 +192,18 @@ pub fn get_memory_background_model_for_provider(
     configured.or_else(|| get_fast_model_for_provider(config, provider_name))
 }
 
-/// Get the default reasoning effort for a specific provider from config.
+/// Get the default reasoning effort for a specific provider routing key.
+///
+/// `provider_name` is the model_ref's provider, which in multi-instance mode is
+/// an instance id (for example `"copilot-work"`). Delegates to
+/// [`Config::reasoning_effort_for_key`] so instance ids, the `bodhi` provider,
+/// and legacy provider types all resolve consistently with the session-create
+/// path.
 pub fn get_reasoning_effort_for_provider(
     config: &Config,
     provider_name: &str,
 ) -> Option<ReasoningEffort> {
-    match provider_name.trim() {
-        "openai" => config
-            .providers
-            .openai
-            .as_ref()
-            .and_then(|c| c.reasoning_effort),
-        "anthropic" => config
-            .providers
-            .anthropic
-            .as_ref()
-            .and_then(|c| c.reasoning_effort),
-        "gemini" => config
-            .providers
-            .gemini
-            .as_ref()
-            .and_then(|c| c.reasoning_effort),
-        "copilot" => config
-            .providers
-            .copilot
-            .as_ref()
-            .and_then(|c| c.reasoning_effort),
-        _ => None,
-    }
+    config.reasoning_effort_for_key(provider_name)
 }
 
 /// Get the task summarization model for the current provider from config.

@@ -1366,7 +1366,31 @@ impl Config {
 
     /// Get the default reasoning effort for the currently active provider.
     pub fn get_reasoning_effort(&self) -> Option<ReasoningEffort> {
-        match self.provider.as_str() {
+        self.reasoning_effort_for_key(&self.provider)
+    }
+
+    /// Resolve the configured default reasoning effort for a provider routing key.
+    ///
+    /// The key may be a multi-instance provider id (for example `"copilot-work"`)
+    /// or a legacy provider type (for example `"openai"`). In multi-instance mode
+    /// the per-instance `reasoning_effort` lives under `provider_instances[<id>]`,
+    /// so we resolve instance ids there first; otherwise we fall back to the
+    /// legacy per-provider config. Both the execute path
+    /// ([`crate`]'s `get_reasoning_effort_for_provider`) and the session-create
+    /// path ([`Self::get_reasoning_effort`]) delegate here so the two cannot drift.
+    pub fn reasoning_effort_for_key(&self, key: &str) -> Option<ReasoningEffort> {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        // Multi-instance mode: the routing key is an instance id.
+        if let Some(instance) = self.provider_instances.get(trimmed) {
+            return instance.reasoning_effort;
+        }
+
+        // Legacy mode: the routing key is a provider type.
+        match trimmed {
             "openai" => self
                 .providers
                 .openai
@@ -1385,6 +1409,11 @@ impl Config {
             "copilot" => self
                 .providers
                 .copilot
+                .as_ref()
+                .and_then(|c| c.reasoning_effort),
+            "bodhi" => self
+                .providers
+                .bodhi
                 .as_ref()
                 .and_then(|c| c.reasoning_effort),
             _ => None,
@@ -1626,6 +1655,69 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn reasoning_effort_for_key_resolves_instance_id() {
+        // Multi-instance mode: the routing key is an instance id and the effort
+        // lives under provider_instances[<id>] — previously this fell through to
+        // None because the resolver only matched literal provider types.
+        let instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
+            "provider_type": "copilot",
+            "reasoning_effort": "high",
+        }))
+        .expect("instance config should deserialize");
+
+        let mut config = Config::create_default();
+        config
+            .provider_instances
+            .insert("copilot-work".to_string(), instance);
+
+        assert_eq!(
+            config.reasoning_effort_for_key("copilot-work"),
+            Some(ReasoningEffort::High),
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_for_key_resolves_bodhi_legacy() {
+        // Legacy mode: the `bodhi` provider previously had no match arm.
+        let mut config = Config::create_default();
+        config.providers.bodhi = Some(
+            serde_json::from_value(serde_json::json!({
+                "reasoning_effort": "xhigh",
+            }))
+            .expect("bodhi config should deserialize"),
+        );
+
+        assert_eq!(
+            config.reasoning_effort_for_key("bodhi"),
+            Some(ReasoningEffort::Xhigh),
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_for_key_resolves_legacy_provider_type() {
+        let mut config = Config::create_default();
+        config.providers.openai = Some(
+            serde_json::from_value(serde_json::json!({
+                "api_key": "sk-test",
+                "reasoning_effort": "low",
+            }))
+            .expect("openai config should deserialize"),
+        );
+
+        assert_eq!(
+            config.reasoning_effort_for_key("openai"),
+            Some(ReasoningEffort::Low),
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_for_key_returns_none_for_unknown_and_empty() {
+        let config = Config::create_default();
+        assert_eq!(config.reasoning_effort_for_key("nope"), None);
+        assert_eq!(config.reasoning_effort_for_key("   "), None);
     }
 
     struct TempHome {
