@@ -123,16 +123,36 @@ impl AppState {
         match (memory_session, storage_session) {
             (Some(memory), Some(storage)) => {
                 let prefer_storage = should_prefer_storage(&memory, &storage);
-                tracing::debug!(
-                    "[{}] load_session_merged: memory={} msgs (updated_at={}), storage={} msgs (updated_at={}), prefer_storage={} -> chose {} msgs",
-                    session_id,
-                    memory.messages.len(),
-                    memory.updated_at,
-                    storage.messages.len(),
-                    storage.updated_at,
-                    prefer_storage,
-                    if prefer_storage { storage.messages.len() } else { memory.messages.len() },
-                );
+                // The vast majority of merges are no-op agreements (same length,
+                // memory wins). Only log when the two sources actually diverge —
+                // i.e. storage is preferred, or the message counts differ — since
+                // that is the only case worth investigating. Full detail at trace.
+                let diverged =
+                    prefer_storage || memory.messages.len() != storage.messages.len();
+                let chosen_len = if prefer_storage {
+                    storage.messages.len()
+                } else {
+                    memory.messages.len()
+                };
+                macro_rules! merged_log {
+                    ($level:ident) => {
+                        tracing::$level!(
+                            "[{}] load_session_merged: memory={} msgs (updated_at={}), storage={} msgs (updated_at={}), prefer_storage={} -> chose {} msgs",
+                            session_id,
+                            memory.messages.len(),
+                            memory.updated_at,
+                            storage.messages.len(),
+                            storage.updated_at,
+                            prefer_storage,
+                            chosen_len,
+                        )
+                    };
+                }
+                if diverged {
+                    merged_log!(debug);
+                } else {
+                    merged_log!(trace);
+                }
                 let chosen = if prefer_storage { storage } else { memory };
                 let mut sessions = self.sessions.write().await;
                 sessions.insert(session_id.to_string(), chosen.clone());

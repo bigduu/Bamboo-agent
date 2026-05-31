@@ -56,7 +56,8 @@ pub(crate) fn spawn_event_forwarder(
                     let mut runners = state.agent_runners.write().await;
                     if let Some(runner) = runners.get_mut(&session_id) {
                         runner.last_budget_event = Some(event.clone());
-                        tracing::debug!(
+                        // Fires once per agent round — far too hot for debug.
+                        tracing::trace!(
                             "[{}] Stored budget event for late subscribers",
                             session_id
                         );

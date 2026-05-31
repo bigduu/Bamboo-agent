@@ -157,6 +157,12 @@ pub async fn patch_session(
             req.model.as_deref(),
         );
 
+        // Tracks whether the locked mutation actually changed model/reasoning,
+        // so the log below reports real diffs (not merely "a field was present
+        // in the request"). `Cell` is fine: the closure runs synchronously.
+        let model_changed = std::cell::Cell::new(false);
+        let reasoning_changed = std::cell::Cell::new(false);
+
         // Apply ONLY the config fields, loading the freshest session under the
         // per-session lock. This must never rewrite `messages`: a config patch
         // (e.g. model/reasoning-effort) can race a concurrent `POST /chat` that
@@ -165,6 +171,10 @@ pub async fn patch_session(
         let updated = state
             .persistence
             .update_runtime_config(&session_id, |session| {
+                let prev_model = session.model.clone();
+                let prev_model_ref = session.model_ref.clone();
+                let prev_reasoning = session.reasoning_effort;
+
                 if let Some(model_ref) = request_model_ref.as_ref() {
                     persist_model_ref(session, model_ref);
                 } else {
@@ -179,6 +189,10 @@ pub async fn patch_session(
                 } else if let Some(reasoning_effort) = req.reasoning_effort {
                     session.reasoning_effort = Some(reasoning_effort);
                 }
+
+                model_changed
+                    .set(session.model != prev_model || session.model_ref != prev_model_ref);
+                reasoning_changed.set(session.reasoning_effort != prev_reasoning);
                 session.updated_at = chrono::Utc::now();
             })
             .await
@@ -195,13 +209,17 @@ pub async fn patch_session(
             })));
         };
 
-        tracing::debug!(
-            "[{}] patch_session config update saved under lock: messages preserved={}, model_changed={}, reasoning_changed={}",
-            session_id,
-            session.messages.len(),
-            req.model_ref.is_some() || req.model.is_some() || req.provider.is_some(),
-            req.reasoning_effort.is_some() || req.clear_reasoning_effort.unwrap_or(false),
-        );
+        // Only worth a line when something actually changed; a no-op config
+        // patch (the common case for repeated/echoed UI writes) stays quiet.
+        if model_changed.get() || reasoning_changed.get() {
+            tracing::debug!(
+                "[{}] patch_session config update saved under lock: messages preserved={}, model_changed={}, reasoning_changed={}",
+                session_id,
+                session.messages.len(),
+                model_changed.get(),
+                reasoning_changed.get(),
+            );
+        }
 
         let mut sessions = state.sessions.write().await;
         sessions.insert(session_id.clone(), session);
