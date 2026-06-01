@@ -6,6 +6,7 @@
 //! - Preserve enough context for the LLM to understand where matches are.
 
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::runtime::runner::tool_execution::output_compressor::filters;
 use crate::runtime::runner::tool_execution::output_compressor::CompressionResult;
@@ -20,18 +21,16 @@ const MAX_LINES: usize = 200;
 /// Maximum matches per file before summarizing.
 const MAX_MATCHES_PER_FILE: usize = 15;
 
-lazy_static::lazy_static! {
-    /// Matches grep output with file path: `path/to/file.rs:42:matched text`
-    /// or `path/to/file.rs-42-context line`
-    static ref GREP_FILE_LINE_RE: Regex = Regex::new(
-        r"^(\S+?)[:]\d+[:-]"
-    ).expect("grep file line regex");
+/// Matches grep output with file path: `path/to/file.rs:42:matched text`
+/// or `path/to/file.rs-42-context line`
+static GREP_FILE_LINE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"^(\S+?)[:]\d+[:-]"
+).expect("grep file line regex"));
 
-    /// Extracts the line number from grep output: `path/to/file.rs:42:matched`
-    static ref GREP_LINE_NUM_RE: Regex = Regex::new(
-        r"^\S+?[:](\d+)[:-]"
-    ).expect("grep line number regex");
-}
+/// Extracts the line number from grep output: `path/to/file.rs:42:matched`
+static GREP_LINE_NUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"^\S+?[:](\d+)[:-]"
+).expect("grep line number regex"));
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
 

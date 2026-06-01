@@ -25,7 +25,6 @@ reqwest-eventsource = "0.6"
 eventsource-stream = "0.2"
 uuid = { workspace = true }
 chrono = { workspace = true }
-lazy_static = "1"
 regex = "1"
 dirs = "5"
 aes-gcm = "0.10"

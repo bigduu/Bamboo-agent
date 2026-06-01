@@ -52,8 +52,8 @@
 //! during use. This proactive refresh ensures seamless operation.
 
 use crate::ProxyAuthRequiredError;
+use std::sync::LazyLock;
 use anyhow::anyhow;
-use lazy_static::lazy_static;
 use reqwest::StatusCode;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
@@ -338,9 +338,7 @@ impl AccessTokenResponse {
 //
 // The lock is acquired in `CopilotAuthHandler::get_chat_token` before
 // attempting silent authentication or starting a new device flow.
-lazy_static! {
-    static ref CHAT_TOKEN_LOCK: Mutex<()> = Mutex::new(());
-}
+static CHAT_TOKEN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Handler for GitHub Copilot authentication.
 ///

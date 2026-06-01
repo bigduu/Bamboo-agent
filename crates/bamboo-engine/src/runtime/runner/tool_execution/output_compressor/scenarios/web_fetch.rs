@@ -7,6 +7,7 @@
 //! - Strip repetitive link-list sections.
 
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::runtime::runner::tool_execution::output_compressor::filters;
 use crate::runtime::runner::tool_execution::output_compressor::CompressionResult;
@@ -24,28 +25,17 @@ const MAX_SHORT_LINE_RUN: usize = 10;
 /// Lines shorter than this in a short-line-run are considered nav noise.
 const SHORT_LINE_THRESHOLD: usize = 40;
 
-lazy_static::lazy_static! {
-    /// Matches common web noise patterns (nav, footer, cookie, etc.)
-    static ref WEB_NOISE_RE: Regex = Regex::new(
-        r"(?i)(?:cookie(?:s?\s+(?:policy|settings|preferences|notice))|privacy\s+policy|terms\s+(?:of\s+(?:use|service))|all\s+rights?\s+reserved|©\s*\d{4}|powered\s+by|sign\s+(?:in|up)\s+(?:with|to)|(?:follow|share|tweet|like)\s+(?:us|on)|loading\.{3}|skip\s+to\s+(?:main\s+)?content)"
-    ).expect("web noise regex");
+/// Matches common web noise patterns (nav, footer, cookie, etc.)
+static WEB_NOISE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?i)(?:cookie(?:s?\s+(?:policy|settings|preferences|notice))|privacy\s+policy|terms\s+(?:of\s+(?:use|service))|all\s+rights?\s+reserved|©\s*\d{4}|powered\s+by|sign\s+(?:in|up)\s+(?:with|to)|(?:follow|share|tweet|like)\s+(?:us|on)|loading\.{3}|skip\s+to\s+(?:main\s+)?content)"
+).expect("web noise regex"));
 
-    /// Matches lines that look like pure navigation links:
-    /// just a few words, likely a menu item
-    static ref NAV_LINK_RE: Regex = Regex::new(
-        r"(?m)^\s*(?:\[.+?\]\(.+?\)\s*){1,3}$"
-    ).expect("nav link regex");
 
-    /// Matches breadcrumb-style navigation: `Home > Products > Widgets`
-    static ref BREADCRUMB_RE: Regex = Regex::new(
-        r"(?m)^(?:\w[\w\s]+\s*(?:>|›|»|/)\s*){2,}"
-    ).expect("breadcrumb regex");
+/// Matches breadcrumb-style navigation: `Home > Products > Widgets`
+static BREADCRUMB_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?m)^(?:\w[\w\s]+\s*(?:>|›|»|/)\s*){2,}"
+).expect("breadcrumb regex"));
 
-    /// Matches lines that are just URLs or markdown image references
-    static ref URL_ONLY_RE: Regex = Regex::new(
-        r"(?m)^(?:\s*(?:https?://|!\[).+\s*)$"
-    ).expect("url only regex");
-}
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
 

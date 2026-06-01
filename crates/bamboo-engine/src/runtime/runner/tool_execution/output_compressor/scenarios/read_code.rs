@@ -7,6 +7,7 @@
 //! - Only triggers when output exceeds a size threshold.
 
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::runtime::runner::tool_execution::output_compressor::filters;
 use crate::runtime::runner::tool_execution::output_compressor::CompressionResult;
@@ -21,23 +22,17 @@ const MAX_LINES: usize = 400;
 /// Maximum consecutive comment lines before collapsing.
 const MAX_COMMENT_BLOCK: usize = 15;
 
-lazy_static::lazy_static! {
-    /// Matches common comment-only lines across languages:
-    /// `//`, `#`, `--`, `/* ... */`, ` * `, `///`, `/** ... */`
-    static ref COMMENT_LINE_RE: Regex = Regex::new(
-        r"(?m)^\s*(?:\d+\s*[\|│]?\s*)?(?://[!/]?|#[!]?|\*|/\*|\*/|--\s|<!--|-->|;;\s|%\s)"
-    ).expect("comment line regex");
+/// Matches common comment-only lines across languages:
+/// `//`, `#`, `--`, `/* ... */`, ` * `, `///`, `/** ... */`
+static COMMENT_LINE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?m)^\s*(?:\d+\s*[\|│]?\s*)?(?://[!/]?|#[!]?|\*|/\*|\*/|--\s|<!--|-->|;;\s|%\s)"
+).expect("comment line regex"));
 
-    /// Matches blank lines (with optional line numbers): `  42 |`
-    static ref BLANK_WITH_NUMBER_RE: Regex = Regex::new(
-        r"(?m)^\s*\d*\s*[\|│]?\s*$"
-    ).expect("blank line regex");
 
-    /// Extracts line number from Read output format: `  42 | content` or `42│content`
-    static ref READ_LINE_NUM_RE: Regex = Regex::new(
-        r"^\s*(\d+)\s*[\|│]"
-    ).expect("read line number regex");
-}
+/// Extracts line number from Read output format: `  42 | content` or `42│content`
+static READ_LINE_NUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"^\s*(\d+)\s*[\|│]"
+).expect("read line number regex"));
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
 

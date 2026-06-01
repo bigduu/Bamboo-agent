@@ -6,6 +6,7 @@
 //! - Keep warnings and audit notices
 
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::runtime::runner::tool_execution::output_compressor::filters;
 use crate::runtime::runner::tool_execution::output_compressor::CompressionResult;
@@ -17,110 +18,108 @@ const MIN_COMPRESS_LEN: usize = 1500;
 /// Max lines for compressed package output.
 const MAX_OUTPUT_LINES: usize = 80;
 
-lazy_static::lazy_static! {
-    // ── npm ──
+// ── npm ──
 
-    /// Matches: `added 150 packages in 8s` or `added 150 packages, and audited 200 packages in 12s`
-    static ref NPM_ADDED_RE: Regex = Regex::new(
-        r"added (\d+) packages?(?:.*in\s+(\S+))?"
-    ).expect("NPM_ADDED_RE must compile");
+/// Matches: `added 150 packages in 8s` or `added 150 packages, and audited 200 packages in 12s`
+static NPM_ADDED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"added (\d+) packages?(?:.*in\s+(\S+))?"
+).expect("NPM_ADDED_RE must compile"));
 
-    /// Matches npm audit summary: `found 0 vulnerabilities`
-    static ref NPM_AUDIT_RE: Regex = Regex::new(
-        r"found (\d+) vulnerabilit"
-    ).expect("NPM_AUDIT_RE must compile");
+/// Matches npm audit summary: `found 0 vulnerabilities`
+static NPM_AUDIT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"found (\d+) vulnerabilit"
+).expect("NPM_AUDIT_RE must compile"));
 
-    /// Matches npm progress/download noise
-    static ref NPM_NOISE_RE: Regex = Regex::new(
-        r"(?:npm (?:warn|notice|http)|GET |reify:|timing |idealTree)"
-    ).expect("NPM_NOISE_RE must compile");
+/// Matches npm progress/download noise
+static NPM_NOISE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?:npm (?:warn|notice|http)|GET |reify:|timing |idealTree)"
+).expect("NPM_NOISE_RE must compile"));
 
-    // ── cargo build ──
+// ── cargo build ──
 
-    /// Matches: `Compiling foo v0.1.0`
-    static ref CARGO_COMPILE_RE: Regex = Regex::new(
-        r"^\s+(Compiling|Downloading|Downloaded|Updating)\s+\S+"
-    ).expect("CARGO_COMPILE_RE must compile");
+/// Matches: `Compiling foo v0.1.0`
+static CARGO_COMPILE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"^\s+(Compiling|Downloading|Downloaded|Updating)\s+\S+"
+).expect("CARGO_COMPILE_RE must compile"));
 
-    /// Matches: `Finished dev [unoptimized + debuginfo] target(s) in 12.34s`
-    static ref CARGO_FINISHED_RE: Regex = Regex::new(
-        r"Finished\s+.+in\s+(\S+)"
-    ).expect("CARGO_FINISHED_RE must compile");
+/// Matches: `Finished dev [unoptimized + debuginfo] target(s) in 12.34s`
+static CARGO_FINISHED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"Finished\s+.+in\s+(\S+)"
+).expect("CARGO_FINISHED_RE must compile"));
 
-    // ── pip ──
+// ── pip ──
 
-    /// Matches: `Successfully installed foo-1.0.0 bar-2.0.0`
-    static ref PIP_INSTALLED_RE: Regex = Regex::new(
-        r"Successfully installed (.+)"
-    ).expect("PIP_INSTALLED_RE must compile");
+/// Matches: `Successfully installed foo-1.0.0 bar-2.0.0`
+static PIP_INSTALLED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"Successfully installed (.+)"
+).expect("PIP_INSTALLED_RE must compile"));
 
-    /// Matches pip download progress: `Downloading foo-1.0.tar.gz (100 kB)` or `━━━━`
-    static ref PIP_NOISE_RE: Regex = Regex::new(
-        r"(?:Downloading |━+|Collecting |Using cached |Preparing metadata)"
-    ).expect("PIP_NOISE_RE must compile");
+/// Matches pip download progress: `Downloading foo-1.0.tar.gz (100 kB)` or `━━━━`
+static PIP_NOISE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?:Downloading |━+|Collecting |Using cached |Preparing metadata)"
+).expect("PIP_NOISE_RE must compile"));
 
-    // ── yarn / pnpm ──
+// ── yarn / pnpm ──
 
-    /// Matches: `Done in 3.5s.` or `✨ Done in 3.5s.`
-    static ref YARN_DONE_RE: Regex = Regex::new(
-        r"Done in\s+(\S+)"
-    ).expect("YARN_DONE_RE must compile");
+/// Matches: `Done in 3.5s.` or `✨ Done in 3.5s.`
+static YARN_DONE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"Done in\s+(\S+)"
+).expect("YARN_DONE_RE must compile"));
 
-    // ── Go ──
+// ── Go ──
 
-    /// Matches: `go: downloading github.com/foo/bar v1.2.3`
-    static ref GO_DOWNLOAD_RE: Regex = Regex::new(
-        r"(?m)^go: (?:downloading|finding|extracting)\s+\S+"
-    ).expect("GO_DOWNLOAD_RE must compile");
+/// Matches: `go: downloading github.com/foo/bar v1.2.3`
+static GO_DOWNLOAD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?m)^go: (?:downloading|finding|extracting)\s+\S+"
+).expect("GO_DOWNLOAD_RE must compile"));
 
-    /// Matches: `go: added github.com/foo/bar v1.2.3` (go get output)
-    static ref GO_ADDED_RE: Regex = Regex::new(
-        r"(?m)^go: added\s+\S+"
-    ).expect("GO_ADDED_RE must compile");
+/// Matches: `go: added github.com/foo/bar v1.2.3` (go get output)
+static GO_ADDED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?m)^go: added\s+\S+"
+).expect("GO_ADDED_RE must compile"));
 
-    // ── Composer (PHP) ──
+// ── Composer (PHP) ──
 
-    /// Matches: `- Installing foo/bar (v1.2.3)` or `- Upgrading foo/bar (v1.0 => v2.0)`
-    static ref COMPOSER_INSTALL_RE: Regex = Regex::new(
-        r"(?m)^\s+-\s+(?:Installing|Upgrading|Removing)\s+\S+"
-    ).expect("COMPOSER_INSTALL_RE must compile");
+/// Matches: `- Installing foo/bar (v1.2.3)` or `- Upgrading foo/bar (v1.0 => v2.0)`
+static COMPOSER_INSTALL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?m)^\s+-\s+(?:Installing|Upgrading|Removing)\s+\S+"
+).expect("COMPOSER_INSTALL_RE must compile"));
 
-    /// Matches: `Downloading (100%)`
-    static ref COMPOSER_NOISE_RE: Regex = Regex::new(
-        r"(?m)^(?:\s+Downloading|\s+-\s+Loading)"
-    ).expect("COMPOSER_NOISE_RE must compile");
+/// Matches: `Downloading (100%)`
+static COMPOSER_NOISE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?m)^(?:\s+Downloading|\s+-\s+Loading)"
+).expect("COMPOSER_NOISE_RE must compile"));
 
-    /// Matches: `Package manifest generated successfully.` or `Generating optimized autoload files`
-    static ref COMPOSER_DONE_RE: Regex = Regex::new(
-        r"(?m)^(?:Package manifest generated|Generating (?:optimized )?autoload)"
-    ).expect("COMPOSER_DONE_RE must compile");
+/// Matches: `Package manifest generated successfully.` or `Generating optimized autoload files`
+static COMPOSER_DONE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?m)^(?:Package manifest generated|Generating (?:optimized )?autoload)"
+).expect("COMPOSER_DONE_RE must compile"));
 
-    // ── Bundler (Ruby) ──
+// ── Bundler (Ruby) ──
 
-    /// Matches: `Fetching gem metadata from https://rubygems.org/`
-    static ref BUNDLER_FETCH_RE: Regex = Regex::new(
-        r"(?m)^(?:Fetching |Downloading |Installing )\S+"
-    ).expect("BUNDLER_FETCH_RE must compile");
+/// Matches: `Fetching gem metadata from https://rubygems.org/`
+static BUNDLER_FETCH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?m)^(?:Fetching |Downloading |Installing )\S+"
+).expect("BUNDLER_FETCH_RE must compile"));
 
-    /// Matches: `Bundle complete! 42 Gemfile dependencies, 120 gems now installed.`
-    static ref BUNDLER_DONE_RE: Regex = Regex::new(
-        r"(?m)^Bundle complete!\s+(\d+)\s+Gemfile dependencies?,\s+(\d+)\s+gems?"
-    ).expect("BUNDLER_DONE_RE must compile");
+/// Matches: `Bundle complete! 42 Gemfile dependencies, 120 gems now installed.`
+static BUNDLER_DONE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?m)^Bundle complete!\s+(\d+)\s+Gemfile dependencies?,\s+(\d+)\s+gems?"
+).expect("BUNDLER_DONE_RE must compile"));
 
-    // ── Gradle deps ──
+// ── Gradle deps ──
 
-    /// Matches Gradle dependency tree lines: `+--- org.foo:bar:1.0`
-    static ref GRADLE_DEP_RE: Regex = Regex::new(
-        r"(?m)^[|+\\]\-\-\-"
-    ).expect("GRADLE_DEP_RE must compile");
+/// Matches Gradle dependency tree lines: `+--- org.foo:bar:1.0`
+static GRADLE_DEP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?m)^[|+\\]\-\-\-"
+).expect("GRADLE_DEP_RE must compile"));
 
-    // ── dotnet restore / NuGet ──
+// ── dotnet restore / NuGet ──
 
-    /// Matches: `  Restored /path/project.csproj`
-    static ref DOTNET_PKG_RESTORE_RE: Regex = Regex::new(
-        r"(?m)^\s+Restored\s+\S+\.csproj"
-    ).expect("DOTNET_PKG_RESTORE_RE must compile");
-}
+/// Matches: `  Restored /path/project.csproj`
+static DOTNET_PKG_RESTORE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?m)^\s+Restored\s+\S+\.csproj"
+).expect("DOTNET_PKG_RESTORE_RE must compile"));
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
 

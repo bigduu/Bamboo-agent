@@ -1,15 +1,14 @@
 //! Low-level text filters shared by all scenario compressors.
 
 use regex::Regex;
+use std::sync::LazyLock;
 
 // ── ANSI Strip ──────────────────────────────────────────────────────────────
 
-lazy_static::lazy_static! {
-    /// Matches ANSI escape sequences: CSI (ESC [ … m) and OSC (ESC ] … ST).
-    static ref ANSI_RE: Regex = Regex::new(
-        r"(\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-B012])"
-    ).expect("ANSI regex must compile");
-}
+/// Matches ANSI escape sequences: CSI (ESC [ … m) and OSC (ESC ] … ST).
+static ANSI_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-B012])"
+).expect("ANSI regex must compile"));
 
 /// Strip all ANSI escape sequences from the input string.
 pub(crate) fn strip_ansi(input: &str) -> String {
