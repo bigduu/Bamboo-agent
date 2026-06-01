@@ -4,8 +4,7 @@ use super::system_sections::strip_existing_prompt_block;
 
 const TASK_LIST_START_MARKER: &str = "<!-- BAMBOO_TASK_LIST_START -->";
 const TASK_LIST_END_MARKER: &str = "<!-- BAMBOO_TASK_LIST_END -->";
-const LEGACY_TODO_LIST_START_MARKER: &str = "<!-- BAMBOO_TODO_LIST_START -->";
-const LEGACY_TODO_LIST_END_MARKER: &str = "<!-- BAMBOO_TODO_LIST_END -->";
+use bamboo_domain::{LEGACY_TODO_LIST_END_MARKER, LEGACY_TODO_LIST_START_MARKER};
 
 pub(super) fn inject_task_list_into_system_message(session: &mut Session) {
     let task_context = session.format_task_list_for_prompt();

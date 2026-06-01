@@ -9,7 +9,7 @@ const SKILL_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_SKILL_CONTEXT_START -->";
 const TOOL_GUIDE_START_MARKER: &str = "<!-- BAMBOO_TOOL_GUIDE_START -->";
 const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
 const TASK_LIST_START_MARKER: &str = "<!-- BAMBOO_TASK_LIST_START -->";
-const LEGACY_TODO_LIST_START_MARKER: &str = "<!-- BAMBOO_TODO_LIST_START -->";
+use bamboo_domain::LEGACY_TODO_LIST_START_MARKER;
 const LEGACY_WORKSPACE_CONTEXT_MARKER: &str = "\n\nWorkspace path: ";
 const LEGACY_SKILL_CONTEXT_MARKERS: [&str; 2] =
     ["\n\n## Skill System\n", "\n\n## Available Skills\n"];

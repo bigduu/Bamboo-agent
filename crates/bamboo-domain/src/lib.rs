@@ -28,8 +28,12 @@ pub mod storage;
 // Subagent profile definitions (additive — not yet wired into runtime).
 pub mod subagent;
 
+// Shared prompt markers (deduped from server/engine).
+pub mod prompt_markers;
+
 // Flat re-exports for backward-compatible access
 pub use mcp_config::*;
+pub use prompt_markers::{LEGACY_TODO_LIST_END_MARKER, LEGACY_TODO_LIST_START_MARKER};
 pub use provider_catalog::*;
 pub use provider_model_ref::ProviderModelRef;
 pub use reasoning::{ReasoningEffort, DEFAULT_REASONING_EFFORT};
