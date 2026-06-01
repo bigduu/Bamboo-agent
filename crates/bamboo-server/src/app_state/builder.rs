@@ -109,6 +109,16 @@ impl AppState {
         config: Config,
         provider: Arc<dyn LLMProvider>,
     ) -> Result<Self, AppError> {
+        // Wire the configured-default-workspace resolver into agent-core. This keeps
+        // the dependency arrow pointing down (agent-core no longer imports the
+        // infrastructure config crate); the server owns config and provides it here.
+        bamboo_agent_core::workspace_state::set_default_workspace_provider(|| {
+            bamboo_infrastructure::Config::from_data_dir(Some(
+                bamboo_infrastructure::paths::bamboo_dir(),
+            ))
+            .get_default_work_area_path()
+        });
+
         let data_dir = bamboo_home_dir.clone();
         let (session_store, storage) = init_storage(&data_dir).await?;
         let persistence = Arc::new(LockedSessionStore::new(storage.clone()));

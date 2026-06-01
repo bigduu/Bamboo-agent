@@ -34,9 +34,26 @@ pub fn get_workspace(session_id: &str) -> Option<PathBuf> {
     Some(entry.workspace.clone())
 }
 
+/// Resolver for the configured default workspace.
+///
+/// `agent-core` is a core layer and must not depend on the infrastructure
+/// config crate. Instead, the composition root (the server bootstrap) registers
+/// a provider here via [`set_default_workspace_provider`]; until then this
+/// resolves to `None` and callers fall back to the process working directory.
+type DefaultWorkspaceProvider = fn() -> Option<PathBuf>;
+static DEFAULT_WORKSPACE_PROVIDER: OnceLock<DefaultWorkspaceProvider> = OnceLock::new();
+
+/// Register the provider that resolves the configured default workspace.
+///
+/// Called once at startup by the layer that owns the infrastructure config, so
+/// that this crate keeps a dependency only on `bamboo-domain`. Subsequent calls
+/// are ignored (first registration wins).
+pub fn set_default_workspace_provider(provider: DefaultWorkspaceProvider) {
+    let _ = DEFAULT_WORKSPACE_PROVIDER.set(provider);
+}
+
 pub fn get_configured_default_workspace() -> Option<PathBuf> {
-    bamboo_infrastructure::Config::from_data_dir(Some(bamboo_infrastructure::paths::bamboo_dir()))
-        .get_default_work_area_path()
+    DEFAULT_WORKSPACE_PROVIDER.get().and_then(|provider| provider())
 }
 
 pub fn ensure_session_workspace(session_id: &str, preferred: Option<PathBuf>) -> Option<PathBuf> {

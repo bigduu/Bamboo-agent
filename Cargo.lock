@@ -510,7 +510,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bamboo-domain",
- "bamboo-infrastructure",
  "base64",
  "chrono",
  "dashmap",
