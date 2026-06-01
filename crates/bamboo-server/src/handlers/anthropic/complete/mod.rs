@@ -42,8 +42,8 @@ pub async fn complete(
 
     let mut internal_messages = convert_messages(openai_request.messages.clone())?;
     let config_snapshot = app_state.config.read().await.clone();
-    if let Err(error) = crate::message_hooks::apply_message_preflight_hooks(
-        Some(app_state.as_ref()),
+    if let Err(error) = bamboo_engine::message_hooks::apply_message_preflight_hooks(
+        Some(app_state.session_store.as_ref() as &dyn bamboo_agent_core::storage::AttachmentReader),
         &config_snapshot,
         openai_request.model.as_str(),
         &mut internal_messages,

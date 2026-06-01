@@ -19,7 +19,7 @@ pub(super) struct PreparedInternalExecution {
 
 pub(super) enum PrepareInternalError {
     App(AppError),
-    Hook(crate::message_hooks::HookError),
+    Hook(bamboo_engine::message_hooks::HookError),
 }
 
 impl From<AppError> for PrepareInternalError {
@@ -35,8 +35,8 @@ pub(super) async fn prepare_internal_execution(
     // Convert messages to internal format (preserving multimodal parts), then apply preflight hooks.
     let mut internal_messages = convert_messages(openai_request.messages.clone())?;
     let config_snapshot = app_state.config.read().await.clone();
-    crate::message_hooks::apply_message_preflight_hooks(
-        Some(app_state.as_ref()),
+    bamboo_engine::message_hooks::apply_message_preflight_hooks(
+        Some(app_state.session_store.as_ref() as &dyn bamboo_agent_core::storage::AttachmentReader),
         &config_snapshot,
         openai_request.model.as_str(),
         &mut internal_messages,

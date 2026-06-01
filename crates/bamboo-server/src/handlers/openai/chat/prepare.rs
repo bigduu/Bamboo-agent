@@ -29,16 +29,16 @@ pub(super) async fn prepare_chat_request(
 
     let mut internal_messages = convert_messages(request.messages)?;
     let config_snapshot = app_state.config.read().await.clone();
-    crate::message_hooks::apply_message_preflight_hooks(
-        Some(app_state.as_ref()),
+    bamboo_engine::message_hooks::apply_message_preflight_hooks(
+        Some(app_state.session_store.as_ref() as &dyn bamboo_agent_core::storage::AttachmentReader),
         &config_snapshot,
         resolved_model.as_str(),
         &mut internal_messages,
     )
     .await
     .map_err(|error| match error {
-        crate::message_hooks::HookError::Unsupported(message) => AppError::BadRequest(message),
-        crate::message_hooks::HookError::InvalidConfig(message) => {
+        bamboo_engine::message_hooks::HookError::Unsupported(message) => AppError::BadRequest(message),
+        bamboo_engine::message_hooks::HookError::InvalidConfig(message) => {
             AppError::InternalError(anyhow::anyhow!(message))
         }
     })?;

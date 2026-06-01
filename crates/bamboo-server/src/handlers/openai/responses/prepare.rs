@@ -44,16 +44,16 @@ pub(super) async fn prepare_request(
     // Convert to internal messages (preserving multimodal parts), then apply preflight hooks.
     let mut internal_messages = convert_messages(input_messages)?;
     let config_snapshot = app_state.config.read().await.clone();
-    crate::message_hooks::apply_message_preflight_hooks(
-        Some(app_state.as_ref()),
+    bamboo_engine::message_hooks::apply_message_preflight_hooks(
+        Some(app_state.session_store.as_ref() as &dyn bamboo_agent_core::storage::AttachmentReader),
         &config_snapshot,
         resolved_model.as_str(),
         &mut internal_messages,
     )
     .await
     .map_err(|error| match error {
-        crate::message_hooks::HookError::Unsupported(msg) => AppError::BadRequest(msg),
-        crate::message_hooks::HookError::InvalidConfig(msg) => {
+        bamboo_engine::message_hooks::HookError::Unsupported(msg) => AppError::BadRequest(msg),
+        bamboo_engine::message_hooks::HookError::InvalidConfig(msg) => {
             AppError::InternalError(anyhow::anyhow!(msg))
         }
     })?;

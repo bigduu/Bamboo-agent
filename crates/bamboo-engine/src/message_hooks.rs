@@ -4,7 +4,6 @@
 //! enter the agent loop. They operate on internal `bamboo_agent_core::Message` so the
 //! same behavior applies across OpenAI-compatible, Anthropic, Gemini, and agent routes.
 
-use crate::app_state::AppState;
 use bamboo_agent_core::Message;
 use bamboo_infrastructure::Config;
 
@@ -18,16 +17,16 @@ pub enum HookError {
 
 /// Apply all configured preflight hooks.
 pub async fn apply_message_preflight_hooks(
-    state: Option<&AppState>,
+    attachment_reader: Option<&dyn bamboo_agent_core::storage::AttachmentReader>,
     config: &Config,
     _model: &str,
     messages: &mut [Message],
 ) -> Result<(), HookError> {
-    apply_image_fallback_hook(state, config, messages).await
+    apply_image_fallback_hook(attachment_reader, config, messages).await
 }
 
 async fn apply_image_fallback_hook(
-    state: Option<&AppState>,
+    attachment_reader: Option<&dyn bamboo_agent_core::storage::AttachmentReader>,
     config: &Config,
     messages: &mut [Message],
 ) -> Result<(), HookError> {
@@ -38,9 +37,9 @@ async fn apply_image_fallback_hook(
 
     let mode = hook_cfg.mode.trim().to_ascii_lowercase();
     let fallback_mode = match mode.as_str() {
-        "placeholder" => bamboo_engine::ImageFallbackMode::Placeholder,
-        "error" => bamboo_engine::ImageFallbackMode::Error,
-        "ocr" => bamboo_engine::ImageFallbackMode::Ocr,
+        "placeholder" => crate::ImageFallbackMode::Placeholder,
+        "error" => crate::ImageFallbackMode::Error,
+        "ocr" => crate::ImageFallbackMode::Ocr,
         _ => {
             return Err(HookError::InvalidConfig(format!(
                 "hooks.image_fallback.mode must be 'placeholder', 'error', or 'ocr' (got '{mode}')"
@@ -48,15 +47,12 @@ async fn apply_image_fallback_hook(
         }
     };
 
-    let fallback = bamboo_engine::ImageFallbackConfig {
+    let fallback = crate::ImageFallbackConfig {
         mode: fallback_mode,
         vision_model: None,
     };
 
-    let attachment_reader: Option<&dyn bamboo_agent_core::storage::AttachmentReader> = state
-        .map(|s| s.session_store.as_ref() as &dyn bamboo_agent_core::storage::AttachmentReader);
-
-    bamboo_engine::runtime::runner::image_fallback::apply_image_fallback_to_llm_messages(
+    crate::runtime::runner::image_fallback::apply_image_fallback_to_llm_messages(
         messages,
         fallback,
         attachment_reader,

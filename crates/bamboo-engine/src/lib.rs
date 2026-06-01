@@ -2,6 +2,7 @@
 
 pub mod mcp;
 pub mod metrics;
+pub mod message_hooks;
 pub mod model_config_helper;
 pub mod model_areas;
 pub mod auto_dream;

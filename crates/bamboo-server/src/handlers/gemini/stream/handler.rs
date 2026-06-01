@@ -44,8 +44,8 @@ pub async fn stream_generate_content(
     }
 
     let config_snapshot = state.config.read().await.clone();
-    crate::message_hooks::apply_message_preflight_hooks(
-        Some(state.as_ref()),
+    bamboo_engine::message_hooks::apply_message_preflight_hooks(
+        Some(state.session_store.as_ref() as &dyn bamboo_agent_core::storage::AttachmentReader),
         &config_snapshot,
         model_to_use.as_str(),
         &mut internal_messages,
