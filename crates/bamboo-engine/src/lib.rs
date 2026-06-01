@@ -2,6 +2,7 @@
 
 pub mod mcp;
 pub mod metrics;
+pub mod metrics_service;
 pub mod runtime;
 pub mod skills;
 

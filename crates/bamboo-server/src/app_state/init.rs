@@ -23,7 +23,7 @@ use bamboo_infrastructure::LockedSessionStore;
 use bamboo_infrastructure::SessionStoreV2;
 
 use crate::error::AppError;
-use crate::metrics_service::MetricsService;
+use bamboo_engine::metrics_service::MetricsService;
 use crate::schedules::manager::{build_schedule_context, ScheduleContext};
 use crate::schedules::ScheduleManager;
 use crate::schedules::ScheduleStore;
