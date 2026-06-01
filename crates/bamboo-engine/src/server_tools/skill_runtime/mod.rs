@@ -5,8 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use bamboo_engine::access_control::{SkillAccessError, SkillSessionPort};
-use bamboo_engine::SkillManager;
+use crate::access_control::{SkillAccessError, SkillSessionPort};
+use crate::SkillManager;
 use bamboo_infrastructure::Config;
 
 use bamboo_agent_core::storage::Storage;

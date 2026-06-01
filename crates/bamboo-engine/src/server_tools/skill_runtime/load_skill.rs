@@ -6,9 +6,9 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
 
-use bamboo_engine::access_control;
-use bamboo_engine::resource_helpers::list_skill_resource_paths;
-use bamboo_engine::SkillManager;
+use crate::access_control;
+use crate::resource_helpers::list_skill_resource_paths;
+use crate::SkillManager;
 use bamboo_infrastructure::Config;
 
 use bamboo_agent_core::storage::Storage;

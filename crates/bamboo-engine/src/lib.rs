@@ -5,6 +5,7 @@ pub mod events;
 pub mod gold_auto_answer;
 pub mod mcp;
 pub mod metrics;
+pub mod server_tools;
 pub mod session_app;
 pub mod title_gen;
 pub mod prompt_defaults;

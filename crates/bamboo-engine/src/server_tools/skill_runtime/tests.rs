@@ -1,6 +1,6 @@
 use super::{LoadSkillTool, ReadSkillResourceTool};
-use bamboo_engine::access_control::{parse_loaded_skill_ids, serialize_loaded_skill_ids};
-use bamboo_engine::runtime_metadata::{
+use crate::access_control::{parse_loaded_skill_ids, serialize_loaded_skill_ids};
+use crate::runtime_metadata::{
     LAST_LOADED_SKILL_SUMMARY_METADATA_KEY, LAST_RESOURCE_READ_SUMMARY_METADATA_KEY,
 };
 use std::collections::{HashMap, HashSet};
@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolExecutionContext};
 use bamboo_agent_core::Session;
-use bamboo_engine::{SkillManager, SkillStoreConfig};
+use crate::{SkillManager, SkillStoreConfig};
 use bamboo_infrastructure::Config;
 
 #[test]
