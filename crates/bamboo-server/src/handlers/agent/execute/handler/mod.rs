@@ -9,8 +9,8 @@ use super::runtime::{
 };
 use super::{ExecuteRequest, ExecuteSyncInfo, ExecuteSyncReason};
 use crate::app_state::AppState;
-use crate::model_areas::resolve_global_area_models;
-use crate::model_config_helper::{
+use bamboo_engine::model_areas::resolve_global_area_models;
+use bamboo_engine::model_config_helper::{
     get_default_model_for_provider, get_reasoning_effort_for_provider, resolve_gold_config,
     resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
 };
@@ -208,7 +208,7 @@ pub async fn handler(
             let resolved_provider_name = session_effective_model_ref(&session)
                 .map(|model_ref| model_ref.provider)
                 .unwrap_or_else(|| config.provider_name.clone());
-            let resolved_provider_type = crate::model_config_helper::resolve_provider_type(
+            let resolved_provider_type = bamboo_engine::model_config_helper::resolve_provider_type(
                 &config_snapshot,
                 &resolved_provider_name,
                 &state.provider_registry,

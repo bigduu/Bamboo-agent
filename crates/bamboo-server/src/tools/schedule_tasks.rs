@@ -4,7 +4,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::handlers::agent::schedules::ScheduleView;
-use crate::model_config_helper::get_schedule_model_from_config;
+use bamboo_engine::model_config_helper::get_schedule_model_from_config;
 use crate::schedules::{
     ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore, ScheduleTrigger,
 };

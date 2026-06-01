@@ -9,7 +9,7 @@ use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::ProviderModelRef;
 
 use super::provider_model::{persist_legacy_model_provider, persist_model_ref};
-use crate::model_config_helper::GOLD_CONFIG_METADATA_KEY;
+use bamboo_engine::model_config_helper::GOLD_CONFIG_METADATA_KEY;
 
 /// Request-level input for session creation.
 pub struct CreateSessionInput {

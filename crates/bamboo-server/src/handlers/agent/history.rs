@@ -143,7 +143,7 @@ pub async fn handler(
     // local session summary after sync-recovery without an extra round-trip.
     let gold_config = session
         .metadata
-        .get(crate::model_config_helper::GOLD_CONFIG_METADATA_KEY)
+        .get(bamboo_engine::model_config_helper::GOLD_CONFIG_METADATA_KEY)
         .and_then(|raw| serde_json::from_str::<bamboo_engine::config::GoldConfig>(raw).ok());
 
     let mut response = serde_json::json!({

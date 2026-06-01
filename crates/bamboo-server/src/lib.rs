@@ -113,8 +113,6 @@ pub mod external_agents;
 pub mod handlers;
 pub mod logging;
 pub mod message_hooks;
-pub mod model_areas;
-pub mod model_config_helper;
 pub mod prompt_defaults;
 pub mod reloadable_provider;
 pub mod routes;

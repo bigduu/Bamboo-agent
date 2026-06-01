@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use bamboo_domain::reasoning::ReasoningEffort;
-use bamboo_engine::config::GoldConfig;
+use crate::config::GoldConfig;
 use bamboo_infrastructure::Config;
 use bamboo_infrastructure::{LLMError, ProviderModelRouter, ProviderRegistry, ResolvedModel};
 

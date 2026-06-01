@@ -2,7 +2,7 @@ use actix_web::{web, HttpResponse, Result};
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::model_config_helper::normalize_gold_config_json;
+use bamboo_engine::model_config_helper::normalize_gold_config_json;
 use bamboo_agent_core::Session;
 
 use super::super::super::types::{CreateSessionRequest, CreateSessionResponse, SessionSummary};

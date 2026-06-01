@@ -18,8 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::app_state::{resume_adapter::AppStateResumeRef, AppState};
 use crate::events::publish_replayable_session_event;
-use crate::model_areas::resolve_global_area_models;
-use crate::model_config_helper::{
+use bamboo_engine::model_areas::resolve_global_area_models;
+use bamboo_engine::model_config_helper::{
     resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
 };
 use crate::session_app::provider_model::session_effective_model_ref;
@@ -428,7 +428,7 @@ async fn resolve_gold_provider_and_model(
     let provider_name = session_effective_model_ref(session)
         .map(|r| r.provider.clone())
         .unwrap_or_else(|| config_snapshot.provider.clone());
-    let fast_model_name = crate::model_config_helper::resolve_fast_model(
+    let fast_model_name = bamboo_engine::model_config_helper::resolve_fast_model(
         &config_snapshot,
         &provider_name,
         &state.provider_registry,

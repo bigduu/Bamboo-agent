@@ -1,7 +1,7 @@
 use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
-use crate::model_config_helper::{
+use bamboo_engine::model_config_helper::{
     resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
 };
 use crate::session_app::provider_model::session_effective_model_ref;
@@ -115,7 +115,7 @@ pub async fn submit_response(
         &state.provider_registry,
     );
     // Auxiliary models are global (config-derived), never session-bound.
-    let areas = crate::model_areas::resolve_global_area_models(
+    let areas = bamboo_engine::model_areas::resolve_global_area_models(
         &config_snapshot,
         &resolved_provider_name,
         &state.provider_registry,

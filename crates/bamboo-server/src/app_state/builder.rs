@@ -333,7 +333,7 @@ impl AppState {
                     let registry = registry.clone();
                     Box::pin(async move {
                         let config_snap = config_for_resolver.read().await.clone();
-                        crate::model_config_helper::resolve_subagent_model_ref(
+                        bamboo_engine::model_config_helper::resolve_subagent_model_ref(
                             &config_snap,
                             &config_snap.provider,
                             &registry,

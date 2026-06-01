@@ -25,8 +25,8 @@ use bamboo_infrastructure::{Config, ProviderModelRouter, ProviderRegistry};
 use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
 
-use crate::model_areas::resolve_global_area_models;
-use crate::model_config_helper::{
+use bamboo_engine::model_areas::resolve_global_area_models;
+use bamboo_engine::model_config_helper::{
     resolve_fast_model, resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
 };
 use crate::session_app::provider_model::session_effective_model_ref;

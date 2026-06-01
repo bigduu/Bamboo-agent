@@ -6,7 +6,7 @@
 //!
 //! - **Session-bound** — ONLY the main *chat* model + *reasoning effort*. A
 //!   session may override these; they cascade `session → request → provider
-//!   default` (see [`crate::session_app::execute`]).
+//!   default` (see `session_app::execute`).
 //! - **Global** — every *auxiliary* area (fast, task-summary, memory-background,
 //!   vision, sub-agent). These are read from server config (`defaults.<area>`
 //!   with a provider/global fallback) and **must never be read from a session**.

@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 
 use crate::app_state::AppState;
 use crate::handlers::agent::schedules::types::{CreateScheduleRequest, PatchScheduleRequest};
-use crate::model_config_helper::get_schedule_model_from_config;
+use bamboo_engine::model_config_helper::get_schedule_model_from_config;
 use crate::schedules::{MisFirePolicy, OverlapPolicy, ScheduleRunConfig, ScheduleTrigger};
 
 pub(super) fn validate_schedule_name(name: &str) -> Result<String, HttpResponse> {

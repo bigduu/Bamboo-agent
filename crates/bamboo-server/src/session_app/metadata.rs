@@ -39,7 +39,7 @@ use chrono::Utc;
 
 use crate::app_state::AppState;
 use crate::events::publish_replayable_session_event;
-use crate::model_config_helper::GOLD_CONFIG_METADATA_KEY;
+use bamboo_engine::model_config_helper::GOLD_CONFIG_METADATA_KEY;
 use crate::title_gen::is_untitled;
 
 /// Errors returned by [`SessionMetadataService`].

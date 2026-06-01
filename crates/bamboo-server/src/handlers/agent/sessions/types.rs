@@ -5,7 +5,7 @@ use bamboo_domain::ProviderModelRef;
 use bamboo_engine::config::GoldConfig;
 use bamboo_infrastructure::SessionIndexEntry;
 
-use crate::model_config_helper::parse_session_gold_config;
+use bamboo_engine::model_config_helper::parse_session_gold_config;
 
 #[derive(Debug, Serialize)]
 pub struct SessionSummary {

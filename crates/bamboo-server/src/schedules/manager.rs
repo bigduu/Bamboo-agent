@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
-use crate::model_areas::resolve_global_area_models;
-use crate::model_config_helper::{
+use bamboo_engine::model_areas::resolve_global_area_models;
+use bamboo_engine::model_config_helper::{
     get_schedule_model_from_config, resolve_gold_config, resolve_provider_type,
 };
 pub use crate::schedule_app::{

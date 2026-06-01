@@ -234,7 +234,7 @@ async fn try_llm_title(
         config_snapshot.provider.clone()
     };
 
-    let resolved = crate::model_config_helper::resolve_fast_model(
+    let resolved = bamboo_engine::model_config_helper::resolve_fast_model(
         &config_snapshot,
         &provider_name,
         &state.provider_registry,
