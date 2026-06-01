@@ -1,8 +1,6 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
 
@@ -10,17 +8,20 @@ use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use bamboo_agent_core::Session;
 use bamboo_memory::memory_store::{
-    DurableMemoryStatus, DurableMemoryType, MemoryQueryOptions, MemoryScope, MemoryStore,
-    MAX_MAX_CHARS, MAX_QUERY_LIMIT,
+    DurableMemoryStatus, MemoryQueryOptions, MemoryScope, MemoryStore, MAX_MAX_CHARS,
+    MAX_QUERY_LIMIT,
 };
 use bamboo_tools::tools::session_memory::{
     execute_session_memory_action, SessionMemoryAction, MEMORY_SESSION_ACTION_NAMES,
 };
 
-type FilterTypeSet = (
-    Option<HashSet<DurableMemoryType>>,
-    Option<HashSet<DurableMemoryStatus>>,
-);
+mod args;
+mod parsing;
+
+#[cfg(test)]
+mod tests;
+
+use args::MemoryArgs;
 
 #[derive(Clone)]
 pub struct MemoryTool {
@@ -77,203 +78,6 @@ impl MemoryTool {
             .map(std::path::PathBuf::from)
             .map(|path| bamboo_memory::memory_store::project_key_from_path(&path))
     }
-
-    fn parse_scope(scope: Option<&str>) -> Result<MemoryScope, ToolError> {
-        match scope
-            .unwrap_or("session")
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "session" => Ok(MemoryScope::Session),
-            "project" => Ok(MemoryScope::Project),
-            "global" => Ok(MemoryScope::Global),
-            other => Err(ToolError::InvalidArguments(format!(
-                "invalid scope '{other}'; expected one of: session, project, global"
-            ))),
-        }
-    }
-
-    fn parse_type(value: &str) -> Result<DurableMemoryType, ToolError> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "user" => Ok(DurableMemoryType::User),
-            "feedback" => Ok(DurableMemoryType::Feedback),
-            "project" => Ok(DurableMemoryType::Project),
-            "reference" => Ok(DurableMemoryType::Reference),
-            other => Err(ToolError::InvalidArguments(format!(
-                "invalid type '{other}'; expected one of: user, feedback, project, reference"
-            ))),
-        }
-    }
-
-    fn parse_status(value: &str) -> Result<DurableMemoryStatus, ToolError> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "active" => Ok(DurableMemoryStatus::Active),
-            "stale" => Ok(DurableMemoryStatus::Stale),
-            "superseded" => Ok(DurableMemoryStatus::Superseded),
-            "contradicted" => Ok(DurableMemoryStatus::Contradicted),
-            "archived" => Ok(DurableMemoryStatus::Archived),
-            other => Err(ToolError::InvalidArguments(format!(
-                "invalid status '{other}'; expected one of: active, stale, superseded, contradicted, archived"
-            ))),
-        }
-    }
-
-    fn parse_query_filters(filters: Option<&QueryFilters>) -> Result<FilterTypeSet, ToolError> {
-        let filter_types = filters
-            .map(|value| {
-                value
-                    .r#type
-                    .iter()
-                    .map(|item| Self::parse_type(item))
-                    .collect::<Result<HashSet<_>, _>>()
-            })
-            .transpose()?;
-        let filter_statuses = filters
-            .map(|value| {
-                value
-                    .status
-                    .iter()
-                    .map(|item| Self::parse_status(item))
-                    .collect::<Result<HashSet<_>, _>>()
-            })
-            .transpose()?;
-        Ok((filter_types, filter_statuses))
-    }
-
-    fn parse_merge_mode(value: Option<&str>) -> Result<Option<String>, ToolError> {
-        let Some(mode) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-            return Ok(None);
-        };
-        let normalized = mode.to_ascii_lowercase();
-        match normalized.as_str() {
-            "semantic_merge" | "merge" | "contradict" => Ok(Some(normalized)),
-            other => Err(ToolError::InvalidArguments(format!(
-                "invalid merge mode '{other}'; expected one of: merge, semantic_merge, contradict"
-            ))),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
-enum MemoryArgs {
-    SessionRead {
-        #[serde(default)]
-        topic: Option<String>,
-        #[serde(default)]
-        options: Option<MemoryActionOptions>,
-    },
-    SessionAppend {
-        #[serde(default)]
-        topic: Option<String>,
-        content: String,
-    },
-    SessionReplace {
-        #[serde(default)]
-        topic: Option<String>,
-        content: String,
-    },
-    SessionClear {
-        #[serde(default)]
-        topic: Option<String>,
-    },
-    SessionListTopics,
-    Query {
-        scope: String,
-        #[serde(default)]
-        query: Option<String>,
-        #[serde(default)]
-        filters: Option<QueryFilters>,
-        #[serde(default)]
-        project_key: Option<String>,
-        #[serde(default)]
-        options: Option<MemoryActionOptions>,
-    },
-    Get {
-        id: String,
-        #[serde(default)]
-        project_key: Option<String>,
-        #[serde(default)]
-        options: Option<MemoryActionOptions>,
-    },
-    Write {
-        scope: String,
-        #[serde(rename = "type")]
-        r#type: String,
-        title: String,
-        content: String,
-        #[serde(default)]
-        tags: Vec<String>,
-        #[serde(default)]
-        project_key: Option<String>,
-        #[serde(default)]
-        options: Option<WriteOptions>,
-    },
-    Merge {
-        id: String,
-        content: String,
-        #[serde(default)]
-        tags: Vec<String>,
-        #[serde(default)]
-        project_key: Option<String>,
-        #[serde(default)]
-        source_memory_ids: Vec<String>,
-        #[serde(default)]
-        mode: Option<String>,
-        #[serde(default)]
-        reason: Option<String>,
-    },
-    Purge {
-        #[serde(default)]
-        id: Option<String>,
-        #[serde(default)]
-        scope: Option<String>,
-        #[serde(default)]
-        reason: Option<String>,
-        #[serde(default)]
-        project_key: Option<String>,
-        #[serde(default)]
-        filters: Option<QueryFilters>,
-        #[serde(default)]
-        mode: Option<String>,
-    },
-    Inspect {
-        scope: String,
-        #[serde(default)]
-        project_key: Option<String>,
-    },
-    Rebuild {
-        scope: String,
-        #[serde(default)]
-        project_key: Option<String>,
-    },
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct MemoryActionOptions {
-    #[serde(default)]
-    limit: Option<usize>,
-    #[serde(default)]
-    max_chars: Option<usize>,
-    #[serde(default)]
-    cursor: Option<String>,
-    #[serde(default)]
-    include_related: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct QueryFilters {
-    #[serde(default)]
-    r#type: Vec<String>,
-    #[serde(default)]
-    status: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct WriteOptions {
-    #[serde(default)]
-    allow_merge_if_similar: Option<bool>,
 }
 
 #[async_trait]
@@ -805,138 +609,5 @@ impl Tool for MemoryTool {
                 })
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use std::collections::HashMap;
-
-    use tokio::sync::RwLock;
-
-    #[derive(Default)]
-    struct TestStorage {
-        sessions: RwLock<HashMap<String, Session>>,
-    }
-
-    #[async_trait]
-    impl Storage for TestStorage {
-        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
-            self.sessions
-                .write()
-                .await
-                .insert(session.id.clone(), session.clone());
-            Ok(())
-        }
-
-        async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
-            Ok(self.sessions.read().await.get(session_id).cloned())
-        }
-
-        async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
-            Ok(self.sessions.write().await.remove(session_id).is_some())
-        }
-    }
-
-    fn test_context<'a>(session_id: &'a str) -> ToolExecutionContext<'a> {
-        ToolExecutionContext {
-            session_id: Some(session_id),
-            tool_call_id: "tool-call-1",
-            event_tx: None,
-            available_tool_schemas: None,
-        }
-    }
-
-    fn build_memory_tool(data_dir: &std::path::Path) -> MemoryTool {
-        let sessions = Arc::new(RwLock::new(HashMap::new()));
-        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
-        MemoryTool::new(sessions, storage, data_dir)
-    }
-
-    #[tokio::test]
-    async fn memory_session_actions_share_read_shape_and_limits() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let tool = build_memory_tool(dir.path());
-
-        tool.execute_with_context(
-            json!({"action":"session_replace","topic":"default","content":"x".repeat(32)}),
-            test_context("session-1"),
-        )
-        .await
-        .expect("session replace should succeed");
-
-        let read = tool
-            .execute_with_context(
-                json!({"action":"session_read","topic":"default","options":{"max_chars":8}}),
-                test_context("session-1"),
-            )
-            .await
-            .expect("session read should succeed");
-        let value: serde_json::Value = serde_json::from_str(&read.result).expect("valid json");
-        assert_eq!(value["action"], "session_read");
-        assert_eq!(value["length_chars"], 32);
-        assert_eq!(value["body_truncated"], true);
-        assert_eq!(value["content"].as_str().unwrap().chars().count(), 8);
-    }
-
-    #[tokio::test]
-    async fn memory_session_append_enforces_shared_limit() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let tool = build_memory_tool(dir.path());
-
-        tool.execute_with_context(
-            json!({
-                "action":"session_replace",
-                "topic":"limit",
-                "content":"x".repeat(bamboo_tools::tools::session_memory::MAX_SESSION_NOTE_CHARS - 1)
-            }),
-            test_context("session-2"),
-        )
-        .await
-        .expect("session replace near limit should succeed");
-
-        let err = tool
-            .execute_with_context(
-                json!({"action":"session_append","topic":"limit","content":"y"}),
-                test_context("session-2"),
-            )
-            .await
-            .expect_err("session append should fail");
-        let message = err.to_string();
-        assert!(message.contains("session note would exceed the limit"));
-        assert!(message.contains("action=session_read"));
-        assert!(message.contains("action=session_replace"));
-    }
-
-    #[tokio::test]
-    async fn memory_session_list_topics_includes_count() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let tool = build_memory_tool(dir.path());
-
-        tool.execute_with_context(
-            json!({"action":"session_append","topic":"alpha","content":"A"}),
-            test_context("session-3"),
-        )
-        .await
-        .expect("session append should succeed");
-        tool.execute_with_context(
-            json!({"action":"session_append","topic":"beta","content":"B"}),
-            test_context("session-3"),
-        )
-        .await
-        .expect("session append should succeed");
-
-        let list = tool
-            .execute_with_context(
-                json!({"action":"session_list_topics"}),
-                test_context("session-3"),
-            )
-            .await
-            .expect("session list topics should succeed");
-        let value: serde_json::Value = serde_json::from_str(&list.result).expect("valid json");
-        assert_eq!(value["action"], "session_list_topics");
-        assert_eq!(value["count"], 2);
     }
 }
