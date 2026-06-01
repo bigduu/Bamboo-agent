@@ -38,7 +38,7 @@ fn read_non_empty_prompt_file(path: &Path) -> Option<String> {
 }
 
 fn builtin_default_prompt() -> String {
-    crate::app_state::DEFAULT_BASE_PROMPT.to_string()
+    crate::context::DEFAULT_BASE_PROMPT.to_string()
 }
 
 fn resolve_with_paths(bamboo_path: &Path) -> GlobalSystemPromptTemplate {
@@ -61,7 +61,7 @@ fn resolve_with_paths(bamboo_path: &Path) -> GlobalSystemPromptTemplate {
 ///
 /// Fallback order:
 /// 1. `${BAMBOO_DATA_DIR}/system-prompt.md` (typically `~/.bamboo/system-prompt.md`) if present and non-empty
-/// 2. Builtin [`crate::app_state::DEFAULT_BASE_PROMPT`]
+/// 2. Builtin [`crate::context::DEFAULT_BASE_PROMPT`]
 pub fn read_global_default_system_prompt_template() -> String {
     resolve_global_default_system_prompt_template().content
 }

@@ -37,7 +37,7 @@ pub async fn get_system_prompt_snapshot(
         },
     };
 
-    let default_prompt = crate::prompt_defaults::read_global_default_system_prompt_template();
+    let default_prompt = bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
     let snapshot =
         crate::session_app::system_prompt::build_system_prompt_snapshot(&session, &default_prompt);
 
@@ -178,7 +178,7 @@ mod tests {
             "Base prompt\n\nExtra guidance\n\n{workspace_context}\n\n{instruction_context}\n\n{env_context}\n\n<!-- BAMBOO_SKILL_CONTEXT_START -->\n## Skill System\n\nSkill details\n<!-- BAMBOO_SKILL_CONTEXT_END -->\n\n<!-- BAMBOO_TOOL_GUIDE_START -->\n## Tool Usage Guidelines\n\nGuide details\n<!-- BAMBOO_TOOL_GUIDE_END -->\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\nMemory details\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->\n\n<!-- BAMBOO_TASK_LIST_START -->\n## Current Task List:\n- [ ] item\n<!-- BAMBOO_TASK_LIST_END -->"
         )));
 
-        let default_prompt = crate::prompt_defaults::read_global_default_system_prompt_template();
+        let default_prompt = bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
         let snapshot = crate::session_app::system_prompt::build_system_prompt_snapshot(
             &session,
             &default_prompt,
@@ -232,7 +232,7 @@ mod tests {
             "Base prompt\n\nExtra guidance\n\nWorkspace path: /tmp/legacy-workspace\n{guidance}\n\n<!-- BAMBOO_SKILL_CONTEXT_START -->\n## Skill System\n\nSkill details\n<!-- BAMBOO_SKILL_CONTEXT_END -->"
         )));
 
-        let default_prompt = crate::prompt_defaults::read_global_default_system_prompt_template();
+        let default_prompt = bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
         let snapshot = crate::session_app::system_prompt::build_system_prompt_snapshot(
             &session,
             &default_prompt,

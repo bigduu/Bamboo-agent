@@ -14,7 +14,7 @@ pub async fn create_session(
 ) -> Result<HttpResponse> {
     let id = Uuid::new_v4().to_string();
     let global_default_prompt =
-        crate::prompt_defaults::read_global_default_system_prompt_template();
+        bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
     let config_snapshot = state.config.read().await.clone();
     let gold_config_json = match req
         .gold_config

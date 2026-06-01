@@ -79,7 +79,7 @@ fn resolve_run_config_from_config(
     let reasoning_effort = requested_reasoning_effort.or(config_snapshot.get_reasoning_effort());
 
     let global_default_prompt =
-        crate::prompt_defaults::read_global_default_system_prompt_template();
+        bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
     let base_system_prompt = job
         .run_config
         .system_prompt

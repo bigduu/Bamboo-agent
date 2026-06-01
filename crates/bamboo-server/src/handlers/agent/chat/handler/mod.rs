@@ -46,7 +46,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     };
 
     let global_default_prompt =
-        crate::prompt_defaults::read_global_default_system_prompt_template();
+        bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
     let builtin_fallback_prompt = crate::app_state::DEFAULT_BASE_PROMPT;
 
     let workspace_path = request::optional_non_empty(req.workspace_path.as_deref());

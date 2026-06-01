@@ -2,6 +2,7 @@
 
 pub mod mcp;
 pub mod metrics;
+pub mod prompt_defaults;
 pub mod message_hooks;
 pub mod model_config_helper;
 pub mod model_areas;

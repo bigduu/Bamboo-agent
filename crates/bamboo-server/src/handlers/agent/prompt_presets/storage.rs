@@ -40,7 +40,7 @@ pub(super) async fn save_store(path: &Path, store: &PromptPresetStore) -> Result
 }
 
 pub(super) fn read_default_prompt_content() -> String {
-    crate::prompt_defaults::read_global_default_system_prompt_template()
+    bamboo_engine::prompt_defaults::read_global_default_system_prompt_template()
 }
 
 pub(super) fn normalize_name(value: &str) -> Option<String> {
