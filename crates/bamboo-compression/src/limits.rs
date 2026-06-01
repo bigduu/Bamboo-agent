@@ -1,78 +1,53 @@
 //! Model context window limits registry.
 //!
-//! Provides known context window sizes for common models, with fallback to
-//! configurable user limits via file or session overrides.
+//! There is intentionally **no** built-in per-model table. Real per-model
+//! values come from two sources, in priority order:
+//!   1. provider runtime metadata (e.g. Copilot reports real context/output),
+//!   2. user overrides persisted in `model_limits.json`.
+//! Anything without a match falls back to a single global default
+//! (`DEFAULT_MAX_CONTEXT_TOKENS` / `DEFAULT_MAX_OUTPUT_TOKENS`). This keeps the
+//! registry from going stale as models churn — see `token_budget.rs`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Known model defaults: `(pattern, max_context_tokens, max_output_tokens)`.
-///
-/// These are the built-in defaults used when there is no user override in
-/// `config.json:model_limits` and no legacy `model_limits.json`.
-pub const KNOWN_MODEL_LIMITS: &[(&str, u32, u32)] = &[
-    // GitHub Copilot model profiles (2026-03)
-    // Anthropic
-    ("claude-haiku-4.5", 160_000, 32_000),
-    ("claude-opus-4.5", 160_000, 32_000),
-    ("claude-opus-4.6", 192_000, 64_000),
-    ("claude-sonnet-4.6", 200_000, 32_000),
-    ("claude-sonnet-4-6", 200_000, 32_000), // Alternate wire format
-    ("claude-sonnet-4.5", 200_000, 32_000),
-    ("claude-sonnet-4-5", 200_000, 32_000), // Alternate wire format
-    // Google
-    ("gemini-2.5-pro", 128_000, 16_000),
-    ("gemini-3-flash-preview", 1_000_000, 8_192),
-    ("gemini-3.1-pro-preview", 128_000, 64_000),
-    // OpenAI
-    ("gpt-5.4", 1_050_000, 32_768),
-    ("gpt-5.3-codex", 400_000, 128_000),
-    ("gpt-5.2-codex", 400_000, 128_000),
-    ("gpt-5.2", 400_000, 128_000),
-    ("gpt-5.1", 400_000, 128_000),
-    ("gpt-5", 400_000, 128_000),
-    ("gpt-5.4-mini", 128_000, 16_384),
-    ("gpt-4.1", 128_000, 16_384),
-    ("gpt-4-o-preview", 128_000, 16_384),
-    ("gpt-4o-preview", 128_000, 16_384), // Alternate spelling
-    // xAI
-    ("grok-code-fast-1", 128_000, 10_240),
-    // GitHub specialized
-    ("oswe-vscode-prime", 264_000, 64_000),
-    // Backward-compatible aliases and non-Copilot profiles
-    ("gpt-5.4-thinking", 1_000_000, 128_000),
-    ("gpt-5.2-pro", 256_000, 64_000),
-    ("gpt-5-mini", 400_000, 128_000),
-    ("gpt-4o", 128_000, 16_000),
-    // Moonshot
-    ("kimi-k2.5", 256_000, 64_000),
-    ("kimi-for-coding", 256_000, 64_000),
-    // Zhipu
-    ("glm-5", 200_000, 128_000),
-    // Compatibility fallbacks
-    ("gpt-4o-mini", 128_000, 16_000),
-    ("gpt-4-turbo", 128_000, 16_000),
-    ("gpt-4", 8_192, 4_096),
-    ("gpt-3.5-turbo", 16_385, 4_096),
-    ("claude-3-5-sonnet", 200_000, 8_192),
-    ("claude-3-5-sonnet-20241022", 200_000, 8_192),
-    ("claude-3-5-sonnet-20240620", 200_000, 8_192),
-    ("claude-3-opus", 200_000, 8_192),
-    ("claude-3-opus-20240229", 200_000, 8_192),
-    ("claude-3-sonnet", 200_000, 8_192),
-    ("claude-3-haiku", 200_000, 8_192),
-    ("copilot-chat", 128_000, 16_000),
-    // Default fallback
-    ("default", 128_000, 4_096),
-];
+/// Sentinel pattern used for the single global fallback limit.
+pub const DEFAULT_MODEL_PATTERN: &str = "default";
 
-/// Default maximum output tokens (reserve ~25% for response).
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
+/// Global default context window applied to any model without a provider
+/// metadata value or a user override. 200K is a mainstream range across
+/// current frontier models.
+pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 200_000;
 
-/// Default safety margin for token counting errors.
+/// Global default maximum output tokens.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 64_000;
+
+/// Default safety margin for token counting errors (floor; scales with context
+/// window via [`ModelLimit::get_safety_margin`]).
 pub const DEFAULT_SAFETY_MARGIN: u32 = 1000;
+
+/// Build the single global default limit (`200K` context / `64K` output).
+pub fn default_model_limit() -> ModelLimit {
+    builtin_limit(
+        DEFAULT_MODEL_PATTERN,
+        DEFAULT_MAX_CONTEXT_TOKENS,
+        DEFAULT_MAX_OUTPUT_TOKENS,
+    )
+}
+
+/// Whether a user override is a no-op — identical to the global default, so it
+/// carries no information and need not be persisted (diff-only storage).
+///
+/// The `model_pattern` is irrelevant: any model pinned to exactly the default
+/// context/output with no explicit safety margin resolves to the same budget
+/// as having no override at all.
+pub fn is_default_limit(limit: &ModelLimit) -> bool {
+    limit.max_context_tokens == DEFAULT_MAX_CONTEXT_TOKENS
+        && limit.max_output_tokens == Some(DEFAULT_MAX_OUTPUT_TOKENS)
+        && limit.safety_margin.is_none()
+}
 
 /// Model limit configuration (user-overridable).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,66 +165,24 @@ impl ModelLimitsRegistry {
     ///
     /// For partial matches, the longest (most specific) pattern wins.
     pub fn get(&self, model: &str) -> Option<ModelLimit> {
-        // First check user limits for exact match
+        // Exact user override match (highest priority).
         if let Some(limit) = self.user_limits.get(model) {
             return Some(limit.clone());
         }
 
-        // Check built-in limits for exact match
-        for (pattern, max_context_tokens, max_output_tokens) in KNOWN_MODEL_LIMITS {
-            if *pattern == model {
-                return Some(builtin_limit(
-                    model,
-                    *max_context_tokens,
-                    *max_output_tokens,
-                ));
-            }
-        }
-
-        // Find the best partial match from user limits
-        // Sort by pattern length (longer = more specific) for deterministic selection
-        let best_user_match = self
-            .user_limits
+        // Best partial match among user overrides. Longer (more specific)
+        // patterns win for deterministic selection. There is no built-in table;
+        // a miss returns None and the caller falls back to the global default.
+        self.user_limits
             .iter()
-            .filter(|(pattern, _)| model.contains(*pattern) || pattern.contains(model))
+            .filter(|(pattern, _)| model.contains(pattern.as_str()) || pattern.contains(model))
             .max_by_key(|(pattern, _)| pattern.len())
-            .map(|(_, limit)| limit.clone());
-
-        if let Some(limit) = best_user_match {
-            return Some(limit);
-        }
-
-        // Find the best partial match from built-in limits
-        let best_builtin_match = KNOWN_MODEL_LIMITS
-            .iter()
-            .filter(|(pattern, _, _)| model.contains(*pattern) || pattern.contains(model))
-            .max_by_key(|(pattern, _, _)| pattern.len());
-
-        if let Some((pattern, max_context_tokens, max_output_tokens)) = best_builtin_match {
-            return Some(builtin_limit(
-                pattern,
-                *max_context_tokens,
-                *max_output_tokens,
-            ));
-        }
-
-        None
+            .map(|(_, limit)| limit.clone())
     }
 
     /// Get limit for a model with fallback to default.
     pub fn get_or_default(&self, model: &str) -> ModelLimit {
-        self.get(model).unwrap_or_else(|| {
-            let default = KNOWN_MODEL_LIMITS
-                .iter()
-                .find(|(k, _, _)| *k == "default")
-                .map(|(_, max_context_tokens, max_output_tokens)| {
-                    (*max_context_tokens, *max_output_tokens)
-                })
-                .unwrap_or((128_000, DEFAULT_MAX_OUTPUT_TOKENS));
-            let mut limit = ModelLimit::new("default", default.0);
-            limit.max_output_tokens = Some(default.1);
-            limit
-        })
+        self.get(model).unwrap_or_else(default_model_limit)
     }
 
     /// Save current user limits to the configuration file.
@@ -346,66 +279,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_limits_contain_common_models() {
-        let gpt54 = KNOWN_MODEL_LIMITS
-            .iter()
-            .find(|(k, _, _)| *k == "gpt-5.4")
-            .expect("Should have gpt-5.4");
-        assert_eq!(gpt54.1, 1_050_000);
-        assert_eq!(gpt54.2, 32_768);
-
-        let gpt53_codex = KNOWN_MODEL_LIMITS
-            .iter()
-            .find(|(k, _, _)| *k == "gpt-5.3-codex")
-            .expect("Should have gpt-5.3-codex");
-        assert_eq!(gpt53_codex.1, 400_000);
-        assert_eq!(gpt53_codex.2, 128_000);
-
-        let gpt52_codex = KNOWN_MODEL_LIMITS
-            .iter()
-            .find(|(k, _, _)| *k == "gpt-5.2-codex")
-            .expect("Should have gpt-5.2-codex");
-        assert_eq!(gpt52_codex.1, 400_000);
-        assert_eq!(gpt52_codex.2, 128_000);
-
-        let gemini31_pro_preview = KNOWN_MODEL_LIMITS
-            .iter()
-            .find(|(k, _, _)| *k == "gemini-3.1-pro-preview")
-            .expect("Should have gemini-3.1-pro-preview");
-        assert_eq!(gemini31_pro_preview.1, 128_000);
-        assert_eq!(gemini31_pro_preview.2, 64_000);
+    fn default_limit_is_200k_64k() {
+        let limit = default_model_limit();
+        assert_eq!(limit.model_pattern, DEFAULT_MODEL_PATTERN);
+        assert_eq!(limit.max_context_tokens, 200_000);
+        assert_eq!(limit.get_max_output_tokens(), 64_000);
     }
 
     #[test]
-    fn registry_finds_builtin_by_exact_match() {
-        let registry = ModelLimitsRegistry::new();
-        let limit = registry
-            .get("gpt-5.2-codex")
-            .expect("Should find gpt-5.2-codex");
-        assert_eq!(limit.max_context_tokens, 400_000);
-        assert_eq!(limit.get_max_output_tokens(), 128_000);
+    fn is_default_limit_detects_no_op_overrides() {
+        // A row pinned to exactly the default values (any pattern) is a no-op.
+        let mut noop = ModelLimit::new("gpt-4o", DEFAULT_MAX_CONTEXT_TOKENS);
+        noop.max_output_tokens = Some(DEFAULT_MAX_OUTPUT_TOKENS);
+        assert!(is_default_limit(&noop));
+
+        // The synthesized global default is itself a no-op override.
+        assert!(is_default_limit(&default_model_limit()));
+
+        // A different context window is a real override.
+        let mut smaller = ModelLimit::new("gpt-4o", 128_000);
+        smaller.max_output_tokens = Some(DEFAULT_MAX_OUTPUT_TOKENS);
+        assert!(!is_default_limit(&smaller));
+
+        // An explicit safety margin is a real override even at default size.
+        let mut custom_margin = ModelLimit::new("gpt-4o", DEFAULT_MAX_CONTEXT_TOKENS);
+        custom_margin.max_output_tokens = Some(DEFAULT_MAX_OUTPUT_TOKENS);
+        custom_margin.safety_margin = Some(500);
+        assert!(!is_default_limit(&custom_margin));
     }
 
     #[test]
-    fn registry_finds_builtin_by_partial_match() {
+    fn registry_returns_none_for_unknown_without_overrides() {
+        // No built-in table: an unknown model with no user override has no match.
         let registry = ModelLimitsRegistry::new();
-        // "gpt-5.2-codex-preview" contains "gpt-5.2-codex"
-        let limit = registry
-            .get("gpt-5.2-codex-preview")
-            .expect("Should find gpt-5.2-codex");
-        assert_eq!(limit.max_context_tokens, 400_000);
-        assert_eq!(limit.get_max_output_tokens(), 128_000);
+        assert!(registry.get("gpt-5.2-codex").is_none());
+        assert!(registry.get("some-brand-new-model").is_none());
     }
 
     #[test]
     fn registry_returns_default_for_unknown() {
         let registry = ModelLimitsRegistry::new();
         let limit = registry.get_or_default("unknown-model-xyz");
-        assert_eq!(limit.model_pattern, "default");
+        assert_eq!(limit.model_pattern, DEFAULT_MODEL_PATTERN);
+        assert_eq!(limit.max_context_tokens, 200_000);
+        assert_eq!(limit.get_max_output_tokens(), 64_000);
     }
 
     #[test]
-    fn user_override_takes_precedence() {
+    fn user_override_exact_match_wins() {
         let mut registry = ModelLimitsRegistry::new();
         registry.add_limit(ModelLimit::new("gpt-5.2-codex", 64_000)); // Override with smaller limit
 
@@ -413,6 +334,19 @@ mod tests {
             .get("gpt-5.2-codex")
             .expect("Should find overridden limit");
         assert_eq!(limit.max_context_tokens, 64_000);
+    }
+
+    #[test]
+    fn user_override_partial_match_longest_wins() {
+        let mut registry = ModelLimitsRegistry::new();
+        registry.add_limit(ModelLimit::new("gpt-5", 111_000));
+        registry.add_limit(ModelLimit::new("gpt-5.2-codex", 222_000));
+
+        // "gpt-5.2-codex-preview" contains both patterns; the longest wins.
+        let limit = registry
+            .get("gpt-5.2-codex-preview")
+            .expect("Should partial-match a user override");
+        assert_eq!(limit.max_context_tokens, 222_000);
     }
 
     #[test]
@@ -504,5 +438,39 @@ mod tests {
         let mut custom = ModelLimit::new("test", 200_000);
         custom.safety_margin = Some(500);
         assert_eq!(custom.get_safety_margin(), 500);
+    }
+
+    #[tokio::test]
+    async fn persisted_overrides_drive_runtime_resolution() {
+        // Integration: a `model_limits.json` on disk → registry load → resolve.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model_limits.json");
+        tokio::fs::write(
+            &path,
+            r#"[{"model_pattern":"gpt-4o","max_context_tokens":128000,"max_output_tokens":16384}]"#,
+        )
+        .await
+        .expect("seed overrides");
+
+        let mut registry = ModelLimitsRegistry::with_config_path(path);
+        registry.load_user_config().await.expect("load user config");
+
+        // Persisted override is applied at runtime.
+        let gpt4o = registry.get("gpt-4o").expect("override present");
+        assert_eq!(gpt4o.max_context_tokens, 128_000);
+        assert_eq!(gpt4o.get_max_output_tokens(), 16_384);
+
+        // Unknown model with no override falls back to the single global default.
+        let unknown = registry.get_or_default("brand-new-frontier-model");
+        assert_eq!(unknown.model_pattern, DEFAULT_MODEL_PATTERN);
+        assert_eq!(unknown.max_context_tokens, 200_000);
+        assert_eq!(unknown.get_max_output_tokens(), 64_000);
+    }
+
+    #[test]
+    fn create_budget_for_model_uses_global_default_for_any_model() {
+        let budget = create_budget_for_model("anything-at-all", crate::BudgetStrategy::default());
+        assert_eq!(budget.max_context_tokens, 200_000);
+        assert_eq!(budget.max_output_tokens, 64_000);
     }
 }

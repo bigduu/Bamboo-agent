@@ -38,26 +38,40 @@ pub(super) async fn write_model_limits_file(
 ) -> Result<(), AppError> {
     let path = model_limits_file_path(app_data_dir);
     match value {
-        None => {
-            if tokio::fs::try_exists(&path)
-                .await
-                .map_err(AppError::StorageError)?
-            {
-                tokio::fs::remove_file(&path)
-                    .await
-                    .map_err(AppError::StorageError)?;
-            }
-            Ok(())
-        }
+        None => remove_file_if_exists(&path).await,
         Some(value) => {
+            // Diff-only storage: a row identical to the global default carries no
+            // information, so drop it. This keeps `model_limits.json` to genuine
+            // overrides and lets future default changes propagate to everyone.
             let limits: Vec<ModelLimit> = serde_json::from_value(value.clone())?;
-            let content = serde_json::to_string_pretty(&limits)?;
+            let overrides: Vec<ModelLimit> = limits
+                .into_iter()
+                .filter(|limit| !bamboo_compression::limits::is_default_limit(limit))
+                .collect();
+
+            if overrides.is_empty() {
+                return remove_file_if_exists(&path).await;
+            }
+
+            let content = serde_json::to_string_pretty(&overrides)?;
             tokio::fs::write(&path, content)
                 .await
                 .map_err(AppError::StorageError)?;
             Ok(())
         }
     }
+}
+
+async fn remove_file_if_exists(path: &Path) -> Result<(), AppError> {
+    if tokio::fs::try_exists(path)
+        .await
+        .map_err(AppError::StorageError)?
+    {
+        tokio::fs::remove_file(path)
+            .await
+            .map_err(AppError::StorageError)?;
+    }
+    Ok(())
 }
 
 pub(super) fn take_model_limits_patch(patch_obj: &mut Map<String, Value>) -> Option<Value> {
