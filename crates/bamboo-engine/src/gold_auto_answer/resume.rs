@@ -1,34 +1,34 @@
 use bamboo_agent_core::{AgentEvent, Session};
-use bamboo_engine::config::GoldConfig;
-use bamboo_engine::model_areas::resolve_global_area_models;
-use bamboo_engine::model_config_helper::{
+use crate::config::GoldConfig;
+use crate::model_areas::resolve_global_area_models;
+use crate::model_config_helper::{
     resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
 };
 
-use crate::app_state::AppState;
+use crate::app_context::AgentSessionContext;
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::session_app::respond::PlanModeTransition;
 use crate::session_app::types::ResumeConfigSnapshot;
 
 pub(crate) async fn build_resume_config_snapshot(
-    state: &AppState,
+    state: &dyn AgentSessionContext,
     session: &Session,
     gold_config_override: Option<GoldConfig>,
 ) -> ResumeConfigSnapshot {
-    let config_snapshot = state.config.read().await.clone();
+    let config_snapshot = state.config().read().await.clone();
     let resolved_provider_name = session_effective_model_ref(session)
         .map(|model_ref| model_ref.provider)
         .unwrap_or_else(|| config_snapshot.provider.clone());
     let resolved_provider_type = resolve_provider_type(
         &config_snapshot,
         &resolved_provider_name,
-        &state.provider_registry,
+        state.provider_registry(),
     );
     // Auxiliary models are global (config-derived), never session-bound.
     let areas = resolve_global_area_models(
         &config_snapshot,
         &resolved_provider_name,
-        &state.provider_registry,
+        state.provider_registry(),
     );
 
     ResumeConfigSnapshot {
@@ -44,7 +44,7 @@ pub(crate) async fn build_resume_config_snapshot(
         summarization_model_provider: areas.summarization.map(|model| model.provider),
         disabled_tools: config_snapshot.disabled_tool_names(),
         disabled_skill_ids: config_snapshot.disabled_skill_ids(),
-        image_fallback: crate::handlers::agent::execute::image_fallback::resolve_image_fallback(
+        image_fallback: crate::model_config_helper::resolve_image_fallback(
             &config_snapshot,
         )
         .ok()

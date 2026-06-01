@@ -3,22 +3,22 @@ use std::sync::Arc;
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::ProviderModelRef;
-use bamboo_engine::config::GoldConfig;
-use bamboo_engine::runtime::gold_evaluation::{evaluate_gold, GoldEvaluationResult};
-use bamboo_engine::runtime::stream::handler::consume_llm_stream_silent;
-use bamboo_engine::TaskLoopContext;
+use crate::config::GoldConfig;
+use crate::runtime::gold_evaluation::{evaluate_gold, GoldEvaluationResult};
+use crate::runtime::stream::handler::consume_llm_stream_silent;
+use crate::TaskLoopContext;
 use bamboo_infrastructure::{LLMProvider, LLMRequestOptions};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::app_state::AppState;
+use crate::app_context::AgentSessionContext;
 use crate::session_app::provider_model::session_effective_model_ref;
 
 use super::decision::{parse_gold_auto_answer_decision, GoldAutoAnswerDecision};
 use super::prompt::{build_gold_auto_answer_messages, get_gold_auto_answer_tools};
 
 pub(crate) async fn evaluate_gold_state_for_pending_question(
-    state: &AppState,
+    state: &dyn AgentSessionContext,
     session_id: &str,
     session: &Session,
     gold_config: &GoldConfig,
@@ -44,7 +44,7 @@ pub(crate) async fn evaluate_gold_state_for_pending_question(
         task_context.as_ref(),
         gold_config,
         provider,
-        &bamboo_engine::runtime::gold_evaluation::GoldEvalFrame {
+        &crate::runtime::gold_evaluation::GoldEvalFrame {
             event_tx: &event_tx,
             session_id,
             model: &model,
@@ -62,7 +62,7 @@ pub(crate) async fn evaluate_gold_state_for_pending_question(
 }
 
 pub(crate) async fn evaluate_gold_auto_answer_question(
-    state: &AppState,
+    state: &dyn AgentSessionContext,
     session_id: &str,
     session: &Session,
     gold_config: &GoldConfig,
@@ -111,19 +111,19 @@ pub(crate) async fn evaluate_gold_auto_answer_question(
 }
 
 async fn resolve_gold_provider_and_model(
-    state: &AppState,
+    state: &dyn AgentSessionContext,
     session: &Session,
     gold_config: &GoldConfig,
 ) -> Result<(Arc<dyn LLMProvider>, String), String> {
     // Resolve fast model eagerly for the fallback chain.
-    let config_snapshot = state.config.read().await.clone();
+    let config_snapshot = state.config().read().await.clone();
     let provider_name = session_effective_model_ref(session)
         .map(|r| r.provider.clone())
         .unwrap_or_else(|| config_snapshot.provider.clone());
-    let fast_model_name = bamboo_engine::model_config_helper::resolve_fast_model(
+    let fast_model_name = crate::model_config_helper::resolve_fast_model(
         &config_snapshot,
         &provider_name,
-        &state.provider_registry,
+        state.provider_registry(),
     )
     .map(|resolved| resolved.model_name);
 
@@ -147,13 +147,13 @@ async fn resolve_gold_provider_and_model(
 
     if let Some(model_ref) = session_effective_model_ref(session) {
         let target = ProviderModelRef::new(model_ref.provider.clone(), model.clone());
-        if let Ok(provider) = state.get_provider_for_model_ref(&target) {
+        if let Some(provider) = state.get_provider_for_model_ref(&target) {
             return Ok((provider, model));
         }
-        if let Some(provider) = state.provider_registry.get(&model_ref.provider) {
+        if let Some(provider) = state.provider_registry().get(&model_ref.provider) {
             return Ok((provider, model));
         }
-        if let Ok(provider) = state.get_provider_for_endpoint(&model_ref.provider).await {
+        if let Some(provider) = state.get_provider_for_endpoint(&model_ref.provider).await {
             return Ok((provider, model));
         }
     }
@@ -165,15 +165,15 @@ async fn resolve_gold_provider_and_model(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        if let Some(provider) = state.provider_registry.get(provider_name) {
+        if let Some(provider) = state.provider_registry().get(provider_name) {
             return Ok((provider, model));
         }
-        if let Ok(provider) = state.get_provider_for_endpoint(provider_name).await {
+        if let Some(provider) = state.get_provider_for_endpoint(provider_name).await {
             return Ok((provider, model));
         }
     }
 
-    if let Some(provider) = state.provider_registry.get_default() {
+    if let Some(provider) = state.provider_registry().get_default() {
         return Ok((provider, model));
     }
 

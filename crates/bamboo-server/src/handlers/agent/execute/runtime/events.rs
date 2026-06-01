@@ -86,9 +86,15 @@ pub(crate) fn spawn_event_forwarder(
             // now happens INSIDE the runner loop's terminal gate (see
             // bamboo-engine `evaluate_gold_terminal`) so the run emits a single
             // terminal `Complete` and the frontend never gets stuck mid-settle.
-            let auto_answer_outcome =
-                maybe_auto_answer_pending_question(state.clone(), &session_id, gold_config.clone())
-                    .await;
+            let resume_port =
+                crate::app_state::resume_adapter::AppStateResumeRef(state.clone());
+            let auto_answer_outcome = maybe_auto_answer_pending_question(
+                state.get_ref(),
+                &resume_port,
+                &session_id,
+                gold_config.clone(),
+            )
+            .await;
             match auto_answer_outcome {
                 GoldAutoAnswerOutcome::Skipped { reason } => {
                     tracing::debug!(

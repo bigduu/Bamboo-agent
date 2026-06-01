@@ -1,18 +1,20 @@
-use super::decision::{
-    canonicalize_pending_answer, parse_gold_auto_answer_decision, session_is_awaiting_clarification,
-    should_attempt_gold_auto_answer,
-};
-use super::{maybe_auto_answer_pending_question, GoldAutoAnswerOutcome, GOLD_AUTO_ANSWER_TOOL_NAME};
+//! Server-side full-loop integration tests for Gold auto-answer.
+//!
+//! These construct a real `AppState` plus the `AppStateResumeRef` resume
+//! adapter, so they live in the server crate. Pure decision-helper unit tests
+//! live alongside the service in `bamboo_engine::gold_auto_answer`.
+
+use super::{maybe_auto_answer_pending_question, GoldAutoAnswerOutcome};
+use crate::app_state::resume_adapter::AppStateResumeRef;
 use crate::app_state::{AgentStatus, AppState};
 use crate::session_app::execute::has_pending_clarification_resume;
 use crate::session_app::types::ResumeOutcome;
 use actix_web::web::Data;
 use async_trait::async_trait;
-use bamboo_agent_core::{
-    AgentEvent, FunctionCall, GoldConfidence, Message, PendingQuestion, PendingQuestionSource,
-    ToolCall, ToolSchema,
-};
 use bamboo_agent_core::Session;
+use bamboo_agent_core::{
+    AgentEvent, FunctionCall, Message, PendingQuestionSource, ToolCall, ToolSchema,
+};
 use bamboo_engine::config::GoldConfig;
 use bamboo_infrastructure::{
     Config, LLMChunk, LLMError, LLMProvider, LLMRequestOptions, LLMStream, ProviderModelRouter,
@@ -25,23 +27,12 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, Semaphore};
 use tokio::time::{sleep, timeout, Duration};
 
-fn pending_question(tool_name: &str) -> PendingQuestion {
-    PendingQuestion {
-        tool_call_id: format!("call::{tool_name}"),
-        tool_name: tool_name.to_string(),
-        question: "Question?".to_string(),
-        options: vec!["OK".to_string(), "Need changes".to_string()],
-        allow_custom: true,
-        source: PendingQuestionSource::PauseTool,
-    }
-}
-
 fn auto_answer_call(arguments: serde_json::Value) -> ToolCall {
     ToolCall {
         id: "call-1".to_string(),
         tool_type: "function".to_string(),
         function: FunctionCall {
-            name: GOLD_AUTO_ANSWER_TOOL_NAME.to_string(),
+            name: "report_gold_auto_answer".to_string(),
             arguments: arguments.to_string(),
         },
     }
@@ -220,67 +211,8 @@ fn build_pending_session(
         "runtime.suspend_reason".to_string(),
         "awaiting_clarification".to_string(),
     );
-    session.agent_runtime_state =
-        Some(awaiting_clarification_state("run-awaiting-clarification"));
+    session.agent_runtime_state = Some(awaiting_clarification_state("run-awaiting-clarification"));
     session
-}
-
-#[test]
-fn should_attempt_gold_auto_answer_allows_exit_plan_mode() {
-    assert!(should_attempt_gold_auto_answer(&pending_question(
-        "ExitPlanMode"
-    )));
-}
-
-#[test]
-fn should_attempt_gold_auto_answer_allows_conclusion_with_options() {
-    assert!(should_attempt_gold_auto_answer(&pending_question(
-        "conclusion_with_options"
-    )));
-}
-
-#[test]
-fn should_attempt_gold_auto_answer_rejects_request_permissions() {
-    assert!(!should_attempt_gold_auto_answer(&pending_question(
-        "request_permissions"
-    )));
-}
-
-#[test]
-fn should_attempt_gold_auto_answer_rejects_gold_origin_questions() {
-    let mut pending = pending_question("conclusion_with_options");
-    pending.source = PendingQuestionSource::Gold;
-    assert!(!should_attempt_gold_auto_answer(&pending));
-}
-
-#[test]
-fn parse_gold_auto_answer_decision_reads_structured_fields() {
-    let parsed = parse_gold_auto_answer_decision(&[auto_answer_call(json!({
-        "apply": true,
-        "answer": "OK",
-        "confidence": "high",
-        "reasoning": "The option is explicitly supported"
-    }))])
-    .expect("decision should parse");
-
-    assert!(parsed.apply);
-    assert_eq!(parsed.answer.as_deref(), Some("OK"));
-    assert_eq!(parsed.confidence, GoldConfidence::High);
-    assert_eq!(parsed.reasoning, "The option is explicitly supported");
-}
-
-#[test]
-fn canonicalize_pending_answer_uses_existing_option_casing() {
-    let pending = pending_question("conclusion_with_options");
-    let answer = canonicalize_pending_answer(&pending, "ok.");
-    assert_eq!(answer.as_deref(), Some("OK"));
-}
-
-#[test]
-fn canonicalize_pending_answer_rejects_free_text() {
-    let pending = pending_question("conclusion_with_options");
-    let answer = canonicalize_pending_answer(&pending, "Ship it");
-    assert!(answer.is_none());
 }
 
 #[tokio::test]
@@ -295,11 +227,9 @@ async fn gold_auto_answer_conclusion_with_options_full_loop() {
         AppState::new_with_provider(temp_dir.path().to_path_buf(), config, provider_trait)
             .await
             .expect("app state");
-    app_state.provider_registry =
-        Arc::new(ProviderRegistry::new(HashMap::new(), String::new()));
-    app_state.provider_router = Arc::new(ProviderModelRouter::new(
-        app_state.provider_registry.clone(),
-    ));
+    app_state.provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), String::new()));
+    app_state.provider_router =
+        Arc::new(ProviderModelRouter::new(app_state.provider_registry.clone()));
     let state = Data::new(app_state);
 
     let session_id = "gold-auto-answer-conclusion-full-loop";
@@ -317,9 +247,14 @@ async fn gold_auto_answer_conclusion_with_options_full_loop() {
     );
     state.save_and_cache_session(&mut session).await;
 
-    let outcome =
-        maybe_auto_answer_pending_question(state.clone(), session_id, Some(test_gold_config()))
-            .await;
+    let resume_port = AppStateResumeRef(state.clone());
+    let outcome = maybe_auto_answer_pending_question(
+        state.get_ref(),
+        &resume_port,
+        session_id,
+        Some(test_gold_config()),
+    )
+    .await;
 
     let run_id = match &outcome {
         GoldAutoAnswerOutcome::Applied {
@@ -389,11 +324,9 @@ async fn gold_auto_answer_exit_plan_mode_full_loop() {
         AppState::new_with_provider(temp_dir.path().to_path_buf(), config, provider_trait)
             .await
             .expect("app state");
-    app_state.provider_registry =
-        Arc::new(ProviderRegistry::new(HashMap::new(), String::new()));
-    app_state.provider_router = Arc::new(ProviderModelRouter::new(
-        app_state.provider_registry.clone(),
-    ));
+    app_state.provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), String::new()));
+    app_state.provider_router =
+        Arc::new(ProviderModelRouter::new(app_state.provider_registry.clone()));
     let state = Data::new(app_state);
 
     let session_id = "gold-auto-answer-exit-plan-mode-full-loop";
@@ -418,9 +351,14 @@ async fn gold_auto_answer_exit_plan_mode_full_loop() {
     state.save_and_cache_session(&mut session).await;
     let mut event_rx = state.get_session_event_sender(session_id).await.subscribe();
 
-    let outcome =
-        maybe_auto_answer_pending_question(state.clone(), session_id, Some(test_gold_config()))
-            .await;
+    let resume_port = AppStateResumeRef(state.clone());
+    let outcome = maybe_auto_answer_pending_question(
+        state.get_ref(),
+        &resume_port,
+        session_id,
+        Some(test_gold_config()),
+    )
+    .await;
     let run_id = match &outcome {
         GoldAutoAnswerOutcome::Applied {
             answer,
@@ -545,14 +483,4 @@ async fn wait_for_provider_purpose(provider: &ScriptedProvider, purpose: &str) {
     })
     .await
     .expect("provider purpose should appear");
-}
-
-#[test]
-fn session_is_awaiting_clarification_checks_metadata_reason() {
-    let mut session = Session::new("session-1", "model");
-    session.metadata.insert(
-        "runtime.suspend_reason".to_string(),
-        "awaiting_clarification".to_string(),
-    );
-    assert!(session_is_awaiting_clarification(&session));
 }

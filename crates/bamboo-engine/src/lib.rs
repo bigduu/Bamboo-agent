@@ -2,6 +2,7 @@
 
 pub mod app_context;
 pub mod events;
+pub mod gold_auto_answer;
 pub mod mcp;
 pub mod metrics;
 pub mod session_app;
