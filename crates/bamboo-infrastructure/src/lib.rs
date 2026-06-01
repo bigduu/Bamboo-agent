@@ -96,8 +96,8 @@ pub mod v2 {
     pub use crate::storage::v2::*;
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     /// The single crate-wide lock guarding all tests that mutate process-global
@@ -106,12 +106,12 @@ pub(crate) mod test_support {
     /// such test across `config`, `encryption`, and `paths` acquires this so
     /// they serialize against one another; per-module locks let them race on
     /// the same globals and flake under parallel test execution.
-    pub(crate) fn env_cache_lock() -> &'static Mutex<()> {
+    pub fn env_cache_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    pub(crate) fn env_cache_lock_acquire() -> MutexGuard<'static, ()> {
+    pub fn env_cache_lock_acquire() -> MutexGuard<'static, ()> {
         env_cache_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

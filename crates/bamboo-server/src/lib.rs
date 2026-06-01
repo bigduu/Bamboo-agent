@@ -140,19 +140,3 @@ pub use routes::{
     configure_routes_with_rate_limiting, gemini_routes, openai_prefixed_routes,
 };
 pub use server::{run, run_with_bind, run_with_bind_and_static, WebService};
-
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    pub(crate) fn env_cache_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    pub(crate) fn env_cache_lock_acquire() -> MutexGuard<'static, ()> {
-        env_cache_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}

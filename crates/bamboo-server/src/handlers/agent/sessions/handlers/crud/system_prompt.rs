@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn snapshot_extracts_generated_sections_workspace_and_env_context() {
-        let _lock = crate::test_support::env_cache_lock_acquire();
+        let _lock = bamboo_infrastructure::test_support::env_cache_lock_acquire();
         publish_test_env_context();
 
         let root = tempfile::tempdir().expect("temp dir");
