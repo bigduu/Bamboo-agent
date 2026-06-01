@@ -7,7 +7,7 @@
 
 use std::sync::OnceLock;
 
-use bamboo_agent_core::Message;
+use bamboo_domain::Message;
 use tiktoken_rs::o200k_base;
 use tiktoken_rs::CoreBPE;
 
@@ -197,7 +197,7 @@ impl TokenCounter for TiktokenTokenCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_agent_core::{FunctionCall, ToolCall};
+    use bamboo_domain::{FunctionCall, ToolCall};
 
     #[test]
     fn heuristic_counter_counts_text() {

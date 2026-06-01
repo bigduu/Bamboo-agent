@@ -4,7 +4,7 @@
 //! This prevents protocol errors that occur when tool results are included without
 //! their corresponding tool calls.
 
-use bamboo_agent_core::{Message, Role};
+use bamboo_domain::{Message, Role};
 use std::collections::HashSet;
 
 /// A segment of conversation that should be treated as atomic during truncation.
@@ -272,8 +272,8 @@ impl Default for MessageSegmenter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_agent_core::Message;
-    use bamboo_agent_core::{FunctionCall, ToolCall};
+    use bamboo_domain::Message;
+    use bamboo_domain::{FunctionCall, ToolCall};
 
     fn create_tool_call(id: &str, name: &str, args: &str) -> ToolCall {
         ToolCall {

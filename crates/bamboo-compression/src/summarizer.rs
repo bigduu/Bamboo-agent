@@ -4,7 +4,7 @@
 //! key information from earlier context.
 
 use async_trait::async_trait;
-use bamboo_agent_core::{
+use bamboo_domain::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, Message, Role,
 };
 use bamboo_domain::ReasoningEffort;
@@ -534,7 +534,7 @@ mod tests {
         async fn chat_stream(
             &self,
             _messages: &[Message],
-            _tools: &[bamboo_agent_core::ToolSchema],
+            _tools: &[bamboo_domain::ToolSchema],
             _max_output_tokens: Option<u32>,
             _model: &str,
         ) -> Result<LLMStream, LLMError> {
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn heuristic_summarizer_extracts_tools_used() {
-        use bamboo_agent_core::{FunctionCall, ToolCall};
+        use bamboo_domain::{FunctionCall, ToolCall};
 
         let summarizer = HeuristicSummarizer::new();
         let tool_call = ToolCall {
@@ -787,7 +787,7 @@ mod tests {
         async fn chat_stream(
             &self,
             _messages: &[Message],
-            _tools: &[bamboo_agent_core::ToolSchema],
+            _tools: &[bamboo_domain::ToolSchema],
             _max_output_tokens: Option<u32>,
             _model: &str,
         ) -> Result<LLMStream, LLMError> {
@@ -800,7 +800,7 @@ mod tests {
         async fn chat_stream_with_options(
             &self,
             messages: &[Message],
-            tools: &[bamboo_agent_core::ToolSchema],
+            tools: &[bamboo_domain::ToolSchema],
             max_output_tokens: Option<u32>,
             model: &str,
             options: Option<&LLMRequestOptions>,
@@ -853,7 +853,7 @@ mod tests {
         async fn chat_stream(
             &self,
             _messages: &[Message],
-            _tools: &[bamboo_agent_core::ToolSchema],
+            _tools: &[bamboo_domain::ToolSchema],
             _max_output_tokens: Option<u32>,
             _model: &str,
         ) -> Result<LLMStream, LLMError> {
@@ -866,7 +866,7 @@ mod tests {
         async fn chat_stream_with_options(
             &self,
             messages: &[Message],
-            tools: &[bamboo_agent_core::ToolSchema],
+            tools: &[bamboo_domain::ToolSchema],
             max_output_tokens: Option<u32>,
             model: &str,
             options: Option<&LLMRequestOptions>,

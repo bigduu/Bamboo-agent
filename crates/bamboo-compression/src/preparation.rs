@@ -8,7 +8,7 @@ use crate::segmenter::{MessageSegment, MessageSegmenter};
 use crate::types::{
     BudgetError, BudgetStrategy, PreparedContext, TokenBudget, TokenUsageBreakdown,
 };
-use bamboo_agent_core::{Message, Role, Session};
+use bamboo_domain::{Message, Role, Session};
 use std::collections::{HashMap, HashSet};
 
 // Safety ceilings on the budget-configurable prompt-cache policy values. These
@@ -338,7 +338,7 @@ struct SegmentSelectionResult {
 }
 
 struct PromptCacheCompactionResult {
-    messages: Vec<bamboo_agent_core::Message>,
+    messages: Vec<bamboo_domain::Message>,
     compacted_tool_outputs: usize,
     tokens_saved: u32,
     /// Best-known total context tokens (messages + summary) after this step.
@@ -365,7 +365,7 @@ struct PromptCacheCandidate {
 
 fn maybe_compact_old_tool_outputs_for_prompt(
     session: &Session,
-    mut active_messages: Vec<bamboo_agent_core::Message>,
+    mut active_messages: Vec<bamboo_domain::Message>,
     budget: &TokenBudget,
     counter: &dyn TokenCounter,
     summary_tokens: u32,
@@ -376,7 +376,7 @@ fn maybe_compact_old_tool_outputs_for_prompt(
         .count_messages(&active_messages)
         .saturating_add(summary_tokens);
 
-    let no_op = |messages: Vec<bamboo_agent_core::Message>, total: u32| PromptCacheCompactionResult {
+    let no_op = |messages: Vec<bamboo_domain::Message>, total: u32| PromptCacheCompactionResult {
         messages,
         compacted_tool_outputs: 0,
         tokens_saved: 0,
@@ -543,7 +543,7 @@ pub fn estimate_prompt_cache_savings(
 }
 
 fn build_prompt_cache_candidates(
-    messages: &[bamboo_agent_core::Message],
+    messages: &[bamboo_domain::Message],
     protected_turn_start: usize,
     protected_recent_calls: &HashSet<String>,
     tool_call_names: &HashMap<String, String>,
@@ -611,7 +611,7 @@ fn build_prompt_cache_candidates(
 }
 
 fn recent_user_turn_start_index(
-    messages: &[bamboo_agent_core::Message],
+    messages: &[bamboo_domain::Message],
     keep_recent_turns: usize,
 ) -> Option<usize> {
     if keep_recent_turns == 0 {
@@ -628,7 +628,7 @@ fn recent_user_turn_start_index(
     Some(user_indices[user_indices.len() - keep_recent_turns])
 }
 
-fn tool_call_name_index(messages: &[bamboo_agent_core::Message]) -> HashMap<String, String> {
+fn tool_call_name_index(messages: &[bamboo_domain::Message]) -> HashMap<String, String> {
     let mut index = HashMap::new();
     for message in messages {
         if message.role != Role::Assistant {
@@ -648,7 +648,7 @@ fn tool_call_name_index(messages: &[bamboo_agent_core::Message]) -> HashMap<Stri
 }
 
 fn collect_recent_tool_call_ids(
-    messages: &[bamboo_agent_core::Message],
+    messages: &[bamboo_domain::Message],
     keep_recent_calls: usize,
 ) -> HashSet<String> {
     let mut result = HashSet::new();
@@ -919,8 +919,8 @@ mod tests {
     use crate::compression_summary_message;
     use crate::counter::TiktokenTokenCounter;
     use crate::counter::TokenCounter;
-    use bamboo_agent_core::{ConversationSummary, Message, Role};
-    use bamboo_agent_core::{FunctionCall, ToolCall};
+    use bamboo_domain::{ConversationSummary, Message, Role};
+    use bamboo_domain::{FunctionCall, ToolCall};
     use std::collections::HashMap;
 
     struct DeterministicCounter {
@@ -1013,7 +1013,7 @@ mod tests {
         assert!(prepared
             .messages
             .iter()
-            .any(|m| m.role == bamboo_agent_core::Role::System));
+            .any(|m| m.role == bamboo_domain::Role::System));
     }
 
     #[test]
@@ -1070,7 +1070,7 @@ mod tests {
             .messages
             .iter()
             .rev()
-            .find(|m| m.role == bamboo_agent_core::Role::User);
+            .find(|m| m.role == bamboo_domain::Role::User);
         assert!(last_user.is_some());
         assert!(last_user.unwrap().content.contains("Recent"));
     }
@@ -1350,7 +1350,7 @@ mod tests {
         let has_system = prepared
             .messages
             .iter()
-            .any(|m| m.role == bamboo_agent_core::Role::System);
+            .any(|m| m.role == bamboo_domain::Role::System);
         assert!(has_system, "System message should always be included");
 
         // Budget should be enforced

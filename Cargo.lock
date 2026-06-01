@@ -546,7 +546,6 @@ name = "bamboo-compression"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bamboo-agent-core",
  "bamboo-domain",
  "bamboo-infrastructure",
  "chrono",

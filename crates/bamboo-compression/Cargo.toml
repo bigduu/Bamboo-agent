@@ -7,7 +7,6 @@ description = "Compression utilities for Bamboo sessions and memory workflows"
 license = "MIT"
 
 [dependencies]
-bamboo-agent-core = { path = "../bamboo-agent-core" }
 bamboo-infrastructure = { path = "../bamboo-infrastructure" }
 bamboo-domain = { path = "../bamboo-domain" }
 serde = { workspace = true }

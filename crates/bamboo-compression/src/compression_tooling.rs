@@ -1,8 +1,8 @@
 use crate::counter::{TiktokenTokenCounter, TokenCounter};
 use crate::limits::create_budget_for_model;
 use crate::{BudgetStrategy, TokenBudget};
-use bamboo_agent_core::MessagePhase;
-use bamboo_agent_core::{
+use bamboo_domain::MessagePhase;
+use bamboo_domain::{
     CompressionEvent, CompressionTriggerType, ConversationSummary, Message, Session,
 };
 
@@ -171,7 +171,7 @@ pub fn estimate_context_compression_exposure(
     // tool even when plan building would immediately fail.
     let non_system_count = active_messages
         .iter()
-        .filter(|m| !matches!(m.role, bamboo_agent_core::Role::System))
+        .filter(|m| !matches!(m.role, bamboo_domain::Role::System))
         .count();
 
     let should_expose_tool = threshold_reached && non_system_count >= 3;
@@ -257,7 +257,7 @@ fn build_compression_plan_with_summary_internal(
 
     let system_messages: Vec<Message> = active_messages
         .iter()
-        .filter(|m| matches!(m.role, bamboo_agent_core::Role::System))
+        .filter(|m| matches!(m.role, bamboo_domain::Role::System))
         .cloned()
         .collect();
     let system_tokens = counter.count_messages(&system_messages);
@@ -266,7 +266,7 @@ fn build_compression_plan_with_summary_internal(
 
     let non_system: Vec<Message> = active_messages
         .drain(..)
-        .filter(|m| !matches!(m.role, bamboo_agent_core::Role::System))
+        .filter(|m| !matches!(m.role, bamboo_domain::Role::System))
         .collect();
 
     if non_system.len() < 3 {
@@ -283,7 +283,7 @@ fn build_compression_plan_with_summary_internal(
         .iter()
         .enumerate()
         .filter_map(|(index, message)| {
-            matches!(message.role, bamboo_agent_core::Role::User).then_some(index)
+            matches!(message.role, bamboo_domain::Role::User).then_some(index)
         })
         .collect::<Vec<_>>();
     let keep_user_count = user_indexes.len().min(3);
@@ -292,7 +292,7 @@ fn build_compression_plan_with_summary_internal(
     } else {
         non_system
             .iter()
-            .rposition(|m| matches!(m.role, bamboo_agent_core::Role::User))
+            .rposition(|m| matches!(m.role, bamboo_domain::Role::User))
             .unwrap_or(non_system.len().saturating_sub(1))
     };
     let protected_user_ids: HashSet<String> = if keep_user_count > 0 {
@@ -476,7 +476,7 @@ pub(super) fn extract_key_decisions(messages: &[Message], limit: usize) -> Vec<S
     ];
     let mut decisions = Vec::new();
     for message in messages {
-        if !matches!(message.role, bamboo_agent_core::Role::Assistant) {
+        if !matches!(message.role, bamboo_domain::Role::Assistant) {
             continue;
         }
         let content = &message.content;
@@ -648,7 +648,7 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
         let insert_pos = session
             .messages
             .iter()
-            .rposition(|m| matches!(m.role, bamboo_agent_core::Role::User) && !m.compressed)
+            .rposition(|m| matches!(m.role, bamboo_domain::Role::User) && !m.compressed)
             .map(|pos| pos + 1)
             .unwrap_or(session.messages.len());
         session.messages.insert(insert_pos, recovery);
@@ -678,12 +678,12 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
         .collect();
     let system_msgs: Vec<_> = remaining_active
         .iter()
-        .filter(|m| matches!(m.role, bamboo_agent_core::Role::System))
+        .filter(|m| matches!(m.role, bamboo_domain::Role::System))
         .cloned()
         .collect();
     let window_msgs: Vec<_> = remaining_active
         .iter()
-        .filter(|m| !matches!(m.role, bamboo_agent_core::Role::System))
+        .filter(|m| !matches!(m.role, bamboo_domain::Role::System))
         .cloned()
         .collect();
     let system_tokens = counter.count_messages(&system_msgs);
@@ -707,7 +707,7 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
         .as_ref()
         .map(|u| u.max_context_tokens)
         .unwrap_or(0);
-    session.token_usage = Some(bamboo_agent_core::TokenBudgetUsage {
+    session.token_usage = Some(bamboo_domain::TokenBudgetUsage {
         system_tokens,
         summary_tokens: new_summary_tokens,
         window_tokens,
@@ -752,7 +752,7 @@ pub fn summary_source_messages(session: &Session) -> Vec<Message> {
         .messages
         .iter()
         .filter(|message| !message.compressed)
-        .filter(|message| !matches!(message.role, bamboo_agent_core::Role::System))
+        .filter(|message| !matches!(message.role, bamboo_domain::Role::System))
         .cloned()
         .collect()
 }
@@ -790,14 +790,14 @@ pub fn build_summary_prompt(
     content.push_str("## Messages To Compress\n\n");
     for message in messages {
         let role = match message.role {
-            bamboo_agent_core::Role::System => continue,
-            bamboo_agent_core::Role::User => "User",
-            bamboo_agent_core::Role::Assistant => match message.phase {
+            bamboo_domain::Role::System => continue,
+            bamboo_domain::Role::User => "User",
+            bamboo_domain::Role::Assistant => match message.phase {
                 Some(MessagePhase::Commentary) => "Assistant Commentary",
                 Some(MessagePhase::FinalAnswer) => "Assistant Final",
                 None => "Assistant",
             },
-            bamboo_agent_core::Role::Tool => "Tool Result",
+            bamboo_domain::Role::Tool => "Tool Result",
         };
 
         content.push_str("### ");
@@ -841,7 +841,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_agent_core::TokenBudgetUsage;
+    use bamboo_domain::TokenBudgetUsage;
     use bamboo_domain::{FunctionCall, TaskItem, TaskItemStatus, TaskList, ToolCall};
     use chrono::Utc;
 
@@ -1023,9 +1023,9 @@ mod tests {
         let kept_user_contents = session
             .messages
             .iter()
-            .filter(|message| !matches!(message.role, bamboo_agent_core::Role::System))
+            .filter(|message| !matches!(message.role, bamboo_domain::Role::System))
             .filter(|message| !compressed_ids.contains(message.id.as_str()))
-            .filter(|message| matches!(message.role, bamboo_agent_core::Role::User))
+            .filter(|message| matches!(message.role, bamboo_domain::Role::User))
             .map(|message| message.content.clone())
             .collect::<Vec<_>>();
 
