@@ -1089,6 +1089,23 @@ pub(super) async fn run_pipeline(
 
     drain_in_flight_task_evaluation(state).await;
     apply_completed_task_evaluation(session, event_tx, config, state).await;
+    // A task evaluation may have been queued during the final round but never
+    // spawned because the in-flight slot was still busy when the loop ended.
+    // Run it now (spawn + drain) so the last round's progress is actually
+    // evaluated instead of being silently dropped — this also makes the
+    // between-rounds refresh behavior deterministic regardless of scheduling.
+    if state.task_evaluation.in_flight.is_none() {
+        if let Some(request) = state.task_evaluation.queued_request.take() {
+            let eval_provider = state
+                .auxiliary_models
+                .fast_model_provider
+                .clone()
+                .unwrap_or_else(|| llm.clone());
+            spawn_task_evaluation_request(state, event_tx, request, eval_provider);
+            drain_in_flight_task_evaluation(state).await;
+            apply_completed_task_evaluation(session, event_tx, config, state).await;
+        }
+    }
     drain_in_flight_gold_evaluation(state).await;
     apply_completed_gold_evaluation(session, config, state).await;
 
