@@ -311,8 +311,8 @@ impl AppState {
             Some(account_sink.inbox()),
         );
 
-        crate::services::auto_dream::spawn_auto_dream_task(
-            crate::services::auto_dream::AutoDreamContext {
+        bamboo_engine::auto_dream::spawn_auto_dream_task(
+            bamboo_engine::auto_dream::AutoDreamContext {
                 session_store: session_store.clone(),
                 storage: storage.clone(),
                 provider: provider_handle.clone(),

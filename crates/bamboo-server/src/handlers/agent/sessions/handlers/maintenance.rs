@@ -3,7 +3,7 @@ use std::path::Path;
 use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
-use crate::services::auto_dream::{run_project_auto_dream_once, AutoDreamContext};
+use bamboo_engine::auto_dream::{run_project_auto_dream_once, AutoDreamContext};
 use bamboo_agent_core::Session;
 use bamboo_infrastructure::{CleanupMode, CleanupResult};
 use bamboo_memory::memory_store::MemoryStore;
