@@ -1,5 +1,7 @@
 //! Bamboo engine — runtime, skills, metrics, MCP.
 
+pub mod app_context;
+pub mod events;
 pub mod mcp;
 pub mod metrics;
 pub mod prompt_defaults;
@@ -10,6 +12,8 @@ pub mod auto_dream;
 pub mod metrics_service;
 pub mod runtime;
 pub mod skills;
+
+pub use app_context::AgentSessionContext;
 
 // Re-export commonly used types from agent (via dependency)
 pub use bamboo_agent_core::{

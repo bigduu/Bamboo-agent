@@ -311,6 +311,7 @@ impl AppState {
     }
 }
 
+mod agent_session_context;
 mod builder;
 pub mod child_completion_coordinator;
 mod config_runtime;

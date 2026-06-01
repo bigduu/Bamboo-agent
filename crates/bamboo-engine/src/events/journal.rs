@@ -112,7 +112,7 @@ impl EventJournal {
     /// Like [`Self::open`] but with a custom rotation threshold (bytes). A small
     /// threshold forces one file per event, which retention/resume tests use to
     /// build a multi-file journal deterministically.
-    pub(crate) fn open_with_threshold(dir: PathBuf, rotate_threshold: u64) -> io::Result<(Self, u64)> {
+    pub fn open_with_threshold(dir: PathBuf, rotate_threshold: u64) -> io::Result<(Self, u64)> {
         std::fs::create_dir_all(&dir)?;
         let max_seq = recover_max_seq(&dir)?;
         Ok((
