@@ -28,7 +28,7 @@ pub use resume_markers::{
 };
 pub use sync::evaluate_client_sync;
 
-pub(crate) use sync::is_hidden_from_ui;
+pub use sync::is_hidden_from_ui;
 
 use validation::validate_image_fallback_for_session;
 
@@ -96,10 +96,10 @@ pub async fn prepare_execute(
     };
 
     // ---- Resolve reasoning effort cascade: session → request → provider default ----
-    // Single shared cascade (see `bamboo_engine::model_areas`). Stays `Option` so
+    // Single shared cascade (see `crate::model_areas`). Stays `Option` so
     // non-reasoning models send no reasoning parameter.
     let (effective_reasoning_effort, reasoning_effort_source) = {
-        let (effort, source) = bamboo_engine::model_areas::resolve_effective_reasoning_effort(
+        let (effort, source) = crate::model_areas::resolve_effective_reasoning_effort(
             session.reasoning_effort,
             input.request_reasoning_effort,
             config.default_reasoning_effort,

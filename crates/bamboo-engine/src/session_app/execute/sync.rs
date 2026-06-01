@@ -63,7 +63,7 @@ pub fn evaluate_client_sync(
 /// client-facing view. Both `GET /history` and the execute sync snapshot
 /// must use this exact predicate so the client and server agree on the
 /// visible message_count and last_message_id.
-pub(crate) fn is_hidden_from_ui(message: &Message) -> bool {
+pub fn is_hidden_from_ui(message: &Message) -> bool {
     message
         .metadata
         .as_ref()

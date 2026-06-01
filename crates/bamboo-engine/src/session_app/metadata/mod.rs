@@ -37,9 +37,9 @@
 use bamboo_agent_core::{AgentEvent, Session, TitleSource};
 use chrono::Utc;
 
-use crate::app_state::AppState;
+use crate::app_context::AgentSessionContext;
 use crate::events::publish_replayable_session_event;
-use bamboo_engine::model_config_helper::GOLD_CONFIG_METADATA_KEY;
+use crate::model_config_helper::GOLD_CONFIG_METADATA_KEY;
 use crate::title_gen::is_untitled;
 
 /// Errors returned by [`SessionMetadataService`].
@@ -84,7 +84,7 @@ impl SessionMetadataService {
     /// `title_version` and `metadata_version`. Returns `Ok(None)` when the
     /// trimmed input equals the existing title (no event emitted).
     pub async fn set_title(
-        state: &AppState,
+        state: &dyn AgentSessionContext,
         session_id: &str,
         new_title: &str,
         if_match: Option<u64>,
@@ -95,7 +95,7 @@ impl SessionMetadataService {
         }
 
         // Lock: serialise all writes for this session.
-        let _guard = state.persistence.acquire_lock(session_id).await;
+        let _guard = state.persistence().acquire_lock(session_id).await;
 
         let mut session = load_latest(state, session_id).await?;
         ensure_if_match(&session, if_match)?;
@@ -109,7 +109,7 @@ impl SessionMetadataService {
         session.updated_at = Utc::now();
 
         state
-            .persistence
+            .persistence()
             .storage()
             .save_session(&session)
             .await
@@ -134,7 +134,7 @@ impl SessionMetadataService {
     /// On success bumps `title_version` and `metadata_version`, emits with
     /// the supplied [`TitleSource`].
     pub async fn apply_generated_title(
-        state: &AppState,
+        state: &dyn AgentSessionContext,
         session_id: &str,
         candidate: &str,
         source: TitleSource,
@@ -146,7 +146,7 @@ impl SessionMetadataService {
         }
 
         // Lock: serialise with any concurrent manual rename.
-        let _guard = state.persistence.acquire_lock(session_id).await;
+        let _guard = state.persistence().acquire_lock(session_id).await;
 
         let mut session = load_latest(state, session_id).await?;
         if !force && !is_untitled(&session.title) {
@@ -162,7 +162,7 @@ impl SessionMetadataService {
         session.updated_at = Utc::now();
 
         state
-            .persistence
+            .persistence()
             .storage()
             .save_session(&session)
             .await
@@ -184,13 +184,13 @@ impl SessionMetadataService {
     /// Toggle the `pinned` flag. Returns `Ok(None)` if the requested value
     /// matches the current state (no event emitted). Bumps `metadata_version`.
     pub async fn set_pinned(
-        state: &AppState,
+        state: &dyn AgentSessionContext,
         session_id: &str,
         pinned: bool,
         if_match: Option<u64>,
     ) -> Result<MetadataChange<bool>, MetadataError> {
         // Lock: serialise with runtime saves and other metadata writes.
-        let _guard = state.persistence.acquire_lock(session_id).await;
+        let _guard = state.persistence().acquire_lock(session_id).await;
 
         let mut session = load_latest(state, session_id).await?;
         ensure_if_match(&session, if_match)?;
@@ -203,7 +203,7 @@ impl SessionMetadataService {
         session.updated_at = Utc::now();
 
         state
-            .persistence
+            .persistence()
             .storage()
             .save_session(&session)
             .await
@@ -226,7 +226,7 @@ impl SessionMetadataService {
     /// `metadata_version` so runtime saves with stale session structs do not
     /// overwrite the user's current-session Gold settings.
     pub async fn set_gold_config_json(
-        state: &AppState,
+        state: &dyn AgentSessionContext,
         session_id: &str,
         gold_config_json: Option<String>,
         if_match: Option<u64>,
@@ -240,7 +240,7 @@ impl SessionMetadataService {
             }
         });
 
-        let _guard = state.persistence.acquire_lock(session_id).await;
+        let _guard = state.persistence().acquire_lock(session_id).await;
         let mut session = load_latest(state, session_id).await?;
         ensure_if_match(&session, if_match)?;
         let current = session
@@ -263,7 +263,7 @@ impl SessionMetadataService {
         session.updated_at = Utc::now();
 
         state
-            .persistence
+            .persistence()
             .storage()
             .save_session(&session)
             .await
@@ -276,9 +276,9 @@ impl SessionMetadataService {
 
 /// Load the latest session from persistent storage (bypasses the in-memory
 /// cache). Called while the per-session lock is held.
-async fn load_latest(state: &AppState, session_id: &str) -> Result<Session, MetadataError> {
+async fn load_latest(state: &dyn AgentSessionContext, session_id: &str) -> Result<Session, MetadataError> {
     state
-        .persistence
+        .persistence()
         .storage()
         .load_session(session_id)
         .await
@@ -287,10 +287,7 @@ async fn load_latest(state: &AppState, session_id: &str) -> Result<Session, Meta
 }
 
 /// Replace the in-memory cache entry with the freshly persisted session.
-async fn refresh_in_memory_cache(state: &AppState, session_id: &str, session: Session) {
-    let mut cache = state.sessions.write().await;
+async fn refresh_in_memory_cache(state: &dyn AgentSessionContext, session_id: &str, session: Session) {
+    let mut cache = state.sessions().write().await;
     cache.insert(session_id.to_string(), session);
 }
-
-#[cfg(test)]
-mod tests;

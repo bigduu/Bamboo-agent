@@ -4,6 +4,8 @@ pub mod app_context;
 pub mod events;
 pub mod mcp;
 pub mod metrics;
+pub mod session_app;
+pub mod title_gen;
 pub mod prompt_defaults;
 pub mod message_hooks;
 pub mod model_config_helper;

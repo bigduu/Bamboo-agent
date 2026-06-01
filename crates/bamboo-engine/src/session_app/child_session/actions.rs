@@ -18,7 +18,7 @@ pub async fn create_child_action(
     input: CreateChildInput,
 ) -> Result<CreateChildResult, ChildSessionError> {
     use bamboo_agent_core::Message;
-    use bamboo_engine::runner::refresh_prompt_snapshot;
+    use crate::runner::refresh_prompt_snapshot;
 
     let mut child = Session::new_child(
         input.child_id.clone(),

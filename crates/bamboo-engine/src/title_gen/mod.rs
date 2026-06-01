@@ -22,6 +22,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::app_context::AgentSessionContext;
 use crate::session_app::metadata::SessionMetadataService;
 
 mod fallback;
@@ -38,17 +39,17 @@ const MAX_USER_TEXT_FOR_TITLE: usize = 2000;
 
 /// Spawn a background task that generates an auto-title for a new (untitled) session.
 /// Skips if the session already has a non-default title.
-pub fn spawn_title_generation(state: Arc<crate::app_state::AppState>, session_id: String) {
+pub fn spawn_title_generation(state: Arc<dyn AgentSessionContext>, session_id: String) {
     spawn_inner(state, session_id, false);
 }
 
 /// Same as [`spawn_title_generation`] but bypasses the "is untitled" check -
 /// always regenerates. Used by `POST /sessions/{id}/regenerate-title`.
-pub fn spawn_title_generation_force(state: Arc<crate::app_state::AppState>, session_id: String) {
+pub fn spawn_title_generation_force(state: Arc<dyn AgentSessionContext>, session_id: String) {
     spawn_inner(state, session_id, true);
 }
 
-fn spawn_inner(state: Arc<crate::app_state::AppState>, session_id: String, force: bool) {
+fn spawn_inner(state: Arc<dyn AgentSessionContext>, session_id: String, force: bool) {
     if !state.title_gen_acquire(&session_id) {
         info!(session_id = %session_id, "title-gen: already in-flight, skipping");
         return;
@@ -67,7 +68,7 @@ fn spawn_inner(state: Arc<crate::app_state::AppState>, session_id: String, force
 }
 
 struct TitleGenGuard {
-    state: Arc<crate::app_state::AppState>,
+    state: Arc<dyn AgentSessionContext>,
     session_id: String,
 }
 
@@ -110,13 +111,13 @@ pub fn is_untitled(title: &str) -> bool {
 }
 
 async fn run_title_generation(
-    state: &Arc<crate::app_state::AppState>,
+    state: &Arc<dyn AgentSessionContext>,
     session_id: &str,
     force: bool,
 ) -> Result<(), String> {
     // 1. Reload session.
     let session = state
-        .storage
+        .storage()
         .load_session(session_id)
         .await
         .map_err(|e| format!("load_session: {e}"))?
@@ -165,7 +166,7 @@ async fn run_title_generation(
     //    concurrent user PATCH wins, bumps title_version and metadata_version,
     //    performs a plain save, refreshes the in-memory cache, and emits
     //    SessionTitleUpdated through the replayable helper.
-    match SessionMetadataService::apply_generated_title(state, session_id, &title, source, force)
+    match SessionMetadataService::apply_generated_title(state.as_ref(), session_id, &title, source, force)
         .await
         .map_err(|e| format!("apply_generated_title: {e}"))?
     {
@@ -220,12 +221,12 @@ fn first_user_text(session: &Session) -> Option<String> {
 /// (resolve, stream, consume, timeout) propagates back so the caller can fall
 /// through to the heuristic.
 async fn try_llm_title(
-    state: &Arc<crate::app_state::AppState>,
+    state: &Arc<dyn AgentSessionContext>,
     session: &Session,
     first_user_text: &str,
 ) -> Result<String, String> {
     // Determine provider name (session-aware, with global config fallback) and resolve fast model.
-    let config_snapshot = { state.config.read().await.clone() };
+    let config_snapshot = { state.config().read().await.clone() };
     let provider_name = if let Some(ref m) = session.model_ref {
         m.provider.clone()
     } else if let Some(p) = session.metadata.get("provider_name") {
@@ -234,10 +235,10 @@ async fn try_llm_title(
         config_snapshot.provider.clone()
     };
 
-    let resolved = bamboo_engine::model_config_helper::resolve_fast_model(
+    let resolved = crate::model_config_helper::resolve_fast_model(
         &config_snapshot,
         &provider_name,
-        &state.provider_registry,
+        state.provider_registry(),
     )
     .ok_or_else(|| "no fast model resolved".to_string())?;
 
@@ -254,7 +255,7 @@ async fn try_llm_title(
             .chat_stream_with_options(&messages, &[], Some(64), &model_name, Some(&options))
             .await
             .map_err(|e| format!("chat_stream: {e}"))?;
-        let output = bamboo_engine::runtime::stream::handler::consume_llm_stream_silent(
+        let output = crate::runtime::stream::handler::consume_llm_stream_silent(
             stream,
             &CancellationToken::new(),
             "title-gen",

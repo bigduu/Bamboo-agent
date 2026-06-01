@@ -9,7 +9,7 @@ use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::ProviderModelRef;
 
 use super::provider_model::{persist_legacy_model_provider, persist_model_ref};
-use bamboo_engine::model_config_helper::GOLD_CONFIG_METADATA_KEY;
+use crate::model_config_helper::GOLD_CONFIG_METADATA_KEY;
 
 /// Request-level input for session creation.
 pub struct CreateSessionInput {
@@ -73,7 +73,7 @@ pub fn build_new_session(input: &CreateSessionInput, config: &CreateSessionConfi
 
     if has_explicit_prompt {
         session.add_message(Message::system(base_prompt));
-        bamboo_engine::runner::refresh_prompt_snapshot(&mut session);
+        crate::runner::refresh_prompt_snapshot(&mut session);
     }
 
     session
@@ -243,7 +243,7 @@ mod tests {
         };
         let session = build_new_session(&input, &default_config());
 
-        let snapshot = bamboo_engine::runner::read_prompt_snapshot(&session)
+        let snapshot = crate::runner::read_prompt_snapshot(&session)
             .expect("prompt snapshot should exist");
         assert_eq!(snapshot.base_system_prompt, "Custom prompt");
         assert_eq!(snapshot.effective_system_prompt, "Custom prompt");

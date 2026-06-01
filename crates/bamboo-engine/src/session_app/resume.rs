@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::execute::{consume_pending_clarification_resume, has_pending_user_message};
 use super::types::{ResumeConfigSnapshot, ResumeOutcome};
-use bamboo_engine::execution::runner_lifecycle::RunnerReservation;
+use crate::execution::runner_lifecycle::RunnerReservation;
 
 // ---------------------------------------------------------------------------
 // Port trait

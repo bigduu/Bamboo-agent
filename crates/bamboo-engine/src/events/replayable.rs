@@ -44,7 +44,7 @@ use crate::app_context::AgentSessionContext;
 /// has already terminated), the cache step is silently skipped and the event
 /// is still broadcast. This matches the semantics of the runtime forwarder.
 pub async fn publish_replayable_session_event(
-    ctx: &(impl AgentSessionContext + ?Sized),
+    ctx: &dyn AgentSessionContext,
     session_id: &str,
     event: AgentEvent,
 ) {

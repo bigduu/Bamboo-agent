@@ -4,8 +4,8 @@ use std::sync::Arc;
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::ProviderModelRef;
 use bamboo_domain::Session;
-use bamboo_engine::config::GoldConfig;
-use bamboo_engine::ImageFallbackConfig;
+use crate::config::GoldConfig;
+use crate::ImageFallbackConfig;
 use bamboo_infrastructure::LLMProvider;
 
 /// Resolved configuration snapshot for execution.

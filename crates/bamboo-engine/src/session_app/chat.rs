@@ -2,9 +2,9 @@
 
 use bamboo_agent_core::{Role, Session};
 use bamboo_domain::Message;
-use bamboo_engine::context::{build_env_prompt_context, build_workspace_prompt_context};
-use bamboo_engine::runner::refresh_prompt_snapshot;
-use bamboo_engine::selection::normalize_selected_skill_ids;
+use crate::context::{build_env_prompt_context, build_workspace_prompt_context};
+use crate::runner::refresh_prompt_snapshot;
+use crate::selection::normalize_selected_skill_ids;
 use bamboo_infrastructure::paths::path_to_display_string;
 use sha2::{Digest, Sha256};
 use std::path::Path;

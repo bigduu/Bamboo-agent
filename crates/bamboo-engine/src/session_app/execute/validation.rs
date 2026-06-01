@@ -4,13 +4,13 @@ use bamboo_domain::Session;
 
 pub(crate) fn validate_image_fallback_for_session(
     session: &Session,
-    image_fallback: Option<&bamboo_engine::ImageFallbackConfig>,
+    image_fallback: Option<&crate::ImageFallbackConfig>,
 ) -> Result<(), String> {
-    use bamboo_engine::ImageFallbackMode;
+    use crate::ImageFallbackMode;
 
     if matches!(
         image_fallback,
-        Some(bamboo_engine::ImageFallbackConfig {
+        Some(crate::ImageFallbackConfig {
             mode: ImageFallbackMode::Error,
             ..
         })

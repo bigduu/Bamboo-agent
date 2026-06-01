@@ -6,7 +6,7 @@
 
 use bamboo_agent_core::{parse_prompt_external_memory_sections, Session};
 use bamboo_domain::types::PromptSnapshot;
-use bamboo_engine::runner::read_prompt_snapshot;
+use crate::runner::read_prompt_snapshot;
 
 // ---------------------------------------------------------------------------
 // Markers
@@ -22,17 +22,17 @@ const TASK_LIST_START_MARKER: &str = "<!-- BAMBOO_TASK_LIST_START -->";
 const TASK_LIST_END_MARKER: &str = "<!-- BAMBOO_TASK_LIST_END -->";
 use bamboo_domain::{LEGACY_TODO_LIST_END_MARKER, LEGACY_TODO_LIST_START_MARKER};
 
-const WORKSPACE_CONTEXT_START_MARKER: &str = bamboo_engine::context::WORKSPACE_CONTEXT_START_MARKER;
-const WORKSPACE_CONTEXT_END_MARKER: &str = bamboo_engine::context::WORKSPACE_CONTEXT_END_MARKER;
-const WORKSPACE_CONTEXT_PREFIX: &str = bamboo_engine::context::WORKSPACE_CONTEXT_PREFIX;
+const WORKSPACE_CONTEXT_START_MARKER: &str = crate::context::WORKSPACE_CONTEXT_START_MARKER;
+const WORKSPACE_CONTEXT_END_MARKER: &str = crate::context::WORKSPACE_CONTEXT_END_MARKER;
+const WORKSPACE_CONTEXT_PREFIX: &str = crate::context::WORKSPACE_CONTEXT_PREFIX;
 
 const INSTRUCTION_CONTEXT_START_MARKER: &str =
-    bamboo_engine::context::instruction::INSTRUCTION_CONTEXT_START_MARKER;
+    crate::context::instruction::INSTRUCTION_CONTEXT_START_MARKER;
 const INSTRUCTION_CONTEXT_END_MARKER: &str =
-    bamboo_engine::context::instruction::INSTRUCTION_CONTEXT_END_MARKER;
+    crate::context::instruction::INSTRUCTION_CONTEXT_END_MARKER;
 
-const ENV_CONTEXT_START_MARKER: &str = bamboo_engine::context::ENV_CONTEXT_START_MARKER;
-const ENV_CONTEXT_END_MARKER: &str = bamboo_engine::context::ENV_CONTEXT_END_MARKER;
+const ENV_CONTEXT_START_MARKER: &str = crate::context::ENV_CONTEXT_START_MARKER;
+const ENV_CONTEXT_END_MARKER: &str = crate::context::ENV_CONTEXT_END_MARKER;
 
 // ---------------------------------------------------------------------------
 // Public builder
@@ -104,13 +104,13 @@ pub fn build_system_prompt_snapshot(session: &Session, default_prompt: &str) -> 
 
     let workspace_context = metadata_value(session, "workspace_path")
         .as_deref()
-        .and_then(bamboo_engine::context::build_workspace_prompt_context)
+        .and_then(crate::context::build_workspace_prompt_context)
         .or(workspace_from_prompt);
 
     let instruction_context = metadata_value(session, "workspace_path")
         .as_deref()
         .and_then(|workspace_path| {
-            bamboo_engine::context::instruction::build_instruction_prompt_context(workspace_path)
+            crate::context::instruction::build_instruction_prompt_context(workspace_path)
         })
         .or(instruction_from_prompt);
 
@@ -274,7 +274,7 @@ fn split_legacy_workspace_context(prompt: &str) -> (String, Option<String>) {
     let Some(start_idx) = prompt.find(WORKSPACE_CONTEXT_PREFIX) else {
         return (prompt.trim().to_string(), None);
     };
-    let guidance = bamboo_engine::context::workspace_prompt_guidance();
+    let guidance = crate::context::workspace_prompt_guidance();
     let end_idx = if let Some(guidance_rel_idx) = prompt[start_idx..].find(&guidance) {
         start_idx + guidance_rel_idx + guidance.len()
     } else {
@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn snapshot_extracts_workspace_from_legacy_unwrapped_context() {
         let mut session = Session::new("session-legacy", "gpt-5");
-        let guidance = bamboo_engine::context::workspace_prompt_guidance();
+        let guidance = crate::context::workspace_prompt_guidance();
         session.add_message(Message::system(format!(
             "Base prompt\n\nExtra guidance\n\nWorkspace path: /tmp/legacy-workspace\n{guidance}\n\n<!-- BAMBOO_SKILL_CONTEXT_START -->\n## Skill System\n\nSkill details\n<!-- BAMBOO_SKILL_CONTEXT_END -->"
         )));
@@ -508,7 +508,7 @@ mod tests {
         session.add_message(Message::system("legacy system prompt"));
         session.metadata.insert(
             "runtime_prompt_snapshot".to_string(),
-            serde_json::to_string(&bamboo_engine::runner::PromptSnapshot {
+            serde_json::to_string(&crate::runner::PromptSnapshot {
                 base_system_prompt: "Shared base".to_string(),
                 enhancement_prompt: Some("Shared enhancement".to_string()),
                 workspace_context: Some("Shared workspace".to_string()),

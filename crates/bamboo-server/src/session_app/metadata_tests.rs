@@ -1,5 +1,11 @@
-use super::*;
-use bamboo_agent_core::Session;
+//! Server-side tests for the engine `SessionMetadataService`.
+//!
+//! These live in the server crate (not alongside the engine service) because
+//! they construct a full `AppState` to exercise the trait-based code path.
+
+use crate::app_state::AppState;
+use crate::session_app::metadata::{MetadataError, SessionMetadataService};
+use bamboo_agent_core::{AgentEvent, Session, TitleSource};
 
 async fn make_state() -> AppState {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -293,8 +299,8 @@ async fn concurrent_authoritative_title_writes_serialize() {
     let state_b = state.clone();
 
     let (a, b) = tokio::join!(
-        SessionMetadataService::set_title(&state_a, "c1", "Title A", None),
-        SessionMetadataService::set_title(&state_b, "c1", "Title B", None),
+        SessionMetadataService::set_title(state_a.as_ref(), "c1", "Title A", None),
+        SessionMetadataService::set_title(state_b.as_ref(), "c1", "Title B", None),
     );
 
     let a = a.expect("A ok").expect("A applied");
@@ -354,12 +360,12 @@ async fn manual_title_beats_generated_title_without_lying_event() {
 
     let manual = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        SessionMetadataService::set_title(&state_manual, "m1", "Manual Override", None).await
+        SessionMetadataService::set_title(state_manual.as_ref(), "m1", "Manual Override", None).await
     });
 
     let gen = tokio::spawn(async move {
         SessionMetadataService::apply_generated_title(
-            &state_gen,
+            state_gen.as_ref(),
             "m1",
             "Auto Generated",
             TitleSource::Auto,

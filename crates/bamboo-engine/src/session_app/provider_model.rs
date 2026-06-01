@@ -20,7 +20,7 @@ pub(crate) fn normalize_model_ref(raw: Option<&ProviderModelRef>) -> Option<Prov
     ))
 }
 
-pub(crate) fn derive_model_ref(
+pub fn derive_model_ref(
     raw_model_ref: Option<&ProviderModelRef>,
     raw_provider: Option<&str>,
     raw_model: Option<&str>,
@@ -33,7 +33,7 @@ pub(crate) fn derive_model_ref(
     })
 }
 
-pub(crate) fn session_effective_model_ref(session: &Session) -> Option<ProviderModelRef> {
+pub fn session_effective_model_ref(session: &Session) -> Option<ProviderModelRef> {
     derive_model_ref(
         session.model_ref.as_ref(),
         session.metadata.get("provider_name").map(String::as_str),
@@ -41,7 +41,7 @@ pub(crate) fn session_effective_model_ref(session: &Session) -> Option<ProviderM
     )
 }
 
-pub(crate) fn persist_model_ref(session: &mut Session, model_ref: &ProviderModelRef) {
+pub fn persist_model_ref(session: &mut Session, model_ref: &ProviderModelRef) {
     session.model = model_ref.model.clone();
     session.model_ref = Some(model_ref.clone());
     session
@@ -49,7 +49,7 @@ pub(crate) fn persist_model_ref(session: &mut Session, model_ref: &ProviderModel
         .insert("provider_name".to_string(), model_ref.provider.clone());
 }
 
-pub(crate) fn persist_legacy_model_provider(
+pub fn persist_legacy_model_provider(
     session: &mut Session,
     raw_model: Option<&str>,
     raw_provider: Option<&str>,
