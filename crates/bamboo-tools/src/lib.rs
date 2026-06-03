@@ -11,12 +11,16 @@ pub mod orchestrator;
 pub mod output_manager;
 pub mod parallel;
 pub mod permission;
+pub mod policy_aware;
 pub mod slash_commands;
 #[allow(clippy::module_inception)]
 pub mod tools;
 
 // Re-export executor types
 pub use executor::{BuiltinToolExecutor, BuiltinToolExecutorBuilder};
+
+// Re-export the policy-aware tool executor (subagent ToolPolicy enforcement)
+pub use policy_aware::PolicyAwareToolExecutor;
 
 // Re-export tool name utilities
 pub use bamboo_domain::tool_names::{
