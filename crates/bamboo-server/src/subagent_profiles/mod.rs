@@ -1,16 +1,16 @@
-//! Subagent profile composition for `bamboo-server`.
+//! Back-compat re-export shim for the subagent profile system.
 //!
-//! - [`builtin`] supplies the six default profiles
-//!   (`general-purpose` / `plan` / `researcher` / `coder` /
-//!   `reviewer` / `tester`).
-//! - [`loader`] composes builtin + user-global + project-level + env-pointed
-//!   override files into a single [`SubagentProfileRegistry`].
-//!
-//! This module is **standalone**: nothing in the runtime imports it yet (the
-//! registry will be plumbed into `AppState` in the same PR but no consumer
-//! reads from it). Subsequent PRs add the runtime wiring.
+//! The canonical implementation now lives in
+//! [`bamboo_engine::profiles`]. This shim keeps the existing server paths
+//! (`crate::subagent_profiles::{builtin, load_registry, LoaderError}`) alive
+//! without duplicating the profile definitions or loader logic.
 
-pub mod builtin;
-pub mod loader;
+pub use bamboo_engine::profiles::{builtin_profiles, load_registry, LoaderError};
 
-pub use loader::{load_registry, LoaderError};
+pub mod builtin {
+    pub use bamboo_engine::profiles::builtin::*;
+}
+
+pub mod loader {
+    pub use bamboo_engine::profiles::loader::*;
+}

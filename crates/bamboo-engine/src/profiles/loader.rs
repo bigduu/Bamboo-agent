@@ -1,5 +1,9 @@
 //! Layered loader that composes the final [`SubagentProfileRegistry`].
 //!
+//! This lives in `bamboo-engine` and is re-exported from the root facade;
+//! `bamboo-server` consumes it through a thin re-export shim
+//! (`crate::subagent_profiles`).
+//!
 //! Layers (each later one overrides earlier entries by `id`):
 //!
 //! 1. Built-in profiles ([`super::builtin::builtin_profiles`]).

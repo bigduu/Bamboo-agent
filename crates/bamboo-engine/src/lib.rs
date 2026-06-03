@@ -12,6 +12,7 @@ pub mod prompt_defaults;
 pub mod message_hooks;
 pub mod model_config_helper;
 pub mod model_areas;
+pub mod profiles;
 pub mod auto_dream;
 pub mod metrics_service;
 pub mod runtime;
@@ -46,6 +47,9 @@ pub use runtime::Agent;
 // Re-export from the ergonomic SDK surface (anti-fork single spawn core).
 pub use sdk::runner::{profile_runner, ProfileRunner, RunProfileInput};
 pub use sdk::spawn::run_child_spawn;
+
+// Re-export the subagent profile system (built-ins + layered loader).
+pub use profiles::{builtin_profiles, load_registry, LoaderError};
 
 // Sub-module re-exports for backward compatibility
 pub mod runner {
