@@ -1675,4 +1675,188 @@ mod tests {
             "child workspace should be set from create args"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // S-T5.2 — End-to-end policy enforcement for a read-only allowlist child.
+    //
+    // The `researcher` builtin profile is a read-only Allowlist. A researcher
+    // child must have mutating tools (Edit/Write) enforced by BOTH halves of
+    // the tool-policy machinery (TD-7):
+    //   1. Discovery (schema): the profile's `disabled_tools` — computed by
+    //      `disabled_tools_for_profile` over the real builtin tool surface —
+    //      contains Edit and Write, so they are absent from the advertised
+    //      schema for the child.
+    //   2. Execution (safety net): `PolicyAwareToolExecutor` rejects an Edit /
+    //      Write call from a `subagent_type=researcher` child at execute time,
+    //      while still permitting allowlisted tools (Read).
+    //
+    // This pins the anti-fork invariant: the same canonical profile drives both
+    // layers; there is no forked policy definition.
+    // -----------------------------------------------------------------------
+
+    /// A recording executor used to prove the runtime safety net forwards vs
+    /// blocks calls. Forwards always succeed; blocked calls never reach it.
+    struct PolicyRecordingExecutor {
+        executed: Arc<RwLock<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for PolicyRecordingExecutor {
+        async fn execute(
+            &self,
+            call: &ToolCall,
+        ) -> std::result::Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError>
+        {
+            self.executed.write().await.push(call.function.name.clone());
+            Ok(bamboo_agent_core::tools::ToolResult {
+                success: true,
+                result: "ok".to_string(),
+                display_preference: None,
+            })
+        }
+
+        async fn execute_with_context(
+            &self,
+            call: &ToolCall,
+            _ctx: bamboo_agent_core::tools::ToolExecutionContext<'_>,
+        ) -> std::result::Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError>
+        {
+            self.executed.write().await.push(call.function.name.clone());
+            Ok(bamboo_agent_core::tools::ToolResult {
+                success: true,
+                result: "ok".to_string(),
+                display_preference: None,
+            })
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    fn researcher_builtin_profile() -> bamboo_domain::subagent::SubagentProfile {
+        crate::subagent_profiles::builtin::builtin_profiles()
+            .into_iter()
+            .find(|p| p.id == "researcher")
+            .expect("researcher builtin profile must exist")
+    }
+
+    fn make_tool_call(name: &str) -> ToolCall {
+        ToolCall {
+            id: "policy_call".to_string(),
+            tool_type: "function".to_string(),
+            function: bamboo_agent_core::tools::FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn researcher_disabled_tools_block_edit_and_write_in_schema() {
+        // Layer 1 (discovery): the schema-level disabled set excludes mutating
+        // tools for the read-only researcher allowlist.
+        let researcher = researcher_builtin_profile();
+        let all_tool_names: Vec<String> = bamboo_domain::tool_names::BUILTIN_TOOL_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let disabled =
+            bamboo_domain::subagent::disabled_tools_for_profile(&researcher.tools, &all_tool_names);
+
+        assert!(
+            disabled.iter().any(|t| t == "Edit"),
+            "researcher schema must disable Edit; disabled={disabled:?}"
+        );
+        assert!(
+            disabled.iter().any(|t| t == "Write"),
+            "researcher schema must disable Write; disabled={disabled:?}"
+        );
+        // Sanity: an allowlisted read-only tool stays enabled.
+        assert!(
+            !disabled.iter().any(|t| t == "Read"),
+            "researcher schema must keep Read enabled; disabled={disabled:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn researcher_child_blocks_edit_and_write_at_execute() {
+        // Layer 2 (execution safety net): a researcher child has Edit / Write
+        // rejected at execute time by PolicyAwareToolExecutor, while Read is
+        // still forwarded. Uses the canonical builtin registry + the new
+        // `bamboo_tools` path via the server's re-export shim.
+        let executed = Arc::new(RwLock::new(Vec::<String>::new()));
+        let inner: Arc<dyn ToolExecutor> = Arc::new(PolicyRecordingExecutor {
+            executed: executed.clone(),
+        });
+
+        let registry = Arc::new(
+            bamboo_domain::subagent::SubagentProfileRegistry::builder()
+                .extend(crate::subagent_profiles::builtin::builtin_profiles())
+                .build()
+                .expect("builtin subagent profiles must build"),
+        );
+
+        let mut child =
+            Session::new_child("researcher-child", "root", "test-model", "Research child");
+        child
+            .metadata
+            .insert("subagent_type".to_string(), "researcher".to_string());
+        let mut sessions = HashMap::new();
+        sessions.insert("researcher-child".to_string(), child);
+        let sessions = Arc::new(RwLock::new(sessions));
+
+        let executor =
+            crate::tools::PolicyAwareToolExecutor::new(inner, registry, sessions);
+
+        let ctx = bamboo_agent_core::tools::ToolExecutionContext {
+            session_id: Some("researcher-child"),
+            tool_call_id: "policy_call",
+            event_tx: None,
+            available_tool_schemas: None,
+        };
+
+        // Edit blocked at execute.
+        let edit_err = executor
+            .execute_with_context(&make_tool_call("Edit"), ctx.clone())
+            .await
+            .expect_err("Edit must be blocked for a researcher child");
+        match edit_err {
+            bamboo_agent_core::tools::ToolError::Execution(msg) => {
+                assert!(msg.contains("Edit"), "error should name the tool: {msg}");
+                assert!(
+                    msg.contains("researcher"),
+                    "error should name the subagent_type: {msg}"
+                );
+            }
+            other => panic!("expected Execution error, got {other:?}"),
+        }
+
+        // Write blocked at execute.
+        let write_err = executor
+            .execute_with_context(&make_tool_call("Write"), ctx.clone())
+            .await
+            .expect_err("Write must be blocked for a researcher child");
+        assert!(
+            matches!(
+                write_err,
+                bamboo_agent_core::tools::ToolError::Execution(ref msg) if msg.contains("Write")
+            ),
+            "Write must be rejected with an Execution error naming the tool"
+        );
+
+        // Allowlisted Read still forwarded to the inner executor.
+        executor
+            .execute_with_context(&make_tool_call("Read"), ctx)
+            .await
+            .expect("Read is allowlisted and must be forwarded");
+
+        // Only Read reached the inner executor; Edit/Write were stopped above it.
+        assert_eq!(
+            executed.read().await.as_slice(),
+            &["Read".to_string()],
+            "only the allowlisted Read should reach the inner executor"
+        );
+    }
 }
