@@ -699,10 +699,10 @@ fn discoverable_tools_title(language: GuideLanguage) -> &'static str {
 fn discoverable_tools_description(language: GuideLanguage) -> &'static str {
     match language {
         GuideLanguage::Chinese => {
-            "These lower-frequency tools are available but not fully expanded by default to save context. Activate them when needed for full parameter details and examples."
+            "These lower-frequency tools are available but listed here only in brief to save context. Their full parameter details and examples become visible once they are activated for this session (activation is handled by the app or user, not via a tool call)."
         }
         GuideLanguage::English => {
-            "These lower-frequency tools are available but not fully expanded by default to save context. Activate them when needed for full parameter details and examples."
+            "These lower-frequency tools are available but listed here only in brief to save context. Their full parameter details and examples become visible once they are activated for this session (activation is handled by the app or user, not via a tool call)."
         }
     }
 }

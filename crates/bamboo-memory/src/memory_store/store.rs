@@ -7,15 +7,20 @@ use tokio::fs;
 use bamboo_agent_core::workspace_state;
 
 use super::{
+    BlobScanItem, BlobScanReport,
+};
+use super::{
     build_dream_view, build_memory_markdown_view, build_recent_markdown_view,
     build_stale_markdown_view, derive_summary, detect_entities, extract_keywords,
     make_query_cursor, match_memory_query, normalize_tags, now_rfc3339, parse_markdown_document,
     parse_query_cursor, parse_rfc3339, project_key_from_path, render_markdown_document,
     short_stable_hash, sort_memories_desc, validate_memory_title, validate_session_id,
     validate_session_topic, AuditLogEntry, GraphIndex, GraphIndexItem, LexicalIndex,
-    LexicalIndexItem, MemoryContradictionResult, MemoryInspectResult, MemoryMergeResult,
+    LexicalIndexItem, MemoryContradictionResult, MemoryDuplicateCandidate, MemoryInspectResult,
+    MemoryMergeResult,
     MemoryPathResolver, MemoryPurgeResult, MemoryQueryItem, MemoryQueryOptions, MemoryQueryResult,
-    RecentIndex, RecentIndexItem, StaleCandidateItem, StaleCandidatesIndex, TaxonomyIndex,
+    MemorySplitPiece, MemorySplitResult, RecentIndex, RecentIndexItem, StaleCandidateItem,
+    StaleCandidatesIndex, TaxonomyIndex,
     CONTRADICTION_AUDIT_LOG, DEFAULT_MAX_CHARS, DEFAULT_QUERY_LIMIT, DEFAULT_SESSION_TOPIC,
     DREAM_VIEW_FILE, GRAPH_INDEX_FILE, LEXICAL_INDEX_FILE, MAX_MAX_CHARS, MAX_QUERY_LIMIT,
     MEMORY_SCHEMA_VERSION, MEMORY_VIEW_FILE, MERGE_AUDIT_LOG, PURGE_AUDIT_LOG, RECENT_INDEX_FILE,
@@ -27,6 +32,13 @@ use super::{
     DurableMemoryRetrieval, DurableMemorySource, DurableMemoryStatus, DurableMemoryType,
     MemoryScope, SessionState,
 };
+
+/// Hard structural cap on a durable memory body (characters). Appends that would
+/// push a body past this are refused: the auto-merge path falls back to creating a
+/// new atomic memory, and the explicit `merge` path fails loudly. This makes it
+/// structurally impossible for a memory to grow into a multi-topic / transcript
+/// "blob". Purely deterministic — no model or embedding involved.
+const MAX_DURABLE_MEMORY_BODY_CHARS: usize = 4000;
 
 #[derive(Debug, Clone)]
 pub struct MemoryStore {
@@ -559,6 +571,14 @@ impl MemoryStore {
             if let Some(mut existing) = self
                 .find_similar_memory(scope, project_key, r#type, title, &tags)
                 .await?
+                // Structural guard: never grow a memory into a blob. If appending
+                // would exceed the body cap, skip the merge and fall through to
+                // create a new atomic memory instead.
+                .filter(|existing| {
+                    existing.body.contains(content)
+                        || existing.body.chars().count() + 9 + content.chars().count()
+                            <= MAX_DURABLE_MEMORY_BODY_CHARS
+                })
             {
                 if !existing.body.contains(content) {
                     existing.body = format!("{}\n\n---\n\n{}", existing.body.trim_end(), content);
@@ -720,6 +740,270 @@ impl MemoryStore {
         )
         .await?;
         Ok(Some(doc))
+    }
+
+    /// Split a multi-topic "blob" memory into N atomic memories.
+    ///
+    /// Each piece becomes a new active memory that `supersedes` the original; the
+    /// original is then marked `Superseded` (kept for lineage, hidden from recall).
+    /// The caller (an LLM) decides the pieces; this only persists them with the
+    /// body size cap enforced, so a split can never re-create a blob.
+    pub async fn split_memory(
+        &self,
+        id: &str,
+        preferred_project_key: Option<&str>,
+        pieces: &[MemorySplitPiece],
+        session_id: Option<&str>,
+        actor: &str,
+    ) -> io::Result<Option<MemorySplitResult>> {
+        let Some(mut source) = self.get_memory(id, preferred_project_key).await? else {
+            return Ok(None);
+        };
+        if pieces.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "split requires at least one piece",
+            ));
+        }
+
+        // Validate every piece up front so a bad piece never leaves a partial split.
+        for piece in pieces {
+            validate_memory_title(&piece.title)?;
+            let content = piece.content.trim();
+            if content.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "split piece content cannot be empty",
+                ));
+            }
+            if content.chars().count() > MAX_DURABLE_MEMORY_BODY_CHARS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "split piece exceeds the durable memory size cap; make each piece a single atomic fact",
+                ));
+            }
+        }
+
+        let scope = source.frontmatter.scope;
+        let project_key_owned = source.frontmatter.project_key.clone();
+        let project_key = project_key_owned.as_deref();
+        let source_id = source.frontmatter.id.clone();
+        let source_type = source.frontmatter.r#type;
+        let source_confidence = source.frontmatter.confidence.clone();
+        let source_sources = source.frontmatter.sources.clone();
+
+        let mut new_ids = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+            let title = validate_memory_title(&piece.title)?;
+            let content = piece.content.trim();
+            if content.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "split piece content cannot be empty",
+                ));
+            }
+            if content.chars().count() > MAX_DURABLE_MEMORY_BODY_CHARS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "split piece exceeds the durable memory size cap; make each piece a single atomic fact",
+                ));
+            }
+            let r#type = piece.r#type.unwrap_or(source_type);
+            let tags = normalize_tags(piece.tags.iter().map(String::as_str));
+
+            let new_id = self.allocate_memory_id(scope, project_key, title).await?;
+            let now = now_rfc3339();
+            let project_key_field = match scope {
+                MemoryScope::Project => Some(project_key.unwrap_or("unknown").to_string()),
+                _ => None,
+            };
+            let frontmatter = DurableMemoryFrontmatter {
+                id: new_id.clone(),
+                title: title.to_string(),
+                r#type,
+                scope,
+                project_key: project_key_field,
+                status: DurableMemoryStatus::Active,
+                freshness: Some("high".to_string()),
+                confidence: source_confidence.clone(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                created_by: CreatedBy {
+                    kind: "memory_split".to_string(),
+                    id: session_id.map(|value| value.to_string()),
+                    actor: Some(actor.to_string()),
+                },
+                updated_by: CreatedBy {
+                    kind: "memory_split".to_string(),
+                    id: None,
+                    actor: Some(actor.to_string()),
+                },
+                sources: source_sources.clone(),
+                relations: DurableMemoryRelations {
+                    supersedes: vec![source_id.clone()],
+                    ..DurableMemoryRelations::default()
+                },
+                tags: tags.clone(),
+                retrieval: DurableMemoryRetrieval {
+                    keywords: extract_keywords(title, content, &tags),
+                    entities: detect_entities(title, content),
+                    embedding_ready: true,
+                    last_accessed_at: None,
+                },
+            };
+            let doc = DurableMemoryDocument {
+                path: self.resolver.topic_path(scope, project_key, &new_id),
+                frontmatter,
+                body: content.to_string(),
+            };
+            self.write_document(&doc).await?;
+            new_ids.push(new_id);
+        }
+
+        self.set_memory_status(&mut source, DurableMemoryStatus::Superseded, "memory_split", actor)
+            .await?;
+
+        self.append_audit(
+            scope,
+            project_key,
+            MERGE_AUDIT_LOG,
+            AuditLogEntry {
+                timestamp: now_rfc3339(),
+                action: "split".to_string(),
+                scope,
+                memory_id: Some(source_id.clone()),
+                session_id: session_id.map(|value| value.to_string()),
+                topic: None,
+                summary: format!(
+                    "Split memory '{}' into {} atomic memories.",
+                    source.frontmatter.title,
+                    new_ids.len()
+                ),
+                metadata: Some(serde_json::json!({
+                    "project_key": project_key,
+                    "new_ids": new_ids,
+                })),
+            },
+        )
+        .await?;
+        self.refresh_scope_artifacts(scope, project_key).await?;
+
+        Ok(Some(MemorySplitResult {
+            source_id,
+            target_scope: scope,
+            project_key: project_key_owned.clone(),
+            new_ids,
+        }))
+    }
+
+    /// Find existing durable memories most lexically similar to a candidate, for
+    /// duplicate review. Returns a ranked shortlist (content-keyword Jaccard); it
+    /// NEVER merges — the caller (an LLM) judges sameness and then writes/merges/
+    /// splits explicitly. Embedding-free: deterministic recall, LLM precision.
+    pub async fn find_duplicate_candidates(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        r#type: Option<DurableMemoryType>,
+        title: &str,
+        content: &str,
+        tags: &[String],
+        limit: usize,
+    ) -> io::Result<Vec<MemoryDuplicateCandidate>> {
+        let project_key = self.require_project_key(scope, project_key)?;
+        let candidate_keywords: HashSet<String> =
+            extract_keywords(title, content, tags).into_iter().collect();
+        if candidate_keywords.is_empty() {
+            return Ok(Vec::new());
+        }
+        let docs = self.list_memory_documents(scope, project_key).await?;
+        let mut scored: Vec<MemoryDuplicateCandidate> = docs
+            .into_iter()
+            .filter(|doc| {
+                doc.frontmatter.status == DurableMemoryStatus::Active
+                    && r#type.map_or(true, |wanted| doc.frontmatter.r#type == wanted)
+            })
+            .filter_map(|doc| {
+                let doc_keywords: HashSet<String> =
+                    doc.frontmatter.retrieval.keywords.iter().cloned().collect();
+                let intersection = candidate_keywords.intersection(&doc_keywords).count();
+                if intersection == 0 {
+                    return None;
+                }
+                let union = candidate_keywords.union(&doc_keywords).count();
+                let score = (intersection as f64 / union as f64 * 100.0).round() / 100.0;
+                Some(MemoryDuplicateCandidate {
+                    id: doc.frontmatter.id.clone(),
+                    title: doc.frontmatter.title.clone(),
+                    r#type: doc.frontmatter.r#type,
+                    scope: doc.frontmatter.scope,
+                    score,
+                    snippet: derive_summary(&doc.body, 200),
+                })
+            })
+            .collect();
+        scored.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        scored.truncate(limit.max(1));
+        Ok(scored)
+    }
+
+    /// Deterministic blob prefilter (NO LLM): flag active memories that look like
+    /// multi-topic / transcript "blobs" — `min_appended_sections`+ `---` accretions
+    /// or a body over the size cap — ranked worst-first. This is the free, always-on
+    /// half of the gardener; the returned items are the worklist for LLM-driven split.
+    pub async fn scan_blob_candidates(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        min_appended_sections: usize,
+        limit: usize,
+    ) -> io::Result<BlobScanReport> {
+        let project_key = self.require_project_key(scope, project_key)?;
+        let docs = self.list_memory_documents(scope, project_key).await?;
+        let scanned = docs.len();
+        let mut items: Vec<BlobScanItem> = docs
+            .into_iter()
+            .filter(|doc| doc.frontmatter.status == DurableMemoryStatus::Active)
+            .filter_map(|doc| {
+                let appended_sections = doc.body.split("\n\n---\n\n").count().saturating_sub(1);
+                let body_chars = doc.body.chars().count();
+                let over_cap = body_chars > MAX_DURABLE_MEMORY_BODY_CHARS;
+                if appended_sections >= min_appended_sections || over_cap {
+                    Some(BlobScanItem {
+                        id: doc.frontmatter.id.clone(),
+                        title: doc.frontmatter.title.clone(),
+                        appended_sections,
+                        body_chars,
+                        over_cap,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        items.sort_by(|left, right| {
+            right
+                .appended_sections
+                .cmp(&left.appended_sections)
+                .then(right.body_chars.cmp(&left.body_chars))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let flagged = items.len();
+        items.truncate(limit.max(1));
+        Ok(BlobScanReport {
+            scope,
+            project_key: project_key.map(ToString::to_string),
+            scanned,
+            flagged,
+            threshold: min_appended_sections,
+            items,
+        })
     }
 
     pub async fn purge_memories(
@@ -921,6 +1205,17 @@ impl MemoryStore {
         let mut appended = false;
         let mut tags_updated = false;
         if !doc.body.contains(content) {
+            // Structural guard: an explicit merge must not grow a memory into a blob.
+            // Fail loudly so the caller consolidates/rewrites into a single coherent
+            // statement or creates a separate memory instead of appending.
+            if doc.body.chars().count() + 9 + content.chars().count()
+                > MAX_DURABLE_MEMORY_BODY_CHARS
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "merge would exceed the durable memory size cap; consolidate the memory into one coherent statement or create a separate memory instead of appending",
+                ));
+            }
             doc.body = format!("{}\n\n---\n\n{}", doc.body.trim_end(), content);
             changed = true;
             appended = true;
@@ -1717,6 +2012,227 @@ mod tests {
             .unwrap();
         let topics = store.list_session_topics("session-1").await.unwrap();
         assert_eq!(topics, vec!["backend", "default"]);
+    }
+
+    #[tokio::test]
+    async fn split_memory_creates_atomic_children_and_supersedes_source() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        let blob = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::User,
+                "mixed blob",
+                "fact A\n\n---\n\nfact B",
+                &[],
+                Some("s1"),
+                "test",
+                false,
+            )
+            .await
+            .unwrap();
+
+        let pieces = vec![
+            MemorySplitPiece {
+                title: "fact A".to_string(),
+                r#type: None,
+                content: "fact A".to_string(),
+                tags: vec!["a".to_string()],
+            },
+            MemorySplitPiece {
+                title: "fact B".to_string(),
+                r#type: Some(DurableMemoryType::Reference),
+                content: "fact B".to_string(),
+                tags: vec![],
+            },
+        ];
+
+        let result = store
+            .split_memory(&blob.frontmatter.id, None, &pieces, Some("s1"), "test")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.new_ids.len(), 2);
+        assert_eq!(result.source_id, blob.frontmatter.id);
+
+        let source = store
+            .get_memory(&blob.frontmatter.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.frontmatter.status, DurableMemoryStatus::Superseded);
+
+        for new_id in &result.new_ids {
+            let child = store.get_memory(new_id, None).await.unwrap().unwrap();
+            assert_eq!(child.frontmatter.status, DurableMemoryStatus::Active);
+            assert!(child
+                .frontmatter
+                .relations
+                .supersedes
+                .contains(&blob.frontmatter.id));
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_blob_candidates_flags_merged_docs_worst_first() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        // Atomic doc: 0 appended sections — must NOT be flagged.
+        store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::User,
+                "atomic",
+                "single fact",
+                &[],
+                Some("s"),
+                "t",
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Simulate a blob via explicit merges (each appends one `---` section).
+        let blob = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::User,
+                "blobby",
+                "fact one",
+                &[],
+                Some("s"),
+                "t",
+                false,
+            )
+            .await
+            .unwrap();
+        for extra in ["fact two", "fact three", "fact four"] {
+            store
+                .merge_memory(&blob.frontmatter.id, None, extra, &[], Some("s"), "t", &[])
+                .await
+                .unwrap();
+        }
+
+        let report = store
+            .scan_blob_candidates(MemoryScope::Global, None, 3, 20)
+            .await
+            .unwrap();
+
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.flagged, 1);
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].title, "blobby");
+        assert_eq!(report.items[0].appended_sections, 3);
+    }
+
+    #[tokio::test]
+    async fn find_duplicate_candidates_ranks_overlap_and_skips_unrelated() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Project,
+                "Release freeze rule",
+                "Mobile release freeze begins Tuesday for the release cut.",
+                &[],
+                Some("s"),
+                "t",
+                false,
+            )
+            .await
+            .unwrap();
+        store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Project,
+                "Unrelated cat fact",
+                "The quiet cat napped under the warm windowsill.",
+                &[],
+                Some("s"),
+                "t",
+                false,
+            )
+            .await
+            .unwrap();
+
+        let candidates = store
+            .find_duplicate_candidates(
+                MemoryScope::Global,
+                None,
+                None,
+                "Release freeze",
+                "Mobile release freeze begins Tuesday",
+                &[],
+                5,
+            )
+            .await
+            .unwrap();
+
+        assert!(!candidates.is_empty());
+        assert_eq!(candidates[0].title, "Release freeze rule");
+        assert!(candidates[0].score > 0.0);
+        // The unrelated memory shares no keywords and must be filtered out.
+        assert!(!candidates.iter().any(|c| c.title == "Unrelated cat fact"));
+    }
+
+    #[tokio::test]
+    async fn split_memory_rejects_oversized_piece_without_partial_write() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        let blob = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::User,
+                "blob",
+                "seed",
+                &[],
+                Some("s1"),
+                "test",
+                false,
+            )
+            .await
+            .unwrap();
+
+        let big = "y".repeat(MAX_DURABLE_MEMORY_BODY_CHARS + 1);
+        let pieces = vec![
+            MemorySplitPiece {
+                title: "ok piece".to_string(),
+                r#type: None,
+                content: "small".to_string(),
+                tags: vec![],
+            },
+            MemorySplitPiece {
+                title: "too big".to_string(),
+                r#type: None,
+                content: big,
+                tags: vec![],
+            },
+        ];
+
+        assert!(store
+            .split_memory(&blob.frontmatter.id, None, &pieces, Some("s1"), "test")
+            .await
+            .is_err());
+
+        // Up-front validation means nothing was written and the source is untouched.
+        let source = store
+            .get_memory(&blob.frontmatter.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.frontmatter.status, DurableMemoryStatus::Active);
     }
 
     #[tokio::test]

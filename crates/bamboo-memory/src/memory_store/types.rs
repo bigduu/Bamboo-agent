@@ -258,6 +258,62 @@ pub struct MemoryMergeResult {
     pub path: PathBuf,
 }
 
+/// One atomic piece produced when splitting a multi-topic "blob" memory.
+#[derive(Debug, Clone)]
+pub struct MemorySplitPiece {
+    pub title: String,
+    pub r#type: Option<DurableMemoryType>,
+    pub content: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemorySplitResult {
+    pub source_id: String,
+    pub target_scope: MemoryScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub new_ids: Vec<String>,
+}
+
+/// A lexically-similar existing memory surfaced for duplicate review. Produced by
+/// `find_duplicate_candidates`; never auto-merged — the caller (an LLM) judges
+/// whether it is the same fact and then writes/merges/splits explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryDuplicateCandidate {
+    pub id: String,
+    pub title: String,
+    pub r#type: DurableMemoryType,
+    pub scope: MemoryScope,
+    pub score: f64,
+    pub snippet: String,
+}
+
+/// One memory flagged by the deterministic blob prefilter (no LLM involved).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlobScanItem {
+    pub id: String,
+    pub title: String,
+    /// Number of `---`-separated sections beyond the first (merge accretions).
+    pub appended_sections: usize,
+    pub body_chars: usize,
+    pub over_cap: bool,
+}
+
+/// Deterministic prefilter report: which active memories look like multi-topic /
+/// transcript "blobs" and are worth LLM-driven split. Free to compute; this is the
+/// always-on, zero-cost half of the gardener.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlobScanReport {
+    pub scope: MemoryScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub scanned: usize,
+    pub flagged: usize,
+    pub threshold: usize,
+    pub items: Vec<BlobScanItem>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryPurgeResult {
     pub scope: MemoryScope,

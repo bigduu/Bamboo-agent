@@ -26,7 +26,8 @@ pub use types::{
     DurableMemoryRef, DurableMemoryRelations, DurableMemoryRetrieval, DurableMemorySource,
     DurableMemoryStatus, DurableMemoryType, MemoryContradictionResult, MemoryInspectResult,
     MemoryMergeResult, MemoryPurgeResult, MemoryQueryCursor, MemoryQueryItem, MemoryQueryOptions,
-    MemoryQueryResult, MemoryScope, SessionState,
+    BlobScanItem, BlobScanReport, MemoryDuplicateCandidate, MemoryQueryResult, MemoryScope,
+    MemorySplitPiece, MemorySplitResult, SessionState,
 };
 
 pub const MEMORY_SCHEMA_VERSION: u32 = 1;

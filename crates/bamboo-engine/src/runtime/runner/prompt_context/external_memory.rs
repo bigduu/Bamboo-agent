@@ -614,19 +614,23 @@ fn build_external_memory_render_parts(
         "- **Project Dream Summary**: synthesized project-scoped orientation when available\n",
     );
     section.push_str(
-        "- **Dream Summaries**: synthesized orientation only, lower-trust than durable memory and current observed state\n\n",
+        "- **Global Dream Summary (fallback)**: synthesized auxiliary orientation, lower-trust than durable memory and current observed state\n\n",
     );
     section.push_str(
-        "Priority order for decisions: current observed state from tools/files > session note > relevant durable memories > project durable memory index > project Dream > global Dream fallback.\n",
+        "Priority order for decisions: current observed state from tools/files > session note > relevant durable memories > project durable memory index > project Dream > global Dream fallback. This order reflects working-context recency, not factual authority: a session note ranks high because it is the live workstream, so if it conflicts with canonical durable/project memory on an established fact, verify before preferring the note.\n",
     );
     section.push_str(
         "If indexed or recalled memory appears to describe files, symbols, configs, or runtime state, verify it against current tools/files before asserting it as fact.\n\n",
     );
     section.push_str(
-        "Use the `memory` tool for durable project/global knowledge that should persist across sessions.\n\n",
+        "Two distinct surfaces: use the `session_note` tool for current-session notes (usage shown below), and the `memory` tool only for durable project/global knowledge that should persist across sessions.\n\n",
     );
     section.push_str("- If you learn durable information that will help later in other sessions (preferences, confirmed project decisions, stable references, non-derivable context), store it with the `memory` tool instead of only leaving it in session_note.\n");
+    section.push_str("- Proactively recall: when the user refers to their own preferences, past decisions, or subjective/personal context you don't already know — including first-person questions about themselves ('what do I...', 'did I...', '我...?') — call `memory` action=query BEFORE answering. Do not reply that you don't know about the user's own preferences, history, or prior decisions without first querying memory; the auto-injected memories above are only a keyword-matched shortlist and may have missed it.\n");
     section.push_str("- For durable memory, prefer `memory` action=query first, then `memory` action=get for the specific item you need, and use `memory` action=write/merge only when the fact should become canonical memory.\n");
+    section.push_str("- One memory = one fact/decision/preference. Do not bundle unrelated facts into a single memory.\n");
+    section.push_str("- Give each durable memory a specific, descriptive title that summarizes its own content; recall is keyword-based, so a misleading title makes the memory unfindable.\n");
+    section.push_str("- Query before writing: if a memory about the same fact already exists, update or merge it instead of creating a near-duplicate. Only merge content that is the SAME fact — never append an unrelated fact to an existing memory.\n");
     section.push_str("- Do NOT store secrets/tokens.\n");
     section.push_str(
         "- Keep the session note concise and factual. If it gets too long, compress it (rewrite a shorter version) and replace it.\n\n",

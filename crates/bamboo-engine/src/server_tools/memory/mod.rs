@@ -87,7 +87,7 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Unified memory management tool for Bamboo. Use session_* actions for session continuity notes, and query/get/write/purge/inspect/rebuild for durable project/global memory backed by canonical topic files and derived indexes."
+        "Unified memory management tool for Bamboo. Use session_* actions for session continuity notes, and query/get/write/merge/split/purge/inspect/rebuild for durable project/global memory backed by canonical topic files and derived indexes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -104,11 +104,14 @@ impl Tool for MemoryTool {
                         "session_list_topics",
                         "query",
                         "get",
+                        "find_duplicates",
                         "write",
                         "merge",
+                        "split",
                         "purge",
                         "inspect",
-                        "rebuild"
+                        "rebuild",
+                        "scan_blobs"
                     ]
                 },
                 "scope": {"type": "string", "enum": ["session", "project", "global"]},
@@ -120,6 +123,7 @@ impl Tool for MemoryTool {
                 "title": {"type": "string"},
                 "content": {"type": "string"},
                 "tags": {"type": "array", "items": {"type": "string"}},
+                "pieces": {"type": "array", "items": {"type": "object"}},
                 "filters": {"type": "object"},
                 "options": {"type": "object"},
                 "reason": {"type": "string"}
@@ -136,9 +140,8 @@ impl Tool for MemoryTool {
             .trim()
             .to_ascii_lowercase();
         match action.as_str() {
-            "session_read" | "session_list_topics" | "query" | "get" | "inspect" => {
-                bamboo_tools::ToolMutability::ReadOnly
-            }
+            "session_read" | "session_list_topics" | "query" | "get" | "find_duplicates"
+            | "scan_blobs" | "inspect" => bamboo_tools::ToolMutability::ReadOnly,
             _ => bamboo_tools::ToolMutability::Mutating,
         }
     }
@@ -365,7 +368,7 @@ impl Tool for MemoryTool {
                         "main-model",
                         options
                             .and_then(|value| value.allow_merge_if_similar)
-                            .unwrap_or(true),
+                            .unwrap_or(false),
                     )
                     .await
                     .map_err(|error| {
@@ -466,6 +469,149 @@ impl Tool for MemoryTool {
                         display_preference: Some("json".to_string()),
                     })
                 }
+            }
+            MemoryArgs::FindDuplicates {
+                scope,
+                title,
+                content,
+                r#type,
+                tags,
+                project_key,
+                options,
+            } => {
+                let scope = Self::parse_scope(Some(&scope))?;
+                if scope == MemoryScope::Session {
+                    return Err(ToolError::InvalidArguments(
+                        "find_duplicates supports durable scopes only".to_string(),
+                    ));
+                }
+                let r#type = match r#type.as_deref() {
+                    Some(value) => Some(Self::parse_type(value)?),
+                    None => None,
+                };
+                let project_key = self
+                    .resolve_project_key(project_key.as_deref(), Some(session_id))
+                    .await;
+                let limit = options
+                    .and_then(|value| value.limit)
+                    .unwrap_or(5)
+                    .clamp(1, MAX_QUERY_LIMIT);
+                let candidates = self
+                    .memory_store
+                    .find_duplicate_candidates(
+                        scope,
+                        project_key.as_deref(),
+                        r#type,
+                        &title,
+                        content.as_deref().unwrap_or(""),
+                        &tags,
+                        limit,
+                    )
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to find duplicates: {error}"))
+                    })?;
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "action": "find_duplicates",
+                        "candidates": candidates,
+                    })
+                    .to_string(),
+                    display_preference: Some("json".to_string()),
+                })
+            }
+            MemoryArgs::Split {
+                id,
+                project_key,
+                pieces,
+            } => {
+                if pieces.is_empty() {
+                    return Err(ToolError::InvalidArguments(
+                        "split requires at least one piece".to_string(),
+                    ));
+                }
+                let project_key = self
+                    .resolve_project_key(project_key.as_deref(), Some(session_id))
+                    .await;
+                let mut split_pieces = Vec::with_capacity(pieces.len());
+                for piece in pieces {
+                    let r#type = match piece.r#type.as_deref() {
+                        Some(value) => Some(Self::parse_type(value)?),
+                        None => None,
+                    };
+                    split_pieces.push(bamboo_memory::memory_store::MemorySplitPiece {
+                        title: piece.title,
+                        r#type,
+                        content: piece.content,
+                        tags: piece.tags,
+                    });
+                }
+                let Some(result) = self
+                    .memory_store
+                    .split_memory(
+                        id.trim(),
+                        project_key.as_deref(),
+                        &split_pieces,
+                        Some(session_id),
+                        "main-model",
+                    )
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to split memory: {error}"))
+                    })?
+                else {
+                    return Err(ToolError::Execution(format!(
+                        "memory not found: {}",
+                        id.trim()
+                    )));
+                };
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "action": "split",
+                        "data": result,
+                    })
+                    .to_string(),
+                    display_preference: Some("json".to_string()),
+                })
+            }
+            MemoryArgs::ScanBlobs {
+                scope,
+                project_key,
+                min_sections,
+                options,
+            } => {
+                let scope = Self::parse_scope(Some(&scope))?;
+                if scope == MemoryScope::Session {
+                    return Err(ToolError::InvalidArguments(
+                        "scan_blobs supports durable scopes only".to_string(),
+                    ));
+                }
+                let project_key = self
+                    .resolve_project_key(project_key.as_deref(), Some(session_id))
+                    .await;
+                let min_sections = min_sections.unwrap_or(3);
+                let limit = options
+                    .and_then(|value| value.limit)
+                    .unwrap_or(20)
+                    .clamp(1, 200);
+                let report = self
+                    .memory_store
+                    .scan_blob_candidates(scope, project_key.as_deref(), min_sections, limit)
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to scan blobs: {error}"))
+                    })?;
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "action": "scan_blobs",
+                        "report": report,
+                    })
+                    .to_string(),
+                    display_preference: Some("json".to_string()),
+                })
             }
             MemoryArgs::Purge {
                 id,

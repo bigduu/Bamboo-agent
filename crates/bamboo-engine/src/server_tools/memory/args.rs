@@ -80,6 +80,35 @@ pub(super) enum MemoryArgs {
         #[serde(default)]
         reason: Option<String>,
     },
+    Split {
+        id: String,
+        #[serde(default)]
+        project_key: Option<String>,
+        pieces: Vec<SplitPiece>,
+    },
+    FindDuplicates {
+        scope: String,
+        title: String,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(rename = "type", default)]
+        r#type: Option<String>,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        project_key: Option<String>,
+        #[serde(default)]
+        options: Option<MemoryActionOptions>,
+    },
+    ScanBlobs {
+        scope: String,
+        #[serde(default)]
+        project_key: Option<String>,
+        #[serde(default)]
+        min_sections: Option<usize>,
+        #[serde(default)]
+        options: Option<MemoryActionOptions>,
+    },
     Purge {
         #[serde(default)]
         id: Option<String>,
@@ -130,4 +159,14 @@ pub(super) struct QueryFilters {
 pub(super) struct WriteOptions {
     #[serde(default)]
     pub(super) allow_merge_if_similar: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct SplitPiece {
+    pub(super) title: String,
+    #[serde(rename = "type", default)]
+    pub(super) r#type: Option<String>,
+    pub(super) content: String,
+    #[serde(default)]
+    pub(super) tags: Vec<String>,
 }

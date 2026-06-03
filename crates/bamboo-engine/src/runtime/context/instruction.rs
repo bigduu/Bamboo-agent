@@ -90,7 +90,7 @@ pub fn build_instruction_prompt_context(workspace_path: &str) -> Option<String> 
 
     let mut sections = Vec::new();
     sections.push(
-        "Repository instruction layer loaded from workspace policy files. Follow these instructions in addition to the base system prompt unless they conflict with higher-priority system/developer directives.".to_string(),
+        "Repository instruction layer loaded from workspace policy files. Follow these instructions in addition to the base system prompt. If they conflict, the base system prompt and the user's explicit instructions in this conversation take precedence over these repository files.".to_string(),
     );
 
     for file in files {

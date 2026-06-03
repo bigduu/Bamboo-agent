@@ -137,7 +137,7 @@ async fn inject_external_memory_includes_global_dream_fallback_and_session_note_
     assert!(system_prompt.contains("Session Memory Note"));
     assert!(system_prompt.contains("Session durable note"));
     assert!(!system_prompt.contains("### Project Durable Memory Index"));
-    assert!(system_prompt.contains("Use the `memory` tool for durable project/global knowledge"));
+    assert!(system_prompt.contains("the `memory` tool only for durable project/global knowledge"));
     assert!(system_prompt.contains("prefer `memory` action=query first"));
 }
 

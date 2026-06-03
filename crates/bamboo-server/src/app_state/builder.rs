@@ -321,6 +321,18 @@ impl AppState {
             },
         );
 
+        // Background memory "gardener": opt-in blob remediation. No-op cost unless
+        // `memory.gardener_enabled` is set; an empty prefilter makes zero LLM calls.
+        bamboo_engine::gardener::spawn_gardener_task(
+            bamboo_engine::auto_dream::AutoDreamContext {
+                session_store: session_store.clone(),
+                storage: storage.clone(),
+                provider: provider_handle.clone(),
+                config: config.clone(),
+                provider_registry: provider_registry.clone(),
+            },
+        );
+
         let config_for_resolver = config.clone();
         let subagent_model_resolver: OptionalSubagentModelResolver = {
             let registry = provider_registry.clone();

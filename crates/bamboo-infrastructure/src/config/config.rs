@@ -148,6 +148,19 @@ pub struct MemoryConfig {
     /// This rolls out cumulative/refining Dream synthesis behind an explicit opt-in flag.
     #[serde(default, alias = "memory_dream_refine_mode")]
     pub dream_refine_mode: bool,
+    /// Whether the background "gardener" may use the LLM to split/merge "blob" memories.
+    /// Opt-in (default false) because it spends model tokens.
+    #[serde(default, alias = "memory_gardener_enabled")]
+    pub gardener_enabled: bool,
+    /// Seconds between gardener runs (default daily — far slower than auto_dream).
+    #[serde(default = "default_gardener_interval_secs")]
+    pub gardener_interval_secs: u64,
+    /// Hard cap on LLM-backed splits per gardener run (cost ceiling per run).
+    #[serde(default = "default_gardener_max_splits_per_run")]
+    pub gardener_max_splits_per_run: usize,
+    /// Minimum `---` accretions for a memory to be a gardener split candidate.
+    #[serde(default = "default_gardener_min_sections")]
+    pub gardener_min_sections: usize,
 }
 
 impl Default for MemoryConfig {
@@ -160,8 +173,24 @@ impl Default for MemoryConfig {
             relevant_recall_rerank: false,
             project_first_dream: default_true_memory_project_first_dream(),
             dream_refine_mode: false,
+            gardener_enabled: false,
+            gardener_interval_secs: default_gardener_interval_secs(),
+            gardener_max_splits_per_run: default_gardener_max_splits_per_run(),
+            gardener_min_sections: default_gardener_min_sections(),
         }
     }
+}
+
+fn default_gardener_interval_secs() -> u64 {
+    86_400
+}
+
+fn default_gardener_max_splits_per_run() -> usize {
+    8
+}
+
+fn default_gardener_min_sections() -> usize {
+    5
 }
 
 fn default_true_memory_project_prompt_injection() -> bool {
@@ -2024,6 +2053,10 @@ mod tests {
                 relevant_recall_rerank: true,
                 project_first_dream: false,
                 dream_refine_mode: true,
+                gardener_enabled: true,
+                gardener_interval_secs: 3_600,
+                gardener_max_splits_per_run: 4,
+                gardener_min_sections: 7,
             }),
             ..Config::default()
         };
@@ -2038,6 +2071,10 @@ mod tests {
         assert!(memory.relevant_recall_rerank);
         assert!(!memory.project_first_dream);
         assert!(memory.dream_refine_mode);
+        assert!(memory.gardener_enabled);
+        assert_eq!(memory.gardener_interval_secs, 3_600);
+        assert_eq!(memory.gardener_max_splits_per_run, 4);
+        assert_eq!(memory.gardener_min_sections, 7);
     }
 
     #[test]

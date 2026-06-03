@@ -294,7 +294,7 @@ async fn extract_and_persist_durable_candidates(
                 &tags,
                 session_id,
                 "background-fast-model",
-                true,
+                false,
             )
             .await
             .map_err(|error| {
