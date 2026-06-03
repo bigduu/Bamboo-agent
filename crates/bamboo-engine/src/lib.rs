@@ -15,6 +15,7 @@ pub mod model_areas;
 pub mod auto_dream;
 pub mod metrics_service;
 pub mod runtime;
+pub mod sdk;
 pub mod skills;
 
 pub use app_context::AgentSessionContext;
@@ -41,6 +42,10 @@ pub use runtime::runtime::{AgentRuntime, AgentRuntimeBuilder, ExecuteRequest};
 pub use runtime::task_context::TaskLoopContext;
 pub use runtime::task_evaluation::{evaluate_task_progress, TaskEvaluationResult};
 pub use runtime::Agent;
+
+// Re-export from the ergonomic SDK surface (anti-fork single spawn core).
+pub use sdk::runner::{profile_runner, ProfileRunner, RunProfileInput};
+pub use sdk::spawn::run_child_spawn;
 
 // Sub-module re-exports for backward compatibility
 pub mod runner {
