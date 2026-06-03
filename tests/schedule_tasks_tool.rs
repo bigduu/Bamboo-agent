@@ -10,7 +10,11 @@ use futures::stream;
 use tokio::sync::{broadcast, Notify, RwLock};
 use tokio::time::{sleep, Duration};
 
-use bamboo_agent::agent::{Agent, AgentBuilder, AgentEvent, Message, Session};
+use bamboo_agent::agent::{AgentEvent, Message, Session};
+// The schedule manager's `ScheduleContext.agent` is an `Arc<bamboo_engine::Agent>`,
+// so this test builds the engine-level runtime directly. The ergonomic
+// `bamboo_agent::agent::Agent` wrapper is exercised separately in tests/agent_sdk.rs.
+use bamboo_engine::{Agent, AgentBuilder};
 use bamboo_agent::server::app_state::AgentRunner;
 use bamboo_agent::server::schedule_app::{ResolvedRunConfig, ScheduleContext};
 use bamboo_agent::server::schedules::{

@@ -59,7 +59,11 @@ pub use bamboo_infrastructure as core;
 
 // Re-export infrastructure crate so consumers can access config, paths, encryption, etc.
 // via `bamboo_agent::infrastructure::...`
-pub use agent::{Agent, AgentBuilder};
+//
+// `Agent` / `AgentBuilder` come from the ergonomic `agent` wrappers (the single
+// source of truth; resolves TD-2 — no more duplicate re-export through
+// `bamboo_engine`). `agent::profiles` re-exports the engine profile system.
+pub use agent::{profiles, Agent, AgentBuilder};
 pub use bamboo_infrastructure as infrastructure;
 
 // Re-export core Config as the primary configuration type
