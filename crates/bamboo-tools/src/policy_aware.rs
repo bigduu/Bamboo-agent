@@ -1,9 +1,13 @@
 //! `PolicyAwareToolExecutor`: enforces a subagent profile's [`ToolPolicy`]
 //! at tool-call time.
 //!
+//! This module lives in `bamboo-tools` (it depends only on `bamboo-agent-core`
+//! and `bamboo-domain`); `bamboo-server` re-exports it through a thin shim
+//! (`crate::tools::PolicyAwareToolExecutor`) for back-compat.
+//!
 //! This is the runtime half of the SubagentProfile feature. Profile loading
-//! and prompt injection live in `subagent_profiles` and
-//! `session_app::child_session`; here we wrap the child-session
+//! and prompt injection live in `bamboo_engine::profiles` and
+//! `bamboo_engine::session_app::child_session`; here we wrap the child-session
 //! [`ToolExecutor`] so that tool calls are filtered against the calling
 //! child's `subagent_type` metadata.
 //!

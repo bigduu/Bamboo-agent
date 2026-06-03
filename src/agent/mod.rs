@@ -27,7 +27,7 @@
 //!   [`AgentBuilder::with_defaults_for_data_dir`].
 //! - [`ExecuteRequestBuilder`] — ergonomic builder over the multi-field
 //!   [`bamboo_engine::ExecuteRequest`].
-//! - [`ToolSpec`] + [`builtin_tool_names`](tools::builtin_tool_names) — tool
+//! - [`ToolSpec`] + [`builtin_tool_names`] — tool
 //!   descriptors derived from the canonical `BUILTIN_TOOL_NAMES`.
 //!
 //! ## Anti-fork invariant
