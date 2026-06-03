@@ -1,7 +1,7 @@
 //! Agent system - Complete AI agent framework
 //!
 //! This module provides:
-//! - Core agent abstractions and types (via bamboo-application-agent)
+//! - Core agent abstractions and types (via bamboo-engine)
 
 // Re-export commonly used types from the agent crate
 pub use bamboo_agent_core::{

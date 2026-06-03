@@ -45,7 +45,6 @@ use std::path::PathBuf;
 
 pub mod error;
 
-// Placeholder modules (will be populated during migration)
 pub mod agent;
 pub mod commands;
 
