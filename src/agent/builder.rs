@@ -1,20 +1,18 @@
 //! Ergonomic [`AgentBuilder`] for the root SDK facade.
 //!
-//! This wraps [`bamboo_engine::AgentBuilder`] and adds the profile-driven,
-//! one-liner ergonomics described in `docs/design/ergonomic-sdk-plan.md` §4:
+//! This wraps [`bamboo_engine::AgentBuilder`] with a concise, one-liner facade:
+//! the caller supplies their own instruction (a system-prompt fragment) plus a
+//! model and optional tool policy, and the engine dynamically assembles the
+//! complete system prompt (tool guides, runtime context, …) around it at run
+//! time.
 //!
 //! ```rust,ignore
 //! let agent = Agent::builder()
-//!     .researcher()
 //!     .model("claude-sonnet-4-6")
+//!     .instruction("You help users research topics thoroughly.")
 //!     .with_defaults_for_data_dir(data_dir).await?
 //!     .build()?;
 //! ```
-//!
-//! Profiles (`.researcher()`, `.coder()`, `.from_profile(..)`) resolve from
-//! [`bamboo_engine::profiles::builtin_profiles`] (resolves plan §C7) and set the
-//! builder's system prompt + tool policy. No profile definitions are duplicated
-//! here.
 //!
 //! `.with_defaults_for_data_dir` assembles the eight runtime dependencies from
 //! the **infrastructure / engine / tools** crates only — `bamboo-server` is
@@ -25,8 +23,7 @@ use std::sync::Arc;
 use std::path::PathBuf;
 use tokio::sync::RwLock;
 
-use bamboo_domain::subagent::{SubagentProfile, ToolPolicy};
-use bamboo_engine::profiles::builtin_profiles;
+use bamboo_domain::subagent::ToolPolicy;
 use bamboo_engine::{
     AgentBuilder as EngineAgentBuilder, MetricsCollector, SkillManager, SkillStoreConfig,
     SqliteMetricsStorage,
@@ -41,16 +38,17 @@ const DEFAULT_METRICS_RETENTION_DAYS: u32 = 90;
 
 /// Ergonomic builder for [`Agent`].
 ///
-/// Holds profile-derived ergonomic state (system prompt, tool policy, model,
-/// api key) alongside the wrapped engine builder. Call
+/// Holds the configured instruction (system-prompt fragment), tool policy,
+/// model, and api key alongside the wrapped engine builder. Call
 /// [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir) to assemble
 /// the runtime dependencies, then [`build`](Self::build).
 pub struct AgentBuilder {
     inner: EngineAgentBuilder,
 
-    /// Role-derived system prompt, injected into the session at `run` time.
+    /// Caller-supplied instruction (system-prompt fragment), injected into the
+    /// session at `run` time; the engine assembles the full prompt around it.
     system_prompt: Option<String>,
-    /// Role-derived tool policy, translated to `disabled_tools` at `run` time.
+    /// Tool policy, translated to `disabled_tools` at `run` time.
     tool_policy: Option<ToolPolicy>,
     /// Primary model override applied to the session at `run` time.
     model: Option<String>,
@@ -70,80 +68,23 @@ impl AgentBuilder {
         }
     }
 
-    // -- Profile-driven configuration --------------------------------------
+    // -- Configuration ------------------------------------------------------
 
-    /// Configure this agent from an explicit [`SubagentProfile`], adopting its
-    /// system prompt, tool policy, and (when present and not already set) the
-    /// profile's model hint.
-    pub fn from_profile(mut self, profile: &SubagentProfile) -> Self {
-        self.system_prompt = Some(profile.system_prompt.clone());
-        self.tool_policy = Some(profile.tools.clone());
-        if self.model.is_none() {
-            if let Some(hint) = profile.model_hint.as_ref() {
-                if let Some(model_ref) = hint.model_ref.as_ref() {
-                    self.model = Some(model_ref.clone());
-                }
-            }
-        }
-        self
-    }
-
-    /// Configure this agent from the built-in profile with the given id.
-    ///
-    /// No-op (leaves the builder unchanged) when the id is unknown.
-    pub fn profile(self, id: &str) -> Self {
-        match builtin_profiles().into_iter().find(|p| p.id == id) {
-            Some(profile) => self.from_profile(&profile),
-            None => self,
-        }
-    }
-
-    /// Adopt the built-in `researcher` profile.
-    pub fn researcher(self) -> Self {
-        self.profile("researcher")
-    }
-
-    /// Adopt the built-in `coder` profile.
-    pub fn coder(self) -> Self {
-        self.profile("coder")
-    }
-
-    /// Adopt the built-in `reviewer` profile.
-    pub fn reviewer(self) -> Self {
-        self.profile("reviewer")
-    }
-
-    /// Adopt the built-in `tester` profile.
-    pub fn tester(self) -> Self {
-        self.profile("tester")
-    }
-
-    /// Adopt the built-in `plan` profile.
-    pub fn plan(self) -> Self {
-        self.profile("plan")
-    }
-
-    /// Adopt the built-in `general-purpose` profile.
-    pub fn general_purpose(self) -> Self {
-        self.profile("general-purpose")
-    }
-
-    // -- Per-run overrides --------------------------------------------------
-
-    /// Override the primary model.
+    /// Set the primary model.
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
         self
     }
 
-    /// Set an explicit system prompt / instruction, overriding any profile
-    /// prompt set earlier.
+    /// Set the instruction — the caller's portion of the system prompt. The
+    /// engine assembles the complete prompt (tool guides, runtime context, …)
+    /// around it at run time.
     pub fn instruction(mut self, instruction: impl Into<String>) -> Self {
         self.system_prompt = Some(instruction.into());
         self
     }
 
-    /// Set an explicit tool policy, overriding any profile policy set earlier.
+    /// Set the tool policy (which tools this agent may use).
     pub fn tools(mut self, policy: ToolPolicy) -> Self {
         self.tool_policy = Some(policy);
         self
@@ -255,7 +196,7 @@ impl AgentBuilder {
 
     /// Finalize into an [`Agent`].
     ///
-    /// The role-derived `system_prompt`, `tool_policy`, and `model` are carried
+    /// The configured `instruction`, `tool_policy`, and `model` are carried
     /// onto the `Agent` so that [`Agent::run`](super::Agent::run) can inject
     /// them into the session.
     pub fn build(self) -> Result<Agent, String> {

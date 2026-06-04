@@ -4,6 +4,15 @@
 **Author:** Lead architect (reconciled from 6 explorer reports + direct code re-read)
 **Date:** 2026-06-04
 
+> **Update (post-review):** The root facade (`bamboo_agent::agent`) is
+> **instruction-based, not profile-based**. The profile-sugar methods
+> (`.researcher()` / `.coder()` / `.from_profile()` etc.) and the facade's
+> `profiles` re-export were removed. The facade is now `Agent::builder()
+> .model(..).instruction(..).tools(..)` — the caller supplies their own
+> system-prompt fragment and the engine assembles the full prompt at run time.
+> The `SubagentProfile` system, `ProfileRunner`, and the profile relocation
+> (Phases 2–3) remain in `bamboo-engine` for the sub-agent / Task subsystem.
+
 ## 0. Goal & guiding constraints
 
 Promote the existing `SubagentProfile` machinery into a first-class, ergonomic SDK

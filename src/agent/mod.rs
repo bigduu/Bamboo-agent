@@ -1,14 +1,16 @@
 //! Ergonomic top-level Agent SDK.
 //!
-//! This module promotes the `SubagentProfile` system into a first-class,
-//! ergonomic SDK so library consumers can write:
+//! A concise facade over the engine runtime: the caller supplies their own
+//! instruction (a system-prompt fragment), a model, and an optional tool
+//! policy; the engine assembles the complete system prompt around it at run
+//! time. Library consumers can write:
 //!
 //! ```rust,ignore
 //! use bamboo_agent::agent::Agent;
 //!
 //! let agent = Agent::builder()
-//!     .researcher()
 //!     .model("claude-sonnet-4-6")
+//!     .instruction("You help users research topics thoroughly.")
 //!     .with_defaults_for_data_dir(data_dir).await?
 //!     .build()?;
 //!
@@ -19,11 +21,10 @@
 //! ## Surface
 //!
 //! - [`Agent`] — stable entry point wrapping the engine runtime. `run` /
-//!   `run_stream` execute the agent loop with the builder's role-derived system
-//!   prompt + tool policy applied to the session.
-//! - [`AgentBuilder`] — profile-driven builder (`.researcher()`, `.coder()`,
-//!   `.from_profile(..)`) that resolves built-in profiles from
-//!   [`bamboo_engine::profiles`] and assembles default deps via
+//!   `run_stream` execute the agent loop with the configured instruction +
+//!   tool policy + model applied to the session.
+//! - [`AgentBuilder`] — concise builder (`.model()`, `.instruction()`,
+//!   `.tools()`) that assembles default deps via
 //!   [`AgentBuilder::with_defaults_for_data_dir`].
 //! - [`ExecuteRequestBuilder`] — ergonomic builder over the multi-field
 //!   [`bamboo_engine::ExecuteRequest`].
@@ -33,8 +34,7 @@
 //! ## Anti-fork invariant
 //!
 //! The SDK never reimplements the agent loop. `run` / `run_stream` funnel into
-//! `bamboo_engine::Agent::execute` (the single canonical execution path); child
-//! spawning likewise funnels into `bamboo_engine::run_child_spawn`.
+//! `bamboo_engine::Agent::execute` (the single canonical execution path).
 
 mod builder;
 mod execute_request;
@@ -45,22 +45,18 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use bamboo_domain::subagent::{disabled_tools_for_profile, ToolPolicy};
+use bamboo_domain::subagent::disabled_tools_for_profile;
 
 pub use builder::AgentBuilder;
 pub use execute_request::ExecuteRequestBuilder;
 pub use tools::{builtin_tool_names, builtin_tool_specs, ToolSpec, CANONICAL_TOOL_NAMES};
-
-// Re-export the engine profile system so SDK consumers can enumerate and
-// inspect built-in / loaded profiles without importing `bamboo_engine`.
-pub use bamboo_engine::profiles;
 
 // Convenience re-exports of commonly used types (single source of truth — these
 // supersede the old duplicate re-export chain, resolving TD-2).
 pub use bamboo_agent_core::{
     AgentError, AgentEvent, Message, MessageContent, Role, Session, TokenBudgetUsage, TokenUsage,
 };
-pub use bamboo_domain::subagent::{ModelHint, SubagentProfile, UiHint};
+pub use bamboo_domain::subagent::ToolPolicy;
 pub use bamboo_domain::{TaskItem, TaskItemStatus, TaskList};
 pub use bamboo_engine::ExecuteRequest;
 pub use bamboo_infrastructure::LLMProvider;
@@ -72,7 +68,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// Stable, ergonomic entry point for agent execution.
 ///
 /// Wraps a [`bamboo_engine::Agent`] (which owns the shared runtime) plus the
-/// role-derived configuration captured at build time. Clone is cheap.
+/// instruction / tool policy / model configured at build time. Clone is cheap.
 #[derive(Clone)]
 pub struct Agent {
     inner: bamboo_engine::Agent,

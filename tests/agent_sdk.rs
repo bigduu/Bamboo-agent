@@ -1,52 +1,43 @@
 //! Root SDK facade tests (ergonomic-sdk-plan §4: S-T4.1 .. S-T4.3).
 //!
-//! These exercise the `bamboo_agent::agent` surface end-to-end without network
-//! I/O: profile resolution, the `ExecuteRequest` builder, and default-dependency
-//! assembly via `with_defaults_for_data_dir`.
+//! These exercise the `bamboo_agent::agent` facade end-to-end without network
+//! I/O: the concise instruction/model/tools builder, the `ExecuteRequest`
+//! builder, and default-dependency assembly via `with_defaults_for_data_dir`.
 
 use bamboo_agent::agent::{
     builtin_tool_names, Agent, AgentBuilder, ExecuteRequestBuilder, ToolSpec,
 };
-use bamboo_agent::agent::profiles::builtin_profiles;
 
 use bamboo_agent_core::AgentEvent;
 use bamboo_domain::subagent::{disabled_tools_for_profile, ToolPolicy};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// S-T4.1: `Agent::builder().researcher().model("m")` resolves the researcher
-/// profile (system prompt + allowlist tool policy) and applies the model
-/// override. We assert via the profile registry + the disabled-tools derivation
-/// the builder will perform (a researcher allowlist disables Edit/Write).
+/// S-T4.1: the concise facade builder accepts `model` + `instruction` + a tool
+/// policy, and an allowlist policy maps to `disabled_tools` that exclude the
+/// non-listed tools (Edit/Write) while keeping the listed ones (Read).
 #[test]
-fn s_t4_1_researcher_profile_and_model_override() {
-    // The builder is profile-driven; verify the registry the builder consults.
-    let researcher = builtin_profiles()
-        .into_iter()
-        .find(|p| p.id == "researcher")
-        .expect("researcher profile must exist");
-
-    // The researcher uses an allowlist (read-only + web + memory).
-    let allow = match &researcher.tools {
-        ToolPolicy::Allowlist { allow } => allow.clone(),
-        other => panic!("expected allowlist, got {other:?}"),
+fn s_t4_1_facade_builder_and_tool_policy_mapping() {
+    let policy = ToolPolicy::Allowlist {
+        allow: vec![
+            "Read".to_string(),
+            "Grep".to_string(),
+            "WebSearch".to_string(),
+        ],
     };
-    assert!(allow.contains(&"Read".to_string()));
-    assert!(!allow.iter().any(|t| t == "Edit" || t == "Write"));
 
-    // The system prompt is non-empty and researcher-specific.
-    assert!(researcher.system_prompt.contains("Researcher"));
+    // The builder accepts the fluent chain without panicking.
+    let _builder: AgentBuilder = Agent::builder()
+        .model("test-model")
+        .instruction("You are a careful research assistant.")
+        .tools(policy.clone());
 
-    // The builder translates the allowlist into disabled_tools over the
-    // canonical tool surface: Edit/Write must be disabled, Read must not.
-    let disabled = disabled_tools_for_profile(&researcher.tools, &builtin_tool_names());
+    // The allowlist translates into disabled_tools over the canonical tool
+    // surface: Read stays enabled; Edit/Write are disabled.
+    let disabled = disabled_tools_for_profile(&policy, &builtin_tool_names());
     assert!(disabled.iter().any(|t| t == "Edit"));
     assert!(disabled.iter().any(|t| t == "Write"));
     assert!(!disabled.iter().any(|t| t == "Read"));
-
-    // The builder accepts the fluent chain without panicking; model override is
-    // carried through to build time.
-    let _builder: AgentBuilder = Agent::builder().researcher().model("test-model");
 }
 
 /// S-T4.2: `ExecuteRequestBuilder` round-trip — required fields are enforced at
@@ -99,7 +90,8 @@ fn s_t4_2_execute_request_builder_round_trip() {
 
 /// S-T4.3: `with_defaults_for_data_dir(tmp)` assembles the eight runtime
 /// dependencies (storage, persistence, attachment reader, skill manager,
-/// metrics collector, config, provider, default tools) and builds an `Agent`.
+/// metrics collector, config, provider, default tools) and builds an `Agent`
+/// from a plain instruction (no profile).
 ///
 /// A pre-seeded config selects the `anthropic` provider with a non-network
 /// api key — `create_provider` constructs it without performing any I/O, and
@@ -125,7 +117,7 @@ async fn s_t4_3_with_defaults_for_data_dir_builds_agent() {
     std::fs::write(data_dir.join("config.json"), config_json).expect("write config");
 
     let agent = Agent::builder()
-        .coder()
+        .instruction("You are a coding assistant.")
         .model("claude-test")
         .with_defaults_for_data_dir(data_dir.clone())
         .await

@@ -62,8 +62,8 @@ pub use bamboo_infrastructure as core;
 //
 // `Agent` / `AgentBuilder` come from the ergonomic `agent` wrappers (the single
 // source of truth; resolves TD-2 — no more duplicate re-export through
-// `bamboo_engine`). `agent::profiles` re-exports the engine profile system.
-pub use agent::{profiles, Agent, AgentBuilder};
+// `bamboo_engine`).
+pub use agent::{Agent, AgentBuilder};
 pub use bamboo_infrastructure as infrastructure;
 
 // Re-export core Config as the primary configuration type
