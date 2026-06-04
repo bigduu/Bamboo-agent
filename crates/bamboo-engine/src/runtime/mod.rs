@@ -27,7 +27,7 @@ pub use managers::{
 };
 pub use model_roster::{ModelRoster, RoleModel};
 pub use runner::{run_agent_loop, run_agent_loop_with_config};
-pub use runtime::{AgentRuntime, AgentRuntimeBuilder, ExecuteRequest};
+pub use runtime::{AgentRuntime, AgentRuntimeBuilder, ExecuteRequest, ExecuteRequestBuilder};
 pub use task_context::TaskLoopContext;
 pub use task_evaluation::{evaluate_task_progress, TaskEvaluationResult};
 

@@ -17,12 +17,12 @@ use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_domain::ReasoningEffort;
 use bamboo_infrastructure::LLMProvider;
 
-use crate::runtime::config::{GoldConfig, ImageFallbackConfig};
+use crate::runtime::config::{AuxiliaryModelConfig, GoldConfig, ImageFallbackConfig};
 use crate::runtime::execution::runner_lifecycle::finalize_runner;
 use crate::runtime::execution::runner_state::AgentRunner;
 use crate::runtime::model_roster::ModelRoster;
 use crate::runtime::Agent;
-use crate::runtime::ExecuteRequest;
+use crate::runtime::{ExecuteRequest, ExecuteRequestBuilder};
 
 const SKILL_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_SKILL_CONTEXT_START -->";
 const TOOL_GUIDE_START_MARKER: &str = "<!-- BAMBOO_TOOL_GUIDE_START -->";
@@ -119,6 +119,95 @@ pub struct SessionExecutionArgs {
     pub on_complete: Option<SessionCompletionHook>,
 }
 
+/// The per-request parameter subset of [`SessionExecutionArgs`] — everything
+/// that maps onto an [`ExecuteRequest`], minus the three required positional
+/// fields (`initial_message`, `event_tx`, `cancel_token`) and the post-execution
+/// resources (runners, sessions cache, completion hook).
+///
+/// Grouping these here lets [`build_execute_request`] perform the
+/// `SessionExecutionArgs` → [`ExecuteRequest`] mapping through the canonical
+/// [`ExecuteRequestBuilder`] in one place, instead of a hand-written struct
+/// literal that must be kept field-aligned with [`ExecuteRequest`] by hand.
+struct ExecuteRequestParams {
+    tools: Option<Arc<dyn ToolExecutor>>,
+    provider_override: Option<Arc<dyn LLMProvider>>,
+    model_roster: ModelRoster,
+    reasoning_effort: Option<ReasoningEffort>,
+    auxiliary_model_resolver: Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
+    disabled_tools: Option<BTreeSet<String>>,
+    disabled_skill_ids: Option<BTreeSet<String>>,
+    selected_skill_ids: Option<Vec<String>>,
+    selected_skill_mode: Option<String>,
+    image_fallback: Option<ImageFallbackConfig>,
+    gold_config: Option<GoldConfig>,
+    app_data_dir: Option<std::path::PathBuf>,
+}
+
+/// Assemble an [`ExecuteRequest`] from the resolved spawn parameters via the
+/// canonical [`ExecuteRequestBuilder`].
+///
+/// Centralizing this mapping keeps every optional field threaded with exactly
+/// the same value the old struct literal carried (the builder defaults each
+/// unset field to `None`), while removing the field-by-field duplication.
+fn build_execute_request(
+    initial_message: String,
+    event_tx: mpsc::Sender<AgentEvent>,
+    cancel_token: CancellationToken,
+    params: ExecuteRequestParams,
+) -> ExecuteRequest {
+    let ExecuteRequestParams {
+        tools,
+        provider_override,
+        model_roster,
+        reasoning_effort,
+        auxiliary_model_resolver,
+        disabled_tools,
+        disabled_skill_ids,
+        selected_skill_ids,
+        selected_skill_mode,
+        image_fallback,
+        gold_config,
+        app_data_dir,
+    } = params;
+
+    let mut builder = ExecuteRequestBuilder::new(initial_message, event_tx, cancel_token)
+        .model_roster(model_roster)
+        .gold_config(gold_config);
+
+    if let Some(tools) = tools {
+        builder = builder.tools(tools);
+    }
+    if let Some(provider_override) = provider_override {
+        builder = builder.provider_override(provider_override);
+    }
+    if let Some(reasoning_effort) = reasoning_effort {
+        builder = builder.reasoning_effort(reasoning_effort);
+    }
+    if let Some(auxiliary_model_resolver) = auxiliary_model_resolver {
+        builder = builder.auxiliary_model_resolver(auxiliary_model_resolver);
+    }
+    if let Some(disabled_tools) = disabled_tools {
+        builder = builder.disabled_tools(disabled_tools);
+    }
+    if let Some(disabled_skill_ids) = disabled_skill_ids {
+        builder = builder.disabled_skill_ids(disabled_skill_ids);
+    }
+    if let Some(selected_skill_ids) = selected_skill_ids {
+        builder = builder.selected_skill_ids(selected_skill_ids);
+    }
+    if let Some(selected_skill_mode) = selected_skill_mode {
+        builder = builder.selected_skill_mode(selected_skill_mode);
+    }
+    if let Some(image_fallback) = image_fallback {
+        builder = builder.image_fallback(image_fallback);
+    }
+    if let Some(app_data_dir) = app_data_dir {
+        builder = builder.app_data_dir(app_data_dir);
+    }
+
+    builder.build()
+}
+
 /// Spawn a background agent execution task.
 ///
 /// This function spawns a tokio task that:
@@ -185,28 +274,27 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 log_base_system_prompt_snapshot(&session_id, prompt);
             }
 
-            let result = agent
-                .execute(
-                    &mut session,
-                    ExecuteRequest {
-                        initial_message,
-                        event_tx: mpsc_tx.clone(),
-                        cancel_token,
-                        tools: tools_override,
-                        provider_override,
-                        model_roster,
-                        reasoning_effort,
-                        auxiliary_model_resolver,
-                        disabled_tools,
-                        disabled_skill_ids,
-                        selected_skill_ids,
-                        selected_skill_mode,
-                        image_fallback,
-                        gold_config,
-                        app_data_dir,
-                    },
-                )
-                .await;
+            let execute_request = build_execute_request(
+                initial_message,
+                mpsc_tx.clone(),
+                cancel_token,
+                ExecuteRequestParams {
+                    tools: tools_override,
+                    provider_override,
+                    model_roster,
+                    reasoning_effort,
+                    auxiliary_model_resolver,
+                    disabled_tools,
+                    disabled_skill_ids,
+                    selected_skill_ids,
+                    selected_skill_mode,
+                    image_fallback,
+                    gold_config,
+                    app_data_dir,
+                },
+            );
+
+            let result = agent.execute(&mut session, execute_request).await;
 
             // Send terminal event for all error cases (including cancellation).
             if let Some(error_event) = terminal_error_event_for_result(&result) {

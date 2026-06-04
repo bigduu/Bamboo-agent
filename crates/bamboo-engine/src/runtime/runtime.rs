@@ -333,6 +333,7 @@ pub struct ExecuteRequestBuilder {
     selected_skill_ids: Option<Vec<String>>,
     selected_skill_mode: Option<String>,
     image_fallback: Option<ImageFallbackConfig>,
+    gold_config: Option<GoldConfig>,
     app_data_dir: Option<std::path::PathBuf>,
 }
 
@@ -366,6 +367,7 @@ impl ExecuteRequestBuilder {
             selected_skill_ids: None,
             selected_skill_mode: None,
             image_fallback: None,
+            gold_config: None,
             app_data_dir: None,
         }
     }
@@ -499,6 +501,17 @@ impl ExecuteRequestBuilder {
         self
     }
 
+    /// Set the internal `gold_config` feature flag.
+    ///
+    /// `gold_config` is an internal feature flag (not part of the public SDK
+    /// surface), so this setter is crate-visible only. Public SDK callers always
+    /// leave it `None`; the in-crate spawn paths thread a resolved value through
+    /// here. Defaults to `None`.
+    pub(crate) fn gold_config(mut self, v: Option<GoldConfig>) -> Self {
+        self.gold_config = v;
+        self
+    }
+
     /// Set the Bamboo application data directory.
     pub fn app_data_dir(mut self, v: std::path::PathBuf) -> Self {
         self.app_data_dir = Some(v);
@@ -507,8 +520,8 @@ impl ExecuteRequestBuilder {
 
     /// Materialize the underlying [`ExecuteRequest`].
     ///
-    /// `gold_config` is intentionally not surfaced as a setter (it is an
-    /// internal feature flag); it always defaults to `None`.
+    /// `gold_config` is an internal feature flag with only a crate-visible
+    /// setter ([`Self::gold_config`]); public SDK callers leave it `None`.
     pub fn build(self) -> ExecuteRequest {
         let model_roster = ModelRoster {
             model: self.model,
@@ -538,7 +551,7 @@ impl ExecuteRequestBuilder {
             selected_skill_ids: self.selected_skill_ids,
             selected_skill_mode: self.selected_skill_mode,
             image_fallback: self.image_fallback,
-            gold_config: None,
+            gold_config: self.gold_config,
             app_data_dir: self.app_data_dir,
         }
     }

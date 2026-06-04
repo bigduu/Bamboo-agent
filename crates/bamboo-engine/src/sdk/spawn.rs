@@ -26,7 +26,7 @@ use crate::runtime::execution::spawn::{
     publish_child_completion_parts, resolve_child_provider_override, watch_child_liveness,
     watchdog_policy_for_session, SpawnContext, SpawnJob,
 };
-use crate::runtime::ExecuteRequest;
+use crate::runtime::ExecuteRequestBuilder;
 
 /// Launch a single child spawn job.
 ///
@@ -276,35 +276,36 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
                 resolve_child_provider_override(provider_router.as_ref(), &session, &model);
             let disabled_tools: Option<std::collections::BTreeSet<String>> =
                 job.disabled_tools.map(|v| v.into_iter().collect());
-            agent
-                .execute(
-                    &mut session,
-                    ExecuteRequest {
-                        initial_message: String::new(), // handled by agent loop
-                        event_tx: mpsc_tx,
-                        cancel_token: cancel_token.clone(),
-                        tools: Some(tools),
-                        provider_override,
-                        model_roster: crate::runtime::ModelRoster {
-                            model: Some(model.clone()),
-                            provider_name,
-                            provider_type,
-                            fast: None,
-                            background: None,
-                            summarization: None,
-                        },
-                        reasoning_effort: None,
-                        auxiliary_model_resolver: None,
-                        disabled_tools,
-                        disabled_skill_ids: None,
-                        selected_skill_ids: None,
-                        selected_skill_mode: None,
-                        image_fallback: None,
-                        gold_config: None,
-                        app_data_dir,
-                    },
-                )
-                .await
+
+            // Build via the canonical `ExecuteRequestBuilder` so the child spawn
+            // doesn't duplicate the full `ExecuteRequest` field list. The child
+            // only sets the primary model/provider and tools; every other field
+            // (auxiliary roles, reasoning effort, skill selection, image
+            // fallback, gold config) stays at the builder's `None` default —
+            // identical to the previous explicit literal.
+            // `initial_message` is empty: the child agent loop sources it itself.
+            let mut builder =
+                ExecuteRequestBuilder::new(String::new(), mpsc_tx, cancel_token.clone())
+                    .tools(tools)
+                    .model_roster(crate::runtime::ModelRoster {
+                        model: Some(model.clone()),
+                        provider_name,
+                        provider_type,
+                        fast: None,
+                        background: None,
+                        summarization: None,
+                    });
+            if let Some(provider_override) = provider_override {
+                builder = builder.provider_override(provider_override);
+            }
+            if let Some(disabled_tools) = disabled_tools {
+                builder = builder.disabled_tools(disabled_tools);
+            }
+            if let Some(app_data_dir) = app_data_dir {
+                builder = builder.app_data_dir(app_data_dir);
+            }
+
+            agent.execute(&mut session, builder.build()).await
         };
 
         let timeout_error = timeout_reason.read().await.clone();
