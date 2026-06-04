@@ -267,7 +267,17 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 reasoning_effort_source
             );
 
-            session.model = model.clone();
+            // Set the resolved model via the single authoritative pre-execution
+            // mutation point. The caller already placed the system prompt on the
+            // session, so pass `None` for `system_prompt` (the subsequent
+            // `system_prompt_for_session` read below sees the caller's message).
+            // This must run before that read / logging so the observable
+            // sequence (model set, then prompt snapshot) is identical.
+            crate::session_app::execution_prep::prepare_session_for_execution(
+                &mut session,
+                None,
+                Some(&model),
+            );
 
             let system_prompt = system_prompt_for_session(&session);
             if let Some(prompt) = system_prompt.as_ref() {

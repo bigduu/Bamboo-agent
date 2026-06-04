@@ -245,7 +245,14 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
     let app_data_dir = ctx.app_data_dir.clone();
 
     tokio::spawn(async move {
-        session.model = model.clone();
+        // Set the child model via the single authoritative pre-execution
+        // mutation point. The child session's system prompt is already in place
+        // (loaded from storage), so pass `None` for `system_prompt`.
+        crate::session_app::execution_prep::prepare_session_for_execution(
+            &mut session,
+            None,
+            Some(&model),
+        );
 
         let wants_external = session
             .metadata

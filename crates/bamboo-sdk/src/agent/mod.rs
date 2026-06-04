@@ -192,22 +192,17 @@ impl Agent {
         event_tx: mpsc::Sender<AgentEvent>,
         cancel_token: CancellationToken,
     ) -> Result<(), AgentError> {
-        // Apply the instruction as the session's leading System message. The
-        // builder's prompt is AUTHORITATIVE: it replaces a leading System
-        // message, otherwise inserts one at index 0, so a caller-supplied
-        // session can't silently shadow the configured instruction.
-        if let Some(prompt) = self.system_prompt.as_ref() {
-            match session.messages.first() {
-                Some(first) if matches!(first.role, Role::System) => {
-                    session.messages[0] = Message::system(prompt.clone());
-                }
-                _ => session.messages.insert(0, Message::system(prompt.clone())),
-            }
-        }
-
-        if let Some(model) = self.model.as_ref() {
-            session.model = model.clone();
-        }
+        // Apply the instruction as the session's leading System message and set
+        // the configured model via the single authoritative pre-execution
+        // mutation point. The builder's prompt is AUTHORITATIVE: it replaces a
+        // leading System message, otherwise inserts one at index 0, so a
+        // caller-supplied session can't silently shadow the configured
+        // instruction.
+        bamboo_engine::session_app::execution_prep::prepare_session_for_execution(
+            session,
+            self.system_prompt.as_deref(),
+            self.model.as_deref(),
+        );
 
         // The last user message in the session drives execution (the engine
         // skips echoing `initial_message`, so we surface it for logging only).
