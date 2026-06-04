@@ -32,10 +32,21 @@ pub(super) async fn consume_llm_stream_internal(
 ) -> Result<StreamHandlingOutput, AgentError> {
     let mut state = StreamAccumulationState::new();
 
-    while let Some(chunk_result) = stream.next().await {
-        if cancel_token.is_cancelled() {
-            return Err(AgentError::Cancelled);
-        }
+    loop {
+        // Select on cancellation *and* the next chunk so a stalled or
+        // non-terminating provider stream is interruptible the instant the
+        // token is cancelled — `stream.next().await` alone blocks forever and
+        // the previous between-chunks `is_cancelled()` poll never ran. `biased`
+        // checks cancellation first so a ready-but-cancelled chunk is dropped,
+        // preserving the prior "return Cancelled without handling" semantics.
+        let chunk_result = tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
+            next = stream.next() => match next {
+                Some(chunk_result) => chunk_result,
+                None => break,
+            },
+        };
 
         handle_chunk_result(chunk_result, &mut state, event_tx, session_id).await?;
     }
