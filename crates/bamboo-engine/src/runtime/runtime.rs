@@ -301,6 +301,231 @@ pub struct ExecuteRequest {
 }
 
 // ---------------------------------------------------------------------------
+// ExecuteRequestBuilder — ergonomic construction of ExecuteRequest
+// ---------------------------------------------------------------------------
+
+/// Fluent builder for [`ExecuteRequest`].
+///
+/// `ExecuteRequest` carries three required fields plus a long tail of optional
+/// overrides; constructing it by hand forces callers to spell out ~20 `None`s.
+/// This builder requires only `initial_message` + `event_tx` + `cancel_token`,
+/// defaults every optional field to `None` (matching the runtime's spawn
+/// defaults), and exposes fluent setters for the rest.
+///
+/// It lives in `bamboo-engine` so both the in-crate server layer (e.g. the
+/// schedule manager) and the root `bamboo_agent` SDK facade (which re-exports
+/// it) construct requests through one shared builder — no forked assembly.
+pub struct ExecuteRequestBuilder {
+    initial_message: String,
+    event_tx: mpsc::Sender<AgentEvent>,
+    cancel_token: CancellationToken,
+
+    tools: Option<Arc<dyn ToolExecutor>>,
+    provider_override: Option<Arc<dyn LLMProvider>>,
+    model: Option<String>,
+    provider_name: Option<String>,
+    provider_type: Option<String>,
+    fast_model: Option<String>,
+    fast_model_provider: Option<Arc<dyn LLMProvider>>,
+    background_model: Option<String>,
+    background_model_provider: Option<Arc<dyn LLMProvider>>,
+    summarization_model: Option<String>,
+    summarization_model_provider: Option<Arc<dyn LLMProvider>>,
+    reasoning_effort: Option<ReasoningEffort>,
+    auxiliary_model_resolver: Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
+    disabled_tools: Option<BTreeSet<String>>,
+    disabled_skill_ids: Option<BTreeSet<String>>,
+    selected_skill_ids: Option<Vec<String>>,
+    selected_skill_mode: Option<String>,
+    image_fallback: Option<ImageFallbackConfig>,
+    app_data_dir: Option<std::path::PathBuf>,
+}
+
+impl ExecuteRequestBuilder {
+    /// Create a builder with the three required fields. All optional overrides
+    /// default to `None`.
+    pub fn new(
+        initial_message: impl Into<String>,
+        event_tx: mpsc::Sender<AgentEvent>,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        Self {
+            initial_message: initial_message.into(),
+            event_tx,
+            cancel_token,
+            tools: None,
+            provider_override: None,
+            model: None,
+            provider_name: None,
+            provider_type: None,
+            fast_model: None,
+            fast_model_provider: None,
+            background_model: None,
+            background_model_provider: None,
+            summarization_model: None,
+            summarization_model_provider: None,
+            reasoning_effort: None,
+            auxiliary_model_resolver: None,
+            disabled_tools: None,
+            disabled_skill_ids: None,
+            selected_skill_ids: None,
+            selected_skill_mode: None,
+            image_fallback: None,
+            app_data_dir: None,
+        }
+    }
+
+    /// Override the tool executor for this execution.
+    pub fn tools(mut self, v: Arc<dyn ToolExecutor>) -> Self {
+        self.tools = Some(v);
+        self
+    }
+
+    /// Override the LLM provider for this execution.
+    pub fn provider_override(mut self, v: Arc<dyn LLMProvider>) -> Self {
+        self.provider_override = Some(v);
+        self
+    }
+
+    /// Override the primary model name.
+    pub fn model(mut self, v: impl Into<String>) -> Self {
+        self.model = Some(v.into());
+        self
+    }
+
+    /// Override the provider name.
+    pub fn provider_name(mut self, v: impl Into<String>) -> Self {
+        self.provider_name = Some(v.into());
+        self
+    }
+
+    /// Override the provider type.
+    pub fn provider_type(mut self, v: impl Into<String>) -> Self {
+        self.provider_type = Some(v.into());
+        self
+    }
+
+    /// Override the fast-model name.
+    pub fn fast_model(mut self, v: impl Into<String>) -> Self {
+        self.fast_model = Some(v.into());
+        self
+    }
+
+    /// Override the provider used for fast-model calls.
+    pub fn fast_model_provider(mut self, v: Arc<dyn LLMProvider>) -> Self {
+        self.fast_model_provider = Some(v);
+        self
+    }
+
+    /// Override the background-model name.
+    pub fn background_model(mut self, v: impl Into<String>) -> Self {
+        self.background_model = Some(v.into());
+        self
+    }
+
+    /// Override the provider used for background/memory model calls.
+    pub fn background_model_provider(mut self, v: Arc<dyn LLMProvider>) -> Self {
+        self.background_model_provider = Some(v);
+        self
+    }
+
+    /// Override the summarization-model name.
+    pub fn summarization_model(mut self, v: impl Into<String>) -> Self {
+        self.summarization_model = Some(v.into());
+        self
+    }
+
+    /// Override the provider used for summarization/compression calls.
+    pub fn summarization_model_provider(mut self, v: Arc<dyn LLMProvider>) -> Self {
+        self.summarization_model_provider = Some(v);
+        self
+    }
+
+    /// Set the reasoning effort.
+    pub fn reasoning_effort(mut self, v: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(v);
+        self
+    }
+
+    /// Set the per-round auxiliary-model resolver.
+    pub fn auxiliary_model_resolver(
+        mut self,
+        v: Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>,
+    ) -> Self {
+        self.auxiliary_model_resolver = Some(v);
+        self
+    }
+
+    /// Set the disabled tool names (merged with config defaults at runtime).
+    pub fn disabled_tools(mut self, v: BTreeSet<String>) -> Self {
+        self.disabled_tools = Some(v);
+        self
+    }
+
+    /// Set the disabled skill ids.
+    pub fn disabled_skill_ids(mut self, v: BTreeSet<String>) -> Self {
+        self.disabled_skill_ids = Some(v);
+        self
+    }
+
+    /// Set the explicitly selected skill ids.
+    pub fn selected_skill_ids(mut self, v: Vec<String>) -> Self {
+        self.selected_skill_ids = Some(v);
+        self
+    }
+
+    /// Set the skill-selection mode.
+    pub fn selected_skill_mode(mut self, v: impl Into<String>) -> Self {
+        self.selected_skill_mode = Some(v.into());
+        self
+    }
+
+    /// Set the image fallback configuration.
+    pub fn image_fallback(mut self, v: ImageFallbackConfig) -> Self {
+        self.image_fallback = Some(v);
+        self
+    }
+
+    /// Set the Bamboo application data directory.
+    pub fn app_data_dir(mut self, v: std::path::PathBuf) -> Self {
+        self.app_data_dir = Some(v);
+        self
+    }
+
+    /// Materialize the underlying [`ExecuteRequest`].
+    ///
+    /// `gold_config` is intentionally not surfaced as a setter (it is an
+    /// internal feature flag); it always defaults to `None`.
+    pub fn build(self) -> ExecuteRequest {
+        ExecuteRequest {
+            initial_message: self.initial_message,
+            event_tx: self.event_tx,
+            cancel_token: self.cancel_token,
+            tools: self.tools,
+            provider_override: self.provider_override,
+            model: self.model,
+            provider_name: self.provider_name,
+            provider_type: self.provider_type,
+            fast_model: self.fast_model,
+            fast_model_provider: self.fast_model_provider,
+            background_model: self.background_model,
+            background_model_provider: self.background_model_provider,
+            summarization_model: self.summarization_model,
+            summarization_model_provider: self.summarization_model_provider,
+            reasoning_effort: self.reasoning_effort,
+            auxiliary_model_resolver: self.auxiliary_model_resolver,
+            disabled_tools: self.disabled_tools,
+            disabled_skill_ids: self.disabled_skill_ids,
+            selected_skill_ids: self.selected_skill_ids,
+            selected_skill_mode: self.selected_skill_mode,
+            image_fallback: self.image_fallback,
+            gold_config: None,
+            app_data_dir: self.app_data_dir,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

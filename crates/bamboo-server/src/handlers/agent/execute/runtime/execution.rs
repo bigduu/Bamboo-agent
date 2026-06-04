@@ -176,6 +176,7 @@ pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
         app_data_dir: args.app_data_dir,
         runners: args.state.agent_runners.clone(),
         sessions_cache: args.state.sessions.clone(),
+        on_complete: None,
     });
 }
 

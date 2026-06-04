@@ -590,6 +590,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             app_data_dir: Some(self.app_data_dir.clone()),
             runners: self.agent_runners.clone(),
             sessions_cache: self.sessions.clone(),
+            on_complete: None,
         });
     }
 }

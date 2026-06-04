@@ -150,88 +150,48 @@ curl -N http://127.0.0.1:9562/api/v1/stream
 
 ### 作为 Rust SDK 直接调用（进程内）
 
-不需要起服务——**同一套 agent loop** 可以直接在进程内通过调用 Rust method 跑起来。构建一次 `Agent`，然后调用 `agent.execute(&mut session, req)`；loop 会通过 `mpsc` channel 把 `AgentEvent` 流式吐回来。公开类型（`Agent`、`AgentBuilder`、`ExecuteRequest`、`AgentEvent`、`Session`）都从 `bamboo_engine` crate 重导出。
+不需要起服务——**同一套 agent loop** 可以直接在进程内跑起来。`bamboo_agent` crate 是引擎之上的一层符合人体工学的**门面（facade）**：你只需给出 model 和一段 instruction，`.with_defaults_for_data_dir` 会从 `~/.bamboo` 装配好八项运行时依赖（storage、persistence、attachment reader、skills、metrics、config、provider、默认工具集），随后 `agent.run(&mut session, input)` 驱动一轮（内部自动消费事件），`agent.run_stream(session, input)` 则通过 `mpsc` channel 把 `AgentEvent` 流式吐回来。每条调用最终都汇入引擎那唯一一条 canonical 执行路径——门面绝不另起一套 loop。符合人体工学的类型都在 `bamboo_agent::agent`（`Agent`、`AgentBuilder`、`ExecuteRequestBuilder`，以及重导出的 `AgentEvent`、`Session` 等）。
 
 ```rust
-use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
-use tokio_util::sync::CancellationToken;
-
-use bamboo_engine::{Agent, AgentEvent, ExecuteRequest, Session, SkillManager};
-use bamboo_engine::metrics::{MetricsCollector, SqliteMetricsStorage};
-use bamboo_infrastructure::{Config, JsonlStorage, LockedSessionStore, SessionStoreV2};
-use bamboo_infrastructure::provider_factory::create_provider;
-use bamboo_tools::BuiltinToolExecutor;
+use bamboo_agent::agent::{Agent, Session};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let home = dirs::home_dir().unwrap().join(".bamboo");
 
-    // 1. 配置（provider 与 API key 从 ~/.bamboo/config.json 读取）和 LLM provider。
-    let config = Config::from_data_dir(Some(home.clone()));
-    let provider = create_provider(&config).await?;            // 真正与 LLM 通信的句柄
-
-    // 2. 装配运行时依赖。
-    let jsonl = JsonlStorage::new(home.join("storage"));
-    jsonl.init().await?;
-    let storage = Arc::new(jsonl);
-    let session_store = Arc::new(SessionStoreV2::new(home.clone()).await?);
-    let metrics = MetricsCollector::spawn(
-        Arc::new(SqliteMetricsStorage::new(home.join("metrics.db"))),
-        7, // 指标保留天数
-    );
-
-    // 3. 构建 agent。
+    // 构建 agent。一次调用即装配好 storage、persistence、skills、metrics、
+    // provider（从 ~/.bamboo/config.json 读取）和默认内置工具集——无需手动接线。
     let agent = Agent::builder()
-        .storage(storage.clone())
-        .persistence(Arc::new(LockedSessionStore::new(storage.clone())))
-        .attachment_reader(session_store.clone())
-        .skill_manager(Arc::new(SkillManager::new()))
-        .metrics_collector(metrics)
-        .config(Arc::new(RwLock::new(config)))
-        .provider(provider)
-        .default_tools(Arc::new(BuiltinToolExecutor::new()))
+        .model("claude-sonnet-4-6")
+        .instruction("你是一个乐于助人的编码 agent。")
+        .with_defaults_for_data_dir(home)
+        .await
+        .expect("装配运行时依赖")
         .build()
         .expect("agent fully configured");
 
-    // 4. 跑一轮，并流式消费事件。
-    let mut session = Session::new("demo-session", "claude-sonnet-4-6");
-    let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
-
-    let req = ExecuteRequest {
-        initial_message: "列出这里的文件，并告诉我这个项目是做什么的。".into(),
-        event_tx: tx,
-        cancel_token: CancellationToken::new(),
-        model: Some("claude-sonnet-4-6".into()),
-        // 其余字段都是 `Option` —— `None` 即回落到配置默认值。
-        tools: None, provider_override: None, provider_name: None, provider_type: None,
-        fast_model: None, fast_model_provider: None, background_model: None,
-        background_model_provider: None, summarization_model: None,
-        summarization_model_provider: None, reasoning_effort: None,
-        auxiliary_model_resolver: None, disabled_tools: None, disabled_skill_ids: None,
-        selected_skill_ids: None, selected_skill_mode: None, image_fallback: None,
-        gold_config: None, app_data_dir: Some(home),
-    };
-
-    // `execute` 驱动整个 loop；它规划、调用工具、给出答案的过程会以事件形式到达 `rx`。
-    let handle = tokio::spawn(async move { agent.execute(&mut session, req).await });
+    // 流式跑一轮：`run_stream` 追加用户消息，在后台任务里驱动 loop，
+    // 并返回一个 AgentEvent 接收端。
+    let session = Session::new("demo-session", "claude-sonnet-4-6");
+    let mut rx = agent.run_stream(
+        session,
+        "列出这里的文件，并告诉我这个项目是做什么的。",
+    );
     while let Some(event) = rx.recv().await {
         println!("{event:?}"); // 助手文本、工具调用、工具结果、token 用量、完成
     }
-    handle.await??;
     Ok(())
 }
 ```
 
-把 bamboo 的 crate 加为依赖（path 或 git —— 这些运行时 crate 是本 workspace 的一部分）：
+> 不需要事件流？`agent.run(&mut session, input).await?` 会把这一轮跑到结束，答案就是 `session` 上的最后一条消息。需要对每次请求做精细覆盖（拆分 fast/background/summarization 模型、skill 选择、provider 句柄等）时，下沉一层到 `bamboo_engine` 的 `ExecuteRequest` / `ExecuteRequestBuilder` 加 `agent.execute(&mut session, req)`——这正是门面内部调用的同一条路径。
+
+把门面 crate 加为依赖（path 或 git）：
 
 ```toml
 [dependencies]
-bamboo-engine = { git = "https://github.com/bigduu/Bamboo-agent" }
-bamboo-infrastructure = { git = "https://github.com/bigduu/Bamboo-agent" }
-bamboo-tools = { git = "https://github.com/bigduu/Bamboo-agent" }
+bamboo-agent = { git = "https://github.com/bigduu/Bamboo-agent" }
 tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
 dirs = "5"
 anyhow = "1"
 ```

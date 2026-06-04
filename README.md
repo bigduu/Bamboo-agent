@@ -151,88 +151,49 @@ curl -N http://127.0.0.1:9562/api/v1/stream
 
 ### Use it as a Rust SDK (in-process)
 
-No server needed — the **same agent loop** runs in-process by calling Rust methods directly. Build an `Agent` once, then call `agent.execute(&mut session, req)`; the loop streams `AgentEvent`s back over an `mpsc` channel. The public types (`Agent`, `AgentBuilder`, `ExecuteRequest`, `AgentEvent`, `Session`) are re-exported from the `bamboo_engine` crate.
+No server needed — the **same agent loop** runs in-process. The `bamboo_agent` crate is an ergonomic **facade** over the engine: you supply a model and an instruction, `.with_defaults_for_data_dir` wires the eight runtime dependencies (storage, persistence, attachment reader, skills, metrics, config, provider, default tools) from `~/.bamboo`, and then `agent.run(&mut session, input)` drives one turn (draining events internally) while `agent.run_stream(session, input)` streams `AgentEvent`s back over an `mpsc` channel. Every call funnels into the engine's single canonical execution path — the facade never forks the loop. The ergonomic types live in `bamboo_agent::agent` (`Agent`, `AgentBuilder`, `ExecuteRequestBuilder`, plus re-exported `AgentEvent`, `Session`, …).
 
 ```rust
-use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
-use tokio_util::sync::CancellationToken;
-
-use bamboo_engine::{Agent, AgentEvent, ExecuteRequest, Session, SkillManager};
-use bamboo_engine::metrics::{MetricsCollector, SqliteMetricsStorage};
-use bamboo_infrastructure::{Config, JsonlStorage, LockedSessionStore, SessionStoreV2};
-use bamboo_infrastructure::provider_factory::create_provider;
-use bamboo_tools::BuiltinToolExecutor;
+use bamboo_agent::agent::{Agent, Session};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let home = dirs::home_dir().unwrap().join(".bamboo");
 
-    // 1. Config (provider + API key are read from ~/.bamboo/config.json) and the LLM provider.
-    let config = Config::from_data_dir(Some(home.clone()));
-    let provider = create_provider(&config).await?;            // the handle that talks to the LLM
-
-    // 2. Wire the runtime's dependencies.
-    let jsonl = JsonlStorage::new(home.join("storage"));
-    jsonl.init().await?;
-    let storage = Arc::new(jsonl);
-    let session_store = Arc::new(SessionStoreV2::new(home.clone()).await?);
-    let metrics = MetricsCollector::spawn(
-        Arc::new(SqliteMetricsStorage::new(home.join("metrics.db"))),
-        7, // metrics retention (days)
-    );
-
-    // 3. Build the agent.
+    // Build the agent. One call assembles storage, persistence, skills,
+    // metrics, the provider (from ~/.bamboo/config.json), and the default
+    // built-in tool set — no manual dependency wiring.
     let agent = Agent::builder()
-        .storage(storage.clone())
-        .persistence(Arc::new(LockedSessionStore::new(storage.clone())))
-        .attachment_reader(session_store.clone())
-        .skill_manager(Arc::new(SkillManager::new()))
-        .metrics_collector(metrics)
-        .config(Arc::new(RwLock::new(config)))
-        .provider(provider)
-        .default_tools(Arc::new(BuiltinToolExecutor::new()))
+        .model("claude-sonnet-4-6")
+        .instruction("You are a helpful coding agent.")
+        .with_defaults_for_data_dir(home)
+        .await
+        .expect("wire runtime deps")
         .build()
         .expect("agent fully configured");
 
-    // 4. Run one turn and stream the events.
-    let mut session = Session::new("demo-session", "claude-sonnet-4-6");
-    let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
-
-    let req = ExecuteRequest {
-        initial_message: "List the files here and tell me what this project does.".into(),
-        event_tx: tx,
-        cancel_token: CancellationToken::new(),
-        model: Some("claude-sonnet-4-6".into()),
-        // Every other field is an `Option` → `None` falls back to the config defaults.
-        tools: None, provider_override: None, provider_name: None, provider_type: None,
-        fast_model: None, fast_model_provider: None, background_model: None,
-        background_model_provider: None, summarization_model: None,
-        summarization_model_provider: None, reasoning_effort: None,
-        auxiliary_model_resolver: None, disabled_tools: None, disabled_skill_ids: None,
-        selected_skill_ids: None, selected_skill_mode: None, image_fallback: None,
-        gold_config: None, app_data_dir: Some(home),
-    };
-
-    // `execute` drives the loop; events arrive on `rx` as it plans, calls tools, and answers.
-    let handle = tokio::spawn(async move { agent.execute(&mut session, req).await });
+    // Stream one turn: `run_stream` appends the user message, runs the loop on
+    // a background task, and hands back a receiver of AgentEvents.
+    let session = Session::new("demo-session", "claude-sonnet-4-6");
+    let mut rx = agent.run_stream(
+        session,
+        "List the files here and tell me what this project does.",
+    );
     while let Some(event) = rx.recv().await {
         println!("{event:?}"); // assistant text, tool calls, tool results, token usage, completion
     }
-    handle.await??;
     Ok(())
 }
 ```
 
-Add the bamboo crates as dependencies (path or git — the runtime crates are part of this workspace):
+> Don't need the event stream? `agent.run(&mut session, input).await?` drives the turn to completion and leaves the answer as the last message on `session`. For full control over per-request overrides (split fast/background/summarization models, skill selection, provider handles, …) drop one layer down to `bamboo_engine`'s `ExecuteRequest` / `ExecuteRequestBuilder` and `agent.execute(&mut session, req)` — the same path the facade calls.
+
+Add the facade crate as a dependency (path or git):
 
 ```toml
 [dependencies]
-bamboo-engine = { git = "https://github.com/bigduu/Bamboo-agent" }
-bamboo-infrastructure = { git = "https://github.com/bigduu/Bamboo-agent" }
-bamboo-tools = { git = "https://github.com/bigduu/Bamboo-agent" }
+bamboo-agent = { git = "https://github.com/bigduu/Bamboo-agent" }
 tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
 dirs = "5"
 anyhow = "1"
 ```

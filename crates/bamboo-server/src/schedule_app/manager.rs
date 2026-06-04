@@ -10,10 +10,11 @@ use bamboo_agent_core::{AgentEvent, Message, Role, Session};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::{
-    create_event_forwarder, finalize_runner, get_or_create_event_sender, try_reserve_runner,
-    AgentRunner, RunnerReservation,
+    create_event_forwarder, get_or_create_event_sender, spawn_session_execution,
+    try_reserve_runner, AgentRunner, RunnerReservation, SessionCompletionHook,
+    SessionExecutionArgs,
 };
-use bamboo_engine::{AuxiliaryModelConfig, ExecuteRequest};
+use bamboo_engine::AuxiliaryModelConfig;
 use bamboo_infrastructure::LockedSessionStore;
 
 use super::store::{ClaimedScheduleRun, ScheduleStore};
@@ -307,8 +308,6 @@ async fn run_schedule_job(
     }
 
     let session_tx = get_or_create_event_sender(&ctx.session_event_senders, &session_id).await;
-    let schedule_id_for_log = job.schedule_id.clone();
-    let run_id_for_log = job.run_id.clone();
 
     // Insert runner status (for cancellation/status introspection).
     let Some(RunnerReservation { cancel_token, .. }) =
@@ -326,137 +325,115 @@ async fn run_schedule_job(
         ctx.account_feed_inbox.clone(),
     );
 
-    // Run agent loop in background.
-    let agent_runtime = ctx.agent.clone();
-    let tools = ctx.tools.clone();
+    // Run the agent loop in the background via the single canonical execution
+    // path (`spawn_session_execution`), the same one the HTTP execute handler
+    // and the child-completion coordinator use. Schedule-specific finalization
+    // (marking the run terminal, and writing a visible failure marker) is
+    // carried by the `on_complete` hook, which runs after the runner is
+    // finalized but before the session is persisted — so the marker is saved.
+    let aux_fast_model = resolved.fast_model.clone();
+    let aux_fast_provider = resolved.fast_model_provider.clone();
+    let aux_background_model = resolved.background_model.clone();
+    let aux_background_provider = resolved.background_model_provider.clone();
+    let aux_summarization_model = resolved.summarization_model.clone();
+    let aux_summarization_provider = resolved.summarization_model_provider.clone();
+    let auxiliary_model_resolver = Arc::new(move || AuxiliaryModelConfig {
+        fast_model_name: aux_fast_model.clone(),
+        fast_model_provider: aux_fast_provider.clone(),
+        background_model_name: aux_background_model.clone(),
+        planning_model_name: None,
+        search_model_name: None,
+        summarization_model_name: aux_summarization_model.clone(),
+        background_model_provider: aux_background_provider.clone(),
+        summarization_model_provider: aux_summarization_provider.clone(),
+    });
+
     let schedule_store = ctx.schedule_store.clone();
-    let persistence = ctx.persistence.clone();
-    let session_id_clone = session_id.clone();
     let schedule_id_for_state = job.schedule_id.clone();
     let run_id_for_state = job.run_id.clone();
-    let agent_runners_for_status = ctx.agent_runners.clone();
-    let sessions_cache = ctx.sessions_cache.clone();
-    let model = resolved.model.clone();
-    let provider_name = resolved.provider_name.clone();
-    let provider_type = resolved.provider_type.clone();
-    let fast_model = resolved.fast_model.clone();
-    let fast_model_provider = resolved.fast_model_provider.clone();
-    let background_model = resolved.background_model.clone();
-    let background_model_provider = resolved.background_model_provider.clone();
-    let summarization_model = resolved.summarization_model.clone();
-    let summarization_model_provider = resolved.summarization_model_provider.clone();
-    let reasoning_effort = resolved.reasoning_effort;
-    let gold_config = resolved.gold_config.clone();
+    let log_session_id = session_id.clone();
 
-    tokio::spawn(async move {
-        let initial_message = session
-            .messages
-            .last()
-            .filter(|m| matches!(m.role, Role::User))
-            .map(|m| m.content.clone())
-            .unwrap_or_default();
-
-        let aux_fast_model = fast_model.clone();
-        let aux_fast_provider = fast_model_provider.clone();
-        let aux_background_model = background_model.clone();
-        let aux_background_provider = background_model_provider.clone();
-        let aux_summarization_model = summarization_model.clone();
-        let aux_summarization_provider = summarization_model_provider.clone();
-        let auxiliary_model_resolver = Arc::new(move || AuxiliaryModelConfig {
-            fast_model_name: aux_fast_model.clone(),
-            fast_model_provider: aux_fast_provider.clone(),
-            background_model_name: aux_background_model.clone(),
-            planning_model_name: None,
-            search_model_name: None,
-            summarization_model_name: aux_summarization_model.clone(),
-            background_model_provider: aux_background_provider.clone(),
-            summarization_model_provider: aux_summarization_provider.clone(),
-        });
-
-        let result = agent_runtime
-            .execute(
-                &mut session,
-                ExecuteRequest {
-                    initial_message,
-                    event_tx: mpsc_tx,
-                    cancel_token,
-                    tools: Some(tools),
-                    provider_override: None,
-                    model: Some(model.clone()),
-                    provider_name,
-                    provider_type,
-                    fast_model,
-                    fast_model_provider,
-                    background_model,
-                    background_model_provider,
-                    summarization_model,
-                    summarization_model_provider,
-                    reasoning_effort,
-                    auxiliary_model_resolver: Some(auxiliary_model_resolver),
-                    disabled_tools: None,
-                    disabled_skill_ids: None,
-                    selected_skill_ids: None,
-                    selected_skill_mode: None,
-                    image_fallback: None,
-                    gold_config,
-                    app_data_dir: ctx.app_data_dir.clone(),
-                },
-            )
-            .await;
-
-        let terminal_status = if let Err(ref e) = result {
-            // Persist a visible failure marker so the user can open the scheduled session
-            // and understand why it didn't produce output.
-            session.add_message(Message::assistant(
-                format!("❌ Scheduled run failed: {e}"),
-                None,
-            ));
-            tracing::warn!(
-                "[schedule:{}][run:{}][session:{}] scheduled run failed: {}",
-                schedule_id_for_log,
-                run_id_for_log,
-                session_id_clone,
-                e
-            );
-            if e.to_string().contains("cancelled") {
-                ScheduleRunStatus::Cancelled
+    let on_complete: SessionCompletionHook = Box::new(move |outcome, session| {
+        Box::pin(async move {
+            let terminal_status = if outcome.success {
+                tracing::info!(
+                    "[schedule:{}][run:{}][session:{}] scheduled run completed",
+                    schedule_id_for_state,
+                    run_id_for_state,
+                    log_session_id
+                );
+                ScheduleRunStatus::Success
             } else {
-                ScheduleRunStatus::Failed
+                let detail = outcome.error.as_deref().unwrap_or("unknown error");
+                // Persist a visible failure marker so the user can open the
+                // scheduled session and understand why it produced no output.
+                session.add_message(Message::assistant(
+                    format!("❌ Scheduled run failed: {detail}"),
+                    None,
+                ));
+                tracing::warn!(
+                    "[schedule:{}][run:{}][session:{}] scheduled run failed: {}",
+                    schedule_id_for_state,
+                    run_id_for_state,
+                    log_session_id,
+                    detail
+                );
+                if outcome.cancelled {
+                    ScheduleRunStatus::Cancelled
+                } else {
+                    ScheduleRunStatus::Failed
+                }
+            };
+
+            if let Err(error) = schedule_store
+                .mark_run_terminal(
+                    &schedule_id_for_state,
+                    &run_id_for_state,
+                    terminal_status,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    "failed to mark schedule run terminal state for {} / {}: {}",
+                    schedule_id_for_state,
+                    run_id_for_state,
+                    error
+                );
             }
-        } else {
-            tracing::info!(
-                "[schedule:{}][run:{}][session:{}] scheduled run completed",
-                schedule_id_for_log,
-                run_id_for_log,
-                session_id_clone
-            );
-            ScheduleRunStatus::Success
-        };
+        })
+    });
 
-        if let Err(error) = schedule_store
-            .mark_run_terminal(
-                &schedule_id_for_state,
-                &run_id_for_state,
-                terminal_status,
-                None,
-            )
-            .await
-        {
-            tracing::warn!(
-                "failed to mark schedule run terminal state for {} / {}: {}",
-                schedule_id_for_state,
-                run_id_for_state,
-                error
-            );
-        }
-
-        finalize_runner(&agent_runners_for_status, &session_id_clone, &result).await;
-
-        let _ = persistence.merge_save_runtime(&mut session).await;
-        {
-            let mut sessions = sessions_cache.write().await;
-            sessions.insert(session_id_clone.clone(), session);
-        }
+    spawn_session_execution(SessionExecutionArgs {
+        agent: ctx.agent.clone(),
+        session_id,
+        session,
+        tools_override: Some(ctx.tools.clone()),
+        provider_override: None,
+        provider_name: resolved.provider_name.clone(),
+        provider_type: resolved.provider_type.clone(),
+        model: resolved.model.clone(),
+        fast_model: resolved.fast_model.clone(),
+        fast_model_provider: resolved.fast_model_provider.clone(),
+        background_model: resolved.background_model.clone(),
+        background_model_provider: resolved.background_model_provider.clone(),
+        summarization_model: resolved.summarization_model.clone(),
+        summarization_model_provider: resolved.summarization_model_provider.clone(),
+        reasoning_effort: resolved.reasoning_effort,
+        reasoning_effort_source: "schedule".to_string(),
+        auxiliary_model_resolver: Some(auxiliary_model_resolver),
+        disabled_tools: None,
+        disabled_skill_ids: None,
+        selected_skill_ids: None,
+        selected_skill_mode: None,
+        cancel_token,
+        mpsc_tx,
+        image_fallback: None,
+        gold_config: resolved.gold_config.clone(),
+        app_data_dir: ctx.app_data_dir.clone(),
+        runners: ctx.agent_runners.clone(),
+        sessions_cache: ctx.sessions_cache.clone(),
+        on_complete: Some(on_complete),
     });
 
     Ok(ScheduleRunLifecycleResult::BackgroundExecutionInProgress)

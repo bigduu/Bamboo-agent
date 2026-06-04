@@ -40,7 +40,9 @@ pub use runtime::managers::{
     LifecycleManager, LlmManager, MemoryManager, MiniLoopExecutor, PromptManager, ToolManager,
 };
 pub use runtime::runner::run_agent_loop_with_config;
-pub use runtime::runtime::{AgentRuntime, AgentRuntimeBuilder, ExecuteRequest};
+pub use runtime::runtime::{
+    AgentRuntime, AgentRuntimeBuilder, ExecuteRequest, ExecuteRequestBuilder,
+};
 pub use runtime::task_context::TaskLoopContext;
 pub use runtime::task_evaluation::{evaluate_task_progress, TaskEvaluationResult};
 pub use runtime::Agent;

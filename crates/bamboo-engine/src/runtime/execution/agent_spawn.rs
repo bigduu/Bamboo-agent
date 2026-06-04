@@ -4,6 +4,8 @@
 //! background agent run: spawn task → execute → finalize runner → persist session.
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
@@ -25,6 +27,59 @@ const SKILL_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_SKILL_CONTEXT_START -->";
 const TOOL_GUIDE_START_MARKER: &str = "<!-- BAMBOO_TOOL_GUIDE_START -->";
 const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
 const TASK_LIST_START_MARKER: &str = "<!-- BAMBOO_TASK_LIST_START -->";
+
+/// Outcome of an agent execution, handed to an optional
+/// [`SessionCompletionHook`].
+///
+/// Deliberately decoupled from the runtime's internal error type so the hook
+/// API stays stable across crates and callers don't need to match on engine
+/// error variants.
+pub struct SessionExecutionOutcome {
+    /// The run finished without error.
+    pub success: bool,
+    /// The run ended because it was cancelled (a non-success subset).
+    pub cancelled: bool,
+    /// Stringified error, present when `!success`.
+    pub error: Option<String>,
+}
+
+impl SessionExecutionOutcome {
+    fn from_result<E: std::fmt::Display>(result: &Result<(), E>) -> Self {
+        match result {
+            Ok(()) => Self {
+                success: true,
+                cancelled: false,
+                error: None,
+            },
+            Err(error) => {
+                let message = error.to_string();
+                let cancelled = message.contains("cancelled");
+                Self {
+                    success: false,
+                    cancelled,
+                    error: Some(message),
+                }
+            }
+        }
+    }
+}
+
+/// Optional post-execution hook for [`spawn_session_execution`].
+///
+/// Invoked after the runner is finalized but **before** the session is
+/// persisted, so a caller can record bespoke terminal bookkeeping (e.g. a
+/// scheduled-run status) and/or append a closing message that is then saved
+/// with the session. Receives the execution outcome plus a mutable handle to
+/// the session. This is how callers with extra finalization (the schedule
+/// manager) route through the single canonical execution path instead of
+/// forking their own spawn + `execute` + persist sequence.
+pub type SessionCompletionHook = Box<
+    dyn for<'a> FnOnce(
+            SessionExecutionOutcome,
+            &'a mut Session,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+        + Send,
+>;
 
 /// Arguments for spawning a background agent execution.
 ///
@@ -69,6 +124,10 @@ pub struct SessionExecutionArgs {
     // Post-execution resources.
     pub runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub sessions_cache: Arc<RwLock<HashMap<String, Session>>>,
+
+    /// Optional bespoke finalization, run after the runner is finalized and
+    /// before the session is persisted. See [`SessionCompletionHook`].
+    pub on_complete: Option<SessionCompletionHook>,
 }
 
 /// Spawn a background agent execution task.
@@ -114,6 +173,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 app_data_dir,
                 runners,
                 sessions_cache,
+                on_complete,
             } = args;
 
             let initial_message = initial_user_message_for_session(&session);
@@ -177,6 +237,14 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
 
             // Update runner status.
             finalize_runner(&runners, &session_id, &result).await;
+
+            // Bespoke terminal bookkeeping (e.g. a scheduled-run status) runs
+            // here — after the runner is finalized but before persistence — so
+            // any closing message the hook appends is saved with the session
+            // below.
+            if let Some(on_complete) = on_complete {
+                on_complete(SessionExecutionOutcome::from_result(&result), &mut session).await;
+            }
 
             // Save session via merge-save so any concurrent UI edits to
             // title / pinned / title_version are preserved (the runtime is not
