@@ -18,7 +18,7 @@ use bamboo_engine::model_config_helper::{resolve_planning_model, resolve_search_
 
 use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::agent_spawn::SessionExecutionArgs;
-use bamboo_engine::{AuxiliaryModelConfig, ImageFallbackConfig};
+use bamboo_engine::{AuxiliaryModelConfig, ImageFallbackConfig, ModelRoster};
 use bamboo_infrastructure::{Config, LLMProvider};
 
 use super::session_state;
@@ -28,16 +28,14 @@ pub(crate) struct SpawnAgentExecution {
     pub(crate) session_id: String,
     pub(crate) session: bamboo_agent_core::Session,
     pub(crate) is_child_session: bool,
+    /// Provider routing key for the primary model. Mirrors
+    /// `model_roster.provider_name` but kept as a required `String` because the
+    /// auxiliary-model resolver is keyed on it; the value is also threaded into
+    /// the roster.
     pub(crate) provider_name: String,
-    pub(crate) provider_type: Option<String>,
     pub(crate) provider_override: Option<Arc<dyn LLMProvider>>,
-    pub(crate) model: String,
-    pub(crate) fast_model: Option<String>,
-    pub(crate) fast_model_provider: Option<Arc<dyn LLMProvider>>,
-    pub(crate) background_model: Option<String>,
-    pub(crate) background_model_provider: Option<Arc<dyn LLMProvider>>,
-    pub(crate) summarization_model: Option<String>,
-    pub(crate) summarization_model_provider: Option<Arc<dyn LLMProvider>>,
+    /// Cohesive primary + auxiliary model/provider selection.
+    pub(crate) model_roster: ModelRoster,
     pub(crate) reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
     pub(crate) reasoning_effort_source: String,
     pub(crate) disabled_tools: BTreeSet<String>,
@@ -147,21 +145,19 @@ pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
 
     let auxiliary_model_resolver = make_auxiliary_model_resolver(&args.state, &args.provider_name);
 
+    // The resolved provider name is the authoritative routing key; thread it into
+    // the roster so it matches the value the old `provider_name` field carried
+    // (and the resolver above is keyed on).
+    let mut model_roster = args.model_roster;
+    model_roster.provider_name = Some(args.provider_name);
+
     bamboo_engine::execution::spawn_session_execution(SessionExecutionArgs {
         agent: args.state.agent.clone(),
         session_id: args.session_id,
         session: args.session,
         tools_override,
         provider_override,
-        provider_name: Some(args.provider_name),
-        provider_type: args.provider_type,
-        model: args.model,
-        fast_model: args.fast_model,
-        fast_model_provider: args.fast_model_provider,
-        background_model: args.background_model,
-        background_model_provider: args.background_model_provider,
-        summarization_model: args.summarization_model,
-        summarization_model_provider: args.summarization_model_provider,
+        model_roster,
         reasoning_effort: args.reasoning_effort,
         reasoning_effort_source: args.reasoning_effort_source,
         auxiliary_model_resolver: Some(auxiliary_model_resolver),

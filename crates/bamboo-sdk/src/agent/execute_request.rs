@@ -27,15 +27,18 @@ mod tests {
         assert_eq!(req.initial_message, "hello");
         assert!(req.tools.is_none());
         assert!(req.provider_override.is_none());
-        assert!(req.model.is_none());
-        assert!(req.provider_name.is_none());
-        assert!(req.provider_type.is_none());
-        assert!(req.fast_model.is_none());
-        assert!(req.fast_model_provider.is_none());
-        assert!(req.background_model.is_none());
-        assert!(req.background_model_provider.is_none());
-        assert!(req.summarization_model.is_none());
-        assert!(req.summarization_model_provider.is_none());
+        assert!(req.model_roster.model.is_none());
+        assert!(req.model_roster.provider_name.is_none());
+        assert!(req.model_roster.provider_type.is_none());
+        assert!(req.model_roster.fast.is_none());
+        assert!(req.model_roster.fast_model().is_none());
+        assert!(req.model_roster.fast_model_provider().is_none());
+        assert!(req.model_roster.background.is_none());
+        assert!(req.model_roster.background_model().is_none());
+        assert!(req.model_roster.background_model_provider().is_none());
+        assert!(req.model_roster.summarization.is_none());
+        assert!(req.model_roster.summarization_model().is_none());
+        assert!(req.model_roster.summarization_model_provider().is_none());
         assert!(req.reasoning_effort.is_none());
         assert!(req.auxiliary_model_resolver.is_none());
         assert!(req.disabled_tools.is_none());
@@ -59,8 +62,8 @@ mod tests {
             .disabled_tools(disabled.clone())
             .build();
 
-        assert_eq!(req.model.as_deref(), Some("claude-x"));
-        assert_eq!(req.provider_name.as_deref(), Some("anthropic"));
+        assert_eq!(req.model_roster.model.as_deref(), Some("claude-x"));
+        assert_eq!(req.model_roster.provider_name.as_deref(), Some("anthropic"));
         assert_eq!(req.disabled_tools, Some(disabled));
     }
 }

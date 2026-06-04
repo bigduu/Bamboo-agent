@@ -71,15 +71,15 @@ fn s_t4_2_execute_request_builder_round_trip() {
     // All optional fields default to None.
     assert!(req.tools.is_none());
     assert!(req.provider_override.is_none());
-    assert!(req.model.is_none());
-    assert!(req.provider_name.is_none());
-    assert!(req.provider_type.is_none());
-    assert!(req.fast_model.is_none());
-    assert!(req.fast_model_provider.is_none());
-    assert!(req.background_model.is_none());
-    assert!(req.background_model_provider.is_none());
-    assert!(req.summarization_model.is_none());
-    assert!(req.summarization_model_provider.is_none());
+    assert!(req.model_roster.model.is_none());
+    assert!(req.model_roster.provider_name.is_none());
+    assert!(req.model_roster.provider_type.is_none());
+    assert!(req.model_roster.fast.is_none());
+    assert!(req.model_roster.fast_model_provider().is_none());
+    assert!(req.model_roster.background.is_none());
+    assert!(req.model_roster.background_model_provider().is_none());
+    assert!(req.model_roster.summarization.is_none());
+    assert!(req.model_roster.summarization_model_provider().is_none());
     assert!(req.reasoning_effort.is_none());
     assert!(req.auxiliary_model_resolver.is_none());
     assert!(req.disabled_tools.is_none());
@@ -96,8 +96,11 @@ fn s_t4_2_execute_request_builder_round_trip() {
         .model("claude-x")
         .provider_name("anthropic")
         .build();
-    assert_eq!(req2.model.as_deref(), Some("claude-x"));
-    assert_eq!(req2.provider_name.as_deref(), Some("anthropic"));
+    assert_eq!(req2.model_roster.model.as_deref(), Some("claude-x"));
+    assert_eq!(
+        req2.model_roster.provider_name.as_deref(),
+        Some("anthropic")
+    );
 
     // ToolSpec is derived from the canonical names.
     let names = builtin_tool_names();

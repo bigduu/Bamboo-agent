@@ -561,21 +561,27 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                 summarization_model_provider: areas.summarization.map(|m| m.provider),
             }
         });
+        let model_roster = bamboo_engine::ModelRoster {
+            model: Some(model),
+            provider_name: Some(resolved_provider_name),
+            provider_type: config.provider_type.clone(),
+            fast: bamboo_engine::RoleModel::from_parts(config.fast_model, resolved_fast_provider),
+            background: bamboo_engine::RoleModel::from_parts(
+                config.background_model,
+                config.background_model_provider,
+            ),
+            summarization: bamboo_engine::RoleModel::from_parts(
+                config.summarization_model,
+                config.summarization_model_provider,
+            ),
+        };
         spawn_session_execution(SessionExecutionArgs {
             agent: self.agent.clone(),
             session_id,
             session,
             tools_override: Some(root_tools),
             provider_override,
-            provider_name: Some(resolved_provider_name),
-            provider_type: config.provider_type.clone(),
-            model,
-            fast_model: config.fast_model,
-            fast_model_provider: resolved_fast_provider,
-            background_model: config.background_model,
-            background_model_provider: config.background_model_provider,
-            summarization_model: config.summarization_model,
-            summarization_model_provider: config.summarization_model_provider,
+            model_roster,
             reasoning_effort,
             reasoning_effort_source,
             auxiliary_model_resolver: Some(auxiliary_model_resolver),

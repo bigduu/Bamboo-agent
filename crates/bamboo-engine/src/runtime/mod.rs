@@ -8,6 +8,7 @@ pub mod execution;
 pub mod gold_evaluation;
 pub mod hooks;
 pub mod managers;
+pub mod model_roster;
 pub mod runner;
 #[allow(clippy::module_inception)]
 pub mod runtime;
@@ -24,6 +25,7 @@ pub use hooks::HookRunner;
 pub use managers::{
     LifecycleManager, LlmManager, MemoryManager, MiniLoopExecutor, PromptManager, ToolManager,
 };
+pub use model_roster::{ModelRoster, RoleModel};
 pub use runner::{run_agent_loop, run_agent_loop_with_config};
 pub use runtime::{AgentRuntime, AgentRuntimeBuilder, ExecuteRequest};
 pub use task_context::TaskLoopContext;

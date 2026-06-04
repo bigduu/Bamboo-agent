@@ -255,21 +255,31 @@ pub async fn handler(
                 session_tx.clone(),
                 gold_config.clone(),
             );
+            let model_roster = bamboo_engine::ModelRoster {
+                model: Some(effective_model),
+                provider_name: Some(resolved_provider_name.clone()),
+                provider_type: resolved_provider_type,
+                fast: bamboo_engine::RoleModel::from_parts(
+                    areas.fast.as_ref().map(|m| m.model_name.clone()),
+                    areas.fast.map(|m| m.provider),
+                ),
+                background: bamboo_engine::RoleModel::from_parts(
+                    areas.background.as_ref().map(|m| m.model_name.clone()),
+                    areas.background.map(|m| m.provider),
+                ),
+                summarization: bamboo_engine::RoleModel::from_parts(
+                    areas.summarization.as_ref().map(|m| m.model_name.clone()),
+                    areas.summarization.map(|m| m.provider),
+                ),
+            };
             spawn_agent_execution(SpawnAgentExecution {
                 state: state.clone(),
                 session_id: session_id.clone(),
                 session,
                 is_child_session,
                 provider_name: resolved_provider_name,
-                provider_type: resolved_provider_type,
                 provider_override: None,
-                model: effective_model,
-                fast_model: areas.fast.as_ref().map(|m| m.model_name.clone()),
-                fast_model_provider: areas.fast.map(|m| m.provider),
-                background_model: areas.background.as_ref().map(|m| m.model_name.clone()),
-                background_model_provider: areas.background.map(|m| m.provider),
-                summarization_model: areas.summarization.as_ref().map(|m| m.model_name.clone()),
-                summarization_model_provider: areas.summarization.map(|m| m.provider),
+                model_roster,
                 reasoning_effort: effective_reasoning_effort,
                 reasoning_effort_source: reasoning_source.to_string(),
                 disabled_tools,

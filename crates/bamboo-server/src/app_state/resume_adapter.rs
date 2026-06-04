@@ -132,21 +132,29 @@ impl ResumeExecutionPort for AppStateResumeRef {
             gold_config.clone(),
         );
 
+        let model_roster = bamboo_engine::ModelRoster {
+            model: Some(model),
+            provider_name: Some(resolved_provider_name.clone()),
+            provider_type: resolved_provider_type,
+            fast: bamboo_engine::RoleModel::from_parts(resolved_fast_model, resolved_fast_provider),
+            background: bamboo_engine::RoleModel::from_parts(
+                resolved_background_model,
+                resolved_bg_provider,
+            ),
+            summarization: bamboo_engine::RoleModel::from_parts(
+                resolved_summarization_model,
+                resolved_summarization_provider,
+            ),
+        };
+
         spawn_agent_execution(SpawnAgentExecution {
             state: state.clone(),
             session_id,
             session,
             is_child_session,
             provider_name: resolved_provider_name,
-            provider_type: resolved_provider_type,
             provider_override: None,
-            model,
-            fast_model: resolved_fast_model,
-            fast_model_provider: resolved_fast_provider,
-            background_model: resolved_background_model,
-            background_model_provider: resolved_bg_provider,
-            summarization_model: resolved_summarization_model,
-            summarization_model_provider: resolved_summarization_provider,
+            model_roster,
             reasoning_effort,
             reasoning_effort_source,
             disabled_tools: config.disabled_tools,

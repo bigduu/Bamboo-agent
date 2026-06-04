@@ -29,6 +29,7 @@ use crate::runtime::hooks::HookRunner;
 use crate::runtime::managers::{
     LifecycleManager, LlmManager, MemoryManager, PromptManager, ToolManager,
 };
+use crate::runtime::model_roster::{ModelRoster, RoleModel};
 use crate::runtime::runner::run_agent_loop_with_config;
 use bamboo_domain::RuntimeSessionPersistence;
 
@@ -268,22 +269,13 @@ pub struct ExecuteRequest {
     /// runtime's shared provider handle.
     pub provider_override: Option<Arc<dyn LLMProvider>>,
 
-    // -- Optional overrides (None → config defaults) ----------------------
-    pub model: Option<String>,
-    pub provider_name: Option<String>,
-    pub provider_type: Option<String>,
-    /// When `None`, falls back to `Config::get_fast_model()`.
-    pub fast_model: Option<String>,
-    /// Optional provider override for lightweight fast-model calls.
-    pub fast_model_provider: Option<Arc<dyn LLMProvider>>,
-    /// When `None`, falls back to `Config::get_memory_background_model()`.
-    pub background_model: Option<String>,
-    /// Optional provider override for memory/background model calls.
-    pub background_model_provider: Option<Arc<dyn LLMProvider>>,
-    /// When `None`, falls back to `Config::get_task_summary_model()`.
-    pub summarization_model: Option<String>,
-    /// Optional provider override for task summarization / compression calls.
-    pub summarization_model_provider: Option<Arc<dyn LLMProvider>>,
+    // -- Model selection (None roles → config defaults) -------------------
+    /// Cohesive primary + auxiliary model/provider selection. Replaces the old
+    /// `model` / `provider_name` / `provider_type` / `fast_model(+provider)` /
+    /// `background_model(+provider)` / `summarization_model(+provider)` clump.
+    /// Per-role `None` preserves the same `None → Config::get_*` fallbacks
+    /// applied during [`AgentRuntime::execute`].
+    pub model_roster: ModelRoster,
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Optional per-round resolver for auxiliary model settings that should be
     /// re-read from live global config between rounds.
@@ -322,6 +314,9 @@ pub struct ExecuteRequestBuilder {
 
     tools: Option<Arc<dyn ToolExecutor>>,
     provider_override: Option<Arc<dyn LLMProvider>>,
+    // Individual model fields are accumulated here for backward-compatible
+    // fluent setters; `build()` assembles them into a `ModelRoster`. A
+    // `.model_roster(..)` setter seeds all of them at once.
     model: Option<String>,
     provider_name: Option<String>,
     provider_type: Option<String>,
@@ -384,6 +379,24 @@ impl ExecuteRequestBuilder {
     /// Override the LLM provider for this execution.
     pub fn provider_override(mut self, v: Arc<dyn LLMProvider>) -> Self {
         self.provider_override = Some(v);
+        self
+    }
+
+    /// Seed the full model selection from a [`ModelRoster`].
+    ///
+    /// Decomposes the roster back into the builder's individual fields so it
+    /// composes with the existing per-field fluent setters; later individual
+    /// setters override the corresponding roster entry.
+    pub fn model_roster(mut self, roster: ModelRoster) -> Self {
+        self.fast_model = roster.fast_model();
+        self.fast_model_provider = roster.fast_model_provider();
+        self.background_model = roster.background_model();
+        self.background_model_provider = roster.background_model_provider();
+        self.summarization_model = roster.summarization_model();
+        self.summarization_model_provider = roster.summarization_model_provider();
+        self.model = roster.model;
+        self.provider_name = roster.provider_name;
+        self.provider_type = roster.provider_type;
         self
     }
 
@@ -497,21 +510,27 @@ impl ExecuteRequestBuilder {
     /// `gold_config` is intentionally not surfaced as a setter (it is an
     /// internal feature flag); it always defaults to `None`.
     pub fn build(self) -> ExecuteRequest {
+        let model_roster = ModelRoster {
+            model: self.model,
+            provider_name: self.provider_name,
+            provider_type: self.provider_type,
+            fast: RoleModel::from_parts(self.fast_model, self.fast_model_provider),
+            background: RoleModel::from_parts(
+                self.background_model,
+                self.background_model_provider,
+            ),
+            summarization: RoleModel::from_parts(
+                self.summarization_model,
+                self.summarization_model_provider,
+            ),
+        };
         ExecuteRequest {
             initial_message: self.initial_message,
             event_tx: self.event_tx,
             cancel_token: self.cancel_token,
             tools: self.tools,
             provider_override: self.provider_override,
-            model: self.model,
-            provider_name: self.provider_name,
-            provider_type: self.provider_type,
-            fast_model: self.fast_model,
-            fast_model_provider: self.fast_model_provider,
-            background_model: self.background_model,
-            background_model_provider: self.background_model_provider,
-            summarization_model: self.summarization_model,
-            summarization_model_provider: self.summarization_model_provider,
+            model_roster,
             reasoning_effort: self.reasoning_effort,
             auxiliary_model_resolver: self.auxiliary_model_resolver,
             disabled_tools: self.disabled_tools,
@@ -560,15 +579,7 @@ impl AgentRuntime {
             cancel_token,
             tools,
             provider_override,
-            model,
-            provider_name,
-            provider_type,
-            fast_model,
-            fast_model_provider,
-            background_model,
-            background_model_provider,
-            summarization_model,
-            summarization_model_provider,
+            model_roster,
             reasoning_effort,
             auxiliary_model_resolver,
             disabled_tools,
@@ -581,6 +592,23 @@ impl AgentRuntime {
         } = req;
         let tools = tools.unwrap_or_else(|| self.default_tools.clone());
         let llm = provider_override.unwrap_or_else(|| self.provider.clone());
+
+        // Decompose the roster back into the loose locals the resolution logic
+        // below expects. This preserves the byte-for-byte `None → Config`
+        // fallbacks: a `None` role yields `None` name/provider exactly as the
+        // old loose fields did.
+        let fast_model = model_roster.fast_model();
+        let fast_model_provider = model_roster.fast_model_provider();
+        let background_model = model_roster.background_model();
+        let background_model_provider = model_roster.background_model_provider();
+        let summarization_model = model_roster.summarization_model();
+        let summarization_model_provider = model_roster.summarization_model_provider();
+        let ModelRoster {
+            model,
+            provider_name,
+            provider_type,
+            ..
+        } = model_roster;
 
         let loop_config = AgentLoopConfig {
             max_rounds: 200,

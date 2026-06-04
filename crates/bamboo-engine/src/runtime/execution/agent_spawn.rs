@@ -20,6 +20,7 @@ use bamboo_infrastructure::LLMProvider;
 use crate::runtime::config::{GoldConfig, ImageFallbackConfig};
 use crate::runtime::execution::runner_lifecycle::finalize_runner;
 use crate::runtime::execution::runner_state::AgentRunner;
+use crate::runtime::model_roster::ModelRoster;
 use crate::runtime::Agent;
 use crate::runtime::ExecuteRequest;
 
@@ -91,18 +92,10 @@ pub struct SessionExecutionArgs {
     // Execution parameters.
     pub tools_override: Option<Arc<dyn ToolExecutor>>,
     pub provider_override: Option<Arc<dyn LLMProvider>>,
-    pub provider_name: Option<String>,
-    pub provider_type: Option<String>,
-    pub model: String,
-    pub fast_model: Option<String>,
-    /// Optional provider override for lightweight fast-model calls.
-    pub fast_model_provider: Option<Arc<dyn LLMProvider>>,
-    pub background_model: Option<String>,
-    /// Optional provider override for memory/background model calls.
-    pub background_model_provider: Option<Arc<dyn LLMProvider>>,
-    pub summarization_model: Option<String>,
-    /// Optional provider override for summarization / context compression calls.
-    pub summarization_model_provider: Option<Arc<dyn LLMProvider>>,
+    /// Cohesive primary + auxiliary model/provider selection. The primary
+    /// `model` is required for a spawn (see [`ModelRoster::model`]); the three
+    /// auxiliary roles default to their `Config::get_*` fallbacks when `None`.
+    pub model_roster: ModelRoster,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub reasoning_effort_source: String,
     pub auxiliary_model_resolver:
@@ -146,15 +139,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 mut session,
                 tools_override,
                 provider_override,
-                provider_name,
-                provider_type,
-                model,
-                fast_model,
-                fast_model_provider,
-                background_model,
-                background_model_provider,
-                summarization_model,
-                summarization_model_provider,
+                model_roster,
                 reasoning_effort,
                 reasoning_effort_source,
                 auxiliary_model_resolver,
@@ -171,6 +156,11 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 sessions_cache,
                 on_complete,
             } = args;
+
+            // The primary model is required for a spawn; the roster stores it as
+            // `Option<String>` for uniformity, so recover the owned String here
+            // for session attribution / logging (same value the caller set).
+            let model = model_roster.model.clone().unwrap_or_default();
 
             let initial_message = initial_user_message_for_session(&session);
             let selected_skill_ids =
@@ -204,15 +194,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                         cancel_token,
                         tools: tools_override,
                         provider_override,
-                        model: Some(model),
-                        provider_name,
-                        provider_type,
-                        fast_model,
-                        fast_model_provider,
-                        background_model,
-                        background_model_provider,
-                        summarization_model,
-                        summarization_model_provider,
+                        model_roster,
                         reasoning_effort,
                         auxiliary_model_resolver,
                         disabled_tools,

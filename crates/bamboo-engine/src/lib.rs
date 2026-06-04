@@ -39,6 +39,7 @@ pub use runtime::hooks::HookRunner;
 pub use runtime::managers::{
     LifecycleManager, LlmManager, MemoryManager, MiniLoopExecutor, PromptManager, ToolManager,
 };
+pub use runtime::model_roster::{ModelRoster, RoleModel};
 pub use runtime::runner::run_agent_loop_with_config;
 pub use runtime::runtime::{
     AgentRuntime, AgentRuntimeBuilder, ExecuteRequest, ExecuteRequestBuilder,

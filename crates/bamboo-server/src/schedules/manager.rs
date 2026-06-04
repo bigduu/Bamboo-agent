@@ -117,16 +117,26 @@ fn resolve_run_config_from_config(
         workspace_path.as_deref(),
     );
 
-    ResolvedRunConfig {
-        model,
+    let model_roster = bamboo_engine::ModelRoster {
+        model: Some(model),
         provider_name,
         provider_type,
-        fast_model: areas.fast.as_ref().map(|m| m.model_name.clone()),
-        fast_model_provider: areas.fast.map(|m| m.provider),
-        background_model: areas.background.as_ref().map(|m| m.model_name.clone()),
-        background_model_provider: areas.background.map(|m| m.provider),
-        summarization_model: areas.summarization.as_ref().map(|m| m.model_name.clone()),
-        summarization_model_provider: areas.summarization.map(|m| m.provider),
+        fast: bamboo_engine::RoleModel::from_parts(
+            areas.fast.as_ref().map(|m| m.model_name.clone()),
+            areas.fast.map(|m| m.provider),
+        ),
+        background: bamboo_engine::RoleModel::from_parts(
+            areas.background.as_ref().map(|m| m.model_name.clone()),
+            areas.background.map(|m| m.provider),
+        ),
+        summarization: bamboo_engine::RoleModel::from_parts(
+            areas.summarization.as_ref().map(|m| m.model_name.clone()),
+            areas.summarization.map(|m| m.provider),
+        ),
+    };
+
+    ResolvedRunConfig {
+        model_roster,
         reasoning_effort,
         gold_config: resolve_gold_config(&config_snapshot, None),
         system_prompt,
@@ -192,7 +202,7 @@ mod tests {
         ));
         let resolved =
             resolve_run_config_from_config(&test_job(), &Arc::new(RwLock::new(config)), &registry);
-        assert_eq!(resolved.model, "gpt-4o-mini");
+        assert_eq!(resolved.model_roster.model.as_deref(), Some("gpt-4o-mini"));
     }
 
     #[test]
@@ -225,6 +235,6 @@ mod tests {
         ));
         let resolved =
             resolve_run_config_from_config(&test_job(), &Arc::new(RwLock::new(config)), &registry);
-        assert_eq!(resolved.model, "gpt-chat");
+        assert_eq!(resolved.model_roster.model.as_deref(), Some("gpt-chat"));
     }
 }

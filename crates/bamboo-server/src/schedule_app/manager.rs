@@ -14,7 +14,7 @@ use bamboo_engine::execution::{
     try_reserve_runner, AgentRunner, RunnerReservation, SessionCompletionHook,
     SessionExecutionArgs,
 };
-use bamboo_engine::AuxiliaryModelConfig;
+use bamboo_engine::{AuxiliaryModelConfig, ModelRoster};
 use bamboo_infrastructure::LockedSessionStore;
 
 use super::store::{ClaimedScheduleRun, ScheduleStore};
@@ -39,15 +39,9 @@ pub struct ScheduleRunJob {
 /// concerns (Config, filesystem prompt templates) stay out of the crate.
 #[derive(Clone)]
 pub struct ResolvedRunConfig {
-    pub model: String,
-    pub provider_name: Option<String>,
-    pub provider_type: Option<String>,
-    pub fast_model: Option<String>,
-    pub fast_model_provider: Option<Arc<dyn bamboo_infrastructure::LLMProvider>>,
-    pub background_model: Option<String>,
-    pub background_model_provider: Option<Arc<dyn bamboo_infrastructure::LLMProvider>>,
-    pub summarization_model: Option<String>,
-    pub summarization_model_provider: Option<Arc<dyn bamboo_infrastructure::LLMProvider>>,
+    /// Primary + auxiliary model/provider selection for the scheduled run.
+    /// The primary `model` is required; resolve it via `roster.model`.
+    pub model_roster: ModelRoster,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub gold_config: Option<GoldConfig>,
     pub system_prompt: String,
@@ -213,9 +207,13 @@ async fn run_schedule_job(
     job: ScheduleRunJob,
 ) -> Result<ScheduleRunLifecycleResult, String> {
     let resolved = (ctx.resolve_run_config)(&job);
+    // Primary model is required for a schedule run; the roster stores it as
+    // `Option<String>`, so recover the owned String once for the checks/logging
+    // below (an absent primary is treated as the old empty-string skip).
+    let resolved_model = resolved.model_roster.model.clone().unwrap_or_default();
 
     // If the adapter resolved an empty model, skip the run.
-    if resolved.model.trim().is_empty() {
+    if resolved_model.trim().is_empty() {
         tracing::warn!(
             "[schedule:{}] skipping run: resolved model is empty",
             job.schedule_id
@@ -236,7 +234,7 @@ async fn run_schedule_job(
 
     let mut session = super::session_factory::create_schedule_session(
         &job,
-        &resolved.model,
+        &resolved_model,
         &resolved.system_prompt,
         &resolved.base_system_prompt,
         resolved.workspace_path.as_deref(),
@@ -280,7 +278,7 @@ async fn run_schedule_job(
         job.schedule_id,
         session_id,
         job.run_config.auto_execute,
-        resolved.model,
+        resolved_model,
         if requested_model.is_some() {
             "schedule.run_config.model"
         } else {
@@ -300,7 +298,7 @@ async fn run_schedule_job(
     }
 
     // Model is required by the provider trait; if resolution failed we'd have returned earlier.
-    if resolved.model.trim().is_empty() {
+    if resolved_model.trim().is_empty() {
         let msg = "resolved model is empty".to_string();
         session.add_message(Message::assistant(format!("❌ {msg}"), None));
         let _ = ctx.persistence.merge_save_runtime(&mut session).await;
@@ -331,12 +329,12 @@ async fn run_schedule_job(
     // (marking the run terminal, and writing a visible failure marker) is
     // carried by the `on_complete` hook, which runs after the runner is
     // finalized but before the session is persisted — so the marker is saved.
-    let aux_fast_model = resolved.fast_model.clone();
-    let aux_fast_provider = resolved.fast_model_provider.clone();
-    let aux_background_model = resolved.background_model.clone();
-    let aux_background_provider = resolved.background_model_provider.clone();
-    let aux_summarization_model = resolved.summarization_model.clone();
-    let aux_summarization_provider = resolved.summarization_model_provider.clone();
+    let aux_fast_model = resolved.model_roster.fast_model();
+    let aux_fast_provider = resolved.model_roster.fast_model_provider();
+    let aux_background_model = resolved.model_roster.background_model();
+    let aux_background_provider = resolved.model_roster.background_model_provider();
+    let aux_summarization_model = resolved.model_roster.summarization_model();
+    let aux_summarization_provider = resolved.model_roster.summarization_model_provider();
     let auxiliary_model_resolver = Arc::new(move || AuxiliaryModelConfig {
         fast_model_name: aux_fast_model.clone(),
         fast_model_provider: aux_fast_provider.clone(),
@@ -410,15 +408,7 @@ async fn run_schedule_job(
         session,
         tools_override: Some(ctx.tools.clone()),
         provider_override: None,
-        provider_name: resolved.provider_name.clone(),
-        provider_type: resolved.provider_type.clone(),
-        model: resolved.model.clone(),
-        fast_model: resolved.fast_model.clone(),
-        fast_model_provider: resolved.fast_model_provider.clone(),
-        background_model: resolved.background_model.clone(),
-        background_model_provider: resolved.background_model_provider.clone(),
-        summarization_model: resolved.summarization_model.clone(),
-        summarization_model_provider: resolved.summarization_model_provider.clone(),
+        model_roster: resolved.model_roster.clone(),
         reasoning_effort: resolved.reasoning_effort,
         reasoning_effort_source: "schedule".to_string(),
         auxiliary_model_resolver: Some(auxiliary_model_resolver),

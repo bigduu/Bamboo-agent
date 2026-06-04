@@ -157,15 +157,10 @@ fn build_manager(
                 .filter(|m| !m.is_empty())
                 .unwrap_or_else(|| "test-model".to_string());
         ResolvedRunConfig {
-            model,
-            provider_name: None,
-            provider_type: None,
-            fast_model: None,
-            fast_model_provider: None,
-            background_model: None,
-            background_model_provider: None,
-            summarization_model: None,
-            summarization_model_provider: None,
+            model_roster: bamboo_engine::ModelRoster {
+                model: Some(model),
+                ..Default::default()
+            },
             reasoning_effort: None,
             gold_config: None,
             system_prompt: String::new(),
