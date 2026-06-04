@@ -32,3 +32,14 @@ pub enum AgentError {
     #[error("Cancelled")]
     Cancelled,
 }
+
+impl AgentError {
+    /// Returns `true` if this error represents a user-initiated cancellation.
+    ///
+    /// Prefer this over substring-matching the error message: a reworded or
+    /// localized message must not silently break cancellation/terminal-status
+    /// logic.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, AgentError::Cancelled)
+    }
+}

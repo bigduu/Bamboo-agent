@@ -11,6 +11,7 @@ members = [
     "crates/bamboo-cli",
     "crates/bamboo-server",
     "crates/bamboo-tui",
+    "crates/bamboo-sdk",
 ]
 resolver = "2"
 
@@ -60,6 +61,7 @@ bamboo-agent-core = { path = "crates/bamboo-agent-core" }
 bamboo-engine = { path = "crates/bamboo-engine" }
 bamboo-tools = { path = "crates/bamboo-tools" }
 bamboo-server = { path = "crates/bamboo-server" }
+bamboo-sdk = { path = "crates/bamboo-sdk" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

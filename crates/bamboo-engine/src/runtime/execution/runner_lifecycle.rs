@@ -12,7 +12,7 @@ use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use bamboo_agent_core::AgentEvent;
+use bamboo_agent_core::{AgentError, AgentEvent};
 
 use super::runner_state::{AgentRunner, AgentStatus};
 
@@ -60,13 +60,10 @@ pub async fn try_reserve_runner(
 }
 
 /// Map an execution result to `AgentStatus`.
-pub fn status_from_execution_result<E>(result: &Result<(), E>) -> AgentStatus
-where
-    E: std::fmt::Display,
-{
+pub fn status_from_execution_result(result: &Result<(), AgentError>) -> AgentStatus {
     match result {
         Ok(_) => AgentStatus::Completed,
-        Err(error) if error.to_string().contains("cancelled") => AgentStatus::Cancelled,
+        Err(error) if error.is_cancelled() => AgentStatus::Cancelled,
         Err(error) => AgentStatus::Error(error.to_string()),
     }
 }
@@ -75,7 +72,7 @@ where
 pub async fn finalize_runner(
     runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_id: &str,
-    result: &Result<(), impl std::fmt::Display>,
+    result: &Result<(), AgentError>,
 ) {
     let mut guard = runners.write().await;
     if let Some(runner) = guard.get_mut(session_id) {
@@ -135,19 +132,23 @@ mod tests {
 
     #[test]
     fn status_from_execution_result_maps_correctly() {
-        let ok_result: Result<(), String> = Ok(());
+        let ok_result: Result<(), AgentError> = Ok(());
         assert!(matches!(
             status_from_execution_result(&ok_result),
             AgentStatus::Completed
         ));
 
-        let cancelled = Err("task cancelled".to_string());
+        // Cancellation is detected by matching the `AgentError::Cancelled`
+        // variant, not by substring-matching the (display) message — note the
+        // variant's message is "Cancelled", which would not even contain the
+        // lowercase "cancelled" the old code searched for.
+        let cancelled: Result<(), AgentError> = Err(AgentError::Cancelled);
         assert!(matches!(
             status_from_execution_result(&cancelled),
             AgentStatus::Cancelled
         ));
 
-        let failed = Err("network error".to_string());
+        let failed: Result<(), AgentError> = Err(AgentError::LLM("network error".to_string()));
         match status_from_execution_result(&failed) {
             AgentStatus::Error(message) => assert!(message.contains("network error")),
             other => panic!("unexpected status: {other:?}"),

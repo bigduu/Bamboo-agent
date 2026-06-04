@@ -44,7 +44,6 @@ use std::path::PathBuf;
 
 pub mod error;
 
-pub mod agent;
 pub mod commands;
 
 // Server module is now a separate workspace crate
@@ -61,9 +60,13 @@ pub use bamboo_infrastructure as core;
 //
 // `Agent` / `AgentBuilder` come from the ergonomic `agent` wrappers (the single
 // source of truth; resolves TD-2 — no more duplicate re-export through
-// `bamboo_engine`).
-pub use agent::{Agent, AgentBuilder};
+// `bamboo_engine`). The facade now lives in the leaf `bamboo-sdk` crate
+// (depends only on engine/infra/tools/agent-core/domain, never on
+// bamboo-server), and is re-exported here to keep existing public paths
+// (`bamboo_agent::agent::...`, `bamboo_agent::Agent`, ...) stable.
 pub use bamboo_infrastructure as infrastructure;
+pub use bamboo_sdk::agent;
+pub use bamboo_sdk::{Agent, AgentBuilder};
 
 // Re-export core Config as the primary configuration type
 pub use bamboo_infrastructure::config::ServerConfig;

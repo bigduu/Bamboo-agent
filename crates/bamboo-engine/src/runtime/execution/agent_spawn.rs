@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{AgentEvent, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_domain::ReasoningEffort;
 use bamboo_infrastructure::LLMProvider;
 
@@ -44,22 +44,18 @@ pub struct SessionExecutionOutcome {
 }
 
 impl SessionExecutionOutcome {
-    fn from_result<E: std::fmt::Display>(result: &Result<(), E>) -> Self {
+    fn from_result(result: &Result<(), AgentError>) -> Self {
         match result {
             Ok(()) => Self {
                 success: true,
                 cancelled: false,
                 error: None,
             },
-            Err(error) => {
-                let message = error.to_string();
-                let cancelled = message.contains("cancelled");
-                Self {
-                    success: false,
-                    cancelled,
-                    error: Some(message),
-                }
-            }
+            Err(error) => Self {
+                success: false,
+                cancelled: error.is_cancelled(),
+                error: Some(error.to_string()),
+            },
         }
     }
 }
@@ -291,26 +287,16 @@ pub fn log_base_system_prompt_snapshot(session_id: &str, prompt: &str) {
 }
 
 /// Map an execution result to a terminal error event.
-pub fn terminal_error_event_for_result<E>(result: &Result<(), E>) -> Option<AgentEvent>
-where
-    E: std::fmt::Display,
-{
+pub fn terminal_error_event_for_result(result: &Result<(), AgentError>) -> Option<AgentEvent> {
     match result {
         Ok(_) => None,
-        Err(error) if is_cancelled_error(error) => Some(AgentEvent::Error {
+        Err(error) if error.is_cancelled() => Some(AgentEvent::Error {
             message: "Agent execution cancelled by user".to_string(),
         }),
         Err(error) => Some(AgentEvent::Error {
             message: error.to_string(),
         }),
     }
-}
-
-fn is_cancelled_error<E>(error: &E) -> bool
-where
-    E: std::fmt::Display,
-{
-    error.to_string().contains("cancelled")
 }
 
 // Session metadata helpers (pure functions, no server dependency).

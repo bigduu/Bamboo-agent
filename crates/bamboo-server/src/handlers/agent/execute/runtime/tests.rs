@@ -1,5 +1,5 @@
 use crate::app_state::AgentStatus;
-use bamboo_agent_core::{AgentEvent, Message, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
 
 use crate::session_app::execute::{
     consume_pending_conclusion_with_options_resume, has_pending_user_message,
@@ -121,19 +121,21 @@ fn selected_skill_mode_for_session_prefers_skill_mode_key() {
 
 #[test]
 fn execution_result_mapping_handles_cancelled_and_error_states() {
-    let ok_result: anyhow::Result<()> = Ok(());
+    let ok_result: Result<(), AgentError> = Ok(());
     assert!(matches!(
         status_from_execution_result(&ok_result),
         AgentStatus::Completed
     ));
 
-    let cancelled_result: anyhow::Result<()> = Err(anyhow::anyhow!("request cancelled"));
+    // Cancellation is matched on the `AgentError::Cancelled` variant, so a
+    // reworded/localized message can no longer silently break the mapping.
+    let cancelled_result: Result<(), AgentError> = Err(AgentError::Cancelled);
     assert!(matches!(
         status_from_execution_result(&cancelled_result),
         AgentStatus::Cancelled
     ));
 
-    let error_result: anyhow::Result<()> = Err(anyhow::anyhow!("boom"));
+    let error_result: Result<(), AgentError> = Err(AgentError::LLM("boom".to_string()));
     match status_from_execution_result(&error_result) {
         AgentStatus::Error(message) => assert!(message.contains("boom")),
         other => panic!("unexpected status: {other:?}"),
@@ -142,10 +144,10 @@ fn execution_result_mapping_handles_cancelled_and_error_states() {
 
 #[test]
 fn terminal_error_event_mapping_matches_execution_result() {
-    let ok_result: anyhow::Result<()> = Ok(());
+    let ok_result: Result<(), AgentError> = Ok(());
     assert!(terminal_error_event_for_result(&ok_result).is_none());
 
-    let cancelled_result: anyhow::Result<()> = Err(anyhow::anyhow!("cancelled by user"));
+    let cancelled_result: Result<(), AgentError> = Err(AgentError::Cancelled);
     match terminal_error_event_for_result(&cancelled_result) {
         Some(AgentEvent::Error { message }) => {
             assert_eq!(message, "Agent execution cancelled by user");
@@ -153,7 +155,7 @@ fn terminal_error_event_mapping_matches_execution_result() {
         other => panic!("unexpected event: {other:?}"),
     }
 
-    let error_result: anyhow::Result<()> = Err(anyhow::anyhow!("network failed"));
+    let error_result: Result<(), AgentError> = Err(AgentError::LLM("network failed".to_string()));
     match terminal_error_event_for_result(&error_result) {
         Some(AgentEvent::Error { message }) => assert!(message.contains("network failed")),
         other => panic!("unexpected event: {other:?}"),

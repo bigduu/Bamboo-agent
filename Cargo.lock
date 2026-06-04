@@ -452,6 +452,7 @@ dependencies = [
  "bamboo-domain",
  "bamboo-engine",
  "bamboo-infrastructure",
+ "bamboo-sdk",
  "bamboo-server",
  "bamboo-tools",
  "base64",
@@ -689,6 +690,20 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "bamboo-sdk"
+version = "0.1.0"
+dependencies = [
+ "bamboo-agent-core",
+ "bamboo-domain",
+ "bamboo-engine",
+ "bamboo-infrastructure",
+ "bamboo-tools",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 
