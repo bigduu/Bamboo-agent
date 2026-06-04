@@ -87,7 +87,7 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Unified memory management tool for Bamboo. Use session_* actions for session continuity notes, and query/get/write/merge/split/purge/inspect/rebuild for durable project/global memory backed by canonical topic files and derived indexes."
+        "Unified memory management tool for Bamboo. Use session_* actions for session continuity notes, and query/get/write/merge/split/consolidate/purge/inspect/rebuild for durable project/global memory backed by canonical topic files and derived indexes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -108,10 +108,12 @@ impl Tool for MemoryTool {
                         "write",
                         "merge",
                         "split",
+                        "consolidate",
                         "purge",
                         "inspect",
                         "rebuild",
-                        "scan_blobs"
+                        "scan_blobs",
+                        "scan_duplicates"
                     ]
                 },
                 "scope": {"type": "string", "enum": ["session", "project", "global"]},
@@ -124,6 +126,8 @@ impl Tool for MemoryTool {
                 "content": {"type": "string"},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "pieces": {"type": "array", "items": {"type": "object"}},
+                "ids": {"type": "array", "items": {"type": "string"}},
+                "min_score": {"type": "number"},
                 "filters": {"type": "object"},
                 "options": {"type": "object"},
                 "reason": {"type": "string"}
@@ -146,6 +150,7 @@ impl Tool for MemoryTool {
             | "get"
             | "find_duplicates"
             | "scan_blobs"
+            | "scan_duplicates"
             | "inspect" => bamboo_tools::ToolMutability::ReadOnly,
             _ => bamboo_tools::ToolMutability::Mutating,
         }
@@ -613,6 +618,98 @@ impl Tool for MemoryTool {
                     result: json!({
                         "action": "scan_blobs",
                         "report": report,
+                    })
+                    .to_string(),
+                    display_preference: Some("json".to_string()),
+                })
+            }
+            MemoryArgs::ScanDuplicates {
+                scope,
+                project_key,
+                min_score,
+                options,
+            } => {
+                let scope = Self::parse_scope(Some(&scope))?;
+                if scope == MemoryScope::Session {
+                    return Err(ToolError::InvalidArguments(
+                        "scan_duplicates supports durable scopes only".to_string(),
+                    ));
+                }
+                let project_key = self
+                    .resolve_project_key(project_key.as_deref(), Some(session_id))
+                    .await;
+                let min_score = min_score.unwrap_or(0.6);
+                let limit = options
+                    .and_then(|value| value.limit)
+                    .unwrap_or(20)
+                    .clamp(1, 200);
+                let report = self
+                    .memory_store
+                    .scan_duplicate_clusters(scope, project_key.as_deref(), min_score, 5, limit)
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to scan duplicates: {error}"))
+                    })?;
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "action": "scan_duplicates",
+                        "report": report,
+                    })
+                    .to_string(),
+                    display_preference: Some("json".to_string()),
+                })
+            }
+            MemoryArgs::Consolidate {
+                ids,
+                title,
+                content,
+                r#type,
+                tags,
+                project_key,
+            } => {
+                if ids.len() < 2 {
+                    return Err(ToolError::InvalidArguments(
+                        "consolidate requires at least two source memory ids".to_string(),
+                    ));
+                }
+                let r#type = match r#type.as_deref() {
+                    Some(value) => Some(Self::parse_type(value)?),
+                    None => None,
+                };
+                let project_key = self
+                    .resolve_project_key(project_key.as_deref(), Some(session_id))
+                    .await;
+                let merged = bamboo_memory::memory_store::MemorySplitPiece {
+                    title,
+                    r#type,
+                    content,
+                    tags,
+                };
+                let ids: Vec<String> = ids.iter().map(|id| id.trim().to_string()).collect();
+                let Some(result) = self
+                    .memory_store
+                    .consolidate_memories(
+                        &ids,
+                        project_key.as_deref(),
+                        &merged,
+                        Some(session_id),
+                        "main-model",
+                    )
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to consolidate memories: {error}"))
+                    })?
+                else {
+                    return Err(ToolError::Execution(
+                        "one or more source memories not found".to_string(),
+                    ));
+                };
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "action": "consolidate",
+                        "data": result,
                     })
                     .to_string(),
                     display_preference: Some("json".to_string()),

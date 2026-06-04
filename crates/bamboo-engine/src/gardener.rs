@@ -1,10 +1,14 @@
-//! Background "gardener": LLM-driven remediation of multi-topic "blob" memories.
+//! Background "gardener": LLM-driven remediation of memory-quality problems.
 //!
-//! Cost-controlled by design: opt-in (`memory.gardener_enabled`, default off), a
-//! hard per-run split cap, a slow cadence, and — crucially — ZERO LLM calls when
-//! the deterministic prefilter finds nothing (an idle gardener costs nothing). The
-//! split *decision* needs the model; the *worklist* (which memories are blobs) is
-//! produced for free by `MemoryStore::scan_blob_candidates`.
+//! Two symmetric passes share one cadence and one cost model:
+//! - the **blob gardener** splits multi-topic "blob" memories into atomic pieces;
+//! - the **dedup gardener** consolidates near-duplicate memories into one.
+//!
+//! Cost-controlled by design: each pass is opt-in (default off), has a hard per-run
+//! cap, runs on a slow cadence, and — crucially — makes ZERO LLM calls when its
+//! deterministic prefilter finds nothing (an idle gardener costs nothing). The
+//! *decision* needs the model; the *worklist* (which memories are blobs / which are
+//! near-duplicates) is produced for free by `MemoryStore` scan methods.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,13 +20,23 @@ use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_infrastructure::{
     Config, LLMChunk, LLMProvider, LLMRequestOptions, ProviderModelRouter,
 };
-use bamboo_memory::auto_dream::{build_blob_split_prompt, parse_split_pieces};
-use bamboo_memory::memory_store::{BlobScanItem, MemoryScope, MemoryStore};
+use bamboo_memory::auto_dream::{
+    build_blob_split_prompt, build_dedup_prompt, parse_dedup_decision, parse_split_pieces,
+};
+use bamboo_memory::memory_store::{
+    BlobScanItem, DuplicateCluster, DurableMemoryStatus, MemoryScope, MemoryStore,
+};
 
 use crate::auto_dream::AutoDreamContext;
 
 const GARDENER_TRACING_TARGET: &str = "bamboo.gardener";
 const GARDENER_RUNTIME_SESSION_ID: &str = "__gardener__";
+/// Upper bound on how many memories the dedup gardener feeds to the model per
+/// cluster, to bound prompt size and avoid over-merging a large fuzzy group.
+const DEDUP_MAX_MEMBERS_PER_CLUSTER: usize = 5;
+
+const BLOB_SYSTEM_INSTRUCTION: &str = "You are Bamboo's background memory gardener. Split the given memory into atomic pieces and return only the specified JSON. No prose, no markdown fences.";
+const DEDUP_SYSTEM_INSTRUCTION: &str = "You are Bamboo's background memory gardener. Decide whether the given memories are the same fact and, if so, consolidate them. Return only the specified JSON. No prose, no markdown fences.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GardenerRunResult {
@@ -32,17 +46,22 @@ pub struct GardenerRunResult {
     pub failed: usize,
 }
 
-async fn collect_split_text(
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DedupGardenerRunResult {
+    pub scanned: usize,
+    pub clustered: usize,
+    pub consolidated: usize,
+    pub superseded: usize,
+    pub failed: usize,
+}
+
+async fn collect_model_json(
     provider: Arc<dyn LLMProvider>,
     model: &str,
+    system_instruction: &str,
     prompt: String,
 ) -> Result<String, String> {
-    let messages = vec![
-        Message::system(
-            "You are Bamboo's background memory gardener. Split the given memory into atomic pieces and return only the specified JSON. No prose, no markdown fences.",
-        ),
-        Message::user(prompt),
-    ];
+    let messages = vec![Message::system(system_instruction), Message::user(prompt)];
     let options = LLMRequestOptions {
         session_id: Some(GARDENER_RUNTIME_SESSION_ID.to_string()),
         reasoning_effort: Some(ReasoningEffort::High),
@@ -193,7 +212,14 @@ async fn run_gardener_once_with_store(
         };
 
         let prompt = build_blob_split_prompt(&doc.frontmatter.title, &doc.body);
-        let raw = match collect_split_text(provider.clone(), &model, prompt).await {
+        let raw = match collect_model_json(
+            provider.clone(),
+            &model,
+            BLOB_SYSTEM_INSTRUCTION,
+            prompt,
+        )
+        .await
+        {
             Ok(text) => text,
             Err(error) => {
                 tracing::warn!(target: GARDENER_TRACING_TARGET, event = "split_llm_failed", id = %item.id, "{error}");
@@ -245,8 +271,170 @@ async fn run_gardener_once_with_store(
     Ok(Some(result))
 }
 
+pub async fn run_dedup_gardener_once(
+    ctx: &AutoDreamContext,
+) -> Result<Option<DedupGardenerRunResult>, String> {
+    let memory = MemoryStore::new(ctx.session_store.bamboo_home_dir());
+    run_dedup_gardener_once_with_store(ctx, &memory).await
+}
+
+async fn run_dedup_gardener_once_with_store(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+) -> Result<Option<DedupGardenerRunResult>, String> {
+    let config_snapshot = ctx.config.read().await.clone();
+    let memory_cfg = config_snapshot.memory.clone().unwrap_or_default();
+    if !memory_cfg.dedup_gardener_enabled {
+        return Ok(None);
+    }
+
+    let max_merges = memory_cfg.dedup_gardener_max_merges_per_run.max(1);
+    let min_score = memory_cfg.dedup_gardener_min_score;
+
+    // Deterministic prefilter across global + every project scope (zero LLM).
+    let mut targets: Vec<(MemoryScope, Option<String>)> = vec![(MemoryScope::Global, None)];
+    for key in memory.list_project_keys().await.unwrap_or_default() {
+        targets.push((MemoryScope::Project, Some(key)));
+    }
+
+    let mut result = DedupGardenerRunResult::default();
+    let mut worklist: Vec<(MemoryScope, Option<String>, DuplicateCluster)> = Vec::new();
+    for (scope, project_key) in &targets {
+        let report = memory
+            .scan_duplicate_clusters(
+                *scope,
+                project_key.as_deref(),
+                min_score,
+                DEDUP_MAX_MEMBERS_PER_CLUSTER,
+                max_merges,
+            )
+            .await
+            .map_err(|error| format!("dedup scan failed: {error}"))?;
+        result.scanned += report.scanned;
+        result.clustered += report.clusters.len();
+        for cluster in report.clusters {
+            worklist.push((*scope, project_key.clone(), cluster));
+        }
+    }
+    worklist.sort_by(|left, right| {
+        right
+            .2
+            .max_score
+            .partial_cmp(&left.2.max_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(right.2.members.len().cmp(&left.2.members.len()))
+    });
+    worklist.truncate(max_merges);
+
+    // Nothing to do → return WITHOUT resolving/calling the model. Idle = free.
+    if worklist.is_empty() {
+        return Ok(Some(result));
+    }
+
+    let Some((provider, model)) = resolve_background_model(ctx, &config_snapshot) else {
+        tracing::warn!(
+            target: GARDENER_TRACING_TARGET,
+            event = "dedup_run_skip",
+            reason = "no_background_model",
+            "[dedup-gardener] skipped: no background model configured"
+        );
+        return Ok(None);
+    };
+
+    for (_scope, project_key, cluster) in worklist {
+        let project_key = project_key.as_deref();
+        // Re-fetch full bodies; drop members that vanished or were superseded since
+        // the scan (e.g. by the blob pass) so we never consolidate a stale set.
+        let mut members: Vec<(String, String, String)> = Vec::new();
+        for member in &cluster.members {
+            if let Some(doc) = memory
+                .get_memory(&member.id, project_key)
+                .await
+                .map_err(|error| format!("dedup get failed: {error}"))?
+            {
+                if doc.frontmatter.status == DurableMemoryStatus::Active {
+                    members.push((
+                        doc.frontmatter.id.clone(),
+                        doc.frontmatter.title.clone(),
+                        doc.body.clone(),
+                    ));
+                }
+            }
+        }
+        if members.len() < 2 {
+            continue;
+        }
+
+        let prompt_members: Vec<(String, String)> = members
+            .iter()
+            .map(|(_, title, body)| (title.clone(), body.clone()))
+            .collect();
+        let prompt = build_dedup_prompt(&prompt_members);
+        let raw = match collect_model_json(
+            provider.clone(),
+            &model,
+            DEDUP_SYSTEM_INSTRUCTION,
+            prompt,
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::warn!(target: GARDENER_TRACING_TARGET, event = "dedup_llm_failed", "{error}");
+                result.failed += 1;
+                continue;
+            }
+        };
+
+        let merged = match parse_dedup_decision(&raw) {
+            // `None` = model judged them distinct facts; leave them untouched.
+            Ok(Some(piece)) => piece,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(target: GARDENER_TRACING_TARGET, event = "dedup_parse_failed", "{error}");
+                result.failed += 1;
+                continue;
+            }
+        };
+
+        let ids: Vec<String> = members.iter().map(|(id, _, _)| id.clone()).collect();
+        match memory
+            .consolidate_memories(
+                &ids,
+                project_key,
+                &merged,
+                Some(GARDENER_RUNTIME_SESSION_ID),
+                "memory-dedup-gardener",
+            )
+            .await
+        {
+            Ok(Some(_)) => {
+                result.consolidated += 1;
+                result.superseded += ids.len();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(target: GARDENER_TRACING_TARGET, event = "dedup_apply_failed", "{error}");
+                result.failed += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        target: GARDENER_TRACING_TARGET,
+        event = "dedup_run_complete",
+        scanned = result.scanned,
+        clustered = result.clustered,
+        consolidated = result.consolidated,
+        superseded = result.superseded,
+        failed = result.failed,
+        "[dedup-gardener] run complete"
+    );
+    Ok(Some(result))
+}
+
 /// Spawn the recurring gardener loop. No-op cost when disabled: each tick reads
-/// config and returns immediately if `gardener_enabled` is false.
+/// config and returns immediately if neither gardener pass is enabled.
 pub fn spawn_gardener_task(ctx: AutoDreamContext) {
     tokio::spawn(async move {
         let interval_secs = ctx
@@ -265,11 +453,21 @@ pub fn spawn_gardener_task(ctx: AutoDreamContext) {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             ticker.tick().await;
+            // Blob remediation first, then dedup: splitting a blob can expose fresh
+            // duplicates, and superseded blob sources drop out of the dedup scan.
             if let Err(error) = run_gardener_once(&ctx).await {
                 tracing::warn!(
                     target: GARDENER_TRACING_TARGET,
                     event = "run_failed",
                     "[gardener] run failed: {}",
+                    error
+                );
+            }
+            if let Err(error) = run_dedup_gardener_once(&ctx).await {
+                tracing::warn!(
+                    target: GARDENER_TRACING_TARGET,
+                    event = "dedup_run_failed",
+                    "[dedup-gardener] run failed: {}",
                     error
                 );
             }
@@ -419,5 +617,106 @@ mod tests {
             provider_registry,
         };
         assert_eq!(run_gardener_once(&ctx).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn dedup_gardener_consolidates_a_near_duplicate_pair() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        bamboo_infrastructure::paths::init_bamboo_dir(temp.path().to_path_buf());
+
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![
+            "{\"same_fact\":true,\"merged\":{\"title\":\"Mobile release freeze is Tuesday\",\"type\":\"project\",\"content\":\"Mobile release freeze begins Tuesday for the release cut.\",\"tags\":[\"release\"]}}".to_string(),
+        ]));
+        let config = Arc::new(RwLock::new(Config {
+            memory: Some(bamboo_infrastructure::config::MemoryConfig {
+                background_model: Some("fast-model".to_string()),
+                dedup_gardener_enabled: true,
+                dedup_gardener_min_score: 0.3,
+                dedup_gardener_max_merges_per_run: 8,
+                ..bamboo_infrastructure::config::MemoryConfig::default()
+            }),
+            ..Config::default()
+        }));
+        let provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()));
+
+        let ctx = AutoDreamContext {
+            session_store: session_store.clone(),
+            storage,
+            provider,
+            config,
+            provider_registry,
+        };
+
+        // Seed two near-duplicate memories in the same bamboo home the gardener reads.
+        let memory = MemoryStore::new(session_store.bamboo_home_dir());
+        let mut ids = Vec::new();
+        for (title, content) in [
+            (
+                "freeze v1",
+                "Mobile release freeze begins Tuesday for the cut.",
+            ),
+            (
+                "freeze v2",
+                "Mobile release freeze starts Tuesday for the release cut.",
+            ),
+        ] {
+            let doc = memory
+                .write_memory(
+                    MemoryScope::Global,
+                    None,
+                    DurableMemoryType::Project,
+                    title,
+                    content,
+                    &[],
+                    Some("s"),
+                    "t",
+                    false,
+                )
+                .await
+                .unwrap();
+            ids.push(doc.frontmatter.id);
+        }
+
+        let result = run_dedup_gardener_once(&ctx).await.unwrap().unwrap();
+        assert_eq!(result.consolidated, 1);
+        assert_eq!(result.superseded, 2);
+
+        // Both originals are superseded by a new canonical memory.
+        for id in &ids {
+            let source = memory.get_memory(id, None).await.unwrap().unwrap();
+            assert_eq!(
+                source.frontmatter.status,
+                bamboo_memory::memory_store::DurableMemoryStatus::Superseded
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dedup_gardener_is_noop_when_disabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        bamboo_infrastructure::paths::init_bamboo_dir(temp.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![]));
+        let config = Arc::new(RwLock::new(Config::default()));
+        let provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()));
+        let ctx = AutoDreamContext {
+            session_store,
+            storage,
+            provider,
+            config,
+            provider_registry,
+        };
+        assert_eq!(run_dedup_gardener_once(&ctx).await.unwrap(), None);
     }
 }

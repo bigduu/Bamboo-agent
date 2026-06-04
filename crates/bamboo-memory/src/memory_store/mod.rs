@@ -22,9 +22,10 @@ pub use recall::{
 };
 pub use store::MemoryStore;
 pub use types::{
-    BlobScanItem, BlobScanReport, CreatedBy, DurableContentLocation, DurableMemoryDocument,
-    DurableMemoryFrontmatter, DurableMemoryRef, DurableMemoryRelations, DurableMemoryRetrieval,
-    DurableMemorySource, DurableMemoryStatus, DurableMemoryType, MemoryContradictionResult,
+    BlobScanItem, BlobScanReport, CreatedBy, DuplicateCluster, DuplicateClusterMember,
+    DuplicateScanReport, DurableContentLocation, DurableMemoryDocument, DurableMemoryFrontmatter,
+    DurableMemoryRef, DurableMemoryRelations, DurableMemoryRetrieval, DurableMemorySource,
+    DurableMemoryStatus, DurableMemoryType, MemoryConsolidateResult, MemoryContradictionResult,
     MemoryDuplicateCandidate, MemoryInspectResult, MemoryMergeResult, MemoryPurgeResult,
     MemoryQueryCursor, MemoryQueryItem, MemoryQueryOptions, MemoryQueryResult, MemoryScope,
     MemorySplitPiece, MemorySplitResult, SessionState,

@@ -112,7 +112,8 @@ pub struct AccessControlConfig {
 }
 
 /// Memory and background summarization configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// No `Eq`: `dedup_gardener_min_score` is an f64 (PartialEq only).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryConfig {
     /// Optional dedicated model for memory/session summarization and reflection.
     /// Falls back to the provider fast model when unset.
@@ -161,6 +162,17 @@ pub struct MemoryConfig {
     /// Minimum `---` accretions for a memory to be a gardener split candidate.
     #[serde(default = "default_gardener_min_sections")]
     pub gardener_min_sections: usize,
+    /// Whether the background dedup gardener may use the LLM to consolidate
+    /// near-duplicate memories. Opt-in (default false) because it spends tokens.
+    #[serde(default, alias = "memory_dedup_gardener_enabled")]
+    pub dedup_gardener_enabled: bool,
+    /// Minimum content-keyword Jaccard (0.0–1.0) for two active memories to be
+    /// flagged as dedup candidates by the deterministic prefilter.
+    #[serde(default = "default_dedup_gardener_min_score")]
+    pub dedup_gardener_min_score: f64,
+    /// Hard cap on LLM-backed consolidations per dedup gardener run (cost ceiling).
+    #[serde(default = "default_dedup_gardener_max_merges_per_run")]
+    pub dedup_gardener_max_merges_per_run: usize,
 }
 
 impl Default for MemoryConfig {
@@ -177,6 +189,9 @@ impl Default for MemoryConfig {
             gardener_interval_secs: default_gardener_interval_secs(),
             gardener_max_splits_per_run: default_gardener_max_splits_per_run(),
             gardener_min_sections: default_gardener_min_sections(),
+            dedup_gardener_enabled: false,
+            dedup_gardener_min_score: default_dedup_gardener_min_score(),
+            dedup_gardener_max_merges_per_run: default_dedup_gardener_max_merges_per_run(),
         }
     }
 }
@@ -191,6 +206,14 @@ fn default_gardener_max_splits_per_run() -> usize {
 
 fn default_gardener_min_sections() -> usize {
     5
+}
+
+fn default_dedup_gardener_min_score() -> f64 {
+    0.6
+}
+
+fn default_dedup_gardener_max_merges_per_run() -> usize {
+    8
 }
 
 fn default_true_memory_project_prompt_injection() -> bool {
@@ -2057,6 +2080,9 @@ mod tests {
                 gardener_interval_secs: 3_600,
                 gardener_max_splits_per_run: 4,
                 gardener_min_sections: 7,
+                dedup_gardener_enabled: true,
+                dedup_gardener_min_score: 0.7,
+                dedup_gardener_max_merges_per_run: 3,
             }),
             ..Config::default()
         };
@@ -2075,6 +2101,9 @@ mod tests {
         assert_eq!(memory.gardener_interval_secs, 3_600);
         assert_eq!(memory.gardener_max_splits_per_run, 4);
         assert_eq!(memory.gardener_min_sections, 7);
+        assert!(memory.dedup_gardener_enabled);
+        assert_eq!(memory.dedup_gardener_min_score, 0.7);
+        assert_eq!(memory.dedup_gardener_max_merges_per_run, 3);
     }
 
     #[test]

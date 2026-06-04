@@ -364,7 +364,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "memory" => Some(guide(
             "memory",
             ToolCategory::TaskManagement,
-            "Manage Bamboo's unified memory system. Use session_* actions only for current-session continuity notes, and use query/get/write/merge/purge/inspect/rebuild for durable project or global memories backed by canonical topic files. Proactively query before answering when the user refers to their own preferences, past decisions, or subjective/personal context you don't already know — including first-person questions about themselves ('what do I...', 'did I...', '我...?') — recall first instead of replying that you don't know.",
+            "Manage Bamboo's unified memory system. Use session_* actions only for current-session continuity notes, and use query/get/write/merge/split/consolidate/purge/inspect/rebuild for durable project or global memories backed by canonical topic files. Proactively query before answering when the user refers to their own preferences, past decisions, or subjective/personal context you don't already know — including first-person questions about themselves ('what do I...', 'did I...', '我...?') — recall first instead of replying that you don't know.",
             "Do not use session actions for long-term project knowledge, and do not dump large bodies through query when query -> get(id) or inspect is more appropriate. Prefer query first, then get the specific durable item you need before writing or merging. One memory = one atomic fact: do not bundle unrelated facts into a single memory. Only merge/append content that is the SAME fact as the target — if it's a different topic, write a new memory instead of appending.",
             &["session_note", "session_history", "Task"],
             vec![
@@ -412,6 +412,11 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                     "Split a multi-topic memory into atomic memories",
                     json!({"action":"split","id":"mem_20260403_001","pieces":[{"title":"User prefers pnpm","type":"user","content":"User prefers pnpm and strict TypeScript.","tags":["preference"]},{"title":"Mobile release freeze is Tuesday","type":"project","content":"Mobile release freeze begins Tuesday.","tags":["release"]}]}),
                     "Use when one memory has accreted several unrelated facts (a 'blob'): split archives the original and creates one atomic memory per fact, preserving lineage via supersedes.",
+                ),
+                example(
+                    "Consolidate near-duplicate memories into one",
+                    json!({"action":"consolidate","ids":["mem_20260403_001","mem_20260403_007"],"type":"project","title":"Mobile release freeze is Tuesday","content":"Mobile release freeze begins Tuesday for the release cut.","tags":["release","freeze"]}),
+                    "Use ONLY when two or more memories are the SAME fact: consolidate archives them all and creates one canonical atomic memory, preserving lineage via supersedes. Confirm sameness (e.g. via scan_duplicates / find_duplicates) before consolidating — never merge distinct facts.",
                 ),
             ],
         )),

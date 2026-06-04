@@ -109,6 +109,26 @@ pub(super) enum MemoryArgs {
         #[serde(default)]
         options: Option<MemoryActionOptions>,
     },
+    ScanDuplicates {
+        scope: String,
+        #[serde(default)]
+        project_key: Option<String>,
+        #[serde(default)]
+        min_score: Option<f64>,
+        #[serde(default)]
+        options: Option<MemoryActionOptions>,
+    },
+    Consolidate {
+        ids: Vec<String>,
+        title: String,
+        content: String,
+        #[serde(rename = "type", default)]
+        r#type: Option<String>,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        project_key: Option<String>,
+    },
     Purge {
         #[serde(default)]
         id: Option<String>,

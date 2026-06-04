@@ -22,7 +22,10 @@ use super::{
     MEMORY_VIEW_FILE, MERGE_AUDIT_LOG, PURGE_AUDIT_LOG, RECENT_INDEX_FILE, RECENT_VIEW_FILE,
     STALE_CANDIDATES_INDEX_FILE, STALE_VIEW_FILE, TAXONOMY_INDEX_FILE, WRITE_AUDIT_LOG,
 };
-use super::{BlobScanItem, BlobScanReport};
+use super::{
+    BlobScanItem, BlobScanReport, DuplicateCluster, DuplicateClusterMember, DuplicateScanReport,
+    MemoryConsolidateResult,
+};
 use super::{
     CreatedBy, DurableMemoryDocument, DurableMemoryFrontmatter, DurableMemoryRelations,
     DurableMemoryRetrieval, DurableMemorySource, DurableMemoryStatus, DurableMemoryType,
@@ -1017,6 +1020,299 @@ impl MemoryStore {
             threshold: min_appended_sections,
             items,
         })
+    }
+
+    /// Deterministic dedup prefilter (NO LLM): cluster active memories that look
+    /// like near-duplicates (pairwise content-keyword Jaccard ≥ `min_score`),
+    /// ranked worst-first. Greedy seeded clustering keeps each memory in at most
+    /// one cluster. This is the free, always-on half of the dedup gardener; each
+    /// cluster is a worklist item for LLM-driven consolidation.
+    pub async fn scan_duplicate_clusters(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        min_score: f64,
+        max_members_per_cluster: usize,
+        limit: usize,
+    ) -> io::Result<DuplicateScanReport> {
+        let project_key = self.require_project_key(scope, project_key)?;
+        let min_score = min_score.clamp(0.0, 1.0);
+        let max_members = max_members_per_cluster.max(2);
+
+        let docs = self.list_memory_documents(scope, project_key).await?;
+        let active: Vec<DurableMemoryDocument> = docs
+            .into_iter()
+            .filter(|doc| doc.frontmatter.status == DurableMemoryStatus::Active)
+            .collect();
+        let scanned = active.len();
+
+        // Precompute each memory's keyword set once (reused across all pair checks).
+        let keyword_sets: Vec<HashSet<String>> = active
+            .iter()
+            .map(|doc| doc.frontmatter.retrieval.keywords.iter().cloned().collect())
+            .collect();
+
+        let mut used = vec![false; active.len()];
+        let mut clusters: Vec<DuplicateCluster> = Vec::new();
+        let mut clustered = 0usize;
+        for i in 0..active.len() {
+            if used[i] || keyword_sets[i].is_empty() {
+                continue;
+            }
+            // Collect everything similar to seed i, with its score, then keep the
+            // strongest partners up to the per-cluster cap.
+            let mut partners: Vec<(usize, f64)> = Vec::new();
+            for j in (i + 1)..active.len() {
+                if used[j] || keyword_sets[j].is_empty() {
+                    continue;
+                }
+                let intersection = keyword_sets[i].intersection(&keyword_sets[j]).count();
+                if intersection == 0 {
+                    continue;
+                }
+                let union = keyword_sets[i].union(&keyword_sets[j]).count();
+                let score = intersection as f64 / union as f64;
+                if score >= min_score {
+                    partners.push((j, score));
+                }
+            }
+            if partners.is_empty() {
+                continue;
+            }
+            partners.sort_by(|left, right| {
+                right
+                    .1
+                    .partial_cmp(&left.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        active[left.0]
+                            .frontmatter
+                            .id
+                            .cmp(&active[right.0].frontmatter.id)
+                    })
+            });
+            partners.truncate(max_members.saturating_sub(1));
+            let max_score = partners.first().map(|(_, score)| *score).unwrap_or(0.0);
+
+            let mut member_indices = vec![i];
+            member_indices.extend(partners.iter().map(|(idx, _)| *idx));
+            for &idx in &member_indices {
+                used[idx] = true;
+            }
+            clustered += member_indices.len();
+
+            let members = member_indices
+                .iter()
+                .map(|&idx| {
+                    let doc = &active[idx];
+                    DuplicateClusterMember {
+                        id: doc.frontmatter.id.clone(),
+                        title: doc.frontmatter.title.clone(),
+                        r#type: doc.frontmatter.r#type,
+                        snippet: derive_summary(&doc.body, 200),
+                    }
+                })
+                .collect();
+            clusters.push(DuplicateCluster {
+                members,
+                max_score: (max_score * 100.0).round() / 100.0,
+            });
+        }
+
+        clusters.sort_by(|left, right| {
+            right
+                .max_score
+                .partial_cmp(&left.max_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(right.members.len().cmp(&left.members.len()))
+                .then_with(|| left.members[0].id.cmp(&right.members[0].id))
+        });
+        clusters.truncate(limit.max(1));
+
+        Ok(DuplicateScanReport {
+            scope,
+            project_key: project_key.map(ToString::to_string),
+            scanned,
+            clustered,
+            threshold: min_score,
+            clusters,
+        })
+    }
+
+    /// Consolidate N near-duplicate memories into ONE canonical atomic memory.
+    ///
+    /// The merged piece (decided by the caller, an LLM) becomes a new active memory
+    /// that `supersedes` every source; each source is then marked `Superseded`
+    /// (kept for lineage, hidden from recall). The body size cap is enforced, so a
+    /// consolidation can never produce a blob. This is the inverse of `split_memory`.
+    pub async fn consolidate_memories(
+        &self,
+        ids: &[String],
+        preferred_project_key: Option<&str>,
+        merged: &MemorySplitPiece,
+        session_id: Option<&str>,
+        actor: &str,
+    ) -> io::Result<Option<MemoryConsolidateResult>> {
+        if ids.len() < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "consolidate requires at least two source memories",
+            ));
+        }
+
+        // Validate the merged piece up front so nothing is written on a bad payload.
+        let title = validate_memory_title(&merged.title)?;
+        let content = merged.content.trim();
+        if content.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "consolidated content cannot be empty",
+            ));
+        }
+        if content.chars().count() > MAX_DURABLE_MEMORY_BODY_CHARS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "consolidated memory exceeds the durable memory size cap; keep it a single atomic fact",
+            ));
+        }
+
+        // Resolve every source first; a missing one aborts before any write. Dedupe
+        // ids so a repeated id can't supersede itself twice.
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        let mut sources: Vec<DurableMemoryDocument> = Vec::with_capacity(ids.len());
+        for id in ids {
+            let id = id.trim();
+            if !seen_ids.insert(id.to_string()) {
+                continue;
+            }
+            let Some(doc) = self.get_memory(id, preferred_project_key).await? else {
+                return Ok(None);
+            };
+            sources.push(doc);
+        }
+        if sources.len() < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "consolidate requires at least two distinct source memories",
+            ));
+        }
+
+        let scope = sources[0].frontmatter.scope;
+        let project_key_owned = sources[0].frontmatter.project_key.clone();
+        if sources.iter().any(|doc| {
+            doc.frontmatter.scope != scope || doc.frontmatter.project_key != project_key_owned
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "all consolidated memories must share one scope and project",
+            ));
+        }
+        let project_key = project_key_owned.as_deref();
+        let superseded_ids: Vec<String> = sources
+            .iter()
+            .map(|doc| doc.frontmatter.id.clone())
+            .collect();
+
+        let r#type = merged.r#type.unwrap_or(sources[0].frontmatter.r#type);
+        let tags = normalize_tags(merged.tags.iter().map(String::as_str));
+        let new_id = self.allocate_memory_id(scope, project_key, title).await?;
+        let now = now_rfc3339();
+        let project_key_field = match scope {
+            MemoryScope::Project => Some(project_key.unwrap_or("unknown").to_string()),
+            _ => None,
+        };
+        // Union the provenance of every source so the consolidated memory keeps the
+        // full lineage of where its facts came from.
+        let mut sources_union: Vec<DurableMemorySource> = Vec::new();
+        for doc in &sources {
+            for source in &doc.frontmatter.sources {
+                if !sources_union.contains(source) {
+                    sources_union.push(source.clone());
+                }
+            }
+        }
+        let frontmatter = DurableMemoryFrontmatter {
+            id: new_id.clone(),
+            title: title.to_string(),
+            r#type,
+            scope,
+            project_key: project_key_field,
+            status: DurableMemoryStatus::Active,
+            freshness: Some("high".to_string()),
+            confidence: sources[0].frontmatter.confidence.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            created_by: CreatedBy {
+                kind: "memory_consolidate".to_string(),
+                id: session_id.map(|value| value.to_string()),
+                actor: Some(actor.to_string()),
+            },
+            updated_by: CreatedBy {
+                kind: "memory_consolidate".to_string(),
+                id: None,
+                actor: Some(actor.to_string()),
+            },
+            sources: sources_union,
+            relations: DurableMemoryRelations {
+                supersedes: superseded_ids.clone(),
+                ..DurableMemoryRelations::default()
+            },
+            tags: tags.clone(),
+            retrieval: DurableMemoryRetrieval {
+                keywords: extract_keywords(title, content, &tags),
+                entities: detect_entities(title, content),
+                embedding_ready: true,
+                last_accessed_at: None,
+            },
+        };
+        let doc = DurableMemoryDocument {
+            path: self.resolver.topic_path(scope, project_key, &new_id),
+            frontmatter,
+            body: content.to_string(),
+        };
+        self.write_document(&doc).await?;
+
+        for mut source in sources {
+            self.set_memory_status(
+                &mut source,
+                DurableMemoryStatus::Superseded,
+                "memory_consolidate",
+                actor,
+            )
+            .await?;
+        }
+
+        self.append_audit(
+            scope,
+            project_key,
+            MERGE_AUDIT_LOG,
+            AuditLogEntry {
+                timestamp: now_rfc3339(),
+                action: "consolidate".to_string(),
+                scope,
+                memory_id: Some(new_id.clone()),
+                session_id: session_id.map(|value| value.to_string()),
+                topic: None,
+                summary: format!(
+                    "Consolidated {} near-duplicate memories into '{}'.",
+                    superseded_ids.len(),
+                    title
+                ),
+                metadata: Some(serde_json::json!({
+                    "project_key": project_key,
+                    "superseded_ids": superseded_ids,
+                })),
+            },
+        )
+        .await?;
+        self.refresh_scope_artifacts(scope, project_key).await?;
+
+        Ok(Some(MemoryConsolidateResult {
+            new_id,
+            target_scope: scope,
+            project_key: project_key_owned.clone(),
+            superseded_ids,
+        }))
     }
 
     pub async fn purge_memories(
@@ -2344,6 +2640,188 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(original.body, near_cap);
+    }
+
+    #[tokio::test]
+    async fn scan_duplicate_clusters_groups_near_duplicates_and_skips_unrelated() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        for (title, content) in [
+            (
+                "Release freeze rule",
+                "Mobile release freeze begins Tuesday for the release cut.",
+            ),
+            (
+                "Release freeze timing",
+                "Mobile release freeze begins Tuesday for the cut.",
+            ),
+            (
+                "Unrelated cat fact",
+                "The quiet cat napped under the warm windowsill.",
+            ),
+        ] {
+            store
+                .write_memory(
+                    MemoryScope::Global,
+                    None,
+                    DurableMemoryType::Project,
+                    title,
+                    content,
+                    &[],
+                    Some("s"),
+                    "t",
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+
+        let report = store
+            .scan_duplicate_clusters(MemoryScope::Global, None, 0.3, 5, 20)
+            .await
+            .unwrap();
+
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.clusters.len(), 1);
+        let cluster = &report.clusters[0];
+        assert_eq!(cluster.members.len(), 2);
+        assert!(cluster.max_score > 0.0);
+        // The unrelated cat memory must not be clustered with the freeze memories.
+        assert!(!cluster
+            .members
+            .iter()
+            .any(|m| m.title == "Unrelated cat fact"));
+    }
+
+    #[tokio::test]
+    async fn consolidate_memories_creates_canonical_and_supersedes_sources() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        let first = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Project,
+                "freeze v1",
+                "Mobile release freeze begins Tuesday.",
+                &[],
+                Some("s"),
+                "t",
+                false,
+            )
+            .await
+            .unwrap();
+        let second = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Project,
+                "freeze v2",
+                "Release freeze starts Tuesday for the cut.",
+                &[],
+                Some("s"),
+                "t",
+                false,
+            )
+            .await
+            .unwrap();
+
+        let merged = MemorySplitPiece {
+            title: "Mobile release freeze is Tuesday".to_string(),
+            r#type: Some(DurableMemoryType::Project),
+            content: "Mobile release freeze begins Tuesday for the release cut.".to_string(),
+            tags: vec!["release".to_string()],
+        };
+        let ids = vec![first.frontmatter.id.clone(), second.frontmatter.id.clone()];
+        let result = store
+            .consolidate_memories(&ids, None, &merged, Some("s"), "test")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.superseded_ids.len(), 2);
+        // The canonical memory is active, supersedes both sources, and carries the
+        // merged body.
+        let canonical = store
+            .get_memory(&result.new_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(canonical.frontmatter.status, DurableMemoryStatus::Active);
+        assert_eq!(canonical.body, merged.content);
+        assert!(canonical
+            .frontmatter
+            .relations
+            .supersedes
+            .contains(&first.frontmatter.id));
+        assert!(canonical
+            .frontmatter
+            .relations
+            .supersedes
+            .contains(&second.frontmatter.id));
+        // Both sources are superseded.
+        for id in &ids {
+            let source = store.get_memory(id, None).await.unwrap().unwrap();
+            assert_eq!(source.frontmatter.status, DurableMemoryStatus::Superseded);
+        }
+    }
+
+    #[tokio::test]
+    async fn consolidate_memories_rejects_single_source_and_missing_source() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        let only = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::User,
+                "lonely fact",
+                "just one fact",
+                &[],
+                Some("s"),
+                "t",
+                false,
+            )
+            .await
+            .unwrap();
+        let merged = MemorySplitPiece {
+            title: "merged".to_string(),
+            r#type: None,
+            content: "merged body".to_string(),
+            tags: vec![],
+        };
+
+        // Fewer than two sources is an error.
+        assert!(store
+            .consolidate_memories(
+                &[only.frontmatter.id.clone()],
+                None,
+                &merged,
+                Some("s"),
+                "t"
+            )
+            .await
+            .is_err());
+
+        // A missing source aborts (Ok(None)) without superseding the real one.
+        let ids = vec![
+            only.frontmatter.id.clone(),
+            "mem_does_not_exist".to_string(),
+        ];
+        assert!(store
+            .consolidate_memories(&ids, None, &merged, Some("s"), "t")
+            .await
+            .unwrap()
+            .is_none());
+        let untouched = store
+            .get_memory(&only.frontmatter.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.frontmatter.status, DurableMemoryStatus::Active);
     }
 
     #[tokio::test]

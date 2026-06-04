@@ -172,6 +172,70 @@ pub fn build_blob_split_prompt(title: &str, body: &str) -> String {
     prompt
 }
 
+#[derive(serde::Deserialize)]
+struct DedupDecisionRaw {
+    #[serde(default)]
+    same_fact: bool,
+    #[serde(default)]
+    merged: Option<SplitPieceRaw>,
+}
+
+/// Parse the background model's dedup decision. Returns `Some(piece)` ONLY when the
+/// model judged the cluster to be the same fact AND returned a usable merged memory;
+/// `None` means "leave them separate" (distinct facts, or unusable output). Pure.
+pub fn parse_dedup_decision(
+    raw: &str,
+) -> Result<Option<crate::memory_store::MemorySplitPiece>, String> {
+    let payload = strip_json_fence(raw);
+    let parsed: DedupDecisionRaw = serde_json::from_str(payload)
+        .map_err(|error| format!("failed to parse dedup decision: {error}"))?;
+    if !parsed.same_fact {
+        return Ok(None);
+    }
+    let Some(piece) = parsed.merged else {
+        return Ok(None);
+    };
+    let title = piece.title.trim().to_string();
+    let content = piece.content.trim().to_string();
+    if title.is_empty() || content.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(crate::memory_store::MemorySplitPiece {
+        title,
+        r#type: piece.kind.as_deref().and_then(parse_candidate_type),
+        content,
+        tags: piece.tags,
+    }))
+}
+
+/// Build the prompt asking the background model to judge whether a cluster of
+/// near-duplicate memories is the SAME fact and, if so, consolidate them into one
+/// atomic memory. Pure — formats text only.
+pub fn build_dedup_prompt(members: &[(String, String)]) -> String {
+    let mut prompt = String::from("# Bamboo Memory Deduplication\n\n");
+    prompt.push_str(
+        "The durable memories below were flagged as possible duplicates of each other.\n\n",
+    );
+    prompt
+        .push_str("Decide whether they all describe the SAME single fact/decision/preference.\n\n");
+    prompt.push_str("Rules:\n");
+    prompt.push_str("- Return JSON only: {\"same_fact\":boolean,\"merged\":{\"title\":string,\"type\":\"user\"|\"feedback\"|\"project\"|\"reference\",\"content\":string,\"tags\":string[]}}\n");
+    prompt.push_str("- Set same_fact=true and provide `merged` ONLY if they are genuinely the same fact. Merge them into ONE atomic memory that preserves every distinct detail, with a specific, keyword-findable title.\n");
+    prompt.push_str("- Set same_fact=false (omit `merged`) if they are merely related but distinct facts. When unsure, prefer false — never merge facts that are not the same.\n");
+    prompt.push_str(
+        "- Preserve original wording; do not invent facts. Drop only exact redundancy.\n\n",
+    );
+    prompt.push_str("## Memories\n");
+    for (index, (title, body)) in members.iter().enumerate() {
+        prompt.push_str(&format!("\n### Memory {}\n", index + 1));
+        prompt.push_str(&format!("- title: {title}\n"));
+        prompt.push_str("- body:\n```md\n");
+        prompt.push_str(body);
+        prompt.push_str("\n```\n");
+    }
+    prompt
+}
+
 // ---------------------------------------------------------------------------
 // Normalization helpers
 // ---------------------------------------------------------------------------
