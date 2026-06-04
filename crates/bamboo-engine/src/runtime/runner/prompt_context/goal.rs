@@ -8,7 +8,7 @@ const GOAL_END_MARKER: &str = "<!-- BAMBOO_GOAL_END -->";
 /// Render the goal section body that gets wrapped into the system prompt.
 fn render_goal_section(goal: &str) -> String {
     format!(
-        "## Session Goal\nThe user has set an explicit goal for this session. Keep working autonomously toward it until it is fully achieved. Do not stop early or hand back control while concrete progress is still possible.\n\nGoal:\n{}",
+        "## Session Goal\nThe user has set an explicit goal for this session. Keep working autonomously toward it until it is fully achieved. Do not stop early or hand back control while concrete progress is still possible. Still ask a focused clarifying question when you are genuinely blocked or when proceeding would risk irreversible or clearly wrong work; otherwise keep going.\n\nGoal:\n{}",
         goal.trim()
     )
 }

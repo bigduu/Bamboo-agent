@@ -364,8 +364,8 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "memory" => Some(guide(
             "memory",
             ToolCategory::TaskManagement,
-            "Manage Bamboo's unified memory system. Use session_* actions only for current-session continuity notes, and use query/get/write/merge/purge/inspect/rebuild for durable project or global memories backed by canonical topic files.",
-            "Do not use session actions for long-term project knowledge, and do not dump large bodies through query when query -> get(id) or inspect is more appropriate. Prefer query first, then get the specific durable item you need before writing or merging.",
+            "Manage Bamboo's unified memory system. Use session_* actions only for current-session continuity notes, and use query/get/write/merge/split/consolidate/purge/inspect/rebuild for durable project or global memories backed by canonical topic files. Proactively query before answering when the user refers to their own preferences, past decisions, or subjective/personal context you don't already know — including first-person questions about themselves ('what do I...', 'did I...', '我...?') — recall first instead of replying that you don't know.",
+            "Do not use session actions for long-term project knowledge, and do not dump large bodies through query when query -> get(id) or inspect is more appropriate. Prefer query first, then get the specific durable item you need before writing or merging. One memory = one atomic fact: do not bundle unrelated facts into a single memory. Only merge/append content that is the SAME fact as the target — if it's a different topic, write a new memory instead of appending.",
             &["session_note", "session_history", "Task"],
             vec![
                 example(
@@ -384,14 +384,39 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                     "Use after query when you need the full body/frontmatter of a single durable memory item.",
                 ),
                 example(
+                    "Recall before answering about the user's own context",
+                    json!({"action":"query","scope":"global","query":"preferred testing framework","options":{"limit":5}}),
+                    "When the user refers to their own preferences, opinions, or past decisions you don't already know — especially first-person questions ('what do I...', 'did I...', '我...?') — query memory BEFORE answering; do not say you don't know without checking.",
+                ),
+                example(
+                    "Recall a past project decision before acting",
+                    json!({"action":"query","scope":"project","query":"why we chose HTTP over Tauri IPC","options":{"limit":5}}),
+                    "When continuing prior work, query project memory for past decisions and constraints before re-deciding or claiming none exist.",
+                ),
+                example(
+                    "Check for an existing duplicate before writing",
+                    json!({"action":"find_duplicates","scope":"project","type":"project","title":"Release freeze begins next week","content":"Mobile release freeze begins Tuesday."}),
+                    "Before write, check whether the same fact already exists; if a high-scoring candidate is the same fact, merge into it instead of creating a near-duplicate.",
+                ),
+                example(
                     "Write a durable project memory",
                     json!({"action":"write","scope":"project","type":"project","title":"Release freeze begins next week","content":"Merge freeze begins on Tuesday for the mobile release cut.","tags":["release","freeze"]}),
-                    "Use when the fact should persist across sessions as canonical project memory and should not live only in session_note.",
+                    "Use when the fact should persist across sessions as canonical project memory. Give it a specific title that summarizes this fact — recall is keyword-based, so a vague or mismatched title makes it unfindable.",
                 ),
                 example(
                     "Merge follow-up details into an existing durable memory",
                     json!({"action":"merge","id":"mem_20260403_001","content":"Additional confirmation from a later session.","tags":["confirmed"],"source_memory_ids":["mem_20260403_002"]}),
-                    "Use when new durable evidence belongs on an existing memory item and older overlapping items should be superseded.",
+                    "Use ONLY when the new evidence is the same fact as the target memory and older overlapping items should be superseded. Do not merge unrelated facts together — create a separate memory instead.",
+                ),
+                example(
+                    "Split a multi-topic memory into atomic memories",
+                    json!({"action":"split","id":"mem_20260403_001","pieces":[{"title":"User prefers pnpm","type":"user","content":"User prefers pnpm and strict TypeScript.","tags":["preference"]},{"title":"Mobile release freeze is Tuesday","type":"project","content":"Mobile release freeze begins Tuesday.","tags":["release"]}]}),
+                    "Use when one memory has accreted several unrelated facts (a 'blob'): split archives the original and creates one atomic memory per fact, preserving lineage via supersedes.",
+                ),
+                example(
+                    "Consolidate near-duplicate memories into one",
+                    json!({"action":"consolidate","ids":["mem_20260403_001","mem_20260403_007"],"type":"project","title":"Mobile release freeze is Tuesday","content":"Mobile release freeze begins Tuesday for the release cut.","tags":["release","freeze"]}),
+                    "Use ONLY when two or more memories are the SAME fact: consolidate archives them all and creates one canonical atomic memory, preserving lineage via supersedes. Confirm sameness (e.g. via scan_duplicates / find_duplicates) before consolidating — never merge distinct facts.",
                 ),
             ],
         )),

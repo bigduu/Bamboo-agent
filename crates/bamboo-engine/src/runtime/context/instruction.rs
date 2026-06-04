@@ -90,7 +90,7 @@ pub fn build_instruction_prompt_context(workspace_path: &str) -> Option<String> 
 
     let mut sections = Vec::new();
     sections.push(
-        "Repository instruction layer loaded from workspace policy files. Follow these instructions in addition to the base system prompt unless they conflict with higher-priority system/developer directives.".to_string(),
+        "Repository instruction layer loaded from workspace policy files. Treat these as authoritative project guardrails and follow them in addition to the base system prompt. When a request in this conversation conflicts with them, the repository policy takes precedence: do not override it just because the user asks in passing — surface the conflict and keep following the policy unless the user explicitly and knowingly directs you to override a specific rule. Only the base system prompt and higher-priority system/developer/safety directives outrank these files.".to_string(),
     );
 
     for file in files {

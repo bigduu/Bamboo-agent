@@ -105,6 +105,137 @@ pub fn parse_candidate_type(kind: &str) -> Option<crate::memory_store::DurableMe
     }
 }
 
+#[derive(serde::Deserialize)]
+struct SplitEnvelope {
+    #[serde(default)]
+    pieces: Vec<SplitPieceRaw>,
+}
+
+#[derive(serde::Deserialize)]
+struct SplitPieceRaw {
+    #[serde(default)]
+    title: String,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+/// Parse the background model's blob-split JSON into atomic split pieces.
+/// Pure; skips pieces missing a title or content.
+pub fn parse_split_pieces(raw: &str) -> Result<Vec<crate::memory_store::MemorySplitPiece>, String> {
+    let payload = strip_json_fence(raw);
+    let parsed: SplitEnvelope = serde_json::from_str(payload)
+        .map_err(|error| format!("failed to parse split pieces: {error}"))?;
+    let pieces = parsed
+        .pieces
+        .into_iter()
+        .filter_map(|piece| {
+            let title = piece.title.trim().to_string();
+            let content = piece.content.trim().to_string();
+            if title.is_empty() || content.is_empty() {
+                return None;
+            }
+            Some(crate::memory_store::MemorySplitPiece {
+                title,
+                r#type: piece.kind.as_deref().and_then(parse_candidate_type),
+                content,
+                tags: piece.tags,
+            })
+        })
+        .collect();
+    Ok(pieces)
+}
+
+/// Build the prompt asking the background model to split a multi-topic "blob"
+/// memory into atomic pieces. Pure — formats text only.
+pub fn build_blob_split_prompt(title: &str, body: &str) -> String {
+    let mut prompt = String::from("# Bamboo Memory Split\n\n");
+    prompt.push_str(
+        "The durable memory below has accreted multiple facts and must be split into atomic memories.\n\n",
+    );
+    prompt.push_str("Rules:\n");
+    prompt.push_str("- Return JSON only: {\"pieces\":[{\"title\":string,\"type\":\"user\"|\"feedback\"|\"project\"|\"reference\",\"content\":string,\"tags\":string[]}]}\n");
+    prompt.push_str("- Each piece must capture exactly ONE atomic fact/decision/preference. Never combine unrelated facts.\n");
+    prompt.push_str("- The title must concisely summarize that piece's own content so it is findable by keyword search.\n");
+    prompt.push_str("- Preserve the original wording of each fact; do not invent facts. Drop only exact duplicates.\n");
+    prompt.push_str(
+        "- If the memory is actually a single coherent fact, return exactly one piece.\n\n",
+    );
+    prompt.push_str("## Memory\n");
+    prompt.push_str(&format!("- title: {title}\n"));
+    prompt.push_str("- body:\n```md\n");
+    prompt.push_str(body);
+    prompt.push_str("\n```\n");
+    prompt
+}
+
+#[derive(serde::Deserialize)]
+struct DedupDecisionRaw {
+    #[serde(default)]
+    same_fact: bool,
+    #[serde(default)]
+    merged: Option<SplitPieceRaw>,
+}
+
+/// Parse the background model's dedup decision. Returns `Some(piece)` ONLY when the
+/// model judged the cluster to be the same fact AND returned a usable merged memory;
+/// `None` means "leave them separate" (distinct facts, or unusable output). Pure.
+pub fn parse_dedup_decision(
+    raw: &str,
+) -> Result<Option<crate::memory_store::MemorySplitPiece>, String> {
+    let payload = strip_json_fence(raw);
+    let parsed: DedupDecisionRaw = serde_json::from_str(payload)
+        .map_err(|error| format!("failed to parse dedup decision: {error}"))?;
+    if !parsed.same_fact {
+        return Ok(None);
+    }
+    let Some(piece) = parsed.merged else {
+        return Ok(None);
+    };
+    let title = piece.title.trim().to_string();
+    let content = piece.content.trim().to_string();
+    if title.is_empty() || content.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(crate::memory_store::MemorySplitPiece {
+        title,
+        r#type: piece.kind.as_deref().and_then(parse_candidate_type),
+        content,
+        tags: piece.tags,
+    }))
+}
+
+/// Build the prompt asking the background model to judge whether a cluster of
+/// near-duplicate memories is the SAME fact and, if so, consolidate them into one
+/// atomic memory. Pure — formats text only.
+pub fn build_dedup_prompt(members: &[(String, String)]) -> String {
+    let mut prompt = String::from("# Bamboo Memory Deduplication\n\n");
+    prompt.push_str(
+        "The durable memories below were flagged as possible duplicates of each other.\n\n",
+    );
+    prompt
+        .push_str("Decide whether they all describe the SAME single fact/decision/preference.\n\n");
+    prompt.push_str("Rules:\n");
+    prompt.push_str("- Return JSON only: {\"same_fact\":boolean,\"merged\":{\"title\":string,\"type\":\"user\"|\"feedback\"|\"project\"|\"reference\",\"content\":string,\"tags\":string[]}}\n");
+    prompt.push_str("- Set same_fact=true and provide `merged` ONLY if they are genuinely the same fact. Merge them into ONE atomic memory that preserves every distinct detail, with a specific, keyword-findable title.\n");
+    prompt.push_str("- Set same_fact=false (omit `merged`) if they are merely related but distinct facts. When unsure, prefer false — never merge facts that are not the same.\n");
+    prompt.push_str(
+        "- Preserve original wording; do not invent facts. Drop only exact redundancy.\n\n",
+    );
+    prompt.push_str("## Memories\n");
+    for (index, (title, body)) in members.iter().enumerate() {
+        prompt.push_str(&format!("\n### Memory {}\n", index + 1));
+        prompt.push_str(&format!("- title: {title}\n"));
+        prompt.push_str("- body:\n```md\n");
+        prompt.push_str(body);
+        prompt.push_str("\n```\n");
+    }
+    prompt
+}
+
 // ---------------------------------------------------------------------------
 // Normalization helpers
 // ---------------------------------------------------------------------------
@@ -219,6 +350,8 @@ pub fn build_extraction_prompt(candidates: &[DreamCandidateInfo]) -> String {
     prompt.push_str("- Return JSON only, no markdown fences or commentary unless the entire response is fenced JSON.\n");
     prompt.push_str("- Output shape: {\"candidates\":[{\"title\":string,\"type\":\"user\"|\"feedback\"|\"project\"|\"reference\",\"scope\":\"project\"|\"global\",\"content\":string,\"tags\":string[],\"session_id\":string,\"confidence\":\"high\"|\"medium\"|\"low\"}]}\n");
     prompt.push_str("- Include at most 8 candidates total.\n");
+    prompt.push_str("- Each candidate must capture exactly ONE atomic fact/decision/preference. Never combine unrelated facts into a single candidate.\n");
+    prompt.push_str("- The title must concisely summarize THAT candidate's own content so it can be found later by keyword search; never use a generic title that does not match the content.\n");
     prompt.push_str("- Skip transient scratch state, code/project structure derivable from tools, and anything low-confidence or secret-like.\n");
     prompt.push_str("- Prefer project scope when the session clearly belongs to a project workspace; otherwise use global.\n\n");
     prompt.push_str("## Candidate sessions\n\n");
@@ -287,6 +420,7 @@ fn build_consolidation_prompt_prefix() -> String {
     );
     prompt.push_str("Requirements:\n");
     prompt.push_str("- Focus on durable facts, recurring goals, stable constraints, user preferences, active project directions, and unresolved blockers\n");
+    prompt.push_str("- Only fold a fact into an existing memory when it is the same fact. Keep unrelated facts as separate memories; never join unrelated facts with separators.\n");
     prompt.push_str("- Prefer cross-session patterns over one-off chatter\n");
     prompt.push_str("- Do not include secrets, tokens, or highly transient details\n");
     prompt.push_str("- Separate active ongoing threads from completed or obsolete items\n");
@@ -820,7 +954,7 @@ async fn extract_and_persist_durable_candidates(
                 &tags,
                 session_id,
                 "background-fast-model",
-                true,
+                false,
             )
             .await
             .map_err(|error| {

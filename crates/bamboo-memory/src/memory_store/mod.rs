@@ -22,11 +22,13 @@ pub use recall::{
 };
 pub use store::MemoryStore;
 pub use types::{
-    CreatedBy, DurableContentLocation, DurableMemoryDocument, DurableMemoryFrontmatter,
+    BlobScanItem, BlobScanReport, CreatedBy, DuplicateCluster, DuplicateClusterMember,
+    DuplicateScanReport, DurableContentLocation, DurableMemoryDocument, DurableMemoryFrontmatter,
     DurableMemoryRef, DurableMemoryRelations, DurableMemoryRetrieval, DurableMemorySource,
-    DurableMemoryStatus, DurableMemoryType, MemoryContradictionResult, MemoryInspectResult,
-    MemoryMergeResult, MemoryPurgeResult, MemoryQueryCursor, MemoryQueryItem, MemoryQueryOptions,
-    MemoryQueryResult, MemoryScope, SessionState,
+    DurableMemoryStatus, DurableMemoryType, MemoryConsolidateResult, MemoryContradictionResult,
+    MemoryDuplicateCandidate, MemoryInspectResult, MemoryMergeResult, MemoryPurgeResult,
+    MemoryQueryCursor, MemoryQueryItem, MemoryQueryOptions, MemoryQueryResult, MemoryScope,
+    MemorySplitPiece, MemorySplitResult, SessionState,
 };
 
 pub const MEMORY_SCHEMA_VERSION: u32 = 1;

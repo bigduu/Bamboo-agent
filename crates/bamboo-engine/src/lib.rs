@@ -3,6 +3,7 @@
 pub mod app_context;
 pub mod auto_dream;
 pub mod events;
+pub mod gardener;
 pub mod gold_auto_answer;
 pub mod mcp;
 pub mod message_hooks;
