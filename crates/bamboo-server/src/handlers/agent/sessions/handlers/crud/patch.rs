@@ -221,8 +221,10 @@ pub async fn patch_session(
             );
         }
 
-        let mut sessions = state.sessions.write().await;
-        sessions.insert(session_id.clone(), session);
+        state.sessions.insert(
+            session_id.clone(),
+            std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        );
     }
 
     // Advertise the new ETag (metadata_version) so clients can send it back as

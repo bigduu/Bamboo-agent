@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tokio::sync::RwLock;
 
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
@@ -25,14 +24,14 @@ use args::MemoryArgs;
 
 #[derive(Clone)]
 pub struct MemoryTool {
-    sessions: Arc<RwLock<std::collections::HashMap<String, Session>>>,
+    sessions: crate::SessionCache,
     storage: Arc<dyn Storage>,
     memory_store: MemoryStore,
 }
 
 impl MemoryTool {
     pub fn new(
-        sessions: Arc<RwLock<std::collections::HashMap<String, Session>>>,
+        sessions: crate::SessionCache,
         storage: Arc<dyn Storage>,
         data_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
@@ -46,8 +45,8 @@ impl MemoryTool {
     async fn session_for_context(&self, session_id: Option<&str>) -> Option<Session> {
         let session_id = session_id?;
         let in_memory = {
-            let sessions = self.sessions.read().await;
-            sessions.get(session_id).cloned()
+            let arc = self.sessions.get(session_id).map(|e| e.value().clone());
+            arc.map(|a| a.read().clone())
         };
         match in_memory {
             Some(session) => Some(session),

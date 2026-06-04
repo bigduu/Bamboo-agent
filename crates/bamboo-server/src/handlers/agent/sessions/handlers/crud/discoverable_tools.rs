@@ -84,10 +84,10 @@ pub async fn activate_discoverable_tools(
             actix_web::error::ErrorInternalServerError(format!("Failed to save session: {error}"))
         })?;
 
-    {
-        let mut sessions = state.sessions.write().await;
-        sessions.insert(session_id.clone(), session.clone());
-    }
+    state.sessions.insert(
+        session_id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+    );
 
     let activated = bamboo_tools::exposure::activated_discoverable_tools(&session);
     Ok(HttpResponse::Ok().json(serde_json::json!({
@@ -131,10 +131,10 @@ pub async fn deactivate_discoverable_tools(
             actix_web::error::ErrorInternalServerError(format!("Failed to save session: {error}"))
         })?;
 
-    {
-        let mut sessions = state.sessions.write().await;
-        sessions.insert(session_id.clone(), session.clone());
-    }
+    state.sessions.insert(
+        session_id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+    );
 
     let activated = bamboo_tools::exposure::activated_discoverable_tools(&session);
     Ok(HttpResponse::Ok().json(serde_json::json!({

@@ -88,10 +88,9 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Res
     };
 
     let removed_from_memory = {
-        let mut sessions = state.sessions.write().await;
         let mut removed = false;
         for id in ids_to_cancel.iter() {
-            removed |= sessions.remove(id).is_some();
+            removed |= state.sessions.remove(id).is_some();
         }
         removed
     };

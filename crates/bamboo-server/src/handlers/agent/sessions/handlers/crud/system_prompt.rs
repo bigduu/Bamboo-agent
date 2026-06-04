@@ -12,8 +12,8 @@ pub async fn get_system_prompt_snapshot(
     let session_id = path.into_inner();
 
     let session = {
-        let sessions = state.sessions.read().await;
-        sessions.get(&session_id).cloned()
+        let arc = state.sessions.get(&session_id).map(|e| e.value().clone());
+        arc.map(|a| a.read().clone())
     };
 
     let session = match session {

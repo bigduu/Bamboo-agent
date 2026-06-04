@@ -14,7 +14,6 @@ use tokio::sync::{broadcast, RwLock};
 
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::Session;
 use bamboo_engine::McpServerManager;
 use bamboo_engine::SkillManager;
 use bamboo_infrastructure::Config;
@@ -32,7 +31,7 @@ pub(super) fn build_base_tools(
     skill_manager: Arc<SkillManager>,
     storage: Arc<dyn Storage>,
     persistence: Arc<LockedSessionStore>,
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    sessions: bamboo_engine::SessionCache,
     app_data_dir: PathBuf,
 ) -> Arc<dyn ToolExecutor> {
     // Initialize built-in tools with permission checks.
@@ -106,7 +105,7 @@ pub(super) fn build_root_tools(
     storage: Arc<dyn Storage>,
     persistence: Arc<LockedSessionStore>,
     spawn_scheduler: Arc<SpawnScheduler>,
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    sessions: bamboo_engine::SessionCache,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_event_senders: Arc<
         RwLock<HashMap<String, broadcast::Sender<bamboo_agent_core::AgentEvent>>>,

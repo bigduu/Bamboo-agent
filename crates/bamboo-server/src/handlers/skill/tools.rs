@@ -65,8 +65,8 @@ async fn selected_skill_ids_for_session(
     let session_id = session_id?;
 
     let in_memory = {
-        let sessions = state.sessions.read().await;
-        sessions.get(session_id).cloned()
+        let arc = state.sessions.get(session_id).map(|e| e.value().clone());
+        arc.map(|a| a.read().clone())
     };
 
     let session = match in_memory {
@@ -87,8 +87,8 @@ async fn selected_skill_mode_for_session(
     let session_id = session_id?;
 
     let in_memory = {
-        let sessions = state.sessions.read().await;
-        sessions.get(session_id).cloned()
+        let arc = state.sessions.get(session_id).map(|e| e.value().clone());
+        arc.map(|a| a.read().clone())
     };
 
     let session = match in_memory {

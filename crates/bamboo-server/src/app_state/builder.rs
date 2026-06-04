@@ -124,8 +124,7 @@ impl AppState {
         let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
 
         // In-memory session cache (shared across handlers and background jobs).
-        let sessions: Arc<RwLock<HashMap<String, bamboo_agent_core::Session>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
 
         let config = Arc::new(RwLock::new(config));
 

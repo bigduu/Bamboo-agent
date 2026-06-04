@@ -185,10 +185,10 @@ pub async fn handler(
                     error
                 ));
             }
-            {
-                let mut sessions = state.sessions.write().await;
-                sessions.insert(session_id.clone(), session.clone());
-            }
+            state.sessions.insert(
+                session_id.clone(),
+                std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+            );
 
             // Kick off async auto-title generation for fresh, untitled sessions.
             if crate::title_gen::is_untitled(&session.title)

@@ -43,7 +43,7 @@ async fn test_app_state_creation() {
         .expect("app state should initialize");
 
     // Verify basic fields
-    assert!(state.sessions.read().await.is_empty());
+    assert!(state.sessions.is_empty());
 }
 
 #[tokio::test]

@@ -47,10 +47,10 @@ pub async fn create_session(
             actix_web::error::ErrorInternalServerError(format!("Failed to save session: {error}"))
         })?;
 
-    {
-        let mut sessions = state.sessions.write().await;
-        sessions.insert(id.clone(), session.clone());
-    }
+    state.sessions.insert(
+        id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+    );
 
     // Publish onto the account change feed so other clients insert the new
     // session into their list without polling `GET /sessions`.

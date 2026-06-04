@@ -122,10 +122,10 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
             .persistence()
             .save_runtime_session(&mut session)
             .await;
-        {
-            let mut sessions = ctx.sessions_cache.write().await;
-            sessions.insert(job.child_session_id.clone(), session);
-        }
+        ctx.sessions_cache.insert(
+            job.child_session_id.clone(),
+            Arc::new(parking_lot::RwLock::new(session)),
+        );
         publish_child_completion_parts(
             &parent_tx,
             ctx.completion_handler.clone(),
@@ -347,10 +347,10 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
             session.clear_last_run_error();
         }
         let _ = agent.persistence().save_runtime_session(&mut session).await;
-        {
-            let mut sessions = sessions_cache.write().await;
-            sessions.insert(session_id_clone.clone(), session);
-        }
+        sessions_cache.insert(
+            session_id_clone.clone(),
+            Arc::new(parking_lot::RwLock::new(session)),
+        );
 
         // Stop forwarding/heartbeats and emit terminal child status through the
         // same durable completion path used by success/error/cancel/timeout.

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,7 +12,6 @@ use bamboo_infrastructure::Config;
 
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
-use bamboo_agent_core::Session;
 use bamboo_infrastructure::LockedSessionStore;
 
 use super::{skill_access_error_to_tool_error, SkillToolAccess};
@@ -31,7 +29,7 @@ impl LoadSkillTool {
     pub fn new(
         skill_manager: Arc<SkillManager>,
         config: Arc<RwLock<Config>>,
-        sessions: Arc<RwLock<HashMap<String, Session>>>,
+        sessions: crate::SessionCache,
         storage: Arc<dyn Storage>,
         persistence: Arc<LockedSessionStore>,
     ) -> Self {

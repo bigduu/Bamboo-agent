@@ -52,8 +52,8 @@ async fn load_session_from_state_or_storage(
     session_id: &str,
 ) -> Result<Option<Session>> {
     let in_memory = {
-        let sessions = state.sessions.read().await;
-        sessions.get(session_id).cloned()
+        let arc = state.sessions.get(session_id).map(|e| e.value().clone());
+        arc.map(|a| a.read().clone())
     };
     if in_memory.is_some() {
         return Ok(in_memory);
@@ -183,11 +183,8 @@ pub async fn cleanup_sessions(
                 }
             }
         }
-        {
-            let mut sessions = state.sessions.write().await;
-            for session_id in &result.deleted_session_ids {
-                sessions.remove(session_id);
-            }
+        for session_id in &result.deleted_session_ids {
+            state.sessions.remove(session_id);
         }
         {
             let mut senders = state.session_event_senders.write().await;

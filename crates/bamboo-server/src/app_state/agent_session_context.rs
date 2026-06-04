@@ -23,7 +23,7 @@ use super::AppState;
 
 #[async_trait]
 impl AgentSessionContext for AppState {
-    fn sessions(&self) -> &Arc<RwLock<HashMap<String, Session>>> {
+    fn sessions(&self) -> &bamboo_engine::SessionCache {
         &self.sessions
     }
 

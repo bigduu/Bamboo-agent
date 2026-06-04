@@ -24,6 +24,17 @@ use crate::runtime::model_roster::ModelRoster;
 use crate::runtime::Agent;
 use crate::runtime::{ExecuteRequest, ExecuteRequestBuilder};
 
+/// Shared, per-session-locked session cache.
+///
+/// A `DashMap` gives each session id its own shard-level lock (so unrelated
+/// sessions never contend), and the inner `parking_lot::RwLock` is a *sync*
+/// lock held only to briefly clone-out or mutate-and-write-back a single
+/// `Session` — never across an `.await`. Using a sync lock makes "no guard
+/// across await" a compile-time guarantee in Send futures.
+pub type SessionCache = std::sync::Arc<
+    dashmap::DashMap<String, std::sync::Arc<parking_lot::RwLock<bamboo_agent_core::Session>>>,
+>;
+
 const SKILL_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_SKILL_CONTEXT_START -->";
 const TOOL_GUIDE_START_MARKER: &str = "<!-- BAMBOO_TOOL_GUIDE_START -->";
 const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
@@ -112,7 +123,7 @@ pub struct SessionExecutionArgs {
 
     // Post-execution resources.
     pub runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
-    pub sessions_cache: Arc<RwLock<HashMap<String, Session>>>,
+    pub sessions_cache: SessionCache,
 
     /// Optional bespoke finalization, run after the runner is finalized and
     /// before the session is persisted. See [`SessionCompletionHook`].
@@ -330,10 +341,10 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             }
 
             // Update memory cache.
-            {
-                let mut sessions = sessions_cache.write().await;
-                sessions.insert(session_id.clone(), session);
-            }
+            sessions_cache.insert(
+                session_id.clone(),
+                Arc::new(parking_lot::RwLock::new(session)),
+            );
 
             tracing::info!("[{}] Agent execution completed", session_id);
         }

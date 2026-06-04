@@ -15,10 +15,7 @@ pub async fn reset(state: web::Data<AppState>) -> Result<HttpResponse> {
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Reset failed: {e}")))?;
 
     // Clear in-memory cache too.
-    {
-        let mut sessions = state.sessions.write().await;
-        sessions.clear();
-    }
+    state.sessions.clear();
     {
         let mut runners = state.agent_runners.write().await;
         for (_, runner) in runners.drain() {

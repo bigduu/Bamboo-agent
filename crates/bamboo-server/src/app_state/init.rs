@@ -13,7 +13,7 @@ use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
 
 use bamboo_agent_core::storage::Storage;
-use bamboo_agent_core::{AgentEvent, Session};
+use bamboo_agent_core::AgentEvent;
 use bamboo_engine::Agent;
 use bamboo_engine::McpServerManager;
 use bamboo_engine::{SkillManager, SkillStoreConfig};
@@ -242,7 +242,7 @@ pub async fn init_schedule_store(data_dir: &PathBuf) -> Result<Arc<ScheduleStore
 pub fn build_spawn_scheduler(
     agent: Arc<Agent>,
     child_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    sessions: bamboo_engine::SessionCache,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     external_child_runner: Option<Arc<dyn bamboo_engine::runtime::execution::ExternalChildRunner>>,
@@ -271,7 +271,7 @@ pub fn build_schedule_manager(
     schedule_store: Arc<ScheduleStore>,
     agent: Arc<Agent>,
     tools_for_schedules: Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    sessions: bamboo_engine::SessionCache,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     persistence: Arc<LockedSessionStore>,

@@ -29,7 +29,7 @@ pub(super) const MAX_RESOURCE_CONTENT_CHARS: usize = 50_000;
 pub(super) struct SkillToolAccess {
     pub(super) skill_manager: Arc<SkillManager>,
     config: Arc<RwLock<Config>>,
-    pub(super) sessions: Arc<RwLock<HashMap<String, Session>>>,
+    pub(super) sessions: crate::SessionCache,
     storage: Arc<dyn Storage>,
     pub(super) persistence: Arc<LockedSessionStore>,
 }
@@ -38,7 +38,7 @@ impl SkillToolAccess {
     pub(super) fn new(
         skill_manager: Arc<SkillManager>,
         config: Arc<RwLock<Config>>,
-        sessions: Arc<RwLock<HashMap<String, Session>>>,
+        sessions: crate::SessionCache,
         storage: Arc<dyn Storage>,
         persistence: Arc<LockedSessionStore>,
     ) -> Self {
@@ -55,8 +55,8 @@ impl SkillToolAccess {
         let session_id = session_id?;
 
         let in_memory = {
-            let sessions = self.sessions.read().await;
-            sessions.get(session_id).cloned()
+            let arc = self.sessions.get(session_id).map(|e| e.value().clone());
+            arc.map(|a| a.read().clone())
         };
 
         match in_memory {
@@ -92,8 +92,8 @@ impl SkillSessionPort for SkillToolAccess {
         updates: &[(String, Option<String>)],
     ) -> Result<(), String> {
         let mut session = {
-            let sessions = self.sessions.read().await;
-            sessions.get(session_id).cloned()
+            let arc = self.sessions.get(session_id).map(|e| e.value().clone());
+            arc.map(|a| a.read().clone())
         };
 
         if session.is_none() {
@@ -119,8 +119,10 @@ impl SkillSessionPort for SkillToolAccess {
             .await
             .map_err(|e| e.to_string())?;
 
-        let mut sessions = self.sessions.write().await;
-        sessions.insert(session_id.to_string(), session);
+        self.sessions.insert(
+            session_id.to_string(),
+            Arc::new(parking_lot::RwLock::new(session)),
+        );
 
         Ok(())
     }

@@ -48,7 +48,6 @@
 //!   `general-purpose` (Inherit) fallback this still forwards unchanged, but a
 //!   restrictively-configured fallback profile would apply to unknown types.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -57,21 +56,28 @@ use bamboo_agent_core::tools::{
 };
 use bamboo_agent_core::Session;
 use bamboo_domain::subagent::{SubagentProfileRegistry, ToolPolicy};
-use tokio::sync::RwLock;
+
+/// Shared, per-session-locked session cache.
+///
+/// Concretely identical to `bamboo_engine::SessionCache`; defined here (rather
+/// than imported) because `bamboo-tools` sits *below* `bamboo-engine` in the
+/// dependency graph. Both are transparent aliases of the same type, so values
+/// flow between them without conversion.
+pub type SessionCache = Arc<dashmap::DashMap<String, Arc<parking_lot::RwLock<Session>>>>;
 
 /// Tool executor that enforces a subagent profile's [`ToolPolicy`] when
 /// executing tool calls from a child session.
 pub struct PolicyAwareToolExecutor {
     inner: Arc<dyn ToolExecutor>,
     profiles: Arc<SubagentProfileRegistry>,
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    sessions: SessionCache,
 }
 
 impl PolicyAwareToolExecutor {
     pub fn new(
         inner: Arc<dyn ToolExecutor>,
         profiles: Arc<SubagentProfileRegistry>,
-        sessions: Arc<RwLock<HashMap<String, Session>>>,
+        sessions: SessionCache,
     ) -> Self {
         Self {
             inner,
@@ -84,8 +90,8 @@ impl PolicyAwareToolExecutor {
     /// in-memory cache. Returns `None` when the session is not cached or
     /// the metadata key is missing / blank.
     async fn subagent_type_for_session(&self, session_id: &str) -> Option<String> {
-        let sessions = self.sessions.read().await;
-        let value = sessions.get(session_id)?.subagent_type()?;
+        let arc = self.sessions.get(session_id).map(|e| e.value().clone())?;
+        let value = arc.read().subagent_type()?;
         let trimmed = value.trim();
         if trimmed.is_empty() {
             None
@@ -190,6 +196,7 @@ mod tests {
     use super::*;
     use bamboo_agent_core::tools::{FunctionCall, ToolMutability};
     use bamboo_domain::subagent::SubagentProfile;
+    use tokio::sync::RwLock;
 
     /// Tiny stand-in executor that records every name it was asked to
     /// execute and always succeeds with a fixed payload. We use it to
@@ -267,19 +274,19 @@ mod tests {
         }
     }
 
-    async fn sessions_with(
-        session_id: &str,
-        subagent_type: Option<&str>,
-    ) -> Arc<RwLock<HashMap<String, Session>>> {
-        let mut map = HashMap::new();
+    async fn sessions_with(session_id: &str, subagent_type: Option<&str>) -> SessionCache {
+        let map = dashmap::DashMap::new();
         let mut session = Session::new_child(session_id, "root", "test-model", "Child");
         if let Some(t) = subagent_type {
             session
                 .metadata
                 .insert("subagent_type".to_string(), t.to_string());
         }
-        map.insert(session_id.to_string(), session);
-        Arc::new(RwLock::new(map))
+        map.insert(
+            session_id.to_string(),
+            Arc::new(parking_lot::RwLock::new(session)),
+        );
+        Arc::new(map)
     }
 
     #[tokio::test]

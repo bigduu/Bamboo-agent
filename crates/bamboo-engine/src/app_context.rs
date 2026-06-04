@@ -38,7 +38,7 @@ use crate::runtime::execution::runner_state::AgentRunner;
 #[async_trait]
 pub trait AgentSessionContext: Send + Sync {
     /// In-memory session cache.
-    fn sessions(&self) -> &Arc<RwLock<HashMap<String, Session>>>;
+    fn sessions(&self) -> &crate::SessionCache;
 
     /// Persistent session storage backend.
     fn storage(&self) -> &Arc<dyn Storage>;

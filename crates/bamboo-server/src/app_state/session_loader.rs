@@ -68,8 +68,8 @@ impl AppState {
     /// Returns `None` if the session does not exist in either tier.
     pub async fn load_session(&self, session_id: &str) -> Option<bamboo_agent_core::Session> {
         let memory_session = {
-            let sessions = self.sessions.read().await;
-            sessions.get(session_id).cloned()
+            let arc = self.sessions.get(session_id).map(|e| e.value().clone());
+            arc.map(|a| a.read().clone())
         };
 
         if let Some(session) = memory_session {
@@ -78,8 +78,10 @@ impl AppState {
 
         match self.storage.load_session(session_id).await {
             Ok(Some(session)) => {
-                let mut sessions = self.sessions.write().await;
-                sessions.insert(session_id.to_string(), session.clone());
+                self.sessions.insert(
+                    session_id.to_string(),
+                    Arc::new(parking_lot::RwLock::new(session.clone())),
+                );
                 Some(session)
             }
             _ => None,
@@ -110,8 +112,8 @@ impl AppState {
         session_id: &str,
     ) -> Option<bamboo_agent_core::Session> {
         let memory_session = {
-            let sessions = self.sessions.read().await;
-            sessions.get(session_id).cloned()
+            let arc = self.sessions.get(session_id).map(|e| e.value().clone());
+            arc.map(|a| a.read().clone())
         };
 
         let storage_session = self
@@ -153,14 +155,18 @@ impl AppState {
                     merged_log!(trace);
                 }
                 let chosen = if prefer_storage { storage } else { memory };
-                let mut sessions = self.sessions.write().await;
-                sessions.insert(session_id.to_string(), chosen.clone());
+                self.sessions.insert(
+                    session_id.to_string(),
+                    Arc::new(parking_lot::RwLock::new(chosen.clone())),
+                );
                 Some(chosen)
             }
             (Some(memory), None) => Some(memory),
             (None, Some(storage)) => {
-                let mut sessions = self.sessions.write().await;
-                sessions.insert(session_id.to_string(), storage.clone());
+                self.sessions.insert(
+                    session_id.to_string(),
+                    Arc::new(parking_lot::RwLock::new(storage.clone())),
+                );
                 Some(storage)
             }
             (None, None) => None,
@@ -176,8 +182,10 @@ impl AppState {
         if let Err(error) = self.persistence.merge_save_runtime(session).await {
             tracing::warn!("[{}] Failed to save session: {}", session.id, error);
         }
-        let mut sessions = self.sessions.write().await;
-        sessions.insert(session.id.clone(), session.clone());
+        self.sessions.insert(
+            session.id.clone(),
+            Arc::new(parking_lot::RwLock::new(session.clone())),
+        );
     }
 }
 
@@ -206,10 +214,10 @@ mod tests {
         let session = bamboo_agent_core::Session::new(session_id.to_string(), "test-model");
 
         // Seed memory cache.
-        {
-            let mut sessions = state.sessions.write().await;
-            sessions.insert(session_id.to_string(), session.clone());
-        }
+        state.sessions.insert(
+            session_id.to_string(),
+            Arc::new(parking_lot::RwLock::new(session.clone())),
+        );
 
         let loaded = state.load_session(session_id).await;
         assert!(loaded.is_some());
@@ -279,10 +287,10 @@ mod tests {
             true,
         );
 
-        {
-            let mut sessions = state.sessions.write().await;
-            sessions.insert(session_id.to_string(), memory_session);
-        }
+        state.sessions.insert(
+            session_id.to_string(),
+            Arc::new(parking_lot::RwLock::new(memory_session)),
+        );
         state
             .storage
             .save_session(&storage_session)
@@ -309,8 +317,8 @@ mod tests {
 
         // Verify memory cache.
         let cached = {
-            let sessions = state.sessions.read().await;
-            sessions.get(session_id).cloned()
+            let arc = state.sessions.get(session_id).map(|e| e.value().clone());
+            arc.map(|a| a.read().clone())
         };
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().title, "test-title");

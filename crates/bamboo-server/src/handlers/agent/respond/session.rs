@@ -28,10 +28,10 @@ mod tests {
             true,
         );
 
-        {
-            let mut sessions = state.sessions.write().await;
-            sessions.insert(session_id.to_string(), memory_session);
-        }
+        state.sessions.insert(
+            session_id.to_string(),
+            std::sync::Arc::new(parking_lot::RwLock::new(memory_session)),
+        );
         state
             .storage
             .save_session(&storage_session)
@@ -52,13 +52,12 @@ mod tests {
             Some("tool-call-1")
         );
 
-        let cached = {
-            let sessions = state.sessions.read().await;
-            sessions
-                .get(session_id)
-                .cloned()
-                .expect("cache should be warmed")
-        };
+        let cached = state
+            .sessions
+            .get(session_id)
+            .map(|e| e.value().clone())
+            .map(|arc| arc.read().clone())
+            .expect("cache should be warmed");
         assert!(cached.pending_question.is_some());
     }
 }

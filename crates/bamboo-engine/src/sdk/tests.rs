@@ -149,7 +149,7 @@ async fn build_harness(
     let metrics_storage = Arc::new(crate::SqliteMetricsStorage::new(home.join("metrics.db")));
     let metrics_collector = MetricsCollector::spawn(metrics_storage, 7);
 
-    let sessions_cache = Arc::new(RwLock::new(HashMap::new()));
+    let sessions_cache: crate::SessionCache = Arc::new(dashmap::DashMap::new());
     let agent_runners = Arc::new(RwLock::new(HashMap::new()));
     let session_event_senders = Arc::new(RwLock::new(HashMap::<
         String,

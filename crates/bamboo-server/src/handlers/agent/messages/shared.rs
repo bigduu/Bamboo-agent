@@ -48,7 +48,9 @@ pub(super) async fn save_and_cache_session(
         .await
         .map_err(|e| ErrorInternalServerError(format!("Failed to save session: {e}")))?;
 
-    let mut sessions = state.sessions.write().await;
-    sessions.insert(session_id.to_string(), session);
+    state.sessions.insert(
+        session_id.to_string(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+    );
     Ok(())
 }

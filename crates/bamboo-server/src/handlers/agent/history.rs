@@ -76,8 +76,8 @@ pub async fn handler(
             Ok(Some(s)) => Some(s),
             Ok(None) => {
                 // Fallback to memory (shouldn't happen but be defensive).
-                let sessions = state.sessions.read().await;
-                sessions.get(&session_id).cloned()
+                let arc = state.sessions.get(&session_id).map(|e| e.value().clone());
+                arc.map(|a| a.read().clone())
             }
             Err(e) => {
                 tracing::warn!(
@@ -85,14 +85,14 @@ pub async fn handler(
                     session_id,
                     e
                 );
-                let sessions = state.sessions.read().await;
-                sessions.get(&session_id).cloned()
+                let arc = state.sessions.get(&session_id).map(|e| e.value().clone());
+                arc.map(|a| a.read().clone())
             }
         }
     } else {
         // No active runner – memory cache is authoritative.
-        let sessions = state.sessions.read().await;
-        sessions.get(&session_id).cloned()
+        let arc = state.sessions.get(&session_id).map(|e| e.value().clone());
+        arc.map(|a| a.read().clone())
     };
 
     if session.is_none() {

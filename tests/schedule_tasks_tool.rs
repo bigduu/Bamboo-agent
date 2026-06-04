@@ -176,7 +176,7 @@ fn build_manager(
             store.clone(),
         )),
         tools: Arc::new(NoopTools),
-        sessions_cache: Arc::new(RwLock::new(HashMap::new())),
+        sessions_cache: Arc::new(dashmap::DashMap::new()),
         agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
         session_event_senders: Arc::new(RwLock::new(HashMap::<
             String,

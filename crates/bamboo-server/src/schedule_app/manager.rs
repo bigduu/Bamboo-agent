@@ -6,7 +6,7 @@ use chrono::Utc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{AgentEvent, Message, Role, Session};
+use bamboo_agent_core::{AgentEvent, Message, Role};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::{
@@ -55,7 +55,7 @@ pub struct ScheduleContext {
     pub agent: Arc<bamboo_engine::Agent>,
     pub persistence: Arc<LockedSessionStore>,
     pub tools: Arc<dyn ToolExecutor>,
-    pub sessions_cache: Arc<RwLock<HashMap<String, Session>>>,
+    pub sessions_cache: bamboo_engine::SessionCache,
     pub agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     /// Optional inbox to the account-wide change feed (durable multi-client sync).
@@ -260,10 +260,10 @@ async fn run_schedule_job(
             error
         );
     }
-    {
-        let mut sessions = ctx.sessions_cache.write().await;
-        sessions.insert(session_id.clone(), session.clone());
-    }
+    ctx.sessions_cache.insert(
+        session_id.clone(),
+        Arc::new(parking_lot::RwLock::new(session.clone())),
+    );
 
     // If no task message (or not configured to execute), we're done.
     let should_execute = job.run_config.auto_execute

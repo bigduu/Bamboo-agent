@@ -179,7 +179,7 @@ pub struct AppState {
     ///
     /// Maps session IDs to Session objects. Persisted to storage
     /// via the `storage` field.
-    pub sessions: Arc<RwLock<HashMap<String, bamboo_agent_core::Session>>>,
+    pub sessions: bamboo_engine::SessionCache,
 
     /// Persistent storage backend for sessions (V2).
     ///

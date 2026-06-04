@@ -295,6 +295,8 @@ async fn refresh_in_memory_cache(
     session_id: &str,
     session: Session,
 ) {
-    let mut cache = state.sessions().write().await;
-    cache.insert(session_id.to_string(), session);
+    state.sessions().insert(
+        session_id.to_string(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+    );
 }

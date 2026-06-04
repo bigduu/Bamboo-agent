@@ -34,7 +34,7 @@ pub struct ChildSessionAdapter {
     pub(crate) storage: Arc<dyn Storage>,
     pub(crate) persistence: Arc<LockedSessionStore>,
     pub(crate) scheduler: Arc<SpawnScheduler>,
-    pub(crate) sessions_cache: Arc<RwLock<HashMap<String, Session>>>,
+    pub(crate) sessions_cache: bamboo_engine::SessionCache,
     pub(crate) agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub(crate) session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     /// Optional subagent model resolver: maps subagent_type → provider+model ref.
@@ -184,10 +184,10 @@ impl ChildSessionAdapter {
             .map_err(|error| {
                 ChildSessionError::Execution(format!("failed to save parent wait state: {error}"))
             })?;
-        self.sessions_cache
-            .write()
-            .await
-            .insert(parent.id.clone(), parent);
+        self.sessions_cache.insert(
+            parent.id.clone(),
+            Arc::new(parking_lot::RwLock::new(parent)),
+        );
 
         Ok(())
     }
@@ -272,8 +272,10 @@ impl ChildSessionPort for ChildSessionAdapter {
                 ChildSessionError::Execution(format!("failed to save child session: {error}"))
             })?;
 
-        let mut sessions = self.sessions_cache.write().await;
-        sessions.insert(child.id.clone(), child.clone());
+        self.sessions_cache.insert(
+            child.id.clone(),
+            Arc::new(parking_lot::RwLock::new(child.clone())),
+        );
 
         Ok(())
     }
@@ -425,10 +427,7 @@ impl ChildSessionPort for ChildSessionAdapter {
                 ChildSessionError::Execution(format!("failed to delete child session: {error}"))
             })?;
 
-        {
-            let mut sessions = self.sessions_cache.write().await;
-            sessions.remove(child_id);
-        }
+        self.sessions_cache.remove(child_id);
         {
             let mut senders = self.session_event_senders.write().await;
             senders.remove(child_id);

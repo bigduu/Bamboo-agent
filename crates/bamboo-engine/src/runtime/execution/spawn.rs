@@ -55,7 +55,7 @@ pub trait ExternalChildRunner: Send + Sync {
 pub struct SpawnContext {
     pub agent: Arc<Agent>,
     pub tools: Arc<dyn ToolExecutor>,
-    pub sessions_cache: Arc<RwLock<HashMap<String, Session>>>,
+    pub sessions_cache: crate::SessionCache,
     pub agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     pub external_child_runner: Option<Arc<dyn ExternalChildRunner>>,

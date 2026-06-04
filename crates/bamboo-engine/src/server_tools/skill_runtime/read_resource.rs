@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -17,7 +16,6 @@ use bamboo_infrastructure::Config;
 
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
-use bamboo_agent_core::Session;
 use bamboo_infrastructure::LockedSessionStore;
 
 use super::{skill_access_error_to_tool_error, SkillToolAccess, MAX_RESOURCE_CONTENT_CHARS};
@@ -40,7 +38,7 @@ impl ReadSkillResourceTool {
     pub fn new(
         skill_manager: Arc<SkillManager>,
         config: Arc<RwLock<Config>>,
-        sessions: Arc<RwLock<HashMap<String, Session>>>,
+        sessions: crate::SessionCache,
         storage: Arc<dyn Storage>,
         persistence: Arc<LockedSessionStore>,
     ) -> Self {
@@ -192,8 +190,10 @@ impl Tool for ReadSkillResourceTool {
                             .persistence
                             .merge_save_runtime(&mut session)
                             .await;
-                        let mut sessions = self.access.sessions.write().await;
-                        sessions.insert(session_id.to_string(), session);
+                        self.access.sessions.insert(
+                            session_id.to_string(),
+                            std::sync::Arc::new(parking_lot::RwLock::new(session)),
+                        );
                     }
                 }
                 json!({

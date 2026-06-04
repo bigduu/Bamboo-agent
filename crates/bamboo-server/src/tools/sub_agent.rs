@@ -639,7 +639,7 @@ mod tests {
         let metrics_storage = Arc::new(SqliteMetricsStorage::new(bamboo_home.join("metrics.db")));
         let metrics_collector = MetricsCollector::spawn(metrics_storage, 7);
 
-        let sessions_cache = Arc::new(RwLock::new(HashMap::new()));
+        let sessions_cache: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
         let agent_runners = Arc::new(RwLock::new(HashMap::new()));
         let session_event_senders = Arc::new(RwLock::new(HashMap::<
             String,
@@ -1807,9 +1807,11 @@ mod tests {
         child
             .metadata
             .insert("subagent_type".to_string(), "researcher".to_string());
-        let mut sessions = HashMap::new();
-        sessions.insert("researcher-child".to_string(), child);
-        let sessions = Arc::new(RwLock::new(sessions));
+        let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
+        sessions.insert(
+            "researcher-child".to_string(),
+            Arc::new(parking_lot::RwLock::new(child)),
+        );
 
         let executor = crate::tools::PolicyAwareToolExecutor::new(inner, registry, sessions);
 

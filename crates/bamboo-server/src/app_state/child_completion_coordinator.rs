@@ -184,7 +184,7 @@ fn runtime_resume_message(
 pub struct ChildCompletionCoordinator {
     storage: Arc<dyn Storage>,
     persistence: Arc<bamboo_infrastructure::LockedSessionStore>,
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    sessions: bamboo_engine::SessionCache,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     agent: Arc<Agent>,
@@ -201,7 +201,7 @@ impl ChildCompletionCoordinator {
     pub fn new(
         storage: Arc<dyn Storage>,
         persistence: Arc<LockedSessionStore>,
-        sessions: Arc<RwLock<HashMap<String, Session>>>,
+        sessions: bamboo_engine::SessionCache,
         agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
         session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
         agent: Arc<Agent>,
@@ -310,10 +310,10 @@ impl ChildCompletionCoordinator {
         if let Err(error) = self.persistence.merge_save_runtime(session).await {
             tracing::warn!(session_id = %session.id, %error, "failed to persist session");
         }
-        self.sessions
-            .write()
-            .await
-            .insert(session.id.clone(), session.clone());
+        self.sessions.insert(
+            session.id.clone(),
+            Arc::new(parking_lot::RwLock::new(session.clone())),
+        );
     }
 }
 
@@ -440,10 +440,17 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
     async fn load_session(&self, session_id: &str) -> Option<Session> {
         match self.storage.load_session(session_id).await {
             Ok(Some(session)) => Some(session),
-            Ok(None) => self.sessions.read().await.get(session_id).cloned(),
+            Ok(None) => self
+                .sessions
+                .get(session_id)
+                .map(|e| e.value().clone())
+                .map(|arc| arc.read().clone()),
             Err(error) => {
                 tracing::warn!(%session_id, %error, "failed to load session from storage");
-                self.sessions.read().await.get(session_id).cloned()
+                self.sessions
+                    .get(session_id)
+                    .map(|e| e.value().clone())
+                    .map(|arc| arc.read().clone())
             }
         }
     }

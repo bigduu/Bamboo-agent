@@ -36,6 +36,16 @@ fn serialize_loaded_skill_ids_is_stable_and_sorted() {
     assert_eq!(serialize_loaded_skill_ids(&ids), r#"["skill-a","skill-b"]"#);
 }
 
+/// Build a per-session-locked session cache pre-populated with one session.
+fn test_session_cache(session_id: &str, session: &Session) -> crate::SessionCache {
+    let cache = Arc::new(dashmap::DashMap::new());
+    cache.insert(
+        session_id.to_string(),
+        Arc::new(parking_lot::RwLock::new(session.clone())),
+    );
+    cache
+}
+
 #[derive(Default)]
 struct TestStorage {
     sessions: RwLock<HashMap<String, Session>>,
@@ -94,10 +104,7 @@ Use this demo skill."#,
 
     let session_id = "session-1";
     let session = Session::new(session_id, "model");
-    let sessions = Arc::new(RwLock::new(HashMap::from([(
-        session_id.to_string(),
-        session.clone(),
-    )])));
+    let sessions = test_session_cache(session_id, &session);
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     storage
         .save_session(&session)
@@ -154,10 +161,7 @@ Use this demo skill."#,
     let config = Arc::new(RwLock::new(Config::default()));
     let session_id = "session-2";
     let session = Session::new(session_id, "model");
-    let sessions = Arc::new(RwLock::new(HashMap::from([(
-        session_id.to_string(),
-        session.clone(),
-    )])));
+    let sessions = test_session_cache(session_id, &session);
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     storage
         .save_session(&session)
@@ -229,10 +233,7 @@ Use this demo skill."#,
     let config = Arc::new(RwLock::new(Config::default()));
     let session_id = "session-3";
     let session = Session::new(session_id, "model");
-    let sessions = Arc::new(RwLock::new(HashMap::from([(
-        session_id.to_string(),
-        session.clone(),
-    )])));
+    let sessions = test_session_cache(session_id, &session);
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     storage
         .save_session(&session)
