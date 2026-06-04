@@ -13,11 +13,23 @@ use bamboo_domain::subagent::{disabled_tools_for_profile, ToolPolicy};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// S-T4.1: the concise facade builder accepts `model` + `instruction` + a tool
-/// policy, and an allowlist policy maps to `disabled_tools` that exclude the
-/// non-listed tools (Edit/Write) while keeping the listed ones (Read).
+/// S-T4.1: the concise facade builder lets the caller freely choose which tools
+/// to activate via `.tools([..])`, and that allowlist maps to `disabled_tools`
+/// that exclude the non-listed tools (Edit/Write) while keeping the listed ones
+/// (Read).
 #[test]
-fn s_t4_1_facade_builder_and_tool_policy_mapping() {
+fn s_t4_1_facade_builder_and_tool_selection() {
+    // The builder accepts a free tool selection in the fluent chain.
+    let _builder: AgentBuilder = Agent::builder()
+        .model("test-model")
+        .instruction("You are a careful research assistant.")
+        .tools(["Read", "Grep", "WebSearch"]);
+
+    // `.tool(..)` appends a single tool to the active selection.
+    let _builder2: AgentBuilder = Agent::builder().tools(["Read"]).tool("WebSearch");
+
+    // Selecting an allowlist translates into disabled_tools over the canonical
+    // tool surface: Read stays enabled; Edit/Write are disabled.
     let policy = ToolPolicy::Allowlist {
         allow: vec![
             "Read".to_string(),
@@ -25,15 +37,6 @@ fn s_t4_1_facade_builder_and_tool_policy_mapping() {
             "WebSearch".to_string(),
         ],
     };
-
-    // The builder accepts the fluent chain without panicking.
-    let _builder: AgentBuilder = Agent::builder()
-        .model("test-model")
-        .instruction("You are a careful research assistant.")
-        .tools(policy.clone());
-
-    // The allowlist translates into disabled_tools over the canonical tool
-    // surface: Read stays enabled; Edit/Write are disabled.
     let disabled = disabled_tools_for_profile(&policy, &builtin_tool_names());
     assert!(disabled.iter().any(|t| t == "Edit"));
     assert!(disabled.iter().any(|t| t == "Write"));

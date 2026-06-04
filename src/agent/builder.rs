@@ -84,8 +84,40 @@ impl AgentBuilder {
         self
     }
 
-    /// Set the tool policy (which tools this agent may use).
-    pub fn tools(mut self, policy: ToolPolicy) -> Self {
+    /// Activate exactly the given tools — the agent may use only these (an
+    /// allowlist). Accepts tool names, e.g. `.tools(["WebSearch", "Read"])`.
+    ///
+    /// Use [`builtin_tool_names`](super::builtin_tool_names) to discover the
+    /// built-in names; MCP / dynamic tool names may be listed here too. Calling
+    /// this replaces any previously configured tool selection.
+    pub fn tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let allow = tools.into_iter().map(Into::into).collect();
+        self.tool_policy = Some(ToolPolicy::Allowlist { allow });
+        self
+    }
+
+    /// Activate a single additional tool, appending to the allowlist (starting
+    /// one if no selection has been made yet).
+    pub fn tool(mut self, name: impl Into<String>) -> Self {
+        let name = name.into();
+        match self
+            .tool_policy
+            .get_or_insert_with(|| ToolPolicy::Allowlist { allow: Vec::new() })
+        {
+            ToolPolicy::Allowlist { allow } => allow.push(name),
+            other => *other = ToolPolicy::Allowlist { allow: vec![name] },
+        }
+        self
+    }
+
+    /// Set an explicit [`ToolPolicy`] (advanced): `Inherit` (all default tools),
+    /// `Allowlist` (only the listed tools), or `Denylist` (all default tools
+    /// except the listed ones). Most callers want [`tools`](Self::tools).
+    pub fn tool_policy(mut self, policy: ToolPolicy) -> Self {
         self.tool_policy = Some(policy);
         self
     }
