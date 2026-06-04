@@ -35,9 +35,7 @@ pub(super) async fn finalize_task_context(
         .as_ref()
         .map(|task_list| task_list.title.clone())
         .unwrap_or_else(|| "Agent Tasks".to_string());
-    session
-        .metadata
-        .insert("task_list_version".to_string(), version.to_string());
+    session.set_task_list_version_meta(version.to_string());
     session.task_list = Some(ctx.into_task_list_with_title(task_list_title));
     session.updated_at = Utc::now();
 

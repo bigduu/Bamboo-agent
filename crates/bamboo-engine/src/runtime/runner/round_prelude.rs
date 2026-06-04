@@ -168,20 +168,15 @@ fn persist_round_prompt_metadata(session: &mut Session, prompt: &str) {
                 .get("base_system_prompt")
                 .cloned()
                 .unwrap_or_default(),
-            enhancement_prompt: session.metadata.get("enhance_prompt").cloned(),
-            workspace_context: session
-                .metadata
-                .get("workspace_path")
-                .and_then(|workspace_path| {
-                    crate::runtime::context::build_workspace_prompt_context(workspace_path)
-                }),
-            instruction_context: session.metadata.get("workspace_path").and_then(
-                |workspace_path| {
-                    crate::runtime::context::instruction::build_instruction_prompt_context(
-                        workspace_path,
-                    )
-                },
-            ),
+            enhancement_prompt: session.enhance_prompt(),
+            workspace_context: session.workspace_path_meta().and_then(|workspace_path| {
+                crate::runtime::context::build_workspace_prompt_context(&workspace_path)
+            }),
+            instruction_context: session.workspace_path_meta().and_then(|workspace_path| {
+                crate::runtime::context::instruction::build_instruction_prompt_context(
+                    &workspace_path,
+                )
+            }),
             env_context: None,
             skill_context: None,
             tool_guide_context: None,

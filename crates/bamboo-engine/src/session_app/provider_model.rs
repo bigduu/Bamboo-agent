@@ -34,9 +34,10 @@ pub fn derive_model_ref(
 }
 
 pub fn session_effective_model_ref(session: &Session) -> Option<ProviderModelRef> {
+    let provider_name = session.provider_name();
     derive_model_ref(
         session.model_ref.as_ref(),
-        session.metadata.get("provider_name").map(String::as_str),
+        provider_name.as_deref(),
         Some(session.model.as_str()),
     )
 }
@@ -44,9 +45,7 @@ pub fn session_effective_model_ref(session: &Session) -> Option<ProviderModelRef
 pub fn persist_model_ref(session: &mut Session, model_ref: &ProviderModelRef) {
     session.model = model_ref.model.clone();
     session.model_ref = Some(model_ref.clone());
-    session
-        .metadata
-        .insert("provider_name".to_string(), model_ref.provider.clone());
+    session.set_provider_name(model_ref.provider.clone());
 }
 
 pub fn persist_legacy_model_provider(
@@ -65,9 +64,7 @@ pub fn persist_legacy_model_provider(
         session.model = model;
     }
     if let Some(provider_name) = normalized_provider {
-        session
-            .metadata
-            .insert("provider_name".to_string(), provider_name);
+        session.set_provider_name(provider_name);
     }
 }
 

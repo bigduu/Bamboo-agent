@@ -35,12 +35,10 @@ pub(super) fn should_apply_workspace_update(session: &Session, tool_call: &ToolC
     }
 
     let current_workspace = session
-        .metadata
-        .get("workspace_path")
-        .map(String::as_str)
-        .map(str::trim)
+        .workspace_path_meta()
+        .map(|path| path.trim().to_string())
         .filter(|path| !path.is_empty());
-    let Some(current_workspace) = current_workspace else {
+    let Some(current_workspace) = current_workspace.as_deref() else {
         return true;
     };
 

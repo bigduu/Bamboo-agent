@@ -498,7 +498,7 @@ pub fn refresh_prompt_snapshot_from_session(session: &mut Session) {
         .get("base_system_prompt")
         .cloned()
         .unwrap_or_else(|| normalize_base_prompt(&effective_system_prompt));
-    let enhancement_prompt = session.metadata.get("enhance_prompt").cloned().or_else(|| {
+    let enhancement_prompt = session.enhance_prompt().or_else(|| {
         derive_enhancement_prompt(
             &base_system_prompt,
             &effective_system_prompt,

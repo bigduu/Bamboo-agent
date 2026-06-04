@@ -45,9 +45,8 @@ impl TaskLoopContext {
             // Preserve version from existing task_list metadata if available.
             // This prevents version reset across multiple executions.
             let existing_version = session
-                .metadata
-                .get("task_list_version")
-                .or_else(|| session.metadata.get("todo_list_version"))
+                .task_list_version_meta()
+                .or_else(|| session.todo_list_version_meta())
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
 

@@ -115,13 +115,8 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         .map(|m| matches!(m.role, Role::User))
         .unwrap_or(false);
     if !last_is_user {
-        session
-            .metadata
-            .insert("last_run_status".to_string(), "skipped".to_string());
-        session.metadata.insert(
-            "last_run_error".to_string(),
-            "No pending message to execute".to_string(),
-        );
+        session.set_last_run_status("skipped");
+        session.set_last_run_error("No pending message to execute");
         let _ = ctx
             .agent
             .persistence()
@@ -144,10 +139,8 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
     }
 
     // Persist a running marker early so list_sessions can reconstruct status.
-    session
-        .metadata
-        .insert("last_run_status".to_string(), "running".to_string());
-    session.metadata.remove("last_run_error");
+    session.set_last_run_status("running");
+    session.clear_last_run_error();
     let _ = ctx
         .agent
         .persistence()
@@ -339,15 +332,11 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         .await;
 
         // Persist final session snapshot.
-        session
-            .metadata
-            .insert("last_run_status".to_string(), status.clone());
+        session.set_last_run_status(status.clone());
         if let Some(err) = &error {
-            session
-                .metadata
-                .insert("last_run_error".to_string(), err.clone());
+            session.set_last_run_error(err.clone());
         } else {
-            session.metadata.remove("last_run_error");
+            session.clear_last_run_error();
         }
         let _ = agent.persistence().save_runtime_session(&mut session).await;
         {

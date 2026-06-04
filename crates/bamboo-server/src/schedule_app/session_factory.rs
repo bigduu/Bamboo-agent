@@ -38,18 +38,14 @@ pub fn create_schedule_session(
         base_system_prompt.to_string(),
     );
     if let Some(path) = workspace_path {
-        session
-            .metadata
-            .insert("workspace_path".to_string(), path.to_string());
+        session.set_workspace_path_meta(path);
         bamboo_tools::tools::workspace_state::ensure_session_workspace(
             &session_id,
             Some(std::path::PathBuf::from(path)),
         );
     }
     if let Some(effort) = reasoning_effort {
-        session
-            .metadata
-            .insert("reasoning_effort".to_string(), effort.as_str().to_string());
+        session.set_reasoning_effort_meta(effort.as_str());
     }
     session.add_message(Message::system(system_prompt.to_string()));
     runner::refresh_prompt_snapshot(&mut session);

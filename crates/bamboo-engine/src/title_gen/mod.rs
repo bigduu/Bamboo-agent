@@ -235,8 +235,8 @@ async fn try_llm_title(
     let config_snapshot = { state.config().read().await.clone() };
     let provider_name = if let Some(ref m) = session.model_ref {
         m.provider.clone()
-    } else if let Some(p) = session.metadata.get("provider_name") {
-        p.clone()
+    } else if let Some(p) = session.provider_name() {
+        p
     } else {
         config_snapshot.provider.clone()
     };

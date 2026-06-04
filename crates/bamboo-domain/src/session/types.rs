@@ -501,6 +501,13 @@ pub struct Session {
     pub compression_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_runtime_state: Option<crate::session::runtime_state::AgentRuntimeState>,
+    /// Typed view over the well-known runtime metadata keys previously smuggled
+    /// through `metadata`. Accessed via the symmetric accessor layer
+    /// (`runtime_metadata_access`) which dual-writes the legacy `metadata`
+    /// strings and falls back to them on read. Additive/optional: old persisted
+    /// sessions without this field load cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_metadata: Option<crate::session::runtime_metadata::SessionRuntimeMetadata>,
     /// Runtime-only flag: when set, the next mid-turn compression check should
     /// force compression regardless of threshold. Set by `compact_context` tool.
     #[serde(skip)]
@@ -550,6 +557,7 @@ impl Session {
             compression_events: Vec::new(),
             compression_instructions: None,
             agent_runtime_state: None,
+            runtime_metadata: None,
             force_manual_compression: None,
             workspace: None,
         }
@@ -590,6 +598,7 @@ impl Session {
             compression_events: Vec::new(),
             compression_instructions: None,
             agent_runtime_state: None,
+            runtime_metadata: None,
             force_manual_compression: None,
             workspace: None,
         }

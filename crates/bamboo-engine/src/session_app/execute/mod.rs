@@ -156,11 +156,9 @@ pub async fn prepare_execute(
     if let Some(skill_mode) = input.request_skill_mode {
         let trimmed = skill_mode.trim();
         if trimmed.is_empty() {
-            session.metadata.remove("skill_mode");
+            session.clear_skill_mode();
         } else {
-            session
-                .metadata
-                .insert("skill_mode".to_string(), trimmed.to_string());
+            session.set_skill_mode(trimmed);
         }
     }
 

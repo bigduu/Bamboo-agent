@@ -23,9 +23,7 @@ pub(super) fn apply_workspace_path_to_session(session: &mut Session, workspace_p
         return;
     }
 
-    session
-        .metadata
-        .insert("workspace_path".to_string(), workspace_path.to_string());
+    session.set_workspace_path_meta(workspace_path);
 
     if let Some(system_message) = session
         .messages

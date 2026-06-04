@@ -11,6 +11,7 @@ use bamboo_agent_core::Session;
 use bamboo_domain::AgentRuntimeState;
 
 const METADATA_KEY: &str = "agent.runtime.state";
+#[cfg(test)]
 const PENDING_INJECTED_MESSAGES_KEY: &str = "pending_injected_messages";
 
 /// Read `AgentRuntimeState` from session.
@@ -44,7 +45,7 @@ pub fn sync_from_metadata(session: &Session, state: &mut AgentRuntimeState) {
         state.llm.model_name = Some(session.model.clone());
     }
     if state.llm.provider_name.is_none() {
-        state.llm.provider_name = session.metadata.get("provider_name").cloned();
+        state.llm.provider_name = session.provider_name();
     }
     if state.llm.responses_previous_id.is_none() {
         state.llm.responses_previous_id = session
@@ -99,11 +100,9 @@ pub async fn merge_pending_injected_messages(
         return 0;
     };
 
-    let Some(raw) = latest.metadata.get(PENDING_INJECTED_MESSAGES_KEY) else {
-        return 0;
-    };
-
-    let Ok(messages) = serde_json::from_str::<Vec<serde_json::Value>>(raw) else {
+    // Read via the typed accessor (prefers `runtime_metadata`, falls back to the
+    // legacy `pending_injected_messages` JSON string; defensive on malformed).
+    let Some(messages) = latest.pending_injected_messages() else {
         return 0;
     };
 
@@ -116,7 +115,8 @@ pub async fn merge_pending_injected_messages(
     }
 
     if merged > 0 {
-        session.metadata.remove(PENDING_INJECTED_MESSAGES_KEY);
+        // Clear on both planes (typed field + legacy string mirror).
+        session.clear_pending_injected_messages();
         session.updated_at = chrono::Utc::now();
 
         if let Some(persistence) = persistence {

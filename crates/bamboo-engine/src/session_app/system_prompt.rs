@@ -99,15 +99,23 @@ pub fn build_system_prompt_snapshot(session: &Session, default_prompt: &str) -> 
         }
     });
 
-    let enhancement_prompt = metadata_value(session, "enhance_prompt")
+    let enhancement_prompt = session
+        .enhance_prompt()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
         .or_else(|| derive_enhancement_prompt_legacy(&base_system_prompt, &prompt_without_env));
 
-    let workspace_context = metadata_value(session, "workspace_path")
+    let workspace_path_meta = session
+        .workspace_path_meta()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let workspace_context = workspace_path_meta
         .as_deref()
         .and_then(crate::context::build_workspace_prompt_context)
         .or(workspace_from_prompt);
 
-    let instruction_context = metadata_value(session, "workspace_path")
+    let instruction_context = workspace_path_meta
         .as_deref()
         .and_then(|workspace_path| {
             crate::context::instruction::build_instruction_prompt_context(workspace_path)

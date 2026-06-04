@@ -39,15 +39,9 @@ pub async fn create_child_action(
             .insert("provider_name".to_string(), model_ref.provider);
     } else if let Some(parent_model_ref) = input.parent_session.model_ref.clone() {
         child.model_ref = Some(parent_model_ref.clone());
-        child
-            .metadata
-            .insert("provider_name".to_string(), parent_model_ref.provider);
-    } else if let Some(parent_provider) =
-        input.parent_session.metadata.get("provider_name").cloned()
-    {
-        child
-            .metadata
-            .insert("provider_name".to_string(), parent_provider);
+        child.set_provider_name(parent_model_ref.provider);
+    } else if let Some(parent_provider) = input.parent_session.provider_name() {
+        child.set_provider_name(parent_provider);
     }
 
     // Apply explicit reasoning_effort override if the LLM passed one;
@@ -66,9 +60,7 @@ pub async fn create_child_action(
     child
         .metadata
         .insert("spawned_by".to_string(), "SubAgent".to_string());
-    child
-        .metadata
-        .insert("subagent_type".to_string(), input.subagent_type.clone());
+    child.set_subagent_type(input.subagent_type.clone());
     child
         .metadata
         .insert("responsibility".to_string(), input.responsibility.clone());
@@ -76,10 +68,8 @@ pub async fn create_child_action(
         "assignment_prompt".to_string(),
         input.assignment_prompt.clone(),
     );
-    child
-        .metadata
-        .insert("last_run_status".to_string(), "pending".to_string());
-    child.metadata.remove("last_run_error");
+    child.set_last_run_status("pending");
+    child.clear_last_run_error();
 
     // Apply runtime metadata (e.g. external agent routing).
     for (key, value) in input.runtime_metadata {
@@ -188,8 +178,8 @@ pub async fn get_child_action(
         "last_tool_phase": runner_info.as_ref().and_then(|r| r.last_tool_phase.clone()),
         "last_event_at": runner_info.as_ref().and_then(|r| r.last_event_at.map(|t| t.to_rfc3339())),
         "round_count": runner_info.as_ref().map(|r| r.round_count).unwrap_or(0),
-        "has_pending_injected_messages": child.metadata.contains_key("pending_injected_messages"),
-        "guidance": compute_status_guidance(status.as_deref(), runner_info.as_ref(), child.metadata.contains_key("pending_injected_messages")),
+        "has_pending_injected_messages": child.has_pending_injected_messages(),
+        "guidance": compute_status_guidance(status.as_deref(), runner_info.as_ref(), child.has_pending_injected_messages()),
     }))
 }
 
@@ -258,10 +248,8 @@ pub async fn update_child_action(
         child
             .metadata
             .insert("assignment_prompt".to_string(), effective_prompt.clone());
-        child
-            .metadata
-            .insert("last_run_status".to_string(), "pending".to_string());
-        child.metadata.remove("last_run_error");
+        child.set_last_run_status("pending");
+        child.clear_last_run_error();
 
         let assignment = format_child_assignment(
             &child.title,
@@ -311,10 +299,8 @@ pub async fn run_child_action(
         messages_removed = truncate_after_last_user(&mut child)?;
     }
 
-    child
-        .metadata
-        .insert("last_run_status".to_string(), "pending".to_string());
-    child.metadata.remove("last_run_error");
+    child.set_last_run_status("pending");
+    child.clear_last_run_error();
     child.updated_at = Utc::now();
     port.save_child_session(&mut child).await?;
 
@@ -353,21 +339,17 @@ pub async fn send_message_to_child_action(
     let message = normalize_required_text(Some(message), "message")?;
 
     if is_running && !should_interrupt {
-        // Store the message in session metadata so the running agent loop
-        // can merge it at the next turn boundary without canceling progress.
-        let mut pending: Vec<QueuedInjectedMessage> = child
-            .metadata
-            .get("pending_injected_messages")
-            .and_then(|raw| serde_json::from_str(raw).ok())
-            .unwrap_or_default();
-        pending.push(QueuedInjectedMessage {
+        // Store the message in session runtime metadata so the running agent
+        // loop can merge it at the next turn boundary without canceling
+        // progress. Routed through the typed accessor (dual-writes the typed
+        // field + the legacy `pending_injected_messages` JSON string mirror).
+        let mut pending = child.pending_injected_messages().unwrap_or_default();
+        let queued = QueuedInjectedMessage {
             content: message.clone(),
             created_at: Some(chrono::Utc::now()),
-        });
-        child.metadata.insert(
-            "pending_injected_messages".to_string(),
-            serde_json::to_string(&pending).unwrap_or_default(),
-        );
+        };
+        pending.push(serde_json::to_value(&queued).unwrap_or(serde_json::Value::Null));
+        child.set_pending_injected_messages(pending);
         port.save_child_session(&mut child).await?;
         return Ok(json!({
             "child_session_id": child.id,
@@ -380,10 +362,8 @@ pub async fn send_message_to_child_action(
     }
 
     child.add_message(bamboo_agent_core::Message::user(message.clone()));
-    child
-        .metadata
-        .insert("last_run_status".to_string(), "pending".to_string());
-    child.metadata.remove("last_run_error");
+    child.set_last_run_status("pending");
+    child.clear_last_run_error();
     port.save_child_session(&mut child).await?;
 
     let should_auto_run = auto_run.unwrap_or(true);
@@ -414,13 +394,8 @@ pub async fn cancel_child_action(
         .load_child_for_parent(parent_id, &child_session_id)
         .await?;
     port.cancel_child_run_and_wait(&child_session_id).await?;
-    child
-        .metadata
-        .insert("last_run_status".to_string(), "cancelled".to_string());
-    child.metadata.insert(
-        "last_run_error".to_string(),
-        "Cancelled by parent".to_string(),
-    );
+    child.set_last_run_status("cancelled");
+    child.set_last_run_error("Cancelled by parent");
     port.save_child_session(&mut child).await?;
     Ok(json!({
         "child_session_id": child_session_id,

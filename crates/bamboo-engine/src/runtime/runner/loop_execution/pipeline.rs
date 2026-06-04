@@ -225,9 +225,7 @@ async fn apply_completed_task_evaluation(
                         .map(|task_list| task_list.title.clone())
                 })
                 .unwrap_or_else(|| "Agent Tasks".to_string());
-            session
-                .metadata
-                .insert("task_list_version".to_string(), ctx.version.to_string());
+            session.set_task_list_version_meta(ctx.version.to_string());
             let task_list = ctx.to_task_list_with_title(task_list_title);
             session.set_task_list(task_list.clone());
             crate::runtime::runner::tool_execution::persist_shared_task_list(

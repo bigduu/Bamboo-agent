@@ -16,8 +16,6 @@ use super::types::ChatTurnInput;
 
 // ---- Metadata keys ----
 const BASE_SYSTEM_PROMPT_KEY: &str = "base_system_prompt";
-const ENHANCE_PROMPT_KEY: &str = "enhance_prompt";
-const SELECTED_SKILL_IDS_KEY: &str = "selected_skill_ids";
 const SKILL_RUNTIME_LOADED_KEY: &str = "skill_runtime_loaded_skill_ids";
 const SKILL_RUNTIME_LAST_KEY: &str = "skill_runtime_last_loaded_skill_id";
 const COPILOT_CONCLUSION_KEY: &str = "copilot_conclusion_with_options_enhancement_enabled";
@@ -25,7 +23,6 @@ const PROMPT_COMPOSER_VERSION_KEY: &str = "prompt_composer_version";
 const PROMPT_FINGERPRINT_KEY: &str = "prompt_fingerprint";
 const PROMPT_COMPONENT_FLAGS_KEY: &str = "prompt_component_flags";
 const PROMPT_COMPONENT_LENGTHS_KEY: &str = "prompt_component_lengths";
-const WORKSPACE_PATH_KEY: &str = "workspace_path";
 
 const PROMPT_COMPOSER_VERSION: &str = "bamboo.prompt-composer.v2";
 
@@ -173,11 +170,9 @@ pub fn resolve_base_prompt(
 
 pub fn resolve_enhance_prompt(session: &mut Session, enhance_prompt_from_request: Option<&str>) {
     if let Some(prompt) = enhance_prompt_from_request {
-        session
-            .metadata
-            .insert(ENHANCE_PROMPT_KEY.to_string(), prompt.to_string());
+        session.set_enhance_prompt(prompt);
     } else {
-        session.metadata.remove(ENHANCE_PROMPT_KEY);
+        session.clear_enhance_prompt();
     }
 }
 
@@ -200,14 +195,12 @@ pub fn resolve_workspace_path(
     data_dir: Option<&Path>,
 ) -> Option<String> {
     if let Some(path) = workspace_path_from_request {
-        session
-            .metadata
-            .insert(WORKSPACE_PATH_KEY.to_string(), path.to_string());
+        session.set_workspace_path_meta(path);
     }
 
     workspace_path_from_request
         .map(ToString::to_string)
-        .or_else(|| session.metadata.get(WORKSPACE_PATH_KEY).cloned())
+        .or_else(|| session.workspace_path_meta())
         .or_else(|| {
             bamboo_infrastructure::Config::from_data_dir(data_dir.map(Path::to_path_buf))
                 .get_default_work_area_path()
@@ -232,7 +225,7 @@ pub fn resolve_selected_skill_ids(
         return;
     }
 
-    session.metadata.remove(SELECTED_SKILL_IDS_KEY);
+    session.clear_selected_skill_ids();
 }
 
 /// Clear skill runtime state markers from session metadata.
@@ -247,17 +240,10 @@ fn persist_selected_skill_ids_metadata(
 ) {
     match selected_skill_ids {
         Some(ids) if !ids.is_empty() => {
-            if let Ok(serialized) = serde_json::to_string(ids) {
-                session
-                    .metadata
-                    .insert(SELECTED_SKILL_IDS_KEY.to_string(), serialized);
-            } else {
-                tracing::warn!("Failed to serialize selected skill IDs; clearing metadata");
-                session.metadata.remove(SELECTED_SKILL_IDS_KEY);
-            }
+            session.set_selected_skill_ids(ids.to_vec());
         }
         _ => {
-            session.metadata.remove(SELECTED_SKILL_IDS_KEY);
+            session.clear_selected_skill_ids();
         }
     }
 }

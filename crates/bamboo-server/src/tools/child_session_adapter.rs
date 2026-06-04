@@ -316,12 +316,11 @@ impl ChildSessionPort for ChildSessionAdapter {
 
         // Resolve profile policy into schema-level disabled_tools.
         let disabled_tools = child
-            .metadata
-            .get("subagent_type")
-            .map(|s| s.trim())
+            .subagent_type()
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .and_then(|subagent_type| {
-                let profile = self.subagent_profiles.resolve(subagent_type);
+                let profile = self.subagent_profiles.resolve(&subagent_type);
                 match &profile.tools {
                     bamboo_domain::subagent::ToolPolicy::Inherit => None,
                     policy => {

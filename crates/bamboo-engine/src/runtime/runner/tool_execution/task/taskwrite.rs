@@ -51,15 +51,12 @@ pub(super) async fn maybe_handle_taskwrite(
         .map(|ctx| ctx.version.saturating_add(1))
         .or_else(|| {
             session
-                .metadata
-                .get("task_list_version")
+                .task_list_version_meta()
                 .and_then(|value| value.parse::<u64>().ok())
                 .map(|value| value.saturating_add(1))
         })
         .unwrap_or(1);
-    session
-        .metadata
-        .insert("task_list_version".to_string(), next_version.to_string());
+    session.set_task_list_version_meta(next_version.to_string());
     tracing::info!(
         "[{}] Task updated shared task list '{}' with {} items",
         session_id,
@@ -101,10 +98,8 @@ pub(in crate::runtime::runner) async fn persist_shared_task_list(
                 match storage.load_session(shared_session_id).await {
                     Ok(Some(mut root_session)) => {
                         root_session.set_task_list(task_list.clone());
-                        if let Some(version) = session.metadata.get("task_list_version") {
-                            root_session
-                                .metadata
-                                .insert("task_list_version".to_string(), version.clone());
+                        if let Some(version) = session.task_list_version_meta() {
+                            root_session.set_task_list_version_meta(version);
                         }
                         if let Err(error) =
                             persistence.save_runtime_session(&mut root_session).await

@@ -85,15 +85,12 @@ impl PolicyAwareToolExecutor {
     /// the metadata key is missing / blank.
     async fn subagent_type_for_session(&self, session_id: &str) -> Option<String> {
         let sessions = self.sessions.read().await;
-        let value = sessions
-            .get(session_id)?
-            .metadata
-            .get("subagent_type")?
-            .trim();
-        if value.is_empty() {
+        let value = sessions.get(session_id)?.subagent_type()?;
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
             None
         } else {
-            Some(value.to_string())
+            Some(trimmed.to_string())
         }
     }
 

@@ -795,7 +795,7 @@ async fn resolve_session_project_key(
         .await
         .ok()
         .flatten()
-        .and_then(|session| session.metadata.get("workspace_path").cloned())
+        .and_then(|session| session.workspace_path_meta())
         .map(std::path::PathBuf::from)
         .map(|path| crate::memory_store::project_key_from_path(&path))
         .or_else(|| memory.project_key_for_session(Some(session_id)))

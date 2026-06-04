@@ -70,13 +70,10 @@ async fn load_session_from_state_or_storage(
 
 fn resolve_session_project_key(session_id: &str, session: &Session) -> Option<String> {
     session
-        .metadata
-        .get("workspace_path")
-        .map(String::as_str)
-        .map(str::trim)
+        .workspace_path_meta()
+        .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .map(Path::new)
-        .and_then(|path| MemoryStore::derive_project_key_from_workspace(Some(path)))
+        .and_then(|path| MemoryStore::derive_project_key_from_workspace(Some(Path::new(&path))))
         .or_else(|| {
             workspace_state::get_workspace(session_id).and_then(|path| {
                 MemoryStore::derive_project_key_from_workspace(Some(path.as_path()))

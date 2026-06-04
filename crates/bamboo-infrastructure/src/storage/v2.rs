@@ -330,15 +330,13 @@ impl SessionStoreV2 {
         rel_path: String,
     ) -> io::Result<()> {
         let has_attachments = self.compute_has_attachments(&session.id).await;
+        // Read the well-known runtime keys via the typed accessors, which prefer
+        // `runtime_metadata` and fall back to the legacy `metadata` strings.
         let last_run_status = session
-            .metadata
-            .get("last_run_status")
-            .cloned()
+            .last_run_status()
             .filter(|value| !value.trim().is_empty());
         let last_run_error = session
-            .metadata
-            .get("last_run_error")
-            .cloned()
+            .last_run_error()
             .filter(|value| !value.trim().is_empty());
         let created_by_schedule_id = session
             .metadata
@@ -350,11 +348,7 @@ impl SessionStoreV2 {
             .get("schedule_run_id")
             .cloned()
             .filter(|v| !v.trim().is_empty());
-        let subagent_type = session
-            .metadata
-            .get("subagent_type")
-            .cloned()
-            .filter(|v| !v.trim().is_empty());
+        let subagent_type = session.subagent_type().filter(|v| !v.trim().is_empty());
         let gold_config_json = session
             .metadata
             .get("gold_config")
