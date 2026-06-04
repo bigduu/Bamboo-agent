@@ -37,7 +37,9 @@ pub(super) async fn prepare_chat_request(
     )
     .await
     .map_err(|error| match error {
-        bamboo_engine::message_hooks::HookError::Unsupported(message) => AppError::BadRequest(message),
+        bamboo_engine::message_hooks::HookError::Unsupported(message) => {
+            AppError::BadRequest(message)
+        }
         bamboo_engine::message_hooks::HookError::InvalidConfig(message) => {
             AppError::InternalError(anyhow::anyhow!(message))
         }

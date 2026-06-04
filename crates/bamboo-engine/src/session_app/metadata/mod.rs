@@ -276,7 +276,10 @@ impl SessionMetadataService {
 
 /// Load the latest session from persistent storage (bypasses the in-memory
 /// cache). Called while the per-session lock is held.
-async fn load_latest(state: &dyn AgentSessionContext, session_id: &str) -> Result<Session, MetadataError> {
+async fn load_latest(
+    state: &dyn AgentSessionContext,
+    session_id: &str,
+) -> Result<Session, MetadataError> {
     state
         .persistence()
         .storage()
@@ -287,7 +290,11 @@ async fn load_latest(state: &dyn AgentSessionContext, session_id: &str) -> Resul
 }
 
 /// Replace the in-memory cache entry with the freshly persisted session.
-async fn refresh_in_memory_cache(state: &dyn AgentSessionContext, session_id: &str, session: Session) {
+async fn refresh_in_memory_cache(
+    state: &dyn AgentSessionContext,
+    session_id: &str,
+    session: Session,
+) {
     let mut cache = state.sessions().write().await;
     cache.insert(session_id.to_string(), session);
 }

@@ -3,8 +3,8 @@ use std::path::Path;
 use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
-use bamboo_engine::auto_dream::{run_project_auto_dream_once, AutoDreamContext};
 use bamboo_agent_core::Session;
+use bamboo_engine::auto_dream::{run_project_auto_dream_once, AutoDreamContext};
 use bamboo_infrastructure::{CleanupMode, CleanupResult};
 use bamboo_memory::memory_store::MemoryStore;
 use bamboo_tools::tools::workspace_state;
@@ -374,19 +374,28 @@ mod tests {
         let resp = test::call_service(&app, create).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = test::read_body_json(resp).await;
-        let session_id = body["session"]["id"].as_str().expect("session id").to_string();
+        let session_id = body["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
 
         // Clear it.
         let clear = test::TestRequest::post()
             .uri(&format!("/api/v1/sessions/{session_id}/clear"))
             .to_request();
-        assert_eq!(test::call_service(&app, clear).await.status(), StatusCode::OK);
+        assert_eq!(
+            test::call_service(&app, clear).await.status(),
+            StatusCode::OK
+        );
 
         // Delete it.
         let delete = test::TestRequest::delete()
             .uri(&format!("/api/v1/sessions/{session_id}"))
             .to_request();
-        assert_eq!(test::call_service(&app, delete).await.status(), StatusCode::OK);
+        assert_eq!(
+            test::call_service(&app, delete).await.status(),
+            StatusCode::OK
+        );
 
         // Let the single writer task drain.
         for _ in 0..100 {
@@ -406,10 +415,19 @@ mod tests {
                 _ => "other",
             })
             .collect();
-        assert_eq!(kinds, vec!["created", "cleared", "deleted"], "events: {kinds:?}");
+        assert_eq!(
+            kinds,
+            vec!["created", "cleared", "deleted"],
+            "events: {kinds:?}"
+        );
         // All carry the right session id and monotonic seq.
-        assert!(events.iter().all(|ce| ce.session_id.as_deref() == Some(session_id.as_str())));
-        assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(events
+            .iter()
+            .all(|ce| ce.session_id.as_deref() == Some(session_id.as_str())));
+        assert_eq!(
+            events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[actix_web::test]

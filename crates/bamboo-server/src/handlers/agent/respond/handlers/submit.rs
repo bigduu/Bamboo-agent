@@ -1,12 +1,12 @@
 use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
-use bamboo_engine::model_config_helper::{
-    resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
-};
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::session_app::respond::PlanModeTransition;
 use bamboo_agent_core::AgentEvent;
+use bamboo_engine::model_config_helper::{
+    resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
+};
 
 use super::super::types::RespondRequest;
 

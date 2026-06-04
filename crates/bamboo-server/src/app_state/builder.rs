@@ -211,8 +211,8 @@ impl AppState {
 
         // Account-scoped durable change feed. Opening the journal recovers the
         // max seq so the sequence counter stays monotonic across restarts.
-        let account_sink = crate::events::AccountEventSink::new(data_dir.join("events"))
-            .map_err(|e| {
+        let account_sink =
+            crate::events::AccountEventSink::new(data_dir.join("events")).map_err(|e| {
                 AppError::InternalError(anyhow::anyhow!(
                     "failed to initialize account change-feed journal: {e}"
                 ))

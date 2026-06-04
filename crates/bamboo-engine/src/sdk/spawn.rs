@@ -11,14 +11,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tokio::sync::broadcast;
 
 use bamboo_agent_core::{AgentEvent, Role, SessionKind};
 
-use crate::runtime::execution::runner_lifecycle::{finalize_runner, try_reserve_runner, RunnerReservation};
 use crate::runtime::execution::event_forwarder::create_event_forwarder;
+use crate::runtime::execution::runner_lifecycle::{
+    finalize_runner, try_reserve_runner, RunnerReservation,
+};
 use crate::runtime::execution::session_events::get_or_create_event_sender;
 use crate::runtime::execution::spawn::{
     publish_child_completion_parts, resolve_child_provider_override, watch_child_liveness,

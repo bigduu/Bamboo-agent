@@ -1,11 +1,11 @@
 use actix_web::{web, HttpRequest, HttpResponse, Result};
 
 use crate::app_state::AppState;
-use bamboo_engine::model_config_helper::normalize_gold_config_json;
 use crate::session_app::metadata::{MetadataError, SessionMetadataService};
 use crate::session_app::provider_model::{
     derive_model_ref, persist_legacy_model_provider, persist_model_ref,
 };
+use bamboo_engine::model_config_helper::normalize_gold_config_json;
 
 use super::super::super::types::PatchSessionRequest;
 use super::query::get_session;
@@ -238,8 +238,7 @@ pub async fn patch_session(
 
     let mut response = get_session(state, web::Path::from(session_id)).await?;
     if let Some(version) = etag {
-        if let Ok(value) =
-            actix_web::http::header::HeaderValue::from_str(&format!("\"{version}\""))
+        if let Ok(value) = actix_web::http::header::HeaderValue::from_str(&format!("\"{version}\""))
         {
             response
                 .headers_mut()
@@ -287,7 +286,9 @@ mod tests {
     async fn patch_with_matching_if_match_succeeds_and_bumps_etag() {
         let state = new_state().await;
         let app = test::init_service(
-            App::new().app_data(state.clone()).configure(configure_routes),
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
         )
         .await;
         let id = create_session!(app);
@@ -300,7 +301,13 @@ mod tests {
                 .to_request(),
         )
         .await;
-        let etag = get.headers().get(header::ETAG).unwrap().to_str().unwrap().to_string();
+        let etag = get
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert_eq!(etag, "\"0\"");
 
         // PATCH with If-Match: "0" succeeds and returns the bumped ETag.
@@ -324,7 +331,9 @@ mod tests {
     async fn patch_with_stale_if_match_returns_412() {
         let state = new_state().await;
         let app = test::init_service(
-            App::new().app_data(state.clone()).configure(configure_routes),
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
         )
         .await;
         let id = create_session!(app);

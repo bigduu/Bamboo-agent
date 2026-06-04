@@ -1,4 +1,6 @@
-use bamboo_agent_core::{GoldConfidence, PendingQuestion, PendingQuestionSource, Session, ToolCall};
+use bamboo_agent_core::{
+    GoldConfidence, PendingQuestion, PendingQuestionSource, Session, ToolCall,
+};
 
 use super::GOLD_AUTO_ANSWER_TOOL_NAME;
 

@@ -168,7 +168,10 @@ async fn write_model_limits_file_removes_file_when_all_rows_default_equal() {
     .await
     .expect("write should succeed");
 
-    assert!(!path.exists(), "file should be removed when no overrides remain");
+    assert!(
+        !path.exists(),
+        "file should be removed when no overrides remain"
+    );
     assert!(read_model_limits_file(dir.path())
         .await
         .expect("read should succeed")

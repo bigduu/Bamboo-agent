@@ -4,6 +4,7 @@
 //! values come from two sources, in priority order:
 //!   1. provider runtime metadata (e.g. Copilot reports real context/output),
 //!   2. user overrides persisted in `model_limits.json`.
+//!
 //! Anything without a match falls back to a single global default
 //! (`DEFAULT_MAX_CONTEXT_TOKENS` / `DEFAULT_MAX_OUTPUT_TOKENS`). This keeps the
 //! registry from going stale as models churn — see `token_budget.rs`.

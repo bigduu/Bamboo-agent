@@ -1,23 +1,23 @@
 //! Bamboo engine — runtime, skills, metrics, MCP.
 
 pub mod app_context;
+pub mod auto_dream;
 pub mod events;
 pub mod gold_auto_answer;
 pub mod mcp;
-pub mod metrics;
-pub mod server_tools;
-pub mod session_app;
-pub mod title_gen;
-pub mod prompt_defaults;
 pub mod message_hooks;
-pub mod model_config_helper;
-pub mod model_areas;
-pub mod profiles;
-pub mod auto_dream;
+pub mod metrics;
 pub mod metrics_service;
+pub mod model_areas;
+pub mod model_config_helper;
+pub mod profiles;
+pub mod prompt_defaults;
 pub mod runtime;
 pub mod sdk;
+pub mod server_tools;
+pub mod session_app;
 pub mod skills;
+pub mod title_gen;
 
 pub use app_context::AgentSessionContext;
 

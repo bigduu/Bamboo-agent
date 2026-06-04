@@ -57,13 +57,19 @@ impl ToolSpec {
 
 /// Return the canonical list of built-in tool names.
 pub fn builtin_tool_names() -> Vec<String> {
-    BUILTIN_TOOL_NAMES.iter().map(|s| (*s).to_string()).collect()
+    BUILTIN_TOOL_NAMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
 }
 
 /// Return a [`ToolSpec`] (enabled, no description) for every canonical built-in
 /// tool, in the stable order defined by [`BUILTIN_TOOL_NAMES`].
 pub fn builtin_tool_specs() -> Vec<ToolSpec> {
-    BUILTIN_TOOL_NAMES.iter().map(|s| ToolSpec::new(*s)).collect()
+    BUILTIN_TOOL_NAMES
+        .iter()
+        .map(|s| ToolSpec::new(*s))
+        .collect()
 }
 
 /// Re-export of the canonical const array for callers that want the static

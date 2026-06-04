@@ -24,13 +24,13 @@ use std::path::PathBuf;
 use tokio::sync::RwLock;
 
 use bamboo_agent_core::tools::{Tool, ToolExecutor};
-use bamboo_tools::ToolRegistry;
 use bamboo_engine::{
     AgentBuilder as EngineAgentBuilder, MetricsCollector, SkillManager, SkillStoreConfig,
     SqliteMetricsStorage,
 };
 use bamboo_infrastructure::storage::{LockedSessionStore, SessionStoreV2};
 use bamboo_infrastructure::{create_provider_with_dir, Config, LLMProvider};
+use bamboo_tools::ToolRegistry;
 
 use super::Agent;
 
@@ -135,10 +135,7 @@ impl AgentBuilder {
     }
 
     /// Inject a pre-built default tool executor.
-    pub fn default_tools(
-        mut self,
-        tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
-    ) -> Self {
+    pub fn default_tools(mut self, tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor>) -> Self {
         self.inner = self.inner.default_tools(tools);
         self
     }

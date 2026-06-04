@@ -5,8 +5,8 @@
 //! `crate::events::…` paths used throughout the server crate.
 
 pub use bamboo_engine::events::{
-    account_sink, change_feed, journal, replayable, AccountEventSink, ChangeEvent,
-    publish_replayable_session_event,
+    account_sink, change_feed, journal, publish_replayable_session_event, replayable,
+    AccountEventSink, ChangeEvent,
 };
 
 #[cfg(test)]

@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use bamboo_agent_core::{AgentEvent, Session};
-use bamboo_domain::reasoning::ReasoningEffort;
-use bamboo_domain::ProviderModelRef;
 use crate::config::GoldConfig;
 use crate::runtime::gold_evaluation::{evaluate_gold, GoldEvaluationResult};
 use crate::runtime::stream::handler::consume_llm_stream_silent;
 use crate::TaskLoopContext;
+use bamboo_agent_core::{AgentEvent, Session};
+use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_domain::ProviderModelRef;
 use bamboo_infrastructure::{LLMProvider, LLMRequestOptions};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

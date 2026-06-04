@@ -207,7 +207,9 @@ mod tests {
         ])
         .await;
         let app = test::init_service(
-            App::new().app_data(state.clone()).configure(configure_routes),
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
         )
         .await;
 
@@ -241,14 +243,18 @@ mod tests {
         let (state, id) =
             app_state_with_session(vec![Message::user("a"), Message::user("b")]).await;
         let app = test::init_service(
-            App::new().app_data(state.clone()).configure(configure_routes),
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
         )
         .await;
 
         let resp = test::call_service(
             &app,
             test::TestRequest::get()
-                .uri(&format!("/api/v1/history/{id}?since_message_id=does-not-exist"))
+                .uri(&format!(
+                    "/api/v1/history/{id}?since_message_id=does-not-exist"
+                ))
                 .to_request(),
         )
         .await;

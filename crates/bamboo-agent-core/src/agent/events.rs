@@ -892,7 +892,10 @@ mod tests {
         assert_eq!(value["status"], "exploring");
         // Compare against serde's own serialization (RFC3339 with `Z` for UTC),
         // not `to_rfc3339()` which emits a `+00:00` offset instead.
-        assert_eq!(value["entered_at"], serde_json::to_value(entered_at).unwrap());
+        assert_eq!(
+            value["entered_at"],
+            serde_json::to_value(entered_at).unwrap()
+        );
     }
 
     #[test]

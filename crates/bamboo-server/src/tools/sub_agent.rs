@@ -1705,8 +1705,10 @@ mod tests {
         async fn execute(
             &self,
             call: &ToolCall,
-        ) -> std::result::Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError>
-        {
+        ) -> std::result::Result<
+            bamboo_agent_core::tools::ToolResult,
+            bamboo_agent_core::tools::ToolError,
+        > {
             self.executed.write().await.push(call.function.name.clone());
             Ok(bamboo_agent_core::tools::ToolResult {
                 success: true,
@@ -1719,8 +1721,10 @@ mod tests {
             &self,
             call: &ToolCall,
             _ctx: bamboo_agent_core::tools::ToolExecutionContext<'_>,
-        ) -> std::result::Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError>
-        {
+        ) -> std::result::Result<
+            bamboo_agent_core::tools::ToolResult,
+            bamboo_agent_core::tools::ToolError,
+        > {
             self.executed.write().await.push(call.function.name.clone());
             Ok(bamboo_agent_core::tools::ToolResult {
                 success: true,
@@ -1807,8 +1811,7 @@ mod tests {
         sessions.insert("researcher-child".to_string(), child);
         let sessions = Arc::new(RwLock::new(sessions));
 
-        let executor =
-            crate::tools::PolicyAwareToolExecutor::new(inner, registry, sessions);
+        let executor = crate::tools::PolicyAwareToolExecutor::new(inner, registry, sessions);
 
         let ctx = bamboo_agent_core::tools::ToolExecutionContext {
             session_id: Some("researcher-child"),
@@ -1819,7 +1822,7 @@ mod tests {
 
         // Edit blocked at execute.
         let edit_err = executor
-            .execute_with_context(&make_tool_call("Edit"), ctx.clone())
+            .execute_with_context(&make_tool_call("Edit"), ctx)
             .await
             .expect_err("Edit must be blocked for a researcher child");
         match edit_err {
@@ -1835,7 +1838,7 @@ mod tests {
 
         // Write blocked at execute.
         let write_err = executor
-            .execute_with_context(&make_tool_call("Write"), ctx.clone())
+            .execute_with_context(&make_tool_call("Write"), ctx)
             .await
             .expect_err("Write must be blocked for a researcher child");
         assert!(

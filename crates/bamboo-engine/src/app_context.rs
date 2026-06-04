@@ -80,8 +80,7 @@ pub trait AgentSessionContext: Send + Sync {
     /// Resolve a provider for a named provider endpoint.
     ///
     /// Returns `None` on failure (see [`Self::get_provider_for_model_ref`]).
-    async fn get_provider_for_endpoint(&self, provider_name: &str)
-        -> Option<Arc<dyn LLMProvider>>;
+    async fn get_provider_for_endpoint(&self, provider_name: &str) -> Option<Arc<dyn LLMProvider>>;
 
     /// Try to claim the title-generation slot for `session_id`.
     /// Returns `true` on success, `false` if generation is already in flight.

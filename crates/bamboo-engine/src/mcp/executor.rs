@@ -322,7 +322,9 @@ mod tests {
             })
         });
 
-        mock_builtin.expect_list_tools().returning(std::vec::Vec::new);
+        mock_builtin
+            .expect_list_tools()
+            .returning(std::vec::Vec::new);
         mock_mcp.expect_list_tools().returning(std::vec::Vec::new);
 
         let composite = CompositeToolExecutor::new(Arc::new(mock_builtin), Arc::new(mock_mcp));

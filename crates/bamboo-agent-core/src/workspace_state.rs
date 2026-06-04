@@ -53,7 +53,9 @@ pub fn set_default_workspace_provider(provider: DefaultWorkspaceProvider) {
 }
 
 pub fn get_configured_default_workspace() -> Option<PathBuf> {
-    DEFAULT_WORKSPACE_PROVIDER.get().and_then(|provider| provider())
+    DEFAULT_WORKSPACE_PROVIDER
+        .get()
+        .and_then(|provider| provider())
 }
 
 pub fn ensure_session_workspace(session_id: &str, preferred: Option<PathBuf>) -> Option<PathBuf> {

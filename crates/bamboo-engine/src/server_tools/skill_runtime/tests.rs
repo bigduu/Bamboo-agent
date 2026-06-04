@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::{SkillManager, SkillStoreConfig};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolExecutionContext};
 use bamboo_agent_core::Session;
-use crate::{SkillManager, SkillStoreConfig};
 use bamboo_infrastructure::Config;
 
 #[test]

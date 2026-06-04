@@ -438,7 +438,8 @@ async fn handle_tool_calls_path(
             frame.session_id
         );
     }
-    let tool_schemas = resolve_available_tool_schemas_for_session(frame.config, frame.tools.as_ref(), session);
+    let tool_schemas =
+        resolve_available_tool_schemas_for_session(frame.config, frame.tools.as_ref(), session);
 
     let tool_execution = crate::runtime::runner::tool_execution::execute_round_tool_calls(
         &stream_output.tool_calls,

@@ -1332,7 +1332,11 @@ mod anthropic_request_building {
     fn plan_places_cache_breakpoint_on_message_by_id() {
         let flagged = Message::user("Old context here");
         let flagged_id = flagged.id.clone();
-        let messages = vec![Message::user("Hi"), flagged, Message::assistant("Got it", None)];
+        let messages = vec![
+            Message::user("Hi"),
+            flagged,
+            Message::assistant("Got it", None),
+        ];
         let plan = crate::llm::cache::PromptCachePlan {
             breakpoint_message_ids: vec![flagged_id],
             ..Default::default()
@@ -1414,11 +1418,19 @@ mod anthropic_request_building {
         );
 
         let msgs = out["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 2, "both tool results merge into one user message");
+        assert_eq!(
+            msgs.len(),
+            2,
+            "both tool results merge into one user message"
+        );
         let user = &msgs[1];
         assert_eq!(user["role"], "user");
         let blocks = user["content"].as_array().unwrap();
-        assert_eq!(blocks.len(), 2, "both tool results present in merged message");
+        assert_eq!(
+            blocks.len(),
+            2,
+            "both tool results present in merged message"
+        );
         assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
     }
 
@@ -1502,10 +1514,12 @@ mod anthropic_request_building {
 
         assert_eq!(tool_breaks, 1);
         assert_eq!(system_breaks, 1);
-        assert_eq!(message_breaks, 2, "only the remaining budget of 2 message breakpoints");
+        assert_eq!(
+            message_breaks, 2,
+            "only the remaining budget of 2 message breakpoints"
+        );
         assert!(
-            tool_breaks + system_breaks + message_breaks
-                <= super::MAX_ANTHROPIC_CACHE_BREAKPOINTS
+            tool_breaks + system_breaks + message_breaks <= super::MAX_ANTHROPIC_CACHE_BREAKPOINTS
         );
     }
 

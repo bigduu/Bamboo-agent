@@ -24,8 +24,8 @@ pub mod api {
     }
 }
 
-pub use cache::{CacheTtl, PromptCachePlan};
 pub use crate::config::Config;
+pub use cache::{CacheTtl, PromptCachePlan};
 pub use error::ProxyAuthRequiredError;
 pub use model_catalog::ModelCatalogService;
 pub use models::*;

@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
+use crate::config::GoldConfig;
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::subagent::ModelHint;
-use crate::config::GoldConfig;
 use bamboo_infrastructure::Config;
 use bamboo_infrastructure::{LLMError, ProviderModelRouter, ProviderRegistry, ResolvedModel};
 
@@ -113,9 +113,13 @@ pub fn resolve_model(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
-        if let Some(resolved) =
-            resolve_tier_model(tier, subagent_type, config, provider_name, provider_registry)
-        {
+        if let Some(resolved) = resolve_tier_model(
+            tier,
+            subagent_type,
+            config,
+            provider_name,
+            provider_registry,
+        ) {
             return Some(resolved);
         }
     }
@@ -962,17 +966,17 @@ mod tests {
                 ..Default::default()
             },
             defaults: Some(DefaultsConfig {
-            chat: ProviderModelRef::new("openai", "gpt-chat"),
-            fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
-            task_summary: None,
-            vision: None,
-            memory_background: None,
-            planning: None,
-            search: None,
-            code_review: None,
-            sub_agent: None,
-            subagent_models: HashMap::new(),
-        }),
+                chat: ProviderModelRef::new("openai", "gpt-chat"),
+                fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
+                task_summary: None,
+                vision: None,
+                memory_background: None,
+                planning: None,
+                search: None,
+                code_review: None,
+                sub_agent: None,
+                subagent_models: HashMap::new(),
+            }),
             ..Default::default()
         };
 
@@ -1017,17 +1021,17 @@ mod tests {
                 ..Default::default()
             },
             defaults: Some(DefaultsConfig {
-            chat: ProviderModelRef::new("openai", "gpt-chat"),
-            fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
-            task_summary: None,
-            vision: None,
-            memory_background: None,
-            planning: None,
-            search: None,
-            code_review: None,
-            sub_agent: Some(ProviderModelRef::new("openai", "gpt-sub-agent")),
-            subagent_models: HashMap::new(),
-        }),
+                chat: ProviderModelRef::new("openai", "gpt-chat"),
+                fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
+                task_summary: None,
+                vision: None,
+                memory_background: None,
+                planning: None,
+                search: None,
+                code_review: None,
+                sub_agent: Some(ProviderModelRef::new("openai", "gpt-sub-agent")),
+                subagent_models: HashMap::new(),
+            }),
             ..Default::default()
         };
 
@@ -1046,17 +1050,17 @@ mod tests {
                 ..Default::default()
             },
             defaults: Some(DefaultsConfig {
-            chat: ProviderModelRef::new("openai", "gpt-chat"),
-            fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
-            task_summary: None,
-            vision: None,
-            memory_background: None,
-            planning: None,
-            search: None,
-            code_review: None,
-            sub_agent: None,
-            subagent_models: HashMap::new(),
-        }),
+                chat: ProviderModelRef::new("openai", "gpt-chat"),
+                fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
+                task_summary: None,
+                vision: None,
+                memory_background: None,
+                planning: None,
+                search: None,
+                code_review: None,
+                sub_agent: None,
+                subagent_models: HashMap::new(),
+            }),
             ..Default::default()
         };
 
@@ -1071,7 +1075,10 @@ mod tests {
     #[test]
     fn infer_provider_maps_known_families() {
         // claude* → anthropic
-        assert_eq!(infer_provider("claude-3-7-sonnet").as_deref(), Some("anthropic"));
+        assert_eq!(
+            infer_provider("claude-3-7-sonnet").as_deref(),
+            Some("anthropic")
+        );
         assert_eq!(infer_provider("Claude-Opus").as_deref(), Some("anthropic"));
         // gpt* → openai
         assert_eq!(infer_provider("gpt-4o").as_deref(), Some("openai"));
@@ -1168,15 +1175,10 @@ mod tests {
         // chain must look up `subagent_models` by the subagent TYPE, not by the
         // provider name.
         let mut config = precedence_config();
-        config
-            .defaults
-            .as_mut()
-            .unwrap()
-            .subagent_models
-            .insert(
-                "researcher".to_string(),
-                ProviderModelRef::new("openai", "gpt-researcher"),
-            );
+        config.defaults.as_mut().unwrap().subagent_models.insert(
+            "researcher".to_string(),
+            ProviderModelRef::new("openai", "gpt-researcher"),
+        );
         let hint = ModelHint::default();
 
         // Matching subagent_type → per-subagent override wins over sub_agent.

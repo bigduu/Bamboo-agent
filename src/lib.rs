@@ -42,7 +42,6 @@
 
 use std::path::PathBuf;
 
-
 pub mod error;
 
 pub mod agent;

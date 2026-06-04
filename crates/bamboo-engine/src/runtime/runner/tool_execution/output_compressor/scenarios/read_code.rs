@@ -24,15 +24,14 @@ const MAX_COMMENT_BLOCK: usize = 15;
 
 /// Matches common comment-only lines across languages:
 /// `//`, `#`, `--`, `/* ... */`, ` * `, `///`, `/** ... */`
-static COMMENT_LINE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^\s*(?:\d+\s*[\|│]?\s*)?(?://[!/]?|#[!]?|\*|/\*|\*/|--\s|<!--|-->|;;\s|%\s)"
-).expect("comment line regex"));
-
+static COMMENT_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*(?:\d+\s*[\|│]?\s*)?(?://[!/]?|#[!]?|\*|/\*|\*/|--\s|<!--|-->|;;\s|%\s)")
+        .expect("comment line regex")
+});
 
 /// Extracts line number from Read output format: `  42 | content` or `42│content`
-static READ_LINE_NUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"^\s*(\d+)\s*[\|│]"
-).expect("read line number regex"));
+static READ_LINE_NUM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(\d+)\s*[\|│]").expect("read line number regex"));
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
 

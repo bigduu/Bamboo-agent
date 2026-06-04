@@ -40,10 +40,8 @@ impl LLMProvider for CompletedProvider {
         _max_output_tokens: Option<u32>,
         _model: &str,
     ) -> Result<LLMStream, LLMError> {
-        let items: Vec<bamboo_infrastructure::provider::Result<LLMChunk>> = vec![
-            Ok(LLMChunk::Token("done".to_string())),
-            Ok(LLMChunk::Done),
-        ];
+        let items: Vec<bamboo_infrastructure::provider::Result<LLMChunk>> =
+            vec![Ok(LLMChunk::Token("done".to_string())), Ok(LLMChunk::Done)];
         Ok(Box::pin(stream::iter(items)))
     }
 }
@@ -153,8 +151,10 @@ async fn build_harness(
 
     let sessions_cache = Arc::new(RwLock::new(HashMap::new()));
     let agent_runners = Arc::new(RwLock::new(HashMap::new()));
-    let session_event_senders =
-        Arc::new(RwLock::new(HashMap::<String, broadcast::Sender<AgentEvent>>::new()));
+    let session_event_senders = Arc::new(RwLock::new(HashMap::<
+        String,
+        broadcast::Sender<AgentEvent>,
+    >::new()));
 
     let parent_session_id = "root-session".to_string();
     let child_session_id = "child-session".to_string();
@@ -193,7 +193,9 @@ async fn build_harness(
             .attachment_reader(session_store.clone())
             .skill_manager(Arc::new(SkillManager::new()))
             .metrics_collector(metrics_collector)
-            .config(Arc::new(RwLock::new(bamboo_infrastructure::Config::default())))
+            .config(Arc::new(RwLock::new(
+                bamboo_infrastructure::Config::default(),
+            )))
             .provider(provider)
             .default_tools(Arc::new(CatalogToolExecutor {
                 names: tool_names.clone(),
@@ -226,9 +228,7 @@ async fn build_harness(
 }
 
 /// Collect parent events until a `SubAgentCompleted` is observed (or timeout).
-async fn collect_until_completed(
-    rx: &mut broadcast::Receiver<AgentEvent>,
-) -> Vec<AgentEvent> {
+async fn collect_until_completed(rx: &mut broadcast::Receiver<AgentEvent>) -> Vec<AgentEvent> {
     collect_until_completed_with_budget(rx, Duration::from_secs(15)).await
 }
 
@@ -341,7 +341,10 @@ async fn s_t2_1_run_child_spawn_emits_started_event_completed_in_order() {
         "Started must precede Completed: {events:?}"
     );
     if let Some(event_idx) = event_idx {
-        assert!(started_idx < event_idx, "Started must precede SubAgentEvent");
+        assert!(
+            started_idx < event_idx,
+            "Started must precede SubAgentEvent"
+        );
         assert!(
             event_idx < completed_idx,
             "SubAgentEvent must precede Completed"
@@ -363,7 +366,10 @@ async fn s_t2_1_run_child_spawn_emits_started_event_completed_in_order() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        persisted.metadata.get("last_run_status").map(String::as_str),
+        persisted
+            .metadata
+            .get("last_run_status")
+            .map(String::as_str),
         Some("completed")
     );
 }
@@ -492,8 +498,7 @@ async fn s_t2_5_watchdog_timeout_completes_with_timeout_status() {
     .await
     .unwrap();
 
-    let events =
-        collect_until_completed_with_budget(&mut parent_rx, Duration::from_secs(45)).await;
+    let events = collect_until_completed_with_budget(&mut parent_rx, Duration::from_secs(45)).await;
     match events.last().unwrap() {
         AgentEvent::SubAgentCompleted { status, .. } => {
             assert_eq!(status, "timeout", "watchdog must yield timeout status");

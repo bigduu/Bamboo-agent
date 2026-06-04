@@ -4,10 +4,10 @@
 //! key information from earlier context.
 
 use async_trait::async_trait;
+use bamboo_domain::ReasoningEffort;
 use bamboo_domain::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, Message, Role,
 };
-use bamboo_domain::ReasoningEffort;
 use bamboo_infrastructure::LLMChunk;
 use bamboo_infrastructure::{LLMProvider, LLMRequestOptions};
 use futures::StreamExt;

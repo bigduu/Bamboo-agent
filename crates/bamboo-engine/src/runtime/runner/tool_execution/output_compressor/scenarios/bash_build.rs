@@ -21,196 +21,213 @@ const MAX_COMPRESSED_LINES: usize = 150;
 // ── Rust (cargo check / clippy) ──
 
 /// Matches: `error[E0308]: mismatched types` or `warning: unused variable`
-static RUST_DIAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^(error|warning)(?:\[E\d+\])?:\s+(.+)"
-).expect("RUST_DIAG_RE must compile"));
+static RUST_DIAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(error|warning)(?:\[E\d+\])?:\s+(.+)").expect("RUST_DIAG_RE must compile")
+});
 
 /// Matches the location line: `  --> src/main.rs:42:5`
-static RUST_LOCATION_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^\s+-->\s+(.+:\d+:\d+)"
-).expect("RUST_LOCATION_RE must compile"));
+static RUST_LOCATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s+-->\s+(.+:\d+:\d+)").expect("RUST_LOCATION_RE must compile")
+});
 
 /// Matches: `error: could not compile` or `error: aborting due to`
-static RUST_FATAL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^error(?:\[E\d+\])?: (?:could not compile|aborting due to)"
-).expect("RUST_FATAL_RE must compile"));
-
+static RUST_FATAL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^error(?:\[E\d+\])?: (?:could not compile|aborting due to)")
+        .expect("RUST_FATAL_RE must compile")
+});
 
 // ── TypeScript (tsc) ──
 
 /// Matches: `src/index.ts(42,5): error TS2304: Cannot find name 'foo'.`
-static TSC_ERROR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^(.+)\((\d+),(\d+)\):\s+(error)\s+(TS\d+):\s+(.+)"
-).expect("TSC_ERROR_RE must compile"));
+static TSC_ERROR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(.+)\((\d+),(\d+)\):\s+(error)\s+(TS\d+):\s+(.+)")
+        .expect("TSC_ERROR_RE must compile")
+});
 
 /// Matches: `Found N errors.` or `Found N errors in N files.`
-static TSC_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^Found (\d+) errors?"
-).expect("TSC_SUMMARY_RE must compile"));
+static TSC_SUMMARY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^Found (\d+) errors?").expect("TSC_SUMMARY_RE must compile"));
 
 // ── ESLint ──
 
 /// Matches eslint problem lines: `  42:5  error  Missing semicolon  semi`
-static ESLINT_PROBLEM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^\s+(\d+):(\d+)\s+(error|warning)\s+(.+)"
-).expect("ESLINT_PROBLEM_RE must compile"));
+static ESLINT_PROBLEM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s+(\d+):(\d+)\s+(error|warning)\s+(.+)")
+        .expect("ESLINT_PROBLEM_RE must compile")
+});
 
 /// Matches eslint summary: `✖ 5 problems (3 errors, 2 warnings)`
-static ESLINT_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"[✖✗]\s+(\d+) problems?\s+\((\d+) errors?,\s*(\d+) warnings?\)"
-).expect("ESLINT_SUMMARY_RE must compile"));
+static ESLINT_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[✖✗]\s+(\d+) problems?\s+\((\d+) errors?,\s*(\d+) warnings?\)")
+        .expect("ESLINT_SUMMARY_RE must compile")
+});
 
 // ── Maven ──
 
 /// Matches: `[INFO] BUILD SUCCESS` or `[INFO] BUILD FAILURE`
-static MVN_BUILD_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^\[INFO\]\s+BUILD (SUCCESS|FAILURE)"
-).expect("MVN_BUILD_RESULT_RE must compile"));
+static MVN_BUILD_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\[INFO\]\s+BUILD (SUCCESS|FAILURE)")
+        .expect("MVN_BUILD_RESULT_RE must compile")
+});
 
 /// Matches Maven timing: `[INFO] Total time:  12.345 s`
-static MVN_TIME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^\[INFO\]\s+Total time:\s+(.+)"
-).expect("MVN_TIME_RE must compile"));
+static MVN_TIME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\[INFO\]\s+Total time:\s+(.+)").expect("MVN_TIME_RE must compile")
+});
 
 /// Matches: `[INFO] Downloading from central:` or `[INFO] Downloaded from`
-static MVN_DOWNLOAD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^\[INFO\]\s+(Downloading|Downloaded)\s+from\s+"
-).expect("MVN_DOWNLOAD_RE must compile"));
+static MVN_DOWNLOAD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\[INFO\]\s+(Downloading|Downloaded)\s+from\s+")
+        .expect("MVN_DOWNLOAD_RE must compile")
+});
 
 /// Matches: `[ERROR] ...` lines
-static MVN_ERROR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^\[ERROR\]\s+(.+)"
-).expect("MVN_ERROR_RE must compile"));
+static MVN_ERROR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^\[ERROR\]\s+(.+)").expect("MVN_ERROR_RE must compile"));
 
 /// Matches: `[WARNING] ...` lines
-static MVN_WARNING_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^\[WARNING\]\s+(.+)"
-).expect("MVN_WARNING_RE must compile"));
+static MVN_WARNING_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^\[WARNING\]\s+(.+)").expect("MVN_WARNING_RE must compile"));
 
 /// Matches Surefire/Failsafe test summary:
 /// `Tests run: 42, Failures: 0, Errors: 0, Skipped: 2`
-static MVN_TEST_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)Tests run:\s+(\d+),\s+Failures:\s+(\d+),\s+Errors:\s+(\d+),\s+Skipped:\s+(\d+)"
-).expect("MVN_TEST_SUMMARY_RE must compile"));
+static MVN_TEST_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)Tests run:\s+(\d+),\s+Failures:\s+(\d+),\s+Errors:\s+(\d+),\s+Skipped:\s+(\d+)",
+    )
+    .expect("MVN_TEST_SUMMARY_RE must compile")
+});
 
 /// Matches Maven module header:
 /// `[INFO] --- maven-compiler-plugin:3.11.0:compile (default-compile) @ my-module ---`
 /// or `[INFO] Building my-module 1.0.0`
-static MVN_MODULE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^\[INFO\]\s+(?:---|Building)\s+(.+)"
-).expect("MVN_MODULE_RE must compile"));
+static MVN_MODULE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\[INFO\]\s+(?:---|Building)\s+(.+)").expect("MVN_MODULE_RE must compile")
+});
 
 /// Matches `[INFO] Compiling N source files` or `[INFO] Nothing to compile`
-static MVN_COMPILE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^\[INFO\]\s+(Compiling \d+ source files?|Nothing to compile)"
-).expect("MVN_COMPILE_RE must compile"));
+static MVN_COMPILE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\[INFO\]\s+(Compiling \d+ source files?|Nothing to compile)")
+        .expect("MVN_COMPILE_RE must compile")
+});
 
 // ── Gradle ──
 
 /// Matches: `BUILD SUCCESSFUL in 12s` or `BUILD FAILED`
-static GRADLE_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^BUILD (SUCCESSFUL|FAILED)\b(?: in (\S+))?"
-).expect("GRADLE_RESULT_RE must compile"));
+static GRADLE_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^BUILD (SUCCESSFUL|FAILED)\b(?: in (\S+))?")
+        .expect("GRADLE_RESULT_RE must compile")
+});
 
 /// Matches: `> Task :compileJava` or `> Task :app:compileKotlin`
-static GRADLE_TASK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^> Task ([:\w]+)"
-).expect("GRADLE_TASK_RE must compile"));
+static GRADLE_TASK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^> Task ([:\w]+)").expect("GRADLE_TASK_RE must compile"));
 
 /// Matches Gradle download lines:
 /// `> https://repo.maven.apache.org/...`
 /// or `Downloading https://...` or `Download https://...`
-static GRADLE_DOWNLOAD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^(?:> |Downloading |Download )https?://"
-).expect("GRADLE_DOWNLOAD_RE must compile"));
+static GRADLE_DOWNLOAD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(?:> |Downloading |Download )https?://")
+        .expect("GRADLE_DOWNLOAD_RE must compile")
+});
 
 /// Matches Gradle error/warning output
-static GRADLE_ERROR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^(?:e:|FAILURE:|> .+Exception|> .+Error|> Could not)"
-).expect("GRADLE_ERROR_RE must compile"));
+static GRADLE_ERROR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(?:e:|FAILURE:|> .+Exception|> .+Error|> Could not)")
+        .expect("GRADLE_ERROR_RE must compile")
+});
 
 /// Matches Gradle "N actionable tasks: N executed"
-static GRADLE_ACTIONABLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^(\d+) actionable tasks?:\s+(.+)"
-).expect("GRADLE_ACTIONABLE_RE must compile"));
+static GRADLE_ACTIONABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(\d+) actionable tasks?:\s+(.+)").expect("GRADLE_ACTIONABLE_RE must compile")
+});
 
 // ── Docker ──
 
 /// Matches Docker build step: `Step 3/12 : RUN apt-get update`
 /// or BuildKit format: `#5 [2/8] RUN apt-get update`
-static DOCKER_STEP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^(?:Step (\d+)/(\d+)|#\d+\s+\[(\d+)/(\d+)\])\s*:?\s*(.*)"
-).expect("DOCKER_STEP_RE must compile"));
+static DOCKER_STEP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(?:Step (\d+)/(\d+)|#\d+\s+\[(\d+)/(\d+)\])\s*:?\s*(.*)")
+        .expect("DOCKER_STEP_RE must compile")
+});
 
 /// Matches Docker layer cache: `---> Using cache` or `CACHED`
-static DOCKER_CACHE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^(?:--->|#\d+)\s+(?:Using cache|CACHED)"
-).expect("DOCKER_CACHE_RE must compile"));
+static DOCKER_CACHE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(?:--->|#\d+)\s+(?:Using cache|CACHED)")
+        .expect("DOCKER_CACHE_RE must compile")
+});
 
 /// Matches Docker hash line: `---> abc123def456`
-static DOCKER_HASH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^--->\s+[0-9a-f]{12}"
-).expect("DOCKER_HASH_RE must compile"));
+static DOCKER_HASH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^--->\s+[0-9a-f]{12}").expect("DOCKER_HASH_RE must compile"));
 
 /// Matches Docker "Successfully built" or "Successfully tagged"
-static DOCKER_SUCCESS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^(?:Successfully (?:built|tagged)|naming to|exporting to image)"
-).expect("DOCKER_SUCCESS_RE must compile"));
+static DOCKER_SUCCESS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(?:Successfully (?:built|tagged)|naming to|exporting to image)")
+        .expect("DOCKER_SUCCESS_RE must compile")
+});
 
 /// Matches Docker download progress: `Downloading [====>  ] 12.3MB/45.6MB`
 /// or `Extracting [====>  ]`
-static DOCKER_PROGRESS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+static DOCKER_PROGRESS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
     r"(?m)^(?:Downloading|Extracting|Waiting|Pulling fs layer|Verifying Checksum|Download complete|Pull complete)\b"
-).expect("DOCKER_PROGRESS_RE must compile"));
+).expect("DOCKER_PROGRESS_RE must compile")
+});
 
 // ── .NET (dotnet build) ──
 
 /// Matches: `Build succeeded.` or `Build FAILED.`
-static DOTNET_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^Build (succeeded|FAILED)\."
-).expect("DOTNET_RESULT_RE must compile"));
+static DOTNET_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^Build (succeeded|FAILED)\.").expect("DOTNET_RESULT_RE must compile")
+});
 
 /// Matches: `  Restored /path/to/project.csproj (in 1.23 s).`
-static DOTNET_RESTORE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^\s+Restored .+\.csproj"
-).expect("DOTNET_RESTORE_RE must compile"));
+static DOTNET_RESTORE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s+Restored .+\.csproj").expect("DOTNET_RESTORE_RE must compile")
+});
 
 /// Matches: `  Determining projects to restore...`
-static DOTNET_DETERMINING_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^\s+Determining projects to restore"
-).expect("DOTNET_DETERMINING_RE must compile"));
+static DOTNET_DETERMINING_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s+Determining projects to restore")
+        .expect("DOTNET_DETERMINING_RE must compile")
+});
 
 /// Matches: `0 Warning(s)` and `0 Error(s)` in dotnet output
-static DOTNET_COUNTS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^\s+(\d+) (Warning|Error)\(s\)"
-).expect("DOTNET_COUNTS_RE must compile"));
+static DOTNET_COUNTS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s+(\d+) (Warning|Error)\(s\)").expect("DOTNET_COUNTS_RE must compile")
+});
 
 // ── Terraform ──
 
 /// Matches: `Plan: 3 to add, 1 to change, 0 to destroy.`
-static TF_PLAN_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^Plan:\s+(\d+)\s+to add,\s+(\d+)\s+to change,\s+(\d+)\s+to destroy\."
-).expect("TF_PLAN_SUMMARY_RE must compile"));
+static TF_PLAN_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^Plan:\s+(\d+)\s+to add,\s+(\d+)\s+to change,\s+(\d+)\s+to destroy\.")
+        .expect("TF_PLAN_SUMMARY_RE must compile")
+});
 
 /// Matches: `Apply complete! Resources: 3 added, 1 changed, 0 destroyed.`
-static TF_APPLY_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+static TF_APPLY_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
     r"(?m)^Apply complete! Resources:\s+(\d+)\s+added,\s+(\d+)\s+changed,\s+(\d+)\s+destroyed\."
-).expect("TF_APPLY_SUMMARY_RE must compile"));
+).expect("TF_APPLY_SUMMARY_RE must compile")
+});
 
 /// Matches terraform resource lines: `  # aws_instance.web will be created`
-static TF_RESOURCE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^\s+#\s+(\S+)\s+will be (created|destroyed|updated|replaced)"
-).expect("TF_RESOURCE_RE must compile"));
+static TF_RESOURCE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s+#\s+(\S+)\s+will be (created|destroyed|updated|replaced)")
+        .expect("TF_RESOURCE_RE must compile")
+});
 
 /// Matches terraform detail lines: `+ resource ...` or `~ resource ...` or `- resource ...`
-static TF_DETAIL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^\s+[+~-]\s+"
-).expect("TF_DETAIL_RE must compile"));
+static TF_DETAIL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^\s+[+~-]\s+").expect("TF_DETAIL_RE must compile"));
 
 /// Matches: `Terraform will perform the following actions:`
-static TF_ACTIONS_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^Terraform will perform the following actions:"
-).expect("TF_ACTIONS_HEADER_RE must compile"));
+static TF_ACTIONS_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^Terraform will perform the following actions:")
+        .expect("TF_ACTIONS_HEADER_RE must compile")
+});
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
 

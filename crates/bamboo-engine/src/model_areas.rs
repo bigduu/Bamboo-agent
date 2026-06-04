@@ -24,8 +24,8 @@ use bamboo_domain::ProviderModelRef;
 use bamboo_infrastructure::{Config, ProviderRegistry, ResolvedModel};
 
 use crate::model_config_helper::{
-    resolve_background_model, resolve_fast_model, resolve_subagent_model, resolve_task_summary_model,
-    resolve_vision_model,
+    resolve_background_model, resolve_fast_model, resolve_subagent_model,
+    resolve_task_summary_model, resolve_vision_model,
 };
 
 /// The auxiliary (non-chat) models, all resolved from **global** config for a
@@ -205,7 +205,10 @@ mod tests {
         let config = config_with_defaults(defaults_with_all_areas());
         let areas = resolve_global_area_models(&config, "openai", &test_registry());
 
-        assert_eq!(areas.fast.as_ref().map(|m| m.model_name.as_str()), Some("gpt-fast"));
+        assert_eq!(
+            areas.fast.as_ref().map(|m| m.model_name.as_str()),
+            Some("gpt-fast")
+        );
         assert_eq!(
             areas.summarization.as_ref().map(|m| m.model_name.as_str()),
             Some("gpt-summary")
@@ -215,7 +218,10 @@ mod tests {
             Some("gpt-memory")
         );
         // The kept refs match the configured defaults.
-        assert_eq!(areas.fast_ref, Some(ProviderModelRef::new("openai", "gpt-fast")));
+        assert_eq!(
+            areas.fast_ref,
+            Some(ProviderModelRef::new("openai", "gpt-fast"))
+        );
         assert_eq!(
             areas.summarization_ref,
             Some(ProviderModelRef::new("openai", "gpt-summary"))
@@ -270,7 +276,10 @@ mod tests {
     fn vision_model_is_global_from_defaults() {
         let config = config_with_defaults(defaults_with_all_areas());
         let vision = resolve_global_vision_model(&config, "openai", &test_registry());
-        assert_eq!(vision.as_ref().map(|m| m.model_name.as_str()), Some("gpt-vision"));
+        assert_eq!(
+            vision.as_ref().map(|m| m.model_name.as_str()),
+            Some("gpt-vision")
+        );
     }
 
     #[test]
@@ -324,7 +333,10 @@ mod tests {
         };
 
         let areas = resolve_global_area_models(&config, "openai", &test_registry());
-        assert_eq!(areas.fast.as_ref().map(|m| m.model_name.as_str()), Some("gpt-4o-mini"));
+        assert_eq!(
+            areas.fast.as_ref().map(|m| m.model_name.as_str()),
+            Some("gpt-4o-mini")
+        );
     }
 
     // ---- reasoning effort cascade ----
@@ -349,7 +361,10 @@ mod tests {
         );
         assert_eq!(
             resolve_effective_reasoning_effort(None, None, Some(ReasoningEffort::Low)),
-            (Some(ReasoningEffort::Low), ReasoningEffortSource::ProviderDefault)
+            (
+                Some(ReasoningEffort::Low),
+                ReasoningEffortSource::ProviderDefault
+            )
         );
     }
 
@@ -366,6 +381,9 @@ mod tests {
         // use this rather than hardcoding a level.
         assert_eq!(DEFAULT_REASONING_EFFORT, ReasoningEffort::Medium);
         let (effort, _) = resolve_effective_reasoning_effort(None, None, None);
-        assert_eq!(effort.unwrap_or(DEFAULT_REASONING_EFFORT), ReasoningEffort::Medium);
+        assert_eq!(
+            effort.unwrap_or(DEFAULT_REASONING_EFFORT),
+            ReasoningEffort::Medium
+        );
     }
 }

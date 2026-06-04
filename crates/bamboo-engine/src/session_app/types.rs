@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crate::config::GoldConfig;
+use crate::ImageFallbackConfig;
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::ProviderModelRef;
 use bamboo_domain::Session;
-use crate::config::GoldConfig;
-use crate::ImageFallbackConfig;
 use bamboo_infrastructure::LLMProvider;
 
 /// Resolved configuration snapshot for execution.

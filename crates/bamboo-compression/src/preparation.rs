@@ -2134,7 +2134,7 @@ mod tests {
         let mut budget =
             TokenBudget::with_safety_margin(1000, 100, BudgetStrategy::Window { size: 50 }, 0);
         budget.compression_trigger_percent = 80; // trigger = 800
-        // default prompt_cache_recent_user_turns is 2; provide only one user turn.
+                                                 // default prompt_cache_recent_user_turns is 2; provide only one user turn.
 
         let big_analysis = "analysis ".repeat(400);
         let messages = vec![
@@ -2222,10 +2222,7 @@ mod tests {
         let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
 
         assert!(
-            prepared
-                .messages
-                .iter()
-                .any(|m| m.content == big_analysis),
+            prepared.messages.iter().any(|m| m.content == big_analysis),
             "assistant analysis should be untouched when context is below the trigger"
         );
         assert!(

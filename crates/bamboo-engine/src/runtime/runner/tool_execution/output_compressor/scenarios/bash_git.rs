@@ -23,44 +23,37 @@ const MAX_DIFF_LINES: usize = 200;
 const MAX_LOG_LINES: usize = 100;
 
 /// Matches: `On branch main` or `On branch feature/foo`
-static GIT_BRANCH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"On branch\s+(\S+)"
-).expect("GIT_BRANCH_RE must compile"));
+static GIT_BRANCH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"On branch\s+(\S+)").expect("GIT_BRANCH_RE must compile"));
 
 /// Matches: `nothing to commit, working tree clean`
-static GIT_CLEAN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"nothing to commit"
-).expect("GIT_CLEAN_RE must compile"));
+static GIT_CLEAN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"nothing to commit").expect("GIT_CLEAN_RE must compile"));
 
 /// Matches git status short format: `M  src/main.rs` or `?? new_file.txt`
-static GIT_STATUS_SHORT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"^\s*([MADRCU?! ]{1,2})\s+(.+)"
-).expect("GIT_STATUS_SHORT_RE must compile"));
+static GIT_STATUS_SHORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*([MADRCU?! ]{1,2})\s+(.+)").expect("GIT_STATUS_SHORT_RE must compile")
+});
 
 /// Matches diff stat lines: ` src/main.rs | 42 +++---`
-static DIFF_STAT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"^\s+\S+.*\|\s+\d+"
-).expect("DIFF_STAT_RE must compile"));
+static DIFF_STAT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s+\S+.*\|\s+\d+").expect("DIFF_STAT_RE must compile"));
 
 /// Matches diff summary: `3 files changed, 10 insertions(+), 5 deletions(-)`
-static DIFF_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"\d+ files? changed"
-).expect("DIFF_SUMMARY_RE must compile"));
+static DIFF_SUMMARY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d+ files? changed").expect("DIFF_SUMMARY_RE must compile"));
 
 /// Matches diff hunk header: `@@ -10,5 +10,7 @@ fn something`
-static DIFF_HUNK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"^@@\s+[-+]\d+"
-).expect("DIFF_HUNK_RE must compile"));
+static DIFF_HUNK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^@@\s+[-+]\d+").expect("DIFF_HUNK_RE must compile"));
 
 /// Matches diff file header: `diff --git a/file b/file`
-static DIFF_FILE_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"^diff --git"
-).expect("DIFF_FILE_HEADER_RE must compile"));
+static DIFF_FILE_HEADER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^diff --git").expect("DIFF_FILE_HEADER_RE must compile"));
 
 /// Matches git log commit line: `commit abc123...`
-static LOG_COMMIT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"^commit [0-9a-f]{7,40}"
-).expect("LOG_COMMIT_RE must compile"));
+static LOG_COMMIT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^commit [0-9a-f]{7,40}").expect("LOG_COMMIT_RE must compile"));
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
 

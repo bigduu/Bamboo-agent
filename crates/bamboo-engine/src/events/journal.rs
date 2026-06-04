@@ -250,7 +250,10 @@ mod tests {
             j.append(&ev(seq)).unwrap();
         }
         let got = read_since(dir.path(), 0).unwrap();
-        assert_eq!(got.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(
+            got.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
 
         let tail = read_since(dir.path(), 3).unwrap();
         assert_eq!(tail.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![4, 5]);
@@ -283,7 +286,10 @@ mod tests {
         let files = list_journal_files(dir.path()).unwrap();
         assert!(files.len() >= 2, "expected rotation into multiple files");
         let got = read_since(dir.path(), 0).unwrap();
-        assert_eq!(got.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(
+            got.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
         assert_eq!(oldest_seq(dir.path()).unwrap(), Some(1));
     }
 
@@ -302,7 +308,10 @@ mod tests {
         // Only the two newest files (seq 5, 6) remain.
         assert_eq!(oldest_seq(dir.path()).unwrap(), Some(5));
         let remaining = read_since(dir.path(), 0).unwrap();
-        assert_eq!(remaining.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![5, 6]);
+        assert_eq!(
+            remaining.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![5, 6]
+        );
 
         // Pruning below the file count is a no-op.
         assert_eq!(prune(dir.path(), 10).unwrap(), 0);
