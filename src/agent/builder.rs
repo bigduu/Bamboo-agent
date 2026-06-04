@@ -23,7 +23,8 @@ use std::sync::Arc;
 use std::path::PathBuf;
 use tokio::sync::RwLock;
 
-use bamboo_domain::subagent::ToolPolicy;
+use bamboo_agent_core::tools::{Tool, ToolExecutor};
+use bamboo_tools::ToolRegistry;
 use bamboo_engine::{
     AgentBuilder as EngineAgentBuilder, MetricsCollector, SkillManager, SkillStoreConfig,
     SqliteMetricsStorage,
@@ -38,8 +39,8 @@ const DEFAULT_METRICS_RETENTION_DAYS: u32 = 90;
 
 /// Ergonomic builder for [`Agent`].
 ///
-/// Holds the configured instruction (system-prompt fragment), tool policy,
-/// model, and api key alongside the wrapped engine builder. Call
+/// Holds the configured instruction (system-prompt fragment), tool set, model,
+/// and api key alongside the wrapped engine builder. Call
 /// [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir) to assemble
 /// the runtime dependencies, then [`build`](Self::build).
 pub struct AgentBuilder {
@@ -48,8 +49,9 @@ pub struct AgentBuilder {
     /// Caller-supplied instruction (system-prompt fragment), injected into the
     /// session at `run` time; the engine assembles the full prompt around it.
     system_prompt: Option<String>,
-    /// Tool policy, translated to `disabled_tools` at `run` time.
-    tool_policy: Option<ToolPolicy>,
+    /// The agent's tool set — built-ins (via [`BuiltinTool::tool`](super::BuiltinTool::tool))
+    /// and/or custom `impl Tool`s. Empty means "all default built-in tools".
+    tools: Vec<Arc<dyn Tool>>,
     /// Primary model override applied to the session at `run` time.
     model: Option<String>,
     /// API key applied to the active provider's config before provider creation.
@@ -62,7 +64,7 @@ impl AgentBuilder {
         Self {
             inner: EngineAgentBuilder::new(),
             system_prompt: None,
-            tool_policy: None,
+            tools: Vec::new(),
             model: None,
             api_key: None,
         }
@@ -84,41 +86,36 @@ impl AgentBuilder {
         self
     }
 
-    /// Activate exactly the given tools — the agent may use only these (an
-    /// allowlist). Accepts tool names, e.g. `.tools(["WebSearch", "Read"])`.
+    /// Set the agent's tool set — the actual tools it may use, as
+    /// `Arc<dyn Tool>`. Built-ins come from the
+    /// [`BuiltinTool`](super::BuiltinTool) catalog via
+    /// [`BuiltinTool::tool`](super::BuiltinTool::tool); custom tools are any
+    /// `impl Tool` wrapped in an `Arc`. Replaces any previous selection.
     ///
-    /// Use [`builtin_tool_names`](super::builtin_tool_names) to discover the
-    /// built-in names; MCP / dynamic tool names may be listed here too. Calling
-    /// this replaces any previously configured tool selection.
-    pub fn tools<I, S>(mut self, tools: I) -> Self
+    /// ```rust,ignore
+    /// agent.tools([BuiltinTool::WebSearch.tool(), BuiltinTool::Read.tool()]);
+    /// ```
+    ///
+    /// Leaving this unset uses the full default built-in tool surface.
+    pub fn tools<I>(mut self, tools: I) -> Self
     where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
+        I: IntoIterator<Item = Arc<dyn Tool>>,
     {
-        let allow = tools.into_iter().map(Into::into).collect();
-        self.tool_policy = Some(ToolPolicy::Allowlist { allow });
+        self.tools = tools.into_iter().collect();
         self
     }
 
-    /// Activate a single additional tool, appending to the allowlist (starting
-    /// one if no selection has been made yet).
-    pub fn tool(mut self, name: impl Into<String>) -> Self {
-        let name = name.into();
-        match self
-            .tool_policy
-            .get_or_insert_with(|| ToolPolicy::Allowlist { allow: Vec::new() })
-        {
-            ToolPolicy::Allowlist { allow } => allow.push(name),
-            other => *other = ToolPolicy::Allowlist { allow: vec![name] },
-        }
+    /// Add a single custom tool (anything implementing
+    /// [`Tool`](bamboo_agent_core::tools::Tool)) to the tool set.
+    pub fn tool<T: Tool + 'static>(mut self, tool: T) -> Self {
+        self.tools.push(Arc::new(tool));
         self
     }
 
-    /// Set an explicit [`ToolPolicy`] (advanced): `Inherit` (all default tools),
-    /// `Allowlist` (only the listed tools), or `Denylist` (all default tools
-    /// except the listed ones). Most callers want [`tools`](Self::tools).
-    pub fn tool_policy(mut self, policy: ToolPolicy) -> Self {
-        self.tool_policy = Some(policy);
+    /// Add a single pre-built shared tool — e.g. `BuiltinTool::Read.tool()` or a
+    /// shared custom tool — to the tool set.
+    pub fn tool_shared(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.tools.push(tool);
         self
     }
 
@@ -228,15 +225,27 @@ impl AgentBuilder {
 
     /// Finalize into an [`Agent`].
     ///
-    /// The configured `instruction`, `tool_policy`, and `model` are carried
-    /// onto the `Agent` so that [`Agent::run`](super::Agent::run) can inject
-    /// them into the session.
-    pub fn build(self) -> Result<Agent, String> {
+    /// If a tool set was configured via [`tools`](Self::tools) / [`tool`](Self::tool),
+    /// the agent's default tool executor is built from exactly those tools, so
+    /// the advertised tool surface is precisely the caller's selection. With no
+    /// selection, the full default built-in surface is used. The configured
+    /// `instruction` and `model` are carried onto the `Agent` for
+    /// [`Agent::run`](super::Agent::run).
+    pub fn build(mut self) -> Result<Agent, String> {
+        if !self.tools.is_empty() {
+            let registry = ToolRegistry::new();
+            for tool in &self.tools {
+                let _ = registry.register_shared(tool.clone());
+            }
+            let executor: Arc<dyn ToolExecutor> =
+                Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(registry));
+            self.inner = self.inner.default_tools(executor);
+        }
+
         let runtime = self.inner.build().map_err(|e| e.to_string())?;
         Ok(Agent::from_runtime_with_config(
             runtime,
             self.system_prompt,
-            self.tool_policy,
             self.model,
         ))
     }

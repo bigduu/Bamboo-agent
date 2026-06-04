@@ -1,46 +1,62 @@
 //! Root SDK facade tests (ergonomic-sdk-plan §4: S-T4.1 .. S-T4.3).
 //!
 //! These exercise the `bamboo_agent::agent` facade end-to-end without network
-//! I/O: the concise instruction/model/tools builder, the `ExecuteRequest`
-//! builder, and default-dependency assembly via `with_defaults_for_data_dir`.
+//! I/O: the concise instruction/model/tools builder (built-in catalog + custom
+//! tools), the `ExecuteRequest` builder, and default-dependency assembly via
+//! `with_defaults_for_data_dir`.
+
+use std::sync::Arc;
 
 use bamboo_agent::agent::{
-    builtin_tool_names, Agent, AgentBuilder, ExecuteRequestBuilder, ToolSpec,
+    builtin_tool_names, Agent, AgentBuilder, BuiltinTool, ExecuteRequestBuilder, ToolSpec,
 };
 
+use bamboo_agent_core::tools::{SharedTool, Tool, ToolError, ToolResult};
 use bamboo_agent_core::AgentEvent;
-use bamboo_domain::subagent::{disabled_tools_for_profile, ToolPolicy};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// S-T4.1: the concise facade builder lets the caller freely choose which tools
-/// to activate via `.tools([..])`, and that allowlist maps to `disabled_tools`
-/// that exclude the non-listed tools (Edit/Write) while keeping the listed ones
-/// (Read).
+/// A trivial custom tool, to prove user-defined `impl Tool`s are accepted by the
+/// builder alongside built-ins.
+struct EchoTool;
+
+#[async_trait::async_trait]
+impl Tool for EchoTool {
+    fn name(&self) -> &str {
+        "echo"
+    }
+    fn description(&self) -> &str {
+        "Echo the input back."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+    async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult {
+            success: true,
+            result: "echo".to_string(),
+            display_preference: None,
+        })
+    }
+}
+
+/// S-T4.1: the `BuiltinTool` catalog vends real tool instances by name, and the
+/// builder freely accepts a mix of built-in instances and a custom `impl Tool`.
 #[test]
-fn s_t4_1_facade_builder_and_tool_selection() {
-    // The builder accepts a free tool selection in the fluent chain.
+fn s_t4_1_tool_catalog_and_custom_tool_selection() {
+    // The catalog resolves each variant to a real Tool whose advertised name
+    // matches the canonical name.
+    let web: SharedTool = BuiltinTool::WebSearch.tool();
+    assert_eq!(web.name(), "WebSearch");
+    assert_eq!(BuiltinTool::Read.tool().name(), "Read");
+
+    // `.tools([..])` takes actual tools (Arc<dyn Tool>); `.tool(..)` adds a
+    // custom one. The fluent chain compiles and runs without panicking.
     let _builder: AgentBuilder = Agent::builder()
         .model("test-model")
         .instruction("You are a careful research assistant.")
-        .tools(["Read", "Grep", "WebSearch"]);
-
-    // `.tool(..)` appends a single tool to the active selection.
-    let _builder2: AgentBuilder = Agent::builder().tools(["Read"]).tool("WebSearch");
-
-    // Selecting an allowlist translates into disabled_tools over the canonical
-    // tool surface: Read stays enabled; Edit/Write are disabled.
-    let policy = ToolPolicy::Allowlist {
-        allow: vec![
-            "Read".to_string(),
-            "Grep".to_string(),
-            "WebSearch".to_string(),
-        ],
-    };
-    let disabled = disabled_tools_for_profile(&policy, &builtin_tool_names());
-    assert!(disabled.iter().any(|t| t == "Edit"));
-    assert!(disabled.iter().any(|t| t == "Write"));
-    assert!(!disabled.iter().any(|t| t == "Read"));
+        .tools([BuiltinTool::Read.tool(), BuiltinTool::WebSearch.tool()])
+        .tool(EchoTool);
 }
 
 /// S-T4.2: `ExecuteRequestBuilder` round-trip — required fields are enforced at
@@ -92,9 +108,9 @@ fn s_t4_2_execute_request_builder_round_trip() {
 }
 
 /// S-T4.3: `with_defaults_for_data_dir(tmp)` assembles the eight runtime
-/// dependencies (storage, persistence, attachment reader, skill manager,
-/// metrics collector, config, provider, default tools) and builds an `Agent`
-/// from a plain instruction (no profile).
+/// dependencies and builds an `Agent` from a plain instruction plus a selected
+/// tool set (a built-in + a custom tool), exercising the build-time executor
+/// assembly path.
 ///
 /// A pre-seeded config selects the `anthropic` provider with a non-network
 /// api key — `create_provider` constructs it without performing any I/O, and
@@ -105,9 +121,6 @@ async fn s_t4_3_with_defaults_for_data_dir_builds_agent() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let data_dir = tmp.path().to_path_buf();
 
-    // Seed a config that selects a provider constructible without network I/O.
-    // `api_key` is `skip_serializing` but still deserialized, so plaintext here
-    // hydrates the in-memory field.
     let config_json = r#"{
         "provider": "anthropic",
         "providers": {
@@ -119,9 +132,12 @@ async fn s_t4_3_with_defaults_for_data_dir_builds_agent() {
     }"#;
     std::fs::write(data_dir.join("config.json"), config_json).expect("write config");
 
+    let custom: Arc<dyn Tool> = Arc::new(EchoTool);
     let agent = Agent::builder()
         .instruction("You are a coding assistant.")
         .model("claude-test")
+        .tools([BuiltinTool::Read.tool()])
+        .tool_shared(custom)
         .with_defaults_for_data_dir(data_dir.clone())
         .await
         .expect("defaults should assemble")

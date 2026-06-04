@@ -143,6 +143,7 @@ name = "bamboo"
 path = "src/bin/bamboo.rs"
 
 [dev-dependencies]
+async-trait = "0.1"
 tempfile = "3"
 wiremock = "0.6"
 tokio-test = "0.4"

@@ -45,18 +45,17 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use bamboo_domain::subagent::disabled_tools_for_profile;
-
 pub use builder::AgentBuilder;
 pub use execute_request::ExecuteRequestBuilder;
-pub use tools::{builtin_tool_names, builtin_tool_specs, ToolSpec, CANONICAL_TOOL_NAMES};
+pub use tools::{
+    builtin_tool_names, builtin_tool_specs, BuiltinTool, ToolSpec, CANONICAL_TOOL_NAMES,
+};
 
 // Convenience re-exports of commonly used types (single source of truth — these
 // supersede the old duplicate re-export chain, resolving TD-2).
 pub use bamboo_agent_core::{
     AgentError, AgentEvent, Message, MessageContent, Role, Session, TokenBudgetUsage, TokenUsage,
 };
-pub use bamboo_domain::subagent::ToolPolicy;
 pub use bamboo_domain::{TaskItem, TaskItemStatus, TaskList};
 pub use bamboo_engine::ExecuteRequest;
 pub use bamboo_infrastructure::LLMProvider;
@@ -72,10 +71,9 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 #[derive(Clone)]
 pub struct Agent {
     inner: bamboo_engine::Agent,
-    /// Role / instruction system prompt injected into the session at `run` time.
+    /// Instruction (system-prompt fragment) injected into the session at `run`
+    /// time; the engine assembles the full prompt around it.
     system_prompt: Option<String>,
-    /// Tool policy translated to `disabled_tools` at `run` time.
-    tool_policy: Option<ToolPolicy>,
     /// Model override applied to the session at `run` time.
     model: Option<String>,
 }
@@ -92,23 +90,20 @@ impl Agent {
         Self {
             inner,
             system_prompt: None,
-            tool_policy: None,
             model: None,
         }
     }
 
-    /// Wrap an engine [`Agent`](bamboo_engine::Agent) plus the role-derived
-    /// configuration assembled by [`AgentBuilder`].
+    /// Wrap an engine [`Agent`](bamboo_engine::Agent) plus the instruction /
+    /// model configuration assembled by [`AgentBuilder`].
     pub(crate) fn from_runtime_with_config(
         inner: bamboo_engine::Agent,
         system_prompt: Option<String>,
-        tool_policy: Option<ToolPolicy>,
         model: Option<String>,
     ) -> Self {
         Self {
             inner,
             system_prompt,
-            tool_policy,
             model,
         }
     }
@@ -116,8 +111,8 @@ impl Agent {
     /// Run the agent loop on `session` with the given input, draining events
     /// internally until completion.
     ///
-    /// The builder's role system prompt + model are applied to the session
-    /// before execution; the tool policy is translated to `disabled_tools`.
+    /// The configured instruction + model are applied to the session before
+    /// execution; the tool set was fixed on the agent's executor at build time.
     pub async fn run(
         &self,
         session: &mut Session,
@@ -140,8 +135,8 @@ impl Agent {
     /// Run the agent loop on `session`, returning a receiver of [`AgentEvent`]s.
     ///
     /// The execution runs on a background task; the caller drives it by reading
-    /// from the returned receiver until it closes. The role system prompt /
-    /// model / tool policy are applied exactly as in [`run`](Self::run).
+    /// from the returned receiver until it closes. The instruction / model are
+    /// applied exactly as in [`run`](Self::run).
     pub fn run_stream(
         &self,
         mut session: Session,
@@ -165,8 +160,8 @@ impl Agent {
     }
 
     /// Shared execution path: prepare the session (system prompt + model), build
-    /// the [`ExecuteRequest`] (with `disabled_tools` from the tool policy), and
-    /// delegate to the canonical engine execution path.
+    /// the [`ExecuteRequest`], and delegate to the canonical engine execution
+    /// path. Tool restriction is applied via the agent's executor (built time).
     async fn execute_internal(
         &self,
         session: &mut Session,
@@ -199,19 +194,12 @@ impl Agent {
         // semantics where the last user message drives execution.
         session.add_message(Message::user(input.clone()));
 
-        let disabled_tools = self.tool_policy.as_ref().map(|policy| {
-            let all = builtin_tool_names();
-            disabled_tools_for_profile(policy, &all)
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>()
-        });
-
+        // Tool restriction is handled at build time: the agent's executor is
+        // built from exactly the configured tool set, so no per-run
+        // `disabled_tools` filter is needed here.
         let mut builder = ExecuteRequestBuilder::new(input, event_tx, cancel_token);
         if let Some(model) = self.model.clone() {
             builder = builder.model(model);
-        }
-        if let Some(disabled) = disabled_tools {
-            builder = builder.disabled_tools(disabled);
         }
 
         self.inner.execute(session, builder.build()).await
