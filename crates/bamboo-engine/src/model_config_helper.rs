@@ -61,13 +61,15 @@ fn is_openai_o_series(name: &str) -> bool {
 /// 2. `model_hint.tier` — a named tier (`fast`, `chat`, `sub_agent`,
 ///    `background`/`memory_background`, `task_summary`, `vision`, `planning`,
 ///    `search`, `code_review`). Resolved via the existing tier resolvers.
-/// 3. Fallback chain — `subagent_models[provider_name]` (treated as a subagent
-///    type key) → `sub_agent` → `fast` → `chat`, via
-///    [`resolve_subagent_model`].
+/// 3. Fallback chain — `subagent_models[subagent_type]` → `sub_agent` →
+///    `fast` → `chat`, via [`resolve_subagent_model`]. `subagent_type` is the
+///    profile id (e.g. `"researcher"`); pass `""` when not resolving for a
+///    specific subagent.
 ///
 /// Returns `None` when nothing in the chain resolves.
 pub fn resolve_model(
     model_hint: &ModelHint,
+    subagent_type: &str,
     provider_name: &str,
     config: &Config,
     provider_registry: &Arc<ProviderRegistry>,
@@ -112,19 +114,20 @@ pub fn resolve_model(
         .filter(|s| !s.is_empty())
     {
         if let Some(resolved) =
-            resolve_tier_model(tier, config, provider_name, provider_registry)
+            resolve_tier_model(tier, subagent_type, config, provider_name, provider_registry)
         {
             return Some(resolved);
         }
     }
 
-    // 3. Fallback chain (subagent_models[type] → sub_agent → fast → chat).
-    resolve_subagent_model(config, provider_name, provider_registry, provider_name)
+    // 3. Fallback chain (subagent_models[subagent_type] → sub_agent → fast → chat).
+    resolve_subagent_model(config, provider_name, provider_registry, subagent_type)
 }
 
 /// Resolve a named tier to a concrete model via the existing tier resolvers.
 fn resolve_tier_model(
     tier: &str,
+    subagent_type: &str,
     config: &Config,
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
@@ -132,7 +135,7 @@ fn resolve_tier_model(
     match tier.to_ascii_lowercase().as_str() {
         "fast" => resolve_fast_model(config, provider_name, provider_registry),
         "sub_agent" | "subagent" => {
-            resolve_subagent_model(config, provider_name, provider_registry, provider_name)
+            resolve_subagent_model(config, provider_name, provider_registry, subagent_type)
         }
         "background" | "memory_background" => {
             resolve_background_model(config, provider_name, provider_registry)
@@ -1118,7 +1121,7 @@ mod tests {
             tier: Some("fast".to_string()),
             model_ref: Some("openai/gpt-explicit".to_string()),
         };
-        let resolved = resolve_model(&hint, "openai", &config, &test_registry())
+        let resolved = resolve_model(&hint, "", "openai", &config, &test_registry())
             .expect("model_ref should resolve");
         assert_eq!(resolved.model_name, "gpt-explicit");
     }
@@ -1130,7 +1133,7 @@ mod tests {
             tier: Some("fast".to_string()),
             model_ref: None,
         };
-        let resolved = resolve_model(&hint, "openai", &config, &test_registry())
+        let resolved = resolve_model(&hint, "", "openai", &config, &test_registry())
             .expect("tier should resolve");
         assert_eq!(resolved.model_name, "gpt-fast");
     }
@@ -1139,7 +1142,7 @@ mod tests {
     fn resolve_model_falls_back_when_hint_empty() {
         let config = precedence_config();
         let hint = ModelHint::default();
-        let resolved = resolve_model(&hint, "openai", &config, &test_registry())
+        let resolved = resolve_model(&hint, "", "openai", &config, &test_registry())
             .expect("fallback chain should resolve");
         // Fallback chain: subagent_models[type] → sub_agent → fast → chat.
         // sub_agent is set, so it wins.
@@ -1154,8 +1157,37 @@ mod tests {
             tier: None,
             model_ref: Some("gpt-bare".to_string()),
         };
-        let resolved = resolve_model(&hint, "openai", &config, &test_registry())
+        let resolved = resolve_model(&hint, "", "openai", &config, &test_registry())
             .expect("bare model_ref should resolve via inferred provider");
         assert_eq!(resolved.model_name, "gpt-bare");
+    }
+
+    #[test]
+    fn resolve_model_honors_per_subagent_override_keyed_by_type() {
+        // Regression for the subagent_type-vs-provider_name mixup: the fallback
+        // chain must look up `subagent_models` by the subagent TYPE, not by the
+        // provider name.
+        let mut config = precedence_config();
+        config
+            .defaults
+            .as_mut()
+            .unwrap()
+            .subagent_models
+            .insert(
+                "researcher".to_string(),
+                ProviderModelRef::new("openai", "gpt-researcher"),
+            );
+        let hint = ModelHint::default();
+
+        // Matching subagent_type → per-subagent override wins over sub_agent.
+        let resolved = resolve_model(&hint, "researcher", "openai", &config, &test_registry())
+            .expect("subagent override should resolve");
+        assert_eq!(resolved.model_name, "gpt-researcher");
+
+        // Non-matching type → falls through to sub_agent (proves the key is the
+        // type, not the provider name "openai").
+        let other = resolve_model(&hint, "nonexistent", "openai", &config, &test_registry())
+            .expect("fallback should resolve");
+        assert_eq!(other.model_name, "gpt-sub-agent");
     }
 }

@@ -192,9 +192,10 @@ impl AgentBuilder {
     /// 6. provider via `create_provider_with_dir`
     /// 7. `BuiltinToolExecutor::new_with_config` → `default_tools`
     ///
-    /// Pre-injected dependencies (via [`provider`](Self::provider) etc.) take
-    /// precedence — the engine builder keeps the last value set, and these
-    /// defaults are applied first.
+    /// The engine builder is last-write-wins, so this method does NOT preserve
+    /// dependencies set before it. Call `with_defaults_for_data_dir` FIRST, then
+    /// override individual dependencies (e.g. [`provider`](Self::provider)) AFTER
+    /// it to make those overrides take precedence.
     pub async fn with_defaults_for_data_dir(mut self, data_dir: PathBuf) -> Result<Self, String> {
         // 1. Config.
         let mut config = Config::from_data_dir(Some(data_dir.clone()));

@@ -26,7 +26,14 @@ use crate::runtime::execution::spawn::{
 };
 use crate::runtime::ExecuteRequest;
 
-/// Execute a single child spawn job end-to-end.
+/// Launch a single child spawn job.
+///
+/// This sets up the child run and **spawns the actual execution onto a
+/// background task**, returning `Ok(())` once the run has been *started* — not
+/// when it completes. Completion (and persistence finalize) is observed via the
+/// `SubAgentCompleted` event on the parent stream, not via this return value.
+/// `Err` is only returned for synchronous setup failures (e.g. child session
+/// not found) before the background task is spawned.
 ///
 /// Preserves EXACTLY the canonical behavior:
 /// - `SubAgentStarted` is emitted by the *adapter* before enqueue (not here).

@@ -180,13 +180,17 @@ impl Agent {
     ) -> Result<(), AgentError> {
         // Apply the role system prompt as the session's leading System message
         // (the engine extracts the system prompt from the session messages).
+        // The builder's prompt is AUTHORITATIVE: it replaces an existing leading
+        // System message rather than deferring to it, so a caller-supplied
+        // session can't silently shadow the configured profile/instruction.
         if let Some(prompt) = self.system_prompt.as_ref() {
-            if !session
+            match session
                 .messages
-                .iter()
-                .any(|m| matches!(m.role, Role::System))
+                .iter_mut()
+                .find(|m| matches!(m.role, Role::System))
             {
-                session.messages.insert(0, Message::system(prompt.clone()));
+                Some(existing) => *existing = Message::system(prompt.clone()),
+                None => session.messages.insert(0, Message::system(prompt.clone())),
             }
         }
 
