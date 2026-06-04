@@ -161,7 +161,9 @@ pub fn build_blob_split_prompt(title: &str, body: &str) -> String {
     prompt.push_str("- Each piece must capture exactly ONE atomic fact/decision/preference. Never combine unrelated facts.\n");
     prompt.push_str("- The title must concisely summarize that piece's own content so it is findable by keyword search.\n");
     prompt.push_str("- Preserve the original wording of each fact; do not invent facts. Drop only exact duplicates.\n");
-    prompt.push_str("- If the memory is actually a single coherent fact, return exactly one piece.\n\n");
+    prompt.push_str(
+        "- If the memory is actually a single coherent fact, return exactly one piece.\n\n",
+    );
     prompt.push_str("## Memory\n");
     prompt.push_str(&format!("- title: {title}\n"));
     prompt.push_str("- body:\n```md\n");

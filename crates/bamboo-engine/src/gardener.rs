@@ -23,7 +23,6 @@ use crate::auto_dream::AutoDreamContext;
 
 const GARDENER_TRACING_TARGET: &str = "bamboo.gardener";
 const GARDENER_RUNTIME_SESSION_ID: &str = "__gardener__";
-const GARDENER_FALLBACK_INTERVAL_SECS: u64 = 86_400;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GardenerRunResult {
@@ -88,7 +87,12 @@ fn resolve_background_model(
             .defaults
             .as_ref()
             .and_then(|d| d.memory_background.as_ref())
-            .or_else(|| config_snapshot.defaults.as_ref().and_then(|d| d.fast.as_ref()))
+            .or_else(|| {
+                config_snapshot
+                    .defaults
+                    .as_ref()
+                    .and_then(|d| d.fast.as_ref())
+            })
     } else {
         None
     };
@@ -253,7 +257,11 @@ pub fn spawn_gardener_task(ctx: AutoDreamContext) {
             .as_ref()
             .map(|memory| memory.gardener_interval_secs)
             .filter(|secs| *secs > 0)
-            .unwrap_or(GARDENER_FALLBACK_INTERVAL_SECS);
+            // Fall back to the config default (single source of truth for "daily")
+            // when memory config is absent or the interval was set to 0.
+            .unwrap_or_else(|| {
+                bamboo_infrastructure::config::MemoryConfig::default().gardener_interval_secs
+            });
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             ticker.tick().await;
@@ -281,9 +289,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use bamboo_agent_core::storage::Storage;
-    use bamboo_infrastructure::{
-        LLMError, LLMStream, ProviderRegistry, SessionStoreV2,
-    };
+    use bamboo_infrastructure::{LLMError, LLMStream, ProviderRegistry, SessionStoreV2};
     use bamboo_memory::memory_store::DurableMemoryType;
 
     #[derive(Clone)]
@@ -326,7 +332,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         bamboo_infrastructure::paths::init_bamboo_dir(temp.path().to_path_buf());
 
-        let session_store = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await.unwrap());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![
             "{\"pieces\":[{\"title\":\"Fact one\",\"type\":\"user\",\"content\":\"Fact one body.\",\"tags\":[]},{\"title\":\"Fact two\",\"type\":\"reference\",\"content\":\"Fact two body.\",\"tags\":[]}]}".to_string(),
@@ -377,15 +387,26 @@ mod tests {
         let result = run_gardener_once(&ctx).await.unwrap().unwrap();
         assert_eq!(result.split, 1);
 
-        let source = memory.get_memory(&blob.frontmatter.id, None).await.unwrap().unwrap();
-        assert_eq!(source.frontmatter.status, bamboo_memory::memory_store::DurableMemoryStatus::Superseded);
+        let source = memory
+            .get_memory(&blob.frontmatter.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source.frontmatter.status,
+            bamboo_memory::memory_store::DurableMemoryStatus::Superseded
+        );
     }
 
     #[tokio::test]
     async fn gardener_is_noop_when_disabled() {
         let temp = tempfile::tempdir().expect("tempdir");
         bamboo_infrastructure::paths::init_bamboo_dir(temp.path().to_path_buf());
-        let session_store = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await.unwrap());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![]));
         let config = Arc::new(RwLock::new(Config::default()));

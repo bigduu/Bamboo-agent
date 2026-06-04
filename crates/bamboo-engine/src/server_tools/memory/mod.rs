@@ -140,8 +140,13 @@ impl Tool for MemoryTool {
             .trim()
             .to_ascii_lowercase();
         match action.as_str() {
-            "session_read" | "session_list_topics" | "query" | "get" | "find_duplicates"
-            | "scan_blobs" | "inspect" => bamboo_tools::ToolMutability::ReadOnly,
+            "session_read"
+            | "session_list_topics"
+            | "query"
+            | "get"
+            | "find_duplicates"
+            | "scan_blobs"
+            | "inspect" => bamboo_tools::ToolMutability::ReadOnly,
             _ => bamboo_tools::ToolMutability::Mutating,
         }
     }

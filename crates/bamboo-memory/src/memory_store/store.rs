@@ -7,9 +7,6 @@ use tokio::fs;
 use bamboo_agent_core::workspace_state;
 
 use super::{
-    BlobScanItem, BlobScanReport,
-};
-use super::{
     build_dream_view, build_memory_markdown_view, build_recent_markdown_view,
     build_stale_markdown_view, derive_summary, detect_entities, extract_keywords,
     make_query_cursor, match_memory_query, normalize_tags, now_rfc3339, parse_markdown_document,
@@ -17,16 +14,15 @@ use super::{
     short_stable_hash, sort_memories_desc, validate_memory_title, validate_session_id,
     validate_session_topic, AuditLogEntry, GraphIndex, GraphIndexItem, LexicalIndex,
     LexicalIndexItem, MemoryContradictionResult, MemoryDuplicateCandidate, MemoryInspectResult,
-    MemoryMergeResult,
-    MemoryPathResolver, MemoryPurgeResult, MemoryQueryItem, MemoryQueryOptions, MemoryQueryResult,
-    MemorySplitPiece, MemorySplitResult, RecentIndex, RecentIndexItem, StaleCandidateItem,
-    StaleCandidatesIndex, TaxonomyIndex,
-    CONTRADICTION_AUDIT_LOG, DEFAULT_MAX_CHARS, DEFAULT_QUERY_LIMIT, DEFAULT_SESSION_TOPIC,
-    DREAM_VIEW_FILE, GRAPH_INDEX_FILE, LEXICAL_INDEX_FILE, MAX_MAX_CHARS, MAX_QUERY_LIMIT,
-    MEMORY_SCHEMA_VERSION, MEMORY_VIEW_FILE, MERGE_AUDIT_LOG, PURGE_AUDIT_LOG, RECENT_INDEX_FILE,
-    RECENT_VIEW_FILE, STALE_CANDIDATES_INDEX_FILE, STALE_VIEW_FILE, TAXONOMY_INDEX_FILE,
-    WRITE_AUDIT_LOG,
+    MemoryMergeResult, MemoryPathResolver, MemoryPurgeResult, MemoryQueryItem, MemoryQueryOptions,
+    MemoryQueryResult, MemorySplitPiece, MemorySplitResult, RecentIndex, RecentIndexItem,
+    StaleCandidateItem, StaleCandidatesIndex, TaxonomyIndex, CONTRADICTION_AUDIT_LOG,
+    DEFAULT_MAX_CHARS, DEFAULT_QUERY_LIMIT, DEFAULT_SESSION_TOPIC, DREAM_VIEW_FILE,
+    GRAPH_INDEX_FILE, LEXICAL_INDEX_FILE, MAX_MAX_CHARS, MAX_QUERY_LIMIT, MEMORY_SCHEMA_VERSION,
+    MEMORY_VIEW_FILE, MERGE_AUDIT_LOG, PURGE_AUDIT_LOG, RECENT_INDEX_FILE, RECENT_VIEW_FILE,
+    STALE_CANDIDATES_INDEX_FILE, STALE_VIEW_FILE, TAXONOMY_INDEX_FILE, WRITE_AUDIT_LOG,
 };
+use super::{BlobScanItem, BlobScanReport};
 use super::{
     CreatedBy, DurableMemoryDocument, DurableMemoryFrontmatter, DurableMemoryRelations,
     DurableMemoryRetrieval, DurableMemorySource, DurableMemoryStatus, DurableMemoryType,
@@ -39,6 +35,20 @@ use super::{
 /// structurally impossible for a memory to grow into a multi-topic / transcript
 /// "blob". Purely deterministic — no model or embedding involved.
 const MAX_DURABLE_MEMORY_BODY_CHARS: usize = 4000;
+
+/// Separator inserted between accreted sections of a durable memory body. The
+/// merge/append paths write it and the blob prefilter counts it, so both always
+/// agree on what an "accretion" is.
+const MEMORY_SECTION_SEPARATOR: &str = "\n\n---\n\n";
+
+/// Projected body length (chars) after appending `content` to `body` with the
+/// section separator. Mirrors the real append, which trims trailing whitespace
+/// first, so the structural blob guard estimates exactly, not conservatively.
+fn projected_merged_body_chars(body: &str, content: &str) -> usize {
+    body.trim_end().chars().count()
+        + MEMORY_SECTION_SEPARATOR.chars().count()
+        + content.chars().count()
+}
 
 #[derive(Debug, Clone)]
 pub struct MemoryStore {
@@ -576,12 +586,17 @@ impl MemoryStore {
                 // create a new atomic memory instead.
                 .filter(|existing| {
                     existing.body.contains(content)
-                        || existing.body.chars().count() + 9 + content.chars().count()
+                        || projected_merged_body_chars(&existing.body, content)
                             <= MAX_DURABLE_MEMORY_BODY_CHARS
                 })
             {
                 if !existing.body.contains(content) {
-                    existing.body = format!("{}\n\n---\n\n{}", existing.body.trim_end(), content);
+                    existing.body = format!(
+                        "{}{}{}",
+                        existing.body.trim_end(),
+                        MEMORY_SECTION_SEPARATOR,
+                        content
+                    );
                 }
                 existing.frontmatter.updated_at = now_rfc3339();
                 existing.frontmatter.updated_by = CreatedBy {
@@ -792,22 +807,11 @@ impl MemoryStore {
         let source_confidence = source.frontmatter.confidence.clone();
         let source_sources = source.frontmatter.sources.clone();
 
+        // Pieces were fully validated above; this pass only persists them.
         let mut new_ids = Vec::with_capacity(pieces.len());
         for piece in pieces {
             let title = validate_memory_title(&piece.title)?;
             let content = piece.content.trim();
-            if content.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "split piece content cannot be empty",
-                ));
-            }
-            if content.chars().count() > MAX_DURABLE_MEMORY_BODY_CHARS {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "split piece exceeds the durable memory size cap; make each piece a single atomic fact",
-                ));
-            }
             let r#type = piece.r#type.unwrap_or(source_type);
             let tags = normalize_tags(piece.tags.iter().map(String::as_str));
 
@@ -860,8 +864,13 @@ impl MemoryStore {
             new_ids.push(new_id);
         }
 
-        self.set_memory_status(&mut source, DurableMemoryStatus::Superseded, "memory_split", actor)
-            .await?;
+        self.set_memory_status(
+            &mut source,
+            DurableMemoryStatus::Superseded,
+            "memory_split",
+            actor,
+        )
+        .await?;
 
         self.append_audit(
             scope,
@@ -971,7 +980,11 @@ impl MemoryStore {
             .into_iter()
             .filter(|doc| doc.frontmatter.status == DurableMemoryStatus::Active)
             .filter_map(|doc| {
-                let appended_sections = doc.body.split("\n\n---\n\n").count().saturating_sub(1);
+                let appended_sections = doc
+                    .body
+                    .split(MEMORY_SECTION_SEPARATOR)
+                    .count()
+                    .saturating_sub(1);
                 let body_chars = doc.body.chars().count();
                 let over_cap = body_chars > MAX_DURABLE_MEMORY_BODY_CHARS;
                 if appended_sections >= min_appended_sections || over_cap {
@@ -1208,15 +1221,18 @@ impl MemoryStore {
             // Structural guard: an explicit merge must not grow a memory into a blob.
             // Fail loudly so the caller consolidates/rewrites into a single coherent
             // statement or creates a separate memory instead of appending.
-            if doc.body.chars().count() + 9 + content.chars().count()
-                > MAX_DURABLE_MEMORY_BODY_CHARS
-            {
+            if projected_merged_body_chars(&doc.body, content) > MAX_DURABLE_MEMORY_BODY_CHARS {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "merge would exceed the durable memory size cap; consolidate the memory into one coherent statement or create a separate memory instead of appending",
                 ));
             }
-            doc.body = format!("{}\n\n---\n\n{}", doc.body.trim_end(), content);
+            doc.body = format!(
+                "{}{}{}",
+                doc.body.trim_end(),
+                MEMORY_SECTION_SEPARATOR,
+                content
+            );
             changed = true;
             appended = true;
         }
@@ -2233,6 +2249,101 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(source.frontmatter.status, DurableMemoryStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn explicit_merge_over_cap_fails_loudly_without_appending() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        let near_cap = "x".repeat(MAX_DURABLE_MEMORY_BODY_CHARS - 20);
+        let existing = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::User,
+                "near cap memory",
+                &near_cap,
+                &[],
+                Some("s1"),
+                "test",
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Appending anything non-trivial would push the body past the cap.
+        let result = store
+            .merge_memory(
+                &existing.frontmatter.id,
+                None,
+                "a second unrelated fact that does not fit",
+                &[],
+                Some("s1"),
+                "test",
+                &[],
+            )
+            .await;
+        assert!(result.is_err());
+
+        // The body must be exactly what it was — no partial append.
+        let after = store
+            .get_memory(&existing.frontmatter.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.body, near_cap);
+    }
+
+    #[tokio::test]
+    async fn auto_merge_over_cap_creates_new_atomic_memory_instead_of_appending() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        let near_cap = "x".repeat(MAX_DURABLE_MEMORY_BODY_CHARS - 20);
+        let first = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::User,
+                "shared title",
+                &near_cap,
+                &[],
+                Some("s1"),
+                "test",
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Same title/type → would normally auto-merge, but the append would exceed
+        // the cap, so the structural guard must fall through to a NEW memory.
+        let second = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::User,
+                "shared title",
+                "a distinct second fact",
+                &[],
+                Some("s1"),
+                "test",
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(
+            second.frontmatter.id, first.frontmatter.id,
+            "over-cap auto-merge must create a separate memory, not append"
+        );
+        // The original body is untouched (no `---` accretion).
+        let original = store
+            .get_memory(&first.frontmatter.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.body, near_cap);
     }
 
     #[tokio::test]
