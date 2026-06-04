@@ -42,10 +42,8 @@
 
 use std::path::PathBuf;
 
-
 pub mod error;
 
-// Placeholder modules (will be populated during migration)
 pub mod agent;
 pub mod commands;
 
@@ -60,6 +58,10 @@ pub use bamboo_infrastructure as core;
 
 // Re-export infrastructure crate so consumers can access config, paths, encryption, etc.
 // via `bamboo_agent::infrastructure::...`
+//
+// `Agent` / `AgentBuilder` come from the ergonomic `agent` wrappers (the single
+// source of truth; resolves TD-2 — no more duplicate re-export through
+// `bamboo_engine`).
 pub use agent::{Agent, AgentBuilder};
 pub use bamboo_infrastructure as infrastructure;
 

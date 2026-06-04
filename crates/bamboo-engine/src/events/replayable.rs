@@ -63,4 +63,3 @@ pub async fn publish_replayable_session_event(
     let sender = ctx.get_session_event_sender(session_id).await;
     let _ = sender.send(event);
 }
-

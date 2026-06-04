@@ -63,6 +63,14 @@ impl ToolRegistry {
         self.tools.register(tool)
     }
 
+    /// Register an already-shared tool (`Arc<dyn Tool>`) without a guide.
+    ///
+    /// Useful when assembling a registry from pre-built tool instances (e.g.
+    /// the SDK builder's selected tool set).
+    pub fn register_shared(&self, tool: SharedTool) -> Result<(), RegistryError> {
+        self.tools.register_shared(tool)
+    }
+
     /// Register a tool with its guide
     pub fn register_with_guide<T, G>(&self, tool: T, guide: G) -> Result<(), RegistryError>
     where

@@ -353,7 +353,12 @@ pub(super) async fn handle_search(
     let max_matches = max_matches.unwrap_or(50).min(200);
 
     if !case_sensitive {
-        match tool.session_store.search_index().search(q, max_matches).await {
+        match tool
+            .session_store
+            .search_index()
+            .search(q, max_matches)
+            .await
+        {
             Ok(fts_matches) if !fts_matches.is_empty() => {
                 let matches = fts_matches
                     .into_iter()

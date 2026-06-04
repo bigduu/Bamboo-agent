@@ -160,7 +160,9 @@ fn test_gold_config() -> GoldConfig {
     }
 }
 
-fn awaiting_clarification_state(run_id: &str) -> bamboo_domain::session::runtime_state::AgentRuntimeState {
+fn awaiting_clarification_state(
+    run_id: &str,
+) -> bamboo_domain::session::runtime_state::AgentRuntimeState {
     use bamboo_domain::session::runtime_state::{
         AgentRuntimeState, AgentStatusState, SuspensionState,
     };
@@ -228,8 +230,9 @@ async fn gold_auto_answer_conclusion_with_options_full_loop() {
             .await
             .expect("app state");
     app_state.provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), String::new()));
-    app_state.provider_router =
-        Arc::new(ProviderModelRouter::new(app_state.provider_registry.clone()));
+    app_state.provider_router = Arc::new(ProviderModelRouter::new(
+        app_state.provider_registry.clone(),
+    ));
     let state = Data::new(app_state);
 
     let session_id = "gold-auto-answer-conclusion-full-loop";
@@ -325,8 +328,9 @@ async fn gold_auto_answer_exit_plan_mode_full_loop() {
             .await
             .expect("app state");
     app_state.provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), String::new()));
-    app_state.provider_router =
-        Arc::new(ProviderModelRouter::new(app_state.provider_registry.clone()));
+    app_state.provider_router = Arc::new(ProviderModelRouter::new(
+        app_state.provider_registry.clone(),
+    ));
     let state = Data::new(app_state);
 
     let session_id = "gold-auto-answer-exit-plan-mode-full-loop";

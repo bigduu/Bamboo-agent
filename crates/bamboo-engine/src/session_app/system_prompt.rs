@@ -4,9 +4,9 @@
 //! structured sections (workspace, instruction, env, skill, tool guide,
 //! external memory, task list) for observability and diagnostics.
 
+use crate::runner::read_prompt_snapshot;
 use bamboo_agent_core::{parse_prompt_external_memory_sections, Session};
 use bamboo_domain::types::PromptSnapshot;
-use crate::runner::read_prompt_snapshot;
 
 // ---------------------------------------------------------------------------
 // Markers

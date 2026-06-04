@@ -11,10 +11,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::app_state::AppState;
-use bamboo_engine::model_areas::resolve_global_area_models;
-use bamboo_engine::model_config_helper::{resolve_planning_model, resolve_search_model};
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::tools::ToolSurface;
+use bamboo_engine::model_areas::resolve_global_area_models;
+use bamboo_engine::model_config_helper::{resolve_planning_model, resolve_search_model};
 
 use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::agent_spawn::SessionExecutionArgs;
@@ -101,7 +101,8 @@ pub(crate) fn make_auxiliary_model_resolver(
     Arc::new(move || {
         let config_snapshot = read_config_snapshot(&config, cached_config.as_ref());
         // Auxiliary models are global (config-derived), never session-bound.
-        let areas = resolve_global_area_models(&config_snapshot, &provider_name, &provider_registry);
+        let areas =
+            resolve_global_area_models(&config_snapshot, &provider_name, &provider_registry);
         let resolved_planning =
             resolve_planning_model(&config_snapshot, &provider_name, &provider_registry);
         let resolved_search =

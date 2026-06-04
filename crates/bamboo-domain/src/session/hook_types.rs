@@ -2,7 +2,7 @@
 //!
 //! These types define the contract between the agent loop and its
 //! extension points.  The trait itself (`AgentHook`) lives in
-//! `bamboo-application-agent` because it depends on `Session`.
+//! `bamboo-engine` because it depends on `Session`.
 
 use serde::{Deserialize, Serialize};
 

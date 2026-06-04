@@ -26,16 +26,16 @@ const MAX_SHORT_LINE_RUN: usize = 10;
 const SHORT_LINE_THRESHOLD: usize = 40;
 
 /// Matches common web noise patterns (nav, footer, cookie, etc.)
-static WEB_NOISE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+static WEB_NOISE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
     r"(?i)(?:cookie(?:s?\s+(?:policy|settings|preferences|notice))|privacy\s+policy|terms\s+(?:of\s+(?:use|service))|all\s+rights?\s+reserved|©\s*\d{4}|powered\s+by|sign\s+(?:in|up)\s+(?:with|to)|(?:follow|share|tweet|like)\s+(?:us|on)|loading\.{3}|skip\s+to\s+(?:main\s+)?content)"
-).expect("web noise regex"));
-
+).expect("web noise regex")
+});
 
 /// Matches breadcrumb-style navigation: `Home > Products > Widgets`
-static BREADCRUMB_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^(?:\w[\w\s]+\s*(?:>|›|»|/)\s*){2,}"
-).expect("breadcrumb regex"));
-
+static BREADCRUMB_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(?:\w[\w\s]+\s*(?:>|›|»|/)\s*){2,}").expect("breadcrumb regex")
+});
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
 

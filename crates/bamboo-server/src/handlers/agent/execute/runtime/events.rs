@@ -86,8 +86,7 @@ pub(crate) fn spawn_event_forwarder(
             // now happens INSIDE the runner loop's terminal gate (see
             // bamboo-engine `evaluate_gold_terminal`) so the run emits a single
             // terminal `Complete` and the frontend never gets stuck mid-settle.
-            let resume_port =
-                crate::app_state::resume_adapter::AppStateResumeRef(state.clone());
+            let resume_port = crate::app_state::resume_adapter::AppStateResumeRef(state.clone());
             let auto_answer_outcome = maybe_auto_answer_pending_question(
                 state.get_ref(),
                 &resume_port,
@@ -578,7 +577,13 @@ mod tests {
 
         let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
         let (session_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
-        spawn_event_forwarder(state.clone(), session_id.to_string(), mpsc_rx, session_tx, None);
+        spawn_event_forwarder(
+            state.clone(),
+            session_id.to_string(),
+            mpsc_rx,
+            session_tx,
+            None,
+        );
 
         // A durable change event...
         mpsc_tx.send(task_list_updated()).await.unwrap();

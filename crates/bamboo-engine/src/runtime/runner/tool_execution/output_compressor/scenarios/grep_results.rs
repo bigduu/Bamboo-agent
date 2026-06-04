@@ -23,14 +23,12 @@ const MAX_MATCHES_PER_FILE: usize = 15;
 
 /// Matches grep output with file path: `path/to/file.rs:42:matched text`
 /// or `path/to/file.rs-42-context line`
-static GREP_FILE_LINE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"^(\S+?)[:]\d+[:-]"
-).expect("grep file line regex"));
+static GREP_FILE_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\S+?)[:]\d+[:-]").expect("grep file line regex"));
 
 /// Extracts the line number from grep output: `path/to/file.rs:42:matched`
-static GREP_LINE_NUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"^\S+?[:](\d+)[:-]"
-).expect("grep line number regex"));
+static GREP_LINE_NUM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\S+?[:](\d+)[:-]").expect("grep line number regex"));
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
 

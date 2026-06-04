@@ -25,15 +25,15 @@ use bamboo_infrastructure::{Config, ProviderModelRouter, ProviderRegistry};
 use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
 
-use bamboo_engine::model_areas::resolve_global_area_models;
-use bamboo_engine::model_config_helper::{
-    resolve_fast_model, resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
-};
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::session_app::resume::{
     resume_session_execution, ResumeExecutionPort, ResumeSpawnRequest,
 };
 use crate::session_app::types::{ResumeConfigSnapshot, ResumeOutcome};
+use bamboo_engine::model_areas::resolve_global_area_models;
+use bamboo_engine::model_config_helper::{
+    resolve_fast_model, resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
+};
 
 const AGENT_RUNTIME_STATE_METADATA_KEY: &str = "agent.runtime.state";
 const RUNTIME_RESUME_MESSAGE_HIDDEN_KEY: &str = "hidden_from_ui";
@@ -250,7 +250,10 @@ impl ChildCompletionCoordinator {
             provider_type,
             fast_model: areas.fast.as_ref().map(|model| model.model_name.clone()),
             fast_model_ref: areas.fast_ref.clone(),
-            background_model: areas.background.as_ref().map(|model| model.model_name.clone()),
+            background_model: areas
+                .background
+                .as_ref()
+                .map(|model| model.model_name.clone()),
             background_model_ref: areas.background_ref.clone(),
             background_model_provider: areas.background.map(|model| model.provider),
             summarization_model: areas

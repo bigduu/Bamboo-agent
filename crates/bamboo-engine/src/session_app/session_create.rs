@@ -243,8 +243,8 @@ mod tests {
         };
         let session = build_new_session(&input, &default_config());
 
-        let snapshot = crate::runner::read_prompt_snapshot(&session)
-            .expect("prompt snapshot should exist");
+        let snapshot =
+            crate::runner::read_prompt_snapshot(&session).expect("prompt snapshot should exist");
         assert_eq!(snapshot.base_system_prompt, "Custom prompt");
         assert_eq!(snapshot.effective_system_prompt, "Custom prompt");
     }

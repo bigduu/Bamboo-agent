@@ -1,13 +1,13 @@
-use bamboo_agent_core::GoldDecision;
 use crate::config::GoldConfig;
+use bamboo_agent_core::GoldDecision;
 
 use crate::app_context::AgentSessionContext;
 use crate::events::publish_replayable_session_event;
+use crate::model_config_helper::{resolve_gold_config, GOLD_CONFIG_METADATA_KEY};
 use crate::session_app::repository::SessionAccess;
 use crate::session_app::respond::{submit_pending_response_with_source, ResponseSource};
 use crate::session_app::resume::{resume_session_execution, ResumeExecutionPort};
 use crate::session_app::types::{RespondInput, ResumeOutcome};
-use crate::model_config_helper::{resolve_gold_config, GOLD_CONFIG_METADATA_KEY};
 
 mod decision;
 mod evaluation;
@@ -101,26 +101,22 @@ where
         };
     }
 
-    let state_evaluation = match evaluate_gold_state_for_pending_question(
-        state,
-        session_id,
-        &session,
-        &gold_config,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %error,
-                "Gold auto-answer skipped because Gold state evaluation failed"
-            );
-            return GoldAutoAnswerOutcome::Skipped {
-                reason: format!("state_evaluation_failed:{error}"),
-            };
-        }
-    };
+    let state_evaluation =
+        match evaluate_gold_state_for_pending_question(state, session_id, &session, &gold_config)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %error,
+                    "Gold auto-answer skipped because Gold state evaluation failed"
+                );
+                return GoldAutoAnswerOutcome::Skipped {
+                    reason: format!("state_evaluation_failed:{error}"),
+                };
+            }
+        };
 
     if !state_evaluation
         .confidence
@@ -216,12 +212,7 @@ where
     };
 
     let (updated_session, _submitted_answer, plan_mode_transition) =
-        match submit_pending_response_with_source(
-            state,
-            respond_input,
-            ResponseSource::Gold,
-        )
-        .await
+        match submit_pending_response_with_source(state, respond_input, ResponseSource::Gold).await
         {
             Ok(result) => result,
             Err(error) => {
@@ -241,11 +232,8 @@ where
     }
 
     let resume_config =
-        build_resume_config_snapshot(state, &updated_session, Some(gold_config.clone()))
-            .await;
-    let resume_outcome =
-        resume_session_execution(resume_port, session_id, resume_config)
-            .await;
+        build_resume_config_snapshot(state, &updated_session, Some(gold_config.clone())).await;
+    let resume_outcome = resume_session_execution(resume_port, session_id, resume_config).await;
 
     tracing::info!(
         session_id = %session_id,

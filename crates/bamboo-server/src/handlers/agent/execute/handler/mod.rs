@@ -9,12 +9,12 @@ use super::runtime::{
 };
 use super::{ExecuteRequest, ExecuteSyncInfo, ExecuteSyncReason};
 use crate::app_state::AppState;
+use crate::session_app::provider_model::session_effective_model_ref;
 use bamboo_engine::model_areas::resolve_global_area_models;
 use bamboo_engine::model_config_helper::{
     get_default_model_for_provider, get_reasoning_effort_for_provider, resolve_gold_config,
     resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
 };
-use crate::session_app::provider_model::session_effective_model_ref;
 
 use self::response::{
     already_running_response, bad_request_error_response, completed_response,

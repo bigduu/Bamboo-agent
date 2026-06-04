@@ -3,12 +3,156 @@
 
 use std::sync::Arc;
 
-use bamboo_domain::reasoning::ReasoningEffort;
 use crate::config::GoldConfig;
+use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_domain::subagent::ModelHint;
 use bamboo_infrastructure::Config;
 use bamboo_infrastructure::{LLMError, ProviderModelRouter, ProviderRegistry, ResolvedModel};
 
 pub const GOLD_CONFIG_METADATA_KEY: &str = "gold_config";
+
+/// Infer the underlying provider type from a bare model name.
+///
+/// This is the single, canonical place that maps a model-name string to a
+/// provider type. Centralising it here (TD-3) keeps the scattered
+/// `claude*`/`gpt*`/`gemini*` pattern matches from drifting apart.
+///
+/// Mapping:
+/// - `claude*` → `anthropic`
+/// - `gpt*` or an OpenAI o-series name (`o1`, `o3`, `o4-mini`, ...) → `openai`
+/// - `gemini*` → `gemini`
+/// - anything else → `None`
+///
+/// The match is case-insensitive and ignores surrounding whitespace.
+pub fn infer_provider(model_name: &str) -> Option<String> {
+    let name = model_name.trim().to_ascii_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+
+    if name.starts_with("claude") {
+        return Some("anthropic".to_string());
+    }
+    if name.starts_with("gpt") || is_openai_o_series(&name) {
+        return Some("openai".to_string());
+    }
+    if name.starts_with("gemini") {
+        return Some("gemini".to_string());
+    }
+    None
+}
+
+/// Whether a (already lower-cased) model name looks like an OpenAI o-series
+/// reasoning model: an `o` immediately followed by a digit (`o1`, `o3-mini`,
+/// `o4-mini`, ...).
+fn is_openai_o_series(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some('o')) && matches!(chars.next(), Some(c) if c.is_ascii_digit())
+}
+
+/// Resolve a [`ModelHint`] into a concrete provider + model, honouring the
+/// precedence **`model_ref` > `tier` > fallback chain**.
+///
+/// 1. `model_hint.model_ref` — an explicit pin. Accepts either a
+///    `provider/model` pair or a bare model name (provider inferred via
+///    [`infer_provider`], falling back to `provider_name`). Routed through the
+///    registry when possible so the returned [`ResolvedModel`] carries a live
+///    provider handle.
+/// 2. `model_hint.tier` — a named tier (`fast`, `chat`, `sub_agent`,
+///    `background`/`memory_background`, `task_summary`, `vision`, `planning`,
+///    `search`, `code_review`). Resolved via the existing tier resolvers.
+/// 3. Fallback chain — `subagent_models[subagent_type]` → `sub_agent` →
+///    `fast` → `chat`, via [`resolve_subagent_model`]. `subagent_type` is the
+///    profile id (e.g. `"researcher"`); pass `""` when not resolving for a
+///    specific subagent.
+///
+/// Returns `None` when nothing in the chain resolves.
+pub fn resolve_model(
+    model_hint: &ModelHint,
+    subagent_type: &str,
+    provider_name: &str,
+    config: &Config,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Option<ResolvedModel> {
+    // 1. Explicit model_ref wins.
+    if let Some(model_ref) = model_hint
+        .model_ref
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let (provider, model) = match model_ref.split_once('/') {
+            Some((p, m)) if !p.trim().is_empty() && !m.trim().is_empty() => {
+                (p.trim().to_string(), m.trim().to_string())
+            }
+            _ => {
+                let inferred =
+                    infer_provider(model_ref).unwrap_or_else(|| provider_name.to_string());
+                (inferred, model_ref.to_string())
+            }
+        };
+
+        let pmr = bamboo_domain::ProviderModelRef::new(provider.clone(), model.clone());
+        let resolved_provider = ProviderModelRouter::new(provider_registry.clone())
+            .route(&pmr)
+            .ok()
+            .or_else(|| provider_registry.get(&provider));
+        if let Some(resolved_provider) = resolved_provider {
+            return Some(ResolvedModel {
+                provider: resolved_provider,
+                model_name: model,
+            });
+        }
+        // Fall through to tier/fallback if the pinned provider is unavailable.
+    }
+
+    // 2. Named tier.
+    if let Some(tier) = model_hint
+        .tier
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(resolved) = resolve_tier_model(
+            tier,
+            subagent_type,
+            config,
+            provider_name,
+            provider_registry,
+        ) {
+            return Some(resolved);
+        }
+    }
+
+    // 3. Fallback chain (subagent_models[subagent_type] → sub_agent → fast → chat).
+    resolve_subagent_model(config, provider_name, provider_registry, subagent_type)
+}
+
+/// Resolve a named tier to a concrete model via the existing tier resolvers.
+fn resolve_tier_model(
+    tier: &str,
+    subagent_type: &str,
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Option<ResolvedModel> {
+    match tier.to_ascii_lowercase().as_str() {
+        "fast" => resolve_fast_model(config, provider_name, provider_registry),
+        "sub_agent" | "subagent" => {
+            resolve_subagent_model(config, provider_name, provider_registry, subagent_type)
+        }
+        "background" | "memory_background" => {
+            resolve_background_model(config, provider_name, provider_registry)
+        }
+        "task_summary" => resolve_task_summary_model(config, provider_name, provider_registry),
+        "vision" => resolve_vision_model(config, provider_name, provider_registry),
+        "planning" => resolve_planning_model(config, provider_name, provider_registry),
+        "search" => resolve_search_model(config, provider_name, provider_registry),
+        "code_review" => resolve_code_review_model(config, provider_name, provider_registry),
+        // `chat` and any unknown tier fall back to the default chat model.
+        _ => resolve_default_chat_model(config, provider_name, provider_registry),
+    }
+}
 
 /// Resolve the underlying provider type for a provider routing key.
 ///
@@ -822,17 +966,17 @@ mod tests {
                 ..Default::default()
             },
             defaults: Some(DefaultsConfig {
-            chat: ProviderModelRef::new("openai", "gpt-chat"),
-            fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
-            task_summary: None,
-            vision: None,
-            memory_background: None,
-            planning: None,
-            search: None,
-            code_review: None,
-            sub_agent: None,
-            subagent_models: HashMap::new(),
-        }),
+                chat: ProviderModelRef::new("openai", "gpt-chat"),
+                fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
+                task_summary: None,
+                vision: None,
+                memory_background: None,
+                planning: None,
+                search: None,
+                code_review: None,
+                sub_agent: None,
+                subagent_models: HashMap::new(),
+            }),
             ..Default::default()
         };
 
@@ -877,17 +1021,17 @@ mod tests {
                 ..Default::default()
             },
             defaults: Some(DefaultsConfig {
-            chat: ProviderModelRef::new("openai", "gpt-chat"),
-            fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
-            task_summary: None,
-            vision: None,
-            memory_background: None,
-            planning: None,
-            search: None,
-            code_review: None,
-            sub_agent: Some(ProviderModelRef::new("openai", "gpt-sub-agent")),
-            subagent_models: HashMap::new(),
-        }),
+                chat: ProviderModelRef::new("openai", "gpt-chat"),
+                fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
+                task_summary: None,
+                vision: None,
+                memory_background: None,
+                planning: None,
+                search: None,
+                code_review: None,
+                sub_agent: Some(ProviderModelRef::new("openai", "gpt-sub-agent")),
+                subagent_models: HashMap::new(),
+            }),
             ..Default::default()
         };
 
@@ -906,17 +1050,17 @@ mod tests {
                 ..Default::default()
             },
             defaults: Some(DefaultsConfig {
-            chat: ProviderModelRef::new("openai", "gpt-chat"),
-            fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
-            task_summary: None,
-            vision: None,
-            memory_background: None,
-            planning: None,
-            search: None,
-            code_review: None,
-            sub_agent: None,
-            subagent_models: HashMap::new(),
-        }),
+                chat: ProviderModelRef::new("openai", "gpt-chat"),
+                fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
+                task_summary: None,
+                vision: None,
+                memory_background: None,
+                planning: None,
+                search: None,
+                code_review: None,
+                sub_agent: None,
+                subagent_models: HashMap::new(),
+            }),
             ..Default::default()
         };
 
@@ -924,5 +1068,128 @@ mod tests {
             .expect("fast model should resolve");
 
         assert_eq!(resolved, ProviderModelRef::new("openai", "gpt-fast"));
+    }
+
+    // ---- S-T1.1: infer_provider mapping ----
+
+    #[test]
+    fn infer_provider_maps_known_families() {
+        // claude* → anthropic
+        assert_eq!(
+            infer_provider("claude-3-7-sonnet").as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(infer_provider("Claude-Opus").as_deref(), Some("anthropic"));
+        // gpt* → openai
+        assert_eq!(infer_provider("gpt-4o").as_deref(), Some("openai"));
+        assert_eq!(infer_provider("GPT-4o-mini").as_deref(), Some("openai"));
+        // o-series → openai
+        assert_eq!(infer_provider("o1").as_deref(), Some("openai"));
+        assert_eq!(infer_provider("o3-mini").as_deref(), Some("openai"));
+        assert_eq!(infer_provider("o4-mini").as_deref(), Some("openai"));
+        // gemini* → gemini
+        assert_eq!(infer_provider("gemini-1.5-pro").as_deref(), Some("gemini"));
+        // unknown / empty → None
+        assert_eq!(infer_provider("llama-3"), None);
+        assert_eq!(infer_provider("opus"), None); // no o-digit, not claude*
+        assert_eq!(infer_provider("  "), None);
+        assert_eq!(infer_provider(""), None);
+    }
+
+    // ---- S-T1.2: resolve_model precedence (model_ref > tier > fallback) ----
+
+    fn precedence_config() -> Config {
+        Config {
+            provider: "openai".to_string(),
+            features: bamboo_infrastructure::FeatureFlags {
+                provider_model_ref: true,
+                ..Default::default()
+            },
+            defaults: Some(DefaultsConfig {
+                chat: ProviderModelRef::new("openai", "gpt-chat"),
+                fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
+                task_summary: None,
+                vision: None,
+                memory_background: None,
+                planning: None,
+                search: None,
+                code_review: None,
+                sub_agent: Some(ProviderModelRef::new("openai", "gpt-sub-agent")),
+                subagent_models: HashMap::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_model_prefers_model_ref_over_tier_and_fallback() {
+        let config = precedence_config();
+        let hint = ModelHint {
+            tier: Some("fast".to_string()),
+            model_ref: Some("openai/gpt-explicit".to_string()),
+        };
+        let resolved = resolve_model(&hint, "", "openai", &config, &test_registry())
+            .expect("model_ref should resolve");
+        assert_eq!(resolved.model_name, "gpt-explicit");
+    }
+
+    #[test]
+    fn resolve_model_uses_tier_when_no_model_ref() {
+        let config = precedence_config();
+        let hint = ModelHint {
+            tier: Some("fast".to_string()),
+            model_ref: None,
+        };
+        let resolved = resolve_model(&hint, "", "openai", &config, &test_registry())
+            .expect("tier should resolve");
+        assert_eq!(resolved.model_name, "gpt-fast");
+    }
+
+    #[test]
+    fn resolve_model_falls_back_when_hint_empty() {
+        let config = precedence_config();
+        let hint = ModelHint::default();
+        let resolved = resolve_model(&hint, "", "openai", &config, &test_registry())
+            .expect("fallback chain should resolve");
+        // Fallback chain: subagent_models[type] → sub_agent → fast → chat.
+        // sub_agent is set, so it wins.
+        assert_eq!(resolved.model_name, "gpt-sub-agent");
+    }
+
+    #[test]
+    fn resolve_model_infers_provider_for_bare_model_ref() {
+        let config = precedence_config();
+        // Bare model name (no provider prefix); provider inferred as openai.
+        let hint = ModelHint {
+            tier: None,
+            model_ref: Some("gpt-bare".to_string()),
+        };
+        let resolved = resolve_model(&hint, "", "openai", &config, &test_registry())
+            .expect("bare model_ref should resolve via inferred provider");
+        assert_eq!(resolved.model_name, "gpt-bare");
+    }
+
+    #[test]
+    fn resolve_model_honors_per_subagent_override_keyed_by_type() {
+        // Regression for the subagent_type-vs-provider_name mixup: the fallback
+        // chain must look up `subagent_models` by the subagent TYPE, not by the
+        // provider name.
+        let mut config = precedence_config();
+        config.defaults.as_mut().unwrap().subagent_models.insert(
+            "researcher".to_string(),
+            ProviderModelRef::new("openai", "gpt-researcher"),
+        );
+        let hint = ModelHint::default();
+
+        // Matching subagent_type → per-subagent override wins over sub_agent.
+        let resolved = resolve_model(&hint, "researcher", "openai", &config, &test_registry())
+            .expect("subagent override should resolve");
+        assert_eq!(resolved.model_name, "gpt-researcher");
+
+        // Non-matching type → falls through to sub_agent (proves the key is the
+        // type, not the provider name "openai").
+        let other = resolve_model(&hint, "nonexistent", "openai", &config, &test_registry())
+            .expect("fallback should resolve");
+        assert_eq!(other.model_name, "gpt-sub-agent");
     }
 }

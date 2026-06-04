@@ -17,7 +17,9 @@ fn deletion(id: &str) -> AgentEvent {
 /// Record `n` durable events into the sink and wait until they are journaled.
 async fn seed(state: &AppState, n: u64) {
     for i in 1..=n {
-        state.account_sink.record(Some(&format!("s{i}")), &deletion(&format!("s{i}")));
+        state
+            .account_sink
+            .record(Some(&format!("s{i}")), &deletion(&format!("s{i}")));
     }
     // Wait for the single writer task to assign + journal all of them.
     for _ in 0..100 {
@@ -123,9 +125,12 @@ async fn stream_resume_delivers_only_events_after_cursor() {
 
     // 5 durable events, plus an ephemeral one that must never reach the feed.
     seed(&state, 5).await;
-    state
-        .account_sink
-        .record(Some("s1"), &AgentEvent::Token { content: "x".into() });
+    state.account_sink.record(
+        Some("s1"),
+        &AgentEvent::Token {
+            content: "x".into(),
+        },
+    );
 
     let app = test::init_service(
         App::new()

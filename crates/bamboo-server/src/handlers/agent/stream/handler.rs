@@ -41,9 +41,7 @@ pub async fn handler(
     let latest_at_start = state.account_sink.latest_seq();
     let events_dir = state.account_sink.events_dir().to_path_buf();
 
-    tracing::debug!(
-        "account feed subscription opened (since={since}, latest={latest_at_start})"
-    );
+    tracing::debug!("account feed subscription opened (since={since}, latest={latest_at_start})");
 
     let response: HttpResponse =
         account_feed_response(since, latest_at_start, events_dir, receiver);

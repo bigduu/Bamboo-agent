@@ -169,7 +169,7 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
             max_context_tokens: 400_000,
             max_output_tokens: 128,
         },
-        )
+    )
     .await
     .expect("execute llm stream");
 
@@ -280,7 +280,7 @@ async fn execute_llm_stream_emits_final_budget_event_with_stream_usage() {
             max_context_tokens: 400_000,
             max_output_tokens: 128,
         },
-        )
+    )
     .await
     .expect("execute llm stream");
 
@@ -365,7 +365,7 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
             max_context_tokens: 400_000,
             max_output_tokens: 128,
         },
-        )
+    )
     .await
     .expect("execute llm stream");
 
@@ -430,7 +430,10 @@ fn build_request_envelope_tails_volatile_context_and_sets_cache_breakpoints() {
     // Volatile task context is rendered and placed at the very tail, out of the
     // cacheable prefix.
     assert_eq!(envelope.volatile_context_messages.len(), 1);
-    let last = envelope.chat_messages.last().expect("chat messages present");
+    let last = envelope
+        .chat_messages
+        .last()
+        .expect("chat messages present");
     assert!(last.content.contains("context_type: task_snapshot"));
 
     // Plan caches system + tools and puts a rolling breakpoint on the last
@@ -490,7 +493,7 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
             max_context_tokens: 400_000,
             max_output_tokens: 128,
         },
-        )
+    )
     .await
     .expect("execute llm stream");
 
@@ -611,7 +614,7 @@ async fn execute_llm_stream_continuation_includes_external_memory_dynamic_block(
             max_context_tokens: 400_000,
             max_output_tokens: 128,
         },
-        )
+    )
     .await
     .expect("execute llm stream");
 
@@ -682,7 +685,7 @@ async fn execute_llm_stream_continuation_includes_plan_mode_and_runtime_dynamic_
             max_context_tokens: 400_000,
             max_output_tokens: 128,
         },
-        )
+    )
     .await
     .expect("execute llm stream");
 
@@ -766,7 +769,7 @@ async fn execute_llm_stream_keeps_previous_response_id_when_local_summary_or_com
             max_context_tokens: 400_000,
             max_output_tokens: 128,
         },
-        )
+    )
     .await
     .expect("execute llm stream");
 
@@ -862,7 +865,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
             max_context_tokens: 400_000,
             max_output_tokens: 128,
         },
-        )
+    )
     .await
     .expect("execute llm stream");
 
@@ -971,7 +974,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot_instance_p
             max_context_tokens: 400_000,
             max_output_tokens: 128,
         },
-        )
+    )
     .await
     .expect("execute llm stream");
 

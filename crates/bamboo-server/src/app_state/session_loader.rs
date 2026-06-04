@@ -127,8 +127,7 @@ impl AppState {
                 // memory wins). Only log when the two sources actually diverge —
                 // i.e. storage is preferred, or the message counts differ — since
                 // that is the only case worth investigating. Full detail at trace.
-                let diverged =
-                    prefer_storage || memory.messages.len() != storage.messages.len();
+                let diverged = prefer_storage || memory.messages.len() != storage.messages.len();
                 let chosen_len = if prefer_storage {
                     storage.messages.len()
                 } else {

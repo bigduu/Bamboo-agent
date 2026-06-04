@@ -1,7 +1,7 @@
 //! Condition predicates for workflow control flow.
 //!
 //! Pure data types — the `evaluate(&ToolResult)` method lives in
-//! bamboo-application-agent's composition module since it depends on
+//! bamboo-engine's composition module since it depends on
 //! the application-layer `ToolResult` type.
 
 use regex::Regex;

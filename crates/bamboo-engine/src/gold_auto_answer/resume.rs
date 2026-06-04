@@ -1,9 +1,9 @@
-use bamboo_agent_core::{AgentEvent, Session};
 use crate::config::GoldConfig;
 use crate::model_areas::resolve_global_area_models;
 use crate::model_config_helper::{
     resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
 };
+use bamboo_agent_core::{AgentEvent, Session};
 
 use crate::app_context::AgentSessionContext;
 use crate::session_app::provider_model::session_effective_model_ref;
@@ -36,19 +36,23 @@ pub(crate) async fn build_resume_config_snapshot(
         provider_type: resolved_provider_type,
         fast_model: areas.fast.as_ref().map(|model| model.model_name.clone()),
         fast_model_ref: areas.fast_ref.clone(),
-        background_model: areas.background.as_ref().map(|model| model.model_name.clone()),
+        background_model: areas
+            .background
+            .as_ref()
+            .map(|model| model.model_name.clone()),
         background_model_ref: areas.background_ref.clone(),
         background_model_provider: areas.background.map(|model| model.provider),
-        summarization_model: areas.summarization.as_ref().map(|model| model.model_name.clone()),
+        summarization_model: areas
+            .summarization
+            .as_ref()
+            .map(|model| model.model_name.clone()),
         summarization_model_ref: areas.summarization_ref.clone(),
         summarization_model_provider: areas.summarization.map(|model| model.provider),
         disabled_tools: config_snapshot.disabled_tool_names(),
         disabled_skill_ids: config_snapshot.disabled_skill_ids(),
-        image_fallback: crate::model_config_helper::resolve_image_fallback(
-            &config_snapshot,
-        )
-        .ok()
-        .flatten(),
+        image_fallback: crate::model_config_helper::resolve_image_fallback(&config_snapshot)
+            .ok()
+            .flatten(),
         gold_config: gold_config_override.or_else(|| {
             resolve_gold_config(
                 &config_snapshot,

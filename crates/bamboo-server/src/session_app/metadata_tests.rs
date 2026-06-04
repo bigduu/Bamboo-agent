@@ -360,7 +360,8 @@ async fn manual_title_beats_generated_title_without_lying_event() {
 
     let manual = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        SessionMetadataService::set_title(state_manual.as_ref(), "m1", "Manual Override", None).await
+        SessionMetadataService::set_title(state_manual.as_ref(), "m1", "Manual Override", None)
+            .await
     });
 
     let gen = tokio::spawn(async move {

@@ -92,99 +92,93 @@ struct CargoTestSummary {
 }
 
 /// Matches: `test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s`
-static CARGO_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+static CARGO_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
     r"test result: (?:ok|FAILED)\.\s+(\d+) passed;\s+(\d+) failed;\s+(\d+) ignored;(?:.*finished in\s+(\S+)|[^\n]*)"
-).expect("cargo summary regex"));
+).expect("cargo summary regex")
+});
 
 /// Matches: `test some::module::name ... ok`
-static TEST_LINE_OK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"^test\s+\S+\s+\.\.\.\s+ok$"
-).expect("test ok regex"));
+static TEST_LINE_OK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^test\s+\S+\s+\.\.\.\s+ok$").expect("test ok regex"));
 
 /// Captures test name from: `test some::module::name ... ok`
-static TEST_NAME_OK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^test\s+(\S+)\s+\.\.\.\s+ok$"
-).expect("test name capture regex"));
+static TEST_NAME_OK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^test\s+(\S+)\s+\.\.\.\s+ok$").expect("test name capture regex")
+});
 
 /// Matches: `running N tests` or `running N test`
-static RUNNING_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"^running \d+ tests?$"
-).expect("running regex"));
+static RUNNING_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^running \d+ tests?$").expect("running regex"));
 
 // ── pytest ──
 
 /// Matches pytest summary: `= 5 passed in 1.23s =` or `= 3 failed, 2 passed in 2.5s =`
 /// or `= 1 failed, 3 passed, 1 warning in 0.8s =`
-static PYTEST_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^=+\s+(.+?)\s+in\s+(\S+)\s+=+\s*$"
-).expect("pytest summary regex"));
+static PYTEST_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^=+\s+(.+?)\s+in\s+(\S+)\s+=+\s*$").expect("pytest summary regex")
+});
 
 /// Matches pytest short test results: `PASSED`, `FAILED`, `ERROR`, `SKIPPED`
-static PYTEST_COUNTS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(\d+)\s+(passed|failed|error|skipped|warnings?|deselected|xfailed|xpassed)"
-).expect("pytest counts regex"));
+static PYTEST_COUNTS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(\d+)\s+(passed|failed|error|skipped|warnings?|deselected|xfailed|xpassed)")
+        .expect("pytest counts regex")
+});
 
 /// Matches pytest FAILURES section header
-static PYTEST_FAILURE_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^_+\s+(.+?)\s+_+\s*$"
-).expect("pytest failure header regex"));
-
+static PYTEST_FAILURE_HEADER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^_+\s+(.+?)\s+_+\s*$").expect("pytest failure header regex"));
 
 // ── Jest / Vitest ──
 
 /// Matches Jest summary: `Tests:       3 failed, 42 passed, 45 total`
-static JEST_TESTS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^Tests:\s+(.+?total)\s*$"
-).expect("jest tests regex"));
+static JEST_TESTS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^Tests:\s+(.+?total)\s*$").expect("jest tests regex"));
 
 /// Matches Jest suite summary: `Test Suites: 1 failed, 4 passed, 5 total`
-static JEST_SUITES_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^Test Suites:\s+(.+?total)\s*$"
-).expect("jest suites regex"));
+static JEST_SUITES_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^Test Suites:\s+(.+?total)\s*$").expect("jest suites regex"));
 
 /// Matches Jest time: `Time:        4.567 s`
-static JEST_TIME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^Time:\s+(.+)"
-).expect("jest time regex"));
+static JEST_TIME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^Time:\s+(.+)").expect("jest time regex"));
 
 /// Matches Jest PASS/FAIL: `PASS src/foo.test.ts` or `FAIL src/bar.test.ts`
-static JEST_RESULT_LINE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^(PASS|FAIL)\s+(.+)"
-).expect("jest result line regex"));
+static JEST_RESULT_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^(PASS|FAIL)\s+(.+)").expect("jest result line regex"));
 
 /// Matches Jest inline counts: `N failed` / `N passed` in summary
-static JEST_COUNT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(\d+)\s+(failed|passed|skipped|pending|todo)"
-).expect("jest count regex"));
+static JEST_COUNT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(\d+)\s+(failed|passed|skipped|pending|todo)").expect("jest count regex")
+});
 
 // ── Go test ──
 
 /// Matches Go test result: `ok      github.com/foo/bar     0.123s`
-static GO_TEST_OK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^ok\s+\S+\s+(\S+)"
-).expect("go test ok regex"));
+static GO_TEST_OK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^ok\s+\S+\s+(\S+)").expect("go test ok regex"));
 
 /// Matches Go test failure: `FAIL    github.com/foo/bar     0.456s`
-static GO_TEST_FAIL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^FAIL\s+\S+\s+(\S+)"
-).expect("go test fail regex"));
+static GO_TEST_FAIL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^FAIL\s+\S+\s+(\S+)").expect("go test fail regex"));
 
 /// Matches Go individual test: `--- PASS: TestFoo (0.00s)` or `--- FAIL: TestBar (0.01s)`
-static GO_TEST_LINE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^--- (PASS|FAIL|SKIP): (\S+)"
-).expect("go test line regex"));
+static GO_TEST_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^--- (PASS|FAIL|SKIP): (\S+)").expect("go test line regex"));
 
 /// Matches Go test pass line: `=== RUN   TestFoo`
-static GO_RUN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)^=== RUN\s+\S+"
-).expect("go run regex"));
+static GO_RUN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^=== RUN\s+\S+").expect("go run regex"));
 
 // ── Maven Surefire / JUnit ──
 
 /// Matches Surefire summary: `Tests run: 42, Failures: 0, Errors: 0, Skipped: 2`
-static SUREFIRE_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?m)Tests run:\s+(\d+),\s+Failures:\s+(\d+),\s+Errors:\s+(\d+),\s+Skipped:\s+(\d+)"
-).expect("surefire summary regex"));
+static SUREFIRE_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)Tests run:\s+(\d+),\s+Failures:\s+(\d+),\s+Errors:\s+(\d+),\s+Skipped:\s+(\d+)",
+    )
+    .expect("surefire summary regex")
+});
 
 /// Parse all `test result:` summary lines from the output (handles workspace
 /// builds with multiple test binaries).

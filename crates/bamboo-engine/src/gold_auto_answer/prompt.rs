@@ -1,7 +1,7 @@
-use bamboo_agent_core::{FunctionSchema, Message, PendingQuestion, Role, Session, ToolSchema};
 use crate::config::GoldConfig;
 use crate::runtime::gold_evaluation::GoldEvaluationResult;
 use crate::TaskLoopContext;
+use bamboo_agent_core::{FunctionSchema, Message, PendingQuestion, Role, Session, ToolSchema};
 use serde_json::json;
 
 use super::decision::normalized_pending_tool_name;

@@ -68,10 +68,7 @@ pub async fn get_session(
 
             let mut response = HttpResponse::Ok();
             if let Some(version) = etag {
-                response.insert_header((
-                    actix_web::http::header::ETAG,
-                    format!("\"{version}\""),
-                ));
+                response.insert_header((actix_web::http::header::ETAG, format!("\"{version}\"")));
             }
             Ok(response.json(GetSessionResponse { session: summary }))
         }

@@ -4,8 +4,8 @@
 //! `AppStateResumeRef` adapter) live in the `bamboo-server` crate.
 
 use super::decision::{
-    canonicalize_pending_answer, parse_gold_auto_answer_decision, session_is_awaiting_clarification,
-    should_attempt_gold_auto_answer,
+    canonicalize_pending_answer, parse_gold_auto_answer_decision,
+    session_is_awaiting_clarification, should_attempt_gold_auto_answer,
 };
 use super::GOLD_AUTO_ANSWER_TOOL_NAME;
 use bamboo_agent_core::{

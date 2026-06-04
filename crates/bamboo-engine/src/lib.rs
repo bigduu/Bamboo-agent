@@ -1,21 +1,23 @@
 //! Bamboo engine — runtime, skills, metrics, MCP.
 
 pub mod app_context;
+pub mod auto_dream;
 pub mod events;
 pub mod gold_auto_answer;
 pub mod mcp;
+pub mod message_hooks;
 pub mod metrics;
+pub mod metrics_service;
+pub mod model_areas;
+pub mod model_config_helper;
+pub mod profiles;
+pub mod prompt_defaults;
+pub mod runtime;
+pub mod sdk;
 pub mod server_tools;
 pub mod session_app;
-pub mod title_gen;
-pub mod prompt_defaults;
-pub mod message_hooks;
-pub mod model_config_helper;
-pub mod model_areas;
-pub mod auto_dream;
-pub mod metrics_service;
-pub mod runtime;
 pub mod skills;
+pub mod title_gen;
 
 pub use app_context::AgentSessionContext;
 
@@ -41,6 +43,13 @@ pub use runtime::runtime::{AgentRuntime, AgentRuntimeBuilder, ExecuteRequest};
 pub use runtime::task_context::TaskLoopContext;
 pub use runtime::task_evaluation::{evaluate_task_progress, TaskEvaluationResult};
 pub use runtime::Agent;
+
+// Re-export from the ergonomic SDK surface (anti-fork single spawn core).
+pub use sdk::runner::{profile_runner, ProfileRunner, RunProfileInput};
+pub use sdk::spawn::run_child_spawn;
+
+// Re-export the subagent profile system (built-ins + layered loader).
+pub use profiles::{builtin_profiles, load_registry, LoaderError};
 
 // Sub-module re-exports for backward compatibility
 pub mod runner {

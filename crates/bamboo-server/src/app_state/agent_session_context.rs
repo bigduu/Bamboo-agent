@@ -74,11 +74,10 @@ impl AgentSessionContext for AppState {
         AppState::get_provider_for_model_ref(self, target).ok()
     }
 
-    async fn get_provider_for_endpoint(
-        &self,
-        provider_name: &str,
-    ) -> Option<Arc<dyn LLMProvider>> {
-        AppState::get_provider_for_endpoint(self, provider_name).await.ok()
+    async fn get_provider_for_endpoint(&self, provider_name: &str) -> Option<Arc<dyn LLMProvider>> {
+        AppState::get_provider_for_endpoint(self, provider_name)
+            .await
+            .ok()
     }
 
     fn title_gen_acquire(&self, session_id: &str) -> bool {

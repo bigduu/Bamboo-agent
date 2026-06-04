@@ -3,7 +3,8 @@
 //! These mirror the six roles defined in the SubagentProfile design doc.
 //! Tool names follow the canonical names exposed by `bamboo-tools` and the
 //! agent runtime. Allow / deny lists are validated lazily — unknown tool
-//! names are simply ignored at runtime by the (future) `FilteredExecutor`.
+//! names are simply ignored at runtime by
+//! [`bamboo_tools::PolicyAwareToolExecutor`].
 //!
 //! `general-purpose` is the **fallback** profile: its `system_prompt` is
 //! intentionally identical to today's `CHILD_SYSTEM_PROMPT` so that
@@ -219,7 +220,7 @@ fn research_tools() -> Vec<String> {
 // System prompts
 // ---------------------------------------------------------------------------
 
-/// Mirrors `crates/bamboo-server/src/session_app/child_session.rs::CHILD_SYSTEM_PROMPT`.
+/// Mirrors `crate::session_app::child_session::CHILD_SYSTEM_PROMPT`.
 ///
 /// Kept literally identical so that sessions resolved to `general-purpose`
 /// behave exactly like the pre-registry code path.
@@ -232,7 +233,7 @@ Requirements:
 - Keep output concise: provide the conclusion first, then only necessary evidence or steps.
 "#;
 
-/// Mirrors `crates/bamboo-server/src/session_app/child_session.rs::PLAN_AGENT_SYSTEM_PROMPT`.
+/// Mirrors `crate::session_app::child_session::PLAN_AGENT_SYSTEM_PROMPT`.
 pub const PLAN_SYSTEM_PROMPT: &str = r#"You are a **Plan Agent**, a read-only exploration specialist delegated by a parent session.
 
 Your role is EXCLUSIVELY to explore the codebase and gather information to help design an implementation plan. You MUST NOT modify anything.

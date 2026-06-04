@@ -52,11 +52,11 @@
 //! during use. This proactive refresh ensures seamless operation.
 
 use crate::ProxyAuthRequiredError;
-use std::sync::LazyLock;
 use anyhow::anyhow;
 use reqwest::StatusCode;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use std::{
     fs::{read_to_string, File},
     io::Write,

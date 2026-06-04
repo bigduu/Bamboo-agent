@@ -6,12 +6,12 @@
 
 use std::sync::Arc;
 
+pub use crate::schedule_app::{
+    ResolvedRunConfig, ScheduleContext, ScheduleManager, ScheduleRunJob,
+};
 use bamboo_engine::model_areas::resolve_global_area_models;
 use bamboo_engine::model_config_helper::{
     get_schedule_model_from_config, resolve_gold_config, resolve_provider_type,
-};
-pub use crate::schedule_app::{
-    ResolvedRunConfig, ScheduleContext, ScheduleManager, ScheduleRunJob,
 };
 use bamboo_infrastructure::ProviderRegistry;
 
@@ -72,8 +72,11 @@ fn resolve_run_config_from_config(
         .as_deref()
         .unwrap_or(config_snapshot.effective_default_provider());
     // Auxiliary models are global (config-derived), never session-bound.
-    let areas =
-        resolve_global_area_models(&config_snapshot, capability_provider_name, provider_registry);
+    let areas = resolve_global_area_models(
+        &config_snapshot,
+        capability_provider_name,
+        provider_registry,
+    );
 
     let requested_reasoning_effort = job.run_config.reasoning_effort;
     let reasoning_effort = requested_reasoning_effort.or(config_snapshot.get_reasoning_effort());

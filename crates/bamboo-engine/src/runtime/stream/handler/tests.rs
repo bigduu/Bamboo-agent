@@ -103,3 +103,44 @@ async fn consume_llm_stream_returns_single_prefix_stream_error_message() {
 
     assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
 }
+
+#[tokio::test]
+async fn consume_llm_stream_aborts_already_cancelled_stalled_stream() {
+    // A provider stream that never yields and never ends. Before the `select!`
+    // fix, `.next().await` would block forever; now a cancelled token must
+    // return promptly instead of hanging.
+    let stream: LLMStream = Box::pin(stream::pending());
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        consume_llm_stream_silent(stream, &cancel, "session-cancelled"),
+    )
+    .await
+    .expect("must not hang: cancellation should interrupt the stalled stream");
+
+    assert!(matches!(result, Err(AgentError::Cancelled)));
+}
+
+#[tokio::test]
+async fn consume_llm_stream_interrupts_blocked_next_on_mid_stream_cancel() {
+    // Proves a *blocked* `stream.next().await` (not just between chunks) is
+    // interrupted when the token is cancelled while the consume call is running.
+    let stream: LLMStream = Box::pin(stream::pending());
+    let cancel = CancellationToken::new();
+    let canceller = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        canceller.cancel();
+    });
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        consume_llm_stream_silent(stream, &cancel, "session-cancel-mid"),
+    )
+    .await
+    .expect("must not hang: mid-stream cancellation should interrupt the blocked next()");
+
+    assert!(matches!(result, Err(AgentError::Cancelled)));
+}

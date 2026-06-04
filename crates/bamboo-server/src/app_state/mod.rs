@@ -76,12 +76,12 @@ use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
-use bamboo_engine::metrics_service::MetricsService;
 use crate::schedules::{ScheduleManager, ScheduleStore};
 use crate::spawn_scheduler::SpawnScheduler;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::AgentEvent;
 use bamboo_agent_core::{tools::ToolSchema, Message};
+use bamboo_engine::metrics_service::MetricsService;
 use bamboo_engine::McpServerManager;
 use bamboo_engine::SkillManager;
 use bamboo_infrastructure::registry::ProcessRegistry;

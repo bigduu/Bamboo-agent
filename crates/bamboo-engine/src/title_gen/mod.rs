@@ -166,9 +166,15 @@ async fn run_title_generation(
     //    concurrent user PATCH wins, bumps title_version and metadata_version,
     //    performs a plain save, refreshes the in-memory cache, and emits
     //    SessionTitleUpdated through the replayable helper.
-    match SessionMetadataService::apply_generated_title(state.as_ref(), session_id, &title, source, force)
-        .await
-        .map_err(|e| format!("apply_generated_title: {e}"))?
+    match SessionMetadataService::apply_generated_title(
+        state.as_ref(),
+        session_id,
+        &title,
+        source,
+        force,
+    )
+    .await
+    .map_err(|e| format!("apply_generated_title: {e}"))?
     {
         Some((applied, title_version)) => {
             info!(
