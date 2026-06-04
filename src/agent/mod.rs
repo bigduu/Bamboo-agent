@@ -118,38 +118,62 @@ impl Agent {
         session: &mut Session,
         input: impl Into<String>,
     ) -> Result<(), AgentError> {
+        session.add_message(Message::user(input.into()));
+        self.run_session(session).await
+    }
+
+    /// Run the agent loop on `session` exactly as it stands — i.e. on a
+    /// caller-provided message list — without appending a new turn. The last
+    /// `User` message already in the session drives execution.
+    ///
+    /// This is how you pass a full conversation / message list: build the
+    /// session from your messages, then run it.
+    ///
+    /// ```rust,ignore
+    /// let mut session = Session::new("s1", "claude-sonnet-4-6");
+    /// session.add_message(Message::user("hi"));
+    /// session.add_message(Message::assistant("hello!", None));
+    /// session.add_message(Message::user("now summarize our chat"));
+    /// agent.run_session(&mut session).await?; // no extra input appended
+    /// ```
+    pub async fn run_session(&self, session: &mut Session) -> Result<(), AgentError> {
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(EVENT_CHANNEL_CAPACITY);
         let cancel_token = CancellationToken::new();
 
         // Drain events so the bounded channel never blocks the loop.
         let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
 
-        let result = self
-            .execute_internal(session, input.into(), event_tx, cancel_token)
-            .await;
+        let result = self.execute_internal(session, event_tx, cancel_token).await;
 
-        let _ = drain.await;
+        // Stop draining once execution returns. Detached engine tasks (e.g.
+        // background evaluations) may still hold a cloned sender, so awaiting
+        // natural channel closure could hang; abort instead.
+        drain.abort();
         result
     }
 
-    /// Run the agent loop on `session`, returning a receiver of [`AgentEvent`]s.
-    ///
-    /// The execution runs on a background task; the caller drives it by reading
-    /// from the returned receiver until it closes. The instruction / model are
-    /// applied exactly as in [`run`](Self::run).
+    /// Append `input` as a new user turn, then stream the run's
+    /// [`AgentEvent`]s. The execution runs on a background task; the caller
+    /// drives it by reading from the returned receiver until it closes.
     pub fn run_stream(
         &self,
         mut session: Session,
         input: impl Into<String>,
     ) -> mpsc::Receiver<AgentEvent> {
+        session.add_message(Message::user(input.into()));
+        self.run_stream_session(session)
+    }
+
+    /// Stream the run's [`AgentEvent`]s for a caller-provided message list,
+    /// without appending a new turn (the last `User` message drives execution).
+    pub fn run_stream_session(&self, mut session: Session) -> mpsc::Receiver<AgentEvent> {
         let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(EVENT_CHANNEL_CAPACITY);
         let cancel_token = CancellationToken::new();
         let agent = self.clone();
-        let input = input.into();
 
         tokio::spawn(async move {
             if let Err(error) = agent
-                .execute_internal(&mut session, input, event_tx, cancel_token)
+                .execute_internal(&mut session, event_tx, cancel_token)
                 .await
             {
                 tracing::warn!("Agent::run_stream execution failed: {error}");
@@ -165,23 +189,19 @@ impl Agent {
     async fn execute_internal(
         &self,
         session: &mut Session,
-        input: String,
         event_tx: mpsc::Sender<AgentEvent>,
         cancel_token: CancellationToken,
     ) -> Result<(), AgentError> {
-        // Apply the role system prompt as the session's leading System message
-        // (the engine extracts the system prompt from the session messages).
-        // The builder's prompt is AUTHORITATIVE: it replaces an existing leading
-        // System message rather than deferring to it, so a caller-supplied
-        // session can't silently shadow the configured profile/instruction.
+        // Apply the instruction as the session's leading System message. The
+        // builder's prompt is AUTHORITATIVE: it replaces a leading System
+        // message, otherwise inserts one at index 0, so a caller-supplied
+        // session can't silently shadow the configured instruction.
         if let Some(prompt) = self.system_prompt.as_ref() {
-            match session
-                .messages
-                .iter_mut()
-                .find(|m| matches!(m.role, Role::System))
-            {
-                Some(existing) => *existing = Message::system(prompt.clone()),
-                None => session.messages.insert(0, Message::system(prompt.clone())),
+            match session.messages.first() {
+                Some(first) if matches!(first.role, Role::System) => {
+                    session.messages[0] = Message::system(prompt.clone());
+                }
+                _ => session.messages.insert(0, Message::system(prompt.clone())),
             }
         }
 
@@ -189,15 +209,20 @@ impl Agent {
             session.model = model.clone();
         }
 
-        // The driving user message goes into the session; the engine runner is
-        // configured to skip echoing the initial message, matching spawn
-        // semantics where the last user message drives execution.
-        session.add_message(Message::user(input.clone()));
+        // The last user message in the session drives execution (the engine
+        // skips echoing `initial_message`, so we surface it for logging only).
+        let initial_message = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::User))
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
 
         // Tool restriction is handled at build time: the agent's executor is
         // built from exactly the configured tool set, so no per-run
         // `disabled_tools` filter is needed here.
-        let mut builder = ExecuteRequestBuilder::new(input, event_tx, cancel_token);
+        let mut builder = ExecuteRequestBuilder::new(initial_message, event_tx, cancel_token);
         if let Some(model) = self.model.clone() {
             builder = builder.model(model);
         }

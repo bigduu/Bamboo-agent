@@ -319,7 +319,7 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         } else {
             match &result {
                 Ok(_) => ("completed".to_string(), None),
-                Err(e) if e.to_string().contains("cancelled") => {
+                Err(e @ bamboo_agent_core::AgentError::Cancelled) => {
                     ("cancelled".to_string(), Some(e.to_string()))
                 }
                 Err(e) => ("error".to_string(), Some(e.to_string())),
