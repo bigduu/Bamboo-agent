@@ -6,10 +6,10 @@ use bamboo_agent_core::{
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
-use crate::mcp::error::McpError;
-use crate::mcp::manager::McpServerManager;
-use crate::mcp::tool_index::ToolIndex;
-use crate::mcp::types::McpContentItem;
+use crate::error::McpError;
+use crate::manager::McpServerManager;
+use crate::tool_index::ToolIndex;
+use crate::types::McpContentItem;
 
 /// MCP tool executor that delegates to the MCP server manager
 pub struct McpToolExecutor {
@@ -209,7 +209,7 @@ impl ToolExecutor for CompositeToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::types::McpContentItem;
+    use crate::types::McpContentItem;
     use bamboo_agent_core::{FunctionCall, FunctionSchema};
     use mockall::mock;
     use mockall::predicate::*;
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn test_format_result_resource_with_text() {
         let content = vec![McpContentItem::Resource {
-            resource: crate::mcp::types::McpResource {
+            resource: crate::types::McpResource {
                 uri: "file:///test.txt".to_string(),
                 mime_type: Some("text/plain".to_string()),
                 text: Some("File content".to_string()),
@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn test_format_result_resource_without_text() {
         let content = vec![McpContentItem::Resource {
-            resource: crate::mcp::types::McpResource {
+            resource: crate::types::McpResource {
                 uri: "file:///test.bin".to_string(),
                 mime_type: None,
                 text: None,

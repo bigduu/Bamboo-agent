@@ -7,9 +7,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, info, trace, warn};
 
-use crate::mcp::config::{HeaderConfig, SseConfig};
-use crate::mcp::error::{McpError, Result};
-use crate::mcp::protocol::client::McpTransport;
+use crate::config::{HeaderConfig, SseConfig};
+use crate::error::{McpError, Result};
+use crate::protocol::client::McpTransport;
 
 #[derive(Debug, Clone)]
 struct PostResponse {

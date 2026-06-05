@@ -5,9 +5,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tracing::{error, info, trace, warn};
 
-use crate::mcp::config::StdioConfig;
-use crate::mcp::error::{McpError, Result};
-use crate::mcp::protocol::client::McpTransport;
+use crate::config::StdioConfig;
+use crate::error::{McpError, Result};
+use crate::protocol::client::McpTransport;
 use bamboo_infrastructure::{hide_window_for_tokio_command, trace_windows_command};
 
 pub struct StdioTransport {

@@ -6,7 +6,7 @@ pub mod events;
 pub mod external_agents;
 pub mod gardener;
 pub mod gold_auto_answer;
-pub mod mcp;
+pub use bamboo_mcp as mcp;
 pub mod llm_summarizer;
 pub mod message_hooks;
 // The live metrics pipeline + service now live in the `bamboo-metrics` crate

@@ -1,6 +1,6 @@
 use super::fingerprint::proxy_fingerprint;
 use super::*;
-use crate::mcp::config::{ReconnectConfig, SseConfig, StdioConfig};
+use crate::config::{ReconnectConfig, SseConfig, StdioConfig};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 

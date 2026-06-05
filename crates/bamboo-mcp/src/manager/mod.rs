@@ -6,12 +6,12 @@ use std::time::{Duration as StdDuration, Instant};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{error, info, warn};
 
-use crate::mcp::config::{McpConfig, McpServerConfig, TransportConfig};
-use crate::mcp::error::{McpError, Result};
-use crate::mcp::protocol::{McpProtocolClient, McpTransport};
-use crate::mcp::tool_index::ToolIndex;
-use crate::mcp::transports::{SseTransport, StdioTransport, StreamableHttpTransport};
-use crate::mcp::types::{McpEvent, McpTool, RuntimeInfo, ServerStatus};
+use crate::config::{McpConfig, McpServerConfig, TransportConfig};
+use crate::error::{McpError, Result};
+use crate::protocol::{McpProtocolClient, McpTransport};
+use crate::tool_index::ToolIndex;
+use crate::transports::{SseTransport, StdioTransport, StreamableHttpTransport};
+use crate::types::{McpEvent, McpTool, RuntimeInfo, ServerStatus};
 use bamboo_infrastructure::Config;
 
 mod config_sync;

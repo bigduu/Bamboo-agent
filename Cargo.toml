@@ -8,6 +8,7 @@ members = [
     "crates/bamboo-memory",
     "crates/bamboo-metrics",
     "crates/bamboo-skills",
+    "crates/bamboo-mcp",
     "crates/bamboo-compression",
     "crates/bamboo-tools",
     "crates/bamboo-cli",

@@ -5,9 +5,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{error, trace, warn};
 
-use crate::mcp::error::{McpError, Result};
-use crate::mcp::protocol::models::*;
-use crate::mcp::types::{McpCallResult, McpTool};
+use crate::error::{McpError, Result};
+use crate::protocol::models::*;
+use crate::types::{McpCallResult, McpTool};
 
 /// Transport trait for MCP communication
 #[async_trait]

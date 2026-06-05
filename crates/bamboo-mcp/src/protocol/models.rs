@@ -468,7 +468,7 @@ pub struct McpToolCallRequest {
 #[serde(rename_all = "camelCase")]
 pub struct McpToolCallResult {
     /// Content items returned by the tool
-    pub content: Vec<crate::mcp::types::McpContentItem>,
+    pub content: Vec<crate::types::McpContentItem>,
     /// Whether the tool execution encountered an error
     #[serde(default)]
     pub is_error: bool,

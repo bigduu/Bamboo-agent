@@ -14,9 +14,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, trace, warn};
 
-use crate::mcp::config::{HeaderConfig, StreamableHttpConfig};
-use crate::mcp::error::{McpError, Result};
-use crate::mcp::protocol::client::McpTransport;
+use crate::config::{HeaderConfig, StreamableHttpConfig};
+use crate::error::{McpError, Result};
+use crate::protocol::client::McpTransport;
 
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const ACCEPT_HEADER: &str = "application/json, text/event-stream";

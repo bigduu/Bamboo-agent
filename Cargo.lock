@@ -593,6 +593,7 @@ dependencies = [
  "bamboo-compression",
  "bamboo-domain",
  "bamboo-infrastructure",
+ "bamboo-mcp",
  "bamboo-memory",
  "bamboo-metrics",
  "bamboo-skills",
@@ -676,6 +677,31 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "bamboo-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bamboo-agent-core",
+ "bamboo-domain",
+ "bamboo-infrastructure",
+ "chrono",
+ "dashmap",
+ "eventsource-stream",
+ "futures",
+ "hex",
+ "mockall",
+ "reqwest",
+ "reqwest-eventsource",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
