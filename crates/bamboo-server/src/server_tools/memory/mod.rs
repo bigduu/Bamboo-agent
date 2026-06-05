@@ -45,8 +45,7 @@ impl MemoryTool {
     async fn session_for_context(&self, session_id: Option<&str>) -> Option<Session> {
         let session_id = session_id?;
         let in_memory = {
-            let arc = self.sessions.get(session_id).map(|e| e.value().clone());
-            arc.map(|a| a.read().clone())
+            bamboo_engine::read_cached_session(&self.sessions, session_id)
         };
         match in_memory {
             Some(session) => Some(session),

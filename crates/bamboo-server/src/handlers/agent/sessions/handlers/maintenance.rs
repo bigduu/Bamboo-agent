@@ -52,8 +52,7 @@ async fn load_session_from_state_or_storage(
     session_id: &str,
 ) -> Result<Option<Session>> {
     let in_memory = {
-        let arc = state.sessions.get(session_id).map(|e| e.value().clone());
-        arc.map(|a| a.read().clone())
+        bamboo_engine::read_cached_session(&state.sessions, session_id)
     };
     if in_memory.is_some() {
         return Ok(in_memory);

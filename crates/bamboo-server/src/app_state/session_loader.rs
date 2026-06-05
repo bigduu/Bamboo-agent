@@ -68,8 +68,7 @@ impl AppState {
     /// Returns `None` if the session does not exist in either tier.
     pub async fn load_session(&self, session_id: &str) -> Option<bamboo_agent_core::Session> {
         let memory_session = {
-            let arc = self.sessions.get(session_id).map(|e| e.value().clone());
-            arc.map(|a| a.read().clone())
+            bamboo_engine::read_cached_session(&self.sessions, session_id)
         };
 
         if let Some(session) = memory_session {
@@ -112,8 +111,7 @@ impl AppState {
         session_id: &str,
     ) -> Option<bamboo_agent_core::Session> {
         let memory_session = {
-            let arc = self.sessions.get(session_id).map(|e| e.value().clone());
-            arc.map(|a| a.read().clone())
+            bamboo_engine::read_cached_session(&self.sessions, session_id)
         };
 
         let storage_session = self
@@ -317,8 +315,7 @@ mod tests {
 
         // Verify memory cache.
         let cached = {
-            let arc = state.sessions.get(session_id).map(|e| e.value().clone());
-            arc.map(|a| a.read().clone())
+            bamboo_engine::read_cached_session(&state.sessions, session_id)
         };
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().title, "test-title");

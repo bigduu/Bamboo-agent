@@ -65,8 +65,7 @@ async fn selected_skill_ids_for_session(
     let session_id = session_id?;
 
     let in_memory = {
-        let arc = state.sessions.get(session_id).map(|e| e.value().clone());
-        arc.map(|a| a.read().clone())
+        bamboo_engine::read_cached_session(&state.sessions, session_id)
     };
 
     let session = match in_memory {
@@ -87,8 +86,7 @@ async fn selected_skill_mode_for_session(
     let session_id = session_id?;
 
     let in_memory = {
-        let arc = state.sessions.get(session_id).map(|e| e.value().clone());
-        arc.map(|a| a.read().clone())
+        bamboo_engine::read_cached_session(&state.sessions, session_id)
     };
 
     let session = match in_memory {

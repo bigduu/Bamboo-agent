@@ -12,8 +12,7 @@ pub async fn get_system_prompt_snapshot(
     let session_id = path.into_inner();
 
     let session = {
-        let arc = state.sessions.get(&session_id).map(|e| e.value().clone());
-        arc.map(|a| a.read().clone())
+        bamboo_engine::read_cached_session(&state.sessions, &session_id)
     };
 
     let session = match session {

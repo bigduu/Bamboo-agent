@@ -76,8 +76,7 @@ pub async fn handler(
             Ok(Some(s)) => Some(s),
             Ok(None) => {
                 // Fallback to memory (shouldn't happen but be defensive).
-                let arc = state.sessions.get(&session_id).map(|e| e.value().clone());
-                arc.map(|a| a.read().clone())
+                bamboo_engine::read_cached_session(&state.sessions, &session_id)
             }
             Err(e) => {
                 tracing::warn!(
@@ -85,14 +84,12 @@ pub async fn handler(
                     session_id,
                     e
                 );
-                let arc = state.sessions.get(&session_id).map(|e| e.value().clone());
-                arc.map(|a| a.read().clone())
+                bamboo_engine::read_cached_session(&state.sessions, &session_id)
             }
         }
     } else {
         // No active runner – memory cache is authoritative.
-        let arc = state.sessions.get(&session_id).map(|e| e.value().clone());
-        arc.map(|a| a.read().clone())
+        bamboo_engine::read_cached_session(&state.sessions, &session_id)
     };
 
     if session.is_none() {

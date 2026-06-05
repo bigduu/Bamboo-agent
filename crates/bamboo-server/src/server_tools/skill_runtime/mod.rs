@@ -55,8 +55,7 @@ impl SkillToolAccess {
         let session_id = session_id?;
 
         let in_memory = {
-            let arc = self.sessions.get(session_id).map(|e| e.value().clone());
-            arc.map(|a| a.read().clone())
+            bamboo_engine::read_cached_session(&self.sessions, session_id)
         };
 
         match in_memory {
@@ -92,8 +91,7 @@ impl SkillSessionPort for SkillToolAccess {
         updates: &[(String, Option<String>)],
     ) -> Result<(), String> {
         let mut session = {
-            let arc = self.sessions.get(session_id).map(|e| e.value().clone());
-            arc.map(|a| a.read().clone())
+            bamboo_engine::read_cached_session(&self.sessions, session_id)
         };
 
         if session.is_none() {

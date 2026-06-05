@@ -35,6 +35,23 @@ pub type SessionCache = std::sync::Arc<
     dashmap::DashMap<String, std::sync::Arc<parking_lot::RwLock<bamboo_agent_core::Session>>>,
 >;
 
+/// Read a session out of the in-memory cache, cloning it out from under the
+/// brief sync read-lock. Returns `None` on a cache miss.
+///
+/// This is the single canonical cache-read used everywhere a caller holds a
+/// `SessionCache` (HTTP handlers, server tools, the app-state loader). It
+/// replaced ~13 verbatim copies of the
+/// `cache.get(id).map(|e| e.value().clone()).map(|a| a.read().clone())` idiom.
+pub fn read_cached_session(
+    cache: &SessionCache,
+    id: &str,
+) -> Option<bamboo_agent_core::Session> {
+    cache
+        .get(id)
+        .map(|e| e.value().clone())
+        .map(|a| a.read().clone())
+}
+
 const SKILL_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_SKILL_CONTEXT_START -->";
 const TOOL_GUIDE_START_MARKER: &str = "<!-- BAMBOO_TOOL_GUIDE_START -->";
 const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
