@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use tracing::{debug, info, warn};
 
-use crate::skills::store::parser::{parse_markdown_skill, render_skill_markdown};
-use crate::skills::types::{SkillDefinition, SkillResult};
+use crate::store::parser::{parse_markdown_skill, render_skill_markdown};
+use crate::types::{SkillDefinition, SkillResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillDirectorySource {

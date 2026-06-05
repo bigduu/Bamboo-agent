@@ -23,7 +23,7 @@ pub mod runtime;
 pub mod sdk;
 pub mod server_tools;
 pub mod session_app;
-pub mod skills;
+pub use bamboo_skills as skills;
 pub mod title_gen;
 
 pub use app_context::AgentSessionContext;

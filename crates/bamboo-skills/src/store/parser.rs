@@ -4,7 +4,7 @@ use bamboo_domain::normalize_tool_ref;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::skills::types::{SkillDefinition, SkillError, SkillResult};
+use crate::types::{SkillDefinition, SkillError, SkillResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

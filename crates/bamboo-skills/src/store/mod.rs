@@ -57,13 +57,13 @@ use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::skills::store::builtin::load_builtin_skill_bundles;
-use crate::skills::store::parser::render_skill_markdown;
-use crate::skills::store::storage::{
+use crate::store::builtin::load_builtin_skill_bundles;
+use crate::store::parser::render_skill_markdown;
+use crate::store::storage::{
     ensure_skills_dir, load_skills_from_discovery_dirs, write_skill_file, SkillDirectorySource,
     SkillDiscoveryDir,
 };
-use crate::skills::types::{
+use crate::types::{
     SkillDefinition, SkillError, SkillFilter, SkillId, SkillResult, SkillStoreConfig,
 };
 
@@ -181,7 +181,7 @@ impl SkillStore {
     }
 
     fn resolve_from_loaded_records(
-        loaded_records: Vec<crate::skills::store::storage::LoadedSkillRecord>,
+        loaded_records: Vec<crate::store::storage::LoadedSkillRecord>,
     ) -> (HashMap<SkillId, SkillDefinition>, HashMap<SkillId, PathBuf>) {
         let mut resolved_skills: HashMap<SkillId, SkillDefinition> = HashMap::new();
         let mut resolved_roots: HashMap<SkillId, PathBuf> = HashMap::new();
@@ -866,7 +866,7 @@ mod tests {
     use tokio::fs;
 
     use super::SkillStore;
-    use crate::skills::types::SkillStoreConfig;
+    use crate::types::SkillStoreConfig;
 
     async fn write_skill(
         skills_root: &Path,

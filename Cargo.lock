@@ -595,6 +595,7 @@ dependencies = [
  "bamboo-infrastructure",
  "bamboo-memory",
  "bamboo-metrics",
+ "bamboo-skills",
  "bamboo-tools",
  "base64",
  "bytes",
@@ -785,6 +786,23 @@ dependencies = [
  "walkdir",
  "wiremock",
  "zip",
+]
+
+[[package]]
+name = "bamboo-skills"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bamboo-domain",
+ "bamboo-infrastructure",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "walkdir",
 ]
 
 [[package]]

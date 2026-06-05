@@ -2,13 +2,13 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::skills::runtime_metadata::{
+use crate::runtime_metadata::{
     LAST_LOADED_SKILL_ID_METADATA_KEY, LAST_LOADED_SKILL_SUMMARY_METADATA_KEY,
     LOADED_SKILL_IDS_METADATA_KEY, SELECTED_SKILL_IDS_METADATA_KEY,
     SELECTED_SKILL_MODE_METADATA_KEY,
 };
-use crate::skills::selection::parse_selected_skill_ids_metadata;
-pub use crate::skills::session_port::SkillSessionPort;
+use crate::selection::parse_selected_skill_ids_metadata;
+pub use crate::session_port::SkillSessionPort;
 
 /// Error type for skill access control operations.
 #[derive(Debug, thiserror::Error)]

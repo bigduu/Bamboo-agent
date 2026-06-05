@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::skills::store::parser::parse_markdown_skill;
-use crate::skills::types::{SkillError, SkillResult};
+use crate::store::parser::parse_markdown_skill;
+use crate::types::{SkillError, SkillResult};
 
 include!(concat!(env!("OUT_DIR"), "/builtin_skills_embedded.rs"));
 
 pub struct BuiltinSkillBundle {
-    pub skill: crate::skills::types::SkillDefinition,
+    pub skill: crate::types::SkillDefinition,
     pub files: HashMap<String, Vec<u8>>,
 }
 
