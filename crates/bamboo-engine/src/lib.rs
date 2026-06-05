@@ -33,7 +33,9 @@ pub use bamboo_agent_core::{
 // Re-export from runtime
 pub use bamboo_domain::RuntimeSessionPersistence;
 pub use runtime::agent::AgentBuilder;
-pub use runtime::config::AgentLoopConfig;
+// `AgentLoopConfig` is intentionally NOT re-exported: its fields are `pub(crate)`,
+// so it cannot be constructed outside the engine. Execution funnels solely through
+// `AgentRuntime::execute`.
 pub use runtime::config::{AuxiliaryModelConfig, ImageFallbackConfig, ImageFallbackMode};
 pub use runtime::execution::runner_state::{AgentRunner, AgentStatus};
 pub use runtime::hooks::HookRunner;
@@ -41,7 +43,6 @@ pub use runtime::managers::{
     LifecycleManager, LlmManager, MemoryManager, MiniLoopExecutor, PromptManager, ToolManager,
 };
 pub use runtime::model_roster::{ModelRoster, RoleModel};
-pub use runtime::runner::run_agent_loop_with_config;
 pub use runtime::runtime::{
     AgentRuntime, AgentRuntimeBuilder, ExecuteRequest, ExecuteRequestBuilder,
 };

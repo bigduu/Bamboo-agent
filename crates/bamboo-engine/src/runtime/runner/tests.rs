@@ -7,7 +7,7 @@ use futures::stream;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use super::AgentLoopConfig;
+use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::{FunctionCall, Tool, ToolError, ToolExecutionContext, ToolResult};
 use bamboo_agent_core::{Message, Session};
 use bamboo_infrastructure::{LLMChunk, LLMError, LLMProvider, LLMStream};

@@ -170,125 +170,127 @@ impl From<&MemoryConfig> for PromptMemoryFlags {
 }
 
 /// Configuration for the agent loop.
+#[non_exhaustive]
 pub struct AgentLoopConfig {
-    pub max_rounds: usize,
-    pub system_prompt: Option<String>,
+    pub(crate) max_rounds: usize,
+    pub(crate) system_prompt: Option<String>,
     /// Skill IDs that are disabled globally for this execution.
-    pub disabled_skill_ids: BTreeSet<String>,
+    pub(crate) disabled_skill_ids: BTreeSet<String>,
     /// Optional explicit skill selection for this execution.
     /// When set, only these skill IDs are considered for skill context and allowlists.
-    pub selected_skill_ids: Option<Vec<String>>,
+    pub(crate) selected_skill_ids: Option<Vec<String>>,
     /// Optional active skill mode for this execution.
     ///
     /// When set, skill discovery prefers `skills-<mode>` directories over generic
     /// directories for the same skill id.
-    pub selected_skill_mode: Option<String>,
-    pub additional_tool_schemas: Vec<ToolSchema>,
-    pub tool_registry: Arc<ToolRegistry>,
-    pub composition_executor: Option<Arc<CompositionExecutor>>,
-    pub skill_manager: Option<Arc<SkillManager>>,
+    pub(crate) selected_skill_mode: Option<String>,
+    pub(crate) additional_tool_schemas: Vec<ToolSchema>,
+    pub(crate) tool_registry: Arc<ToolRegistry>,
+    pub(crate) composition_executor: Option<Arc<CompositionExecutor>>,
+    pub(crate) skill_manager: Option<Arc<SkillManager>>,
     /// If true, skip appending the initial user message (already present in session).
-    pub skip_initial_user_message: bool,
+    pub(crate) skip_initial_user_message: bool,
     /// Optional storage for persisting session changes
-    pub storage: Option<Arc<dyn Storage>>,
+    pub(crate) storage: Option<Arc<dyn Storage>>,
     /// Optional runtime persistence for non-authoritative session saves.
     /// When set, engine save sites use this instead of `storage` for writes.
-    pub persistence: Option<Arc<dyn RuntimeSessionPersistence>>,
+    pub(crate) persistence: Option<Arc<dyn RuntimeSessionPersistence>>,
     /// Optional attachment reader for resolving `bamboo-attachment://...` references
     /// into `data:` URLs for upstream providers. This must not mutate session storage.
-    pub attachment_reader: Option<Arc<dyn AttachmentReader>>,
+    pub(crate) attachment_reader: Option<Arc<dyn AttachmentReader>>,
     /// Optional asynchronous metrics collector
-    pub metrics_collector: Option<MetricsCollector>,
+    pub(crate) metrics_collector: Option<MetricsCollector>,
     /// Model name used for metrics attribution
-    pub model_name: Option<String>,
+    pub(crate) model_name: Option<String>,
     /// Fast/cheap model for lightweight tasks (task evaluation, search, etc.).
     ///
     /// Call sites may fall back to `model_name` when this is unset.
-    pub fast_model_name: Option<String>,
+    pub(crate) fast_model_name: Option<String>,
     /// Optional provider override for lightweight fast-model LLM calls.
-    pub fast_model_provider: Option<Arc<dyn LLMProvider>>,
+    pub(crate) fast_model_provider: Option<Arc<dyn LLMProvider>>,
     /// Fast/cheap model for memory/background tasks.
     ///
     /// This must not silently fall back to the main interaction model.
-    pub background_model_name: Option<String>,
+    pub(crate) background_model_name: Option<String>,
 
     /// Model for planning/coordination tasks (task decomposition, architecture).
     /// Falls back to `model_name` when unset.
-    pub planning_model_name: Option<String>,
+    pub(crate) planning_model_name: Option<String>,
     /// Model for search/navigation tasks (grep, file listing, symbol resolution).
     /// Falls back to `fast_model_name` when unset.
-    pub search_model_name: Option<String>,
+    pub(crate) search_model_name: Option<String>,
     /// Custom instructions for conversation summarization, injected into the
     /// LLM summary prompt. Lets users control what the summary focuses on.
     ///
     /// Resolution order: session-level > config-level > built-in defaults.
-    pub compression_instructions: Option<String>,
+    pub(crate) compression_instructions: Option<String>,
     /// Dedicated model for summarization. Falls back to `background_model_name`.
-    pub summarization_model_name: Option<String>,
+    pub(crate) summarization_model_name: Option<String>,
     /// Optional provider override for memory/background model LLM calls.
     ///
     /// When set, memory recall rerank and other memory/background tasks use this
     /// provider instead of the shared agent loop provider.
-    pub background_model_provider: Option<Arc<dyn LLMProvider>>,
+    pub(crate) background_model_provider: Option<Arc<dyn LLMProvider>>,
     /// Optional provider override for summarization / context compression calls.
     ///
     /// When set, conversation/task summarization uses this provider instead of
     /// the shared agent loop provider.
-    pub summarization_model_provider: Option<Arc<dyn LLMProvider>>,
+    pub(crate) summarization_model_provider: Option<Arc<dyn LLMProvider>>,
     /// Provider routing key used for provider-specific request behavior.
     ///
     /// In multi-instance mode this may be the instance id.
-    pub provider_name: Option<String>,
+    pub(crate) provider_name: Option<String>,
     /// Underlying provider type (for example `openai`, `anthropic`, `copilot`).
     ///
     /// This is distinct from `provider_name` so provider-specific behavior can
     /// remain correct when routing keys are instance ids.
-    pub provider_type: Option<String>,
+    pub(crate) provider_type: Option<String>,
     /// Optional request-time reasoning effort override.
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
     /// Bamboo application data directory (typically `~/.bamboo`).
     ///
     /// Used by runtime features that persist auxiliary artifacts outside the
     /// session store, such as durable plan mode files under `~/.bamboo/plan`.
-    pub app_data_dir: Option<PathBuf>,
+    pub(crate) app_data_dir: Option<PathBuf>,
     /// Tool names that should be excluded from schemas sent to the LLM.
-    pub disabled_tools: BTreeSet<String>,
+    pub(crate) disabled_tools: BTreeSet<String>,
     /// Token budget for context management (optional, defaults to model's limits)
-    pub token_budget: Option<TokenBudget>,
+    pub(crate) token_budget: Option<TokenBudget>,
     /// Optional image fallback behavior applied to *LLM requests only* (never persisted).
     ///
     /// This is intended for text-only provider paths where image parts must be degraded
     /// (placeholder / OCR / error) without leaking into stored session history or UI.
-    pub image_fallback: Option<ImageFallbackConfig>,
+    pub(crate) image_fallback: Option<ImageFallbackConfig>,
     /// Feature flags controlling prompt-time memory injection behavior.
-    pub prompt_memory_flags: PromptMemoryFlags,
+    pub(crate) prompt_memory_flags: PromptMemoryFlags,
     /// Maximum tool calls allowed per round (default: 80).
-    pub max_tool_calls_per_round: usize,
+    pub(crate) max_tool_calls_per_round: usize,
     /// Maximum consecutive failures per tool before circuit breaker (default: 3).
-    pub max_consecutive_failures_per_tool: usize,
+    pub(crate) max_consecutive_failures_per_tool: usize,
     /// Tool names that require strict argument validation.
-    pub strict_argument_tool_names: Vec<String>,
+    pub(crate) strict_argument_tool_names: Vec<String>,
     /// Per-tool execution timeout in seconds (default: 120).
-    pub per_tool_timeout_secs: u64,
+    pub(crate) per_tool_timeout_secs: u64,
     /// Parallel batch execution timeout in seconds (default: 300).
-    pub parallel_batch_timeout_secs: u64,
+    pub(crate) parallel_batch_timeout_secs: u64,
     /// Permission mode for this execution (default: None = use PermissionConfig's mode).
-    pub permission_mode: Option<PermissionMode>,
+    pub(crate) permission_mode: Option<PermissionMode>,
     /// Optional Gold observe-only evaluator configuration.
     ///
     /// When `None` or `enabled == false`, Gold evaluation is disabled and the
     /// existing execute/respond/resume loop remains unchanged.
-    pub gold_config: Option<GoldConfig>,
+    pub(crate) gold_config: Option<GoldConfig>,
     /// Enable dynamic per-round model routing based on task complexity.
     /// When true, the pipeline classifies complexity at each round end and
     /// stores the result in session metadata.
-    pub features_dynamic_model_routing: bool,
+    pub(crate) features_dynamic_model_routing: bool,
     /// Optional per-round resolver for auxiliary model settings that should
     /// follow live global config rather than stay frozen for the whole run.
     ///
     /// The main chat model remains session/request scoped; this hook is only
     /// for fast/background/planning/search/summarization helpers.
-    pub auxiliary_model_resolver: Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
+    pub(crate) auxiliary_model_resolver:
+        Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
 }
 
 impl Default for AgentLoopConfig {

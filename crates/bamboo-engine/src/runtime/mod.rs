@@ -19,14 +19,17 @@ pub mod task_evaluation;
 pub use agent::{Agent, AgentBuilder};
 pub use bamboo_domain::RuntimeSessionPersistence;
 pub use complexity_classifier::{ComplexityClassifier, TaskComplexity};
-pub use config::{AgentLoopConfig, GoldConfig, ImageFallbackConfig, ImageFallbackMode};
+pub use config::{GoldConfig, ImageFallbackConfig, ImageFallbackMode};
+// `AgentLoopConfig` is intentionally NOT re-exported: its fields are `pub(crate)`,
+// so it is unconstructible outside the engine. Internal call sites reach it via
+// `crate::runtime::config::AgentLoopConfig`. External code drives the loop only
+// through `AgentRuntime::execute`.
 pub use execution::runner_state::{AgentRunner, AgentStatus};
 pub use hooks::HookRunner;
 pub use managers::{
     LifecycleManager, LlmManager, MemoryManager, MiniLoopExecutor, PromptManager, ToolManager,
 };
 pub use model_roster::{ModelRoster, RoleModel};
-pub use runner::{run_agent_loop, run_agent_loop_with_config};
 pub use runtime::{AgentRuntime, AgentRuntimeBuilder, ExecuteRequest, ExecuteRequestBuilder};
 pub use task_context::TaskLoopContext;
 pub use task_evaluation::{evaluate_task_progress, TaskEvaluationResult};

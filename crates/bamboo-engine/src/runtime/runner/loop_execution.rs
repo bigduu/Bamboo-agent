@@ -35,7 +35,7 @@ use startup::{initialize_loop_state, LoopRunState};
 /// # Returns
 ///
 /// Returns `Ok(())` on successful completion, or an error if the loop fails.
-pub async fn run_agent_loop_with_config(
+pub(crate) async fn run_agent_loop_with_config(
     session: &mut Session,
     initial_message: String,
     event_tx: mpsc::Sender<AgentEvent>,

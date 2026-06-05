@@ -3,17 +3,8 @@
 //! This module provides the core agent execution loop that orchestrates LLM interactions,
 //! tool execution, and event streaming for conversational AI agents.
 
-use std::sync::Arc;
-
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
-
-use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::TokenUsage;
-use bamboo_agent_core::{AgentError, AgentEvent, Session};
-use bamboo_infrastructure::LLMProvider;
-
-use crate::runtime::config::AgentLoopConfig;
+use bamboo_agent_core::{AgentError, Session};
 
 pub mod image_fallback;
 mod logging;
@@ -31,7 +22,7 @@ pub(crate) mod tool_execution;
 mod workspace_context;
 
 pub use bamboo_agent_core::PromptSnapshot;
-pub use loop_execution::run_agent_loop_with_config;
+pub(crate) use loop_execution::run_agent_loop_with_config;
 
 pub fn read_prompt_snapshot(session: &Session) -> Option<PromptSnapshot> {
     session_setup::read_prompt_snapshot(session)
@@ -53,31 +44,6 @@ pub(super) fn to_event_token_usage(prompt_tokens: u64, completion_tokens: u64) -
 
 /// Result type for agent loop operations.
 pub type Result<T> = std::result::Result<T, AgentError>;
-
-pub async fn run_agent_loop(
-    session: &mut Session,
-    initial_message: String,
-    event_tx: mpsc::Sender<AgentEvent>,
-    llm: Arc<dyn LLMProvider>,
-    tools: Arc<dyn ToolExecutor>,
-    cancel_token: CancellationToken,
-    max_rounds: usize,
-) -> Result<()> {
-    run_agent_loop_with_config(
-        session,
-        initial_message,
-        event_tx,
-        llm,
-        tools,
-        cancel_token,
-        AgentLoopConfig {
-            max_rounds,
-            skip_initial_user_message: false,
-            ..Default::default()
-        },
-    )
-    .await
-}
 
 #[cfg(test)]
 mod tests;
