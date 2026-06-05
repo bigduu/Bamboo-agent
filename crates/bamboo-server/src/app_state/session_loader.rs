@@ -12,53 +12,34 @@
 
 use super::*;
 
+use bamboo_agent_core::Session;
+use bamboo_engine::session_app::errors::{SessionLoadError, SessionSaveError};
+use bamboo_engine::session_app::repository::SessionAccess;
+
+// `SessionAccess` for `AppState` is a pure forward to the framework-owned
+// `session_repo` (the canonical `SessionAccess` impl lives on
+// `bamboo_engine::SessionRepository`). The coordination + error mapping is
+// defined once there, not duplicated here.
 #[async_trait::async_trait]
-impl bamboo_engine::session_app::repository::SessionAccess for AppState {
-    async fn load_session(
-        &self,
-        id: &str,
-    ) -> Result<Option<bamboo_agent_core::Session>, bamboo_engine::session_app::errors::SessionLoadError>
-    {
-        match AppState::load_session(self, id).await {
-            Some(session) => Ok(Some(session)),
-            None => Err(bamboo_engine::session_app::errors::SessionLoadError::NotFound(
-                id.to_string(),
-            )),
-        }
+impl SessionAccess for AppState {
+    async fn load_session(&self, id: &str) -> Result<Option<Session>, SessionLoadError> {
+        SessionAccess::load_session(&self.session_repo, id).await
     }
 
-    async fn load_or_create(
-        &self,
-        id: &str,
-        model: &str,
-    ) -> Result<bamboo_agent_core::Session, bamboo_engine::session_app::errors::SessionLoadError> {
-        Ok(AppState::load_or_create_session(self, id, model).await)
+    async fn load_or_create(&self, id: &str, model: &str) -> Result<Session, SessionLoadError> {
+        SessionAccess::load_or_create(&self.session_repo, id, model).await
     }
 
-    async fn save_session(
-        &self,
-        session: &mut bamboo_agent_core::Session,
-    ) -> Result<(), bamboo_engine::session_app::errors::SessionSaveError> {
-        self.persistence
-            .merge_save_runtime(session)
-            .await
-            .map_err(|e| bamboo_engine::session_app::errors::SessionSaveError::StorageError(e.to_string()))
+    async fn load_merged(&self, id: &str) -> Result<Option<Session>, SessionLoadError> {
+        SessionAccess::load_merged(&self.session_repo, id).await
     }
 
-    async fn save_and_cache(
-        &self,
-        session: &mut bamboo_agent_core::Session,
-    ) -> Result<(), bamboo_engine::session_app::errors::SessionSaveError> {
-        AppState::save_and_cache_session(self, session).await;
-        Ok(())
+    async fn save_session(&self, session: &mut Session) -> Result<(), SessionSaveError> {
+        SessionAccess::save_session(&self.session_repo, session).await
     }
 
-    async fn load_merged(
-        &self,
-        id: &str,
-    ) -> Result<Option<bamboo_agent_core::Session>, bamboo_engine::session_app::errors::SessionLoadError>
-    {
-        Ok(AppState::load_session_merged(self, id).await)
+    async fn save_and_cache(&self, session: &mut Session) -> Result<(), SessionSaveError> {
+        SessionAccess::save_and_cache(&self.session_repo, session).await
     }
 }
 

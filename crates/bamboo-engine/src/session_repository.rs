@@ -187,3 +187,13 @@ fn should_prefer_storage(memory_session: &Session, storage_session: &Session) ->
     }
     storage_session.updated_at > memory_session.updated_at
 }
+
+/// `SessionRepository` is the canonical `RuntimeSessionPersistence`: the runtime
+/// can persist a session through the same coordinator (merge-on-write + cache
+/// refresh) instead of a bespoke adapter.
+#[async_trait::async_trait]
+impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
+    async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.save(session).await
+    }
+}
