@@ -377,6 +377,12 @@ impl AppState {
         let tool_factory =
             crate::tools::ToolSurfaceFactory::new(base_tools, tools_with_task, tools);
 
+        let session_repo = bamboo_engine::SessionRepository::new(
+            sessions.clone(),
+            storage.clone(),
+            persistence.clone(),
+        );
+
         Ok(Self {
             app_data_dir: bamboo_home_dir,
             config,
@@ -385,6 +391,7 @@ impl AppState {
             sessions,
             storage,
             session_store,
+            session_repo,
             persistence,
             spawn_scheduler,
             child_completion_coordinator,

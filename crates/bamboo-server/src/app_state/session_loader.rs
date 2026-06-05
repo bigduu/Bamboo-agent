@@ -62,139 +62,37 @@ impl bamboo_engine::session_app::repository::SessionAccess for AppState {
     }
 }
 
+// The canonical load/save coordination now lives in
+// `bamboo_engine::SessionRepository`. These inherent methods are kept as thin
+// delegations so the ~hundreds of `state.load_session(...)` call sites stay
+// unchanged; new code can take a `&SessionRepository` directly.
 impl AppState {
     /// Load a session from memory cache, falling back to persistent storage.
-    ///
-    /// Returns `None` if the session does not exist in either tier.
     pub async fn load_session(&self, session_id: &str) -> Option<bamboo_agent_core::Session> {
-        let memory_session = {
-            bamboo_engine::read_cached_session(&self.sessions, session_id)
-        };
-
-        if let Some(session) = memory_session {
-            return Some(session);
-        }
-
-        match self.storage.load_session(session_id).await {
-            Ok(Some(session)) => {
-                self.sessions.insert(
-                    session_id.to_string(),
-                    Arc::new(parking_lot::RwLock::new(session.clone())),
-                );
-                Some(session)
-            }
-            _ => None,
-        }
+        self.session_repo.load(session_id).await
     }
 
     /// Load a session, creating a new one if it doesn't exist.
-    ///
-    /// Memory cache → storage → new `Session::new(session_id, model)`.
     pub async fn load_or_create_session(
         &self,
         session_id: &str,
         model: &str,
     ) -> bamboo_agent_core::Session {
-        if let Some(session) = self.load_session(session_id).await {
-            return session;
-        }
-        bamboo_agent_core::Session::new(session_id.to_string(), model.to_string())
+        self.session_repo.load_or_create(session_id, model).await
     }
 
     /// Load a session, merging memory and storage using a preference heuristic.
-    ///
-    /// Prefers the storage version when:
-    /// - memory lacks a `pending_question` but storage has one
-    /// - storage session has a newer `updated_at`
     pub async fn load_session_merged(
         &self,
         session_id: &str,
     ) -> Option<bamboo_agent_core::Session> {
-        let memory_session = {
-            bamboo_engine::read_cached_session(&self.sessions, session_id)
-        };
-
-        let storage_session = self
-            .storage
-            .load_session(session_id)
-            .await
-            .unwrap_or_default();
-
-        match (memory_session, storage_session) {
-            (Some(memory), Some(storage)) => {
-                let prefer_storage = should_prefer_storage(&memory, &storage);
-                // The vast majority of merges are no-op agreements (same length,
-                // memory wins). Only log when the two sources actually diverge —
-                // i.e. storage is preferred, or the message counts differ — since
-                // that is the only case worth investigating. Full detail at trace.
-                let diverged = prefer_storage || memory.messages.len() != storage.messages.len();
-                let chosen_len = if prefer_storage {
-                    storage.messages.len()
-                } else {
-                    memory.messages.len()
-                };
-                macro_rules! merged_log {
-                    ($level:ident) => {
-                        tracing::$level!(
-                            "[{}] load_session_merged: memory={} msgs (updated_at={}), storage={} msgs (updated_at={}), prefer_storage={} -> chose {} msgs",
-                            session_id,
-                            memory.messages.len(),
-                            memory.updated_at,
-                            storage.messages.len(),
-                            storage.updated_at,
-                            prefer_storage,
-                            chosen_len,
-                        )
-                    };
-                }
-                if diverged {
-                    merged_log!(debug);
-                } else {
-                    merged_log!(trace);
-                }
-                let chosen = if prefer_storage { storage } else { memory };
-                self.sessions.insert(
-                    session_id.to_string(),
-                    Arc::new(parking_lot::RwLock::new(chosen.clone())),
-                );
-                Some(chosen)
-            }
-            (Some(memory), None) => Some(memory),
-            (None, Some(storage)) => {
-                self.sessions.insert(
-                    session_id.to_string(),
-                    Arc::new(parking_lot::RwLock::new(storage.clone())),
-                );
-                Some(storage)
-            }
-            (None, None) => None,
-        }
+        self.session_repo.load_merged(session_id).await
     }
 
     /// Persist session to storage and update the in-memory cache.
-    ///
-    /// Uses [`bamboo_infrastructure::LockedSessionStore::merge_save_runtime`]
-    /// so concurrent UI edits to the authoritative metadata group are preserved.
-    /// The in-memory cache is updated with the merged session (post-merge fields).
     pub async fn save_and_cache_session(&self, session: &mut bamboo_agent_core::Session) {
-        if let Err(error) = self.persistence.merge_save_runtime(session).await {
-            tracing::warn!("[{}] Failed to save session: {}", session.id, error);
-        }
-        self.sessions.insert(
-            session.id.clone(),
-            Arc::new(parking_lot::RwLock::new(session.clone())),
-        );
+        self.session_repo.save_and_cache(session).await
     }
-}
-
-fn should_prefer_storage(
-    memory_session: &bamboo_agent_core::Session,
-    storage_session: &bamboo_agent_core::Session,
-) -> bool {
-    if memory_session.pending_question.is_none() && storage_session.pending_question.is_some() {
-        return true;
-    }
-    storage_session.updated_at > memory_session.updated_at
 }
 
 #[cfg(test)]

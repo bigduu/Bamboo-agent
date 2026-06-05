@@ -197,6 +197,13 @@ pub struct AppState {
     /// may race with a UI metadata update.
     pub persistence: Arc<LockedSessionStore>,
 
+    /// Framework-owned session coordinator (cache + storage + persistence).
+    /// The canonical load/save coordination lives here in `bamboo-engine`, not
+    /// on `AppState`; the inherent `AppState::load_session`/`save_and_cache_session`
+    /// methods now delegate to it. Holds clones of the same `Arc`s as the
+    /// `sessions`/`storage`/`persistence` fields above.
+    pub session_repo: bamboo_engine::SessionRepository,
+
     /// Background scheduler for async sub-session spawning.
     pub spawn_scheduler: Arc<SpawnScheduler>,
 

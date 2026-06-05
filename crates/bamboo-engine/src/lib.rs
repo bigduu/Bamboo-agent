@@ -22,6 +22,8 @@ pub mod prompt_defaults;
 pub mod runtime;
 pub mod sdk;
 pub mod session_app;
+pub mod session_repository;
+pub use session_repository::SessionRepository;
 pub use bamboo_skills as skills;
 pub mod title_gen;
 
