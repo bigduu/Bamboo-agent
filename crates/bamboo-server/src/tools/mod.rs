@@ -6,8 +6,8 @@
 //! Framework-agnostic tools (MemoryTool, OverlayToolExecutor, etc.) live in
 //! `bamboo-server-tools` crate. This module re-exports them for convenience.
 
-// Re-export framework-agnostic tools from crate
-pub use bamboo_engine::server_tools::{
+// Re-export framework-agnostic tools from crate::server_tools
+pub use crate::server_tools::{
     CompactContextTool, LoadSkillTool, MemoryTool, OverlayToolExecutor, ReadSkillResourceTool,
     SessionInspectorTool, ToolSurface, ToolSurfaceFactory,
 };

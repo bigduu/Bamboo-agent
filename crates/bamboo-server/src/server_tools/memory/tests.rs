@@ -38,7 +38,7 @@ fn test_context<'a>(session_id: &'a str) -> ToolExecutionContext<'a> {
 }
 
 fn build_memory_tool(data_dir: &std::path::Path) -> MemoryTool {
-    let sessions: crate::SessionCache = Arc::new(dashmap::DashMap::new());
+    let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     MemoryTool::new(sessions, storage, data_dir)
 }

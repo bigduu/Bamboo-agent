@@ -21,7 +21,6 @@ pub mod profiles;
 pub mod prompt_defaults;
 pub mod runtime;
 pub mod sdk;
-pub mod server_tools;
 pub mod session_app;
 pub use bamboo_skills as skills;
 pub mod title_gen;

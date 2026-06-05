@@ -1,6 +1,6 @@
 use super::{LoadSkillTool, ReadSkillResourceTool};
-use crate::access_control::{parse_loaded_skill_ids, serialize_loaded_skill_ids};
-use crate::runtime_metadata::{
+use bamboo_engine::access_control::{parse_loaded_skill_ids, serialize_loaded_skill_ids};
+use bamboo_engine::runtime_metadata::{
     LAST_LOADED_SKILL_SUMMARY_METADATA_KEY, LAST_RESOURCE_READ_SUMMARY_METADATA_KEY,
 };
 use std::collections::{HashMap, HashSet};
@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::{SkillManager, SkillStoreConfig};
+use bamboo_engine::{SkillManager, SkillStoreConfig};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolExecutionContext};
 use bamboo_agent_core::Session;
@@ -37,7 +37,7 @@ fn serialize_loaded_skill_ids_is_stable_and_sorted() {
 }
 
 /// Build a per-session-locked session cache pre-populated with one session.
-fn test_session_cache(session_id: &str, session: &Session) -> crate::SessionCache {
+fn test_session_cache(session_id: &str, session: &Session) -> bamboo_engine::SessionCache {
     let cache = Arc::new(dashmap::DashMap::new());
     cache.insert(
         session_id.to_string(),

@@ -6,12 +6,12 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
 
-use crate::access_control;
-use crate::resource_helpers::{
+use bamboo_engine::access_control;
+use bamboo_engine::resource_helpers::{
     display_relative_path, normalize_relative_resource_path, page_text_lines, truncate_text,
 };
-use crate::runtime_metadata::LAST_RESOURCE_READ_SUMMARY_METADATA_KEY;
-use crate::SkillManager;
+use bamboo_engine::runtime_metadata::LAST_RESOURCE_READ_SUMMARY_METADATA_KEY;
+use bamboo_engine::SkillManager;
 use bamboo_infrastructure::Config;
 
 use bamboo_agent_core::storage::Storage;
@@ -38,7 +38,7 @@ impl ReadSkillResourceTool {
     pub fn new(
         skill_manager: Arc<SkillManager>,
         config: Arc<RwLock<Config>>,
-        sessions: crate::SessionCache,
+        sessions: bamboo_engine::SessionCache,
         storage: Arc<dyn Storage>,
         persistence: Arc<LockedSessionStore>,
     ) -> Self {

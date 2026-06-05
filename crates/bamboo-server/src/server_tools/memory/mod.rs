@@ -24,14 +24,14 @@ use args::MemoryArgs;
 
 #[derive(Clone)]
 pub struct MemoryTool {
-    sessions: crate::SessionCache,
+    sessions: bamboo_engine::SessionCache,
     storage: Arc<dyn Storage>,
     memory_store: MemoryStore,
 }
 
 impl MemoryTool {
     pub fn new(
-        sessions: crate::SessionCache,
+        sessions: bamboo_engine::SessionCache,
         storage: Arc<dyn Storage>,
         data_dir: impl Into<std::path::PathBuf>,
     ) -> Self {

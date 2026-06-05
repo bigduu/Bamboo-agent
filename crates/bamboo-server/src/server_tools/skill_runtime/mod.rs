@@ -5,8 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use crate::access_control::{SkillAccessError, SkillSessionPort};
-use crate::SkillManager;
+use bamboo_engine::access_control::{SkillAccessError, SkillSessionPort};
+use bamboo_engine::SkillManager;
 use bamboo_infrastructure::Config;
 
 use bamboo_agent_core::storage::Storage;
@@ -29,7 +29,7 @@ pub(super) const MAX_RESOURCE_CONTENT_CHARS: usize = 50_000;
 pub(super) struct SkillToolAccess {
     pub(super) skill_manager: Arc<SkillManager>,
     config: Arc<RwLock<Config>>,
-    pub(super) sessions: crate::SessionCache,
+    pub(super) sessions: bamboo_engine::SessionCache,
     storage: Arc<dyn Storage>,
     pub(super) persistence: Arc<LockedSessionStore>,
 }
@@ -38,7 +38,7 @@ impl SkillToolAccess {
     pub(super) fn new(
         skill_manager: Arc<SkillManager>,
         config: Arc<RwLock<Config>>,
-        sessions: crate::SessionCache,
+        sessions: bamboo_engine::SessionCache,
         storage: Arc<dyn Storage>,
         persistence: Arc<LockedSessionStore>,
     ) -> Self {
