@@ -7,6 +7,7 @@ pub mod external_agents;
 pub mod gardener;
 pub mod gold_auto_answer;
 pub mod mcp;
+pub mod llm_summarizer;
 pub mod message_hooks;
 pub mod metrics;
 pub mod metrics_service;

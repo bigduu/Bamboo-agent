@@ -7,10 +7,11 @@ use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
     AgentError, AgentEvent, CompressionTriggerType, ContextBlock, Role, Session,
 };
+use crate::llm_summarizer::LlmSummarizer;
 use bamboo_compression::{
     apply_compression_plan, build_forced_compression_plan_with_summary,
     estimate_context_compression_exposure, prepare_hybrid_context, summary_source_messages,
-    LlmSummarizer, PreparedContext, Summarizer, TiktokenTokenCounter, TokenBudget, TokenCounter,
+    PreparedContext, Summarizer, TiktokenTokenCounter, TokenBudget, TokenCounter,
 };
 use bamboo_infrastructure::LLMProvider;
 use std::sync::Arc;
@@ -324,9 +325,9 @@ async fn maybe_apply_host_context_compression_with_budget(
     .with_context_blocks(compression_context_blocks)
     .with_custom_instructions(compression_instructions)
     .with_summary_mode(if existing_summary.is_some() {
-        bamboo_compression::SummaryMode::IncrementalMerge
+        crate::llm_summarizer::SummaryMode::IncrementalMerge
     } else {
-        bamboo_compression::SummaryMode::FullRewrite
+        crate::llm_summarizer::SummaryMode::FullRewrite
     });
     emit_context_compression_status(event_tx, phase_label, "started").await;
     let summary = match summarizer.summarize(&messages).await {

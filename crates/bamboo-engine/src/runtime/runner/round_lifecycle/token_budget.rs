@@ -26,7 +26,9 @@ pub(super) async fn resolve_token_budget(
     // 2. provider runtime metadata (copilot only)
     // 3. dedicated config file: model_limits.json
     // 4. legacy fallback: config.json -> model_limits
-    let mut registry = ModelLimitsRegistry::default();
+    let mut registry = ModelLimitsRegistry::with_config_path(
+        bamboo_compression::limits::get_default_config_path(&bamboo_infrastructure::paths::bamboo_dir()),
+    );
 
     if let Some(provider_limit) = resolve_provider_runtime_limit(config, llm, model_name).await {
         registry.add_limit(provider_limit);
@@ -37,7 +39,7 @@ pub(super) async fn resolve_token_budget(
         Err(error) => {
             tracing::warn!(
                 "Failed to load model limits from {:?}: {}. Falling back to legacy config.json key.",
-                bamboo_compression::limits::get_default_config_path(),
+                bamboo_compression::limits::get_default_config_path(&bamboo_infrastructure::paths::bamboo_dir()),
                 error
             );
             false
@@ -47,7 +49,7 @@ pub(super) async fn resolve_token_budget(
     if !loaded_from_file {
         let unified_model_limits = match tokio::task::spawn_blocking(|| {
             let config = bamboo_infrastructure::Config::new();
-            load_model_limits_from_unified_config(&config)
+            load_model_limits_from_unified_config(config.extra.get("model_limits"))
         })
         .await
         {
@@ -94,7 +96,7 @@ pub(super) async fn resolve_token_budget(
             model_name,
             model_limit.model_pattern,
             model_limit.max_context_tokens,
-            bamboo_compression::limits::get_default_config_path()
+            bamboo_compression::limits::get_default_config_path(&bamboo_infrastructure::paths::bamboo_dir())
         );
     }
 

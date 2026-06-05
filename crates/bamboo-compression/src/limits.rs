@@ -121,14 +121,15 @@ impl ModelLimitsRegistry {
         }
     }
 
-    /// Load user overrides from the default configuration path.
+    /// Load user overrides from the registry's configured path.
     ///
-    /// Default path: `{bamboo_data_dir}/model_limits.json`
+    /// No-op when the registry was created without a `config_path` (use
+    /// [`Self::with_config_path`] — e.g. with [`get_default_config_path`] — to
+    /// point it at `{bamboo_data_dir}/model_limits.json`).
     pub async fn load_user_config(&mut self) -> std::io::Result<()> {
-        let path = self
-            .config_path
-            .clone()
-            .unwrap_or_else(get_default_config_path);
+        let Some(path) = self.config_path.clone() else {
+            return Ok(());
+        };
 
         if !path.exists() {
             return Ok(());
@@ -186,12 +187,13 @@ impl ModelLimitsRegistry {
         self.get(model).unwrap_or_else(default_model_limit)
     }
 
-    /// Save current user limits to the configuration file.
+    /// Save current user limits to the configured file.
+    ///
+    /// No-op when the registry has no `config_path`.
     pub async fn save_user_config(&self) -> std::io::Result<()> {
-        let path = self
-            .config_path
-            .clone()
-            .unwrap_or_else(get_default_config_path);
+        let Some(path) = self.config_path.clone() else {
+            return Ok(());
+        };
 
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
@@ -220,21 +222,28 @@ impl Default for ModelLimitsRegistry {
 
 /// Get the default configuration file path.
 ///
-/// Returns `{bamboo_data_dir}/model_limits.json`.
-pub fn get_default_config_path() -> PathBuf {
-    bamboo_infrastructure::paths::bamboo_dir().join("model_limits.json")
+/// Returns `{bamboo_data_dir}/model_limits.json`, given the Bamboo data dir.
+///
+/// The caller supplies the base directory so this crate stays free of any
+/// infrastructure/filesystem-config dependency.
+pub fn get_default_config_path(bamboo_dir: &std::path::Path) -> PathBuf {
+    bamboo_dir.join("model_limits.json")
 }
 
-/// Load user model limits from unified `config.json` root key `model_limits`.
+/// Load user model limits from the unified `config.json` `model_limits` value.
+///
+/// The caller extracts the raw `model_limits` JSON value (e.g. from
+/// `config.extra.get("model_limits")`) and passes it here, keeping this crate
+/// independent of the concrete `Config` type.
 ///
 /// Returns:
-/// - `Ok(None)` when `model_limits` key is absent.
-/// - `Ok(Some(vec))` when key exists and is valid (including empty array).
-/// - `Err(...)` when key exists but is not a valid `Vec<ModelLimit>`.
+/// - `Ok(None)` when `model_limits` is absent.
+/// - `Ok(Some(vec))` when present and valid (including empty array).
+/// - `Err(...)` when present but not a valid `Vec<ModelLimit>`.
 pub fn load_model_limits_from_unified_config(
-    config: &bamboo_infrastructure::Config,
+    raw_limits: Option<&Value>,
 ) -> Result<Option<Vec<ModelLimit>>, String> {
-    let Some(raw_limits) = config.extra.get("model_limits") else {
+    let Some(raw_limits) = raw_limits else {
         return Ok(None);
     };
 
@@ -373,31 +382,22 @@ mod tests {
 
     #[test]
     fn unified_config_loader_returns_none_when_absent() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let config =
-            bamboo_infrastructure::Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
-        let loaded = load_model_limits_from_unified_config(&config).expect("should parse");
+        let loaded = load_model_limits_from_unified_config(None).expect("should parse");
         assert!(loaded.is_none());
     }
 
     #[test]
     fn unified_config_loader_reads_valid_model_limits() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let mut config =
-            bamboo_infrastructure::Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
-        config.extra.insert(
-            "model_limits".to_string(),
-            serde_json::json!([
-                {
-                    "model_pattern": "gpt-5.2-codex",
-                    "max_context_tokens": 64000,
-                    "max_output_tokens": 2048,
-                    "safety_margin": 512
-                }
-            ]),
-        );
+        let raw = serde_json::json!([
+            {
+                "model_pattern": "gpt-5.2-codex",
+                "max_context_tokens": 64000,
+                "max_output_tokens": 2048,
+                "safety_margin": 512
+            }
+        ]);
 
-        let loaded = load_model_limits_from_unified_config(&config)
+        let loaded = load_model_limits_from_unified_config(Some(&raw))
             .expect("should parse")
             .expect("should exist");
         assert_eq!(loaded.len(), 1);
@@ -409,15 +409,8 @@ mod tests {
 
     #[test]
     fn unified_config_loader_errors_on_invalid_shape() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let mut config =
-            bamboo_infrastructure::Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
-        config.extra.insert(
-            "model_limits".to_string(),
-            serde_json::json!({"unexpected": true}),
-        );
-
-        let error = load_model_limits_from_unified_config(&config).expect_err("should error");
+        let raw = serde_json::json!({"unexpected": true});
+        let error = load_model_limits_from_unified_config(Some(&raw)).expect_err("should error");
         assert!(error.contains("expected array"));
     }
 
