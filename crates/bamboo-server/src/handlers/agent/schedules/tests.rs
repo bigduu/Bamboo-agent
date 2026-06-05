@@ -14,7 +14,7 @@ fn validate_schedule_name_rejects_empty_values() {
 
 #[test]
 fn validate_interval_trigger_rejects_zero() {
-    let response = validate_schedule_trigger(&crate::schedules::ScheduleTrigger::Interval {
+    let response = validate_schedule_trigger(&crate::schedule_app::ScheduleTrigger::Interval {
         every_seconds: 0,
         anchor_at: None,
     })
@@ -24,7 +24,7 @@ fn validate_interval_trigger_rejects_zero() {
 
 #[test]
 fn validate_interval_trigger_accepts_positive_values() {
-    validate_schedule_trigger(&crate::schedules::ScheduleTrigger::Interval {
+    validate_schedule_trigger(&crate::schedule_app::ScheduleTrigger::Interval {
         every_seconds: 1,
         anchor_at: None,
     })

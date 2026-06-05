@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 
 use crate::app_state::AppState;
 use crate::handlers::agent::schedules::types::{CreateScheduleRequest, PatchScheduleRequest};
-use crate::schedules::{MisFirePolicy, OverlapPolicy, ScheduleRunConfig, ScheduleTrigger};
+use crate::schedule_app::{MisFirePolicy, OverlapPolicy, ScheduleRunConfig, ScheduleTrigger};
 use bamboo_engine::model_config_helper::get_schedule_model_from_config;
 
 pub(super) fn validate_schedule_name(name: &str) -> Result<String, HttpResponse> {
@@ -121,12 +121,12 @@ pub(super) fn validate_trigger_api_fields(
 
 #[derive(Debug)]
 pub(super) struct ResolvedCreateScheduleDefinition {
-    pub definition: crate::schedules::store::ScheduleDefinitionChanges,
+    pub definition: crate::schedule_app::store::ScheduleDefinitionChanges,
 }
 
 #[derive(Debug)]
 pub(super) struct ResolvedPatchScheduleDefinition {
-    pub definition: crate::schedules::store::ScheduleDefinitionChanges,
+    pub definition: crate::schedule_app::store::ScheduleDefinitionChanges,
 }
 
 pub(super) fn resolve_create_schedule_definition(
@@ -142,7 +142,7 @@ pub(super) fn resolve_create_schedule_definition(
     )?;
 
     Ok(ResolvedCreateScheduleDefinition {
-        definition: crate::schedules::store::ScheduleDefinitionChanges {
+        definition: crate::schedule_app::store::ScheduleDefinitionChanges {
             trigger: Some(req.trigger.clone()),
             timezone: req.timezone.clone(),
             start_at: req.start_at,
@@ -166,7 +166,7 @@ pub(super) fn resolve_patch_schedule_definition(
     )?;
 
     Ok(ResolvedPatchScheduleDefinition {
-        definition: crate::schedules::store::ScheduleDefinitionChanges {
+        definition: crate::schedule_app::store::ScheduleDefinitionChanges {
             trigger: req.trigger.clone(),
             timezone: req.timezone.clone(),
             start_at: req.start_at,
@@ -243,7 +243,7 @@ pub(super) async fn validate_auto_execute_run_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schedules::ScheduleWeekday;
+    use crate::schedule_app::ScheduleWeekday;
 
     #[test]
     fn validate_schedule_name_accepts_valid_name() {

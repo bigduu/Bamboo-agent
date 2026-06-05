@@ -23,9 +23,9 @@ use bamboo_infrastructure::LockedSessionStore;
 use bamboo_infrastructure::SessionStoreV2;
 
 use crate::error::AppError;
-use crate::schedules::manager::{build_schedule_context, ScheduleContext};
-use crate::schedules::ScheduleManager;
-use crate::schedules::ScheduleStore;
+use crate::schedule_app::manager::{build_schedule_context, ScheduleContext};
+use crate::schedule_app::ScheduleManager;
+use crate::schedule_app::ScheduleStore;
 use crate::spawn_scheduler::{SpawnContext, SpawnScheduler};
 use bamboo_engine::metrics_service::MetricsService;
 
@@ -305,7 +305,7 @@ pub fn build_schedule_manager(
         account_feed_inbox,
         persistence,
         app_data_dir,
-        trigger_engine: crate::schedules::default_trigger_engine(),
+        trigger_engine: crate::schedule_app::default_trigger_engine(),
         resolve_run_config: Arc::new(|_| unimplemented!("replaced by build_schedule_context")),
     };
     Arc::new(ScheduleManager::new(build_schedule_context(

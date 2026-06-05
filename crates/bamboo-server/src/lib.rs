@@ -115,7 +115,6 @@ pub mod logging;
 pub mod reloadable_provider;
 pub mod routes;
 pub mod schedule_app;
-pub mod schedules;
 pub mod server;
 pub mod services;
 pub mod session_app;

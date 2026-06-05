@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::schedules::{
+use crate::schedule_app::{
     MisFirePolicy, OverlapPolicy, ScheduleEntry, ScheduleRunConfig, ScheduleRunRecord,
     ScheduleRunStatus, ScheduleSpec, ScheduleState, ScheduleTrigger,
 };
@@ -155,7 +155,7 @@ pub struct ListScheduleRunsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schedules::{ScheduleState, ScheduleTrigger};
+    use crate::schedule_app::{ScheduleState, ScheduleTrigger};
 
     #[test]
     fn test_schedule_view_from_entry_serialization() {

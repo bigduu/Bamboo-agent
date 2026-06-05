@@ -1,7 +1,7 @@
 use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
-use crate::schedules::ScheduleRunJob;
+use crate::schedule_app::ScheduleRunJob;
 
 use super::super::types::{CreateScheduleRequest, PatchScheduleRequest, ScheduleView};
 use super::super::validation::{
