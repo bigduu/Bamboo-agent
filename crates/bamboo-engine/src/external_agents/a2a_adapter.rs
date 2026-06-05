@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bamboo_agent_core::{AgentError, AgentEvent, Role, TokenUsage};
-use bamboo_engine::runtime::execution::{ExternalChildRunner, SpawnJob};
+use crate::runtime::execution::{ExternalChildRunner, SpawnJob};
 use bamboo_infrastructure::a2a::types::{
     A2ARole, CancelTaskRequest, GetTaskRequest, Message, Part, PartContentWire,
     SendMessageConfiguration, SendMessageRequest,
@@ -118,7 +118,7 @@ impl ExternalChildRunner for A2AExternalChildRunner {
         _job: &SpawnJob,
         event_tx: mpsc::Sender<AgentEvent>,
         cancel_token: CancellationToken,
-    ) -> bamboo_engine::runtime::runner::Result<()> {
+    ) -> crate::runtime::runner::Result<()> {
         // Increment attempt counter.
         let attempt: u64 = session
             .metadata
@@ -226,7 +226,7 @@ async fn handle_non_streaming(
     event_tx: mpsc::Sender<AgentEvent>,
     session: &mut bamboo_agent_core::Session,
     tenant: Option<String>,
-) -> bamboo_engine::runtime::runner::Result<()> {
+) -> crate::runtime::runner::Result<()> {
     let response = client
         .send_message(request)
         .await
@@ -317,7 +317,7 @@ async fn handle_streaming(
     cancel_token: CancellationToken,
     session: &mut bamboo_agent_core::Session,
     tenant: Option<String>,
-) -> bamboo_engine::runtime::runner::Result<()> {
+) -> crate::runtime::runner::Result<()> {
     let mut mapper = A2AEventMapper::new();
 
     loop {
@@ -432,7 +432,7 @@ async fn apply_mapped_events(
     event_tx: &mpsc::Sender<AgentEvent>,
     session: &mut bamboo_agent_core::Session,
     mapped: A2AMappedEvents,
-) -> bamboo_engine::runtime::runner::Result<()> {
+) -> crate::runtime::runner::Result<()> {
     for (k, v) in mapped.metadata_updates {
         session.metadata.insert(k, v);
     }

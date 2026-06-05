@@ -109,7 +109,6 @@ pub mod config;
 pub mod config_manager;
 pub mod error;
 pub mod events;
-pub mod external_agents;
 pub mod handlers;
 pub mod logging;
 pub mod reloadable_provider;

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bamboo_agent_core::{AgentError, AgentEvent};
-use bamboo_engine::runtime::execution::{ExternalChildRunner, SpawnJob};
+use crate::runtime::execution::{ExternalChildRunner, SpawnJob};
 use bamboo_infrastructure::a2a::A2AJsonRpcClient;
 use bamboo_infrastructure::Config;
 use tokio::sync::mpsc;
@@ -39,7 +39,7 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
         job: &SpawnJob,
         event_tx: mpsc::Sender<AgentEvent>,
         cancel_token: CancellationToken,
-    ) -> bamboo_engine::runtime::runner::Result<()> {
+    ) -> crate::runtime::runner::Result<()> {
         for runner in &self.runners {
             if runner.should_handle(session).await {
                 return runner

@@ -279,7 +279,7 @@ impl AppState {
         // Initialize sub-session spawn scheduler (async background jobs).
         let config_snapshot = config.read().await.clone();
         let external_runner =
-            crate::external_agents::runtime::build_external_child_runner(&config_snapshot);
+            bamboo_engine::external_agents::runtime::build_external_child_runner(&config_snapshot);
         let spawn_scheduler = build_spawn_scheduler(
             agent.clone(),
             child_tools,

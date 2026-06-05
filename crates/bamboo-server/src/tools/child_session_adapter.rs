@@ -116,7 +116,7 @@ impl ChildSessionAdapter {
     /// Resolve runtime metadata (e.g. external agent routing) for a subagent_type.
     pub async fn resolve_runtime_metadata(&self, subagent_type: &str) -> HashMap<String, String> {
         let config = self.config.read().await;
-        crate::external_agents::config::resolve_runtime_metadata(&config, subagent_type)
+        bamboo_engine::external_agents::config::resolve_runtime_metadata(&config, subagent_type)
     }
 
     /// Resolve the canonical system prompt for the given `subagent_type`.
