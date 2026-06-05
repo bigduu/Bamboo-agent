@@ -20,6 +20,46 @@ pub trait Storage: Send + Sync {
 
     /// Deletes a session, returns true if anything was deleted.
     async fn delete_session(&self, session_id: &str) -> std::io::Result<bool>;
+
+    /// Persist ONLY the runtime control-plane (everything except the potentially
+    /// large `messages` history) for an already-existing session.
+    ///
+    /// Backends that keep a small runtime sidecar use this to make frequent
+    /// runtime-state updates (e.g. registering a parent's wait for spawned
+    /// children) O(1) in conversation length instead of rewriting the whole
+    /// message history. Backends without a sidecar fall back to a full
+    /// [`save_session`](Self::save_session), so this is always safe to call.
+    async fn save_runtime_state(&self, session: &Session) -> std::io::Result<()> {
+        self.save_session(session).await
+    }
+
+    /// Load only the runtime control-plane snapshot — a [`Session`] whose
+    /// `messages` are left empty — when the backend keeps one.
+    ///
+    /// Used to merge authoritative metadata before a runtime-only save without
+    /// paying to deserialize the full message history. Backends without a
+    /// sidecar fall back to a full [`load_session`](Self::load_session).
+    async fn load_runtime_control_plane(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        self.load_session(session_id).await
+    }
+
+    /// List `(child_session_id, last_run_status)` for every direct child of the
+    /// given parent session, sourced from the index/metadata the backend keeps.
+    ///
+    /// This is the single source of truth for the parent→child relationship and
+    /// each child's status; callers reconstruct active/completed child sets from
+    /// it instead of reading a denormalized copy out of the parent file. Backends
+    /// without a child-aware index return an empty list by default.
+    async fn list_child_run_statuses(
+        &self,
+        parent_session_id: &str,
+    ) -> std::io::Result<Vec<(String, Option<String>)>> {
+        let _ = parent_session_id;
+        Ok(Vec::new())
+    }
 }
 
 /// Attachment reader for `bamboo-attachment://<session_id>/<attachment_id>` references.

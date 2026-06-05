@@ -135,6 +135,7 @@ pub(super) fn build_root_tools(
         config: config.clone(),
         subagent_profiles,
         tool_names,
+        parent_wait_slots: Arc::new(dashmap::DashMap::new()),
     });
 
     // Root sessions can create and manage child sessions via unified SubAgent tool.

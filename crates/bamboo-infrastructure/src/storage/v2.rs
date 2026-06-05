@@ -33,6 +33,39 @@ fn other_io_error(message: impl Into<String>) -> io::Error {
     io::Error::other(message.into())
 }
 
+/// Filename of the runtime control-plane sidecar, stored alongside
+/// `session.json` in each session directory.
+const RUNTIME_SIDECAR_FILE: &str = "runtime.json";
+
+/// Marker (under `bamboo_home_dir`) recording that the one-shot runtime sidecar
+/// migration has completed, so it is skipped on subsequent boots.
+const RUNTIME_SIDECAR_MIGRATION_MARKER: &str = ".runtime_sidecar_migrated";
+
+/// Build the sidecar snapshot: the full session minus its `messages` history.
+/// Every field except `messages` is authoritative in the sidecar; on load the
+/// message history is taken back from `session.json`.
+fn runtime_sidecar_snapshot(session: &Session) -> Session {
+    let mut snapshot = session.clone();
+    snapshot.messages.clear();
+    snapshot
+}
+
+/// Overlay the runtime sidecar onto the session loaded from `session.json`.
+///
+/// The sidecar holds the freshest control-plane (metadata, `agent_runtime_state`,
+/// title group, …) because every save — full or runtime-only — writes it. The
+/// large `messages` history is only ever written by full saves into
+/// `session.json`, so it is preserved from `main`.
+fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
+    match sidecar {
+        Some(mut side) => {
+            side.messages = main.messages;
+            side
+        }
+        None => main,
+    }
+}
+
 fn validate_session_id(session_id: &str) -> io::Result<()> {
     if session_id.is_empty()
         || session_id.contains('/')
@@ -303,6 +336,115 @@ impl SessionStoreV2 {
             Ok(Some(self.abs_path_from_rel(&rel).join("session.json")))
         } else {
             Ok(None)
+        }
+    }
+
+    async fn runtime_json_path(&self, session_id: &str) -> io::Result<Option<PathBuf>> {
+        if let Some(rel) = self.resolve_rel_path(session_id).await {
+            Ok(Some(self.abs_path_from_rel(&rel).join(RUNTIME_SIDECAR_FILE)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Write the runtime control-plane sidecar: a full session snapshot with the
+    /// (potentially huge) `messages` history cleared. This is what makes
+    /// runtime-only saves O(1) in conversation length.
+    async fn write_runtime_sidecar(&self, abs_dir: &Path, session: &Session) -> io::Result<()> {
+        let path = abs_dir.join(RUNTIME_SIDECAR_FILE);
+        let snapshot = runtime_sidecar_snapshot(session);
+        let tmp = path.with_extension(format!("json.tmp.{}", Uuid::new_v4()));
+        let bytes =
+            serde_json::to_vec_pretty(&snapshot).map_err(|e| other_io_error(e.to_string()))?;
+        fs::write(&tmp, bytes).await?;
+        atomic_rename(&tmp, &path).await?;
+        Ok(())
+    }
+
+    /// One-shot migration: create the runtime sidecar (`runtime.json`) for every
+    /// existing session that predates the message/control-plane split.
+    ///
+    /// Loading already tolerates a missing sidecar (it falls back to the embedded
+    /// control-plane in `session.json`), so this is an *optimization* migration,
+    /// not a correctness one — but running it once means the fast runtime-save
+    /// path is in effect immediately for legacy sessions, and the denormalized
+    /// `children` id vectors (now `#[serde(skip)]`) drop out of the sidecar.
+    ///
+    /// Idempotent and cheap on later boots: guarded by a marker file, and any
+    /// session that already has a sidecar is skipped. Returns the number of
+    /// sidecars created.
+    pub async fn migrate_runtime_sidecars(&self) -> io::Result<usize> {
+        let marker = self.bamboo_home_dir.join(RUNTIME_SIDECAR_MIGRATION_MARKER);
+        if fs::try_exists(&marker).await.unwrap_or(false) {
+            return Ok(0);
+        }
+
+        let entries = self.list_index_entries().await;
+        let mut migrated = 0usize;
+        for entry in entries {
+            let abs_dir = self.abs_path_from_rel(&entry.rel_path);
+            let sidecar_path = abs_dir.join(RUNTIME_SIDECAR_FILE);
+            if fs::try_exists(&sidecar_path).await.unwrap_or(false) {
+                continue;
+            }
+            let session_path = abs_dir.join("session.json");
+            // Read session.json directly (not load_session) — there is no sidecar
+            // to overlay yet, and we want the raw embedded control-plane.
+            let raw = match fs::read_to_string(&session_path).await {
+                Ok(raw) => raw,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let session: Session = match serde_json::from_str(&raw) {
+                Ok(session) => session,
+                Err(error) => {
+                    tracing::warn!(
+                        "runtime sidecar migration: skipping unreadable session {}: {}",
+                        entry.id,
+                        error
+                    );
+                    continue;
+                }
+            };
+            self.write_runtime_sidecar(&abs_dir, &session).await?;
+            migrated += 1;
+        }
+
+        // Persist the marker last, atomically, so an interrupted migration simply
+        // re-runs (it is idempotent) instead of being falsely marked complete.
+        let tmp = marker.with_extension(format!("tmp.{}", Uuid::new_v4()));
+        fs::write(&tmp, b"runtime-sidecar-v1\n").await?;
+        atomic_rename(&tmp, &marker).await?;
+
+        if migrated > 0 {
+            tracing::info!("runtime sidecar migration: created {migrated} sidecar(s)");
+        }
+        Ok(migrated)
+    }
+
+    /// Read the runtime sidecar (a Session snapshot with empty `messages`), if it
+    /// exists. Returns `None` when the session has no sidecar yet (e.g. legacy
+    /// sessions not yet migrated).
+    async fn read_runtime_sidecar(&self, session_id: &str) -> io::Result<Option<Session>> {
+        let Some(path) = self.runtime_json_path(session_id).await? else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(&path).await?;
+        match serde_json::from_str::<Session>(&raw) {
+            Ok(side) => Ok(Some(side)),
+            Err(error) => {
+                // A corrupt sidecar must never make a session unloadable — the
+                // authoritative copy still lives in session.json. Warn and ignore.
+                tracing::warn!(
+                    "ignoring corrupt runtime sidecar for {}: {}",
+                    session_id,
+                    error
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -778,6 +920,14 @@ impl Storage for SessionStoreV2 {
         let abs_dir = self.abs_path_from_rel(&rel_path);
         let path = abs_dir.join("session.json");
 
+        // Refresh the runtime sidecar BEFORE session.json. If the process
+        // crashes between the two writes, the sidecar then carries a
+        // control-plane that is at least as fresh as session.json, and the
+        // load-time overlay (sidecar wins for non-message fields) stays correct.
+        // Writing session.json first could leave a stale sidecar that silently
+        // reverts the just-saved control-plane on the next load.
+        self.write_runtime_sidecar(&abs_dir, session).await?;
+
         let tmp = path.with_extension(format!("json.tmp.{}", Uuid::new_v4()));
         let bytes =
             serde_json::to_vec_pretty(session).map_err(|e| other_io_error(e.to_string()))?;
@@ -806,12 +956,55 @@ impl Storage for SessionStoreV2 {
         let raw = fs::read_to_string(path).await?;
         let session: Session = serde_json::from_str(&raw)
             .map_err(|e| other_io_error(format!("invalid session.json: {e}")))?;
-        Ok(Some(session))
+        let sidecar = self.read_runtime_sidecar(session_id).await?;
+        Ok(Some(overlay_runtime_sidecar(session, sidecar)))
     }
 
     async fn delete_session(&self, session_id: &str) -> io::Result<bool> {
         // Historical API deletes sessions. In V2, treat this as recursive and forced.
         self.delete_session_recursive(session_id, true).await
+    }
+
+    async fn save_runtime_state(&self, session: &Session) -> io::Result<()> {
+        // Fast path: write ONLY the small runtime sidecar (no messages), leaving
+        // session.json — which carries the full conversation history — untouched.
+        // This is O(1) in conversation length, unlike `save_session`.
+        let Some(rel) = self.resolve_rel_path(&session.id).await else {
+            // Session was never fully persisted yet — fall back to a full save so
+            // session.json and the index get created.
+            return self.save_session(session).await;
+        };
+        let abs_dir = self.abs_path_from_rel(&rel);
+        self.write_runtime_sidecar(&abs_dir, session).await
+    }
+
+    async fn load_runtime_control_plane(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Session>> {
+        validate_session_id(session_id)?;
+        // Prefer the sidecar (cheap: no messages). Fall back to a full load for
+        // sessions that predate the sidecar (not yet migrated).
+        if let Some(side) = self.read_runtime_sidecar(session_id).await? {
+            return Ok(Some(side));
+        }
+        self.load_session(session_id).await
+    }
+
+    async fn list_child_run_statuses(
+        &self,
+        parent_session_id: &str,
+    ) -> io::Result<Vec<(String, Option<String>)>> {
+        let index = self.index.read().await;
+        Ok(index
+            .sessions
+            .values()
+            .filter(|entry| {
+                entry.kind == SessionKind::Child
+                    && entry.parent_session_id.as_deref() == Some(parent_session_id)
+            })
+            .map(|entry| (entry.id.clone(), entry.last_run_status.clone()))
+            .collect())
     }
 }
 
@@ -862,6 +1055,244 @@ mod tests {
         let _storage = SessionStoreV2::new(bamboo_home).await?;
         assert!(index_path.exists());
 
+        Ok(())
+    }
+
+    // ── Runtime sidecar (③) ───────────────────────────────────────────────
+
+    use bamboo_domain::session::types::Message;
+    use bamboo_domain::AgentRuntimeState;
+
+    fn session_with_history(id: &str, messages: usize, run_id: &str) -> Session {
+        let mut s = Session::new(id.to_string(), "test-model".to_string());
+        for i in 0..messages {
+            s.add_message(Message::user(format!("msg-{i}")));
+        }
+        s.agent_runtime_state = Some(AgentRuntimeState::new(run_id));
+        s
+    }
+
+    async fn read_session_json_raw(storage: &SessionStoreV2, id: &str) -> String {
+        let path = storage.session_json_path(id).await.unwrap().unwrap();
+        tokio::fs::read_to_string(path).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn save_session_writes_runtime_sidecar() -> io::Result<()> {
+        let (storage, _t) = create_temp_storage().await?;
+        let s = session_with_history("sc-1", 2, "run-A");
+        storage.save_session(&s).await?;
+
+        let sidecar_path = storage.runtime_json_path("sc-1").await?.unwrap();
+        assert!(sidecar_path.exists(), "save_session must write runtime.json");
+
+        // Sidecar must NOT carry the message history.
+        let side = storage.read_runtime_sidecar("sc-1").await?.unwrap();
+        assert!(side.messages.is_empty(), "sidecar messages must be cleared");
+        assert_eq!(side.agent_runtime_state.as_ref().unwrap().run_id, "run-A");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn save_runtime_state_does_not_rewrite_session_json_messages() -> io::Result<()> {
+        let (storage, _t) = create_temp_storage().await?;
+
+        // Full save: 3 messages + run-A.
+        let s = session_with_history("sc-2", 3, "run-A");
+        storage.save_session(&s).await?;
+        let raw_before = read_session_json_raw(&storage, "sc-2").await;
+        assert!(raw_before.contains("msg-2"));
+
+        // Runtime-only save: bump control-plane to run-B AND (deviously) add a
+        // 4th in-memory message. The sidecar must persist run-B but IGNORE the
+        // message, and session.json must be left byte-identical.
+        let mut s2 = s.clone();
+        s2.agent_runtime_state = Some(AgentRuntimeState::new("run-B"));
+        s2.add_message(Message::user("msg-3-should-not-persist"));
+        storage.save_runtime_state(&s2).await?;
+
+        let raw_after = read_session_json_raw(&storage, "sc-2").await;
+        assert_eq!(
+            raw_before, raw_after,
+            "save_runtime_state must not touch session.json"
+        );
+
+        // Load overlays the sidecar: run-B control-plane + original 3 messages.
+        let loaded = storage.load_session("sc-2").await?.unwrap();
+        assert_eq!(loaded.agent_runtime_state.as_ref().unwrap().run_id, "run-B");
+        assert_eq!(
+            loaded.messages.len(),
+            3,
+            "runtime-only save must not add a message"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn save_runtime_state_falls_back_to_full_save_when_unpersisted() -> io::Result<()> {
+        let (storage, _t) = create_temp_storage().await?;
+        // Session was never saved: no index entry, no dir. save_runtime_state
+        // must fall back to a full save so session.json + index get created.
+        let s = session_with_history("sc-3", 1, "run-A");
+        storage.save_runtime_state(&s).await?;
+
+        let loaded = storage.load_session("sc-3").await?;
+        assert!(loaded.is_some(), "fallback full save must create the session");
+        assert_eq!(loaded.unwrap().messages.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupt_sidecar_is_ignored_and_session_still_loads() -> io::Result<()> {
+        let (storage, _t) = create_temp_storage().await?;
+        let s = session_with_history("sc-4", 2, "run-A");
+        storage.save_session(&s).await?;
+
+        // Corrupt the sidecar.
+        let sidecar_path = storage.runtime_json_path("sc-4").await?.unwrap();
+        tokio::fs::write(&sidecar_path, b"{ not valid json").await?;
+
+        // Session still loads from session.json; corrupt sidecar is ignored.
+        let loaded = storage.load_session("sc-4").await?.unwrap();
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.agent_runtime_state.as_ref().unwrap().run_id, "run-A");
+        Ok(())
+    }
+
+    // ── ⑤ Runtime sidecar migration ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn migration_backfills_sidecars_for_legacy_sessions() -> io::Result<()> {
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
+        let bamboo_home = temp_dir.path().to_path_buf();
+        let storage = SessionStoreV2::new(bamboo_home.clone()).await?;
+
+        // Persist two sessions, then delete their sidecars to simulate the
+        // legacy on-disk layout (session.json only).
+        let a = session_with_history("mig-a", 3, "run-A");
+        let b = session_with_history("mig-b", 1, "run-B");
+        storage.save_session(&a).await?;
+        storage.save_session(&b).await?;
+        for id in ["mig-a", "mig-b"] {
+            let sidecar = storage.runtime_json_path(id).await?.unwrap();
+            tokio::fs::remove_file(&sidecar).await?;
+            assert!(!sidecar.exists());
+        }
+
+        let migrated = storage.migrate_runtime_sidecars().await?;
+        assert_eq!(migrated, 2, "both legacy sessions get a sidecar");
+
+        // Sidecars now exist and carry the control-plane (no messages).
+        for (id, run) in [("mig-a", "run-A"), ("mig-b", "run-B")] {
+            let side = storage.read_runtime_sidecar(id).await?.unwrap();
+            assert!(side.messages.is_empty());
+            assert_eq!(side.agent_runtime_state.as_ref().unwrap().run_id, run);
+        }
+        // Full load still returns the messages from session.json.
+        assert_eq!(storage.load_session("mig-a").await?.unwrap().messages.len(), 3);
+
+        // Marker written; a second run is a no-op.
+        let marker = bamboo_home.join(RUNTIME_SIDECAR_MIGRATION_MARKER);
+        assert!(marker.exists());
+        assert_eq!(storage.migrate_runtime_sidecars().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_is_idempotent_and_skips_existing_sidecars() -> io::Result<()> {
+        let (storage, _t) = create_temp_storage().await?;
+        // Fresh save already writes a sidecar — migration must not double-count it.
+        storage.save_session(&session_with_history("mig-c", 2, "run-C")).await?;
+        let first = storage.migrate_runtime_sidecars().await?;
+        assert_eq!(first, 0, "session saved in new format needs no migration");
+        // And a re-run remains a no-op.
+        assert_eq!(storage.migrate_runtime_sidecars().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_drops_legacy_denormalized_children_from_sidecar() -> io::Result<()> {
+        // A legacy session.json whose embedded runtime state still carries the
+        // old denormalized children id vectors. After migration the sidecar must
+        // not contain them (they are now derived from the index).
+        let (storage, _t) = create_temp_storage().await?;
+        let mut s = session_with_history("mig-legacy", 1, "run-L");
+        storage.save_session(&s).await?;
+
+        // Hand-write a legacy session.json containing children.active_ids and
+        // remove the sidecar, simulating pre-split on-disk data.
+        let dir = storage.abs_path_from_rel(
+            &storage.resolve_rel_path("mig-legacy").await.unwrap(),
+        );
+        s.agent_runtime_state = Some(AgentRuntimeState::new("run-L"));
+        let mut value = serde_json::to_value(&s).unwrap();
+        value["agent_runtime_state"]["children"]["active_ids"] =
+            serde_json::json!(["ghost-child"]);
+        tokio::fs::write(
+            dir.join("session.json"),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .await?;
+        tokio::fs::remove_file(storage.runtime_json_path("mig-legacy").await?.unwrap()).await?;
+
+        assert_eq!(storage.migrate_runtime_sidecars().await?, 1);
+
+        let raw_sidecar = tokio::fs::read_to_string(
+            storage.runtime_json_path("mig-legacy").await?.unwrap(),
+        )
+        .await?;
+        assert!(
+            !raw_sidecar.contains("ghost-child") && !raw_sidecar.contains("active_ids"),
+            "legacy denormalized children must not survive migration: {raw_sidecar}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_child_run_statuses_filters_by_parent_and_reports_status() -> io::Result<()> {
+        let (storage, _t) = create_temp_storage().await?;
+
+        // Parent root + two children with distinct statuses, plus an unrelated
+        // child under a different parent that must NOT appear.
+        let parent = Session::new("p-root".to_string(), "m".to_string());
+        storage.save_session(&parent).await?;
+        let other = Session::new("p-other".to_string(), "m".to_string());
+        storage.save_session(&other).await?;
+
+        let mut c1 = Session::new_child("ch-done", "p-root", "m", "c1");
+        c1.metadata
+            .insert("last_run_status".to_string(), "completed".to_string());
+        storage.save_session(&c1).await?;
+
+        let c2 = Session::new_child("ch-pending", "p-root", "m", "c2");
+        storage.save_session(&c2).await?;
+
+        let foreign = Session::new_child("ch-foreign", "p-other", "m", "x");
+        storage.save_session(&foreign).await?;
+
+        let mut got = storage.list_child_run_statuses("p-root").await?;
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got.len(), 2, "only p-root's children: {got:?}");
+        assert_eq!(got[0].0, "ch-done");
+        assert_eq!(got[0].1.as_deref(), Some("completed"));
+        assert_eq!(got[1].0, "ch-pending");
+        // pending child has no terminal status mirrored yet.
+        assert!(got[1].1.as_deref() != Some("completed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_runtime_control_plane_reads_sidecar_without_messages() -> io::Result<()> {
+        let (storage, _t) = create_temp_storage().await?;
+        let s = session_with_history("sc-5", 5, "run-A");
+        storage.save_session(&s).await?;
+
+        let cp = storage.load_runtime_control_plane("sc-5").await?.unwrap();
+        assert!(
+            cp.messages.is_empty(),
+            "control-plane load must skip the message history"
+        );
+        assert_eq!(cp.agent_runtime_state.as_ref().unwrap().run_id, "run-A");
         Ok(())
     }
 

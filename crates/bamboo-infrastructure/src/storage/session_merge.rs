@@ -80,6 +80,29 @@ impl LockedSessionStore {
         lock.lock_owned().await
     }
 
+    /// Runtime-only save: persist the control-plane (`agent_runtime_state`,
+    /// metadata, …) without rewriting the message history.
+    ///
+    /// This is the fast path for runtime-state mutations that do NOT change
+    /// `messages` — e.g. registering a parent's wait for spawned children. It
+    /// delegates to [`Storage::save_runtime_state`], which writes a small
+    /// sidecar (or falls back to a full save on backends without one).
+    ///
+    /// Like [`Self::merge_save_runtime`], it merges newer authoritative metadata
+    /// from disk so a concurrent UI title/pin edit is never clobbered — but it
+    /// reads only the lightweight control-plane snapshot (no message history) to
+    /// do so.
+    ///
+    /// Callers MUST NOT use this when they have appended messages: the in-memory
+    /// `messages` are ignored by the sidecar and would not be persisted.
+    pub async fn save_runtime_only(&self, session: &mut Session) -> std::io::Result<()> {
+        let _guard = self.acquire_lock(&session.id).await;
+        if let Ok(Some(latest)) = self.storage.load_runtime_control_plane(&session.id).await {
+            apply_authoritative_metadata(session, &latest);
+        }
+        self.storage.save_runtime_state(session).await
+    }
+
     /// Authoritative metadata commit.
     ///
     /// The caller must have already loaded the latest session, mutated the
@@ -106,18 +129,20 @@ impl LockedSessionStore {
     pub async fn merge_save_runtime(&self, session: &mut Session) -> std::io::Result<()> {
         let _guard = self.acquire_lock(&session.id).await;
 
+        // Single disk read serves BOTH the SHRINK diagnostic and the
+        // authoritative-metadata merge below. Previously this path loaded the
+        // session twice (once here, once inside the merge helper); on a parent
+        // session carrying the full conversation history that doubled the
+        // deserialization cost of every runtime save, which is the hot path
+        // during sub-agent spawn.
+        let latest = self.storage.load_session(&session.id).await.ok().flatten();
+
         // DIAGNOSTIC: merge_save_runtime overwrites the whole `messages` array
         // (it only merges authoritative metadata, not messages). If the incoming
         // session is stale (fewer messages than what is already on disk), this save
         // silently reverts a concurrent append (e.g. a just-persisted user message).
         // Log a SHRINK warning so we can identify the stale writer.
-        let existing_message_count = self
-            .storage
-            .load_session(&session.id)
-            .await
-            .ok()
-            .flatten()
-            .map(|s| s.messages.len());
+        let existing_message_count = latest.as_ref().map(|s| s.messages.len());
         let incoming_message_count = session.messages.len();
         if existing_message_count.is_some_and(|existing| existing > incoming_message_count) {
             tracing::warn!(
@@ -138,7 +163,9 @@ impl LockedSessionStore {
             );
         }
 
-        merge_authoritative_metadata_into_stale(&self.storage, session).await;
+        if let Some(latest) = latest.as_ref() {
+            apply_authoritative_metadata(session, latest);
+        }
         self.storage.save_session(session).await
     }
 
@@ -194,19 +221,28 @@ async fn merge_authoritative_metadata_into_stale(
     session: &mut Session,
 ) {
     if let Ok(Some(latest)) = storage.load_session(&session.id).await {
-        if latest.metadata_version >= session.metadata_version {
-            session.title = latest.title;
-            session.title_version = latest.title_version;
-            session.pinned = latest.pinned;
-            for key in AUTHORITATIVE_METADATA_KEYS {
-                if let Some(value) = latest.metadata.get(*key) {
-                    session.metadata.insert((*key).to_string(), value.clone());
-                } else {
-                    session.metadata.remove(*key);
-                }
+        apply_authoritative_metadata(session, &latest);
+    }
+}
+
+/// Pure merge step: given a freshly-loaded on-disk copy, overwrite the
+/// in-memory authoritative metadata group when disk's `metadata_version` is at
+/// least the in-memory one. Split out so callers that have already loaded the
+/// disk copy (e.g. [`LockedSessionStore::merge_save_runtime`]) don't pay for a
+/// second read.
+fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
+    if latest.metadata_version >= session.metadata_version {
+        session.title = latest.title.clone();
+        session.title_version = latest.title_version;
+        session.pinned = latest.pinned;
+        for key in AUTHORITATIVE_METADATA_KEYS {
+            if let Some(value) = latest.metadata.get(*key) {
+                session.metadata.insert((*key).to_string(), value.clone());
+            } else {
+                session.metadata.remove(*key);
             }
-            session.metadata_version = latest.metadata_version;
         }
+        session.metadata_version = latest.metadata_version;
     }
 }
 
@@ -352,6 +388,47 @@ mod tests {
             1,
             "merge_save_runtime clobbers concurrent appends — this is why config patches must use update_runtime_config"
         );
+    }
+
+    #[tokio::test]
+    async fn merge_save_runtime_preserves_disk_authoritative_metadata_with_single_load() {
+        // Regression guard for the single-load refactor of `merge_save_runtime`:
+        // it must STILL pull the authoritative metadata group (title / pinned /
+        // metadata_version) from the freshest on-disk copy when disk's
+        // metadata_version >= the in-memory one, even though it now reads disk
+        // only once.
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "runtime-merge-meta";
+
+        // Baseline persisted by a runtime writer (metadata_version 0).
+        let mut baseline = fresh(session_id);
+        baseline.title = "Auto Title".to_string();
+        baseline.metadata_version = 0;
+        storage.save_session(&baseline).await.unwrap();
+
+        // A stale runtime snapshot (still metadata_version 0, old title).
+        let mut stale_snapshot = storage.load_session(session_id).await.unwrap().unwrap();
+
+        // An authoritative UI rename bumps metadata_version on disk.
+        let mut renamed = storage.load_session(session_id).await.unwrap().unwrap();
+        renamed.title = "User Renamed".to_string();
+        renamed.title_version = 1;
+        renamed.pinned = true;
+        renamed.metadata_version = 1;
+        store.commit_metadata(&renamed).await.unwrap();
+
+        // The stale runtime writer saves: it must adopt the disk title/pinned.
+        stale_snapshot.title = "Auto Title".to_string();
+        store.merge_save_runtime(&mut stale_snapshot).await.unwrap();
+
+        let after = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(after.title, "User Renamed");
+        assert!(after.pinned);
+        assert_eq!(after.metadata_version, 1);
+        // And the in-memory copy was corrected by the merge too.
+        assert_eq!(stale_snapshot.title, "User Renamed");
+        assert_eq!(stale_snapshot.metadata_version, 1);
     }
 
     // ── Free-function merge tests (updated for metadata-group) ──────

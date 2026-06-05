@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::session_app::child_session::{self, ChildSessionPort, CreateChildInput};
 use crate::tools::child_session_adapter::{tool_error_from_child_session, ChildSessionAdapter};
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
+use bamboo_domain::session::runtime_state::ChildWaitPolicy;
 use bamboo_domain::subagent::SubagentProfileRegistry;
 use bamboo_domain::ReasoningEffort;
 
@@ -25,10 +26,23 @@ enum SubAgentArgs {
         #[serde(default)]
         responsibility: Option<String>,
         prompt: String,
-        subagent_type: String,
-        workspace: String,
+        /// Subagent profile/role. Optional: defaults to `general-purpose` when
+        /// omitted or empty, so a missing value never hard-fails a create.
+        #[serde(default)]
+        subagent_type: Option<String>,
+        /// Working directory for the child. Optional: defaults to the parent
+        /// session's workspace when omitted.
+        #[serde(default)]
+        workspace: Option<String>,
         #[serde(default)]
         auto_run: Option<bool>,
+        /// When `true`, the parent suspends immediately and waits for THIS child
+        /// to finish (the legacy one-shot behavior). Defaults to `false`:
+        /// `create` runs the child in the background and returns right away so
+        /// the parent can spawn more children. Call `action=wait` once, after
+        /// spawning everything, to suspend until they finish.
+        #[serde(default)]
+        wait: Option<bool>,
         /// Optional reasoning effort for the child session. When omitted,
         /// the child stays at `None` so the provider's default applies
         /// (it does NOT inherit the parent's reasoning_effort). The LLM
@@ -36,6 +50,21 @@ enum SubAgentArgs {
         /// `"high"`/`"max"` for hard reasoning) when it has a preference.
         #[serde(default)]
         reasoning_effort: Option<ReasoningEffort>,
+    },
+    /// Suspend the parent run until its background child sessions finish.
+    ///
+    /// Spawn children with `action=create` (which no longer suspends), then call
+    /// this once. By default it waits on every currently-active child; pass
+    /// explicit `child_session_ids` to wait on a subset. If no children are
+    /// active it is a no-op (the parent keeps running).
+    Wait {
+        #[serde(default)]
+        child_session_ids: Option<Vec<String>>,
+        /// Wait policy: `all` (default) resumes when every tracked child is
+        /// terminal; `any` resumes on the first; `first_error` resumes early on
+        /// any error/timeout/cancel.
+        #[serde(default)]
+        wait_for: Option<ChildWaitPolicy>,
     },
     List,
     Get {
@@ -137,7 +166,11 @@ fn tool_result(value: serde_json::Value) -> Result<ToolResult, ToolError> {
 fn waiting_for_children_tool_result(mut value: serde_json::Value) -> Result<ToolResult, ToolError> {
     if let Some(object) = value.as_object_mut() {
         object.insert("runtime_control".to_string(), json!("waiting_for_children"));
-        object.insert("wait_for".to_string(), json!("all"));
+        // Don't clobber a caller-provided policy (e.g. action=wait with
+        // wait_for=any); only default it when absent.
+        object
+            .entry("wait_for".to_string())
+            .or_insert_with(|| json!("all"));
         object.insert(
             "note".to_string(),
             json!("Child session queued. The parent run is suspended and will resume automatically when the child finishes or times out."),
@@ -175,7 +208,9 @@ impl Tool for SubAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. A child session runs independently under the current root session with its own conversation context, can use a specialized subagent profile, streams progress back to the parent via sub_agent_* events, and can be reopened from the Sub-agents panel. Use action=create for a new delegated task; use list/get to inspect existing children; use update/run/send_message/cancel/delete to manage existing children. Use only when the user explicitly asks for delegation/parallelism or when a side task would otherwise flood the main context. Do not use for simple one-step tasks. Child sessions cannot spawn nested child sessions. IMPORTANT: When a child fails or needs redirection, prefer send_message over creating a duplicate child. Use list before create to avoid spawning redundant children."
+        "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. A child session runs independently under the current root session with its own conversation context, can use a specialized subagent profile, streams progress back to the parent via sub_agent_* events, and can be reopened from the Sub-agents panel. \
+PARALLEL FAN-OUT (important): action=create now runs the child in the BACKGROUND and returns immediately WITHOUT suspending the parent. To launch several agents in parallel, call create once per child (ideally several creates in a single turn), then call action=wait ONCE to suspend until they finish. Do NOT pass wait=true on each create for parallel work — that would serialize them (suspend after the first). action=wait defaults to waiting on every active child; if you forget to call it, the runtime auto-waits at the end of the turn so results are never lost. \
+Use list/get to inspect existing children; use update/run/send_message/cancel/delete to manage existing children; use list_profiles to enumerate subagent roles. Use only when the user explicitly asks for delegation/parallelism or when a side task would otherwise flood the main context. Do not use for simple one-step tasks. Child sessions cannot spawn nested child sessions. IMPORTANT: When a child fails or needs redirection, prefer send_message over creating a duplicate child. Use list before create to avoid spawning redundant children."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -184,12 +219,27 @@ impl Tool for SubAgentTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "list", "get", "update", "run", "send_message", "cancel", "delete", "list_profiles"],
-                    "description": "Sub-agent lifecycle operation. Use create to delegate a new independent child session; use list/get to inspect; use update/run/send_message/cancel/delete to manage existing child sessions. Use list_profiles to enumerate available subagent roles before deciding which subagent_type to pass to create."
+                    "enum": ["create", "wait", "list", "get", "update", "run", "send_message", "cancel", "delete", "list_profiles"],
+                    "description": "Sub-agent lifecycle operation. To run work in parallel: call create once per child (this no longer suspends the parent — children run in the background), then call wait ONCE to suspend until they all finish. Use list/get to inspect; update/run/send_message/cancel/delete to manage existing children; list_profiles to enumerate available subagent roles before choosing subagent_type. \
+A create call requires: title, responsibility, prompt, and subagent_type (workspace and subagent_type are optional and default to the parent's workspace / general-purpose). EXAMPLE create: {\"action\":\"create\",\"subagent_type\":\"researcher\",\"title\":\"Analyze auth module\",\"responsibility\":\"Map the auth flow and list its public API\",\"prompt\":\"Read crates/auth/src/lib.rs, summarize the login flow, and list every pub fn.\",\"workspace\":\"/abs/path/to/repo\"}. Then EXAMPLE wait: {\"action\":\"wait\"}."
                 },
                 "child_session_id": {
                     "type": "string",
                     "description": "Existing child session id. Required for get/update/run/send_message/cancel/delete."
+                },
+                "child_session_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "For wait: optional explicit subset of child sessions to wait on. Omit to wait on every currently-active child."
+                },
+                "wait_for": {
+                    "type": "string",
+                    "enum": ["all", "any", "first_error"],
+                    "description": "For wait: resume policy. all (default) resumes when every tracked child is done; any resumes on the first; first_error resumes early on any error/timeout/cancel."
+                },
+                "wait": {
+                    "type": "boolean",
+                    "description": "For create: if true, suspend immediately and wait for just THIS child (legacy one-shot behavior). Defaults to false — create returns immediately and the child runs in the background; suspend later with action=wait."
                 },
                 "title": {
                     "type": "string",
@@ -209,11 +259,11 @@ impl Tool for SubAgentTool {
                 },
                 "subagent_type": {
                     "type": "string",
-                    "description": "Specialized child agent profile, e.g. general-purpose, researcher, coder, plan. Use plan/researcher for read-only exploration and coder/general-purpose for implementation when allowed."
+                    "description": "For create: the specialized child agent profile/role, e.g. general-purpose, researcher, coder, plan. Use plan/researcher for read-only exploration and coder/general-purpose for implementation when allowed. Optional — omitting it defaults to general-purpose — but you should pick the most fitting role. Call list_profiles to see the available roles."
                 },
                 "workspace": {
                     "type": "string",
-                    "description": "Absolute path to the working directory for the child session. The child will use this as its workspace for file operations."
+                    "description": "For create: absolute path to the child session's working directory for file operations. Optional — defaults to the parent session's workspace when omitted."
                 },
                 "auto_run": {
                     "type": "boolean",
@@ -241,7 +291,7 @@ impl Tool for SubAgentTool {
                     "description": "For create/update: reasoning effort level applied to the child session's own LLM calls. Use \"low\" for trivial fan-outs (e.g. simple lookups), \"medium\"/\"high\" for normal coding/analysis, \"xhigh\"/\"max\" for deep reasoning tasks. Omit to leave at provider default; the child does NOT inherit the parent's reasoning_effort."
                 }
             },
-            "required": ["action", "workspace"],
+            "required": ["action"],
             "additionalProperties": false
         })
     }
@@ -296,13 +346,31 @@ impl Tool for SubAgentTool {
                 subagent_type,
                 workspace,
                 auto_run,
+                wait,
                 reasoning_effort,
             } => {
                 let title = normalize_title(title, description)?;
                 let responsibility = normalize_required_text(responsibility, "responsibility")?;
                 let prompt = normalize_required_text(Some(prompt), "prompt")?;
-                let subagent_type = normalize_required_text(Some(subagent_type), "subagent_type")?;
-                let workspace = normalize_required_text(Some(workspace), "workspace")?;
+                // subagent_type is optional: an omitted/blank value falls back to
+                // the catch-all `general-purpose` profile (the same fallback
+                // resolve_subagent_prompt already applies), so the model never
+                // hard-fails a create just for leaving the role unspecified.
+                let subagent_type = subagent_type
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "general-purpose".to_string());
+                // workspace is optional: default to the parent's workspace.
+                let workspace = workspace
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| parent.workspace.clone())
+                    .ok_or_else(|| {
+                        ToolError::InvalidArguments(
+                            "workspace must be non-empty (parent has no workspace to inherit)"
+                                .to_string(),
+                        )
+                    })?;
 
                 if parent.model.trim().is_empty() {
                     return Err(ToolError::Execution(
@@ -354,6 +422,36 @@ impl Tool for SubAgentTool {
                 ))
                 .await;
 
+                // `wait=true` preserves the legacy one-shot behavior: register a
+                // wait for THIS child and suspend now. Default (`wait=false`) runs
+                // the child in the background and returns immediately, so the
+                // parent can keep spawning; it suspends later via `action=wait`.
+                let should_wait = should_auto_run && wait.unwrap_or(false);
+                if should_wait {
+                    self.adapter
+                        .register_parent_wait_for_child(
+                            &parent.id,
+                            &result.child_session_id,
+                            None,
+                        )
+                        .await
+                        .map_err(tool_error_from_child_session)?;
+                }
+
+                let status = if !should_auto_run {
+                    "created"
+                } else if should_wait {
+                    "queued"
+                } else {
+                    "running_in_background"
+                };
+                let note = if should_wait {
+                    "Child session queued (typically 30-120 seconds); the parent is suspended until it finishes. Use send_message (not create) to correct a child in place."
+                } else if should_auto_run {
+                    "Child session is running in the background (typically 30-120 seconds). Spawn any other children you need, then call action=wait once to suspend until they finish. Use send_message (not create) to correct a child in place."
+                } else {
+                    "Child session created (not started). Use action=run to start it. Use send_message (not create) to correct a child in place."
+                };
                 let payload = json!({
                     "title": title.clone(),
                     "description": title,
@@ -364,14 +462,50 @@ impl Tool for SubAgentTool {
                     "parent_session_id": parent_session_id,
                     "model": result.model,
                     "reasoning_effort": reasoning_effort.map(|effort| effort.as_str()),
-                    "status": if should_auto_run { "queued" } else { "created" },
-                    "note": "Child session created. Typical execution time: 30-120 seconds. If the child fails or needs correction, use send_message (not create) to retry in place."
+                    "status": status,
+                    "note": note,
                 });
-                if should_auto_run {
+                if should_wait {
                     waiting_for_children_tool_result(payload)
                 } else {
                     tool_result(payload)
                 }
+            }
+            SubAgentArgs::Wait {
+                child_session_ids,
+                wait_for,
+            } => {
+                let policy = wait_for.unwrap_or(ChildWaitPolicy::All);
+                // Default to every currently-active child; honor an explicit
+                // subset when provided.
+                let targets = match child_session_ids {
+                    Some(ids) if !ids.is_empty() => ids,
+                    _ => self.adapter.active_child_ids(&parent.id).await,
+                };
+
+                if targets.is_empty() {
+                    // Nothing to wait on — never register an empty wait (that
+                    // would suspend the parent with no child able to resume it).
+                    return tool_result(json!({
+                        "status": "no_active_children",
+                        "parent_session_id": parent_session_id,
+                        "note": "No active child sessions to wait for; the parent continues running.",
+                    }));
+                }
+
+                let count = self
+                    .adapter
+                    .register_parent_wait_for_children(&parent.id, &targets, policy)
+                    .await
+                    .map_err(tool_error_from_child_session)?;
+
+                waiting_for_children_tool_result(json!({
+                    "status": "waiting",
+                    "parent_session_id": parent_session_id,
+                    "child_session_ids": targets,
+                    "wait_for": policy.as_str(),
+                    "waiting_on": count,
+                }))
             }
             SubAgentArgs::List => {
                 let result =
@@ -423,6 +557,13 @@ impl Tool for SubAgentTool {
                         .enqueue_child_run(&parent, &child)
                         .await
                         .map_err(tool_error_from_child_session)?;
+                    // Re-running an existing child keeps its synchronous "wait for
+                    // the answer" semantics: register the wait + suspend. (enqueue
+                    // itself no longer registers — that is now explicit.)
+                    self.adapter
+                        .register_parent_wait_for_child(&parent.id, &child_session_id, None)
+                        .await
+                        .map_err(tool_error_from_child_session)?;
                 }
 
                 if should_auto_run {
@@ -438,11 +579,16 @@ impl Tool for SubAgentTool {
                 let result = child_session::run_child_action(
                     self.adapter.as_ref(),
                     &parent,
-                    child_session_id,
+                    child_session_id.clone(),
                     reset_to_last_user,
                 )
                 .await
                 .map_err(tool_error_from_child_session)?;
+                // `run` keeps the synchronous retry semantics: wait for this child.
+                self.adapter
+                    .register_parent_wait_for_child(&parent.id, &child_session_id, None)
+                    .await
+                    .map_err(tool_error_from_child_session)?;
                 waiting_for_children_tool_result(result)
             }
             SubAgentArgs::SendMessage {
@@ -455,19 +601,25 @@ impl Tool for SubAgentTool {
                 let result = child_session::send_message_to_child_action(
                     self.adapter.as_ref(),
                     &parent,
-                    child_session_id,
+                    child_session_id.clone(),
                     message,
                     auto_run,
                     interrupt_running,
                 )
                 .await
                 .map_err(tool_error_from_child_session)?;
-                if should_auto_run
+                let queued = should_auto_run
                     && result
                         .get("status")
                         .and_then(|value| value.as_str())
-                        .is_some_and(|status| status == "queued")
-                {
+                        .is_some_and(|status| status == "queued");
+                if queued {
+                    // Sending + running keeps synchronous semantics: wait for the
+                    // child's response. (enqueue no longer registers the wait.)
+                    self.adapter
+                        .register_parent_wait_for_child(&parent.id, &child_session_id, None)
+                        .await
+                        .map_err(tool_error_from_child_session)?;
                     waiting_for_children_tool_result(result)
                 } else {
                     tool_result(result)
@@ -612,6 +764,7 @@ mod tests {
 
     struct TestHarness {
         tool: SubAgentTool,
+        adapter: Arc<ChildSessionAdapter>,
         storage: Arc<dyn Storage>,
         agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
         parent_session_id: String,
@@ -725,17 +878,249 @@ mod tests {
             config: Arc::new(RwLock::new(bamboo_infrastructure::Config::default())),
             subagent_profiles: test_profiles.clone(),
             tool_names: Vec::new(),
+            parent_wait_slots: Arc::new(dashmap::DashMap::new()),
         });
-        let tool = SubAgentTool::new(adapter, test_profiles);
+        let tool = SubAgentTool::new(adapter.clone(), test_profiles);
 
         TestHarness {
             tool,
+            adapter,
             storage,
             agent_runners,
             parent_session_id,
             child_session_id,
             parent_rx,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // ④ Batched parent-wait registration
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn concurrent_parent_wait_registrations_all_land_in_wait_set() {
+        let harness = build_test_harness().await;
+        let adapter = harness.adapter.clone();
+        let parent_id = harness.parent_session_id.clone();
+
+        // Fire several registrations for the same parent concurrently, exactly as
+        // a round of parallel `SubAgent.create` calls would.
+        let child_ids: Vec<String> = (0..6).map(|i| format!("c-{i}")).collect();
+        let mut handles = Vec::new();
+        for id in &child_ids {
+            let adapter = adapter.clone();
+            let parent_id = parent_id.clone();
+            let id = id.clone();
+            handles.push(tokio::spawn(async move {
+                adapter
+                    .register_parent_wait_for_child(&parent_id, &id, Some("tc-1"))
+                    .await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().expect("registration should succeed");
+        }
+
+        // Every child must be durably present in the parent's wait set, with no
+        // duplicates — regardless of how the concurrent calls coalesced.
+        let parent = harness
+            .storage
+            .load_session(&parent_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let wait = parent
+            .agent_runtime_state
+            .expect("runtime state persisted")
+            .waiting_for_children
+            .expect("wait state persisted");
+        let mut got = wait.child_session_ids.clone();
+        got.sort();
+        assert_eq!(got, child_ids, "all children must be registered exactly once");
+        assert_eq!(
+            parent.metadata.get("runtime.suspend_reason").map(String::as_str),
+            Some("waiting_for_children")
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_registration_of_same_child_is_idempotent() {
+        let harness = build_test_harness().await;
+        let adapter = harness.adapter.clone();
+        let parent_id = harness.parent_session_id.clone();
+
+        for _ in 0..3 {
+            adapter
+                .register_parent_wait_for_child(&parent_id, "dup-child", None)
+                .await
+                .unwrap();
+        }
+
+        let parent = harness
+            .storage
+            .load_session(&parent_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let wait = parent
+            .agent_runtime_state
+            .unwrap()
+            .waiting_for_children
+            .unwrap();
+        assert_eq!(wait.child_session_ids, vec!["dup-child".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Decoupled create + explicit SubAgent.wait
+    // -----------------------------------------------------------------------
+
+    fn ctx_for<'a>(session_id: &'a str, tool_call_id: &'static str) -> ToolExecutionContext<'a> {
+        ToolExecutionContext {
+            session_id: Some(session_id),
+            tool_call_id,
+            event_tx: None,
+            available_tool_schemas: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_without_subagent_type_defaults_to_general_purpose() {
+        let harness = build_test_harness().await;
+        let result = harness
+            .tool
+            .execute_with_context(
+                json!({
+                    "action": "create",
+                    "title": "No Role Child",
+                    "responsibility": "Do work",
+                    "prompt": "Do the work",
+                    "workspace": "/tmp/ws"
+                    // subagent_type intentionally omitted
+                }),
+                ctx_for(&harness.parent_session_id, "tc_no_role"),
+            )
+            .await
+            .expect("create must succeed without subagent_type");
+
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(payload["subagent_type"].as_str(), Some("general-purpose"));
+    }
+
+    #[tokio::test]
+    async fn create_with_wait_true_suspends_and_registers_wait() {
+        let harness = build_test_harness().await;
+        let result = harness
+            .tool
+            .execute_with_context(
+                json!({
+                    "action": "create",
+                    "title": "Blocking Child",
+                    "responsibility": "Do one thing",
+                    "prompt": "Do it",
+                    "subagent_type": "general-purpose",
+                    "workspace": "/tmp/ws",
+                    "wait": true
+                }),
+                ctx_for(&harness.parent_session_id, "tc_create_wait"),
+            )
+            .await
+            .expect("create should succeed");
+
+        assert_eq!(
+            result.display_preference.as_deref(),
+            Some("runtime_control:waiting_for_children"),
+            "create wait=true must suspend the parent"
+        );
+
+        let parent = harness
+            .storage
+            .load_session(&harness.parent_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let wait = parent
+            .agent_runtime_state
+            .expect("runtime state")
+            .waiting_for_children
+            .expect("wait registered");
+        assert_eq!(wait.child_session_ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_action_with_explicit_children_suspends_and_registers() {
+        let harness = build_test_harness().await;
+        let result = harness
+            .tool
+            .execute_with_context(
+                json!({
+                    "action": "wait",
+                    "child_session_ids": ["k1", "k2", "k3"],
+                    "wait_for": "any"
+                }),
+                ctx_for(&harness.parent_session_id, "tc_wait"),
+            )
+            .await
+            .expect("wait should succeed");
+
+        assert_eq!(
+            result.display_preference.as_deref(),
+            Some("runtime_control:waiting_for_children"),
+            "wait must suspend the parent"
+        );
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(payload["status"].as_str(), Some("waiting"));
+        assert_eq!(payload["wait_for"].as_str(), Some("any"));
+
+        let parent = harness
+            .storage
+            .load_session(&harness.parent_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let wait = parent
+            .agent_runtime_state
+            .unwrap()
+            .waiting_for_children
+            .unwrap();
+        assert_eq!(
+            wait.child_session_ids,
+            vec!["k1".to_string(), "k2".to_string(), "k3".to_string()]
+        );
+        assert_eq!(wait.wait_for, ChildWaitPolicy::Any);
+    }
+
+    #[tokio::test]
+    async fn wait_action_is_noop_when_no_active_children() {
+        let harness = build_test_harness().await;
+        // No explicit ids and (in the jsonl-backed harness) no derivable active
+        // children → must NOT suspend, and must NOT register an empty wait.
+        let result = harness
+            .tool
+            .execute_with_context(
+                json!({ "action": "wait" }),
+                ctx_for(&harness.parent_session_id, "tc_wait_noop"),
+            )
+            .await
+            .expect("wait should succeed");
+
+        assert_ne!(
+            result.display_preference.as_deref(),
+            Some("runtime_control:waiting_for_children"),
+            "wait with no active children must not suspend"
+        );
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(payload["status"].as_str(), Some("no_active_children"));
+
+        let parent = harness
+            .storage
+            .load_session(&harness.parent_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(parent
+            .agent_runtime_state
+            .and_then(|s| s.waiting_for_children)
+            .is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -1292,8 +1677,7 @@ mod tests {
                     "responsibility": "Do something",
                     "prompt": "Do something useful",
                     "subagent_type": "general-purpose",
-                    "workspace": "/tmp/test-workspace",
-                    "auto_run": false
+                    "workspace": "/tmp/test-workspace"
                 }),
                 ToolExecutionContext {
                     session_id: Some(harness.parent_session_id.as_str()),
@@ -1316,6 +1700,14 @@ mod tests {
             note.contains("send_message"),
             "note should mention send_message: {note}"
         );
+        // Default create now runs in the background and does NOT suspend the
+        // parent: the result must not carry the waiting_for_children control.
+        assert_ne!(
+            result.display_preference.as_deref(),
+            Some("runtime_control:waiting_for_children"),
+            "default create must not suspend the parent"
+        );
+        assert_eq!(payload["status"].as_str(), Some("running_in_background"));
     }
 
     #[tokio::test]

@@ -54,6 +54,21 @@ pub async fn init_storage(
             AppError::StorageError(error)
         },
     )?);
+
+    // One-shot, idempotent migration: split each legacy session's runtime
+    // control-plane into a `runtime.json` sidecar so the O(1) runtime-save path
+    // (used heavily during sub-agent spawn) is active immediately. Run inline
+    // before the server starts serving so it cannot race concurrent saves; it is
+    // a no-op on already-migrated stores (marker file).
+    match session_store.migrate_runtime_sidecars().await {
+        Ok(0) => {}
+        Ok(count) => tracing::info!("Runtime sidecar migration created {count} sidecar(s)"),
+        Err(error) => {
+            // Non-fatal: loading tolerates a missing sidecar. Log and continue.
+            tracing::warn!("Runtime sidecar migration failed (continuing): {error}");
+        }
+    }
+
     let session_store_for_rebuild = session_store.clone();
     tokio::spawn(async move {
         let purged_rows = match session_store_for_rebuild

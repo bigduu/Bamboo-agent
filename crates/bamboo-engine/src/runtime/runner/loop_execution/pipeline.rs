@@ -26,7 +26,9 @@ use crate::runtime::stream::handler::StreamHandlingOutput;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
-use bamboo_domain::session::runtime_state::{AgentStatusState, SuspensionState};
+use bamboo_domain::session::runtime_state::{
+    AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForChildrenState,
+};
 use bamboo_infrastructure::LLMProvider;
 
 use super::super::to_event_token_usage;
@@ -75,6 +77,88 @@ fn is_overflow_recoverable(error: &AgentError) -> bool {
 struct TurnOutcome {
     should_break: bool,
     sent_complete: bool,
+}
+
+/// Terminal child run statuses, as mirrored into the session index.
+fn is_terminal_child_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "error" | "timeout" | "cancelled" | "skipped"
+    )
+}
+
+/// End-of-turn safety net for the spawn/wait model.
+///
+/// `SubAgent.create` runs children in the background without suspending, and the
+/// model is expected to call `SubAgent.wait` when it wants their results. If the
+/// model instead finishes its turn (no tool calls) while children are still
+/// running and it never registered a wait, we suspend here on its behalf so
+/// background results are never silently dropped.
+///
+/// Returns `Some` suspend outcome (with the durable wait persisted) when it
+/// engages, or `None` to let the run complete normally. No-ops when there is no
+/// storage, no active children, or a wait is already registered — so child
+/// sessions (which have no children) and explicit-wait flows are unaffected.
+async fn maybe_suspend_for_orphaned_children(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    runtime_state: &mut AgentRuntimeState,
+) -> Option<TurnOutcome> {
+    if runtime_state.waiting_for_children.is_some() {
+        return None;
+    }
+    let storage = config.storage.as_ref()?;
+
+    let mut active: Vec<String> = storage
+        .list_child_run_statuses(&session.id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, status)| !status.as_deref().is_some_and(is_terminal_child_status))
+        .map(|(id, _)| id)
+        .collect();
+    if active.is_empty() {
+        return None;
+    }
+    active.sort();
+    active.dedup();
+
+    let now = Utc::now();
+    let count = active.len();
+    runtime_state.waiting_for_children = Some(WaitingForChildrenState {
+        child_session_ids: active,
+        wait_for: ChildWaitPolicy::All,
+        registered_at: now,
+        timeout_at: Some(now + chrono::Duration::hours(6)),
+        registered_by_tool_call_id: None,
+    });
+    state_bridge::write_runtime_state(session, runtime_state);
+    session.metadata.insert(
+        "runtime.suspend_reason".to_string(),
+        "waiting_for_children".to_string(),
+    );
+    session.updated_at = now;
+
+    // Persist so the completion coordinator can resume this parent, and so the
+    // suspend finalization merges (rather than clobbers) the durable wait.
+    if let Some(persistence) = config.persistence.as_ref() {
+        if let Err(error) = persistence.save_runtime_session(session).await {
+            tracing::warn!(
+                "[{}] safety-net auto-wait failed to persist parent wait: {}",
+                session.id,
+                error
+            );
+        }
+    }
+    tracing::info!(
+        "[{}] end-of-turn safety net: suspending to wait for {} orphaned child session(s) the model did not explicitly wait on",
+        session.id,
+        count,
+    );
+    Some(TurnOutcome {
+        should_break: true,
+        sent_complete: false,
+    })
 }
 
 // ---- Metrics helpers (from round_error.rs) ----
@@ -837,6 +921,16 @@ pub(super) async fn run_pipeline(
             let stream_output = llm_output.stream_output;
 
             if stream_output.tool_calls.is_empty() {
+                // Safety net: if the model is about to finish but left background
+                // children running without waiting on them, suspend instead of
+                // completing so their results are collected.
+                if let Some(suspend) =
+                    maybe_suspend_for_orphaned_children(session, config, &mut state.runtime_state)
+                        .await
+                {
+                    turn_outcome = Some(suspend);
+                    break;
+                }
                 let reasoning = (!stream_output.reasoning_content.trim().is_empty())
                     .then_some(stream_output.reasoning_content);
                 let eval_model = state
@@ -1142,7 +1236,12 @@ fn heuristic_complexity(
 #[cfg(test)]
 mod tests {
     use super::super::startup::OverflowRecoveryState;
-    use super::{is_overflow_recoverable, map_turn_error_status, should_retry_turn_error};
+    use super::{
+        is_overflow_recoverable, is_terminal_child_status, map_turn_error_status,
+        maybe_suspend_for_orphaned_children, should_retry_turn_error,
+    };
+    use crate::runtime::config::AgentLoopConfig;
+    use bamboo_domain::AgentRuntimeState;
     use crate::metrics::{
         RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
         TokenUsage as MetricsTokenUsage,
@@ -1700,7 +1799,7 @@ mod tests {
             },
             gold_evaluation: super::super::startup::GoldEvaluationState::default(),
             auxiliary_models: crate::runtime::config::AuxiliaryModelConfig::default(),
-            runtime_state: bamboo_domain::AgentRuntimeState::new("session-task-eval"),
+            runtime_state: AgentRuntimeState::new("session-task-eval"),
         };
         let config = crate::runtime::config::AgentLoopConfig {
             storage: Some(storage.clone()),
@@ -1780,5 +1879,138 @@ mod tests {
         assert_eq!(usage.prompt_tokens, u64::MAX);
         assert_eq!(usage.completion_tokens, u64::MAX);
         assert_eq!(usage.total_tokens, u64::MAX);
+    }
+
+    // ── End-of-turn safety net (auto-wait on orphaned children) ──────────
+
+    #[test]
+    fn is_terminal_child_status_classifies_correctly() {
+        for s in ["completed", "error", "timeout", "cancelled", "skipped"] {
+            assert!(is_terminal_child_status(s), "{s} should be terminal");
+        }
+        for s in ["running", "pending", "queued", ""] {
+            assert!(!is_terminal_child_status(s), "{s} should be active");
+        }
+    }
+
+    /// Storage whose child index is configurable, for the safety-net tests.
+    struct ChildIndexStorage {
+        inner: Arc<TestStorage>,
+        children: Vec<(String, Option<String>)>,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for ChildIndexStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.inner.save_session(session).await
+        }
+        async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_session(id).await
+        }
+        async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(id).await
+        }
+        async fn list_child_run_statuses(
+            &self,
+            _parent: &str,
+        ) -> std::io::Result<Vec<(String, Option<String>)>> {
+            Ok(self.children.clone())
+        }
+    }
+
+    fn config_with_storage(storage: Arc<dyn Storage>) -> AgentLoopConfig {
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            Arc::new(TestPersistence(storage.clone()));
+        AgentLoopConfig {
+            storage: Some(storage),
+            persistence: Some(persistence),
+            ..AgentLoopConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn safety_net_suspends_on_orphaned_active_children() {
+        let inner = Arc::new(TestStorage::default());
+        let storage: Arc<dyn Storage> = Arc::new(ChildIndexStorage {
+            inner: inner.clone(),
+            children: vec![
+                ("c-run".into(), Some("running".into())),
+                ("c-pend".into(), None),
+                ("c-done".into(), Some("completed".into())),
+            ],
+        });
+        let config = config_with_storage(storage.clone());
+        let mut session = Session::new("parent-orphan", "model");
+        let mut runtime_state = AgentRuntimeState::new("parent-orphan");
+
+        let outcome = maybe_suspend_for_orphaned_children(&mut session, &config, &mut runtime_state)
+            .await
+            .expect("must suspend when active children remain");
+        assert!(outcome.should_break && !outcome.sent_complete);
+
+        let wait = runtime_state
+            .waiting_for_children
+            .expect("durable wait registered");
+        // Only the non-terminal children, sorted/deduped.
+        assert_eq!(wait.child_session_ids, vec!["c-pend".to_string(), "c-run".to_string()]);
+        assert_eq!(
+            session.metadata.get("runtime.suspend_reason").map(String::as_str),
+            Some("waiting_for_children")
+        );
+        // Persisted so the coordinator can resume it.
+        let persisted = storage.load_session("parent-orphan").await.unwrap().unwrap();
+        assert!(persisted
+            .agent_runtime_state
+            .and_then(|s| s.waiting_for_children)
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn safety_net_noop_when_all_children_terminal() {
+        let inner = Arc::new(TestStorage::default());
+        let storage: Arc<dyn Storage> = Arc::new(ChildIndexStorage {
+            inner,
+            children: vec![
+                ("a".into(), Some("completed".into())),
+                ("b".into(), Some("error".into())),
+            ],
+        });
+        let config = config_with_storage(storage);
+        let mut session = Session::new("parent-done", "model");
+        let mut runtime_state = AgentRuntimeState::new("parent-done");
+
+        assert!(
+            maybe_suspend_for_orphaned_children(&mut session, &config, &mut runtime_state)
+                .await
+                .is_none(),
+            "no active children → must not suspend"
+        );
+        assert!(runtime_state.waiting_for_children.is_none());
+    }
+
+    #[tokio::test]
+    async fn safety_net_noop_when_already_waiting() {
+        // A model that DID call wait already has waiting_for_children set; the
+        // safety net must not touch it (and must not even query storage).
+        let storage: Arc<dyn Storage> = Arc::new(ChildIndexStorage {
+            inner: Arc::new(TestStorage::default()),
+            children: vec![("x".into(), Some("running".into()))],
+        });
+        let config = config_with_storage(storage);
+        let mut session = Session::new("parent-waiting", "model");
+        let mut runtime_state = AgentRuntimeState::new("parent-waiting");
+        runtime_state.waiting_for_children = Some(super::WaitingForChildrenState {
+            child_session_ids: vec!["x".into()],
+            wait_for: super::ChildWaitPolicy::All,
+            registered_at: chrono::Utc::now(),
+            timeout_at: None,
+            registered_by_tool_call_id: None,
+        });
+
+        assert!(
+            maybe_suspend_for_orphaned_children(&mut session, &config, &mut runtime_state)
+                .await
+                .is_none()
+        );
     }
 }

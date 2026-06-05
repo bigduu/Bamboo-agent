@@ -94,13 +94,24 @@ pub struct LlmRuntimeState {
 }
 
 /// Child session tracking for spawn/session-tree support.
+///
+/// These fields are a **derived, in-memory-only** view. The authoritative
+/// parent→child relationship and each child's run status already live in the
+/// global session index (`parent_session_id` + `last_run_status`), so persisting
+/// them here would denormalize that data and force a full parent rewrite on every
+/// child state change. They are `#[serde(skip)]`: never written to disk and never
+/// read back — callers that need them reconstruct from the index (see
+/// `Storage::list_child_run_statuses`). The durable parent-side state is
+/// [`WaitingForChildrenState`], which is NOT derivable and IS persisted.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct ChildSessionRuntimeState {
+    #[serde(skip)]
     pub active_children: u32,
+    #[serde(skip)]
     pub completed_children: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip)]
     pub active_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip)]
     pub completed_ids: Vec<String>,
 }
 
@@ -310,8 +321,6 @@ mod tests {
         state.round.max_rounds = 200;
         state.llm.model_name = Some("gpt-4o".to_string());
         state.memory.overflow_recovery_total = 1;
-        state.children.active_children = 2;
-        state.children.active_ids = vec!["child-1".to_string(), "child-2".to_string()];
         state.suspension = Some(SuspensionState {
             reason: "awaiting_user".to_string(),
             suspended_at: Utc::now(),
@@ -382,6 +391,31 @@ mod tests {
         assert_eq!(state.version, 1);
         assert_eq!(state.run_id, "old-run");
         assert!(state.plan_mode.is_none());
+    }
+
+    #[test]
+    fn children_view_is_not_persisted() {
+        // The derived child-tracking view must never be serialized: it is
+        // reconstructed from the session index, not the parent file.
+        let mut state = AgentRuntimeState::new("run-children");
+        state.children.active_children = 3;
+        state.children.completed_children = 1;
+        state.children.active_ids = vec!["c-1".to_string(), "c-2".to_string(), "c-3".to_string()];
+        state.children.completed_ids = vec!["c-0".to_string()];
+
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            !json.contains("active_ids") && !json.contains("completed_ids"),
+            "children id vectors must not be serialized: {json}"
+        );
+        assert!(
+            !json.contains("active_children") && !json.contains("completed_children"),
+            "children counts must not be serialized: {json}"
+        );
+
+        // And they come back as the empty default after a round trip.
+        let restored: AgentRuntimeState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.children, ChildSessionRuntimeState::default());
     }
 
     #[test]

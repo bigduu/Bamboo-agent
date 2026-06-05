@@ -65,6 +65,43 @@ fn is_error_like(status: &str) -> bool {
     matches!(status, "error" | "timeout" | "cancelled")
 }
 
+/// Terminal child run statuses, as mirrored into the session index.
+fn is_terminal_child_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "error" | "timeout" | "cancelled" | "skipped"
+    )
+}
+
+/// Reconstruct the set of completed child session ids for a parent from the
+/// session index (the single source of truth), folding in the child whose
+/// completion event is being processed so a momentarily-lagging index can never
+/// stall the parent's resume.
+async fn derive_completed_child_ids(
+    storage: &Arc<dyn Storage>,
+    parent_session_id: &str,
+    just_completed_child_id: &str,
+) -> Vec<String> {
+    let mut completed: Vec<String> = storage
+        .list_child_run_statuses(parent_session_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, status)| {
+            status
+                .as_deref()
+                .is_some_and(is_terminal_child_status)
+        })
+        .map(|(id, _)| id)
+        .collect();
+    if !completed.iter().any(|id| id == just_completed_child_id) {
+        completed.push(just_completed_child_id.to_string());
+    }
+    completed.sort();
+    completed.dedup();
+    completed
+}
+
 fn read_config_snapshot(config: &Arc<RwLock<Config>>, cached_config: &StdRwLock<Config>) -> Config {
     if let Ok(config_guard) = config.try_read() {
         let snapshot = config_guard.clone();
@@ -339,26 +376,15 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
         }
 
         let mut runtime_state = read_runtime_state(&parent);
-        runtime_state
-            .children
-            .active_ids
-            .retain(|id| id != &completion.child_session_id);
-        if !runtime_state
-            .children
-            .completed_ids
-            .iter()
-            .any(|id| id == &completion.child_session_id)
-        {
-            runtime_state
-                .children
-                .completed_ids
-                .push(completion.child_session_id.clone());
-        }
-        runtime_state.children.completed_ids.sort();
-        runtime_state.children.completed_ids.dedup();
-        runtime_state.children.active_children = runtime_state.children.active_ids.len() as u32;
-        runtime_state.children.completed_children =
-            runtime_state.children.completed_ids.len() as u32;
+
+        // Single source of truth: reconstruct the completed-child set from the
+        // session index rather than from a denormalized copy on the parent file.
+        let completed_child_ids = derive_completed_child_ids(
+            &self.storage,
+            &completion.parent_session_id,
+            &completion.child_session_id,
+        )
+        .await;
 
         let mut should_resume = false;
         let mut remaining_children = 0usize;
@@ -366,18 +392,12 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             remaining_children = wait
                 .child_session_ids
                 .iter()
-                .filter(|id| {
-                    !runtime_state
-                        .children
-                        .completed_ids
-                        .iter()
-                        .any(|completed| completed == *id)
-                })
+                .filter(|id| !completed_child_ids.iter().any(|completed| completed == *id))
                 .count();
             should_resume = wait_policy_satisfied(
                 wait.wait_for,
                 &wait.child_session_ids,
-                &runtime_state.children.completed_ids,
+                &completed_child_ids,
                 &completion.status,
             );
             if should_resume {
@@ -621,6 +641,73 @@ mod tests {
             error: None,
             completed_at: Utc::now(),
         }
+    }
+
+    // ── ② derive completed children from the index ──────────────────────
+
+    struct StubChildIndex {
+        children: Vec<(String, Option<String>)>,
+    }
+
+    #[async_trait]
+    impl Storage for StubChildIndex {
+        async fn save_session(&self, _session: &Session) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn load_session(&self, _id: &str) -> std::io::Result<Option<Session>> {
+            Ok(None)
+        }
+        async fn delete_session(&self, _id: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        async fn list_child_run_statuses(
+            &self,
+            _parent_session_id: &str,
+        ) -> std::io::Result<Vec<(String, Option<String>)>> {
+            Ok(self.children.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn derive_completed_only_includes_terminal_children() {
+        let storage: Arc<dyn Storage> = Arc::new(StubChildIndex {
+            children: vec![
+                ("a".into(), Some("completed".into())),
+                ("b".into(), Some("running".into())),
+                ("c".into(), Some("error".into())),
+                ("d".into(), None),
+            ],
+        });
+        let completed = derive_completed_child_ids(&storage, "parent-1", "b").await;
+        // Terminal from index: a, c. Plus the just-completed child b folded in.
+        assert_eq!(completed, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn derive_completed_folds_in_just_completed_when_index_lags() {
+        // Index hasn't caught up — reports the child as still running.
+        let storage: Arc<dyn Storage> = Arc::new(StubChildIndex {
+            children: vec![("only".into(), Some("running".into()))],
+        });
+        let completed = derive_completed_child_ids(&storage, "parent-1", "only").await;
+        assert_eq!(completed, vec!["only".to_string()]);
+    }
+
+    #[test]
+    fn wait_policy_all_uses_derived_completed_set() {
+        let waited = vec!["a".to_string(), "b".to_string()];
+        assert!(!wait_policy_satisfied(
+            ChildWaitPolicy::All,
+            &waited,
+            &["a".to_string()],
+            "completed"
+        ));
+        assert!(wait_policy_satisfied(
+            ChildWaitPolicy::All,
+            &waited,
+            &["a".to_string(), "b".to_string()],
+            "completed"
+        ));
     }
 
     #[test]

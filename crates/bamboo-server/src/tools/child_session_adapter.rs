@@ -47,9 +47,37 @@ pub struct ChildSessionAdapter {
     /// Cached list of all available tool names from the base executor.
     /// Used to compute the complement set for Allowlist policies.
     pub(crate) tool_names: Vec<String>,
+    /// Coalesces concurrent parent-wait registrations for the same parent that
+    /// arrive in one spawn round (the LLM emitting several `SubAgent.create`
+    /// calls at once → `join_all`) into a single parent persist. See
+    /// [`ChildSessionAdapter::register_parent_wait_for_child`].
+    pub(crate) parent_wait_slots: Arc<dashmap::DashMap<String, Arc<ParentWaitSlot>>>,
+}
+
+/// Per-parent coalescing slot for batched wait registration.
+///
+/// `flush_lock` is a barrier distinct from the persistence per-session lock
+/// (using the latter here would deadlock, since the flush itself takes it). The
+/// first registration to win the barrier drains `pending` and persists the whole
+/// batch once; concurrent registrations that find `pending` already drained were
+/// persisted by that holder before it released the barrier, so they return
+/// without an extra write.
+#[derive(Default)]
+pub(crate) struct ParentWaitSlot {
+    flush_lock: tokio::sync::Mutex<()>,
+    pending: parking_lot::Mutex<Vec<(String, Option<String>)>>,
 }
 
 const AGENT_RUNTIME_STATE_METADATA_KEY: &str = "agent.runtime.state";
+
+/// Terminal child run statuses, as mirrored into the session index. A child not
+/// in one of these states is considered active (still pending/running).
+fn is_terminal_child_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "error" | "timeout" | "cancelled" | "skipped"
+    )
+}
 
 fn read_runtime_state(session: &Session) -> AgentRuntimeState {
     session
@@ -108,11 +136,109 @@ impl ChildSessionAdapter {
     /// This is intentionally idempotent: repeated registrations for the same
     /// child merge into the existing wait set. The child runner owns timeout
     /// and liveness; the parent wait timeout is a long lease for observability.
+    ///
+    /// Registrations are **coalesced** per parent: when several children are
+    /// spawned in one round (the LLM issuing multiple `SubAgent.create` calls
+    /// that `join_all` runs concurrently), the first call to win the per-parent
+    /// barrier drains all currently-pending registrations and persists the parent
+    /// once, instead of each child triggering its own load+write. Callers whose
+    /// child was drained-and-persisted by that holder return without an extra
+    /// write — and only after the holder's write committed, so durability holds.
     pub async fn register_parent_wait_for_child(
         &self,
         parent_session_id: &str,
         child_session_id: &str,
         tool_call_id: Option<&str>,
+    ) -> Result<(), ChildSessionError> {
+        let slot = self
+            .parent_wait_slots
+            .entry(parent_session_id.to_string())
+            .or_default()
+            .clone();
+
+        // 1. Enqueue this registration.
+        slot.pending.lock().push((
+            child_session_id.to_string(),
+            tool_call_id.map(str::to_string),
+        ));
+
+        // 2. Barrier: serialize flushers for this parent.
+        let _flush_guard = slot.flush_lock.lock().await;
+
+        // 3. Drain everything pending for this parent (siblings that enqueued
+        //    while we waited for the barrier are picked up here too).
+        let batch: Vec<(String, Option<String>)> = {
+            let mut pending = slot.pending.lock();
+            pending.drain(..).collect()
+        };
+        if batch.is_empty() {
+            // A prior barrier holder already persisted our child before releasing
+            // the barrier we just acquired — nothing left to write.
+            return Ok(());
+        }
+
+        // 4. Persist the whole batch in a single parent write.
+        if let Err(error) = self
+            .flush_parent_waits(parent_session_id, &batch, ChildWaitPolicy::All)
+            .await
+        {
+            // Re-queue so nothing is silently lost; a retry or sibling picks it up.
+            let mut pending = slot.pending.lock();
+            for item in batch {
+                pending.push(item);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Explicitly register a parent wait for an arbitrary set of children with a
+    /// chosen policy. Used by the `SubAgent.wait` action (wait on all active
+    /// children) and the end-of-turn safety net. A single parent write.
+    ///
+    /// Returns the number of children the wait now covers (0 means there was
+    /// nothing to wait on and no wait was registered).
+    pub async fn register_parent_wait_for_children(
+        &self,
+        parent_session_id: &str,
+        child_session_ids: &[String],
+        policy: ChildWaitPolicy,
+    ) -> Result<usize, ChildSessionError> {
+        if child_session_ids.is_empty() {
+            return Ok(0);
+        }
+        let batch: Vec<(String, Option<String>)> = child_session_ids
+            .iter()
+            .map(|id| (id.clone(), None))
+            .collect();
+        self.flush_parent_waits(parent_session_id, &batch, policy)
+            .await?;
+        Ok(batch.len())
+    }
+
+    /// The parent's currently-active (non-terminal) children, derived from the
+    /// session index (single source of truth).
+    pub async fn active_child_ids(&self, parent_session_id: &str) -> Vec<String> {
+        self.storage
+            .list_child_run_statuses(parent_session_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, status)| {
+                !status
+                    .as_deref()
+                    .is_some_and(is_terminal_child_status)
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Persist a batch of parent-wait registrations in one runtime-only save.
+    async fn flush_parent_waits(
+        &self,
+        parent_session_id: &str,
+        batch: &[(String, Option<String>)],
+        policy: ChildWaitPolicy,
     ) -> Result<(), ChildSessionError> {
         let Some(mut parent) =
             self.storage
@@ -127,24 +253,10 @@ impl ChildSessionAdapter {
             return Err(ChildSessionError::NotFound(parent_session_id.to_string()));
         };
 
+        // The active/completed child sets are derived from the session index
+        // (single source of truth), so we no longer maintain a denormalized copy
+        // here. Only the durable wait state below is parent-owned.
         let mut runtime_state = read_runtime_state(&parent);
-        runtime_state
-            .children
-            .active_ids
-            .retain(|id| id != child_session_id);
-        runtime_state
-            .children
-            .completed_ids
-            .retain(|id| id != child_session_id);
-        runtime_state
-            .children
-            .active_ids
-            .push(child_session_id.to_string());
-        runtime_state.children.active_ids.sort();
-        runtime_state.children.active_ids.dedup();
-        runtime_state.children.active_children = runtime_state.children.active_ids.len() as u32;
-        runtime_state.children.completed_children =
-            runtime_state.children.completed_ids.len() as u32;
 
         let now = Utc::now();
         let mut wait = runtime_state
@@ -152,23 +264,23 @@ impl ChildSessionAdapter {
             .take()
             .unwrap_or_else(|| WaitingForChildrenState {
                 child_session_ids: Vec::new(),
-                wait_for: ChildWaitPolicy::All,
+                wait_for: policy,
                 registered_at: now,
                 timeout_at: Some(now + ChronoDuration::hours(6)),
-                registered_by_tool_call_id: tool_call_id.map(str::to_string),
+                registered_by_tool_call_id: None,
             });
-        if !wait
-            .child_session_ids
-            .iter()
-            .any(|id| id == child_session_id)
-        {
-            wait.child_session_ids.push(child_session_id.to_string());
+        // An explicit wait re-asserts the policy on any pre-existing wait state.
+        wait.wait_for = policy;
+        for (child_session_id, tool_call_id) in batch {
+            if !wait.child_session_ids.iter().any(|id| id == child_session_id) {
+                wait.child_session_ids.push(child_session_id.clone());
+            }
+            if wait.registered_by_tool_call_id.is_none() {
+                wait.registered_by_tool_call_id = tool_call_id.clone();
+            }
         }
         wait.child_session_ids.sort();
         wait.child_session_ids.dedup();
-        if wait.registered_by_tool_call_id.is_none() {
-            wait.registered_by_tool_call_id = tool_call_id.map(str::to_string);
-        }
         runtime_state.waiting_for_children = Some(wait);
 
         write_runtime_state(&mut parent, &runtime_state);
@@ -178,8 +290,12 @@ impl ChildSessionAdapter {
         );
         parent.updated_at = Utc::now();
 
+        // Runtime-only save: registering a parent's wait mutates the
+        // control-plane (runtime_state + suspend metadata) but NEVER the message
+        // history. Writing just the sidecar keeps spawn O(1) in conversation
+        // length instead of rewriting the parent's full session.json per child.
         self.persistence
-            .merge_save_runtime(&mut parent)
+            .save_runtime_only(&mut parent)
             .await
             .map_err(|error| {
                 ChildSessionError::Execution(format!("failed to save parent wait state: {error}"))
@@ -339,9 +455,11 @@ impl ChildSessionPort for ChildSessionAdapter {
                 }
             });
 
-        self.register_parent_wait_for_child(&parent.id, &child.id, None)
-            .await?;
-
+        // NOTE: enqueue only *runs* the child in the background. Registering the
+        // parent's wait (which suspends the parent) is now an explicit, separate
+        // step so the model can spawn several children without each one
+        // suspending it — see `register_parent_wait_for_child` /
+        // `register_parent_wait_for_children` and the `SubAgent.wait` action.
         self.scheduler
             .enqueue(SpawnJob {
                 parent_session_id: parent.id.clone(),
