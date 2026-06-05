@@ -4,7 +4,7 @@
 use actix_web::{test, web, App};
 use bamboo_agent::agent::Message;
 use bamboo_agent::server::handlers::agent;
-use bamboo_agent::server::schedules::{ScheduleRunConfig, ScheduleRunStatus, ScheduleTrigger};
+use bamboo_agent::server::schedule_app::{ScheduleRunConfig, ScheduleRunStatus, ScheduleTrigger};
 use serde_json::Value;
 
 #[actix_web::test]

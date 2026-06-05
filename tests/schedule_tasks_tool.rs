@@ -16,7 +16,7 @@ use bamboo_agent::agent::{AgentEvent, Message, Session};
 // `bamboo_agent::agent::Agent` wrapper is exercised separately in tests/agent_sdk.rs.
 use bamboo_agent::server::app_state::AgentRunner;
 use bamboo_agent::server::schedule_app::{ResolvedRunConfig, ScheduleContext};
-use bamboo_agent::server::schedules::{
+use bamboo_agent::server::schedule_app::{
     ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore,
 };
 use bamboo_agent::server::tools::ScheduleTasksTool;
@@ -184,7 +184,7 @@ fn build_manager(
         >::new())),
         account_feed_inbox: None,
         app_data_dir: None,
-        trigger_engine: bamboo_agent::server::schedules::default_trigger_engine(),
+        trigger_engine: bamboo_agent::server::schedule_app::default_trigger_engine(),
         resolve_run_config,
     };
 
@@ -589,7 +589,7 @@ async fn schedule_run_non_auto_execute_completes_with_success_accounting() {
     let created = schedule_store
         .create_schedule(
             "Non Auto Execute".to_string(),
-            bamboo_agent::server::schedules::ScheduleTrigger::Interval {
+            bamboo_agent::server::schedule_app::ScheduleTrigger::Interval {
                 every_seconds: 60,
                 anchor_at: None,
             },
@@ -663,7 +663,7 @@ async fn schedule_run_uses_config_get_fast_then_default_fallback() {
     let created = schedule_store
         .create_schedule(
             "Config Model Fallback".to_string(),
-            bamboo_agent::server::schedules::ScheduleTrigger::Interval {
+            bamboo_agent::server::schedule_app::ScheduleTrigger::Interval {
                 every_seconds: 60,
                 anchor_at: None,
             },
@@ -760,7 +760,7 @@ async fn schedule_auto_execute_keeps_running_until_background_completion() {
     let created = schedule_store
         .create_schedule(
             "Auto Execute".to_string(),
-            bamboo_agent::server::schedules::ScheduleTrigger::Interval {
+            bamboo_agent::server::schedule_app::ScheduleTrigger::Interval {
                 every_seconds: 60,
                 anchor_at: None,
             },
@@ -822,7 +822,7 @@ async fn schedule_auto_execute_keeps_running_until_background_completion() {
         .expect("run record should exist while running");
     assert_eq!(
         running_record.status,
-        bamboo_agent::server::schedules::ScheduleRunStatus::Running
+        bamboo_agent::server::schedule_app::ScheduleRunStatus::Running
     );
     assert!(running_record.started_at.is_some());
     assert!(running_record.session_id.is_some());
@@ -849,7 +849,7 @@ async fn schedule_auto_execute_keeps_running_until_background_completion() {
         .expect("run record should still exist after completion");
     assert_eq!(
         completed_record.status,
-        bamboo_agent::server::schedules::ScheduleRunStatus::Success
+        bamboo_agent::server::schedule_app::ScheduleRunStatus::Success
     );
     assert!(completed_record.completed_at.is_some());
     assert!(completed_record.execution_duration_ms.is_some());
