@@ -2,6 +2,7 @@
 members = [
     ".",
     "crates/bamboo-domain",
+    "crates/bamboo-config",
     "crates/bamboo-infrastructure",
     "crates/bamboo-engine",
     "crates/bamboo-agent-core",

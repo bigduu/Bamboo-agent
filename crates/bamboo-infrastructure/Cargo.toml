@@ -8,6 +8,7 @@ license = "MIT"
 
 [dependencies]
 bamboo-domain = { path = "../bamboo-domain" }
+bamboo-config = { path = "../bamboo-config" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = "1"
@@ -25,12 +26,6 @@ reqwest-eventsource = "0.6"
 eventsource-stream = "0.2"
 uuid = { workspace = true }
 chrono = { workspace = true }
-regex = "1"
-dirs = "5"
-aes-gcm = "0.10"
-rand = "0.8"
-sha2 = "0.10"
-hex = "0.4"
 base64 = "0.22"
 dashmap = "6"
 parking_lot = "0.12"
@@ -47,4 +42,4 @@ wiremock = "0.6"
 tokio-test = "0.4"
 
 [features]
-test-utils = []
+test-utils = ["bamboo-config/test-utils"]

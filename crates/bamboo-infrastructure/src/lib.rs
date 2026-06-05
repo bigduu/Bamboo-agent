@@ -1,15 +1,19 @@
 //! Bamboo infrastructure — config, LLM, storage, process.
 
 pub mod a2a;
-pub mod config;
 pub mod llm;
 pub mod logging;
 pub mod metrics;
 pub mod process;
 pub mod storage;
 
+// Configuration now lives in the `bamboo-config` crate; re-exported here so the
+// historical `bamboo_infrastructure::config::…` / flat `bamboo_infrastructure::Config`
+// paths (and engine/server/tools/llm callers) keep resolving unchanged.
+pub use bamboo_config as config;
+
 // Flat re-exports for backward compatibility
-pub use config::*;
+pub use bamboo_config::*;
 
 // Re-export LLM sub-modules so `bamboo_infrastructure::models::ContentPart` works
 pub mod models {

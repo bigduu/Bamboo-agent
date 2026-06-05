@@ -107,7 +107,7 @@ mod tests {
         let resolved = load_settings_from_dirs(&user_path, None);
         assert_eq!(
             resolved.settings.permission_mode,
-            Some(crate::config::settings::PermissionMode::Plan)
+            Some(crate::settings::PermissionMode::Plan)
         );
         assert_eq!(resolved.source_paths.len(), 1);
     }
@@ -139,7 +139,7 @@ mod tests {
         // Project mode overrides user mode
         assert_eq!(
             resolved.settings.permission_mode,
-            Some(crate::config::settings::PermissionMode::Plan)
+            Some(crate::settings::PermissionMode::Plan)
         );
         // User model falls through (project doesn't set it)
         assert_eq!(resolved.settings.default_model, Some("gpt-4".to_string()));
@@ -172,7 +172,7 @@ mod tests {
         let resolved = load_settings_from_dirs(&user_dir.join("settings.json"), Some(&project_dir));
         assert_eq!(
             resolved.settings.permission_mode,
-            Some(crate::config::settings::PermissionMode::AcceptEdits)
+            Some(crate::settings::PermissionMode::AcceptEdits)
         );
     }
 
@@ -225,7 +225,7 @@ mod tests {
         // Managed overrides permission mode
         assert_eq!(
             resolved.settings.permission_mode,
-            Some(crate::config::settings::PermissionMode::Plan)
+            Some(crate::settings::PermissionMode::Plan)
         );
         // User and project models merge through
         assert_eq!(
