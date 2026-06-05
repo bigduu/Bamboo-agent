@@ -1,9 +1,6 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use serde_json::json;
 
-use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use bamboo_agent_core::Session;
 use bamboo_memory::memory_store::{
@@ -24,33 +21,23 @@ use args::MemoryArgs;
 
 #[derive(Clone)]
 pub struct MemoryTool {
-    sessions: bamboo_engine::SessionCache,
-    storage: Arc<dyn Storage>,
+    session_repo: bamboo_engine::SessionRepository,
     memory_store: MemoryStore,
 }
 
 impl MemoryTool {
     pub fn new(
-        sessions: bamboo_engine::SessionCache,
-        storage: Arc<dyn Storage>,
+        session_repo: bamboo_engine::SessionRepository,
         data_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
         Self {
-            sessions,
-            storage,
+            session_repo,
             memory_store: MemoryStore::new(data_dir),
         }
     }
 
     async fn session_for_context(&self, session_id: Option<&str>) -> Option<Session> {
-        let session_id = session_id?;
-        let in_memory = {
-            bamboo_engine::read_cached_session(&self.sessions, session_id)
-        };
-        match in_memory {
-            Some(session) => Some(session),
-            None => self.storage.load_session(session_id).await.ok().flatten(),
-        }
+        self.session_repo.load(session_id?).await
     }
 
     async fn resolve_project_key(

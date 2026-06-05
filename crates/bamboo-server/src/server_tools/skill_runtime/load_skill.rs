@@ -10,9 +10,7 @@ use bamboo_engine::resource_helpers::list_skill_resource_paths;
 use bamboo_engine::SkillManager;
 use bamboo_infrastructure::Config;
 
-use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
-use bamboo_infrastructure::LockedSessionStore;
 
 use super::{skill_access_error_to_tool_error, SkillToolAccess};
 
@@ -29,12 +27,10 @@ impl LoadSkillTool {
     pub fn new(
         skill_manager: Arc<SkillManager>,
         config: Arc<RwLock<Config>>,
-        sessions: bamboo_engine::SessionCache,
-        storage: Arc<dyn Storage>,
-        persistence: Arc<LockedSessionStore>,
+        session_repo: bamboo_engine::SessionRepository,
     ) -> Self {
         Self {
-            access: SkillToolAccess::new(skill_manager, config, sessions, storage, persistence),
+            access: SkillToolAccess::new(skill_manager, config, session_repo),
         }
     }
 }

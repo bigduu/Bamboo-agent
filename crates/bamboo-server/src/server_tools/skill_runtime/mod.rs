@@ -9,10 +9,8 @@ use bamboo_engine::access_control::{SkillAccessError, SkillSessionPort};
 use bamboo_engine::SkillManager;
 use bamboo_infrastructure::Config;
 
-use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolError;
 use bamboo_agent_core::Session;
-use bamboo_infrastructure::LockedSessionStore;
 
 mod load_skill;
 mod read_resource;
@@ -29,39 +27,24 @@ pub(super) const MAX_RESOURCE_CONTENT_CHARS: usize = 50_000;
 pub(super) struct SkillToolAccess {
     pub(super) skill_manager: Arc<SkillManager>,
     config: Arc<RwLock<Config>>,
-    pub(super) sessions: bamboo_engine::SessionCache,
-    storage: Arc<dyn Storage>,
-    pub(super) persistence: Arc<LockedSessionStore>,
+    pub(super) session_repo: bamboo_engine::SessionRepository,
 }
 
 impl SkillToolAccess {
     pub(super) fn new(
         skill_manager: Arc<SkillManager>,
         config: Arc<RwLock<Config>>,
-        sessions: bamboo_engine::SessionCache,
-        storage: Arc<dyn Storage>,
-        persistence: Arc<LockedSessionStore>,
+        session_repo: bamboo_engine::SessionRepository,
     ) -> Self {
         Self {
             skill_manager,
             config,
-            sessions,
-            storage,
-            persistence,
+            session_repo,
         }
     }
 
     pub(super) async fn session_for_context(&self, session_id: Option<&str>) -> Option<Session> {
-        let session_id = session_id?;
-
-        let in_memory = {
-            bamboo_engine::read_cached_session(&self.sessions, session_id)
-        };
-
-        match in_memory {
-            Some(session) => Some(session),
-            None => self.storage.load_session(session_id).await.ok().flatten(),
-        }
+        self.session_repo.load(session_id?).await
     }
 
     pub(super) async fn skill_root(
@@ -90,19 +73,12 @@ impl SkillSessionPort for SkillToolAccess {
         session_id: &str,
         updates: &[(String, Option<String>)],
     ) -> Result<(), String> {
-        let mut session = {
-            bamboo_engine::read_cached_session(&self.sessions, session_id)
-        };
-
-        if session.is_none() {
-            session = self
-                .storage
-                .load_session(session_id)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-
-        let mut session = session.ok_or_else(|| format!("Session '{session_id}' not found"))?;
+        let mut session = self
+            .session_repo
+            .try_load(session_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Session '{session_id}' not found"))?;
 
         for (key, value) in updates {
             if let Some(val) = value {
@@ -112,15 +88,10 @@ impl SkillSessionPort for SkillToolAccess {
             }
         }
 
-        self.persistence
-            .merge_save_runtime(&mut session)
+        self.session_repo
+            .save(&mut session)
             .await
             .map_err(|e| e.to_string())?;
-
-        self.sessions.insert(
-            session_id.to_string(),
-            Arc::new(parking_lot::RwLock::new(session)),
-        );
 
         Ok(())
     }

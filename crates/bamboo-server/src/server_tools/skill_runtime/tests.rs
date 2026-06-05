@@ -115,7 +115,11 @@ Use this demo skill."#,
         storage.clone(),
     ));
 
-    let tool = LoadSkillTool::new(skill_manager, config, sessions, storage, persistence);
+    let tool = LoadSkillTool::new(
+        skill_manager,
+        config,
+        bamboo_engine::SessionRepository::new(sessions, storage, persistence),
+    );
     let ctx = ToolExecutionContext {
         session_id: Some(session_id),
         tool_call_id: "tool-call-1",
@@ -174,9 +178,7 @@ Use this demo skill."#,
     let tool = LoadSkillTool::new(
         skill_manager,
         config,
-        sessions.clone(),
-        storage.clone(),
-        persistence.clone(),
+        bamboo_engine::SessionRepository::new(sessions.clone(), storage.clone(), persistence.clone()),
     );
     let ctx = ToolExecutionContext {
         session_id: Some(session_id),
@@ -243,20 +245,10 @@ Use this demo skill."#,
         storage.clone(),
     ));
 
-    let load_tool = LoadSkillTool::new(
-        skill_manager.clone(),
-        config.clone(),
-        sessions.clone(),
-        storage.clone(),
-        persistence.clone(),
-    );
-    let read_tool = ReadSkillResourceTool::new(
-        skill_manager,
-        config,
-        sessions,
-        storage.clone(),
-        persistence,
-    );
+    let session_repo =
+        bamboo_engine::SessionRepository::new(sessions, storage.clone(), persistence);
+    let load_tool = LoadSkillTool::new(skill_manager.clone(), config.clone(), session_repo.clone());
+    let read_tool = ReadSkillResourceTool::new(skill_manager, config, session_repo);
 
     let load_ctx = ToolExecutionContext {
         session_id: Some(session_id),

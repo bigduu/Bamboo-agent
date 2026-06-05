@@ -14,9 +14,7 @@ use bamboo_engine::runtime_metadata::LAST_RESOURCE_READ_SUMMARY_METADATA_KEY;
 use bamboo_engine::SkillManager;
 use bamboo_infrastructure::Config;
 
-use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
-use bamboo_infrastructure::LockedSessionStore;
 
 use super::{skill_access_error_to_tool_error, SkillToolAccess, MAX_RESOURCE_CONTENT_CHARS};
 
@@ -38,12 +36,10 @@ impl ReadSkillResourceTool {
     pub fn new(
         skill_manager: Arc<SkillManager>,
         config: Arc<RwLock<Config>>,
-        sessions: bamboo_engine::SessionCache,
-        storage: Arc<dyn Storage>,
-        persistence: Arc<LockedSessionStore>,
+        session_repo: bamboo_engine::SessionRepository,
     ) -> Self {
         Self {
-            access: SkillToolAccess::new(skill_manager, config, sessions, storage, persistence),
+            access: SkillToolAccess::new(skill_manager, config, session_repo),
         }
     }
 }
@@ -185,15 +181,7 @@ impl Tool for ReadSkillResourceTool {
                             LAST_RESOURCE_READ_SUMMARY_METADATA_KEY.to_string(),
                             summary.to_string(),
                         );
-                        let _ = self
-                            .access
-                            .persistence
-                            .merge_save_runtime(&mut session)
-                            .await;
-                        self.access.sessions.insert(
-                            session_id.to_string(),
-                            std::sync::Arc::new(parking_lot::RwLock::new(session)),
-                        );
+                        self.access.session_repo.save_and_cache(&mut session).await;
                     }
                 }
                 json!({

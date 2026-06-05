@@ -73,6 +73,35 @@ impl SessionRepository {
         }
     }
 
+    /// Like [`load`](Self::load), but surfaces storage errors instead of
+    /// swallowing them to `None`. Cache hit short-circuits; a storage hit
+    /// back-fills the cache.
+    pub async fn try_load(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+        if let Some(session) = read_cached_session(&self.cache, session_id) {
+            return Ok(Some(session));
+        }
+        let loaded = self.storage.load_session(session_id).await?;
+        if let Some(ref session) = loaded {
+            self.cache.insert(
+                session_id.to_string(),
+                Arc::new(parking_lot::RwLock::new(session.clone())),
+            );
+        }
+        Ok(loaded)
+    }
+
+    /// Persist the session (merge-on-write) and refresh the cache, surfacing
+    /// storage errors. Use [`save_and_cache`](Self::save_and_cache) for the
+    /// fire-and-forget variant that logs and continues on failure.
+    pub async fn save(&self, session: &mut Session) -> std::io::Result<()> {
+        self.persistence.merge_save_runtime(session).await?;
+        self.cache.insert(
+            session.id.clone(),
+            Arc::new(parking_lot::RwLock::new(session.clone())),
+        );
+        Ok(())
+    }
+
     /// Load a session, creating a fresh `Session::new(id, model)` if absent.
     pub async fn load_or_create(&self, session_id: &str, model: &str) -> Session {
         if let Some(session) = self.load(session_id).await {

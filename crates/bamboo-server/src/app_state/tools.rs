@@ -56,9 +56,16 @@ pub(super) fn build_base_tools(
         mcp_tools,
     ));
 
-    let memory_tool = Arc::new(crate::tools::MemoryTool::new(
+    // One framework-owned session coordinator, shared by every tool that needs
+    // to load/persist sessions — instead of each re-rolling the cache+storage dance.
+    let session_repo = bamboo_engine::SessionRepository::new(
         sessions.clone(),
         storage.clone(),
+        persistence.clone(),
+    );
+
+    let memory_tool = Arc::new(crate::tools::MemoryTool::new(
+        session_repo.clone(),
         app_data_dir.clone(),
     ));
     let with_memory: Arc<dyn ToolExecutor> =
@@ -67,9 +74,7 @@ pub(super) fn build_base_tools(
     let load_skill_tool = Arc::new(crate::tools::LoadSkillTool::new(
         skill_manager.clone(),
         config.clone(),
-        sessions.clone(),
-        storage.clone(),
-        persistence.clone(),
+        session_repo.clone(),
     ));
     let with_load_skill: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_memory,
@@ -79,9 +84,7 @@ pub(super) fn build_base_tools(
     let read_skill_resource_tool = Arc::new(crate::tools::ReadSkillResourceTool::new(
         skill_manager,
         config,
-        sessions,
-        storage,
-        persistence,
+        session_repo,
     ));
     let with_skills: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_load_skill,
