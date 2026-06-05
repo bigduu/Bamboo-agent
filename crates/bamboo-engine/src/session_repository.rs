@@ -111,8 +111,13 @@ impl SessionRepository {
     }
 
     /// Load a session, reconciling the memory and storage copies via a
-    /// preference heuristic (storage wins when it carries a pending question
-    /// memory lacks, or has a newer `updated_at`). Back-fills the cache.
+    /// preference heuristic: storage wins when it is strictly newer, or when it
+    /// is the same age but still carries a pending question memory lost. Storage
+    /// is **never** preferred when it is strictly older than memory.
+    ///
+    /// The cache is refreshed cache-aside but with a no-regression guarantee:
+    /// `load_merged` never overwrites a newer cached session with an older
+    /// storage copy, so it is safe to call from hot read paths.
     pub async fn load_merged(&self, session_id: &str) -> Option<Session> {
         let memory_session = read_cached_session(&self.cache, session_id);
         let storage_session = self
@@ -149,11 +154,21 @@ impl SessionRepository {
                 } else {
                     merged_log!(trace);
                 }
+                let memory_updated_at = memory.updated_at;
                 let chosen = if prefer_storage { storage } else { memory };
-                self.cache.insert(
-                    session_id.to_string(),
-                    Arc::new(parking_lot::RwLock::new(chosen.clone())),
-                );
+                // Cache-aside refresh with a hard no-regression invariant: only
+                // write back when we actually reconciled *to storage* (a memory
+                // win is already the cached copy; re-inserting it would needlessly
+                // replace a possibly-live Arc) AND the reconciled copy is not
+                // older than what memory already holds. This is what makes
+                // `load_merged` safe on hot read paths — it can never clobber a
+                // freshly-updated session with a stale storage copy.
+                if prefer_storage && chosen.updated_at >= memory_updated_at {
+                    self.cache.insert(
+                        session_id.to_string(),
+                        Arc::new(parking_lot::RwLock::new(chosen.clone())),
+                    );
+                }
                 Some(chosen)
             }
             (Some(memory), None) => Some(memory),
@@ -182,10 +197,19 @@ impl SessionRepository {
 }
 
 fn should_prefer_storage(memory_session: &Session, storage_session: &Session) -> bool {
-    if memory_session.pending_question.is_none() && storage_session.pending_question.is_some() {
-        return true;
+    // Never reconcile *backwards* to a strictly-older storage copy: if memory is
+    // newer it is authoritative (e.g. it just answered and cleared a pending
+    // question while storage still holds the stale one). Respecting `updated_at`
+    // here is what stops `load_merged` from returning — and caching — stale data.
+    if storage_session.updated_at < memory_session.updated_at {
+        return false;
     }
+    // Storage is same-age or newer: prefer it when strictly newer, or when it
+    // still carries a pending question that the (same-age) memory copy lost, so
+    // a genuine clarification is never dropped.
     storage_session.updated_at > memory_session.updated_at
+        || (memory_session.pending_question.is_none()
+            && storage_session.pending_question.is_some())
 }
 
 /// `SessionRepository` is the canonical `RuntimeSessionPersistence`: the runtime
@@ -195,5 +219,119 @@ fn should_prefer_storage(memory_session: &Session, storage_session: &Session) ->
 impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         self.save(session).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_agent_core::storage::Storage;
+    use chrono::Utc;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MapStorage {
+        sessions: Mutex<HashMap<String, Session>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for MapStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.sessions
+                .lock()
+                .unwrap()
+                .insert(session.id.clone(), session.clone());
+            Ok(())
+        }
+        async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+            Ok(self.sessions.lock().unwrap().get(session_id).cloned())
+        }
+        async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
+            Ok(self.sessions.lock().unwrap().remove(session_id).is_some())
+        }
+    }
+
+    fn test_repo(storage: Arc<dyn Storage>) -> SessionRepository {
+        let cache: SessionCache = Arc::new(dashmap::DashMap::new());
+        let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
+        SessionRepository::new(cache, storage, persistence)
+    }
+
+    fn cache_put(repo: &SessionRepository, session: &Session) {
+        repo.cache().insert(
+            session.id.clone(),
+            Arc::new(parking_lot::RwLock::new(session.clone())),
+        );
+    }
+
+    /// Regression guard: a strictly-newer in-memory session (e.g. one that just
+    /// answered and cleared its pending question) must win over a strictly-older
+    /// storage copy that still carries the pending question — both in the value
+    /// returned AND in the cache (no clobber).
+    #[tokio::test]
+    async fn load_merged_does_not_regress_to_older_storage() {
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let repo = test_repo(storage.clone());
+        let id = "s1";
+
+        let mut stale = Session::new(id.to_string(), "m");
+        stale.set_pending_question(
+            "tc1".into(),
+            "kind".into(),
+            "q?".into(),
+            vec!["OK".into()],
+            true,
+        );
+        stale.updated_at = Utc::now() - chrono::Duration::seconds(10);
+        storage.save_session(&stale).await.unwrap();
+
+        let mut fresh = Session::new(id.to_string(), "m");
+        fresh.updated_at = Utc::now();
+        cache_put(&repo, &fresh);
+
+        let merged = repo.load_merged(id).await.expect("session exists");
+        assert!(
+            merged.pending_question.is_none(),
+            "must return the newer answered memory copy, not the stale storage one"
+        );
+        let cached = read_cached_session(repo.cache(), id).expect("cached");
+        assert!(
+            cached.pending_question.is_none(),
+            "load_merged must never regress the cache to a stale storage copy"
+        );
+    }
+
+    /// The pending-question recovery still works when storage is the same age:
+    /// if memory lost a pending question that same-age storage retains, prefer
+    /// storage so a genuine clarification is not dropped.
+    #[tokio::test]
+    async fn load_merged_recovers_pending_question_from_same_age_storage() {
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let repo = test_repo(storage.clone());
+        let id = "s2";
+        let ts = Utc::now();
+
+        let mut with_pending = Session::new(id.to_string(), "m");
+        with_pending.set_pending_question(
+            "tc".into(),
+            "k".into(),
+            "q".into(),
+            vec!["OK".into()],
+            true,
+        );
+        with_pending.updated_at = ts;
+        storage.save_session(&with_pending).await.unwrap();
+
+        let mut lost = with_pending.clone();
+        lost.clear_pending_question();
+        lost.updated_at = ts;
+        cache_put(&repo, &lost);
+
+        let merged = repo.load_merged(id).await.expect("session exists");
+        assert!(
+            merged.pending_question.is_some(),
+            "same-age storage carrying a pending question must still be recovered"
+        );
     }
 }
