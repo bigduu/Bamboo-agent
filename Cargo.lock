@@ -662,6 +662,7 @@ dependencies = [
  "async-trait",
  "bamboo-config",
  "bamboo-domain",
+ "bamboo-llm",
  "base64",
  "chrono",
  "dashmap",
@@ -672,9 +673,6 @@ dependencies = [
  "mockall",
  "parking_lot 0.12.5",
  "reqwest",
- "reqwest-eventsource",
- "reqwest-middleware",
- "reqwest-retry",
  "rusqlite",
  "serde",
  "serde_json",
@@ -689,6 +687,33 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "bamboo-llm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bamboo-config",
+ "bamboo-domain",
+ "base64",
+ "bytes",
+ "chrono",
+ "eventsource-stream",
+ "futures",
+ "http 1.4.0",
+ "reqwest",
+ "reqwest-eventsource",
+ "reqwest-middleware",
+ "reqwest-retry",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

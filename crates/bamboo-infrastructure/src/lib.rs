@@ -1,7 +1,6 @@
 //! Bamboo infrastructure — config, LLM, storage, process.
 
 pub mod a2a;
-pub mod llm;
 pub mod logging;
 pub mod metrics;
 pub mod process;
@@ -11,6 +10,12 @@ pub mod storage;
 // historical `bamboo_infrastructure::config::…` / flat `bamboo_infrastructure::Config`
 // paths (and engine/server/tools/llm callers) keep resolving unchanged.
 pub use bamboo_config as config;
+
+// The LLM provider layer now lives in the `bamboo-llm` crate; aliased here so
+// the facade modules below (`crate::llm::…`) and every
+// `bamboo_infrastructure::{LLMProvider, ProviderRegistry, …}` consumer keep
+// resolving unchanged.
+pub use bamboo_llm as llm;
 
 // Flat re-exports for backward compatibility
 pub use bamboo_config::*;

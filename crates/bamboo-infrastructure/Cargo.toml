@@ -9,6 +9,7 @@ license = "MIT"
 [dependencies]
 bamboo-domain = { path = "../bamboo-domain" }
 bamboo-config = { path = "../bamboo-config" }
+bamboo-llm = { path = "../bamboo-llm" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = "1"
@@ -20,9 +21,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 reqwest = { version = "0.12", features = ["json", "stream"] }
-reqwest-middleware = { version = "0.4", features = ["json"] }
-reqwest-retry = "0.7"
-reqwest-eventsource = "0.6"
 eventsource-stream = "0.2"
 uuid = { workspace = true }
 chrono = { workspace = true }
