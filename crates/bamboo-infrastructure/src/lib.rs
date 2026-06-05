@@ -4,6 +4,7 @@ pub mod a2a;
 pub mod config;
 pub mod llm;
 pub mod logging;
+pub mod metrics;
 pub mod process;
 pub mod storage;
 

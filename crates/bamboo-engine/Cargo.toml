@@ -39,7 +39,6 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 reqwest-eventsource = "0.6"
 eventsource-stream = "0.2"
 tokio-stream = "0.1"
-rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 url = "2"
 toml = "0.8"
 dirs = "5"

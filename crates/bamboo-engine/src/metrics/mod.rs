@@ -1,12 +1,18 @@
-//! Metrics collection and aggregation system (re-exported from bamboo-agent-metrics).
+//! Metrics collection and aggregation system.
+//!
+//! The live pipeline (bus / collector / worker / aggregator / events) lives
+//! here in the engine. The persistence layer — metrics `types` and the
+//! `MetricsStorage` abstraction with its SQLite implementation — lives in
+//! `bamboo_infrastructure::metrics` and is re-exported below so the historical
+//! `crate::metrics::{types, storage}::…` paths keep resolving.
 
 pub mod aggregator;
 pub mod bus;
 pub mod collector;
 pub mod events;
-pub mod storage;
-pub mod types;
 pub mod worker;
+
+pub use bamboo_infrastructure::metrics::{storage, types};
 
 pub use aggregator::{aggregate_monthly, aggregate_weekly, PeriodMetrics};
 pub use bus::MetricsBus;
