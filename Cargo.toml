@@ -9,6 +9,7 @@ members = [
     "crates/bamboo-compression",
     "crates/bamboo-tools",
     "crates/bamboo-cli",
+    "crates/bamboo-client-core",
     "crates/bamboo-server",
     "crates/bamboo-tui",
     "crates/bamboo-sdk",

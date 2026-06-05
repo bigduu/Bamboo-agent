@@ -530,6 +530,7 @@ name = "bamboo-cli"
 version = "2026.6.5"
 dependencies = [
  "anyhow",
+ "bamboo-client-core",
  "clap",
  "colored",
  "eventsource-client",
@@ -540,6 +541,14 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "bamboo-client-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -802,6 +811,7 @@ name = "bamboo-tui"
 version = "2026.6.5"
 dependencies = [
  "anyhow",
+ "bamboo-client-core",
  "chrono",
  "clap",
  "crossterm",

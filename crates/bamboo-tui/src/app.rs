@@ -552,7 +552,7 @@ impl App {
         let req = ChatRequest {
             message,
             session_id: self.chat.session_id.clone(),
-            model: model.clone(),
+            model: Some(model.clone()),
         };
 
         match self.client.chat(req).await {

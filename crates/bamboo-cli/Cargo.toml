@@ -12,6 +12,7 @@ name = "bamboo-cli"
 path = "src/main.rs"
 
 [dependencies]
+bamboo-client-core = { path = "../bamboo-client-core" }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 

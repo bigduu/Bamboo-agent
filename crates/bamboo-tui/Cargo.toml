@@ -12,6 +12,7 @@ name = "bamboo-tui"
 path = "src/main.rs"
 
 [dependencies]
+bamboo-client-core = { path = "../bamboo-client-core" }
 # Async
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"

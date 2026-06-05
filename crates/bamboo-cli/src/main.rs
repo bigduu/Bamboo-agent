@@ -10,7 +10,7 @@ use colored::Colorize;
 use eventsource_client::{Client, SSE};
 use futures::StreamExt;
 use launchdarkly_sdk_transport::HyperTransport;
-use serde::{Deserialize, Serialize};
+use bamboo_client_core::{AgentEvent, ChatRequest, ChatResponse};
 use std::io::{self, Write};
 use std::time::Instant;
 
@@ -51,98 +51,6 @@ enum Commands {
     History,
 }
 
-#[derive(Serialize)]
-struct ChatRequest {
-    message: String,
-    session_id: Option<String>,
-    model: Option<String>,
-}
-
-#[derive(Deserialize, Debug)]
-struct ChatResponse {
-    session_id: String,
-    stream_url: String,
-    #[allow(dead_code)]
-    status: String,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum AgentEvent {
-    Token {
-        content: String,
-    },
-    ReasoningToken {
-        content: String,
-    },
-    ToolToken {
-        #[allow(dead_code)]
-        tool_call_id: String,
-        content: String,
-    },
-    ToolStart {
-        #[allow(dead_code)]
-        tool_call_id: String,
-        tool_name: String,
-        arguments: serde_json::Value,
-    },
-    ToolComplete {
-        #[allow(dead_code)]
-        tool_call_id: String,
-        result: ToolResult,
-    },
-    ToolError {
-        #[allow(dead_code)]
-        tool_call_id: String,
-        error: String,
-    },
-    NeedClarification {
-        question: String,
-        options: Option<Vec<String>>,
-    },
-    ToolLifecycle {
-        #[allow(dead_code)]
-        tool_call_id: String,
-        tool_name: String,
-        phase: String,
-        #[allow(dead_code)]
-        elapsed_ms: Option<u64>,
-        is_mutating: bool,
-        #[allow(dead_code)]
-        auto_approved: bool,
-        #[allow(dead_code)]
-        summary: Option<String>,
-        #[allow(dead_code)]
-        error: Option<String>,
-    },
-    ContextCompressionStatus {
-        phase: String,
-        status: String,
-    },
-    Complete {
-        usage: TokenUsage,
-    },
-    Cancelled {
-        message: Option<String>,
-    },
-    Error {
-        message: String,
-    },
-}
-
-#[derive(Deserialize, Debug)]
-struct ToolResult {
-    #[allow(dead_code)]
-    success: bool,
-    result: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct TokenUsage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    total_tokens: u32,
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -471,6 +379,9 @@ async fn stream_message(
                             println!();
                             println!("{}", format!("❌ Error: {}", message).red());
                         }
+                        AgentEvent::PlanModeEntered { .. }
+                        | AgentEvent::PlanModeExited { .. }
+                        | AgentEvent::PlanFileUpdated { .. } => {}
                     }
                 } else if debug {
                     eprintln!(

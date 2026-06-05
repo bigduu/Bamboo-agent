@@ -1,0 +1,11 @@
+[package]
+name = "bamboo-client-core"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+description = "Shared HTTP/SSE wire types for Bamboo client front-ends (CLI, TUI)"
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = "1"
