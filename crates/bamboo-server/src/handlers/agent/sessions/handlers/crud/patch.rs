@@ -1,8 +1,8 @@
 use actix_web::{web, HttpRequest, HttpResponse, Result};
 
 use crate::app_state::AppState;
-use crate::session_app::metadata::{MetadataError, SessionMetadataService};
-use crate::session_app::provider_model::{
+use bamboo_engine::session_app::metadata::{MetadataError, SessionMetadataService};
+use bamboo_engine::session_app::provider_model::{
     derive_model_ref, persist_legacy_model_provider, persist_model_ref,
 };
 use bamboo_engine::model_config_helper::normalize_gold_config_json;

@@ -2,7 +2,7 @@ use super::request::{optional_non_empty, resolve_session_id, validate_and_normal
 use super::sync_runtime_workspace;
 use bamboo_agent_core::Session;
 
-use crate::session_app::chat::{
+use bamboo_engine::session_app::chat::{
     clear_skill_runtime_state, resolve_base_prompt,
     resolve_copilot_conclusion_with_options_enhancement, resolve_enhance_prompt,
     resolve_selected_skill_ids, resolve_workspace_path,

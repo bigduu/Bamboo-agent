@@ -1,7 +1,7 @@
 use crate::app_state::AgentStatus;
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
 
-use crate::session_app::execute::{
+use bamboo_engine::session_app::execute::{
     consume_pending_conclusion_with_options_resume, has_pending_user_message,
 };
 use bamboo_engine::execution::agent_spawn::terminal_error_event_for_result;

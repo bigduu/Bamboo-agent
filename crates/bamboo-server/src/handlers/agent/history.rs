@@ -123,7 +123,7 @@ pub async fn handler(
     let mut messages: Vec<_> = session
         .messages
         .into_iter()
-        .filter(|message| !crate::session_app::execute::is_hidden_from_ui(message))
+        .filter(|message| !bamboo_engine::session_app::execute::is_hidden_from_ui(message))
         .collect();
 
     // Delta mode: if the client supplied a cursor and we can locate it, return

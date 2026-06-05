@@ -1,8 +1,8 @@
 use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
-use crate::session_app::provider_model::session_effective_model_ref;
-use crate::session_app::respond::PlanModeTransition;
+use bamboo_engine::session_app::provider_model::session_effective_model_ref;
+use bamboo_engine::session_app::respond::PlanModeTransition;
 use bamboo_agent_core::AgentEvent;
 use bamboo_engine::model_config_helper::{
     resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
@@ -29,7 +29,7 @@ pub async fn submit_response(
 
     tracing::info!("[{}] Received user response: {}", session_id, user_response);
 
-    let input = crate::session_app::types::RespondInput {
+    let input = bamboo_engine::session_app::types::RespondInput {
         session_id: session_id.clone(),
         user_response: user_response.clone(),
         model: req.model.clone(),
@@ -39,21 +39,21 @@ pub async fn submit_response(
     };
 
     let (_session, user_response, plan_mode_transition) =
-        match crate::session_app::respond::submit_pending_response(state.as_ref(), input).await {
+        match bamboo_engine::session_app::respond::submit_pending_response(state.as_ref(), input).await {
             Ok(result) => result,
             Err(error) => {
                 return match error {
-                    crate::session_app::errors::RespondError::NotFound(_) => {
+                    bamboo_engine::session_app::errors::RespondError::NotFound(_) => {
                         Ok(HttpResponse::NotFound().json(serde_json::json!({
                             "error": "Session not found"
                         })))
                     }
-                    crate::session_app::errors::RespondError::NoPendingQuestion => {
+                    bamboo_engine::session_app::errors::RespondError::NoPendingQuestion => {
                         Ok(HttpResponse::BadRequest().json(serde_json::json!({
                             "error": "No pending question waiting for response"
                         })))
                     }
-                    crate::session_app::errors::RespondError::InvalidResponse(msg) => {
+                    bamboo_engine::session_app::errors::RespondError::InvalidResponse(msg) => {
                         Ok(HttpResponse::BadRequest().json(serde_json::json!({
                             "error": "Invalid response",
                             "message": msg,
@@ -120,7 +120,7 @@ pub async fn submit_response(
         &resolved_provider_name,
         &state.provider_registry,
     );
-    let resume_config = crate::session_app::types::ResumeConfigSnapshot {
+    let resume_config = bamboo_engine::session_app::types::ResumeConfigSnapshot {
         provider_name: resolved_provider_name.clone(),
         provider_type: resolved_provider_type,
         fast_model: areas.fast.as_ref().map(|m| m.model_name.clone()),
@@ -147,7 +147,7 @@ pub async fn submit_response(
         ),
     };
 
-    let auto_resume_outcome = crate::session_app::resume::resume_session_execution(
+    let auto_resume_outcome = bamboo_engine::session_app::resume::resume_session_execution(
         &crate::app_state::resume_adapter::AppStateResumeRef(state),
         &session_id,
         resume_config,

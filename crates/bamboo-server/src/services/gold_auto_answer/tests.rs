@@ -4,11 +4,11 @@
 //! adapter, so they live in the server crate. Pure decision-helper unit tests
 //! live alongside the service in `bamboo_engine::gold_auto_answer`.
 
-use super::{maybe_auto_answer_pending_question, GoldAutoAnswerOutcome};
+use bamboo_engine::gold_auto_answer::{maybe_auto_answer_pending_question, GoldAutoAnswerOutcome};
 use crate::app_state::resume_adapter::AppStateResumeRef;
 use crate::app_state::{AgentStatus, AppState};
-use crate::session_app::execute::has_pending_clarification_resume;
-use crate::session_app::types::ResumeOutcome;
+use bamboo_engine::session_app::execute::has_pending_clarification_resume;
+use bamboo_engine::session_app::types::ResumeOutcome;
 use actix_web::web::Data;
 use async_trait::async_trait;
 use bamboo_agent_core::Session;

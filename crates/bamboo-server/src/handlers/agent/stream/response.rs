@@ -18,8 +18,8 @@ use actix_web::http::header;
 use actix_web::{web, HttpResponse};
 use tokio::sync::broadcast;
 
-use crate::events::change_feed::ChangeEvent;
-use crate::events::journal;
+use bamboo_engine::events::change_feed::ChangeEvent;
+use bamboo_engine::events::journal;
 
 /// The events to emit when (re)seeking the journal from a cursor, plus the new
 /// `last_replayed` watermark and whether a `feed_reset` was needed.

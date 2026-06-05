@@ -211,7 +211,7 @@ impl AppState {
         // Account-scoped durable change feed. Opening the journal recovers the
         // max seq so the sequence counter stays monotonic across restarts.
         let account_sink =
-            crate::events::AccountEventSink::new(data_dir.join("events")).map_err(|e| {
+            bamboo_engine::events::AccountEventSink::new(data_dir.join("events")).map_err(|e| {
                 AppError::InternalError(anyhow::anyhow!(
                     "failed to initialize account change-feed journal: {e}"
                 ))
@@ -224,7 +224,7 @@ impl AppState {
         // the registry is a process-wide singleton; per-workspace overrides
         // can still be picked up via `BAMBOO_SUBAGENT_PROFILES_FILE` or by
         // resolving against `<bamboo_home_dir>/subagent_profiles.json`.
-        let subagent_profiles = crate::subagent_profiles::load_registry(&bamboo_home_dir, None)
+        let subagent_profiles = bamboo_engine::profiles::load_registry(&bamboo_home_dir, None)
             .map_err(|e| {
                 crate::error::AppError::InternalError(anyhow::anyhow!(
                     "failed to load subagent profile registry: {e}"

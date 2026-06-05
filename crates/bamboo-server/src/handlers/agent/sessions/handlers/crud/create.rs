@@ -82,7 +82,7 @@ fn build_new_session(
     global_default_prompt: &str,
     config: &bamboo_infrastructure::Config,
 ) -> Session {
-    use crate::session_app::session_create::{
+    use bamboo_engine::session_app::session_create::{
         build_new_session as crate_build, CreateSessionConfig, CreateSessionInput,
     };
 

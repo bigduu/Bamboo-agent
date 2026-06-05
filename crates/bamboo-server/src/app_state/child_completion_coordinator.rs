@@ -25,11 +25,11 @@ use bamboo_infrastructure::{Config, ProviderModelRouter, ProviderRegistry};
 use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
 
-use crate::session_app::provider_model::session_effective_model_ref;
-use crate::session_app::resume::{
+use bamboo_engine::session_app::provider_model::session_effective_model_ref;
+use bamboo_engine::session_app::resume::{
     resume_session_execution, ResumeExecutionPort, ResumeSpawnRequest,
 };
-use crate::session_app::types::{ResumeConfigSnapshot, ResumeOutcome};
+use bamboo_engine::session_app::types::{ResumeConfigSnapshot, ResumeOutcome};
 use bamboo_engine::model_areas::resolve_global_area_models;
 use bamboo_engine::model_config_helper::{
     resolve_fast_model, resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,

@@ -6,8 +6,8 @@
 //! `AppStateResumeRef` is a newtype wrapper around `Data<AppState>` to satisfy
 //! Rust's orphan rules (can't impl a foreign trait on a foreign type).
 
-use crate::session_app::provider_model::session_effective_model_ref;
-use crate::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
+use bamboo_engine::session_app::provider_model::session_effective_model_ref;
+use bamboo_engine::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
 use async_trait::async_trait;
 use bamboo_agent_core::AgentEvent;
 use bamboo_engine::model_areas::resolve_global_area_models;
@@ -25,7 +25,7 @@ use crate::handlers::agent::execute::{spawn_agent_execution, spawn_event_forward
 /// Newtype wrapper that implements `ResumeExecutionPort`.
 ///
 /// Needed because Rust's orphan rules prevent implementing
-/// `crate::session_app::resume::ResumeExecutionPort` directly on
+/// `bamboo_engine::session_app::resume::ResumeExecutionPort` directly on
 /// `actix_web::web::Data<AppState>`.
 pub struct AppStateResumeRef(pub actix_web::web::Data<AppState>);
 

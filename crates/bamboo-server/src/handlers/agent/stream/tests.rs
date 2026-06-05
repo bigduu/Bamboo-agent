@@ -5,8 +5,8 @@ use bamboo_agent_core::AgentEvent;
 
 use super::response::plan_replay;
 use crate::app_state::AppState;
-use crate::events::change_feed::ChangeEvent;
-use crate::events::journal;
+use bamboo_engine::events::change_feed::ChangeEvent;
+use bamboo_engine::events::journal;
 
 fn deletion(id: &str) -> AgentEvent {
     AgentEvent::SessionDeleted {

@@ -26,7 +26,7 @@ use crate::error::AppError;
 use crate::schedule_app::manager::{build_schedule_context, ScheduleContext};
 use crate::schedule_app::ScheduleManager;
 use crate::schedule_app::ScheduleStore;
-use crate::spawn_scheduler::{SpawnContext, SpawnScheduler};
+use bamboo_engine::execution::spawn::{SpawnContext, SpawnScheduler};
 use bamboo_engine::metrics_service::MetricsService;
 
 use super::{AgentRunner, AgentStatus};

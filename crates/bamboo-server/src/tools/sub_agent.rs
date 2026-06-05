@@ -4,7 +4,7 @@ use serde_json::json;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::session_app::child_session::{self, ChildSessionPort, CreateChildInput};
+use bamboo_engine::session_app::child_session::{self, ChildSessionPort, CreateChildInput};
 use crate::tools::child_session_adapter::{tool_error_from_child_session, ChildSessionAdapter};
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use bamboo_domain::session::runtime_state::ChildWaitPolicy;
@@ -720,7 +720,7 @@ mod tests {
     use tokio::sync::{broadcast, RwLock};
 
     use crate::app_state::{AgentRunner, AgentStatus};
-    use crate::spawn_scheduler::{SpawnContext, SpawnScheduler};
+    use bamboo_engine::execution::spawn::{SpawnContext, SpawnScheduler};
     use bamboo_agent_core::storage::Storage;
     use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
     use bamboo_agent_core::{AgentEvent, Message, Role, Session};
@@ -860,7 +860,7 @@ mod tests {
 
         let test_profiles = std::sync::Arc::new(
             bamboo_domain::subagent::SubagentProfileRegistry::builder()
-                .extend(crate::subagent_profiles::builtin::builtin_profiles())
+                .extend(bamboo_engine::profiles::builtin::builtin_profiles())
                 .build()
                 .expect("builtin subagent profiles must build"),
         );
@@ -2131,7 +2131,7 @@ mod tests {
     }
 
     fn researcher_builtin_profile() -> bamboo_domain::subagent::SubagentProfile {
-        crate::subagent_profiles::builtin::builtin_profiles()
+        bamboo_engine::profiles::builtin::builtin_profiles()
             .into_iter()
             .find(|p| p.id == "researcher")
             .expect("researcher builtin profile must exist")
@@ -2189,7 +2189,7 @@ mod tests {
 
         let registry = Arc::new(
             bamboo_domain::subagent::SubagentProfileRegistry::builder()
-                .extend(crate::subagent_profiles::builtin::builtin_profiles())
+                .extend(bamboo_engine::profiles::builtin::builtin_profiles())
                 .build()
                 .expect("builtin subagent profiles must build"),
         );

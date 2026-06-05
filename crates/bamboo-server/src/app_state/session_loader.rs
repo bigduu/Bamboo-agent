@@ -13,15 +13,15 @@
 use super::*;
 
 #[async_trait::async_trait]
-impl crate::session_app::repository::SessionAccess for AppState {
+impl bamboo_engine::session_app::repository::SessionAccess for AppState {
     async fn load_session(
         &self,
         id: &str,
-    ) -> Result<Option<bamboo_agent_core::Session>, crate::session_app::errors::SessionLoadError>
+    ) -> Result<Option<bamboo_agent_core::Session>, bamboo_engine::session_app::errors::SessionLoadError>
     {
         match AppState::load_session(self, id).await {
             Some(session) => Ok(Some(session)),
-            None => Err(crate::session_app::errors::SessionLoadError::NotFound(
+            None => Err(bamboo_engine::session_app::errors::SessionLoadError::NotFound(
                 id.to_string(),
             )),
         }
@@ -31,24 +31,24 @@ impl crate::session_app::repository::SessionAccess for AppState {
         &self,
         id: &str,
         model: &str,
-    ) -> Result<bamboo_agent_core::Session, crate::session_app::errors::SessionLoadError> {
+    ) -> Result<bamboo_agent_core::Session, bamboo_engine::session_app::errors::SessionLoadError> {
         Ok(AppState::load_or_create_session(self, id, model).await)
     }
 
     async fn save_session(
         &self,
         session: &mut bamboo_agent_core::Session,
-    ) -> Result<(), crate::session_app::errors::SessionSaveError> {
+    ) -> Result<(), bamboo_engine::session_app::errors::SessionSaveError> {
         self.persistence
             .merge_save_runtime(session)
             .await
-            .map_err(|e| crate::session_app::errors::SessionSaveError::StorageError(e.to_string()))
+            .map_err(|e| bamboo_engine::session_app::errors::SessionSaveError::StorageError(e.to_string()))
     }
 
     async fn save_and_cache(
         &self,
         session: &mut bamboo_agent_core::Session,
-    ) -> Result<(), crate::session_app::errors::SessionSaveError> {
+    ) -> Result<(), bamboo_engine::session_app::errors::SessionSaveError> {
         AppState::save_and_cache_session(self, session).await;
         Ok(())
     }
@@ -56,7 +56,7 @@ impl crate::session_app::repository::SessionAccess for AppState {
     async fn load_merged(
         &self,
         id: &str,
-    ) -> Result<Option<bamboo_agent_core::Session>, crate::session_app::errors::SessionLoadError>
+    ) -> Result<Option<bamboo_agent_core::Session>, bamboo_engine::session_app::errors::SessionLoadError>
     {
         Ok(AppState::load_session_merged(self, id).await)
     }

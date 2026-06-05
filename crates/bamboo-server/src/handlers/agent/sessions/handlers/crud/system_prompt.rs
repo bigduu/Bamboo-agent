@@ -40,7 +40,7 @@ pub async fn get_system_prompt_snapshot(
     let default_prompt =
         bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
     let snapshot =
-        crate::session_app::system_prompt::build_system_prompt_snapshot(&session, &default_prompt);
+        bamboo_engine::session_app::system_prompt::build_system_prompt_snapshot(&session, &default_prompt);
 
     Ok(HttpResponse::Ok().json(SessionSystemPromptResponse {
         session_id: session_id.to_string(),
@@ -181,7 +181,7 @@ mod tests {
 
         let default_prompt =
             bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
-        let snapshot = crate::session_app::system_prompt::build_system_prompt_snapshot(
+        let snapshot = bamboo_engine::session_app::system_prompt::build_system_prompt_snapshot(
             &session,
             &default_prompt,
         );
@@ -236,7 +236,7 @@ mod tests {
 
         let default_prompt =
             bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
-        let snapshot = crate::session_app::system_prompt::build_system_prompt_snapshot(
+        let snapshot = bamboo_engine::session_app::system_prompt::build_system_prompt_snapshot(
             &session,
             &default_prompt,
         );

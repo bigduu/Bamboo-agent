@@ -6,7 +6,7 @@ use super::shared::{
 };
 use super::types::TruncateRequest;
 use crate::app_state::AppState;
-use crate::session_app::truncation::{
+use bamboo_engine::session_app::truncation::{
     sanitize_malformed_tool_chains, truncate_after_last_user, truncate_for_unresolved_tool_calls,
     unresolved_tool_call_ids,
 };

@@ -4,7 +4,7 @@
 //! they construct a full `AppState` to exercise the trait-based code path.
 
 use crate::app_state::AppState;
-use crate::session_app::metadata::{MetadataError, SessionMetadataService};
+use bamboo_engine::session_app::metadata::{MetadataError, SessionMetadataService};
 use bamboo_agent_core::{AgentEvent, Session, TitleSource};
 
 async fn make_state() -> AppState {

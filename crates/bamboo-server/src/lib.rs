@@ -124,8 +124,6 @@ pub mod session_app;
 pub use bamboo_engine::{
     message_hooks, metrics_service, model_areas, model_config_helper, prompt_defaults, server_tools,
 };
-pub mod spawn_scheduler;
-pub mod subagent_profiles;
 pub mod title_gen;
 pub mod tools;
 pub mod workflow;

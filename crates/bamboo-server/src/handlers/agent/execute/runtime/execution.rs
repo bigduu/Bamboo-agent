@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::app_state::AppState;
-use crate::session_app::provider_model::session_effective_model_ref;
+use bamboo_engine::session_app::provider_model::session_effective_model_ref;
 use crate::tools::ToolSurface;
 use bamboo_engine::model_areas::resolve_global_area_models;
 use bamboo_engine::model_config_helper::{resolve_planning_model, resolve_search_model};

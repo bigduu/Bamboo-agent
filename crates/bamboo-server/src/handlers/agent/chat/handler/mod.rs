@@ -2,8 +2,8 @@ use actix_web::{web, HttpResponse, Responder};
 
 use super::{ChatRequest, ChatResponse};
 use crate::app_state::AppState;
-use crate::session_app::chat::{parse_goal_command, GoalCommand};
-use crate::session_app::metadata::SessionMetadataService;
+use bamboo_engine::session_app::chat::{parse_goal_command, GoalCommand};
+use bamboo_engine::session_app::metadata::SessionMetadataService;
 use bamboo_engine::config::GoldConfig;
 use bamboo_engine::model_config_helper::{
     parse_session_gold_config, resolve_gold_config, GOLD_CONFIG_METADATA_KEY,
@@ -58,7 +58,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         workspace_path.map(str::trim).filter(|s| !s.is_empty()),
     );
 
-    let input = crate::session_app::types::ChatTurnInput {
+    let input = bamboo_engine::session_app::types::ChatTurnInput {
         session_id: session_id.clone(),
         model: model.clone(),
         model_ref: req.model_ref.clone(),
@@ -74,7 +74,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         data_dir,
     };
 
-    let mut session = match crate::session_app::chat::prepare_chat_turn(
+    let mut session = match bamboo_engine::session_app::chat::prepare_chat_turn(
         state.as_ref(),
         input,
         global_default_prompt.as_str(),

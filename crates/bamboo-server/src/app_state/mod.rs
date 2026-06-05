@@ -77,7 +77,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
 use crate::schedule_app::{ScheduleManager, ScheduleStore};
-use crate::spawn_scheduler::SpawnScheduler;
+use bamboo_engine::execution::spawn::SpawnScheduler;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::AgentEvent;
 use bamboo_agent_core::{tools::ToolSchema, Message};
@@ -268,7 +268,7 @@ pub struct AppState {
     /// durable change events (message appended, session metadata, task updates,
     /// terminal status) across every session are sequenced, journaled to disk,
     /// and broadcast here for resumable multi-client sync.
-    pub account_sink: Arc<crate::events::AccountEventSink>,
+    pub account_sink: Arc<bamboo_engine::events::AccountEventSink>,
 
     /// Registry for tracking external processes.
     pub process_registry: Arc<ProcessRegistry>,

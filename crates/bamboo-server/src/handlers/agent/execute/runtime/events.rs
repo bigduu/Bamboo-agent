@@ -2,7 +2,7 @@ use tokio::sync::mpsc;
 use tracing::Instrument;
 
 use crate::app_state::AppState;
-use crate::services::gold_auto_answer::{
+use bamboo_engine::gold_auto_answer::{
     maybe_auto_answer_pending_question, GoldAutoAnswerOutcome,
 };
 use bamboo_agent_core::AgentEvent;
@@ -143,7 +143,7 @@ mod tests {
     use tokio::time::{sleep, timeout, Duration};
 
     use crate::app_state::AgentStatus;
-    use crate::session_app::execute::has_pending_clarification_resume;
+    use bamboo_engine::session_app::execute::has_pending_clarification_resume;
 
     /// Helper: create a minimal `TaskListUpdated` event for testing.
     fn task_list_updated() -> AgentEvent {
@@ -606,7 +606,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
         let journaled =
-            crate::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+            bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
         // Only the two durable events (TaskListUpdated, Complete) were journaled.
         assert_eq!(journaled.len(), 2, "ephemeral Token must be excluded");
         assert!(matches!(

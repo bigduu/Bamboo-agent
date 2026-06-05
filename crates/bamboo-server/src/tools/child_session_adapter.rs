@@ -13,10 +13,10 @@ use tokio::time::{sleep, Duration, Instant};
 
 use crate::app_state::session_events::get_or_create_event_sender;
 use crate::app_state::{AgentRunner, AgentStatus};
-use crate::session_app::child_session::{
+use bamboo_engine::session_app::child_session::{
     ChildRunnerInfo, ChildSessionEntry, ChildSessionError, ChildSessionPort, DeleteChildResult,
 };
-use crate::spawn_scheduler::{SpawnJob, SpawnScheduler};
+use bamboo_engine::execution::spawn::{SpawnJob, SpawnScheduler};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolError;
 use bamboo_agent_core::{AgentEvent, Session, SessionKind};

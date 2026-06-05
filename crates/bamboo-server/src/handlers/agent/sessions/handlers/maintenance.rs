@@ -346,7 +346,7 @@ mod tests {
 
     #[actix_web::test]
     async fn lifecycle_mutations_publish_change_feed_events() {
-        use crate::events::journal;
+        use bamboo_engine::events::journal;
 
         let temp_dir = tempdir().expect("tempdir");
         bamboo_infrastructure::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
