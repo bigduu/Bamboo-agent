@@ -36,7 +36,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::metrics::types::{ForwardStatus, RoundStatus, SessionStatus, TokenUsage};
+use crate::types::{ForwardStatus, RoundStatus, SessionStatus, TokenUsage};
 
 /// Metadata attached to every metrics event.
 ///

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::metrics::events::{MetricsEvent, SystemEvent};
+use crate::events::{MetricsEvent, SystemEvent};
 
 /// A bounded channel-based metrics event bus
 ///
@@ -79,7 +79,7 @@ impl Clone for MetricsBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::events::ChatEvent;
+    use crate::events::ChatEvent;
     use tokio::time::{timeout, Duration};
 
     #[tokio::test]
@@ -87,7 +87,7 @@ mod tests {
         let (bus, mut rx) = MetricsBus::new(10);
 
         let event = MetricsEvent::Chat(ChatEvent::SessionStarted {
-            meta: crate::metrics::events::EventMeta::new(),
+            meta: crate::events::EventMeta::new(),
             session_id: "test".to_string(),
             model: "gpt-4".to_string(),
         });
@@ -113,7 +113,7 @@ mod tests {
 
         // Fill the channel
         let event1 = MetricsEvent::Chat(ChatEvent::SessionStarted {
-            meta: crate::metrics::events::EventMeta::new(),
+            meta: crate::events::EventMeta::new(),
             session_id: "1".to_string(),
             model: "gpt-4".to_string(),
         });
@@ -121,7 +121,7 @@ mod tests {
 
         // This should be dropped
         let event2 = MetricsEvent::Chat(ChatEvent::SessionStarted {
-            meta: crate::metrics::events::EventMeta::new(),
+            meta: crate::events::EventMeta::new(),
             session_id: "2".to_string(),
             model: "gpt-4".to_string(),
         });
@@ -140,7 +140,7 @@ mod tests {
 
         // Emit through bus1
         let event = MetricsEvent::Chat(ChatEvent::SessionStarted {
-            meta: crate::metrics::events::EventMeta::new(),
+            meta: crate::events::EventMeta::new(),
             session_id: "1".to_string(),
             model: "gpt-4".to_string(),
         });

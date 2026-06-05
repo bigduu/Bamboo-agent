@@ -4,10 +4,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::metrics::bus::MetricsBus;
-use crate::metrics::events::{ChatEvent, ForwardEvent, MetricsEvent, SystemEvent};
-use crate::metrics::storage::{MetricsStorage, ToolCallCompletion};
-use crate::metrics::types::ForwardStatus;
+use crate::bus::MetricsBus;
+use crate::events::{ChatEvent, ForwardEvent, MetricsEvent, SystemEvent};
+use crate::storage::{MetricsStorage, ToolCallCompletion};
+use crate::types::ForwardStatus;
 
 /// Worker that consumes metrics events from the bus and writes them to storage
 pub struct MetricsWorker {
@@ -305,8 +305,8 @@ fn event_type_name(event: &MetricsEvent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::events::EventMeta;
-    use crate::metrics::types::{RoundStatus, TokenUsage};
+    use crate::events::EventMeta;
+    use crate::types::{RoundStatus, TokenUsage};
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -315,7 +315,7 @@ mod tests {
         let db_path = dir.path().join("metrics.db");
         // Keep temp dir alive for the test
         std::mem::forget(dir);
-        let storage = Arc::new(crate::metrics::storage::SqliteMetricsStorage::new(&db_path));
+        let storage = Arc::new(crate::storage::SqliteMetricsStorage::new(&db_path));
         storage.init().await.expect("init storage");
         (storage, db_path)
     }
@@ -361,7 +361,7 @@ mod tests {
 
         // Verify data was written
         let summary = storage
-            .summary(crate::metrics::types::MetricsDateFilter::default())
+            .summary(crate::types::MetricsDateFilter::default())
             .await
             .expect("get summary");
         assert_eq!(summary.total_sessions, 1);
@@ -406,7 +406,7 @@ mod tests {
 
         // Verify data was written
         let summary = storage
-            .forward_summary(crate::metrics::types::ForwardMetricsFilter::default())
+            .forward_summary(crate::types::ForwardMetricsFilter::default())
             .await
             .expect("get forward summary");
         assert_eq!(summary.total_requests, 1);

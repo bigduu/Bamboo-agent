@@ -11,6 +11,7 @@ bamboo-domain = { path = "../bamboo-domain" }
 bamboo-infrastructure = { path = "../bamboo-infrastructure" }
 bamboo-agent-core = { path = "../bamboo-agent-core" }
 bamboo-memory = { path = "../bamboo-memory" }
+bamboo-metrics = { path = "../bamboo-metrics" }
 bamboo-compression = { path = "../bamboo-compression" }
 bamboo-tools = { path = "../bamboo-tools" }
 serde = { workspace = true }

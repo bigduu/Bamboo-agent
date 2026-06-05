@@ -9,8 +9,12 @@ pub mod gold_auto_answer;
 pub mod mcp;
 pub mod llm_summarizer;
 pub mod message_hooks;
-pub mod metrics;
-pub mod metrics_service;
+// The live metrics pipeline + service now live in the `bamboo-metrics` crate
+// (clean downward deps on infrastructure + agent-core). Re-exported here so the
+// historical `bamboo_engine::metrics::…` and `bamboo_engine::metrics_service::…`
+// paths used across the engine and server keep resolving unchanged.
+pub use bamboo_metrics as metrics;
+pub use bamboo_metrics::metrics_service;
 pub mod model_areas;
 pub mod model_config_helper;
 pub mod profiles;

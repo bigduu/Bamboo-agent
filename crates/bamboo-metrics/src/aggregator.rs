@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use chrono::{Datelike, Duration, NaiveDate, Weekday};
 use serde::{Deserialize, Serialize};
 
-use crate::metrics::types::{DailyMetrics, TokenUsage};
+use crate::types::{DailyMetrics, TokenUsage};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PeriodMetrics {
@@ -113,7 +113,7 @@ mod tests {
     use chrono::NaiveDate;
 
     use super::{aggregate_monthly, aggregate_weekly};
-    use crate::metrics::types::{DailyMetrics, TokenUsage};
+    use crate::types::{DailyMetrics, TokenUsage};
 
     #[test]
     fn aggregate_weekly_combines_days_into_a_single_week_bucket() {

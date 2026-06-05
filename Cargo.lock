@@ -594,6 +594,7 @@ dependencies = [
  "bamboo-domain",
  "bamboo-infrastructure",
  "bamboo-memory",
+ "bamboo-metrics",
  "bamboo-tools",
  "base64",
  "bytes",
@@ -699,6 +700,23 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "bamboo-metrics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bamboo-agent-core",
+ "bamboo-domain",
+ "bamboo-infrastructure",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

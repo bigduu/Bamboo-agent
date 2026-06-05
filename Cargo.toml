@@ -6,6 +6,7 @@ members = [
     "crates/bamboo-engine",
     "crates/bamboo-agent-core",
     "crates/bamboo-memory",
+    "crates/bamboo-metrics",
     "crates/bamboo-compression",
     "crates/bamboo-tools",
     "crates/bamboo-cli",
