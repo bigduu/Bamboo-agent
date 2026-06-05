@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-use crate::permission::config::match_glob_pattern;
+use crate::config::match_glob_pattern;
 
 /// Match a pattern against a target string with support for prefix/suffix/infix wildcards.
 ///
@@ -108,7 +108,7 @@ impl ParsedRule {
     /// # Examples
     ///
     /// ```
-    /// use bamboo_tools::permission::rule_parser::ParsedRule;
+    /// use bamboo_permission::rule_parser::ParsedRule;
     ///
     /// let rule = ParsedRule::parse("Read");
     /// assert_eq!(rule.tool_name, "Read");
@@ -164,7 +164,7 @@ impl ParsedRule {
     /// # Examples
     ///
     /// ```
-    /// use bamboo_tools::permission::rule_parser::ParsedRule;
+    /// use bamboo_permission::rule_parser::ParsedRule;
     /// use serde_json::json;
     ///
     /// let rule = ParsedRule::parse("Bash(npm run *)");

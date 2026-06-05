@@ -10,7 +10,7 @@ pub mod guide;
 pub mod orchestrator;
 pub mod output_manager;
 pub mod parallel;
-pub mod permission;
+pub use bamboo_permission as permission;
 pub mod policy_aware;
 pub mod slash_commands;
 #[allow(clippy::module_inception)]

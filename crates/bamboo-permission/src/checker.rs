@@ -579,7 +579,7 @@ impl<T: PermissionChecker + ?Sized> PermissionCheckerExt for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permission::PermissionRule;
+    use crate::PermissionRule;
 
     #[tokio::test]
     async fn test_allow_all_checker() {

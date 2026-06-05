@@ -1,7 +1,7 @@
 use serde_json::Value;
 
-use crate::permission::config::{PermissionConfig, PermissionRule, PermissionType};
-use crate::permission::rule_parser::ParsedRule;
+use crate::config::{PermissionConfig, PermissionRule, PermissionType};
+use crate::rule_parser::ParsedRule;
 
 /// A set of allow and deny rules extracted from a single config source.
 #[derive(Debug, Clone, Default)]
@@ -97,7 +97,7 @@ impl PermissionRuleSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permission::PermissionRule;
+    use crate::PermissionRule;
 
     #[test]
     fn test_rule_set_from_config() {

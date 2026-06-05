@@ -742,6 +742,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "bamboo-permission"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bamboo-domain",
+ "bamboo-infrastructure",
+ "chrono",
+ "dashmap",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "url",
+]
+
+[[package]]
 name = "bamboo-sdk"
 version = "0.1.0"
 dependencies = [
@@ -837,6 +861,7 @@ dependencies = [
  "bamboo-domain",
  "bamboo-infrastructure",
  "bamboo-memory",
+ "bamboo-permission",
  "base64",
  "chrono",
  "colored",
@@ -844,7 +869,6 @@ dependencies = [
  "dirs",
  "futures",
  "globset",
- "libc",
  "parking_lot 0.12.5",
  "regex",
  "reqwest",
@@ -856,8 +880,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "tree-sitter",
- "tree-sitter-bash",
  "url",
  "uuid",
  "walkdir",

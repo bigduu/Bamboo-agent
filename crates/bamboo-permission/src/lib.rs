@@ -15,7 +15,7 @@
 //!
 //! ```ignore
 //! use std::sync::Arc;
-//! use crate::permission::{PermissionConfig, PermissionChecker, PermissionType};
+//! use crate::{PermissionConfig, PermissionChecker, PermissionType};
 //!
 //! // Create a permission configuration
 //! let config = Arc::new(PermissionConfig::new());

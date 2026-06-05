@@ -1,8 +1,8 @@
 use serde_json::Value;
 
-use crate::permission::bash_security;
-use crate::permission::hierarchy::PermissionRuleSet;
-use crate::permission::{PermissionContext, PermissionError, PermissionType};
+use crate::bash_security;
+use crate::hierarchy::PermissionRuleSet;
+use crate::{PermissionContext, PermissionError, PermissionType};
 
 const DELETE_COMMANDS: [&str; 7] = ["rm", "rmdir", "del", "erase", "unlink", "rd", "remove-item"];
 

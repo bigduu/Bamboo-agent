@@ -40,7 +40,7 @@ impl ApprovalDecision {
 ///
 /// # Example
 /// ```ignore
-/// use crate::permission::ApprovalStore;
+/// use crate::ApprovalStore;
 ///
 /// let store = ApprovalStore::new();
 ///
