@@ -364,9 +364,13 @@ mod tests {
         // affects the genuine-hang detection ceiling, not the happy path.
         timeout(Duration::from_secs(30), async {
             loop {
-                let marker_consumed = state
-                    .load_session_merged(session_id)
-                    .await
+                // Read the marker from the authoritative in-memory cache rather
+                // than `load_session_merged`: the merge has a write side-effect
+                // (on a prefer-storage decision it inserts the storage copy back
+                // into the cache), so polling it here can repeatedly clobber the
+                // freshly-answered session with the stale storage version and
+                // starve convergence under load.
+                let marker_consumed = bamboo_engine::read_cached_session(&state.sessions, session_id)
                     .is_some_and(|session| !has_pending_clarification_resume(&session));
                 let runner_status = {
                     let runners = state.agent_runners.read().await;
@@ -811,10 +815,31 @@ mod tests {
             AgentStatus::Running | AgentStatus::Completed
         ));
 
-        let after = state
-            .load_session_merged(session_id)
-            .await
-            .expect("session should exist after forwarder close hook");
+        // The gold answer (pending_question cleared + auto-answer message)
+        // lands in the memory cache first; `load_session_merged` can still
+        // surface the stale storage copy until persistence catches up, because
+        // its prefer-storage heuristic favours a storage session that still
+        // carries the pending question (`memory.pending=None && storage.pending=Some`).
+        // Poll until the merged view has settled so the assertions are
+        // deterministic rather than racing the memory↔storage convergence.
+        let after = timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(session) = bamboo_engine::read_cached_session(&state.sessions, session_id) {
+                    let answered = session.pending_question.is_none()
+                        && session.messages.iter().any(|message| {
+                            message.tool_call_id.as_deref() == Some(tool_call_id)
+                                && message.content == "Auto-selected response (gold): OK"
+                                && message.tool_success == Some(true)
+                        });
+                    if answered {
+                        return session;
+                    }
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("gold auto-answer should be applied to the session");
         assert!(after.pending_question.is_none());
         assert!(after.messages.iter().any(|message| {
             message.tool_call_id.as_deref() == Some(tool_call_id)
@@ -907,10 +932,27 @@ mod tests {
             AgentStatus::Running | AgentStatus::Completed
         ));
 
-        let after = state
-            .load_session_merged(session_id)
-            .await
-            .expect("session should exist after forwarder close hook");
+        // See the sibling test: poll until the merged view has settled (the
+        // gold answer is visible) so the assertions don't race the
+        // memory↔storage convergence in `load_session_merged`.
+        let after = timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(session) = bamboo_engine::read_cached_session(&state.sessions, session_id) {
+                    let answered = session.pending_question.is_none()
+                        && session.messages.iter().any(|message| {
+                            message.tool_call_id.as_deref() == Some(tool_call_id)
+                                && message.content == "Auto-selected response (gold): OK"
+                                && message.tool_success == Some(true)
+                        });
+                    if answered {
+                        return session;
+                    }
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("gold auto-answer should be applied to the session");
         assert!(after.pending_question.is_none());
         assert!(after.messages.iter().any(|message| {
             message.tool_call_id.as_deref() == Some(tool_call_id)
