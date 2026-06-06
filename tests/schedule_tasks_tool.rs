@@ -19,7 +19,7 @@ use bamboo_agent::server::schedule_app::{ResolvedRunConfig, ScheduleContext};
 use bamboo_agent::server::schedule_app::{
     ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore,
 };
-use bamboo_agent::server::tools::ScheduleTasksTool;
+use bamboo_agent::server::schedule_app::ScheduleTasksTool;
 use bamboo_agent::Config;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{
