@@ -536,23 +536,12 @@ fn resolve_run_config_from_config(
         workspace_path.as_deref(),
     );
 
-    let model_roster = bamboo_engine::ModelRoster {
-        model: Some(model),
+    let model_roster = bamboo_engine::ModelRoster::from_areas(
+        Some(model),
         provider_name,
         provider_type,
-        fast: bamboo_engine::RoleModel::from_parts(
-            areas.fast.as_ref().map(|m| m.model_name.clone()),
-            areas.fast.map(|m| m.provider),
-        ),
-        background: bamboo_engine::RoleModel::from_parts(
-            areas.background.as_ref().map(|m| m.model_name.clone()),
-            areas.background.map(|m| m.provider),
-        ),
-        summarization: bamboo_engine::RoleModel::from_parts(
-            areas.summarization.as_ref().map(|m| m.model_name.clone()),
-            areas.summarization.map(|m| m.provider),
-        ),
-    };
+        areas,
+    );
 
     ResolvedRunConfig {
         model_roster,

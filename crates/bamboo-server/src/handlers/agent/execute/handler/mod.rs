@@ -255,23 +255,12 @@ pub async fn handler(
                 session_tx.clone(),
                 gold_config.clone(),
             );
-            let model_roster = bamboo_engine::ModelRoster {
-                model: Some(effective_model),
-                provider_name: Some(resolved_provider_name.clone()),
-                provider_type: resolved_provider_type,
-                fast: bamboo_engine::RoleModel::from_parts(
-                    areas.fast.as_ref().map(|m| m.model_name.clone()),
-                    areas.fast.map(|m| m.provider),
-                ),
-                background: bamboo_engine::RoleModel::from_parts(
-                    areas.background.as_ref().map(|m| m.model_name.clone()),
-                    areas.background.map(|m| m.provider),
-                ),
-                summarization: bamboo_engine::RoleModel::from_parts(
-                    areas.summarization.as_ref().map(|m| m.model_name.clone()),
-                    areas.summarization.map(|m| m.provider),
-                ),
-            };
+            let model_roster = bamboo_engine::ModelRoster::from_areas(
+                Some(effective_model),
+                Some(resolved_provider_name.clone()),
+                resolved_provider_type,
+                areas,
+            );
             spawn_agent_execution(SpawnAgentExecution {
                 state: state.clone(),
                 session_id: session_id.clone(),

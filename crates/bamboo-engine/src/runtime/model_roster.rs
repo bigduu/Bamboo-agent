@@ -102,6 +102,35 @@ impl ModelRoster {
         Self::default()
     }
 
+    /// Build a roster from a resolved [`GlobalAreaModels`] plus the primary
+    /// model selection. Centralizes the fast/background/summarization mapping
+    /// (`RoleModel::from_parts(area.model_name, area.provider)`) that the
+    /// execute handler and schedule manager previously hand-rolled identically.
+    pub fn from_areas(
+        model: Option<String>,
+        provider_name: Option<String>,
+        provider_type: Option<String>,
+        areas: crate::model_areas::GlobalAreaModels,
+    ) -> Self {
+        Self {
+            model,
+            provider_name,
+            provider_type,
+            fast: RoleModel::from_parts(
+                areas.fast.as_ref().map(|m| m.model_name.clone()),
+                areas.fast.map(|m| m.provider),
+            ),
+            background: RoleModel::from_parts(
+                areas.background.as_ref().map(|m| m.model_name.clone()),
+                areas.background.map(|m| m.provider),
+            ),
+            summarization: RoleModel::from_parts(
+                areas.summarization.as_ref().map(|m| m.model_name.clone()),
+                areas.summarization.map(|m| m.provider),
+            ),
+        }
+    }
+
     /// Fast-model name override, if any.
     pub fn fast_model(&self) -> Option<String> {
         self.fast.as_ref().and_then(|r| r.name.clone())
