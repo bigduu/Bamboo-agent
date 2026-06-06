@@ -437,6 +437,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "bamboo-a2a"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "eventsource-stream",
+ "futures",
+ "http 1.4.0",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "bamboo-agent"
 version = "2026.6.5"
 dependencies = [
@@ -660,9 +676,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bamboo-a2a",
  "bamboo-config",
  "bamboo-domain",
  "bamboo-llm",
+ "bamboo-storage",
  "base64",
  "chrono",
  "dashmap",
@@ -912,6 +930,25 @@ dependencies = [
  "tokio",
  "tracing",
  "walkdir",
+]
+
+[[package]]
+name = "bamboo-storage"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bamboo-domain",
+ "base64",
+ "chrono",
+ "dashmap",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

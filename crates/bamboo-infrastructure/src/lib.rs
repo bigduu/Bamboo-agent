@@ -1,10 +1,17 @@
 //! Bamboo infrastructure — config, LLM, storage, process.
 
-pub mod a2a;
+// The A2A protocol client now lives in the `bamboo-a2a` crate; re-exported
+// here so the historical `bamboo_infrastructure::a2a::…` paths keep resolving
+// unchanged.
+pub use bamboo_a2a as a2a;
 pub mod logging;
 pub mod metrics;
 pub mod process;
-pub mod storage;
+
+// The session storage layer now lives in the `bamboo-storage` crate; re-exported
+// here so the historical `bamboo_infrastructure::storage::…` paths (and
+// engine/server callers) keep resolving unchanged.
+pub use bamboo_storage as storage;
 
 // Configuration now lives in the `bamboo-config` crate; re-exported here so the
 // historical `bamboo_infrastructure::config::…` / flat `bamboo_infrastructure::Config`

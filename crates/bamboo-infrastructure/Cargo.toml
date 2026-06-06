@@ -10,6 +10,8 @@ license = "MIT"
 bamboo-domain = { path = "../bamboo-domain" }
 bamboo-config = { path = "../bamboo-config" }
 bamboo-llm = { path = "../bamboo-llm" }
+bamboo-a2a = { path = "../bamboo-a2a" }
+bamboo-storage = { path = "../bamboo-storage" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = "1"

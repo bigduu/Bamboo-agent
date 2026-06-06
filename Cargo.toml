@@ -19,6 +19,8 @@ members = [
     "crates/bamboo-server",
     "crates/bamboo-server-tools",
     "crates/bamboo-tui",
+    "crates/bamboo-a2a",
+    "crates/bamboo-storage",
     "crates/bamboo-sdk",
 ]
 resolver = "2"
