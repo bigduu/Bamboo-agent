@@ -156,7 +156,7 @@ pub(super) fn build_root_tools(
     // Root sessions can manage schedules via `scheduler`.
     // Background schedule runs intentionally use `tools_for_schedules` above and therefore
     // do not get this management tool by default.
-    let schedule_tasks_tool = Arc::new(crate::tools::ScheduleTasksTool::new(
+    let schedule_tasks_tool = Arc::new(crate::schedule_app::ScheduleTasksTool::new(
         schedule_store,
         schedule_manager,
         session_store.clone(),

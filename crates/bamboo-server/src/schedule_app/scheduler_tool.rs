@@ -4,7 +4,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::handlers::agent::schedules::ScheduleView;
-use crate::schedule_app::{
+use super::{
     ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore, ScheduleTrigger,
 };
 use bamboo_agent_core::storage::Storage;
@@ -112,9 +112,9 @@ enum ScheduleTasksArgs {
         #[serde(default)]
         end_at: Option<chrono::DateTime<chrono::Utc>>,
         #[serde(default)]
-        misfire_policy: Option<crate::schedule_app::MisFirePolicy>,
+        misfire_policy: Option<super::MisFirePolicy>,
         #[serde(default)]
-        overlap_policy: Option<crate::schedule_app::OverlapPolicy>,
+        overlap_policy: Option<super::OverlapPolicy>,
         #[serde(default)]
         enabled: Option<bool>,
         #[serde(default)]
@@ -135,9 +135,9 @@ enum ScheduleTasksArgs {
         #[serde(default)]
         end_at: Option<chrono::DateTime<chrono::Utc>>,
         #[serde(default)]
-        misfire_policy: Option<crate::schedule_app::MisFirePolicy>,
+        misfire_policy: Option<super::MisFirePolicy>,
         #[serde(default)]
-        overlap_policy: Option<crate::schedule_app::OverlapPolicy>,
+        overlap_policy: Option<super::OverlapPolicy>,
         #[serde(default)]
         run_config: Option<ScheduleRunConfig>,
     },
@@ -281,7 +281,7 @@ impl Tool for ScheduleTasksTool {
                         name,
                         enabled.unwrap_or(false),
                         run_config,
-                        crate::schedule_app::store::ScheduleDefinitionChanges {
+                        super::store::ScheduleDefinitionChanges {
                             trigger: Some(trigger),
                             timezone,
                             start_at,
@@ -342,7 +342,7 @@ impl Tool for ScheduleTasksTool {
                         name.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
                         enabled,
                         run_config,
-                        crate::schedule_app::store::ScheduleDefinitionChanges {
+                        super::store::ScheduleDefinitionChanges {
                             trigger,
                             timezone,
                             start_at,
