@@ -17,6 +17,7 @@ members = [
     "crates/bamboo-cli",
     "crates/bamboo-client-core",
     "crates/bamboo-server",
+    "crates/bamboo-server-tools",
     "crates/bamboo-tui",
     "crates/bamboo-sdk",
 ]

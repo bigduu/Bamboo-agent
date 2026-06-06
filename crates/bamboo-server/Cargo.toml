@@ -13,6 +13,7 @@ bamboo-memory = { path = "../bamboo-memory" }
 bamboo-compression = { path = "../bamboo-compression" }
 bamboo-agent-core = { path = "../bamboo-agent-core" }
 bamboo-tools = { path = "../bamboo-tools" }
+bamboo-server-tools = { path = "../bamboo-server-tools" }
 bamboo-infrastructure = { path = "../bamboo-infrastructure" }
 bamboo-domain = { path = "../bamboo-domain" }
 

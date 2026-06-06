@@ -838,6 +838,7 @@ dependencies = [
  "bamboo-engine",
  "bamboo-infrastructure",
  "bamboo-memory",
+ "bamboo-server-tools",
  "bamboo-tools",
  "bytes",
  "chrono",
@@ -873,6 +874,25 @@ dependencies = [
  "walkdir",
  "wiremock",
  "zip",
+]
+
+[[package]]
+name = "bamboo-server-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bamboo-agent-core",
+ "bamboo-engine",
+ "bamboo-infrastructure",
+ "bamboo-memory",
+ "bamboo-tools",
+ "dashmap",
+ "parking_lot 0.12.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

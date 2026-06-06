@@ -3,11 +3,11 @@
 //! These tools are registered only when running the Bamboo HTTP server.
 //! They may depend on `AppState` components (storage, schedulers, etc.).
 //!
-//! Framework-agnostic tools (MemoryTool, OverlayToolExecutor, etc.) live in
+//! Framework-agnostic tools (MemoryTool, OverlayToolExecutor, etc.) live in the
 //! `bamboo-server-tools` crate. This module re-exports them for convenience.
 
-// Re-export framework-agnostic tools from crate::server_tools
-pub use crate::server_tools::{
+// Re-export framework-agnostic tools from the bamboo-server-tools crate.
+pub use bamboo_server_tools::{
     CompactContextTool, LoadSkillTool, MemoryTool, OverlayToolExecutor, ReadSkillResourceTool,
     SessionInspectorTool, ToolSurface, ToolSurfaceFactory,
 };

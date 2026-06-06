@@ -123,7 +123,9 @@ pub mod session_app;
 pub use bamboo_engine::{
     message_hooks, metrics_service, model_areas, model_config_helper, prompt_defaults,
 };
-pub mod server_tools;
+// `server_tools` was extracted to the `bamboo-server-tools` crate; keep the
+// historical `bamboo_server::server_tools::…` path working as a re-export shim.
+pub use bamboo_server_tools as server_tools;
 pub mod title_gen;
 pub mod tools;
 pub mod workflow;
