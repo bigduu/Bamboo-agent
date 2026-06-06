@@ -7,7 +7,7 @@ use bamboo_infrastructure::LLMRequestOptions;
 
 use super::super::conversion::convert_messages_response;
 use super::super::errors::anthropic_error_response;
-use super::super::usage::{build_estimated_usage, estimate_completion_tokens};
+use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens};
 use super::shared::{map_prepare_error, map_tool_calls, prepare_internal_execution};
 
 pub(super) async fn handle_non_streaming_messages(

@@ -6,7 +6,6 @@ mod messages;
 mod models;
 mod resolution;
 mod stream;
-mod usage;
 
 #[cfg(test)]
 mod tests;

@@ -8,8 +8,8 @@ use bamboo_infrastructure::LLMRequestOptions;
 use super::{map_provider_error, PreparedChatRequest};
 use crate::handlers::openai::{
     helpers::build_completion_response,
-    usage::{build_estimated_usage, estimate_completion_tokens},
 };
+use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens};
 
 pub(super) async fn handle_non_streaming_chat(
     app_state: web::Data<AppState>,

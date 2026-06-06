@@ -11,7 +11,7 @@ use bamboo_infrastructure::LLMRequestOptions;
 use super::super::conversion::convert_llm_chunk_to_openai;
 use super::super::errors::{anthropic_error_response, AnthropicError};
 use super::super::stream::{format_sse_event, AnthropicStreamState};
-use super::super::usage::{build_estimated_usage, estimate_completion_tokens};
+use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens};
 use super::shared::{map_prepare_error, prepare_internal_execution};
 
 pub(super) async fn handle_streaming_messages(

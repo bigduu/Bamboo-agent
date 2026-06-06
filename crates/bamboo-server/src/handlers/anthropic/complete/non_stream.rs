@@ -8,7 +8,8 @@ use bamboo_infrastructure::api::models::{
 use bamboo_infrastructure::LLMRequestOptions;
 
 use super::PreparedCompleteRequest;
-use crate::handlers::anthropic::{conversion::convert_complete_response, usage};
+use crate::handlers::anthropic::conversion::convert_complete_response;
+use crate::handlers::llm_compat::usage;
 
 pub(super) async fn handle_non_streaming_complete(
     app_state: web::Data<AppState>,

@@ -3,7 +3,6 @@ mod conversion;
 mod generate;
 mod models;
 mod stream;
-mod usage;
 
 pub use config::config;
 pub use generate::generate_content;

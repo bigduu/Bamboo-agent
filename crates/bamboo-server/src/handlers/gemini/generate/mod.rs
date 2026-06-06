@@ -6,7 +6,7 @@ use crate::{app_state::AppState, error::AppError};
 use bamboo_engine::metrics::types::ForwardStatus;
 
 use super::conversion::{convert_gemini_to_messages, convert_gemini_tools};
-use super::usage::{build_estimated_usage, estimate_completion_tokens, estimate_prompt_tokens};
+use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens, estimate_prompt_tokens};
 
 mod collect;
 mod response;

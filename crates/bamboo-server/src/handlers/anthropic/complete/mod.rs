@@ -12,7 +12,7 @@ use bamboo_infrastructure::{
 use super::conversion::{convert_complete_request, convert_messages, convert_tools};
 use super::errors::{anthropic_error_response, AnthropicError};
 use super::resolution::resolve_model;
-use super::usage::estimate_prompt_tokens;
+use crate::handlers::llm_compat::usage::estimate_prompt_tokens;
 
 pub async fn complete(
     app_state: web::Data<AppState>,
@@ -64,7 +64,7 @@ pub async fn complete(
         .and_then(|value| value.as_u64())
         .map(|value| value as u32);
     let reasoning_effort =
-        crate::handlers::openai::helpers::parse_reasoning_effort(&openai_request.parameters);
+        crate::handlers::llm_compat::parse_reasoning_effort(&openai_request.parameters);
     let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
 
     let prepared = PreparedCompleteRequest {

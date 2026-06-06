@@ -12,8 +12,8 @@ use crate::handlers::anthropic::{
     conversion::convert_llm_chunk_to_openai,
     errors::{anthropic_error_response, AnthropicError},
     stream::{format_sse_data, map_completion_stream_chunk},
-    usage::{build_estimated_usage, estimate_completion_tokens},
 };
+use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens};
 
 pub(super) async fn handle_streaming_complete(
     app_state: web::Data<AppState>,

@@ -6,7 +6,7 @@ use bamboo_engine::metrics::types::ForwardStatus;
 use bamboo_infrastructure::LLMRequestOptions;
 
 use super::super::helpers::now_unix_ts;
-use super::super::usage::{build_estimated_usage, estimate_completion_tokens};
+use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens};
 use super::output::{build_completed_response, build_output_items};
 use super::PreparedResponsesRequest;
 

@@ -7,7 +7,7 @@ use super::super::helpers::{
     parse_responses_request_options, responses_input_to_chat_messages,
 };
 use super::super::types::ResponsesCreateRequest;
-use super::super::usage::{estimate_prompt_tokens, estimate_text_tokens};
+use crate::handlers::llm_compat::usage::{estimate_prompt_tokens, estimate_text_tokens};
 use super::PreparedResponsesRequest;
 
 pub(super) async fn prepare_request(

@@ -5,7 +5,7 @@ use futures::{Stream, StreamExt};
 use bamboo_engine::{ForwardStatus, MetricsCollector};
 use bamboo_infrastructure::{provider::LLMStream, LLMChunk};
 
-use super::super::usage::{build_estimated_usage, estimate_completion_tokens};
+use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens};
 use super::sse;
 
 #[derive(Clone)]

@@ -6,7 +6,7 @@ use bamboo_engine::{ForwardStatus, MetricsCollector};
 use bamboo_infrastructure::provider::LLMStream;
 use bamboo_infrastructure::types::LLMChunk;
 
-use super::super::super::usage::{build_estimated_usage, estimate_completion_tokens};
+use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens};
 use super::super::output::{build_completed_response, build_output_items};
 use super::events::{
     completed_event, created_event, done_sse_bytes, event_to_sse_bytes, output_text_delta_event,

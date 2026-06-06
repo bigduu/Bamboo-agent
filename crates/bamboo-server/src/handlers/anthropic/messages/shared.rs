@@ -7,7 +7,7 @@ use bamboo_infrastructure::api::models::ChatCompletionRequest;
 
 use super::super::conversion::{convert_messages, convert_tools};
 use super::super::errors::{anthropic_error_response, AnthropicError};
-use super::super::usage::estimate_prompt_tokens;
+use crate::handlers::llm_compat::usage::estimate_prompt_tokens;
 
 pub(super) struct PreparedInternalExecution {
     pub(super) internal_messages: Vec<Message>,
@@ -51,7 +51,7 @@ pub(super) async fn prepare_internal_execution(
         .and_then(|value| value.as_u64())
         .map(|value| value as u32);
     let reasoning_effort =
-        crate::handlers::openai::helpers::parse_reasoning_effort(&openai_request.parameters);
+        crate::handlers::llm_compat::parse_reasoning_effort(&openai_request.parameters);
     let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages);
 
     Ok(PreparedInternalExecution {

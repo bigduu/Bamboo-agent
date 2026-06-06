@@ -4,7 +4,6 @@ pub(crate) mod helpers;
 mod models;
 mod responses;
 mod types;
-mod usage;
 
 #[cfg(test)]
 mod tests;
