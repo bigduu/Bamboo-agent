@@ -261,7 +261,7 @@ impl AppState {
         );
 
         let child_completion_coordinator = Arc::new(
-            super::child_completion_coordinator::ChildCompletionCoordinator::new(
+            bamboo_engine::ChildCompletionCoordinator::new(
                 storage.clone(),
                 persistence.clone(),
                 sessions.clone(),

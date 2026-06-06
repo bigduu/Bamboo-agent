@@ -208,7 +208,7 @@ pub struct AppState {
     pub spawn_scheduler: Arc<SpawnScheduler>,
 
     /// Coordinates child completion notifications into parent resume.
-    pub child_completion_coordinator: Arc<child_completion_coordinator::ChildCompletionCoordinator>,
+    pub child_completion_coordinator: Arc<bamboo_engine::ChildCompletionCoordinator>,
 
     /// Schedule store (timed tasks).
     pub schedule_store: Arc<ScheduleStore>,
@@ -320,7 +320,6 @@ impl AppState {
 
 mod agent_session_context;
 mod builder;
-pub mod child_completion_coordinator;
 mod config_runtime;
 pub mod init;
 mod persistence;

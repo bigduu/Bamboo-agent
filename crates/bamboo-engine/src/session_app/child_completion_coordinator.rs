@@ -15,23 +15,23 @@ use bamboo_agent_core::{AgentEvent, Message, Role, Session, SessionKind};
 use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState,
 };
-use bamboo_engine::execution::{
+use crate::execution::{
     create_event_forwarder, spawn_session_execution, try_reserve_runner, AgentRunner,
     ChildCompletion, ChildCompletionHandler, RunnerReservation, SessionExecutionArgs,
 };
-use bamboo_engine::Agent;
+use crate::Agent;
 use bamboo_infrastructure::LockedSessionStore;
 use bamboo_infrastructure::{Config, ProviderModelRouter, ProviderRegistry};
 use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
 
-use bamboo_engine::session_app::provider_model::session_effective_model_ref;
-use bamboo_engine::session_app::resume::{
+use crate::session_app::provider_model::session_effective_model_ref;
+use crate::session_app::resume::{
     resume_session_execution, ResumeExecutionPort, ResumeSpawnRequest,
 };
-use bamboo_engine::session_app::types::{ResumeConfigSnapshot, ResumeOutcome};
-use bamboo_engine::model_areas::resolve_global_area_models;
-use bamboo_engine::model_config_helper::{
+use crate::session_app::types::{ResumeConfigSnapshot, ResumeOutcome};
+use crate::model_areas::resolve_global_area_models;
+use crate::model_config_helper::{
     resolve_fast_model, resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
 };
 
@@ -221,7 +221,7 @@ fn runtime_resume_message(
 pub struct ChildCompletionCoordinator {
     storage: Arc<dyn Storage>,
     persistence: Arc<bamboo_infrastructure::LockedSessionStore>,
-    sessions: bamboo_engine::SessionCache,
+    sessions: crate::SessionCache,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     agent: Arc<Agent>,
@@ -229,7 +229,7 @@ pub struct ChildCompletionCoordinator {
     provider_registry: Arc<ProviderRegistry>,
     provider_router: Arc<ProviderModelRouter>,
     app_data_dir: std::path::PathBuf,
-    account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
+    account_feed_inbox: Option<crate::execution::AccountFeedInbox>,
     root_tools: Arc<RwLock<Option<Arc<dyn ToolExecutor>>>>,
 }
 
@@ -238,7 +238,7 @@ impl ChildCompletionCoordinator {
     pub fn new(
         storage: Arc<dyn Storage>,
         persistence: Arc<LockedSessionStore>,
-        sessions: bamboo_engine::SessionCache,
+        sessions: crate::SessionCache,
         agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
         session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
         agent: Arc<Agent>,
@@ -246,7 +246,7 @@ impl ChildCompletionCoordinator {
         provider_registry: Arc<ProviderRegistry>,
         provider_router: Arc<ProviderModelRouter>,
         app_data_dir: std::path::PathBuf,
-        account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
+        account_feed_inbox: Option<crate::execution::AccountFeedInbox>,
     ) -> Self {
         Self {
             storage,
@@ -302,7 +302,7 @@ impl ChildCompletionCoordinator {
             disabled_tools: config_snapshot.disabled_tool_names(),
             disabled_skill_ids: config_snapshot.disabled_skill_ids(),
             image_fallback:
-                crate::handlers::agent::execute::image_fallback::resolve_image_fallback(
+                crate::model_config_helper::resolve_image_fallback(
                     config_snapshot,
                 )
                 .ok()
@@ -493,7 +493,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
     }
 
     async fn get_or_create_event_sender(&self, session_id: &str) -> broadcast::Sender<AgentEvent> {
-        crate::app_state::session_events::get_or_create_event_sender(
+        crate::execution::session_events::get_or_create_event_sender(
             &self.session_event_senders,
             session_id,
         )
@@ -574,7 +574,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                 &provider_name_for_aux,
                 &provider_registry,
             );
-            bamboo_engine::AuxiliaryModelConfig {
+            crate::AuxiliaryModelConfig {
                 fast_model_name: areas.fast.as_ref().map(|m| m.model_name.clone()),
                 fast_model_provider: areas.fast.map(|m| m.provider),
                 background_model_name: areas.background.as_ref().map(|m| m.model_name.clone()),
@@ -588,16 +588,16 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                 summarization_model_provider: areas.summarization.map(|m| m.provider),
             }
         });
-        let model_roster = bamboo_engine::ModelRoster {
+        let model_roster = crate::ModelRoster {
             model: Some(model),
             provider_name: Some(resolved_provider_name),
             provider_type: config.provider_type.clone(),
-            fast: bamboo_engine::RoleModel::from_parts(config.fast_model, resolved_fast_provider),
-            background: bamboo_engine::RoleModel::from_parts(
+            fast: crate::RoleModel::from_parts(config.fast_model, resolved_fast_provider),
+            background: crate::RoleModel::from_parts(
                 config.background_model,
                 config.background_model_provider,
             ),
-            summarization: bamboo_engine::RoleModel::from_parts(
+            summarization: crate::RoleModel::from_parts(
                 config.summarization_model,
                 config.summarization_model_provider,
             ),

@@ -28,6 +28,7 @@ pub use bamboo_skills as skills;
 pub mod title_gen;
 
 pub use app_context::AgentSessionContext;
+pub use session_app::child_completion_coordinator::ChildCompletionCoordinator;
 pub use runtime::execution::agent_spawn::{read_cached_session, SessionCache};
 
 // Re-export commonly used types from agent (via dependency)
