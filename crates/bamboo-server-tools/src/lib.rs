@@ -11,9 +11,11 @@ pub mod memory;
 pub mod overlay_executor;
 pub mod session_inspector;
 pub mod skill_runtime;
+pub mod sub_agent;
 pub mod surface;
 
 pub use compact::CompactContextTool;
+pub use sub_agent::SubAgentTool;
 pub use memory::MemoryTool;
 pub use overlay_executor::OverlayToolExecutor;
 pub use session_inspector::SessionInspectorTool;

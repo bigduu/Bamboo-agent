@@ -5,7 +5,9 @@
 //! the infrastructure operations (load, save, schedule, cancel).
 
 use async_trait::async_trait;
+use bamboo_domain::session::runtime_state::ChildWaitPolicy;
 use bamboo_domain::Session;
+use std::collections::HashMap;
 
 mod actions;
 mod helpers;
@@ -200,4 +202,58 @@ pub trait ChildSessionPort: Send + Sync {
     ) -> Result<DeleteChildResult, ChildSessionError>;
     /// Return live diagnostic info for a running child session, if available.
     async fn get_child_runner_info(&self, child_id: &str) -> Option<ChildRunnerInfo>;
+
+    /// Register a durable parent wait for a single enqueued child. Idempotent
+    /// and coalesced per parent (concurrent sibling spawns merge into one write).
+    async fn register_parent_wait_for_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        tool_call_id: Option<&str>,
+    ) -> Result<(), ChildSessionError>;
+
+    /// Register a durable parent wait over an explicit set of children with a
+    /// chosen policy (the `SubAgent.wait` action). Returns the number of
+    /// children the wait now covers (0 = nothing to wait on).
+    async fn register_parent_wait_for_children(
+        &self,
+        parent_session_id: &str,
+        child_session_ids: &[String],
+        policy: ChildWaitPolicy,
+    ) -> Result<usize, ChildSessionError>;
+
+    /// The parent's currently-active (non-terminal) child session ids.
+    async fn active_child_ids(&self, parent_session_id: &str) -> Vec<String>;
+
+    /// Best-effort: ensure the child's session-index entry is visible
+    /// immediately after creation (the index is otherwise eventually
+    /// consistent). Failures are ignored by the caller.
+    async fn ensure_child_indexed(&self, child_session_id: &str);
+}
+
+// ---------------------------------------------------------------------------
+// Subagent resolution port
+// ---------------------------------------------------------------------------
+
+/// Resolves subagent-type–specific configuration (model, runtime metadata,
+/// system prompt) for the `SubAgent` tool.
+///
+/// Kept separate from [`ChildSessionPort`] (session CRUD/lifecycle/state): this
+/// port is pure `subagent_type` → config resolution. The server layer
+/// implements it; the tool depends only on the trait, carrying no `AppState`
+/// coupling.
+#[async_trait]
+pub trait SubagentResolutionPort: Send + Sync {
+    /// Provider+model ref for a `subagent_type`, or `None` to use defaults.
+    async fn resolve_subagent_model(
+        &self,
+        subagent_type: &str,
+    ) -> Option<bamboo_domain::ProviderModelRef>;
+
+    /// Runtime metadata (e.g. external-agent routing) for a `subagent_type`.
+    async fn resolve_runtime_metadata(&self, subagent_type: &str) -> HashMap<String, String>;
+
+    /// Canonical system prompt for a `subagent_type` (falls back to
+    /// `general-purpose` for unknown/empty values; never empty).
+    fn resolve_subagent_prompt(&self, subagent_type: &str) -> String;
 }

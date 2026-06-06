@@ -142,7 +142,13 @@ pub(super) fn build_root_tools(
     });
 
     // Root sessions can create and manage child sessions via unified SubAgent tool.
-    let sub_agent_tool = Arc::new(crate::tools::SubAgentTool::new(adapter, profiles_for_tool));
+    // The adapter satisfies both ports the tool depends on (`ChildSessionPort`
+    // for session lifecycle, `SubagentResolutionPort` for subagent_type config).
+    let sub_agent_tool = Arc::new(crate::tools::SubAgentTool::new(
+        adapter.clone(),
+        adapter,
+        profiles_for_tool,
+    ));
     let tools_with_sub_agent: Arc<dyn ToolExecutor> = Arc::new(
         crate::tools::OverlayToolExecutor::new(base_tools, sub_agent_tool),
     );

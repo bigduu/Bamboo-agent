@@ -3,19 +3,25 @@
 //! These tools are registered only when running the Bamboo HTTP server.
 //! They may depend on `AppState` components (storage, schedulers, etc.).
 //!
-//! Framework-agnostic tools (MemoryTool, OverlayToolExecutor, etc.) live in the
-//! `bamboo-server-tools` crate. This module re-exports them for convenience.
+//! Framework-agnostic tools (MemoryTool, OverlayToolExecutor, SubAgentTool,
+//! etc.) live in the `bamboo-server-tools` crate. This module re-exports them
+//! for convenience and keeps the server-bound glue (`ChildSessionAdapter`,
+//! `ScheduleTasksTool`) that wires those tools to `AppState` via ports.
 
 // Re-export framework-agnostic tools from the bamboo-server-tools crate.
 pub use bamboo_server_tools::{
     CompactContextTool, LoadSkillTool, MemoryTool, OverlayToolExecutor, ReadSkillResourceTool,
-    SessionInspectorTool, ToolSurface, ToolSurfaceFactory,
+    SessionInspectorTool, SubAgentTool, ToolSurface, ToolSurfaceFactory,
 };
 
 pub mod child_session_adapter;
 pub mod policy_aware;
 pub mod schedule_tasks;
-pub mod sub_agent;
+
+// Integration tests that wire `SubAgentTool` to a real `ChildSessionAdapter`
+// (the tool itself + its pure unit tests live in `bamboo-server-tools`).
+#[cfg(test)]
+mod sub_agent_tests;
 
 pub type SubagentModelResolver = std::sync::Arc<
     dyn Fn(String) -> futures::future::BoxFuture<'static, Option<bamboo_domain::ProviderModelRef>>
@@ -28,4 +34,3 @@ pub type OptionalSubagentModelResolver = Option<SubagentModelResolver>;
 pub use child_session_adapter::ChildSessionAdapter;
 pub use policy_aware::PolicyAwareToolExecutor;
 pub use schedule_tasks::ScheduleTasksTool;
-pub use sub_agent::SubAgentTool;

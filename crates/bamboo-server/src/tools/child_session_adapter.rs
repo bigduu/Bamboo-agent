@@ -15,10 +15,10 @@ use crate::app_state::session_events::get_or_create_event_sender;
 use crate::app_state::{AgentRunner, AgentStatus};
 use bamboo_engine::session_app::child_session::{
     ChildRunnerInfo, ChildSessionEntry, ChildSessionError, ChildSessionPort, DeleteChildResult,
+    SubagentResolutionPort,
 };
 use bamboo_engine::execution::spawn::{SpawnJob, SpawnScheduler};
 use bamboo_agent_core::storage::Storage;
-use bamboo_agent_core::tools::ToolError;
 use bamboo_agent_core::{AgentEvent, Session, SessionKind};
 use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, ChildWaitPolicy, WaitingForChildrenState,
@@ -322,6 +322,27 @@ fn map_index_entry_to_child_entry(entry: &SessionIndexEntry) -> ChildSessionEntr
 }
 
 #[async_trait]
+impl SubagentResolutionPort for ChildSessionAdapter {
+    async fn resolve_subagent_model(
+        &self,
+        subagent_type: &str,
+    ) -> Option<bamboo_domain::ProviderModelRef> {
+        ChildSessionAdapter::resolve_subagent_model(self, subagent_type).await
+    }
+
+    async fn resolve_runtime_metadata(
+        &self,
+        subagent_type: &str,
+    ) -> std::collections::HashMap<String, String> {
+        ChildSessionAdapter::resolve_runtime_metadata(self, subagent_type).await
+    }
+
+    fn resolve_subagent_prompt(&self, subagent_type: &str) -> String {
+        ChildSessionAdapter::resolve_subagent_prompt(self, subagent_type)
+    }
+}
+
+#[async_trait]
 impl ChildSessionPort for ChildSessionAdapter {
     async fn load_root_session(&self, root_session_id: &str) -> Result<Session, ChildSessionError> {
         let Some(session) = self
@@ -578,17 +599,42 @@ impl ChildSessionPort for ChildSessionAdapter {
             round_count: runner.round_count,
         })
     }
-}
 
-/// Map a `ChildSessionError` to a server `ToolError`.
-pub fn tool_error_from_child_session(error: ChildSessionError) -> ToolError {
-    match error {
-        ChildSessionError::NotFound(id) => ToolError::Execution(format!("session not found: {id}")),
-        ChildSessionError::NotRootSession(id) => {
-            ToolError::Execution(format!("session is not a root session: {id}"))
-        }
-        ChildSessionError::InvalidArguments(msg) => ToolError::InvalidArguments(msg),
-        ChildSessionError::Execution(msg) => ToolError::Execution(msg),
-        other => ToolError::Execution(other.to_string()),
+    async fn register_parent_wait_for_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        tool_call_id: Option<&str>,
+    ) -> Result<(), ChildSessionError> {
+        ChildSessionAdapter::register_parent_wait_for_child(
+            self,
+            parent_session_id,
+            child_session_id,
+            tool_call_id,
+        )
+        .await
+    }
+
+    async fn register_parent_wait_for_children(
+        &self,
+        parent_session_id: &str,
+        child_session_ids: &[String],
+        policy: ChildWaitPolicy,
+    ) -> Result<usize, ChildSessionError> {
+        ChildSessionAdapter::register_parent_wait_for_children(
+            self,
+            parent_session_id,
+            child_session_ids,
+            policy,
+        )
+        .await
+    }
+
+    async fn active_child_ids(&self, parent_session_id: &str) -> Vec<String> {
+        ChildSessionAdapter::active_child_ids(self, parent_session_id).await
+    }
+
+    async fn ensure_child_indexed(&self, child_session_id: &str) {
+        let _ = self.session_store.get_index_entry(child_session_id).await;
     }
 }

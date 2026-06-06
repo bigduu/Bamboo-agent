@@ -9,6 +9,7 @@ license = "MIT"
 [dependencies]
 bamboo-agent-core = { path = "../bamboo-agent-core" }
 bamboo-engine = { path = "../bamboo-engine" }
+bamboo-domain = { path = "../bamboo-domain" }
 bamboo-infrastructure = { path = "../bamboo-infrastructure" }
 bamboo-memory = { path = "../bamboo-memory" }
 bamboo-tools = { path = "../bamboo-tools" }
@@ -19,6 +20,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 parking_lot = "0.12"
 dashmap = "6"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"

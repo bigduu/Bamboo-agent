@@ -882,6 +882,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bamboo-agent-core",
+ "bamboo-domain",
  "bamboo-engine",
  "bamboo-infrastructure",
  "bamboo-memory",
@@ -893,6 +894,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
