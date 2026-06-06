@@ -1,12 +1,8 @@
 use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
-use bamboo_engine::session_app::provider_model::session_effective_model_ref;
 use bamboo_engine::session_app::respond::PlanModeTransition;
 use bamboo_agent_core::AgentEvent;
-use bamboo_engine::model_config_helper::{
-    resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
-};
 
 use super::super::types::RespondRequest;
 
@@ -104,48 +100,15 @@ pub async fn submit_response(
         session_id
     );
 
-    // Build resume config snapshot from server config.
+    // Build resume config snapshot from server config via the single-source-of-
+    // truth resolver (provider-name derivation + global auxiliary models + gold).
     let config_snapshot = state.config.read().await.clone();
-    let resolved_provider_name = session_effective_model_ref(&_session)
-        .map(|model_ref| model_ref.provider)
-        .unwrap_or_else(|| config_snapshot.provider.clone());
-    let resolved_provider_type = resolve_provider_type(
+    let resume_config = bamboo_engine::session_app::resolution::resolve_resume_config_snapshot(
         &config_snapshot,
-        &resolved_provider_name,
         &state.provider_registry,
+        &_session,
+        None,
     );
-    // Auxiliary models are global (config-derived), never session-bound.
-    let areas = bamboo_engine::model_areas::resolve_global_area_models(
-        &config_snapshot,
-        &resolved_provider_name,
-        &state.provider_registry,
-    );
-    let resume_config = bamboo_engine::session_app::types::ResumeConfigSnapshot {
-        provider_name: resolved_provider_name.clone(),
-        provider_type: resolved_provider_type,
-        fast_model: areas.fast.as_ref().map(|m| m.model_name.clone()),
-        fast_model_ref: areas.fast_ref.clone(),
-        background_model: areas.background.as_ref().map(|m| m.model_name.clone()),
-        background_model_ref: areas.background_ref.clone(),
-        background_model_provider: areas.background.map(|m| m.provider),
-        summarization_model: areas.summarization.as_ref().map(|m| m.model_name.clone()),
-        summarization_model_ref: areas.summarization_ref.clone(),
-        summarization_model_provider: areas.summarization.map(|m| m.provider),
-        disabled_tools: config_snapshot.disabled_tool_names(),
-        disabled_skill_ids: config_snapshot.disabled_skill_ids(),
-        image_fallback: crate::handlers::agent::execute::image_fallback::resolve_image_fallback(
-            &config_snapshot,
-        )
-        .ok()
-        .flatten(),
-        gold_config: resolve_gold_config(
-            &config_snapshot,
-            _session
-                .metadata
-                .get(GOLD_CONFIG_METADATA_KEY)
-                .map(String::as_str),
-        ),
-    };
 
     let auto_resume_outcome = bamboo_engine::session_app::resume::resume_session_execution(
         &crate::app_state::resume_adapter::AppStateResumeRef(state),

@@ -32,7 +32,7 @@ use crate::session_app::resume::{
 use crate::session_app::types::{ResumeConfigSnapshot, ResumeOutcome};
 use crate::model_areas::resolve_global_area_models;
 use crate::model_config_helper::{
-    resolve_fast_model, resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
+    resolve_fast_model, resolve_gold_config, GOLD_CONFIG_METADATA_KEY,
 };
 
 const AGENT_RUNTIME_STATE_METADATA_KEY: &str = "agent.runtime.state";
@@ -273,48 +273,12 @@ impl ChildCompletionCoordinator {
         session: &Session,
         config_snapshot: &Config,
     ) -> ResumeConfigSnapshot {
-        let provider_name = session_effective_model_ref(session)
-            .map(|model_ref| model_ref.provider)
-            .unwrap_or_else(|| config_snapshot.provider.clone());
-        let provider_type =
-            resolve_provider_type(config_snapshot, &provider_name, &self.provider_registry);
-        // Auxiliary models are global (config-derived), never session-bound.
-        let areas =
-            resolve_global_area_models(config_snapshot, &provider_name, &self.provider_registry);
-
-        ResumeConfigSnapshot {
-            provider_name,
-            provider_type,
-            fast_model: areas.fast.as_ref().map(|model| model.model_name.clone()),
-            fast_model_ref: areas.fast_ref.clone(),
-            background_model: areas
-                .background
-                .as_ref()
-                .map(|model| model.model_name.clone()),
-            background_model_ref: areas.background_ref.clone(),
-            background_model_provider: areas.background.map(|model| model.provider),
-            summarization_model: areas
-                .summarization
-                .as_ref()
-                .map(|model| model.model_name.clone()),
-            summarization_model_ref: areas.summarization_ref.clone(),
-            summarization_model_provider: areas.summarization.map(|model| model.provider),
-            disabled_tools: config_snapshot.disabled_tool_names(),
-            disabled_skill_ids: config_snapshot.disabled_skill_ids(),
-            image_fallback:
-                crate::model_config_helper::resolve_image_fallback(
-                    config_snapshot,
-                )
-                .ok()
-                .flatten(),
-            gold_config: resolve_gold_config(
-                config_snapshot,
-                session
-                    .metadata
-                    .get(GOLD_CONFIG_METADATA_KEY)
-                    .map(String::as_str),
-            ),
-        }
+        crate::session_app::resolution::resolve_resume_config_snapshot(
+            config_snapshot,
+            &self.provider_registry,
+            session,
+            None,
+        )
     }
 
     async fn resume_parent(&self, parent_session_id: String) {

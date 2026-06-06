@@ -9,6 +9,7 @@ pub mod execution_prep;
 pub mod metadata;
 pub mod provider_model;
 pub mod repository;
+pub mod resolution;
 pub mod respond;
 pub mod resume;
 pub mod session_create;
