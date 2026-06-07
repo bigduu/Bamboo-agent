@@ -2,7 +2,7 @@
 
 use bamboo_agent::agent::{Session, TokenBudgetUsage};
 use bamboo_agent_core::storage::Storage;
-use bamboo_infrastructure::SessionStoreV2;
+use bamboo_storage::SessionStoreV2;
 
 mod common;
 

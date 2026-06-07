@@ -1,27 +1,31 @@
 [workspace]
 members = [
     ".",
-    "crates/bamboo-domain",
-    "crates/bamboo-config",
-    "crates/bamboo-llm",
-    "crates/bamboo-infrastructure",
-    "crates/bamboo-engine",
-    "crates/bamboo-agent-core",
-    "crates/bamboo-memory",
-    "crates/bamboo-metrics",
-    "crates/bamboo-skills",
-    "crates/bamboo-mcp",
-    "crates/bamboo-permission",
-    "crates/bamboo-compression",
-    "crates/bamboo-tools",
-    "crates/bamboo-cli",
-    "crates/bamboo-client-core",
-    "crates/bamboo-server",
-    "crates/bamboo-server-tools",
-    "crates/bamboo-tui",
-    "crates/bamboo-a2a",
-    "crates/bamboo-storage",
-    "crates/bamboo-sdk",
+    # Core — types + interfaces
+    "crates/core/bamboo-domain",
+    "crates/core/bamboo-agent-core",
+    # Infra — independent services
+    "crates/infra/bamboo-config",
+    "crates/infra/bamboo-llm",
+    "crates/infra/bamboo-storage",
+    "crates/infra/bamboo-a2a",
+    "crates/infra/bamboo-infrastructure",
+    "crates/infra/bamboo-memory",
+    "crates/infra/bamboo-metrics",
+    "crates/infra/bamboo-skills",
+    "crates/infra/bamboo-mcp",
+    "crates/infra/bamboo-permission",
+    "crates/infra/bamboo-compression",
+    # Engine — core logic
+    "crates/engine/bamboo-engine",
+    "crates/engine/bamboo-tools",
+    # App — executables + entry points
+    "crates/app/bamboo-server",
+    "crates/app/bamboo-server-tools",
+    "crates/app/bamboo-sdk",
+    "crates/app/bamboo-cli",
+    "crates/app/bamboo-tui",
+    "crates/app/bamboo-client-core",
 ]
 resolver = "2"
 
@@ -65,13 +69,16 @@ include = [
 
 [dependencies]
 # Workspace crates
-bamboo-domain = { path = "crates/bamboo-domain" }
-bamboo-infrastructure = { path = "crates/bamboo-infrastructure" }
-bamboo-agent-core = { path = "crates/bamboo-agent-core" }
-bamboo-engine = { path = "crates/bamboo-engine" }
-bamboo-tools = { path = "crates/bamboo-tools" }
-bamboo-server = { path = "crates/bamboo-server" }
-bamboo-sdk = { path = "crates/bamboo-sdk" }
+bamboo-domain = { path = "crates/core/bamboo-domain" }
+bamboo-infrastructure = { path = "crates/infra/bamboo-infrastructure" }
+bamboo-config = { path = "crates/infra/bamboo-config" }
+bamboo-llm = { path = "crates/infra/bamboo-llm" }
+bamboo-storage = { path = "crates/infra/bamboo-storage" }
+bamboo-agent-core = { path = "crates/core/bamboo-agent-core" }
+bamboo-engine = { path = "crates/engine/bamboo-engine" }
+bamboo-tools = { path = "crates/engine/bamboo-tools" }
+bamboo-server = { path = "crates/app/bamboo-server" }
+bamboo-sdk = { path = "crates/app/bamboo-sdk" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -163,9 +170,13 @@ mockall = "0.13"
 http = "1"
 actix-rt = "2"
 serde_json = "1"
-bamboo-infrastructure = { path = "crates/bamboo-infrastructure", features = ["test-utils"] }
-bamboo-agent-core = { path = "crates/bamboo-agent-core" }
-bamboo-engine = { path = "crates/bamboo-engine" }
+bamboo-infrastructure = { path = "crates/infra/bamboo-infrastructure", features = ["test-utils"] }
+bamboo-config = { path = "crates/infra/bamboo-config", features = ["test-utils"] }
+bamboo-agent-core = { path = "crates/core/bamboo-agent-core" }
+bamboo-engine = { path = "crates/engine/bamboo-engine" }
+bamboo-metrics = { path = "crates/infra/bamboo-metrics" }
+bamboo-mcp = { path = "crates/infra/bamboo-mcp" }
+bamboo-skills = { path = "crates/infra/bamboo-skills" }
 
 [profile.release]
 opt-level = 3

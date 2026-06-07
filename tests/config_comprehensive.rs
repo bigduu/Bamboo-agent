@@ -206,7 +206,7 @@ mod comprehensive_config_tests {
         let config = Config::new();
         assert_eq!(config.provider, "from_custom_dir");
         assert_eq!(
-            bamboo_infrastructure::paths::resolve_bamboo_dir(),
+            bamboo_config::paths::resolve_bamboo_dir(),
             temp.path
         );
     }
@@ -270,7 +270,7 @@ mod comprehensive_config_tests {
 
         let mut original = Config::from_data_dir(Some(temp.path.clone()));
         original.provider = "anthropic".to_string();
-        original.providers.anthropic = Some(bamboo_infrastructure::config::AnthropicConfig {
+        original.providers.anthropic = Some(bamboo_config::AnthropicConfig {
             api_key: String::new(),
             api_key_encrypted: None,
             base_url: None,

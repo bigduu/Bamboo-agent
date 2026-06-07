@@ -1,7 +1,7 @@
-use bamboo_infrastructure::keyword_masking::{KeywordEntry, KeywordMaskingConfig};
+use bamboo_config::keyword_masking::{KeywordEntry, KeywordMaskingConfig};
 use serde::{Deserialize, Serialize};
 
-use bamboo_infrastructure::Config;
+use bamboo_llm::Config;
 
 /// Response for keyword masking configuration
 #[derive(Debug, Serialize, Deserialize)]

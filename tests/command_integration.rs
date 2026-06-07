@@ -102,7 +102,7 @@ Just a simple command without frontmatter.
 
     #[test]
     fn test_keyword_masking() {
-        use bamboo_infrastructure::keyword_masking::{
+        use bamboo_config::keyword_masking::{
             KeywordEntry, KeywordMaskingConfig, MatchType,
         };
 

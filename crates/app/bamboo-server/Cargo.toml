@@ -1,0 +1,81 @@
+[package]
+name = "bamboo-server"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+description = "HTTP server and API layer for the Bamboo agent framework"
+license = "MIT"
+
+[dependencies]
+# Workspace crates
+bamboo-engine = { path = "../../engine/bamboo-engine" }
+bamboo-memory = { path = "../../infra/bamboo-memory" }
+bamboo-compression = { path = "../../infra/bamboo-compression" }
+bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
+bamboo-tools = { path = "../../engine/bamboo-tools" }
+bamboo-server-tools = { path = "../../app/bamboo-server-tools" }
+bamboo-metrics = { path = "../../infra/bamboo-metrics" }
+bamboo-mcp = { path = "../../infra/bamboo-mcp" }
+bamboo-skills = { path = "../../infra/bamboo-skills" }
+bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
+bamboo-llm = { path = "../../infra/bamboo-llm" }
+bamboo-config = { path = "../../infra/bamboo-config" }
+bamboo-storage = { path = "../../infra/bamboo-storage" }
+bamboo-domain = { path = "../../core/bamboo-domain" }
+
+# Web framework
+actix-web = "4"
+actix-cors = "0.7"
+actix-files = "0.6"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+async-stream = "0.3"
+tokio-stream = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+cron = "0.15"
+regex = "1"
+futures = "0.3"
+thiserror = "1"
+anyhow = "1"
+parking_lot = "0.12"
+dashmap = "6"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest-middleware = { version = "0.4", features = ["json"] }
+reqwest-retry = "0.7"
+reqwest-eventsource = "0.6"
+walkdir = "2"
+globset = "0.4"
+tokio-util = "0.7"
+bytes = "1"
+url = "2"
+hex = "0.4"
+sha2 = "0.10"
+rand = "0.8"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+tokio-test = "0.4"
+mockall = "0.13"
+http = "1"
+actix-rt = "2"
+bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure", features = ["test-utils"] }
+bamboo-llm = { path = "../../infra/bamboo-llm" }
+bamboo-config = { path = "../../infra/bamboo-config" }
+bamboo-storage = { path = "../../infra/bamboo-storage" }

@@ -1,0 +1,22 @@
+[package]
+name = "bamboo-metrics"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+description = "Live metrics pipeline (bus, collector, worker, aggregation) for the Bamboo agent framework"
+license = "MIT"
+
+[dependencies]
+bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
+bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
+bamboo-domain = { path = "../../core/bamboo-domain" }
+serde = { workspace = true }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"

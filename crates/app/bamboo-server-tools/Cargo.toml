@@ -1,0 +1,32 @@
+[package]
+name = "bamboo-server-tools"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+description = "Framework-agnostic server-side tool implementations (memory, session inspector, skill runtime, compact, overlay) for the Bamboo agent framework"
+license = "MIT"
+
+[dependencies]
+bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
+bamboo-engine = { path = "../../engine/bamboo-engine" }
+bamboo-domain = { path = "../../core/bamboo-domain" }
+bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
+bamboo-memory = { path = "../../infra/bamboo-memory" }
+bamboo-tools = { path = "../../engine/bamboo-tools" }
+bamboo-metrics = { path = "../../infra/bamboo-metrics" }
+bamboo-skills = { path = "../../infra/bamboo-skills" }
+bamboo-llm = { path = "../../infra/bamboo-llm" }
+bamboo-config = { path = "../../infra/bamboo-config" }
+bamboo-a2a = { path = "../../infra/bamboo-a2a" }
+bamboo-storage = { path = "../../infra/bamboo-storage" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+parking_lot = "0.12"
+dashmap = "6"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

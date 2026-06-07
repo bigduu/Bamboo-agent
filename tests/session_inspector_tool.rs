@@ -8,7 +8,7 @@ use bamboo_agent::server::tools::SessionInspectorTool;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolExecutionContext};
 use bamboo_agent_core::ConversationSummary;
-use bamboo_infrastructure::SessionStoreV2;
+use bamboo_storage::SessionStoreV2;
 
 mod common;
 

@@ -7,7 +7,7 @@ mod tests {
     // Test env-lock is a std Mutex intentionally held across .await to serialize env access.
     #![allow(clippy::await_holding_lock)]
 
-    use bamboo_infrastructure::paths::workflows_dir;
+    use bamboo_config::paths::workflows_dir;
     use std::sync::Mutex;
     use tempfile::TempDir;
 

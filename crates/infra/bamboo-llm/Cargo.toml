@@ -1,0 +1,32 @@
+[package]
+name = "bamboo-llm"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+description = "LLM provider layer (providers, protocol adapters, streaming, routing, model catalog) for the Bamboo agent framework"
+license = "MIT"
+
+[dependencies]
+bamboo-config = { path = "../../infra/bamboo-config" }
+bamboo-domain = { path = "../../core/bamboo-domain" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = "1"
+tracing = "0.1"
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest-eventsource = "0.6"
+reqwest-middleware = { version = "0.4", features = ["json"] }
+reqwest-retry = "0.7"
+eventsource-stream = "0.2"
+uuid = { workspace = true }
+base64 = "0.22"
+bytes = "1"
+
+[dev-dependencies]
+tempfile = "3"
+http = "1"

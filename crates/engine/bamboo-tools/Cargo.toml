@@ -1,0 +1,47 @@
+[package]
+name = "bamboo-tools"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+description = "Tool execution and integrations for the Bamboo agent framework"
+license = "MIT"
+
+[dependencies]
+bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
+bamboo-memory = { path = "../../infra/bamboo-memory" }
+bamboo-compression = { path = "../../infra/bamboo-compression" }
+bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
+bamboo-llm = { path = "../../infra/bamboo-llm" }
+bamboo-config = { path = "../../infra/bamboo-config" }
+bamboo-storage = { path = "../../infra/bamboo-storage" }
+bamboo-permission = { path = "../../infra/bamboo-permission" }
+bamboo-domain = { path = "../../core/bamboo-domain" }
+serde = { workspace = true }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full", "test-util"] }
+futures = "0.3"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+thiserror = "1"
+anyhow = "1"
+regex = "1"
+dashmap = "6"
+uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"
+globset = "0.4"
+base64 = "0.22"
+parking_lot = "0.12"
+url = "2"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+toml = "0.8"
+dirs = "5"
+colored = "2"
+
+[dev-dependencies]
+tempfile = "3"
+bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure", features = ["test-utils"] }
+bamboo-llm = { path = "../../infra/bamboo-llm" }
+bamboo-config = { path = "../../infra/bamboo-config" }
+bamboo-storage = { path = "../../infra/bamboo-storage" }

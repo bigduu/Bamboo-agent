@@ -1,0 +1,30 @@
+[package]
+name = "bamboo-infrastructure"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+description = "Process management, logging, and metrics for the Bamboo agent framework"
+license = "MIT"
+
+[dependencies]
+bamboo-domain = { path = "../../core/bamboo-domain" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = "1"
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+chrono = { workspace = true }
+dashmap = "6"
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+sysinfo = "0.33"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+test-utils = []

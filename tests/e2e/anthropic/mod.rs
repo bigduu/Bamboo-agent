@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use bamboo_agent::agent::{Message, Role};
 use bamboo_agent::server::handlers::anthropic;
 use bamboo_agent_core::tools::ToolSchema;
-use bamboo_infrastructure::{LLMChunk, LLMProvider, LLMStream};
+use bamboo_llm::{LLMChunk, LLMProvider, LLMStream};
 use futures::stream;
 use serde_json::json;
 
@@ -44,7 +44,7 @@ impl LLMProvider for RecordingProvider {
         _tools: &[ToolSchema],
         max_output_tokens: Option<u32>,
         model: &str,
-    ) -> bamboo_infrastructure::provider::Result<LLMStream> {
+    ) -> bamboo_llm::provider::Result<LLMStream> {
         self.calls
             .lock()
             .expect("recording provider lock poisoned")
@@ -60,7 +60,7 @@ impl LLMProvider for RecordingProvider {
         ])))
     }
 
-    async fn list_models(&self) -> bamboo_infrastructure::provider::Result<Vec<String>> {
+    async fn list_models(&self) -> bamboo_llm::provider::Result<Vec<String>> {
         Ok(vec!["claude-3-5-sonnet-20241022".to_string()])
     }
 }

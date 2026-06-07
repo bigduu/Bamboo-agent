@@ -2,7 +2,7 @@
 //!
 //! Standalone HTTP server for Bamboo
 
-use bamboo_infrastructure::Config;
+use bamboo_llm::Config;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -62,7 +62,7 @@ async fn main() {
         Commands::Serve { ref data_dir, .. } => {
             let home = data_dir
                 .clone()
-                .unwrap_or_else(bamboo_infrastructure::paths::resolve_bamboo_dir);
+                .unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
             bamboo_agent::server::logging::init_logging_with_home(&home, debug);
         }
         Commands::Config { .. } => {
@@ -87,9 +87,9 @@ async fn main() {
         } => {
             let bamboo_home_dir = data_dir
                 .clone()
-                .unwrap_or_else(bamboo_infrastructure::paths::resolve_bamboo_dir);
+                .unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
             // Stabilize the data dir for the lifetime of this process.
-            bamboo_infrastructure::paths::init_bamboo_dir(bamboo_home_dir.clone());
+            bamboo_config::paths::init_bamboo_dir(bamboo_home_dir.clone());
             // Keep runtime path resolution consistent: most helpers derive their base dir from
             // BAMBOO_DATA_DIR / `${HOME}/.bamboo` via `core::paths::bamboo_dir()`.
             // SAFETY: Called on the main thread before any async runtime work begins,
@@ -101,7 +101,7 @@ async fn main() {
             // Load config (with env var overrides already applied)
             // If --data-dir is specified, load from that directory.
             let mut config =
-                bamboo_infrastructure::Config::from_data_dir(Some(bamboo_home_dir.clone()));
+                bamboo_llm::Config::from_data_dir(Some(bamboo_home_dir.clone()));
 
             // Apply CLI argument overrides (highest priority)
             if let Some(p) = port {
@@ -155,7 +155,7 @@ async fn main() {
             if path {
                 println!(
                     "{}",
-                    bamboo_infrastructure::paths::config_json_path().display()
+                    bamboo_config::paths::config_json_path().display()
                 );
             } else {
                 let mut config = Config::new();
@@ -199,8 +199,8 @@ fn serialize_config_for_cli(
 #[cfg(test)]
 mod tests {
     use super::serialize_config_for_cli;
-    use bamboo_engine::{McpServerConfig, StdioConfig, TransportConfig};
-    use bamboo_infrastructure::config::{Config, OpenAIConfig, ProviderConfigs, ProxyAuth};
+    use bamboo_mcp::{McpServerConfig, StdioConfig, TransportConfig};
+    use bamboo_config::{Config, OpenAIConfig, ProviderConfigs, ProxyAuth};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
 

@@ -1,0 +1,31 @@
+[package]
+name = "bamboo-permission"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+description = "Tool-execution permission system (rules, grants, bash-security analysis) for the Bamboo agent framework"
+license = "MIT"
+
+[dependencies]
+bamboo-domain = { path = "../../core/bamboo-domain" }
+bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
+bamboo-llm = { path = "../../infra/bamboo-llm" }
+bamboo-config = { path = "../../infra/bamboo-config" }
+serde = { workspace = true }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+async-trait = "0.1"
+dashmap = "6"
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+libc = "0.2"
+regex = "1"
+anyhow = "1"
+thiserror = "1"
+tree-sitter = "0.26"
+tree-sitter-bash = "0.25"
+
+[dev-dependencies]
+tempfile = "3"

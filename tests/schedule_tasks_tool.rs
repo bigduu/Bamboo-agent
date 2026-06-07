@@ -27,10 +27,10 @@ use bamboo_agent_core::tools::{
 };
 use bamboo_agent_core::SessionKind;
 use bamboo_engine::{Agent, AgentBuilder};
-use bamboo_infrastructure::provider::Result as LLMResult;
-use bamboo_infrastructure::provider::{LLMProvider, LLMStream};
-use bamboo_infrastructure::LLMChunk;
-use bamboo_infrastructure::SessionStoreV2;
+use bamboo_llm::provider::Result as LLMResult;
+use bamboo_llm::provider::{LLMProvider, LLMStream};
+use bamboo_llm::LLMChunk;
+use bamboo_storage::SessionStoreV2;
 
 mod common;
 
@@ -125,14 +125,14 @@ fn build_manager(
     provider: Arc<dyn LLMProvider>,
     config: Config,
 ) -> (Arc<Agent>, Arc<ScheduleManager>) {
-    use bamboo_engine::metrics::collector::MetricsCollector;
-    use bamboo_engine::metrics::storage::SqliteMetricsStorage;
-    use bamboo_engine::SkillManager;
+    use bamboo_metrics::collector::MetricsCollector;
+    use bamboo_metrics::storage::SqliteMetricsStorage;
+    use bamboo_skills::SkillManager;
 
     let metrics_storage = Arc::new(SqliteMetricsStorage::new(dir.join("metrics.db")));
     let metrics = MetricsCollector::spawn(metrics_storage, 1);
 
-    let persistence = Arc::new(bamboo_infrastructure::LockedSessionStore::new(
+    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(
         store.clone(),
     ));
 
@@ -172,7 +172,7 @@ fn build_manager(
     let ctx = ScheduleContext {
         schedule_store,
         agent: agent.clone(),
-        persistence: Arc::new(bamboo_infrastructure::LockedSessionStore::new(
+        persistence: Arc::new(bamboo_storage::LockedSessionStore::new(
             store.clone(),
         )),
         tools: Arc::new(NoopTools),

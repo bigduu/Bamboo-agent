@@ -69,27 +69,27 @@ pub use bamboo_sdk::agent;
 pub use bamboo_sdk::{Agent, AgentBuilder};
 
 // Re-export core Config as the primary configuration type
-pub use bamboo_infrastructure::config::ServerConfig;
-pub use bamboo_infrastructure::Config;
+pub use bamboo_config::ServerConfig;
+pub use bamboo_llm::Config;
 pub use error::{BambooError, Result};
 
 /// Main Bamboo server instance
 pub struct BambooServer {
-    config: bamboo_infrastructure::Config,
+    config: bamboo_llm::Config,
     data_dir: PathBuf,
 }
 
 impl BambooServer {
     /// Create a new Bamboo server with configuration
-    pub fn new(config: bamboo_infrastructure::Config) -> Self {
+    pub fn new(config: bamboo_llm::Config) -> Self {
         Self {
             config,
-            data_dir: bamboo_infrastructure::paths::bamboo_dir(),
+            data_dir: bamboo_config::paths::bamboo_dir(),
         }
     }
 
     /// Create a new Bamboo server with an explicit data directory.
-    pub fn new_with_data_dir(config: bamboo_infrastructure::Config, data_dir: PathBuf) -> Self {
+    pub fn new_with_data_dir(config: bamboo_llm::Config, data_dir: PathBuf) -> Self {
         Self { config, data_dir }
     }
 
@@ -101,7 +101,7 @@ impl BambooServer {
     ///
     /// This method blocks until the server shuts down.
     pub async fn start(self) -> Result<()> {
-        bamboo_infrastructure::paths::init_bamboo_dir(self.data_dir.clone());
+        bamboo_config::paths::init_bamboo_dir(self.data_dir.clone());
 
         let result = if self.config.server.static_dir.is_some() {
             server::run_with_bind_and_static(
@@ -149,7 +149,7 @@ impl BambooServer {
 ///     .unwrap();
 /// ```
 pub struct BambooBuilder {
-    config: bamboo_infrastructure::Config,
+    config: bamboo_llm::Config,
     data_dir: PathBuf,
     /// When `Some(debug)`, [`build`](Self::build) installs Bamboo's shared logging
     /// policy (file + stdout). `None` leaves logging untouched. Opt-in by design:
@@ -161,8 +161,8 @@ impl BambooBuilder {
     /// Create a new BambooBuilder with default configuration
     pub fn new() -> Self {
         Self {
-            config: bamboo_infrastructure::Config::new(),
-            data_dir: bamboo_infrastructure::paths::bamboo_dir(),
+            config: bamboo_llm::Config::new(),
+            data_dir: bamboo_config::paths::bamboo_dir(),
             logging: None,
         }
     }
