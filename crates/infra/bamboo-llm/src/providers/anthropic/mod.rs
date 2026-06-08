@@ -508,11 +508,22 @@ fn messages_to_anthropic_json(messages: &[Message]) -> (Option<Value>, Vec<Value
     let mut out: Vec<Value> = Vec::new();
     let mut out_ids: Vec<String> = Vec::new();
 
-    for m in messages {
+    // Keep only the MOST RECENT tool-result image (e.g. screenshot); older ones
+    // are dropped from the request to control context size, since a conversation
+    // can accumulate many large images. (User-attached images are untouched.)
+    let last_image_tool_idx = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m.role, Role::Tool) && message_has_image(m))
+        .map(|(i, _)| i)
+        .last();
+
+    for (idx, m) in messages.iter().enumerate() {
         match m.role {
             Role::System => system_parts.push(m.content.as_str()),
             Role::User | Role::Assistant | Role::Tool => {
-                let msg_json = message_to_anthropic_json(m);
+                let keep_image = Some(idx) == last_image_tool_idx;
+                let msg_json = message_to_anthropic_json(m, keep_image);
                 // Merge consecutive Tool messages into the preceding user
                 // message so that all tool_results for a single assistant
                 // tool_use turn live in the *same* user message, as required
@@ -561,7 +572,18 @@ fn messages_to_anthropic_json(messages: &[Message]) -> (Option<Value>, Vec<Value
     (system, out, out_ids)
 }
 
-fn message_to_anthropic_json(message: &Message) -> Value {
+/// Whether a message carries at least one image in its content parts.
+fn message_has_image(message: &Message) -> bool {
+    message
+        .content_parts
+        .as_ref()
+        .is_some_and(|parts| parts.iter().any(|p| matches!(p, MessagePart::ImageUrl { .. })))
+}
+
+/// `keep_image`: when false, a tool result's images are dropped (replaced by a
+/// short note) so only the most recent screenshot is sent — see
+/// `messages_to_anthropic_json`.
+fn message_to_anthropic_json(message: &Message, keep_image: bool) -> Value {
     match message.role {
         Role::System => unreachable!("system messages should be extracted into top-level `system`"),
         Role::User => json!({
@@ -620,13 +642,50 @@ fn message_to_anthropic_json(message: &Message) -> Value {
                 });
             };
 
+            // Tool results that carry images (e.g. an MCP `screenshot`) embed the
+            // picture as blocks; Anthropic's tool_result `content` accepts an
+            // array of text + image blocks. Only the most recent screenshot is
+            // kept (keep_image); older ones are dropped to control context size.
+            let image_blocks: Vec<Value> = if keep_image {
+                message
+                    .content_parts
+                    .as_ref()
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter(|p| matches!(p, MessagePart::ImageUrl { .. }))
+                            .filter_map(content_part_to_anthropic_block)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            let tool_result_content = if !image_blocks.is_empty() {
+                let mut blocks = Vec::with_capacity(image_blocks.len() + 1);
+                if !message.content.is_empty() {
+                    blocks.push(json!({ "type": "text", "text": message.content }));
+                }
+                blocks.extend(image_blocks);
+                json!(blocks)
+            } else if !keep_image && message_has_image(message) {
+                // This tool result had a screenshot we dropped — note it.
+                json!(format!(
+                    "{}\n[earlier screenshot omitted to save context; take a new one if needed]",
+                    message.content
+                ))
+            } else {
+                json!(message.content)
+            };
+
             json!({
                 "role": "user",
                 "content": [
                     {
                         "type": "tool_result",
                         "tool_use_id": tool_use_id,
-                        "content": message.content,
+                        "content": tool_result_content,
                     }
                 ],
             })
@@ -1174,6 +1233,84 @@ mod anthropic_request_building {
             super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
         assert!(out.get("system").is_none());
+    }
+
+    #[test]
+    fn tool_result_with_image_emits_text_and_image_blocks() {
+        // An MCP screenshot result: text note + one image.
+        let msg = Message::tool_result_with_images(
+            "toolu_1",
+            "screenshot 1280x536",
+            true,
+            vec![bamboo_domain::ToolResultImage {
+                mime_type: "image/jpeg".to_string(),
+                data: "AAAA".to_string(),
+            }],
+        );
+        let v = super::message_to_anthropic_json(&msg, true);
+        let block = &v["content"][0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["tool_use_id"], "toolu_1");
+        let arr = block["content"]
+            .as_array()
+            .expect("tool_result content should be an array when images are present");
+        assert!(arr
+            .iter()
+            .any(|b| b["type"] == "text" && b["text"] == "screenshot 1280x536"));
+        let img = arr
+            .iter()
+            .find(|b| b["type"] == "image")
+            .expect("an image block");
+        assert_eq!(img["source"]["type"], "base64");
+        assert_eq!(img["source"]["media_type"], "image/jpeg");
+        assert_eq!(img["source"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn tool_result_without_image_stays_plain_string() {
+        // Regression: text-only tool results keep the cheap string form.
+        let msg = Message::tool_result("toolu_2", "plain text");
+        let v = super::message_to_anthropic_json(&msg, true);
+        assert_eq!(v["content"][0]["type"], "tool_result");
+        assert_eq!(v["content"][0]["content"], "plain text");
+    }
+
+    #[test]
+    fn older_tool_image_is_dropped_keeping_only_latest() {
+        // With keep_image=false, an image-bearing tool result drops the image and
+        // notes the omission (only the most recent screenshot is sent).
+        let msg = Message::tool_result_with_images(
+            "toolu_old",
+            "screenshot 1",
+            true,
+            vec![bamboo_domain::ToolResultImage {
+                mime_type: "image/jpeg".to_string(),
+                data: "OLD".to_string(),
+            }],
+        );
+        let v = super::message_to_anthropic_json(&msg, false);
+        let content = &v["content"][0]["content"];
+        // No image block — content is a plain string with the omission note.
+        assert!(content.is_string(), "dropped image should leave a string");
+        assert!(content.as_str().unwrap().contains("omitted"));
+    }
+
+    #[test]
+    fn messages_keep_only_the_most_recent_tool_image() {
+        let img = |d: &str| bamboo_domain::ToolResultImage {
+            mime_type: "image/jpeg".to_string(),
+            data: d.to_string(),
+        };
+        let messages = vec![
+            Message::user("look"),
+            Message::tool_result_with_images("t1", "shot1", true, vec![img("FIRST")]),
+            Message::tool_result_with_images("t2", "shot2", true, vec![img("LAST")]),
+        ];
+        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+        let dumped = out.to_string();
+        // The most recent image survives; the older one is dropped.
+        assert!(dumped.contains("LAST"), "latest screenshot must be sent");
+        assert!(!dumped.contains("FIRST"), "older screenshot must be dropped");
     }
 
     #[test]
