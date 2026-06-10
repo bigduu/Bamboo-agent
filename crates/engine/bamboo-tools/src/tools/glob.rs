@@ -225,6 +225,7 @@ impl Tool for GlobTool {
             success: true,
             result: result_lines.join("\n"),
             display_preference: Some("Collapsible".to_string()),
+            images: Vec::new(),
         })
     }
 }

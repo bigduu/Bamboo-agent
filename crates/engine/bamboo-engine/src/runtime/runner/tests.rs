@@ -104,6 +104,7 @@ async fn agent_loop_passes_session_id_into_tool_execution_context() {
                 success: true,
                 result: "ok".to_string(),
                 display_preference: None,
+                images: Vec::new(),
             })
         }
     }
@@ -215,6 +216,7 @@ async fn agent_loop_refreshes_fast_model_between_rounds_for_task_evaluation() {
                 success: true,
                 result: "ok".to_string(),
                 display_preference: None,
+                images: Vec::new(),
             })
         }
     }

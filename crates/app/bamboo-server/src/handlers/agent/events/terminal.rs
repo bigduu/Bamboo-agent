@@ -5,6 +5,7 @@ use bamboo_agent_core::agent::events::TokenUsage;
 use bamboo_agent_core::agent::Role;
 use bamboo_agent_core::{AgentEvent, Session, SessionKind};
 use bamboo_domain::AgentStatusState;
+use bamboo_engine::session_app::execute::has_pending_user_message;
 
 pub(super) async fn terminal_event_if_ready(
     state: &web::Data<AppState>,
@@ -99,6 +100,21 @@ pub(super) fn session_prevents_terminal_event(session: Option<&Session>) -> bool
         return true;
     }
 
+    // A resume is pending. After the user answers a clarification /
+    // `conclusion_with_options` question, `submit_pending_response` records the
+    // answer as a tool-result message (so the last message is NOT `User`),
+    // clears the pending question, removes `runtime.suspend_reason`, and sets the
+    // resume markers. The resumed runner is reserved and marked `Running` only a
+    // moment later in `resume_session_execution`. An SSE subscription that opens
+    // in that gap would otherwise look "finished" here and receive a one-shot
+    // terminal `Complete` — closing the stream so the resumed agent streams into
+    // a broadcast with no live subscriber, leaving the UI stuck on "thinking".
+    // Mirror the resume decision, which uses this same predicate, so the window
+    // [markers set] and [runner Running] tile with no gap.
+    if has_pending_user_message(session) {
+        return true;
+    }
+
     session
         .agent_runtime_state
         .as_ref()
@@ -136,4 +152,52 @@ async fn has_running_child(state: &web::Data<AppState>, session_id: &str) -> boo
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_agent_core::Message;
+
+    #[test]
+    fn no_session_does_not_prevent_terminal() {
+        assert!(!session_prevents_terminal_event(None));
+    }
+
+    #[test]
+    fn last_user_message_prevents_terminal() {
+        let mut session = Session::new("s-1", "test-model");
+        session.add_message(Message::user("hello"));
+        assert!(session_prevents_terminal_event(Some(&session)));
+    }
+
+    #[test]
+    fn finished_session_allows_terminal() {
+        let mut session = Session::new("s-1", "test-model");
+        session.add_message(Message::user("hello"));
+        session.add_message(Message::assistant("done", None));
+        assert!(!session_prevents_terminal_event(Some(&session)));
+    }
+
+    /// Regression: after answering a `conclusion_with_options` question the answer
+    /// is recorded as a tool result (last message is NOT `User`) and the pending
+    /// question is cleared, but the resume marker is set and the resumed runner is
+    /// not yet `Running`. The SSE handler must keep the stream LIVE in this window
+    /// rather than emitting a one-shot terminal that strands the resumed run.
+    #[test]
+    fn pending_conclusion_with_options_resume_prevents_terminal() {
+        let mut session = Session::new("s-1", "test-model");
+        session.add_message(Message::assistant("tool question", None));
+        session.add_message(Message::tool_result("ask-1", "Selected response: A"));
+        // No pending question, last message is a tool result — looks "finished"...
+        assert!(!session.has_pending_question());
+        assert!(!session_prevents_terminal_event(Some(&session)));
+
+        // ...until the resume marker set by `submit_pending_response` is present.
+        session.metadata.insert(
+            "conclusion_with_options_resume_pending".to_string(),
+            "true".to_string(),
+        );
+        assert!(session_prevents_terminal_event(Some(&session)));
+    }
 }

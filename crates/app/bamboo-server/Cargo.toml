@@ -77,5 +77,5 @@ http = "1"
 actix-rt = "2"
 bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure", features = ["test-utils"] }
 bamboo-llm = { path = "../../infra/bamboo-llm" }
-bamboo-config = { path = "../../infra/bamboo-config" }
+bamboo-config = { path = "../../infra/bamboo-config", features = ["test-utils"] }
 bamboo-storage = { path = "../../infra/bamboo-storage" }

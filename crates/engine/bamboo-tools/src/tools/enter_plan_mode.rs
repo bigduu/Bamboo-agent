@@ -71,6 +71,7 @@ impl Tool for EnterPlanModeTool {
             success: true,
             result: payload.to_string(),
             display_preference: Some("conclusion_with_options".to_string()),
+            images: Vec::new(),
         })
     }
 }

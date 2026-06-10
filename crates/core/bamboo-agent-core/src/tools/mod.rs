@@ -117,7 +117,7 @@ pub use result_handler::{
     ToolHandlingOutcome, MAX_SUB_ACTIONS,
 };
 pub use smart_code_review::SmartCodeReviewTool;
-pub use types::{FunctionCall, FunctionSchema, ToolCall, ToolResult, ToolSchema};
+pub use types::{FunctionCall, FunctionSchema, ToolCall, ToolResult, ToolResultImage, ToolSchema};
 
 /// Classification of a tool call for approval purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

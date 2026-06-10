@@ -218,6 +218,7 @@ impl Tool for ConclusionWithOptionsTool {
             success: true,
             result: result_payload.to_string(),
             display_preference: Some("conclusion_with_options".to_string()),
+            images: Vec::new(),
         })
     }
 }

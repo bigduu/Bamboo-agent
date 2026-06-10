@@ -68,6 +68,7 @@ impl Tool for MockTool {
                 success: true,
                 result: self.result_value.clone(),
                 display_preference: None,
+                images: Vec::new(),
             })
         }
     }
@@ -87,6 +88,7 @@ impl Composition for ConstantComposition {
                 success: true,
                 result: self.value.clone(),
                 display_preference: None,
+                images: Vec::new(),
             },
             context: ctx,
         })
@@ -105,6 +107,7 @@ impl Composition for FailingComposition {
                 success: false,
                 result: "Failed".to_string(),
                 display_preference: None,
+                images: Vec::new(),
             },
             context: ctx,
         })
@@ -429,6 +432,7 @@ mod map_tests {
             success: result.success,
             result: format!("transformed: {}", result.result),
             display_preference: result.display_preference,
+            images: Vec::new(),
         });
 
         let result = map.execute(ExecutionContext::new()).await.unwrap();
@@ -443,6 +447,7 @@ mod map_tests {
             success: result.success,
             result: format!("mapped: {}", result.result),
             display_preference: None,
+            images: Vec::new(),
         });
 
         let result = map.execute(ExecutionContext::new()).await.unwrap();
@@ -482,6 +487,7 @@ mod variable_binding_tests {
             success: true,
             result: "previous".to_string(),
             display_preference: None,
+            images: Vec::new(),
         });
 
         assert!(ctx.last_result.is_some());

@@ -257,12 +257,25 @@ pub(crate) fn resolve_base_prompt_for_language<'a>(
         .unwrap_or_default()
 }
 
-pub(crate) fn build_stable_prompt_frame(
+/// One labeled segment of the cacheable stable prefix, captured alongside the
+/// assembled frame purely for prompt-cache drift diagnostics. The segment order
+/// mirrors the order they are merged into `stable_instructions`.
+#[derive(Debug, Clone)]
+pub(crate) struct StablePrefixSection {
+    pub name: &'static str,
+    pub content: String,
+}
+
+/// Build the cacheable stable prompt frame and the per-section breakdown of the
+/// prefix, so callers can diff which section changed between rounds without
+/// re-deriving the contexts. The section order mirrors the merge order in
+/// `stable_instructions`.
+pub(crate) fn build_stable_prompt_frame_with_sections(
     session: &Session,
     config: &AgentLoopConfig,
     tool_schemas: &[ToolSchema],
     activated_discoverable_tools: &BTreeSet<String>,
-) -> StablePromptFrame {
+) -> (StablePromptFrame, Vec<StablePrefixSection>) {
     let raw_base_prompt = resolve_base_prompt_for_language(config, session).to_string();
     let workspace_context = extract_workspace_context(&raw_base_prompt);
     let instruction_context = workspace_context
@@ -296,7 +309,34 @@ pub(crate) fn build_stable_prompt_frame(
         &tool_guide_context,
     );
 
-    StablePromptFrame::new(stable_instructions, Vec::new())
+    let sections = vec![
+        StablePrefixSection {
+            name: "base",
+            content: base_prompt,
+        },
+        StablePrefixSection {
+            name: "workspace",
+            content: workspace_context.unwrap_or_default(),
+        },
+        StablePrefixSection {
+            name: "instruction",
+            content: instruction_context.unwrap_or_default(),
+        },
+        StablePrefixSection {
+            name: "env",
+            content: env_context.unwrap_or_default(),
+        },
+        StablePrefixSection {
+            name: "skill",
+            content: skill_context.to_string(),
+        },
+        StablePrefixSection {
+            name: "tool_guide",
+            content: tool_guide_context,
+        },
+    ];
+
+    (StablePromptFrame::new(stable_instructions, Vec::new()), sections)
 }
 
 pub(crate) fn build_tool_guide_context(
@@ -309,11 +349,24 @@ pub(crate) fn build_tool_guide_context(
     let normalized_base_prompt = normalize_base_prompt(base_prompt_for_language);
     let mut guide_context = GuideBuildContext::from_system_prompt(&normalized_base_prompt);
     guide_context.activated_discoverable_tools = activated_discoverable_tools.clone();
-    let tool_guide_context = EnhancedPromptBuilder::build(
+    let mut tool_guide_context = EnhancedPromptBuilder::build(
         Some(config.tool_registry.as_ref()),
         tool_schemas,
         &guide_context,
     );
+    // Append connected MCP servers' own usage guidance (their `initialize`
+    // `instructions`), captured into the config when the executor was assembled.
+    // Present only for runs with a server that returned instructions, so it stays
+    // scoped to what is actually loaded.
+    if let Some(guidance) = config.mcp_tool_guidance.as_deref() {
+        let guidance = guidance.trim();
+        if !guidance.is_empty() {
+            if !tool_guide_context.is_empty() {
+                tool_guide_context.push_str("\n\n");
+            }
+            tool_guide_context.push_str(guidance);
+        }
+    }
     tracing::info!(
         "[{}] Tool guide context built, length: {} chars",
         session_id,
@@ -597,7 +650,7 @@ fn normalize_base_prompt(prompt: &str) -> String {
     merge_system_prompt_with_contexts(&without_plan_runtime, "", "")
 }
 
-fn merge_with_optional_contexts(
+pub(crate) fn merge_with_optional_contexts(
     base_prompt: &str,
     workspace_context: Option<&str>,
     instruction_context: Option<&str>,

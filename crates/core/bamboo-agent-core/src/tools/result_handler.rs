@@ -208,11 +208,24 @@ pub async fn handle_tool_result_with_agentic_support(
         );
     }
     let Some(agentic_result) = try_parse_agentic_result(result) else {
-        session.add_message(Message::tool_result_with_status(
-            tool_call.id.clone(),
-            result.result.clone(),
-            result.success,
-        ));
+        // Image-producing tools (e.g. MCP `screenshot`) carry the picture in
+        // `images`; route those into content_parts so the model actually sees
+        // them. Text-only results keep the original (cheaper) path.
+        let message = if result.images.is_empty() {
+            Message::tool_result_with_status(
+                tool_call.id.clone(),
+                result.result.clone(),
+                result.success,
+            )
+        } else {
+            Message::tool_result_with_images(
+                tool_call.id.clone(),
+                result.result.clone(),
+                result.success,
+                result.images.clone(),
+            )
+        };
+        session.add_message(message);
         return if should_wait_for_children {
             ToolHandlingOutcome::WaitingForChildren
         } else {
@@ -493,6 +506,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_result_with_images_adds_image_message_to_session() {
+        let (event_tx, _rx) = mpsc::channel(8);
+        let tools: Arc<dyn ToolExecutor> = Arc::new(StaticExecutor::new(HashMap::new()));
+        let mut session = Session::new("s-img", "test-model");
+        let tool_call = make_tool_call("call_shot", "screenshot", "{}");
+
+        // A plain (non-agentic) tool result that carries an image, like an MCP
+        // screenshot.
+        let result = ToolResult {
+            success: true,
+            result: "screenshot 1280x536".to_string(),
+            display_preference: None,
+            images: vec![crate::tools::ToolResultImage {
+                mime_type: "image/jpeg".to_string(),
+                data: "AAAA".to_string(),
+            }],
+        };
+
+        let outcome = handle_tool_result_with_agentic_support(
+            &result,
+            &tool_call,
+            &event_tx,
+            &mut session,
+            tools.as_ref(),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, ToolHandlingOutcome::Continue);
+        let msg = session
+            .messages
+            .last()
+            .expect("a tool-result message was added");
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call_shot"));
+        let parts = msg
+            .content_parts
+            .as_ref()
+            .expect("image must be routed into content_parts");
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[tokio::test]
     async fn need_clarification_sends_event() {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let tools: Arc<dyn ToolExecutor> = Arc::new(StaticExecutor::new(HashMap::new()));
@@ -507,6 +562,7 @@ mod tests {
             })
             .unwrap(),
             display_preference: None,
+            images: Vec::new(),
         };
 
         let outcome = handle_tool_result_with_agentic_support(
@@ -549,6 +605,7 @@ mod tests {
                 success: true,
                 result: "sub-action-done".to_string(),
                 display_preference: None,
+                images: Vec::new(),
             },
         );
         let tools: Arc<dyn ToolExecutor> = Arc::new(StaticExecutor::new(results));
@@ -562,6 +619,7 @@ mod tests {
             })
             .unwrap(),
             display_preference: None,
+            images: Vec::new(),
         };
 
         let outcome = handle_tool_result_with_agentic_support(

@@ -15,14 +15,19 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
     build_plan_runtime_context_block_from_messages, build_task_list_context_block,
     envelope_to_chat_messages, envelope_to_responses_view,
 };
-use crate::runtime::runner::session_setup::prompt_setup::build_stable_prompt_frame;
+use crate::runtime::runner::session_setup::prompt_setup::{
+    build_stable_prompt_frame_with_sections, merge_with_optional_contexts, StablePrefixSection,
+};
 use bamboo_agent_core::agent::events::TokenBudgetUsage;
 use bamboo_agent_core::tools::ToolSchema;
-use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
+use bamboo_agent_core::{
+    AgentError, AgentEvent, ContextBlock, ContextBlockPriority, ContextBlockStability,
+    ContextBlockType, Message, Role, Session,
+};
 use bamboo_compression::PreparedContext;
 use bamboo_domain::ReasoningEffort;
 use bamboo_llm::provider::ResponsesRequestOptions;
-use bamboo_llm::{LLMProvider, LLMRequestOptions, PromptCachePlan};
+use bamboo_llm::{LLMProvider, LLMRequestOptions, PromptCachePlan, PromptLanes};
 use bamboo_tools::exposure::activated_discoverable_tools;
 
 /// LLM-stream frame bundling per-request identification, observability, and
@@ -202,6 +207,11 @@ fn derive_system_remainder_message(
 
 struct PreparedRequestEnvelope {
     chat_messages: Vec<Message>,
+    /// Canonical, provider-facing prompt structure (the four lanes). Its
+    /// `flatten()` reproduces `chat_messages` exactly, so routing the normal
+    /// (non-continuation) request through `chat_stream_lanes` is byte-identical
+    /// until providers override it to consume the lanes structurally.
+    lanes: PromptLanes,
     responses_input_messages: Vec<Message>,
     system_remainder_messages: Vec<Message>,
     dynamic_context_messages: Vec<Message>,
@@ -216,6 +226,9 @@ struct PreparedRequestEnvelope {
     /// Prompt-cache plan for this request (cacheable system/tools plus rolling
     /// summary and conversation-tail breakpoints).
     cache_plan: PromptCachePlan,
+    /// Per-section breakdown of the cacheable stable prefix, kept for prompt-cache
+    /// drift diagnostics (not sent to the provider).
+    stable_prefix_sections: Vec<StablePrefixSection>,
 }
 
 fn build_request_envelope(
@@ -225,7 +238,8 @@ fn build_request_envelope(
     tool_schemas: &[ToolSchema],
 ) -> PreparedRequestEnvelope {
     let activated = activated_discoverable_tools(session);
-    let stable_frame = build_stable_prompt_frame(session, config, tool_schemas, &activated);
+    let (stable_frame, stable_prefix_sections) =
+        build_stable_prompt_frame_with_sections(session, config, tool_schemas, &activated);
     let stable_instructions = stable_frame.stable_instructions.clone();
 
     // Per-round volatile context (recalled memory, task list, plan state) is
@@ -282,8 +296,12 @@ fn build_request_envelope(
         .last()
         .map(|message| message.id.clone());
 
-    let envelope =
+    let mut envelope =
         assemble_prompt_envelope(stable_frame, front_blocks, envelope_conversation_messages);
+    // Fill the (otherwise unset) stable-prefix hash so per-round drift can be
+    // observed and so the value surfaces in envelope observability/logs.
+    envelope.observability.stable_prefix_hash =
+        Some(super::prefix_drift::hash_sections(&stable_prefix_sections));
     // The only front block is the conversation summary (if present); its rendered
     // message id becomes the summary breakpoint.
     let summary_breakpoint_id = envelope
@@ -294,16 +312,97 @@ fn build_request_envelope(
     let responses_view = envelope_to_responses_view(&envelope);
     let mut chat_messages = envelope_to_chat_messages(&envelope);
     chat_messages.extend(volatile_context_messages.clone());
-    let mut responses_input_messages = responses_view.input_messages;
-    responses_input_messages.extend(volatile_context_messages.clone());
-    let instructions = responses_view.instructions;
     let envelope_observability = envelope.observability.clone();
+
+    // Canonical prompt structure — where Bamboo OWNS assembly and providers are
+    // pure adapters.
+    //
+    // The tool/server guide (tool schemas + each connected MCP server's
+    // `initialize` instructions — e.g. nova's targeting workflow) is relocated OUT
+    // of the system prompt and INTO a fixed prefix MESSAGE: the system keeps only
+    // the static identity/workspace/env/skill, and the large, session-stable guide
+    // rides as a typed context block at a known position with its own cache
+    // breakpoint. Applied to BOTH the chat lanes and the Responses-API view, so
+    // every provider family gets the same static-system structure. (The legacy
+    // `chat_messages` keeps the merged system, used only for the continuation
+    // delta and logging.)
+    let section = |name: &str| -> String {
+        stable_prefix_sections
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.content.clone())
+            .unwrap_or_default()
+    };
+    let tool_guide = section("tool_guide");
+    let relocate_tool_guide = !tool_guide.trim().is_empty();
+    let lane_system = if relocate_tool_guide {
+        merge_with_optional_contexts(
+            &section("base"),
+            Some(&section("workspace")),
+            Some(&section("instruction")),
+            Some(&section("env")),
+            &section("skill"),
+            "", // tool_guide moves to a fixed prefix message below
+        )
+    } else {
+        envelope.stable_instructions.clone()
+    };
+    let tool_guide_message = relocate_tool_guide.then(|| {
+        ContextBlock::new(
+            ContextBlockType::ToolGuide,
+            ContextBlockPriority::High,
+            ContextBlockStability::SessionStable,
+            "Tool & Connected-Server Guide",
+            tool_guide,
+        )
+        .render_runtime_context_message()
+    });
+    let tool_guide_breakpoint_id = tool_guide_message.as_ref().map(|m| m.id.clone());
+
+    // Responses-API view mirrors the relocation: the guide leaves `instructions`
+    // and rides at the front of the input messages.
+    let instructions = if relocate_tool_guide {
+        let trimmed = lane_system.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    } else {
+        responses_view.instructions
+    };
+    let mut responses_input_messages = Vec::new();
+    if let Some(message) = tool_guide_message.clone() {
+        responses_input_messages.push(message);
+    }
+    responses_input_messages.extend(responses_view.input_messages);
+    responses_input_messages.extend(volatile_context_messages.clone());
+
+    let mut stable_prefix_messages = envelope.stable_prefix_messages.clone();
+    if let Some(message) = tool_guide_message {
+        stable_prefix_messages.push(message);
+    }
+
+    let lanes = PromptLanes {
+        stable_instructions: lane_system,
+        stable_prefix_messages,
+        dynamic_context_messages: envelope.dynamic_context_messages.clone(),
+        conversation_messages: {
+            let mut tail = envelope.conversation_messages.clone();
+            tail.extend(volatile_context_messages.clone());
+            tail
+        },
+    };
 
     // tools + system + (summary) + (conversation tail) — at most the
     // 4-breakpoint Anthropic budget. Providers without explicit breakpoints
     // (OpenAI/Gemini/Copilot) still benefit from the stable-prefix ordering.
     let mut breakpoint_message_ids = Vec::new();
-    if let Some(id) = summary_breakpoint_id {
+    // The relocated tool guide is large and session-stable, so it earns a
+    // dedicated breakpoint; when present it takes priority over the summary
+    // breakpoint to stay within Anthropic's marker budget (the summary still
+    // caches as part of the prefix up to the conversation tail, just without its
+    // own boundary). For the legacy/continuation paths this id simply isn't found
+    // in the message array, so the breakpoint is harmlessly ignored there.
+    if let Some(id) = tool_guide_breakpoint_id {
+        breakpoint_message_ids.push(id);
+    } else if let Some(id) = summary_breakpoint_id {
         breakpoint_message_ids.push(id);
     }
     if let Some(id) = conversation_breakpoint_id {
@@ -318,6 +417,7 @@ fn build_request_envelope(
 
     PreparedRequestEnvelope {
         chat_messages,
+        lanes,
         responses_input_messages,
         system_remainder_messages,
         dynamic_context_messages: envelope.dynamic_context_messages.clone(),
@@ -326,6 +426,7 @@ fn build_request_envelope(
         instructions,
         envelope_observability,
         cache_plan,
+        stable_prefix_sections,
     }
 }
 
@@ -350,13 +451,23 @@ pub(super) async fn execute_llm_stream(
 
     let llm_started_at = std::time::Instant::now();
     let supports_previous_response_id = provider_supports_previous_response_id(provider_type);
+    // Owned (not borrowed) so the immutable borrow of `session` ends here and the
+    // drift diagnostic below can take `&mut session`.
     let previous_response_id = if supports_previous_response_id {
-        session_previous_response_id(session)
+        session_previous_response_id(session).map(str::to_string)
     } else {
         None
     };
 
     let prepared_envelope = build_request_envelope(session, prepared_context, config, tool_schemas);
+    // Side-channel diagnostic: record whether the cacheable stable prefix drifted
+    // from the previous round (esp. shrinks, which drop cached content). Never
+    // affects what is sent below.
+    super::prefix_drift::record_prefix_drift(
+        session,
+        config.app_data_dir.as_deref(),
+        &prepared_envelope.stable_prefix_sections,
+    );
     let request_messages_buf = if previous_response_id.is_some() {
         let mut delta_messages = prepared_envelope.system_remainder_messages.clone();
         delta_messages.extend(prepared_envelope.dynamic_context_messages.clone());
@@ -386,7 +497,7 @@ pub(super) async fn execute_llm_stream(
         input_messages: Some(prepared_envelope.responses_input_messages.clone()),
         ..Default::default()
     };
-    if let Some(response_id) = previous_response_id {
+    if let Some(response_id) = previous_response_id.as_deref() {
         responses_options.previous_response_id = Some(response_id.to_string());
     }
     // Cache plan computed by the envelope: stable system prompt + tool
@@ -411,7 +522,7 @@ pub(super) async fn execute_llm_stream(
             session_id,
             provider_name.unwrap_or("unknown")
         );
-    } else if let Some(response_id) = previous_response_id {
+    } else if let Some(response_id) = previous_response_id.as_deref() {
         tracing::debug!(
             "[{}] Continuing Responses API turn with previous_response_id={} using {} delta messages ({} total messages in context)",
             session_id,
@@ -433,8 +544,13 @@ pub(super) async fn execute_llm_stream(
         prepared_envelope.envelope_observability.dynamic_context_message_count,
         prepared_envelope.envelope_observability.included_block_types,
     );
-    let stream = llm
-        .chat_stream_with_options(
+    // Normal request → canonical lanes (provider renders system + cache
+    // breakpoints structurally; default impl flattens to the same bytes as
+    // `request_messages`). The Responses-API continuation path sends only a delta
+    // of messages, which the lane model doesn't represent, so it stays on the
+    // flat `chat_stream_with_options` entry point.
+    let stream = if previous_response_id.is_some() {
+        llm.chat_stream_with_options(
             request_messages,
             tool_schemas,
             Some(max_output_tokens),
@@ -442,7 +558,17 @@ pub(super) async fn execute_llm_stream(
             Some(&request_options),
         )
         .await
-        .map_err(|error| {
+    } else {
+        llm.chat_stream_lanes(
+            &prepared_envelope.lanes,
+            tool_schemas,
+            Some(max_output_tokens),
+            model,
+            Some(&request_options),
+        )
+        .await
+    }
+    .map_err(|error| {
             let message = format_provider_error(error);
             if is_llm_overflow_error(&message) {
                 AgentError::LLMOverflow(message)

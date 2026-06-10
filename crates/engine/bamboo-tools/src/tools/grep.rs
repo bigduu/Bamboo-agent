@@ -478,6 +478,7 @@ impl Tool for GrepTool {
             success: true,
             result,
             display_preference: Some("Collapsible".to_string()),
+            images: Vec::new(),
         })
     }
 }

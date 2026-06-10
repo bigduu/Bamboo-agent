@@ -20,6 +20,7 @@ fn extract_workspace_path_from_tool_result_supports_alias_name() {
         success: true,
         result: r#"{"workspace":"/tmp/ws"}"#.to_string(),
         display_preference: Some("json".to_string()),
+        images: Vec::new(),
     };
 
     assert_eq!(

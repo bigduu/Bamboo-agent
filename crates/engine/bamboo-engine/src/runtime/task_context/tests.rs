@@ -92,6 +92,7 @@ fn track_tool_execution_appends_record_for_active_item() {
         success: true,
         result: "OK".to_string(),
         display_preference: None,
+        images: Vec::new(),
     };
     context.track_tool_execution("read_file", &result, 1);
 
@@ -240,6 +241,7 @@ fn format_for_prompt_shows_tool_call_count() {
         success: true,
         result: "OK".to_string(),
         display_preference: None,
+        images: Vec::new(),
     };
 
     context.track_tool_execution("read_file", &result, 1);
@@ -416,6 +418,7 @@ fn format_for_prompt_mixed_statuses_with_tool_calls() {
         success: true,
         result: "OK".to_string(),
         display_preference: None,
+        images: Vec::new(),
     };
     context.track_tool_execution("test_tool", &result, 1);
 
@@ -462,6 +465,7 @@ fn auto_update_status_marks_completed_after_success_threshold() {
         success: true,
         result: "OK".to_string(),
         display_preference: None,
+        images: Vec::new(),
     };
 
     context.track_tool_execution("read_file", &success, 1);
@@ -493,6 +497,7 @@ fn auto_update_status_does_not_auto_complete_when_completion_criteria_exist() {
         success: true,
         result: "OK".to_string(),
         display_preference: None,
+        images: Vec::new(),
     };
 
     context.track_tool_execution("read_file", &success, 1);
@@ -519,6 +524,7 @@ fn auto_update_status_marks_blocked_after_two_failures() {
         success: false,
         result: "Error".to_string(),
         display_preference: None,
+        images: Vec::new(),
     };
 
     context.track_tool_execution("read_file", &failure, 1);
@@ -624,6 +630,7 @@ fn tool_execution_records_evidence_and_blockers() {
         success: false,
         result: "Permission denied while opening file".to_string(),
         display_preference: None,
+        images: Vec::new(),
     };
     context.track_tool_execution("read_file", &failure, 1);
     context.auto_update_status("read_file", &failure);

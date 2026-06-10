@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bamboo_agent_core::{
     parse_tool_args_best_effort, ToolCall, ToolError, ToolExecutionContext, ToolExecutor,
-    ToolResult, ToolSchema,
+    ToolResult, ToolResultImage, ToolSchema,
 };
 use std::sync::Arc;
 use tracing::{debug, error, warn};
@@ -37,25 +37,35 @@ impl McpToolExecutor {
         preview.replace('\n', "\\n").replace('\r', "\\r")
     }
 
-    /// Convert MCP result to string representation
-    fn format_result_content(content: &[McpContentItem]) -> String {
-        content
-            .iter()
-            .map(|item| match item {
-                McpContentItem::Text { text } => text.clone(),
+    /// Convert MCP result content into a text string plus any returned images.
+    ///
+    /// Text and resource items are joined into the result string as before;
+    /// image items are collected separately (with a short textual marker left in
+    /// the string) so they can be forwarded to vision-capable models instead of
+    /// being flattened to a `[Image: …]` placeholder.
+    fn format_result_content(content: &[McpContentItem]) -> (String, Vec<ToolResultImage>) {
+        let mut parts = Vec::new();
+        let mut images = Vec::new();
+        for item in content {
+            match item {
+                McpContentItem::Text { text } => parts.push(text.clone()),
                 McpContentItem::Image { data, mime_type } => {
-                    format!("[Image: {} ({} bytes)]", mime_type, data.len())
+                    images.push(ToolResultImage {
+                        mime_type: mime_type.clone(),
+                        data: data.clone(),
+                    });
+                    parts.push(format!("[image returned: {mime_type}]"));
                 }
                 McpContentItem::Resource { resource } => {
                     if let Some(text) = &resource.text {
-                        format!("[Resource {}]: {}", resource.uri, text)
+                        parts.push(format!("[Resource {}]: {}", resource.uri, text));
                     } else {
-                        format!("[Resource {}]", resource.uri)
+                        parts.push(format!("[Resource {}]", resource.uri));
                     }
                 }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+            }
+        }
+        (parts.join("\n"), images)
     }
 }
 
@@ -102,19 +112,21 @@ impl ToolExecutor for McpToolExecutor {
             .await
         {
             Ok(result) => {
+                let (text, images) = Self::format_result_content(&result.content);
                 if result.is_error {
-                    let error_text = Self::format_result_content(&result.content);
+                    // Errors are textual; don't forward images.
                     Ok(ToolResult {
                         success: false,
-                        result: error_text,
+                        result: text,
                         display_preference: None,
+                        images: Vec::new(),
                     })
                 } else {
-                    let content = Self::format_result_content(&result.content);
                     Ok(ToolResult {
                         success: true,
-                        result: content,
+                        result: text,
                         display_preference: None,
+                        images,
                     })
                 }
             }
@@ -150,6 +162,26 @@ impl ToolExecutor for McpToolExecutor {
                     })
             })
             .collect()
+    }
+
+    /// Each connected MCP server's `instructions`, rendered as a labeled block.
+    /// Only ready servers contribute, so this guidance is automatically scoped to
+    /// whatever is loaded for the run.
+    fn tool_guidance(&self) -> Option<String> {
+        let servers = self.manager.connected_server_instructions();
+        if servers.is_empty() {
+            return None;
+        }
+        let blocks: Vec<String> = servers
+            .into_iter()
+            .map(|(server_id, instructions)| {
+                format!("### MCP server `{server_id}`\n\n{instructions}")
+            })
+            .collect();
+        Some(format!(
+            "## Connected MCP server instructions\n\n{}",
+            blocks.join("\n\n")
+        ))
     }
 }
 
@@ -204,6 +236,18 @@ impl ToolExecutor for CompositeToolExecutor {
         tools.extend(self.mcp.list_tools());
         tools
     }
+
+    fn tool_guidance(&self) -> Option<String> {
+        let parts: Vec<String> = [self.builtin.tool_guidance(), self.mcp.tool_guidance()]
+            .into_iter()
+            .flatten()
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +267,70 @@ mod tests {
             async fn execute(&self, call: &ToolCall) -> std::result::Result<ToolResult, ToolError>;
             fn list_tools(&self) -> Vec<ToolSchema>;
         }
+    }
+
+    /// Minimal stub executor with a fixed `tool_guidance`, for composite tests.
+    struct GuidanceStub(Option<&'static str>);
+
+    #[async_trait]
+    impl ToolExecutor for GuidanceStub {
+        async fn execute(&self, _call: &ToolCall) -> std::result::Result<ToolResult, ToolError> {
+            Err(ToolError::NotFound("stub".into()))
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+        fn tool_guidance(&self) -> Option<String> {
+            self.0.map(str::to_string)
+        }
+    }
+
+    #[test]
+    fn composite_tool_guidance_merges_builtin_and_mcp() {
+        // Both present → joined with a blank line, builtin first.
+        let both = CompositeToolExecutor::new(
+            Arc::new(GuidanceStub(Some("BUILTIN"))),
+            Arc::new(GuidanceStub(Some("MCP"))),
+        );
+        assert_eq!(both.tool_guidance().as_deref(), Some("BUILTIN\n\nMCP"));
+
+        // Only MCP present → just that.
+        let mcp_only = CompositeToolExecutor::new(
+            Arc::new(GuidanceStub(None)),
+            Arc::new(GuidanceStub(Some("MCP"))),
+        );
+        assert_eq!(mcp_only.tool_guidance().as_deref(), Some("MCP"));
+
+        // Neither present → None (no empty section leaks into the prompt).
+        let neither = CompositeToolExecutor::new(
+            Arc::new(GuidanceStub(None)),
+            Arc::new(GuidanceStub(None)),
+        );
+        assert!(neither.tool_guidance().is_none());
+    }
+
+    #[test]
+    fn default_tool_guidance_is_none() {
+        // The trait default contributes nothing unless an executor opts in.
+        assert!(GuidanceStub(None).tool_guidance().is_none());
+    }
+
+    #[test]
+    fn format_result_content_collects_images_and_keeps_text() {
+        let content = vec![
+            McpContentItem::Text {
+                text: "screenshot 1280x536".to_string(),
+            },
+            McpContentItem::Image {
+                data: "abc123".to_string(),
+                mime_type: "image/jpeg".to_string(),
+            },
+        ];
+        let (text, images) = McpToolExecutor::format_result_content(&content);
+        assert!(text.contains("screenshot 1280x536"));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/jpeg");
+        assert_eq!(images[0].data, "abc123");
     }
 
     fn create_test_tool_call(name: &str, args: &str) -> ToolCall {
@@ -246,8 +354,9 @@ mod tests {
                 text: "World".to_string(),
             },
         ];
-        let result = McpToolExecutor::format_result_content(&content);
-        assert_eq!(result, "Hello\nWorld");
+        let (text, images) = McpToolExecutor::format_result_content(&content);
+        assert_eq!(text, "Hello\nWorld");
+        assert!(images.is_empty());
     }
 
     #[test]
@@ -256,8 +365,13 @@ mod tests {
             data: "base64imagedata".to_string(),
             mime_type: "image/png".to_string(),
         }];
-        let result = McpToolExecutor::format_result_content(&content);
-        assert_eq!(result, "[Image: image/png (15 bytes)]");
+        // The image is no longer flattened to a placeholder; it is collected
+        // separately, with a short marker left in the text.
+        let (text, images) = McpToolExecutor::format_result_content(&content);
+        assert_eq!(text, "[image returned: image/png]");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(images[0].data, "base64imagedata");
     }
 
     #[test]
@@ -270,8 +384,8 @@ mod tests {
                 blob: None,
             },
         }];
-        let result = McpToolExecutor::format_result_content(&content);
-        assert_eq!(result, "[Resource file:///test.txt]: File content");
+        let (text, _images) = McpToolExecutor::format_result_content(&content);
+        assert_eq!(text, "[Resource file:///test.txt]: File content");
     }
 
     #[test]
@@ -284,8 +398,8 @@ mod tests {
                 blob: Some("base64data".to_string()),
             },
         }];
-        let result = McpToolExecutor::format_result_content(&content);
-        assert_eq!(result, "[Resource file:///test.bin]");
+        let (text, _images) = McpToolExecutor::format_result_content(&content);
+        assert_eq!(text, "[Resource file:///test.bin]");
     }
 
     #[test]
@@ -299,9 +413,10 @@ mod tests {
                 mime_type: "image/png".to_string(),
             },
         ];
-        let result = McpToolExecutor::format_result_content(&content);
-        assert!(result.contains("Result:"));
-        assert!(result.contains("[Image:"));
+        let (text, images) = McpToolExecutor::format_result_content(&content);
+        assert!(text.contains("Result:"));
+        assert!(text.contains("[image returned:"));
+        assert_eq!(images.len(), 1);
     }
 
     #[tokio::test]
@@ -319,6 +434,7 @@ mod tests {
                 success: true,
                 result: "MCP result".to_string(),
                 display_preference: None,
+                images: Vec::new(),
             })
         });
 
@@ -346,6 +462,7 @@ mod tests {
                 success: true,
                 result: "Built-in result".to_string(),
                 display_preference: None,
+                images: Vec::new(),
             })
         });
 

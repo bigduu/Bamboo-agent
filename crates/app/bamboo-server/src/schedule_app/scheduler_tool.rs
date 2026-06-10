@@ -243,6 +243,7 @@ impl Tool for ScheduleTasksTool {
                     success: true,
                     result: json!({ "schedules": items }).to_string(),
                     display_preference: Some("Collapsible".to_string()),
+                    images: Vec::new(),
                 })
             }
             ScheduleTasksArgs::Create {
@@ -301,6 +302,7 @@ impl Tool for ScheduleTasksTool {
                     })
                     .to_string(),
                     display_preference: Some("Collapsible".to_string()),
+                    images: Vec::new(),
                 })
             }
             ScheduleTasksArgs::Patch {
@@ -366,6 +368,7 @@ impl Tool for ScheduleTasksTool {
                     success: true,
                     result: json!({ "schedule": ScheduleView::from(schedule) }).to_string(),
                     display_preference: Some("Collapsible".to_string()),
+                    images: Vec::new(),
                 })
             }
             ScheduleTasksArgs::Delete { schedule_id } => {
@@ -390,6 +393,7 @@ impl Tool for ScheduleTasksTool {
                     result: json!({ "success": true, "schedule_id": schedule_id.trim() })
                         .to_string(),
                     display_preference: Some("Default".to_string()),
+                    images: Vec::new(),
                 })
             }
             ScheduleTasksArgs::RunNow { schedule_id } => {
@@ -434,6 +438,7 @@ impl Tool for ScheduleTasksTool {
                     })
                     .to_string(),
                     display_preference: Some("Default".to_string()),
+                    images: Vec::new(),
                 })
             }
             ScheduleTasksArgs::ListSessions { schedule_id } => {
@@ -456,6 +461,7 @@ impl Tool for ScheduleTasksTool {
                     success: true,
                     result: json!({ "schedule_id": schedule_id, "sessions": sessions }).to_string(),
                     display_preference: Some("Collapsible".to_string()),
+                    images: Vec::new(),
                 })
             }
         }

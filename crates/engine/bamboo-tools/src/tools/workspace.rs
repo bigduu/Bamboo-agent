@@ -107,6 +107,7 @@ impl Tool for WorkspaceTool {
                         success: false,
                         result: format!("Path does not exist: {}", path_obj.display()),
                         display_preference: Some("error".to_string()),
+                        images: Vec::new(),
                     });
                 }
                 if !path_obj.is_dir() {
@@ -114,6 +115,7 @@ impl Tool for WorkspaceTool {
                         success: false,
                         result: format!("Path is not a directory: {}", path_obj.display()),
                         display_preference: Some("error".to_string()),
+                        images: Vec::new(),
                     });
                 }
 
@@ -131,6 +133,7 @@ impl Tool for WorkspaceTool {
                     })
                     .to_string(),
                     display_preference: Some("json".to_string()),
+                    images: Vec::new(),
                 })
             }
 
@@ -144,6 +147,7 @@ impl Tool for WorkspaceTool {
                                 &workspace,
                             ),
                             display_preference: None,
+                            images: Vec::new(),
                         });
                     }
                 }
@@ -153,11 +157,13 @@ impl Tool for WorkspaceTool {
                         success: true,
                         result: bamboo_config::paths::path_to_display_string(&dir),
                         display_preference: None,
+                        images: Vec::new(),
                     }),
                     Err(error) => Ok(ToolResult {
                         success: false,
                         result: format!("Failed to get current directory: {error}"),
                         display_preference: Some("error".to_string()),
+                        images: Vec::new(),
                     }),
                 }
             }

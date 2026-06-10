@@ -235,6 +235,7 @@ impl Tool for ReadTool {
                 success: true,
                 result: rendered,
                 display_preference: Some("Collapsible".to_string()),
+                images: Vec::new(),
             });
         }
 
@@ -251,6 +252,7 @@ impl Tool for ReadTool {
                 success: true,
                 result: "[Binary file omitted]".to_string(),
                 display_preference: Some("Collapsible".to_string()),
+                images: Vec::new(),
             });
         }
 
@@ -262,6 +264,7 @@ impl Tool for ReadTool {
             success: true,
             result: rendered,
             display_preference: Some("Collapsible".to_string()),
+            images: Vec::new(),
         })
     }
 }

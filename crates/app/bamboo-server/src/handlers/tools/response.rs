@@ -32,6 +32,7 @@ mod tests {
             success: true,
             result: result.to_string(),
             display_preference: display_preference.map(|s| s.to_string()),
+            images: Vec::new(),
         }
     }
 

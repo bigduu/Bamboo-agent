@@ -459,6 +459,7 @@ impl Tool for TaskTool {
             success: true,
             result: format!("Task list updated with {count} items"),
             display_preference: Some("Default".to_string()),
+            images: Vec::new(),
         })
     }
 }

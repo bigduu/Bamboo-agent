@@ -873,6 +873,7 @@ mod tests {
                     success: true,
                     result: "ok".to_string(),
                     display_preference: None,
+                    images: Vec::new(),
                 })
             }
 
@@ -953,6 +954,7 @@ mod tests {
                     success: true,
                     result: "custom-spawn-session".to_string(),
                     display_preference: None,
+                    images: Vec::new(),
                 })
             }
         }

@@ -291,6 +291,12 @@ pub struct AgentLoopConfig {
     /// for fast/background/planning/search/summarization helpers.
     pub(crate) auxiliary_model_resolver:
         Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
+    /// Server-level usage guidance contributed by the run's tool executor —
+    /// chiefly the `instructions` connected MCP servers return from `initialize`.
+    /// Captured once at config construction (from `ToolExecutor::tool_guidance`)
+    /// and appended to the tool-guide section of the system prompt, so a server's
+    /// own how-to-use notes appear only while that server is loaded for the run.
+    pub(crate) mcp_tool_guidance: Option<String>,
 }
 
 impl Default for AgentLoopConfig {
@@ -349,6 +355,7 @@ impl Default for AgentLoopConfig {
             gold_config: None,
             features_dynamic_model_routing: false,
             auxiliary_model_resolver: None,
+            mcp_tool_guidance: None,
         }
     }
 }

@@ -33,6 +33,9 @@ struct MockLlmProvider {
     requested_include: Mutex<Option<Vec<String>>>,
     requested_text_verbosity: Mutex<Option<String>>,
     requested_instructions: Mutex<Option<String>>,
+    /// Set when the engine routed this request through the canonical
+    /// `chat_stream_lanes` entry point (the normal, non-continuation path).
+    lanes_invoked: Mutex<bool>,
 }
 
 #[async_trait]
@@ -45,6 +48,20 @@ impl LLMProvider for MockLlmProvider {
         _model: &str,
     ) -> bamboo_llm::provider::Result<LLMStream> {
         panic!("chat_stream should not be called directly in this test");
+    }
+
+    async fn chat_stream_lanes(
+        &self,
+        lanes: &bamboo_llm::PromptLanes,
+        tools: &[bamboo_agent_core::tools::ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> bamboo_llm::provider::Result<LLMStream> {
+        *self.lanes_invoked.lock().expect("lanes_invoked lock") = true;
+        // Mirror the default behavior so `requested_messages` is still captured.
+        self.chat_stream_with_options(&lanes.flatten(), tools, max_output_tokens, model, options)
+            .await
     }
 
     async fn chat_stream_with_options(
@@ -109,6 +126,7 @@ fn mock_llm(chunks: Vec<LLMChunk>) -> Arc<MockLlmProvider> {
         requested_include: Mutex::new(None),
         requested_text_verbosity: Mutex::new(None),
         requested_instructions: Mutex::new(None),
+        lanes_invoked: Mutex::new(false),
     })
 }
 
@@ -441,6 +459,207 @@ fn build_request_envelope_tails_volatile_context_and_sets_cache_breakpoints() {
     assert!(envelope.cache_plan.cache_system);
     assert!(envelope.cache_plan.cache_tools);
     assert!(envelope.cache_plan.is_breakpoint(&last_user_id));
+}
+
+#[test]
+fn stable_prefix_is_byte_stable_across_rounds() {
+    // The whole point of relocating the tool guide out of the system prompt is a
+    // PREFIX that actually caches: across rounds where only the conversation
+    // grows, the cacheable prefix (static system + the relocated guide message
+    // content) must be byte-identical and its drift hash unchanged, so the
+    // provider cache hits instead of re-reading the prefix each turn.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-prefix-stable", "test-model");
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER stable guidance".to_string());
+
+    let ctx = |msgs: Vec<Message>| PreparedContext {
+        messages: msgs,
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    // Round 1: a short conversation.
+    let round1 = ctx(vec![Message::system("BASE_IDENTITY"), Message::user("first")]);
+    // Round 2: the same session, conversation has grown.
+    let round2 = ctx(vec![
+        Message::system("BASE_IDENTITY"),
+        Message::user("first"),
+        Message::assistant("answer", None),
+        Message::user("second"),
+    ]);
+
+    let e1 = super::build_request_envelope(&session, &round1, &config, &[]);
+    let e2 = super::build_request_envelope(&session, &round2, &config, &[]);
+
+    // The static system identity is unchanged across rounds.
+    assert_eq!(
+        e1.lanes.stable_instructions, e2.lanes.stable_instructions,
+        "system prompt must stay byte-stable across rounds"
+    );
+
+    // The relocated guide message content is unchanged (its id may differ — only
+    // content is what the provider caches).
+    let guide = |e: &super::PreparedRequestEnvelope| -> String {
+        e.lanes
+            .stable_prefix_messages
+            .iter()
+            .find(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
+            .map(|m| m.content.clone())
+            .expect("relocated guide present")
+    };
+    assert_eq!(guide(&e1), guide(&e2), "guide prefix must stay byte-stable");
+
+    // The cacheable-prefix drift hash is unchanged, so the cache hits.
+    assert!(e1.envelope_observability.stable_prefix_hash.is_some());
+    assert_eq!(
+        e1.envelope_observability.stable_prefix_hash,
+        e2.envelope_observability.stable_prefix_hash,
+        "stable prefix must not drift between rounds"
+    );
+}
+
+#[tokio::test]
+async fn execute_llm_stream_routes_normal_request_through_lanes_with_relocated_guide() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-stream-lanes", "test-model");
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let llm = mock_llm(vec![LLMChunk::Token("ok".to_string()), LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-lanes",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+        },
+    )
+    .await
+    .expect("execute llm stream");
+
+    // Normal (non-continuation) requests go through the canonical lanes entry.
+    assert!(
+        *llm.lanes_invoked.lock().expect("lanes_invoked lock"),
+        "normal request must route through chat_stream_lanes"
+    );
+
+    // What the provider actually received: the leading system message keeps the
+    // static identity but NOT the tool/server guide, which arrives as its own
+    // message instead.
+    let messages = llm.requested_messages.lock().expect("messages lock").clone();
+    assert!(matches!(messages[0].role, Role::System));
+    assert!(messages[0].content.contains("BASE_IDENTITY"));
+    assert!(
+        !messages[0].content.contains("NOVA_GUIDANCE_MARKER"),
+        "guide must not be in the system message"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| matches!(m.role, Role::User) && m.content.contains("NOVA_GUIDANCE_MARKER")),
+        "guide arrives as a dedicated message"
+    );
+}
+
+#[test]
+fn build_request_envelope_relocates_tool_guide_into_stable_prefix_lane() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-toolguide", "test-model");
+    let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    // A connected MCP server's `initialize` guidance (e.g. nova's targeting
+    // workflow) flows into the tool guide; mark it so we can locate it.
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("BASE_SYSTEM_IDENTITY"),
+            Message::user("go"),
+        ],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    // The lane's system prompt keeps the static identity but NO LONGER carries the
+    // tool/connected-server guide — that is the "system stays static" property.
+    assert!(
+        envelope
+            .lanes
+            .stable_instructions
+            .contains("BASE_SYSTEM_IDENTITY"),
+        "lane system keeps the static base identity"
+    );
+    assert!(
+        !envelope
+            .lanes
+            .stable_instructions
+            .contains("NOVA_GUIDANCE_MARKER"),
+        "tool/server guide must be removed from the lane system prompt"
+    );
+
+    // It rides as a fixed stable-prefix MESSAGE (a typed, never-compressed context
+    // block at a known position) instead.
+    let guide = envelope
+        .lanes
+        .stable_prefix_messages
+        .iter()
+        .find(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
+        .expect("tool guide relocated into a stable-prefix message");
+    assert_eq!(guide.role, bamboo_agent_core::Role::User);
+    assert!(guide.never_compress);
+
+    // And that relocated, session-stable message earns its own cache breakpoint.
+    assert!(envelope.cache_plan.is_breakpoint(&guide.id));
+
+    // The Responses-API view mirrors the relocation: the guide leaves
+    // `instructions` and rides at the FRONT of the input messages — so every
+    // provider family gets the same static-system structure.
+    assert!(
+        !envelope
+            .instructions
+            .as_deref()
+            .unwrap_or_default()
+            .contains("NOVA_GUIDANCE_MARKER"),
+        "tool/server guide must be removed from Responses instructions"
+    );
+    assert!(
+        envelope
+            .responses_input_messages
+            .first()
+            .is_some_and(|m| m.content.contains("NOVA_GUIDANCE_MARKER")),
+        "tool/server guide leads the Responses input messages"
+    );
 }
 
 #[tokio::test]

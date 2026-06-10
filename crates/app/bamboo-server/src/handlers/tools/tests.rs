@@ -133,6 +133,7 @@ fn build_execution_response_defaults_display_preference() {
         success: true,
         result: "{\"ok\":true}".to_string(),
         display_preference: None,
+        images: Vec::new(),
     };
 
     let response =
@@ -150,6 +151,7 @@ fn build_execution_response_uses_custom_display_preference() {
         success: true,
         result: "{\"data\":\"test\"}".to_string(),
         display_preference: Some("Collapsible".to_string()),
+        images: Vec::new(),
     };
 
     let response =
@@ -176,6 +178,7 @@ fn build_execution_response_preserves_result_content() {
         success: true,
         result: complex_result.to_string(),
         display_preference: Some("Hidden".to_string()),
+        images: Vec::new(),
     };
 
     let response =
@@ -201,6 +204,7 @@ fn build_execution_response_handles_failed_tool_result() {
         success: false,
         result: "Error: File not found".to_string(),
         display_preference: None,
+        images: Vec::new(),
     };
 
     let response =
@@ -220,6 +224,7 @@ fn build_execution_response_handles_empty_result() {
         success: true,
         result: "".to_string(),
         display_preference: Some("Default".to_string()),
+        images: Vec::new(),
     };
 
     let response =
@@ -237,6 +242,7 @@ fn build_execution_response_handles_special_characters_in_result() {
         success: true,
         result: "Result with special chars: <>&\"'\\n\\t".to_string(),
         display_preference: None,
+        images: Vec::new(),
     };
 
     let response = build_execution_response("special_chars_tool".to_string(), result)
@@ -254,6 +260,7 @@ fn build_execution_response_handles_unicode_in_result() {
         success: true,
         result: "Unicode: 你好世界 🌍".to_string(),
         display_preference: Some("Default".to_string()),
+        images: Vec::new(),
     };
 
     let response =
@@ -272,6 +279,7 @@ fn build_execution_response_handles_large_result() {
         success: true,
         result: large_data.clone(),
         display_preference: None,
+        images: Vec::new(),
     };
 
     let response =

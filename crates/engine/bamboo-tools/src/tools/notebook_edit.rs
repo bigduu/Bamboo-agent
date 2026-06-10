@@ -226,6 +226,7 @@ impl Tool for NotebookEditTool {
             success: true,
             result: payload,
             display_preference: Some("Default".to_string()),
+            images: Vec::new(),
         })
     }
 }

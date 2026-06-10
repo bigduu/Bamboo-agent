@@ -100,6 +100,7 @@ impl Tool for SlashCommandTool {
                 })
                 .to_string(),
                 display_preference: Some("Collapsible".to_string()),
+                images: Vec::new(),
             });
         }
 

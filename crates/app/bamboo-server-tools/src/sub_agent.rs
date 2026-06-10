@@ -161,6 +161,7 @@ fn tool_result(value: serde_json::Value) -> Result<ToolResult, ToolError> {
         success: true,
         result: value.to_string(),
         display_preference: Some("Collapsible".to_string()),
+        images: Vec::new(),
     })
 }
 
@@ -182,6 +183,7 @@ fn waiting_for_children_tool_result(mut value: serde_json::Value) -> Result<Tool
         success: true,
         result: value.to_string(),
         display_preference: Some("runtime_control:waiting_for_children".to_string()),
+        images: Vec::new(),
     })
 }
 

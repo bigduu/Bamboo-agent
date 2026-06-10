@@ -36,6 +36,7 @@ impl Tool for EchoTool {
             success: true,
             result: "echo".to_string(),
             display_preference: None,
+            images: Vec::new(),
         })
     }
 }

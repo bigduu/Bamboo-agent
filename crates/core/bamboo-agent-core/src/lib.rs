@@ -29,5 +29,5 @@ pub use tools::{
     AgenticContext, AgenticTool, AgenticToolResult, FunctionCall, FunctionSchema, RegistryError,
     SharedTool, SmartCodeReviewTool, Tool, ToolCall, ToolCallAccumulator, ToolError,
     ToolExecutionContext, ToolExecutor, ToolGoal, ToolHandlingOutcome, ToolMutability,
-    ToolRegistry, ToolResult, ToolSchema,
+    ToolRegistry, ToolResult, ToolResultImage, ToolSchema,
 };

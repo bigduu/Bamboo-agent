@@ -675,6 +675,7 @@ impl Tool for EditTool {
             success: true,
             result: payload.to_string(),
             display_preference: Some("Default".to_string()),
+            images: Vec::new(),
         })
     }
 }

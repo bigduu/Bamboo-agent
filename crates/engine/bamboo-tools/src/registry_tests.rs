@@ -64,6 +64,7 @@ mod tests {
                 success: true,
                 result: format!("Processed: {}", input),
                 display_preference: Some("text".to_string()),
+                images: Vec::new(),
             })
         }
     }
@@ -130,6 +131,7 @@ mod tests {
                 success: true,
                 result: result.to_string(),
                 display_preference: None,
+                images: Vec::new(),
             })
         }
     }

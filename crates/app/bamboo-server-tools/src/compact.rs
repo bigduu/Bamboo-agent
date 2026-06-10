@@ -61,6 +61,7 @@ impl Tool for CompactContextTool {
                 instructions_note
             ),
             display_preference: Some("Collapsible".to_string()),
+            images: Vec::new(),
         })
     }
 

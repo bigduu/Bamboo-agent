@@ -15,7 +15,7 @@ impl McpServerManager {
         info!("Starting MCP server '{}'", server_id);
 
         let runtime_proxy_fingerprint = desired_proxy_fingerprint(self.config.as_ref()).await;
-        let (client, tools) = self
+        let (client, tools, instructions) = self
             .bootstrap_server_client(&server_id, &config, "start")
             .await?;
 
@@ -31,6 +31,7 @@ impl McpServerManager {
                 tool_count: tools.len(),
                 restart_count: 0,
                 last_ping_at: Some(Utc::now()),
+                instructions,
             }),
             tools: RwLock::new(tools.clone()),
             shutdown: AtomicBool::new(false),

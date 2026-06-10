@@ -148,7 +148,9 @@ pub enum McpContentItem {
     Image {
         /// Base64-encoded image data
         data: String,
-        /// MIME type of the image (e.g., "image/png")
+        /// MIME type of the image (e.g., "image/png").
+        /// MCP sends this as `mimeType`; accept legacy `mime_type` too.
+        #[serde(rename = "mimeType", alias = "mime_type")]
         mime_type: String,
     },
     /// Resource reference
@@ -198,8 +200,13 @@ pub enum McpContentItem {
 pub struct McpResource {
     /// Unique resource identifier (URI format)
     pub uri: String,
-    /// MIME type of the resource content
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// MIME type of the resource content.
+    /// MCP sends this as `mimeType`; accept legacy `mime_type` too.
+    #[serde(
+        rename = "mimeType",
+        alias = "mime_type",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub mime_type: Option<String>,
     /// Text content (for text-based resources)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -313,6 +320,11 @@ pub struct RuntimeInfo {
     /// Timestamp of the last successful ping
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_ping_at: Option<DateTime<Utc>>,
+    /// Human-readable usage guidance the server returned in its `initialize`
+    /// result (`instructions`). Surfaced into the system prompt while the server
+    /// is connected so the model gets the server's own how-to-use notes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 impl Default for RuntimeInfo {
@@ -328,6 +340,7 @@ impl Default for RuntimeInfo {
             tool_count: 0,
             restart_count: 0,
             last_ping_at: None,
+            instructions: None,
         }
     }
 }
@@ -495,6 +508,26 @@ mod tests {
     }
 
     #[test]
+    fn test_image_content_deserializes_spec_mimetype() {
+        // MCP spec (and rmcp-based servers like Nova) emit `mimeType`. Previously
+        // bamboo expected `mime_type` and failed with
+        // "Serialization error: missing field `mime_type`".
+        let json = r#"{"type":"image","data":"abc","mimeType":"image/jpeg"}"#;
+        let item: McpContentItem = serde_json::from_str(json).expect("parse mimeType image");
+        match item {
+            McpContentItem::Image { data, mime_type } => {
+                assert_eq!(data, "abc");
+                assert_eq!(mime_type, "image/jpeg");
+            }
+            _ => panic!("Expected Image variant"),
+        }
+
+        // Legacy snake_case still accepted via alias.
+        let legacy = r#"{"type":"image","data":"abc","mime_type":"image/png"}"#;
+        assert!(serde_json::from_str::<McpContentItem>(legacy).is_ok());
+    }
+
+    #[test]
     fn test_mcp_content_item_resource() {
         let item = McpContentItem::Resource {
             resource: McpResource {
@@ -565,6 +598,7 @@ mod tests {
             tool_count: 5,
             restart_count: 0,
             last_ping_at: Some(Utc::now()),
+            instructions: None,
         };
         assert_eq!(info.status, ServerStatus::Ready);
         assert_eq!(info.tool_count, 5);

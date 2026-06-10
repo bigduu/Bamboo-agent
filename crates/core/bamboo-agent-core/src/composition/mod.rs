@@ -154,6 +154,7 @@ impl Composition for Sequence {
             success: true,
             result: String::new(),
             display_preference: None,
+            images: Vec::new(),
         };
 
         for step in &self.steps {
@@ -271,6 +272,7 @@ impl Composition for Parallel {
                 success: all_success,
                 result: serde_json::to_string(&combined_results).unwrap_or_default(),
                 display_preference: None,
+                images: Vec::new(),
             },
             context: ctx,
         })
@@ -372,6 +374,7 @@ impl Composition for Choice {
                     success: true,
                     result: "Condition was false, no else branch".to_string(),
                     display_preference: None,
+                    images: Vec::new(),
                 },
                 context: ctx,
             })

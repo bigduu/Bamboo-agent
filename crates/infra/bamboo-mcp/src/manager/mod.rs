@@ -190,6 +190,27 @@ impl McpServerManager {
             .and_then(|runtime| runtime.info.try_read().ok().map(|info| info.clone()))
     }
 
+    /// `(server_id, instructions)` for every currently-ready server that returned
+    /// `instructions` from `initialize`. Used to inject each connected server's
+    /// own usage guidance into the system prompt — so guidance appears only while
+    /// the server is actually loaded. Sorted by server id for a stable prompt.
+    pub fn connected_server_instructions(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .runtimes
+            .iter()
+            .filter_map(|entry| {
+                let info = entry.value().info.try_read().ok()?;
+                if info.status != ServerStatus::Ready {
+                    return None;
+                }
+                let instructions = info.instructions.clone()?;
+                Some((entry.key().clone(), instructions))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Check if a server is running.
     pub fn is_server_running(&self, server_id: &str) -> bool {
         self.runtimes.contains_key(server_id)

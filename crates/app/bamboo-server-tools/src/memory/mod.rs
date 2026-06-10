@@ -285,6 +285,7 @@ impl Tool for MemoryTool {
                         "warnings": [],
                     }).to_string(),
                     display_preference: Some("json".to_string()),
+                    images: Vec::new(),
                 })
             }
             MemoryArgs::Get {
@@ -329,6 +330,7 @@ impl Tool for MemoryTool {
                     })
                     .to_string(),
                     display_preference: Some("json".to_string()),
+                    images: Vec::new(),
                 })
             }
             MemoryArgs::Write {
@@ -385,6 +387,7 @@ impl Tool for MemoryTool {
                     })
                     .to_string(),
                     display_preference: Some("json".to_string()),
+                    images: Vec::new(),
                 })
             }
             MemoryArgs::Merge {
@@ -430,6 +433,7 @@ impl Tool for MemoryTool {
                         })
                         .to_string(),
                         display_preference: Some("json".to_string()),
+                        images: Vec::new(),
                     })
                 } else {
                     let Some(result) = self
@@ -462,6 +466,7 @@ impl Tool for MemoryTool {
                         })
                         .to_string(),
                         display_preference: Some("json".to_string()),
+                        images: Vec::new(),
                     })
                 }
             }
@@ -514,6 +519,7 @@ impl Tool for MemoryTool {
                     })
                     .to_string(),
                     display_preference: Some("json".to_string()),
+                    images: Vec::new(),
                 })
             }
             MemoryArgs::Split {
@@ -569,6 +575,7 @@ impl Tool for MemoryTool {
                     })
                     .to_string(),
                     display_preference: Some("json".to_string()),
+                    images: Vec::new(),
                 })
             }
             MemoryArgs::ScanBlobs {
@@ -606,6 +613,7 @@ impl Tool for MemoryTool {
                     })
                     .to_string(),
                     display_preference: Some("json".to_string()),
+                    images: Vec::new(),
                 })
             }
             MemoryArgs::ScanDuplicates {
@@ -643,6 +651,7 @@ impl Tool for MemoryTool {
                     })
                     .to_string(),
                     display_preference: Some("json".to_string()),
+                    images: Vec::new(),
                 })
             }
             MemoryArgs::Consolidate {
@@ -698,6 +707,7 @@ impl Tool for MemoryTool {
                     })
                     .to_string(),
                     display_preference: Some("json".to_string()),
+                    images: Vec::new(),
                 })
             }
             MemoryArgs::Purge {
@@ -744,6 +754,7 @@ impl Tool for MemoryTool {
                         })
                         .to_string(),
                         display_preference: Some("json".to_string()),
+                        images: Vec::new(),
                     })
                 } else {
                     let scope = Self::parse_scope(scope.as_deref())?;
@@ -776,6 +787,7 @@ impl Tool for MemoryTool {
                         })
                         .to_string(),
                         display_preference: Some("json".to_string()),
+                        images: Vec::new(),
                     })
                 }
             }
@@ -804,6 +816,7 @@ impl Tool for MemoryTool {
                     })
                     .to_string(),
                     display_preference: Some("json".to_string()),
+                    images: Vec::new(),
                 })
             }
             MemoryArgs::Rebuild { scope, project_key } => {
@@ -839,6 +852,7 @@ impl Tool for MemoryTool {
                     })
                     .to_string(),
                     display_preference: Some("json".to_string()),
+                    images: Vec::new(),
                 })
             }
         }

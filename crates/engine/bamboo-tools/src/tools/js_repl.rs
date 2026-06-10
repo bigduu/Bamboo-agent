@@ -186,6 +186,7 @@ impl Tool for JsReplTool {
                     })
                     .to_string(),
                     display_preference: Some("Collapsible".to_string()),
+                    images: Vec::new(),
                 })
             }
             Ok(Err(e)) => Err(ToolError::Execution(format!(
@@ -206,6 +207,7 @@ impl Tool for JsReplTool {
                     })
                     .to_string(),
                     display_preference: Some("Collapsible".to_string()),
+                    images: Vec::new(),
                 })
             }
         }

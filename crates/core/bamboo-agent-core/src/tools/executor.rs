@@ -92,6 +92,19 @@ pub trait ToolExecutor: Send + Sync {
     /// Returns schemas for all tools that can be executed via this executor
     fn list_tools(&self) -> Vec<ToolSchema>;
 
+    /// Server-level usage guidance to surface in the system prompt for whatever
+    /// this executor currently exposes — e.g. the `instructions` an MCP server
+    /// returns from `initialize`. Because it is derived from the live executor,
+    /// the text is naturally scoped to what is actually connected/loaded for the
+    /// run (a disconnected server contributes nothing).
+    ///
+    /// Returns `None` when there is no guidance to add (the default for executors
+    /// that have none). The string, when present, is appended to the tool-guide
+    /// section of the prompt.
+    fn tool_guidance(&self) -> Option<String> {
+        None
+    }
+
     /// Returns mutability metadata for a tool name when available.
     /// Executors that can inspect concrete tools should override this.
     fn tool_mutability(&self, tool_name: &str) -> crate::tools::ToolMutability {
@@ -252,6 +265,7 @@ mod tests {
                 success: true,
                 result: "from-composition".to_string(),
                 display_preference: None,
+                images: Vec::new(),
             })
         }
     }
@@ -276,6 +290,7 @@ mod tests {
                 success: true,
                 result: "from-fallback".to_string(),
                 display_preference: None,
+                images: Vec::new(),
             },
         );
 

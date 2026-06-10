@@ -680,6 +680,10 @@ impl AgentRuntime {
                 .and_then(|state| state.plan_mode.as_ref())
                 .map(|_| PermissionMode::Plan),
             gold_config,
+            // Capture the tool executor's server-level guidance (connected MCP
+            // servers' `instructions`) once, so it lands in the system prompt only
+            // while those servers are loaded for this run.
+            mcp_tool_guidance: tools.tool_guidance(),
             ..Default::default()
         };
 

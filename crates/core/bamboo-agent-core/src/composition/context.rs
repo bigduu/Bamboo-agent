@@ -142,6 +142,7 @@ mod tests {
             success: true,
             result: "test".to_string(),
             display_preference: None,
+            images: Vec::new(),
         };
 
         ctx.bind("test_var".to_string(), result.clone());
@@ -156,6 +157,7 @@ mod tests {
             success: true,
             result: "parent_value".to_string(),
             display_preference: None,
+            images: Vec::new(),
         };
         parent.bind("shared".to_string(), result);
 
@@ -164,6 +166,7 @@ mod tests {
             success: true,
             result: "child_value".to_string(),
             display_preference: None,
+            images: Vec::new(),
         };
         child.bind("child_only".to_string(), child_result);
 

@@ -68,6 +68,7 @@ async fn need_clarification_sends_event() {
         })
         .unwrap(),
         display_preference: None,
+        images: Vec::new(),
     };
 
     let outcome = handle_tool_result_with_agentic_support(
@@ -147,6 +148,7 @@ async fn need_more_actions_executes_sub_actions() {
         })
         .unwrap(),
         display_preference: None,
+        images: Vec::new(),
     };
 
     let outcome = handle_tool_result_with_agentic_support(

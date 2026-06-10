@@ -1,9 +1,10 @@
 use crate::provider_model_ref::ProviderModelRef;
 use crate::reasoning::ReasoningEffort;
 use crate::session::budget_types::{TokenBudget, TokenBudgetUsage};
-use crate::session::message_part::MessagePart;
+use crate::session::message_part::{ImageUrlRef, MessagePart};
 use crate::session::task::{TaskItemStatus, TaskList};
 use crate::session::tool_types::ToolCall;
+use crate::tool_types::ToolResultImage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -212,6 +213,46 @@ impl Message {
             content: content.into(),
             reasoning: None,
             content_parts: None,
+            image_ocr: None,
+            phase: None,
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
+            tool_success: Some(success),
+            compressed: false,
+            compressed_by_event_id: None,
+            never_compress: false,
+            compression_level: 0,
+            created_at: Utc::now(),
+            metadata: None,
+        }
+    }
+
+    /// Tool-result message carrying both text and images (e.g. an MCP
+    /// `screenshot`). The text goes in `content` (token-capped/persisted as
+    /// usual); each image becomes a `MessagePart::ImageUrl` data URL in
+    /// `content_parts`, so vision-capable providers receive the real image.
+    pub fn tool_result_with_images(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        success: bool,
+        images: Vec<ToolResultImage>,
+    ) -> Self {
+        let parts: Vec<MessagePart> = images
+            .into_iter()
+            .map(|img| MessagePart::ImageUrl {
+                image_url: ImageUrlRef {
+                    url: format!("data:{};base64,{}", img.mime_type, img.data),
+                    detail: None,
+                },
+            })
+            .collect();
+        let content_parts = (!parts.is_empty()).then_some(parts);
+        Self {
+            id: Uuid::new_v4().to_string(),
+            role: Role::Tool,
+            content: content.into(),
+            reasoning: None,
+            content_parts,
             image_ocr: None,
             phase: None,
             tool_calls: None,
@@ -883,6 +924,37 @@ mod tests {
             !serialized.contains("\"metadata\""),
             "metadata key should be absent when None"
         );
+    }
+
+    #[test]
+    fn tool_result_with_images_puts_images_in_content_parts() {
+        let msg = Message::tool_result_with_images(
+            "call-1",
+            "note text",
+            true,
+            vec![ToolResultImage {
+                mime_type: "image/jpeg".to_string(),
+                data: "abc".to_string(),
+            }],
+        );
+        assert_eq!(msg.role, Role::Tool);
+        assert_eq!(msg.content, "note text");
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(msg.tool_success, Some(true));
+        let parts = msg.content_parts.expect("content_parts should be set");
+        assert_eq!(parts.len(), 1);
+        match &parts[0] {
+            MessagePart::ImageUrl { image_url } => {
+                assert_eq!(image_url.url, "data:image/jpeg;base64,abc");
+            }
+            _ => panic!("expected an ImageUrl part"),
+        }
+    }
+
+    #[test]
+    fn tool_result_with_no_images_has_no_content_parts() {
+        let msg = Message::tool_result_with_images("call-2", "text", true, vec![]);
+        assert!(msg.content_parts.is_none());
     }
 
     #[test]

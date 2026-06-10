@@ -68,6 +68,11 @@ pub use bamboo_infrastructure as infrastructure;
 pub use bamboo_sdk::agent;
 pub use bamboo_sdk::{Agent, AgentBuilder};
 
+// Re-export the runtime config crate so consumers can reach config, paths,
+// proxy auth, encryption, etc. via `bamboo_agent::config::...`. These moved out
+// of `bamboo_infrastructure` into the dedicated `bamboo-config` crate.
+pub use bamboo_config as config;
+
 // Re-export core Config as the primary configuration type
 pub use bamboo_config::ServerConfig;
 pub use bamboo_llm::Config;

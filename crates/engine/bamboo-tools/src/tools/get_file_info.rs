@@ -76,12 +76,14 @@ impl Tool for GetFileInfoTool {
                         })
                         .to_string(),
                         display_preference: Some("json".to_string()),
+                        images: Vec::new(),
                     });
                 }
                 return Ok(ToolResult {
                     success: false,
                     result: format!("Failed to read metadata for '{path}': {error}"),
                     display_preference: Some("error".to_string()),
+                    images: Vec::new(),
                 });
             }
         };
@@ -104,6 +106,7 @@ impl Tool for GetFileInfoTool {
             })
             .to_string(),
             display_preference: Some("json".to_string()),
+            images: Vec::new(),
         })
     }
 }

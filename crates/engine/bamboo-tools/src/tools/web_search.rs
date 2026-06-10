@@ -202,6 +202,7 @@ impl Tool for WebSearchTool {
                 success: true,
                 result: cached.to_string(),
                 display_preference: Some("Collapsible".to_string()),
+                images: Vec::new(),
             });
         }
 
@@ -358,6 +359,7 @@ impl Tool for WebSearchTool {
             success: true,
             result: result_string,
             display_preference: Some("Collapsible".to_string()),
+            images: Vec::new(),
         })
     }
 }

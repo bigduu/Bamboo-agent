@@ -29,6 +29,7 @@ async fn maybe_handle_taskwrite_handles_task_tool_updates_session_and_context() 
         success: true,
         result: "ok".to_string(),
         display_preference: None,
+        images: Vec::new(),
     };
 
     let mut session = Session::new("session-1", "model");
@@ -74,6 +75,7 @@ async fn maybe_handle_taskwrite_ignores_non_task_calls() {
         success: true,
         result: "ok".to_string(),
         display_preference: None,
+        images: Vec::new(),
     };
 
     let mut session = Session::new("session-1", "model");

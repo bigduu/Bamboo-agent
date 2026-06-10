@@ -1505,6 +1505,68 @@ mod anthropic_request_building {
     }
 
     #[test]
+    fn stable_prefix_caches_system_and_relocated_tool_guide() {
+        // Mirrors a prompt-lanes request: a static system identity, the relocated
+        // tool/server guide as its own fixed prefix message, then the
+        // conversation. The cacheable PREFIX (system + guide) and the rolling
+        // conversation tail must each carry a `cache_control` marker; the middle
+        // turns must not. This is the prefix-prompt-cache guarantee of the
+        // tool-guide relocation.
+        let guide = Message::user("Tool & Connected-Server Guide: nova targeting workflow");
+        let guide_id = guide.id.clone();
+        let tail = Message::user("the current ask");
+        let tail_id = tail.id.clone();
+        let messages = vec![
+            Message::system("BASE_IDENTITY"),
+            guide,
+            Message::user("earlier turn"),
+            Message::assistant("ok", None),
+            tail,
+        ];
+        let plan = crate::cache::PromptCachePlan {
+            cache_system: true,
+            cache_tools: true,
+            breakpoint_message_ids: vec![guide_id, tail_id],
+            ..Default::default()
+        };
+
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+
+        // Static system identity is cached (top of the stable prefix).
+        let system = out["system"].as_array().expect("system blocks");
+        assert_eq!(
+            system.last().unwrap()["cache_control"]["type"],
+            "ephemeral",
+            "static system identity must be cached"
+        );
+
+        // After system extraction the messages are [guide, earlier, assistant, tail].
+        let msgs = out["messages"].as_array().unwrap();
+        let cc = |m: &serde_json::Value| -> bool {
+            m["content"]
+                .as_array()
+                .and_then(|b| b.last())
+                .map(|b| b.get("cache_control").is_some())
+                .unwrap_or(false)
+        };
+        // The relocated guide closes the stable prefix and is cached.
+        assert!(cc(&msgs[0]), "relocated tool guide must be cached");
+        // A middle conversation turn must NOT be cached.
+        assert!(!cc(&msgs[1]), "middle turn must not be cached");
+        // The rolling conversation tail is cached.
+        assert!(cc(msgs.last().unwrap()), "conversation tail must be cached");
+    }
+
+    #[test]
     fn breakpoint_survives_tool_result_merge_by_id() {
         // The first tool result of a turn creates a user message; subsequent
         // tool results merge into it (keeping the first result's id). A

@@ -148,7 +148,7 @@ impl McpServerManager {
             }
         }
 
-        let (client, tools) = self
+        let (client, tools, instructions) = self
             .bootstrap_server_client(&server_id, &runtime.config, "reconnect")
             .await?;
 
@@ -162,6 +162,12 @@ impl McpServerManager {
         {
             let mut tools_lock = runtime.tools.write().await;
             *tools_lock = tools.clone();
+        }
+
+        // Refresh the server's prompt instructions from the new init result.
+        {
+            let mut info = runtime.info.write().await;
+            info.instructions = instructions;
         }
 
         // Re-register tools in index
@@ -198,7 +204,7 @@ impl McpServerManager {
         server_id: &str,
         config: &McpServerConfig,
         phase: &'static str,
-    ) -> Result<(McpProtocolClient, Vec<McpTool>)> {
+    ) -> Result<(McpProtocolClient, Vec<McpTool>, Option<String>)> {
         let transport = self.build_transport(&config.transport).await?;
         let mut client = McpProtocolClient::new(transport);
 
@@ -226,6 +232,13 @@ impl McpServerManager {
             server_id, phase, init_result.server_info.name, init_result.server_info.version
         );
 
+        // The server's optional `instructions` (how-to-use guidance) — surfaced
+        // into the system prompt while this server is connected.
+        let instructions = init_result
+            .instructions
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let tools = client.list_tools(config.request_timeout_ms).await?;
         info!(
             "MCP server '{}' has {} tools during {}",
@@ -234,7 +247,7 @@ impl McpServerManager {
             phase
         );
 
-        Ok((client, tools))
+        Ok((client, tools, instructions))
     }
 
     async fn build_transport(&self, config: &TransportConfig) -> Result<Box<dyn McpTransport>> {

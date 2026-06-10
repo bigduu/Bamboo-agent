@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use super::prompt_envelope::{
     assemble_prompt_envelope, envelope_to_responses_view, StablePromptFrame,
 };
-use super::prompt_setup::build_stable_prompt_frame;
+use super::prompt_setup::build_stable_prompt_frame_with_sections;
 use super::tool_schemas::resolve_available_tool_schemas_for_session;
 use bamboo_agent_core::agent::types::{TaskItem, TaskItemStatus, TaskList};
 use bamboo_agent_core::tools::{FunctionSchema, ToolCall, ToolExecutor, ToolResult, ToolSchema};
@@ -32,6 +32,7 @@ impl ToolExecutor for StaticToolExecutor {
             success: true,
             result: "ok".to_string(),
             display_preference: None,
+            images: Vec::new(),
         })
     }
 
@@ -721,8 +722,13 @@ fn build_stable_prompt_frame_includes_base_and_stable_contexts() {
         "## Skill\nUse the skill".to_string(),
     );
 
-    let stable =
-        build_stable_prompt_frame(&session, &config, &[], &std::collections::BTreeSet::new());
+    let stable = build_stable_prompt_frame_with_sections(
+        &session,
+        &config,
+        &[],
+        &std::collections::BTreeSet::new(),
+    )
+    .0;
 
     assert!(stable.stable_instructions.contains("Base system"));
     assert!(stable.stable_instructions.contains("Workspace path:"));
@@ -771,8 +777,13 @@ fn build_stable_prompt_frame_strips_round_dynamic_prompt_blocks() {
         80,
     ));
 
-    let stable =
-        build_stable_prompt_frame(&session, &config, &[], &std::collections::BTreeSet::new());
+    let stable = build_stable_prompt_frame_with_sections(
+        &session,
+        &config,
+        &[],
+        &std::collections::BTreeSet::new(),
+    )
+    .0;
 
     assert!(stable.stable_instructions.contains("Base system"));
     assert!(stable.stable_instructions.contains("Workspace path:"));

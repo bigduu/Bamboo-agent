@@ -116,6 +116,7 @@ pub async fn execute_session_memory_action(
                 })
                 .to_string(),
                 display_preference: Some("json".to_string()),
+                images: Vec::new(),
             })
         }
         SessionMemoryAction::Clear => {
@@ -135,6 +136,7 @@ pub async fn execute_session_memory_action(
                 })
                 .to_string(),
                 display_preference: Some("json".to_string()),
+                images: Vec::new(),
             })
         }
         SessionMemoryAction::ListTopics => {
@@ -154,6 +156,7 @@ pub async fn execute_session_memory_action(
                 })
                 .to_string(),
                 display_preference: Some("json".to_string()),
+                images: Vec::new(),
             })
         }
         SessionMemoryAction::Replace | SessionMemoryAction::Append => {
@@ -198,6 +201,7 @@ pub async fn execute_session_memory_action(
                     })
                     .to_string(),
                     display_preference: Some("json".to_string()),
+                    images: Vec::new(),
                 })
             } else {
                 let existing = memory.read_session_topic(session_id, topic).await.map_err(|error| {
@@ -249,6 +253,7 @@ pub async fn execute_session_memory_action(
                     })
                     .to_string(),
                     display_preference: Some("json".to_string()),
+                    images: Vec::new(),
                 })
             }
         }

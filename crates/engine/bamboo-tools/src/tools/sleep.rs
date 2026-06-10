@@ -99,6 +99,7 @@ impl Tool for SleepTool {
                     .unwrap_or_default()
             ),
             display_preference: None,
+            images: Vec::new(),
         })
     }
 }

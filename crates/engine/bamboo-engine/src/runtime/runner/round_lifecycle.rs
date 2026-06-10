@@ -15,6 +15,7 @@ use bamboo_llm::LLMProvider;
 use token_estimation::{estimate_completion_tokens, estimate_prompt_tokens};
 
 mod context_preparation;
+mod prefix_drift;
 mod stream_execution;
 mod token_budget;
 mod token_estimation;

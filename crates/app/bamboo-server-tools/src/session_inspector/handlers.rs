@@ -96,6 +96,7 @@ pub(super) async fn handle_list(
         })
         .to_string(),
         display_preference: Some("Collapsible".to_string()),
+        images: Vec::new(),
     })
 }
 
@@ -120,6 +121,7 @@ pub(super) async fn handle_get_meta(
         success: true,
         result: json!({ "session": map_index_entry(&entry) }).to_string(),
         display_preference: Some("Collapsible".to_string()),
+        images: Vec::new(),
     })
 }
 
@@ -221,6 +223,7 @@ pub(super) async fn handle_read_messages(
         })
         .to_string(),
         display_preference: Some("Collapsible".to_string()),
+        images: Vec::new(),
     })
 }
 
@@ -325,6 +328,7 @@ pub(super) async fn handle_read_compressed_cache(
         })
         .to_string(),
         display_preference: Some("Collapsible".to_string()),
+        images: Vec::new(),
     })
 }
 
@@ -393,6 +397,7 @@ pub(super) async fn handle_search(
                     })
                     .to_string(),
                     display_preference: Some("Collapsible".to_string()),
+                    images: Vec::new(),
                 });
             }
             Ok(_) => {}
@@ -472,5 +477,6 @@ pub(super) async fn handle_search(
         })
         .to_string(),
         display_preference: Some("Collapsible".to_string()),
+        images: Vec::new(),
     })
 }

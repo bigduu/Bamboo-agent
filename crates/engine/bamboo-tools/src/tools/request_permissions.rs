@@ -174,6 +174,7 @@ impl Tool for RequestPermissionsTool {
             success: true,
             result: result_payload.to_string(),
             display_preference: Some("request_permissions".to_string()),
+            images: Vec::new(),
         })
     }
 }

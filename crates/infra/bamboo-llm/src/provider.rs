@@ -121,6 +121,55 @@ pub struct LLMRequestOptions {
     pub cache: Option<crate::cache::PromptCachePlan>,
 }
 
+/// Canonical, provider-facing prompt structure: the engine assembles these four
+/// layers ONCE, and each provider adapter renders them into its own wire format
+/// (system field + message array + cache breakpoints) instead of re-deriving the
+/// structure from a pre-flattened message list. This is what lets every provider
+/// be a pure adapter — the prompt-assembly logic lives in Bamboo, not duplicated
+/// across providers.
+///
+/// Concatenation order is fixed and defines the message layout:
+/// `[system(stable_instructions)] + stable_prefix_messages + dynamic_context_messages + conversation_messages`.
+///
+/// The lane boundaries are also the natural cache breakpoints: everything up to
+/// (and including) `stable_prefix_messages` is the stable, cacheable prefix;
+/// `dynamic_context_messages` onward changes per round.
+#[derive(Debug, Clone, Default)]
+pub struct PromptLanes {
+    /// Static system instructions — the cacheable base. Rendered into the
+    /// provider's dedicated system field, NOT the message array.
+    pub stable_instructions: String,
+    /// Session-stable context messages (tool guide, connected MCP servers'
+    /// guidance, workspace, env, skills): fixed positions that change rarely. The
+    /// stable cache prefix ends after these.
+    pub stable_prefix_messages: Vec<Message>,
+    /// Per-round dynamic context (task snapshot, recalled memory, conversation
+    /// summary): changes turn to turn, so it sits AFTER the cache breakpoint.
+    pub dynamic_context_messages: Vec<Message>,
+    /// The actual user / assistant / tool conversation history.
+    pub conversation_messages: Vec<Message>,
+}
+
+impl PromptLanes {
+    /// Flatten the lanes into one message list in canonical order — the exact
+    /// shape a provider that has NOT yet been migrated to consume lanes still
+    /// expects, so the default trait path stays byte-identical to today.
+    pub fn flatten(&self) -> Vec<Message> {
+        let mut messages = Vec::with_capacity(
+            1 + self.stable_prefix_messages.len()
+                + self.dynamic_context_messages.len()
+                + self.conversation_messages.len(),
+        );
+        if !self.stable_instructions.trim().is_empty() {
+            messages.push(Message::system(self.stable_instructions.trim().to_string()));
+        }
+        messages.extend(self.stable_prefix_messages.iter().cloned());
+        messages.extend(self.dynamic_context_messages.iter().cloned());
+        messages.extend(self.conversation_messages.iter().cloned());
+        messages
+    }
+}
+
 /// Trait for LLM provider implementations
 ///
 /// This trait defines the interface that all LLM providers must implement
@@ -193,6 +242,31 @@ pub trait LLMProvider: Send + Sync {
             .await
     }
 
+    /// Stream a completion from the canonical [`PromptLanes`] contract — the
+    /// structure-preserving entry point.
+    ///
+    /// The provider receives the prompt LAYERS (static system, stable prefix,
+    /// dynamic context, conversation) and is expected to render them into its own
+    /// dialect: place the system block in its system field and the cache
+    /// breakpoint at the structural stable↔dynamic boundary, rather than
+    /// re-deriving both from a flattened message list.
+    ///
+    /// The default implementation flattens the lanes ([`PromptLanes::flatten`])
+    /// and delegates to [`LLMProvider::chat_stream_with_options`], so a provider
+    /// that has not yet been migrated produces exactly the request it does today.
+    async fn chat_stream_lanes(
+        &self,
+        lanes: &PromptLanes,
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
+        let messages = lanes.flatten();
+        self.chat_stream_with_options(&messages, tools, max_output_tokens, model, options)
+            .await
+    }
+
     /// Lists available models from this provider
     ///
     /// Returns a list of model identifiers that can be used with `chat_stream`.
@@ -224,6 +298,90 @@ mod tests {
     use futures::{stream, StreamExt};
 
     use super::*;
+
+    #[test]
+    fn prompt_lanes_flatten_preserves_canonical_order() {
+        let lanes = PromptLanes {
+            stable_instructions: "  base system  ".to_string(),
+            stable_prefix_messages: vec![Message::user("tool-guide")],
+            dynamic_context_messages: vec![Message::user("task-snapshot")],
+            conversation_messages: vec![Message::user("real ask")],
+        };
+        let flat = lanes.flatten();
+        assert_eq!(flat.len(), 4);
+        assert!(matches!(flat[0].role, bamboo_domain::Role::System));
+        assert_eq!(flat[0].content, "base system"); // trimmed
+        assert_eq!(flat[1].content, "tool-guide");
+        assert_eq!(flat[2].content, "task-snapshot");
+        assert_eq!(flat[3].content, "real ask");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_lanes_default_flattens_and_delegates() {
+        // A provider that captures whatever message list it is handed.
+        #[derive(Default)]
+        struct Capture {
+            seen: Arc<Mutex<Vec<Message>>>,
+        }
+        #[async_trait]
+        impl LLMProvider for Capture {
+            async fn chat_stream(
+                &self,
+                _m: &[Message],
+                _t: &[ToolSchema],
+                _mt: Option<u32>,
+                _model: &str,
+            ) -> Result<LLMStream> {
+                unreachable!("default chat_stream_lanes must route via chat_stream_with_options")
+            }
+            async fn chat_stream_with_options(
+                &self,
+                messages: &[Message],
+                _t: &[ToolSchema],
+                _mt: Option<u32>,
+                _model: &str,
+                _o: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream> {
+                *self.seen.lock().expect("seen lock") = messages.to_vec();
+                Ok(Box::pin(stream::iter(Vec::<Result<LLMChunk>>::new())))
+            }
+        }
+
+        let cap = Capture::default();
+        let lanes = PromptLanes {
+            stable_instructions: "sys".into(),
+            stable_prefix_messages: vec![Message::user("guide")],
+            dynamic_context_messages: vec![Message::user("dyn")],
+            conversation_messages: vec![Message::user("ask")],
+        };
+        let _ = cap
+            .chat_stream_lanes(&lanes, &[], None, "m", None)
+            .await
+            .expect("lanes stream");
+
+        let seen = cap.seen.lock().expect("seen lock").clone();
+        let expected = lanes.flatten();
+        assert_eq!(seen.len(), expected.len(), "delegates the flattened lanes");
+        for (got, want) in seen.iter().zip(expected.iter()) {
+            assert_eq!(got.role, want.role);
+            assert_eq!(got.content, want.content);
+        }
+        // system + guide + dyn + ask
+        assert_eq!(seen.len(), 4);
+        assert!(matches!(seen[0].role, bamboo_domain::Role::System));
+    }
+
+    #[test]
+    fn prompt_lanes_flatten_omits_empty_system() {
+        let lanes = PromptLanes {
+            stable_instructions: "   ".to_string(),
+            conversation_messages: vec![Message::user("hi")],
+            ..PromptLanes::default()
+        };
+        let flat = lanes.flatten();
+        assert_eq!(flat.len(), 1);
+        assert!(matches!(flat[0].role, bamboo_domain::Role::User));
+    }
 
     #[derive(Clone, Default)]
     struct RecordingProvider {

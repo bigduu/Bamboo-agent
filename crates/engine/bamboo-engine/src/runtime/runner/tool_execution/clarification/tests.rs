@@ -27,6 +27,7 @@ async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events(
         })
         .to_string(),
         display_preference: Some("conclusion_with_options".to_string()),
+        images: Vec::new(),
     };
 
     let (tx, mut rx) = mpsc::channel(8);
@@ -119,6 +120,7 @@ async fn maybe_handle_user_question_tool_handles_request_permissions() {
         })
         .to_string(),
         display_preference: Some("request_permissions".to_string()),
+        images: Vec::new(),
     };
 
     let (tx, mut rx) = mpsc::channel(8);
@@ -208,6 +210,7 @@ async fn maybe_handle_user_question_tool_persists_exit_plan_file_and_emits_updat
         })
         .to_string(),
         display_preference: Some("conclusion_with_options".to_string()),
+        images: Vec::new(),
     };
 
     let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -363,6 +366,7 @@ async fn maybe_handle_user_question_tool_ignores_unrelated_tool_calls() {
         success: true,
         result: "{}".to_string(),
         display_preference: None,
+        images: Vec::new(),
     };
 
     let (tx, mut rx) = mpsc::channel(4);

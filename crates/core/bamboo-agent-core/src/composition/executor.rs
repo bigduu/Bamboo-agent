@@ -377,6 +377,7 @@ impl CompositionExecutor {
             success,
             result: result.into(),
             display_preference: None,
+            images: Vec::new(),
         }
     }
 }
@@ -410,6 +411,7 @@ mod tests {
                 success: true,
                 result: args.to_string(),
                 display_preference: None,
+                images: Vec::new(),
             })
         }
     }
@@ -439,6 +441,7 @@ mod tests {
                 success: self.success,
                 result: self.result.to_string(),
                 display_preference: None,
+                images: Vec::new(),
             })
         }
     }
@@ -495,6 +498,7 @@ mod tests {
                 success: true,
                 result: format!("attempt-{attempt}"),
                 display_preference: None,
+                images: Vec::new(),
             })
         }
     }
@@ -644,6 +648,7 @@ mod tests {
             success: true,
             result: r#"{"status":"ready","email":"agent@example.com"}"#.to_string(),
             display_preference: None,
+            images: Vec::new(),
         };
 
         let condition = Condition::And {

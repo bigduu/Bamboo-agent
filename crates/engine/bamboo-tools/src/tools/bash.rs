@@ -322,6 +322,7 @@ impl BashTool {
             })
             .to_string(),
             display_preference: Some("Collapsible".to_string()),
+            images: Vec::new(),
         })
     }
 }
@@ -423,6 +424,7 @@ impl Tool for BashTool {
                 })
                 .to_string(),
                 display_preference: Some("Collapsible".to_string()),
+                images: Vec::new(),
             });
         }
 

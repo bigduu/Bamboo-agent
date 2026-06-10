@@ -681,21 +681,25 @@ pub fn convert_to_standard_result(agentic_result: ToolResult) -> crate::tools::t
             success: true,
             result,
             display_preference: None,
+            images: Vec::new(),
         },
         ToolResult::Error { error } => crate::tools::types::ToolResult {
             success: false,
             result: error,
             display_preference: Some("error".to_string()),
+            images: Vec::new(),
         },
         ToolResult::NeedClarification { question, .. } => crate::tools::types::ToolResult {
             success: true,
             result: question,
             display_preference: Some("clarification".to_string()),
+            images: Vec::new(),
         },
         ToolResult::NeedMoreActions { reason, .. } => crate::tools::types::ToolResult {
             success: true,
             result: reason,
             display_preference: Some("actions_needed".to_string()),
+            images: Vec::new(),
         },
     }
 }
