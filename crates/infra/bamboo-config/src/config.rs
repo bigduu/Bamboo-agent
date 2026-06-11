@@ -122,6 +122,11 @@ pub struct MemoryConfig {
     /// Whether lightweight automatic Dream-style consolidation should run in the background.
     #[serde(default)]
     pub auto_dream_enabled: bool,
+    /// Seconds between background auto-Dream ticks (default 30 minutes).
+    /// Each tick still no-ops when there are no new candidate sessions, so raising
+    /// this only lowers how often an active user triggers a real consolidation.
+    #[serde(default = "default_auto_dream_interval_secs")]
+    pub auto_dream_interval_secs: u64,
     /// Whether project durable-memory index injection is enabled for the main prompt.
     #[serde(
         default = "default_true_memory_project_prompt_injection",
@@ -180,6 +185,7 @@ impl Default for MemoryConfig {
         Self {
             background_model: None,
             auto_dream_enabled: false,
+            auto_dream_interval_secs: default_auto_dream_interval_secs(),
             project_prompt_injection: default_true_memory_project_prompt_injection(),
             relevant_recall: default_true_memory_relevant_recall(),
             relevant_recall_rerank: false,
@@ -198,6 +204,10 @@ impl Default for MemoryConfig {
 
 fn default_gardener_interval_secs() -> u64 {
     86_400
+}
+
+fn default_auto_dream_interval_secs() -> u64 {
+    60 * 30
 }
 
 fn default_gardener_max_splits_per_run() -> usize {
@@ -2071,6 +2081,7 @@ mod tests {
             memory: Some(MemoryConfig {
                 background_model: Some("dream-fast".to_string()),
                 auto_dream_enabled: true,
+                auto_dream_interval_secs: 900,
                 project_prompt_injection: false,
                 relevant_recall: false,
                 relevant_recall_rerank: true,

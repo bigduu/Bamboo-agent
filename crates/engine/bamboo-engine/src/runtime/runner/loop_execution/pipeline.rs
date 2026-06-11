@@ -366,6 +366,22 @@ fn spawn_task_evaluation_if_needed(
     state: &mut LoopRunState,
     llm: Arc<dyn LLMProvider>,
 ) -> Result<(), AgentError> {
+    // Gate: evaluate only when the Task tool structurally rewrote the list this
+    // turn. The flag is set in `maybe_handle_taskwrite`, so an evaluation fires
+    // once per Task-tool write rather than every round of tool activity (which
+    // bumps `TaskLoopContext::version` without changing the plan). A task list
+    // that never went through the Task tool is never auto-evaluated.
+    let task_list_dirty = state
+        .task_context
+        .as_ref()
+        .is_some_and(|ctx| ctx.task_list_dirty);
+    if !task_list_dirty {
+        return Ok(());
+    }
+    if let Some(ctx) = state.task_context.as_mut() {
+        ctx.task_list_dirty = false;
+    }
+
     let eval_model = state
         .auxiliary_models
         .fast_model_name

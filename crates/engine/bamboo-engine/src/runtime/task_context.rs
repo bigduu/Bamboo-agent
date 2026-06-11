@@ -43,6 +43,12 @@ pub struct TaskLoopContext {
 
     /// Version number for conflict detection
     pub version: u64,
+
+    /// Set when the Task tool structurally rewrites the list, cleared once an
+    /// evaluation has been spawned for that change. This is the single signal that
+    /// gates async task evaluation to actual Task-tool writes, instead of firing
+    /// every round of tool activity (which bumps `version` without changing the plan).
+    pub task_list_dirty: bool,
 }
 
 /// Task item with execution tracking

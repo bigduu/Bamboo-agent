@@ -15,10 +15,6 @@ use super::TaskEvaluationResult;
 
 mod outcomes;
 
-fn has_tool_activity(ctx: &TaskLoopContext) -> bool {
-    ctx.items.iter().any(|item| !item.tool_calls.is_empty())
-}
-
 fn skipped_evaluation(reasoning: &str) -> TaskEvaluationResult {
     TaskEvaluationResult {
         needs_evaluation: false,
@@ -60,18 +56,9 @@ pub async fn evaluate_task_progress(
         return Ok(skipped_evaluation("No in-progress tasks to evaluate"));
     }
 
-    let is_plan_mode = session
-        .agent_runtime_state
-        .as_ref()
-        .and_then(|s| s.plan_mode.as_ref())
-        .is_some();
-
-    if !is_plan_mode && !has_tool_activity(ctx) {
-        return Ok(skipped_evaluation(
-            "No tool executions yet; skipping task evaluation.",
-        ));
-    }
-
+    // When to evaluate is owned entirely by the caller (the loop spawns this only
+    // on a Task-tool write); this function just decides how. The single remaining
+    // guard above skips when there is nothing in progress to assess.
     tracing::info!(
         "[{}] Evaluating {} in-progress task items",
         session_id,

@@ -25,7 +25,8 @@ use bamboo_memory::memory_store::{MemoryScope, MemoryStore};
 
 const DREAM_RUNTIME_SESSION_ID: &str = "__dream__";
 const DREAM_TRACING_TARGET: &str = "bamboo.auto_dream";
-const DREAM_INTERVAL_SECS: u64 = 60 * 30;
+// Auto-Dream tick cadence now lives in `MemoryConfig::auto_dream_interval_secs`
+// (default 30 min); see `spawn_auto_dream_task`.
 const DREAM_FULL_REBUILD_INTERVAL_SECS: i64 = 60 * 60 * 24 * 30;
 const DREAM_MAX_SESSIONS: usize = 12;
 const DREAM_MAX_SUMMARY_CHARS: usize = 12_000;
@@ -818,7 +819,18 @@ async fn run_project_auto_dream_once_with_store(
 
 pub fn spawn_auto_dream_task(ctx: AutoDreamContext) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(DREAM_INTERVAL_SECS));
+        let interval_secs = ctx
+            .config
+            .read()
+            .await
+            .memory
+            .as_ref()
+            .map(|memory| memory.auto_dream_interval_secs)
+            .filter(|secs| *secs > 0)
+            // Fall back to the config default (single source of truth for the
+            // 30-minute cadence) when memory config is absent or set to 0.
+            .unwrap_or_else(|| bamboo_config::MemoryConfig::default().auto_dream_interval_secs);
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             ticker.tick().await;
             if let Err(error) = run_auto_dream_once(&ctx).await {

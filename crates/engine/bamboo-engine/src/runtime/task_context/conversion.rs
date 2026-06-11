@@ -98,6 +98,7 @@ impl TaskLoopContext {
                 created_at: task_list.created_at,
                 updated_at: task_list.updated_at,
                 version: existing_version,
+                task_list_dirty: false,
             }
         })
     }

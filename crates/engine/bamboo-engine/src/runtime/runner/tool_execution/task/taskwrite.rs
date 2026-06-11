@@ -146,7 +146,11 @@ fn reinitialize_task_context(
 ) {
     // IMPORTANT: Re-initialize TaskLoopContext from session.
     *task_context = TaskLoopContext::from_session(session);
-    if task_context.is_some() {
+    if let Some(ctx) = task_context.as_mut() {
+        // Mark the list dirty so the end-of-turn gate spawns exactly one
+        // evaluation for this Task-tool write. This is the only place the flag is
+        // set; it is cleared when the evaluation is spawned.
+        ctx.task_list_dirty = true;
         tracing::debug!("[{}] TaskLoopContext re-initialized after Task", session_id);
     }
 }

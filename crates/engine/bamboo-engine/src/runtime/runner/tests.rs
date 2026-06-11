@@ -224,14 +224,25 @@ async fn agent_loop_refreshes_fast_model_between_rounds_for_task_evaluation() {
     let tools = BuiltinToolExecutorBuilder::new()
         .with_tool(NoopTool)
         .expect("register test tool")
+        .with_command_tool("Task")
+        .expect("register Task tool")
         .build();
 
+    // Task evaluation now fires only on Task-tool writes, so each round must issue
+    // a Task call to exercise the per-round auxiliary fast-model refresh.
     let tool_call = |id: &str| bamboo_agent_core::tools::ToolCall {
         id: id.to_string(),
         tool_type: "function".to_string(),
         function: FunctionCall {
-            name: "noop_tool".to_string(),
-            arguments: "{}".to_string(),
+            name: "Task".to_string(),
+            arguments: serde_json::json!({
+                "tasks": [{
+                    "content": "Verify auxiliary refresh",
+                    "status": "in_progress",
+                    "activeForm": "Verifying auxiliary refresh"
+                }]
+            })
+            .to_string(),
         },
     };
 
