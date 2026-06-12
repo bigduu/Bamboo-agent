@@ -1,0 +1,153 @@
+//! Full production-path integration test for the actor runtime:
+//!
+//! ```text
+//! AppState (real server assembly, friendly `subagents` config)
+//!   -> SubAgent tool `create`
+//!   -> ChildSessionAdapter -> SpawnScheduler -> run_child_spawn (wants_external)
+//!   -> ActorChildRunner -> spawns the REAL `bamboo subagent-worker` process
+//!   -> stdin ProvisionSpec -> fabric self-register -> WS run (echo, no LLM)
+//!   -> terminal -> result written back onto the child session + status persisted
+//! ```
+//!
+//! This is the exact wiring a user gets from `"subagents": { "runtime": "actor" }`;
+//! only the executor is `echo` so no API key is needed.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use bamboo_agent_core::storage::Storage as _;
+use bamboo_agent_core::tools::ToolExecutionContext;
+use bamboo_agent_core::{Role, Session};
+use bamboo_domain::session::tool_types::{FunctionCall, ToolCall};
+use bamboo_server::app_state::AppState;
+use bamboo_server::tools::ToolSurface;
+use tempfile::TempDir;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subagent_create_runs_actor_process_through_the_server() {
+    let bamboo_bin = env!("CARGO_BIN_EXE_bamboo");
+    let home = TempDir::new().unwrap();
+    let fabric_dir = home.path().join("fabric");
+
+    // The friendly config a user would write — plus expert worker_bin override
+    // because inside a test the "current executable" is the test runner, not bamboo.
+    let config = serde_json::json!({
+        "provider": "anthropic",
+        "providers": { "anthropic": { "api_key": "test-key", "model": "claude-test" } },
+        "subagents": {
+            "runtime": "actor",
+            "executor": "echo",
+            "worker_bin": bamboo_bin,
+            "worker_args": ["subagent-worker"],
+            "fabric_dir": fabric_dir.to_string_lossy(),
+            "max_concurrent": 2
+        }
+    });
+    std::fs::write(
+        home.path().join("config.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+
+    let state = AppState::new(home.path().to_path_buf())
+        .await
+        .expect("app state boots");
+
+    // A root session for the parent (workspace = the temp dir).
+    let parent_id = "parent-actor-e2e";
+    let mut parent = Session::new(parent_id, "claude-test");
+    parent.title = "Actor e2e parent".into();
+    parent.workspace = Some(home.path().to_string_lossy().into_owned());
+    state.storage.save_session(&parent).await.unwrap();
+    state.session_store.save_session(&parent).await.unwrap();
+
+    // Invoke the SubAgent tool exactly as the LLM would.
+    let tools = state.tool_factory.get(ToolSurface::Root);
+    let args = serde_json::json!({
+        "action": "create",
+        "title": "Echo task",
+        "responsibility": "echo the assignment",
+        "prompt": "hello actor",
+        "wait": false,
+        "auto_run": true
+    });
+    let call = ToolCall {
+        id: "t1".into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "SubAgent".into(),
+            arguments: args.to_string(),
+        },
+    };
+    let mut ctx = ToolExecutionContext::none("t1");
+    ctx.session_id = Some(parent_id);
+    let result = tools
+        .execute_with_context(&call, ctx)
+        .await
+        .expect("SubAgent.create succeeds");
+    assert!(result.success, "create failed: {}", result.result);
+
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    let child_id = payload["child_session_id"]
+        .as_str()
+        .expect("create returns child_session_id")
+        .to_string();
+
+    // Wait for the actor process round-trip: spawn -> register -> WS -> echo -> terminal
+    // -> write-back -> persist (status flips to completed).
+    let mut completed_child: Option<Session> = None;
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Ok(Some(child)) = state.storage.load_session(&child_id).await {
+            let status: HashMap<_, _> = child.metadata.clone().into_iter().collect();
+            let runtime_status = child
+                .runtime_metadata
+                .as_ref()
+                .and_then(|m| m.last_run_status.clone())
+                .or_else(|| status.get("last_run_status").cloned());
+            match runtime_status.as_deref() {
+                Some("completed") => {
+                    completed_child = Some(child);
+                    break;
+                }
+                Some("error") | Some("timeout") | Some("cancelled") => {
+                    panic!(
+                        "actor child ended with status {:?}, error: {:?}",
+                        runtime_status,
+                        child
+                            .runtime_metadata
+                            .as_ref()
+                            .and_then(|m| m.last_run_error.clone())
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let child = completed_child.expect("actor child should complete within 60s");
+
+    // The actor's reply was written back onto the child session (the actor's
+    // durable state), so the transcript survives the process.
+    let reply = child
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::Assistant))
+        .map(|m| m.content.clone())
+        .expect("child session has the actor's assistant reply");
+    assert!(
+        reply.starts_with("echo:"),
+        "expected echo result written back, got: {reply}"
+    );
+    assert!(
+        reply.contains("hello actor"),
+        "echo should contain the assignment text, got: {reply}"
+    );
+
+    // Routing metadata proves it went through the actor path (not in-process).
+    assert_eq!(
+        child.metadata.get("external.protocol").map(String::as_str),
+        Some("actor")
+    );
+}
