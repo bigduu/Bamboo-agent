@@ -5,7 +5,7 @@
 //! policy is satisfied.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -117,6 +117,28 @@ fn read_config_snapshot(config: &Arc<RwLock<Config>>, cached_config: &StdRwLock<
             .map(|guard| guard.clone())
             .unwrap_or_default()
     }
+}
+
+/// Per-parent async locks that serialize concurrent `on_child_completed`
+/// invocations for the same parent session.
+///
+/// Race eliminated: when `wait_for=Any` and two child sessions complete
+/// simultaneously, both invocations load the parent with
+/// `waiting_for_children=Some` before either persists the cleared state, so
+/// both pass `wait_policy_satisfied`, both clear `waiting_for_children`, add a
+/// duplicate resume message, and call `resume_parent` — a double resume.
+/// Holding this per-parent `tokio::sync::Mutex` across the load-check-save
+/// critical section makes the second caller observe the already-cleared state.
+///
+/// The inner `std::sync::Mutex` guards only the brief HashMap lookup/insert
+/// (no await inside); the per-parent `tokio::sync::Mutex` is the one held
+/// across the async critical section. Entries accumulate but are small
+/// (`Arc<tokio::sync::Mutex<()>>` ≈ 24 bytes) and bounded by the number of
+/// distinct parent sessions.
+fn parent_locks() -> &'static std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
 fn wait_policy_satisfied(
@@ -321,6 +343,18 @@ impl ChildCompletionCoordinator {
 #[async_trait]
 impl ChildCompletionHandler for ChildCompletionCoordinator {
     async fn on_child_completed(&self, completion: ChildCompletion) {
+        // Acquire a per-parent async lock to eliminate the concurrent
+        // double-resume race (see `parent_locks` for the full scenario). The
+        // inner std::sync::Mutex is released immediately so no sync lock is
+        // held across the await that follows.
+        let per_parent = {
+            let mut map = parent_locks().lock().expect("parent lock map poisoned");
+            map.entry(completion.parent_session_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _per_parent_guard = per_parent.lock().await;
+
         let Some(mut parent) = self.load_session(&completion.parent_session_id).await else {
             tracing::warn!(
                 parent_session_id = %completion.parent_session_id,
@@ -413,8 +447,15 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
         write_runtime_state(&mut parent, &runtime_state);
         self.save_and_cache(&mut parent).await;
 
+        // Capture before releasing the per-parent lock so the borrow checker
+        // is satisfied; `resume_parent` has its own retry loop and should not
+        // hold the per-parent lock (it would block other completions for the
+        // same parent, and the state is already durably settled above).
+        let resume_parent_id = parent.id.clone();
+        drop(_per_parent_guard);
+
         if should_resume {
-            self.resume_parent(parent.id.clone()).await;
+            self.resume_parent(resume_parent_id).await;
         }
     }
 }

@@ -334,6 +334,10 @@ infra(infra) ─────┘
 | 凭证短期 token / 父代理模式 | 安全迭代;`SecretsEnvelope` 已留演进位 |
 | `Limits` 强制执行 | 资源限额需求明确时(父侧 watchdog 已兜总超时) |
 | Tier-1 fabric 介质替换(文件目录 → 可插拔) | 多机/容器化部署时:`/tmp` 共享文件系统是单机假设,届时以 `Fabric` 为 seam 换 Redis/etcd/k8s 服务发现(2026-06-12 `-p` 并行自调研发现) |
+| `last_run_status` 双写引入版本号/CAS | 第三轮自检发现(中):cancel 与 background task 的终态写入交错时取决于写顺序;设计级改动,下个迭代 |
+| 测试缺口 Top:`service_agent_concurrent_no_crosstalk` + `cancel_running_child_e2e_actor` | 第三轮测试缺口分析的 风险×成本 前两名 |
+
+> 📌 **已审定行为(非缺陷)**:watchdog 超时与外部 cancel 并发时终态标 `"timeout"` 而非 `"cancelled"`——超时即取消的根因,该标签信息量更大(第三轮自检 #3 的复核结论)。
 
 > 📌 **已修(同分支)**:store 索引写入的"registry 单写者"原为口头契约、无运行时防护——并发误用会静默覆盖 `index.json`(同次自调研发现);已在 `SubagentStore` 内加写串行化兜底。
 

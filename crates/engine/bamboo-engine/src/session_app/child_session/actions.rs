@@ -369,6 +369,23 @@ pub async fn send_message_to_child_action(
         pending.push(serde_json::to_value(&queued).unwrap_or(serde_json::Value::Null));
         child.set_pending_injected_messages(pending);
         port.save_child_session(&mut child).await?;
+
+        // Race guard: the `is_running` snapshot above may be stale — if the
+        // child finished between that check and this queue write, nothing
+        // would ever drain the pending message. Re-check and schedule a run
+        // so the message is processed instead of stranding.
+        if !port.is_child_running(&child.id).await {
+            port.enqueue_child_run(parent, &child).await?;
+            return Ok(json!({
+                "child_session_id": child.id,
+                "status": "queued",
+                "auto_run": true,
+                "message": message,
+                "message_count": child.messages.len(),
+                "note": "Child finished while the message was being queued; a new run was scheduled to process it.",
+            }));
+        }
+
         return Ok(json!({
             "child_session_id": child.id,
             "status": "message_queued",
