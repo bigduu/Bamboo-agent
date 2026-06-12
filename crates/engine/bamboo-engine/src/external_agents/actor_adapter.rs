@@ -1,12 +1,14 @@
-//! Subprocess external child runner.
+//! Actor external child runner.
 //!
-//! Runs a child session as a **separate OS process** that speaks the `bamboo-subagent` WebSocket
-//! protocol. This is the engine-side adapter on the `wants_external` seam: it spawns the worker
-//! binary, waits for it to self-register into the Tier-1 file fabric, connects, sends the
-//! assignment, and forwards the child's `AgentEvent`s back onto the parent's `event_tx`.
+//! Runs a child session as an independent **actor**: a separate OS process with its own
+//! isolated context, speaking the `bamboo-subagent` WebSocket protocol. This is the
+//! engine-side adapter on the `wants_external` seam: it spawns the worker binary, waits for
+//! it to self-register into the Tier-1 file fabric, connects, sends the assignment, and
+//! forwards the child's `AgentEvent`s back onto the parent's `event_tx`.
 //!
-//! Gated entirely behind config (`externalAgents` + `subagentRouting`); when no `subprocess`
-//! profile is configured, this runner is never built and default behavior is unchanged.
+//! Gated entirely behind config (`subagents.runtime = "actor"` or the expert
+//! `externalAgents` tables); when nothing routes to an actor, this runner is never built
+//! and default behavior is unchanged.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -25,8 +27,8 @@ use bamboo_subagent::transport::ChildClient;
 
 use crate::runtime::execution::{ExternalChildRunner, SpawnJob};
 
-/// Spawns and drives a child session as a `bamboo-subagent` worker subprocess.
-pub struct SubprocessChildRunner {
+/// Spawns and drives a child session as an independent actor: a `bamboo-subagent` worker process.
+pub struct ActorChildRunner {
     agent_id: String,
     worker_bin: PathBuf,
     worker_args: Vec<String>,
@@ -40,7 +42,7 @@ pub struct SubprocessChildRunner {
     spawn_timeout: Duration,
 }
 
-impl SubprocessChildRunner {
+impl ActorChildRunner {
     pub fn new(
         agent_id: String,
         worker_bin: PathBuf,
@@ -107,7 +109,7 @@ impl SubprocessChildRunner {
             spec.secrets.provider_credentials.push(cred.clone());
         } else {
             tracing::warn!(
-                "subprocess child {}: no credential found for provider '{}'",
+                "actor child {}: no credential found for provider '{}'",
                 job.child_session_id,
                 provider
             );
@@ -117,10 +119,10 @@ impl SubprocessChildRunner {
 }
 
 #[async_trait]
-impl ExternalChildRunner for SubprocessChildRunner {
+impl ExternalChildRunner for ActorChildRunner {
     async fn should_handle(&self, session: &Session) -> bool {
         session.metadata.get("runtime.kind") == Some(&"external".to_string())
-            && session.metadata.get("external.protocol") == Some(&"subprocess".to_string())
+            && session.metadata.get("external.protocol") == Some(&"actor".to_string())
             && session.metadata.get("external.agent_id") == Some(&self.agent_id)
     }
 
@@ -136,18 +138,18 @@ impl ExternalChildRunner for SubprocessChildRunner {
 
         let spawned = spawn_worker(&self.worker_bin, &self.worker_args, &spec, self.spawn_timeout)
             .await
-            .map_err(|e| AgentError::LLM(format!("subprocess spawn/register failed: {e}")))?;
+            .map_err(|e| AgentError::LLM(format!("actor spawn/register failed: {e}")))?;
 
         let mut client = ChildClient::connect(&spawned.record.endpoint)
             .await
-            .map_err(|e| AgentError::LLM(format!("subprocess connect failed: {e}")))?;
+            .map_err(|e| AgentError::LLM(format!("actor connect failed: {e}")))?;
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment,
                 reasoning_effort: None,
             }))
             .await
-            .map_err(|e| AgentError::LLM(format!("subprocess run dispatch failed: {e}")))?;
+            .map_err(|e| AgentError::LLM(format!("actor run dispatch failed: {e}")))?;
 
         let result = drive(&mut client, &event_tx, &cancel_token).await;
 
@@ -182,17 +184,17 @@ async fn drive(
                             TerminalStatus::Completed => Ok(()),
                             TerminalStatus::Cancelled => Err(AgentError::Cancelled),
                             TerminalStatus::Error => Err(AgentError::LLM(
-                                error.unwrap_or_else(|| "subprocess child errored".to_string()),
+                                error.unwrap_or_else(|| "actor child errored".to_string()),
                             )),
                         };
                     }
                     Ok(None) => {
                         return Err(AgentError::LLM(
-                            "subprocess child closed before terminal".to_string(),
+                            "actor child closed before terminal".to_string(),
                         ));
                     }
                     Err(e) => {
-                        return Err(AgentError::LLM(format!("subprocess transport error: {e}")));
+                        return Err(AgentError::LLM(format!("actor transport error: {e}")));
                     }
                 }
             }

@@ -2,7 +2,7 @@ pub mod a2a_adapter;
 pub mod config;
 pub mod mapping;
 pub mod runtime;
-pub mod subprocess_adapter;
+pub mod actor_adapter;
 
 pub use a2a_adapter::A2AExternalChildRunner;
 pub use config::{
@@ -10,4 +10,4 @@ pub use config::{
     ExternalAgentProtocol, SubagentRouting,
 };
 pub use runtime::build_external_child_runner;
-pub use subprocess_adapter::SubprocessChildRunner;
+pub use actor_adapter::ActorChildRunner;

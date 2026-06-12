@@ -245,27 +245,29 @@ pub enum SubagentRuntimeMode {
     /// Run sub-agents inside the server process (the historical default).
     #[default]
     InProcess,
-    /// Run each sub-agent as an isolated OS subprocess (crash isolation,
-    /// true parallelism, per-child resource limits).
-    Subprocess,
+    /// Run each sub-agent as an independent actor: an isolated OS process
+    /// with its own context (crash isolation, true parallelism, per-child
+    /// resource limits). `subprocess` is accepted as an alias.
+    #[serde(alias = "subprocess")]
+    Actor,
 }
 
 /// Sub-agent execution settings.
 ///
 /// Friendly path — one switch:
 /// ```json
-/// "subagents": { "runtime": "subprocess" }
+/// "subagents": { "runtime": "actor" }
 /// ```
 /// Per-role exceptions:
 /// ```json
-/// "subagents": { "runtime": "subprocess", "overrides": { "researcher": "in_process" } }
+/// "subagents": { "runtime": "actor", "overrides": { "researcher": "in_process" } }
 /// ```
 /// The worker binary, its arguments, and the discovery directory are derived
 /// automatically (the current `bamboo` executable + `subagent-worker`); the
 /// expert fields below override them only when you run a custom worker.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SubagentsConfig {
-    /// Default runtime for all sub-agents: `in_process` (default) or `subprocess`.
+    /// Default runtime for all sub-agents: `in_process` (default) or `actor`.
     #[serde(default)]
     pub runtime: SubagentRuntimeMode,
     /// Per-`subagent_type` exceptions to `runtime` (highest precedence).
@@ -282,7 +284,7 @@ pub struct SubagentsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fabric_dir: Option<String>,
     /// Expert: `"echo"` swaps in a dependency-free smoke executor (no LLM)
-    /// to verify the subprocess chain end-to-end.
+    /// to verify the actor chain end-to-end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
 }
@@ -296,13 +298,13 @@ impl SubagentsConfig {
             .unwrap_or(self.runtime)
     }
 
-    /// True if any sub-agent could run as a subprocess under this config.
-    pub fn any_subprocess(&self) -> bool {
-        self.runtime == SubagentRuntimeMode::Subprocess
+    /// True if any sub-agent could run as an actor process under this config.
+    pub fn any_actor(&self) -> bool {
+        self.runtime == SubagentRuntimeMode::Actor
             || self
                 .overrides
                 .values()
-                .any(|m| *m == SubagentRuntimeMode::Subprocess)
+                .any(|m| *m == SubagentRuntimeMode::Actor)
     }
 }
 
@@ -427,10 +429,11 @@ pub struct Config {
     /// Sub-agent execution settings.
     ///
     /// The one knob most users need is `runtime`:
-    /// `"subagents": { "runtime": "subprocess" }` runs every sub-agent as an
-    /// isolated OS process (crash isolation, true parallelism). Everything
-    /// else (worker binary, discovery dir) is derived automatically.
-    /// Always serialized so the knob is discoverable in `bamboo config`.
+    /// `"subagents": { "runtime": "actor" }` runs every sub-agent as an
+    /// independent actor process (crash isolation, true parallelism).
+    /// Everything else (worker binary, discovery dir) is derived
+    /// automatically. Always serialized so the knob is discoverable in
+    /// `bamboo config`.
     #[serde(default)]
     pub subagents: SubagentsConfig,
 

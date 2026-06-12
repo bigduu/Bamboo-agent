@@ -20,19 +20,19 @@ pub struct ExternalAgentProfile {
     pub skill: Option<String>,
     #[serde(default)]
     pub allow_non_streaming_fallback: bool,
-    /// Subprocess protocol only: path to the worker binary to spawn.
+    /// Actor protocol only: path to the worker binary to spawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_bin: Option<String>,
-    /// Subprocess protocol only: fixed arguments passed to the worker binary
+    /// Actor protocol only: fixed arguments passed to the worker binary
     /// (e.g. `["subagent-worker"]` when `worker_bin` is the main `bamboo`
     /// binary). Per-child data never rides here — it goes in the spec.
     #[serde(default)]
     pub worker_args: Vec<String>,
-    /// Subprocess protocol only: directory the worker self-registers into
+    /// Actor protocol only: directory the worker self-registers into
     /// (Tier-1 file fabric). Defaults to a per-user temp dir when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fabric_dir: Option<String>,
-    /// Subprocess protocol only: which engine the worker runs.
+    /// Actor protocol only: which engine the worker runs.
     /// `"bamboo_runtime"` (default) for the real agent loop, `"echo"` for a
     /// dependency-free smoke run through the whole chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -43,9 +43,9 @@ pub struct ExternalAgentProfile {
 pub enum ExternalAgentProtocol {
     #[serde(rename = "a2a_jsonrpc")]
     A2aJsonRpc,
-    /// Local OS subprocess speaking the `bamboo-subagent` WebSocket protocol.
-    #[serde(rename = "subprocess")]
-    Subprocess,
+    /// Independent actor process speaking the `bamboo-subagent` WebSocket protocol.
+    #[serde(rename = "actor", alias = "subprocess")]
+    Actor,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,9 +91,9 @@ pub fn parse_subagent_routing(config: &Config) -> HashMap<String, SubagentRoutin
     }
 }
 
-/// Synthetic agent id for the built-in local subprocess worker (friendly
-/// `subagents.runtime = "subprocess"` path; no `externalAgents` entry needed).
-pub const LOCAL_SUBPROCESS_AGENT_ID: &str = "local-subprocess";
+/// Synthetic agent id for the built-in local actor worker (friendly
+/// `subagents.runtime = "actor"` path; no `externalAgents` entry needed).
+pub const LOCAL_ACTOR_AGENT_ID: &str = "local-actor";
 
 /// Resolve runtime metadata for a subagent_type based on config routing.
 ///
@@ -104,13 +104,13 @@ pub const LOCAL_SUBPROCESS_AGENT_ID: &str = "local-subprocess";
 pub fn resolve_runtime_metadata(config: &Config, subagent_type: &str) -> HashMap<String, String> {
     use bamboo_config::SubagentRuntimeMode;
 
-    let local_subprocess_metadata = || {
+    let local_actor_metadata = || {
         HashMap::from([
             ("runtime.kind".to_string(), "external".to_string()),
-            ("external.protocol".to_string(), "subprocess".to_string()),
+            ("external.protocol".to_string(), "actor".to_string()),
             (
                 "external.agent_id".to_string(),
-                LOCAL_SUBPROCESS_AGENT_ID.to_string(),
+                LOCAL_ACTOR_AGENT_ID.to_string(),
             ),
         ])
     };
@@ -118,7 +118,7 @@ pub fn resolve_runtime_metadata(config: &Config, subagent_type: &str) -> HashMap
     // 1. Explicit per-role override: decides absolutely (either direction).
     if let Some(mode) = config.subagents.overrides.get(subagent_type) {
         return match mode {
-            SubagentRuntimeMode::Subprocess => local_subprocess_metadata(),
+            SubagentRuntimeMode::Actor => local_actor_metadata(),
             SubagentRuntimeMode::InProcess => HashMap::new(),
         };
     }
@@ -130,8 +130,8 @@ pub fn resolve_runtime_metadata(config: &Config, subagent_type: &str) -> HashMap
 
     let Some(route) = routing.get(subagent_type) else {
         // 3. No expert routing for this type: apply the typed global default.
-        if config.subagents.runtime == SubagentRuntimeMode::Subprocess {
-            return local_subprocess_metadata();
+        if config.subagents.runtime == SubagentRuntimeMode::Actor {
+            return local_actor_metadata();
         }
         return metadata;
     };
@@ -147,7 +147,7 @@ pub fn resolve_runtime_metadata(config: &Config, subagent_type: &str) -> HashMap
                     "external.protocol".to_string(),
                     match profile.protocol {
                         ExternalAgentProtocol::A2aJsonRpc => "a2a_jsonrpc".to_string(),
-                        ExternalAgentProtocol::Subprocess => "subprocess".to_string(),
+                        ExternalAgentProtocol::Actor => "actor".to_string(),
                     },
                 );
                 metadata.insert(
@@ -262,26 +262,26 @@ mod tests {
     // ---- friendly typed `subagents` config ----
 
     #[test]
-    fn typed_global_subprocess_routes_every_type() {
+    fn typed_global_actor_routes_every_type() {
         let mut config = Config::default();
-        config.subagents.runtime = bamboo_config::SubagentRuntimeMode::Subprocess;
+        config.subagents.runtime = bamboo_config::SubagentRuntimeMode::Actor;
 
         let metadata = resolve_runtime_metadata(&config, "researcher");
         assert_eq!(metadata.get("runtime.kind"), Some(&"external".to_string()));
         assert_eq!(
             metadata.get("external.protocol"),
-            Some(&"subprocess".to_string())
+            Some(&"actor".to_string())
         );
         assert_eq!(
             metadata.get("external.agent_id"),
-            Some(&LOCAL_SUBPROCESS_AGENT_ID.to_string())
+            Some(&LOCAL_ACTOR_AGENT_ID.to_string())
         );
     }
 
     #[test]
     fn typed_override_beats_global_default() {
         let mut config = Config::default();
-        config.subagents.runtime = bamboo_config::SubagentRuntimeMode::Subprocess;
+        config.subagents.runtime = bamboo_config::SubagentRuntimeMode::Actor;
         config.subagents.overrides.insert(
             "researcher".to_string(),
             bamboo_config::SubagentRuntimeMode::InProcess,
@@ -304,21 +304,21 @@ mod tests {
         );
         config.subagents.overrides.insert(
             "impl".to_string(),
-            bamboo_config::SubagentRuntimeMode::Subprocess,
+            bamboo_config::SubagentRuntimeMode::Actor,
         );
 
         let metadata = resolve_runtime_metadata(&config, "impl");
         // the typed per-role override wins over the legacy expert table
         assert_eq!(
             metadata.get("external.agent_id"),
-            Some(&LOCAL_SUBPROCESS_AGENT_ID.to_string())
+            Some(&LOCAL_ACTOR_AGENT_ID.to_string())
         );
     }
 
     #[test]
     fn legacy_routing_beats_typed_global_default() {
         let mut config = Config::default();
-        config.subagents.runtime = bamboo_config::SubagentRuntimeMode::Subprocess;
+        config.subagents.runtime = bamboo_config::SubagentRuntimeMode::Actor;
         config.extra.insert(
             "externalAgents".to_string(),
             serde_json::json!({

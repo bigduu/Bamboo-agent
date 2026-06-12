@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::a2a_adapter::A2AExternalChildRunner;
 use super::config::{parse_external_agents, ExternalAgentProtocol};
-use super::subprocess_adapter::SubprocessChildRunner;
+use super::actor_adapter::ActorChildRunner;
 
 /// Composite router that delegates to the first matching external child runner.
 pub struct CompositeExternalChildRunner {
@@ -58,8 +58,8 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
 ///
 /// Returns `None` when nothing routes externally. Builds a composite router
 /// over all configured runners so `external.agent_id` metadata selects the
-/// right one. The friendly `subagents.runtime = "subprocess"` switch
-/// synthesizes a local subprocess runner automatically — worker binary,
+/// right one. The friendly `subagents.runtime = "actor"` switch
+/// synthesizes a local actor runner automatically — worker binary,
 /// arguments, and discovery dir are all derived; no expert tables needed.
 pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalChildRunner>> {
     let agents = parse_external_agents(config);
@@ -67,10 +67,10 @@ pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalCh
     let mut runners: Vec<Arc<dyn ExternalChildRunner>> = Vec::new();
 
     // Friendly path: one switch in typed config -> built-in local worker.
-    if config.subagents.any_subprocess() {
-        match build_local_subprocess_runner(config) {
+    if config.subagents.any_actor() {
+        match build_local_actor_runner(config) {
             Ok(runner) => runners.push(runner),
-            Err(e) => tracing::error!("subagents.runtime=subprocess unavailable: {e}"),
+            Err(e) => tracing::error!("subagents.runtime=actor unavailable: {e}"),
         }
     }
 
@@ -79,11 +79,11 @@ pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalCh
     }
 
     for (_agent_id, profile) in agents {
-        // Subprocess protocol: spawn a local worker binary over the bamboo-subagent WS protocol.
-        if matches!(profile.protocol, ExternalAgentProtocol::Subprocess) {
+        // Actor protocol: spawn a local worker binary over the bamboo-subagent WS protocol.
+        if matches!(profile.protocol, ExternalAgentProtocol::Actor) {
             let Some(worker_bin) = profile.worker_bin.as_ref() else {
                 tracing::error!(
-                    "Subprocess agent profile {} has no worker_bin; skipping",
+                    "Actor agent profile {} has no worker_bin; skipping",
                     profile.agent_id
                 );
                 continue;
@@ -100,14 +100,14 @@ pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalCh
                 }
                 Some(other) => {
                     tracing::error!(
-                        "Subprocess agent profile {} has unknown executor '{}'; skipping",
+                        "Actor agent profile {} has unknown executor '{}'; skipping",
                         profile.agent_id,
                         other
                     );
                     continue;
                 }
             };
-            runners.push(Arc::new(SubprocessChildRunner::new(
+            runners.push(Arc::new(ActorChildRunner::new(
                 profile.agent_id.clone(),
                 std::path::PathBuf::from(worker_bin),
                 profile.worker_args.clone(),
@@ -178,11 +178,11 @@ pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalCh
     }
 }
 
-/// Build the built-in local subprocess runner from the typed `subagents`
+/// Build the built-in local actor runner from the typed `subagents`
 /// config. Everything is derived: worker = the current bamboo executable +
 /// `subagent-worker`, fabric = per-user temp dir — unless expert fields
 /// override them.
-fn build_local_subprocess_runner(
+fn build_local_actor_runner(
     config: &Config,
 ) -> Result<Arc<dyn ExternalChildRunner>, String> {
     let sub = &config.subagents;
@@ -212,8 +212,8 @@ fn build_local_subprocess_runner(
         Some(other) => return Err(format!("unknown subagents.executor '{other}'")),
     };
 
-    Ok(Arc::new(SubprocessChildRunner::new(
-        super::config::LOCAL_SUBPROCESS_AGENT_ID.to_string(),
+    Ok(Arc::new(ActorChildRunner::new(
+        super::config::LOCAL_ACTOR_AGENT_ID.to_string(),
         worker_bin,
         worker_args,
         fabric_dir,
@@ -223,7 +223,7 @@ fn build_local_subprocess_runner(
     )))
 }
 
-/// Snapshot per-provider credentials from the parent config for subprocess
+/// Snapshot per-provider credentials from the parent config for actor
 /// provisioning. Serialized generically so this code does not chase the
 /// per-provider config struct shapes — any slot with a non-empty `api_key`
 /// yields a scoped credential (plus `base_url` when present).
