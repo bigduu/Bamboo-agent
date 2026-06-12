@@ -43,9 +43,11 @@ struct Cli {
     #[arg(long)]
     echo: bool,
 
-    /// With -p: print raw event JSON instead of pretty streaming.
-    #[arg(long)]
-    raw: bool,
+    /// With -p: NDJSON streaming on stdout — one JSON object per line:
+    /// {"type":"session_started",...}, every agent event verbatim, then a
+    /// final {"type":"result",...} envelope. Pipe-safe (logs go to stderr).
+    #[arg(long = "stream-json", alias = "raw")]
+    stream_json: bool,
 }
 
 #[derive(Subcommand)]
@@ -237,7 +239,7 @@ async fn main() {
                     workspace: cli.workspace,
                     data_dir: cli.data_dir,
                     echo: true,
-                    raw: cli.raw,
+                    raw: cli.stream_json,
                 };
                 if let Err(e) = bamboo_agent::actor_cli::run(args).await {
                     eprintln!("run failed: {e}");
@@ -263,7 +265,7 @@ async fn main() {
                 model: cli.model,
                 workspace: cli.workspace,
                 data_dir: bamboo_home_dir,
-                raw: cli.raw,
+                stream_json: cli.stream_json,
             };
             if let Err(e) = bamboo_agent::headless::run(args).await {
                 eprintln!("run failed: {e}");

@@ -24,7 +24,11 @@ pub struct HeadlessArgs {
     pub model: Option<String>,
     pub workspace: Option<PathBuf>,
     pub data_dir: PathBuf,
-    pub raw: bool,
+    /// NDJSON streaming: one JSON object per line on stdout —
+    /// `session_started`, every AgentEvent verbatim, then a final `result`
+    /// envelope. Nothing else is written to stdout (logs go to stderr), so
+    /// the stream is pipe-safe.
+    pub stream_json: bool,
 }
 
 pub async fn run(args: HeadlessArgs) -> Result<(), String> {
@@ -98,7 +102,18 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
 
     let model_ref = parse_model_ref(&args.model)?;
 
-    eprintln!("▶ session {session_id}");
+    if args.stream_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "session_started",
+                "session_id": session_id,
+                "resumed": args.session.is_some(),
+            })
+        );
+    } else {
+        eprintln!("▶ session {session_id}");
+    }
     let data = web::Data::new(state);
     let response = execute_handler(
         data.clone(),
@@ -138,7 +153,7 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
                     Ok(event) => {
                         last_event = Instant::now();
                         if let Ok(value) = serde_json::to_value(&event) {
-                            if args.raw {
+                            if args.stream_json {
                                 println!("{value}");
                             } else {
                                 print_server_event(&value, &mut streamed_tokens);
@@ -176,25 +191,47 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
     }
 
     // ---- final output ----
-    println!();
-    if let Ok(Some(session)) = data.storage.load_session(&session_id).await {
-        if !streamed_tokens {
-            if let Some(reply) = session
+    let final_reply = data
+        .storage
+        .load_session(&session_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|session| {
+            session
                 .messages
                 .iter()
                 .rev()
                 .find(|m| matches!(m.role, Role::Assistant))
-            {
-                println!("{}", reply.content);
+                .map(|m| m.content.clone())
+        });
+
+    if args.stream_json {
+        // Terminal envelope: machine-readable summary closing the stream.
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "result",
+                "session_id": session_id,
+                "status": if exit.is_ok() { "finished" } else { "error" },
+                "result": final_reply,
+                "error": exit.as_ref().err(),
+            })
+        );
+    } else {
+        println!();
+        if !streamed_tokens {
+            if let Some(reply) = &final_reply {
+                println!("{reply}");
             }
         }
+        match &exit {
+            Ok(()) => eprintln!("✔ finished"),
+            Err(e) => eprintln!("✘ {e}"),
+        }
+        eprintln!("session: {session_id}");
+        eprintln!("continue with: bamboo -p \"<next message>\" -s {session_id}");
     }
-    match &exit {
-        Ok(()) => eprintln!("✔ finished"),
-        Err(e) => eprintln!("✘ {e}"),
-    }
-    eprintln!("session: {session_id}");
-    eprintln!("continue with: bamboo -p \"<next message>\" -s {session_id}");
     exit
 }
 
