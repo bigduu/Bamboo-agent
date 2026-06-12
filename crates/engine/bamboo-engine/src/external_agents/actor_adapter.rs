@@ -178,7 +178,13 @@ impl ExternalChildRunner for ActorChildRunner {
             .await
             .map_err(|e| AgentError::LLM(format!("actor run dispatch failed: {e}")))?;
 
-        let result = drive(&mut client, &event_tx, &cancel_token).await;
+        // Register as a live actor so send_message (running, no interrupt) can
+        // steer this child in-band over the existing WS connection. The guard
+        // unregisters on every exit path.
+        let (live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
+        let _live_guard = super::live::register(&job.child_session_id, live_tx);
+
+        let result = drive(&mut client, &event_tx, &cancel_token, &mut live_rx).await;
 
         let _ = client.close().await;
         spawned.kill().await;
@@ -201,16 +207,24 @@ impl ExternalChildRunner for ActorChildRunner {
 
 /// Pump child frames -> parent events until a terminal frame (or cancellation).
 /// On success, yields the actor's final result text (for session write-back).
+/// `live_rx` carries in-band frames (steering messages) from the live registry.
 async fn drive(
     client: &mut ChildClient,
     event_tx: &mpsc::Sender<AgentEvent>,
     cancel_token: &CancellationToken,
+    live_rx: &mut mpsc::UnboundedReceiver<ParentFrame>,
 ) -> crate::runtime::runner::Result<Option<String>> {
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
                 // fall through to the cancel handling below
                 break;
+            }
+            Some(frame) = live_rx.recv() => {
+                // Forward in-band steering to the worker over the existing WS.
+                if client.send(frame).await.is_err() {
+                    tracing::warn!("live steering frame could not be sent; connection failing");
+                }
             }
             frame = client.next_frame() => {
                 match frame {

@@ -16,7 +16,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_async, connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
-use crate::executor::{ChildExecutor, EventSink};
+use crate::executor::{ChildExecutor, EventSink, SteerInbox};
 use crate::proto::{ChildFrame, ParentFrame, RunSpec};
 
 #[derive(Debug, thiserror::Error)]
@@ -103,20 +103,29 @@ async fn handle_conn<E: ChildExecutor + ?Sized>(stream: TcpStream, executor: Arc
     let writer = tokio::spawn(writer_task(ws_tx, out_rx));
 
     let mut active_cancel: Option<CancellationToken> = None;
+    let mut active_steer: Option<mpsc::UnboundedSender<String>> = None;
     while let Some(msg) = ws_rx.next().await {
         match msg? {
             Message::Text(t) => match ParentFrame::from_text(t.as_str()) {
                 Ok(ParentFrame::Run(spec)) => {
                     let cancel = CancellationToken::new();
+                    let (steer_tx, steer_rx) = SteerInbox::channel();
                     active_cancel = Some(cancel.clone());
-                    start_run(executor.clone(), spec, cancel, out_tx.clone());
+                    active_steer = Some(steer_tx);
+                    start_run(executor.clone(), spec, steer_rx, cancel, out_tx.clone());
                 }
                 Ok(ParentFrame::Cancel) => {
                     if let Some(c) = &active_cancel {
                         c.cancel();
                     }
                 }
-                Ok(ParentFrame::Message { .. }) => { /* multi-turn: slice 4 */ }
+                Ok(ParentFrame::Message { text }) => {
+                    // In-band steering: hand to the active run's inbox; the
+                    // executor admits it at its next safe point.
+                    if let Some(steer) = &active_steer {
+                        let _ = steer.send(text);
+                    }
+                }
                 Err(_) => { /* ignore malformed frame */ }
             },
             Message::Close(_) => break,
@@ -144,6 +153,7 @@ async fn writer_task(
 fn start_run<E: ChildExecutor + ?Sized>(
     executor: Arc<E>,
     spec: RunSpec,
+    steer: SteerInbox,
     cancel: CancellationToken,
     out_tx: mpsc::UnboundedSender<ChildFrame>,
 ) {
@@ -158,7 +168,7 @@ fn start_run<E: ChildExecutor + ?Sized>(
         }
     });
     tokio::spawn(async move {
-        let outcome = executor.run(spec, sink, cancel).await;
+        let outcome = executor.run(spec, sink, steer, cancel).await;
         let _ = fwd.await; // flush all events before the terminal frame
         let _ = out_tx.send(ChildFrame::Terminal {
             status: outcome.status,
@@ -247,6 +257,64 @@ mod tests {
         assert_eq!(status, TerminalStatus::Completed);
         assert_eq!(result.as_deref(), Some("echo: one two"));
         assert!(events.iter().any(|e| e["content"] == "one "));
+
+        let _ = client.close().await;
+        let _ = srv.await;
+    }
+
+    /// Mid-run steering: a `Message` frame reaches the active run's SteerInbox.
+    #[tokio::test]
+    async fn message_frame_routes_to_active_steer_inbox() {
+        use crate::executor::{ChildExecutor, ChildOutcome, SteerInbox};
+
+        /// Completes only after receiving one steering message, echoing it back.
+        struct SteerEcho;
+        #[async_trait::async_trait]
+        impl ChildExecutor for SteerEcho {
+            async fn run(
+                &self,
+                _spec: RunSpec,
+                events: EventSink,
+                mut steer: SteerInbox,
+                _cancel: CancellationToken,
+            ) -> ChildOutcome {
+                let steered = steer.recv().await.unwrap_or_default();
+                events.emit(serde_json::json!({"type": "token", "content": steered.clone()}));
+                ChildOutcome::completed(format!("steered: {steered}"))
+            }
+        }
+
+        let server = WsServer::bind_loopback().await.unwrap();
+        let endpoint = server.ws_endpoint();
+        let srv = tokio::spawn(async move { server.serve_one(Arc::new(SteerEcho)).await });
+
+        let mut client = ChildClient::connect(&endpoint).await.unwrap();
+        client
+            .send(ParentFrame::Run(RunSpec {
+                assignment: "start".into(),
+                reasoning_effort: None,
+                messages: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        // mid-run in-band message
+        client
+            .send(ParentFrame::Message {
+                text: "change course".into(),
+            })
+            .await
+            .unwrap();
+
+        let mut terminal = None;
+        while let Some(frame) = client.next_frame().await.unwrap() {
+            if let ChildFrame::Terminal { status, result, .. } = frame {
+                terminal = Some((status, result));
+                break;
+            }
+        }
+        let (status, result) = terminal.expect("terminal");
+        assert_eq!(status, TerminalStatus::Completed);
+        assert_eq!(result.as_deref(), Some("steered: change course"));
 
         let _ = client.close().await;
         let _ = srv.await;

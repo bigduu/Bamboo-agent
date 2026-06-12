@@ -27,7 +27,7 @@ use bamboo_metrics::{MetricsCollector, SqliteMetricsStorage};
 use bamboo_skills::{SkillManager, SkillStoreConfig};
 use bamboo_storage::{LockedSessionStore, SessionStoreV2};
 use bamboo_subagent::discovery::Fabric;
-use bamboo_subagent::executor::{ChildExecutor, ChildOutcome, EchoExecutor, EventSink};
+use bamboo_subagent::executor::{ChildExecutor, ChildOutcome, EchoExecutor, EventSink, SteerInbox};
 use bamboo_subagent::proto::{AgentRecord, RunSpec};
 use bamboo_subagent::provision::{ExecutorSpec, ProvisionSpec};
 use bamboo_subagent::transport::WsServer;
@@ -216,6 +216,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
         &self,
         run: RunSpec,
         events: EventSink,
+        mut steer: SteerInbox,
         cancel: CancellationToken,
     ) -> ChildOutcome {
         // Fresh session per run, in the worker's isolated store. When the parent
@@ -252,6 +253,38 @@ impl ChildExecutor for BambooRuntimeExecutor {
             self.model.as_deref(),
         );
 
+        // Seed the worker's local store so mid-run steering can read-modify-write
+        // the session's pending_injected_messages (the engine loop merges that
+        // queue from storage at every round boundary).
+        {
+            let mut seed = session.clone();
+            let _ = self.agent.persistence().save_runtime_session(&mut seed).await;
+        }
+
+        // In-band steering: each ParentFrame::Message lands in the local store's
+        // pending queue; the running loop admits it at its next round boundary —
+        // exactly the in-process mechanism, reused across the process boundary.
+        let steer_storage = self.agent.storage().clone();
+        let steer_persistence = self.agent.persistence().clone();
+        let steer_session_id = session.id.clone();
+        let steer_task = tokio::spawn(async move {
+            while let Some(text) = steer.recv().await {
+                if let Ok(Some(mut latest)) = steer_storage.load_session(&steer_session_id).await {
+                    let mut pending = latest.pending_injected_messages().unwrap_or_default();
+                    pending.push(serde_json::json!({
+                        "content": text,
+                        "created_at": chrono::Utc::now(),
+                    }));
+                    latest.set_pending_injected_messages(pending);
+                    if let Err(e) = steer_persistence.save_runtime_session(&mut latest).await {
+                        tracing::warn!("steer message could not be queued: {e}");
+                    }
+                } else {
+                    tracing::warn!("steer message dropped: session not found in worker store");
+                }
+            }
+        });
+
         // AgentEvents stream to the parent verbatim (zero mapping).
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
         let forward = tokio::spawn(async move {
@@ -275,6 +308,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
         }
 
         let result = self.agent.execute(&mut session, builder.build()).await;
+        steer_task.abort();
         let _ = forward.await; // flush remaining events before the terminal frame
 
         match result {

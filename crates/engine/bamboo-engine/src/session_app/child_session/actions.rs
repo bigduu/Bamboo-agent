@@ -339,6 +339,24 @@ pub async fn send_message_to_child_action(
     let message = normalize_required_text(Some(message), "message")?;
 
     if is_running && !should_interrupt {
+        // Actor child with a live WS connection: deliver in-band. The worker's
+        // agent loop admits it at the next round boundary — the same semantics
+        // as the queued path below, extended across the process boundary. The
+        // message is appended to the durable transcript immediately so the
+        // next activation rehydrates with it and nothing is delivered twice.
+        if crate::external_agents::live::deliver_message(&child.id, &message) {
+            child.add_message(bamboo_agent_core::Message::user(message.clone()));
+            port.save_child_session(&mut child).await?;
+            return Ok(json!({
+                "child_session_id": child.id,
+                "status": "message_delivered_live",
+                "auto_run": false,
+                "message": message,
+                "message_count": child.messages.len(),
+                "note": "Message delivered to the running actor in-band; it will be admitted at the next round boundary without canceling progress.",
+            }));
+        }
+
         // Store the message in session runtime metadata so the running agent
         // loop can merge it at the next turn boundary without canceling
         // progress. Routed through the typed accessor (dual-writes the typed

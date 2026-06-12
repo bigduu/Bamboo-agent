@@ -60,10 +60,40 @@ impl ChildOutcome {
     }
 }
 
+/// Mid-run steering inbox: `ParentFrame::Message` texts arriving while a run is
+/// active. Executors that support in-band steering admit them at a safe point
+/// (the engine's round boundary); others may simply ignore the inbox.
+pub struct SteerInbox {
+    rx: mpsc::UnboundedReceiver<String>,
+}
+
+impl SteerInbox {
+    /// Create a sender + inbox pair (the transport holds the sender).
+    pub fn channel() -> (mpsc::UnboundedSender<String>, Self) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (tx, SteerInbox { rx })
+    }
+    /// An already-closed inbox (for tests / executors that don't steer).
+    pub fn disconnected() -> Self {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        SteerInbox { rx }
+    }
+    /// Next steering message, or `None` once the run's sender is gone.
+    pub async fn recv(&mut self) -> Option<String> {
+        self.rx.recv().await
+    }
+}
+
 /// What runs inside an actor. Implemented by the worker with the real runtime.
 #[async_trait]
 pub trait ChildExecutor: Send + Sync + 'static {
-    async fn run(&self, spec: RunSpec, events: EventSink, cancel: CancellationToken) -> ChildOutcome;
+    async fn run(
+        &self,
+        spec: RunSpec,
+        events: EventSink,
+        steer: SteerInbox,
+        cancel: CancellationToken,
+    ) -> ChildOutcome;
 }
 
 /// Dependency-free executor: streams one `token` event per word, then completes with an echo.
@@ -76,6 +106,7 @@ impl ChildExecutor for EchoExecutor {
         &self,
         spec: RunSpec,
         events: EventSink,
+        _steer: SteerInbox,
         cancel: CancellationToken,
     ) -> ChildOutcome {
         for word in spec.assignment.split_whitespace() {
@@ -106,6 +137,7 @@ mod tests {
                 messages: Vec::new(),
                 },
                 sink,
+                SteerInbox::disconnected(),
                 CancellationToken::new(),
             )
             .await;
@@ -134,6 +166,7 @@ mod tests {
                 messages: Vec::new(),
                 },
                 sink,
+                SteerInbox::disconnected(),
                 cancel,
             )
             .await;
