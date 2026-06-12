@@ -9,9 +9,39 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "bamboo")]
 #[command(about = "A fully self-contained AI agent backend framework", long_about = None)]
+#[command(
+    after_help = "QUICK RUN:\n  bamboo -p \"your task\"          run an agent on the prompt and print the result\n  bamboo -p \"ping\" --echo        no-key smoke test of the actor chain\n  bamboo -p \"...\" -m provider:model   pin the model"
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
+
+    /// Run an agent on this prompt and print the result (headless one-shot;
+    /// spawns an isolated actor process and streams its output).
+    #[arg(short = 'p', long = "prompt", global = false)]
+    prompt: Option<String>,
+
+    /// With -p: model as 'provider:model' (or a bare model id on the default
+    /// provider). Defaults to defaults.sub_agent, then defaults.chat.
+    #[arg(short = 'm', long)]
+    model: Option<String>,
+
+    /// With -p: working directory for the agent (defaults to the current dir).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+
+    /// With -p: data directory holding config.json (defaults to ~/.bamboo).
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+
+    /// With -p: use the dependency-free echo executor (no LLM, no key) to
+    /// smoke-test the actor chain.
+    #[arg(long)]
+    echo: bool,
+
+    /// With -p: print raw event JSON instead of pretty streaming.
+    #[arg(long)]
+    raw: bool,
 }
 
 #[derive(Subcommand)]
@@ -108,14 +138,14 @@ async fn main() {
     // Initialize logging (file + stdout, with rotation).
     // Use debug level in debug builds, info in release.
     let debug = cfg!(debug_assertions);
-    match cli.command {
-        Commands::Serve { ref data_dir, .. } => {
+    match &cli.command {
+        Some(Commands::Serve { data_dir, .. }) => {
             let home = data_dir
                 .clone()
                 .unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
             bamboo_agent::server::logging::init_logging_with_home(&home, debug);
         }
-        Commands::Config { .. } => {
+        Some(Commands::Config { .. }) => {
             // No file logging for config subcommand; stdout only.
             tracing_subscriber::fmt()
                 .with_target(true)
@@ -125,9 +155,10 @@ async fn main() {
                 )
                 .init();
         }
-        Commands::SubagentWorker | Commands::Actor { .. } => {
+        Some(Commands::SubagentWorker) | Some(Commands::Actor { .. }) | None => {
             // Worker/CLI logs go to stderr only: stdin/stdout are part of the
-            // bootstrap & streaming protocol and must stay clean.
+            // bootstrap & streaming protocol and must stay clean. (`None` is
+            // the top-level `-p` quick run, or bare `bamboo` -> help.)
             tracing_subscriber::fmt()
                 .with_writer(std::io::stderr)
                 .with_target(true)
@@ -139,7 +170,33 @@ async fn main() {
         }
     }
 
-    match cli.command {
+    // Top-level quick run: `bamboo -p "<prompt>"` — headless one-shot agent.
+    let command = match cli.command {
+        Some(command) => command,
+        None => {
+            let Some(prompt) = cli.prompt else {
+                use clap::CommandFactory;
+                let _ = Cli::command().print_help();
+                std::process::exit(2);
+            };
+            let args = bamboo_agent::actor_cli::ActorRunArgs {
+                prompt,
+                model: cli.model,
+                role: "cli".to_string(),
+                workspace: cli.workspace,
+                data_dir: cli.data_dir,
+                echo: cli.echo,
+                raw: cli.raw,
+            };
+            if let Err(e) = bamboo_agent::actor_cli::run(args).await {
+                eprintln!("run failed: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    };
+
+    match command {
         Commands::Serve {
             port,
             bind,
