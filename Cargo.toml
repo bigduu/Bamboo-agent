@@ -16,6 +16,7 @@ members = [
     "crates/infra/bamboo-mcp",
     "crates/infra/bamboo-permission",
     "crates/infra/bamboo-compression",
+    "crates/infra/bamboo-subagent",
     # Engine — core logic
     "crates/engine/bamboo-engine",
     "crates/engine/bamboo-tools",
