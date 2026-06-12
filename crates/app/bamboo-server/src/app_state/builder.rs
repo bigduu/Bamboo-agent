@@ -368,6 +368,7 @@ impl AppState {
             subagent_model_resolver,
             config.clone(),
             subagent_profiles.clone(),
+            provider_registry.clone(),
         );
 
         child_completion_coordinator

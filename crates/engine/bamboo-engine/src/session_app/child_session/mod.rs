@@ -257,3 +257,31 @@ pub trait SubagentResolutionPort: Send + Sync {
     /// `general-purpose` for unknown/empty values; never empty).
     fn resolve_subagent_prompt(&self, subagent_type: &str) -> String;
 }
+
+/// Models available from one configured provider (best-effort listing).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderModelList {
+    pub provider: String,
+    pub models: Vec<String>,
+    /// Set when this provider's listing failed (auth missing, network, …);
+    /// the provider is still usable with an explicitly known model id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Lists the models the parent can pin a child session to
+/// (`SubAgent` tool `action=list_models` / `create.model`).
+///
+/// Separate from [`SubagentResolutionPort`] because it is backed by the live
+/// provider registry rather than per-`subagent_type` config resolution.
+#[async_trait]
+pub trait ModelCatalogPort: Send + Sync {
+    /// Best-effort model listing per configured provider. Providers whose
+    /// listing fails are still returned (with `error` set) so the caller can
+    /// see they exist.
+    async fn list_models(&self) -> Vec<ProviderModelList>;
+
+    /// The default provider name (used to resolve a bare model id without a
+    /// `provider:` prefix).
+    fn default_provider(&self) -> String;
+}

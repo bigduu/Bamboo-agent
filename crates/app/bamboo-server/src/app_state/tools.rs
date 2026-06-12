@@ -116,6 +116,7 @@ pub(super) fn build_root_tools(
     subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
     config: Arc<RwLock<Config>>,
     subagent_profiles: Arc<bamboo_domain::subagent::SubagentProfileRegistry>,
+    provider_registry: Arc<bamboo_llm::ProviderRegistry>,
 ) -> Arc<dyn ToolExecutor> {
     // Shared adapter for the unified child session tool. Cloning the
     // profile registry Arc is cheap and lets us hand the same registry
@@ -144,11 +145,13 @@ pub(super) fn build_root_tools(
     // Root sessions can create and manage child sessions via unified SubAgent tool.
     // The adapter satisfies both ports the tool depends on (`ChildSessionPort`
     // for session lifecycle, `SubagentResolutionPort` for subagent_type config).
-    let sub_agent_tool = Arc::new(crate::tools::SubAgentTool::new(
-        adapter.clone(),
-        adapter,
-        profiles_for_tool,
-    ));
+    // The model catalog enables `action=list_models` + explicit `create.model`.
+    let sub_agent_tool = Arc::new(
+        crate::tools::SubAgentTool::new(adapter.clone(), adapter, profiles_for_tool)
+            .with_model_catalog(Arc::new(crate::tools::RegistryModelCatalog::new(
+                provider_registry,
+            ))),
+    );
     let tools_with_sub_agent: Arc<dyn ToolExecutor> = Arc::new(
         crate::tools::OverlayToolExecutor::new(base_tools, sub_agent_tool),
     );

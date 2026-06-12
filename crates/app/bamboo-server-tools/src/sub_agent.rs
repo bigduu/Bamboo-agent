@@ -5,7 +5,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use bamboo_engine::session_app::child_session::{
-    self, ChildSessionError, ChildSessionPort, CreateChildInput, SubagentResolutionPort,
+    self, ChildSessionError, ChildSessionPort, CreateChildInput, ModelCatalogPort,
+    SubagentResolutionPort,
 };
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use bamboo_domain::session::runtime_state::ChildWaitPolicy;
@@ -51,6 +52,13 @@ enum SubAgentArgs {
         /// `"high"`/`"max"` for hard reasoning) when it has a preference.
         #[serde(default)]
         reasoning_effort: Option<ReasoningEffort>,
+        /// Optional explicit model for the child, `"provider:model"`
+        /// (e.g. `"anthropic:claude-sonnet-4-6"`) or a bare model id (resolved
+        /// against the parent's provider, falling back to the default
+        /// provider). Takes precedence over per-`subagent_type` model routing.
+        /// Call `list_models` to see what is available.
+        #[serde(default)]
+        model: Option<String>,
     },
     /// Suspend the parent run until its background child sessions finish.
     ///
@@ -115,6 +123,9 @@ enum SubAgentArgs {
     /// Useful both for the LLM (to discover roles before calling
     /// `create`) and for the frontend (to populate a role dropdown).
     ListProfiles,
+    /// Enumerate the models the parent can pin a child to via
+    /// `create.model`. Read-only; best-effort per configured provider.
+    ListModels,
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +223,10 @@ pub struct SubAgentTool {
     /// Registry consulted by `action=list_profiles`. Held as `Arc` so the
     /// tool stays cheap to clone and share across executors.
     profiles: Arc<SubagentProfileRegistry>,
+    /// Optional model catalog consulted by `action=list_models` and used to
+    /// resolve a bare `create.model` id to a provider. `None` keeps the tool
+    /// constructible without a live provider registry (tests, embedded use).
+    catalog: Option<Arc<dyn ModelCatalogPort>>,
 }
 
 impl SubAgentTool {
@@ -224,8 +239,56 @@ impl SubAgentTool {
             sessions,
             resolver,
             profiles,
+            catalog: None,
         }
     }
+
+    /// Attach a model catalog, enabling `action=list_models` and bare-model
+    /// resolution for `create.model`.
+    pub fn with_model_catalog(mut self, catalog: Arc<dyn ModelCatalogPort>) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
+}
+
+/// Parse an explicit `create.model` spec into a `ProviderModelRef`.
+///
+/// `"provider:model"` is explicit; a bare model id falls back to the parent
+/// session's provider, then the catalog's default provider.
+fn parse_model_spec(
+    spec: &str,
+    parent: &bamboo_agent_core::Session,
+    default_provider: Option<String>,
+) -> Result<bamboo_domain::ProviderModelRef, ToolError> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err(ToolError::InvalidArguments(
+            "model must be non-empty when provided".to_string(),
+        ));
+    }
+    if let Some((provider, model)) = spec.split_once(':') {
+        let (provider, model) = (provider.trim(), model.trim());
+        if provider.is_empty() || model.is_empty() {
+            return Err(ToolError::InvalidArguments(format!(
+                "model '{spec}' must be 'provider:model' with both parts non-empty"
+            )));
+        }
+        return Ok(bamboo_domain::ProviderModelRef::new(provider, model));
+    }
+    // Bare model id: inherit the parent's provider, else the default provider.
+    let provider = parent
+        .model_ref
+        .as_ref()
+        .map(|r| r.provider.clone())
+        .filter(|p| !p.trim().is_empty())
+        .or(default_provider)
+        .ok_or_else(|| {
+            ToolError::InvalidArguments(format!(
+                "model '{spec}' has no provider prefix and no default provider is known; \
+                 use 'provider:model' (see action=list_models)"
+            ))
+        })?;
+    Ok(bamboo_domain::ProviderModelRef::new(provider, spec))
 }
 
 #[async_trait]
@@ -246,8 +309,8 @@ Use list/get to inspect existing children; use update/run/send_message/cancel/de
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "wait", "list", "get", "update", "run", "send_message", "cancel", "delete", "list_profiles"],
-                    "description": "Sub-agent lifecycle operation. To run work in parallel: call create once per child (this no longer suspends the parent — children run in the background), then call wait ONCE to suspend until they all finish. Use list/get to inspect; update/run/send_message/cancel/delete to manage existing children; list_profiles to enumerate available subagent roles before choosing subagent_type. \
+                    "enum": ["create", "wait", "list", "get", "update", "run", "send_message", "cancel", "delete", "list_profiles", "list_models"],
+                    "description": "Sub-agent lifecycle operation. To run work in parallel: call create once per child (this no longer suspends the parent — children run in the background), then call wait ONCE to suspend until they all finish. Use list/get to inspect; update/run/send_message/cancel/delete to manage existing children; list_profiles to enumerate available subagent roles before choosing subagent_type; list_models to enumerate the models you can pin a child to via create.model. \
 A create call requires: title, responsibility, prompt, and subagent_type (workspace and subagent_type are optional and default to the parent's workspace / general-purpose). EXAMPLE create: {\"action\":\"create\",\"subagent_type\":\"researcher\",\"title\":\"Analyze auth module\",\"responsibility\":\"Map the auth flow and list its public API\",\"prompt\":\"Read crates/auth/src/lib.rs, summarize the login flow, and list every pub fn.\",\"workspace\":\"/abs/path/to/repo\"}. Then EXAMPLE wait: {\"action\":\"wait\"}."
                 },
                 "child_session_id": {
@@ -316,6 +379,10 @@ A create call requires: title, responsibility, prompt, and subagent_type (worksp
                     "type": "string",
                     "enum": ["low", "medium", "high", "xhigh", "max"],
                     "description": "For create/update: reasoning effort level applied to the child session's own LLM calls. Use \"low\" for trivial fan-outs (e.g. simple lookups), \"medium\"/\"high\" for normal coding/analysis, \"xhigh\"/\"max\" for deep reasoning tasks. Omit to leave at provider default; the child does NOT inherit the parent's reasoning_effort."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "For create: explicit model for the child as 'provider:model' (e.g. 'anthropic:claude-sonnet-4-6'), or a bare model id to use the parent's provider. Takes precedence over per-role model routing. Pick a cheaper/faster model for simple fan-outs and a stronger model for hard reasoning. Call list_models first to see what is available; omit to use the configured default for the chosen subagent_type."
                 }
             },
             "required": ["action"],
@@ -357,6 +424,21 @@ A create call requires: title, responsibility, prompt, and subagent_type (worksp
             return tool_result(self.list_profiles_payload());
         }
 
+        // `list_models` is likewise read-only and session-independent.
+        if let SubAgentArgs::ListModels = parsed {
+            let Some(catalog) = self.catalog.as_ref() else {
+                return Err(ToolError::Execution(
+                    "model catalog is not configured on this server".to_string(),
+                ));
+            };
+            let providers = catalog.list_models().await;
+            return tool_result(json!({
+                "default_provider": catalog.default_provider(),
+                "providers": providers,
+                "usage": "Pass create.model as 'provider:model' (or a bare model id to use the parent's provider).",
+            }));
+        }
+
         let parent = self
             .sessions
             .as_ref()
@@ -375,6 +457,7 @@ A create call requires: title, responsibility, prompt, and subagent_type (worksp
                 auto_run,
                 wait,
                 reasoning_effort,
+                model,
             } => {
                 let title = normalize_title(title, description)?;
                 let responsibility = normalize_required_text(responsibility, "responsibility")?;
@@ -406,7 +489,20 @@ A create call requires: title, responsibility, prompt, and subagent_type (worksp
                 }
 
                 let child_id = Uuid::new_v4().to_string();
-                let model_ref_override = self.resolver.resolve_subagent_model(&subagent_type).await;
+                // Model precedence: explicit `model` arg > per-subagent_type
+                // routing (resolver) > engine defaults (None).
+                let model_ref_override = match model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                {
+                    Some(spec) => Some(parse_model_spec(
+                        spec,
+                        &parent,
+                        self.catalog.as_ref().map(|c| c.default_provider()),
+                    )?),
+                    None => self.resolver.resolve_subagent_model(&subagent_type).await,
+                };
                 let model_override = model_ref_override
                     .as_ref()
                     .map(|model_ref| model_ref.model.clone());
@@ -673,6 +769,8 @@ A create call requires: title, responsibility, prompt, and subagent_type (worksp
             // Already short-circuited above; kept here so the match stays
             // exhaustive without a wildcard.
             SubAgentArgs::ListProfiles => tool_result(self.list_profiles_payload()),
+            // Handled by the session-independent short-circuit above.
+            SubAgentArgs::ListModels => unreachable!("list_models short-circuits earlier"),
         }
     }
 }
@@ -761,5 +859,53 @@ mod tests {
     fn normalize_title_rejects_both_empty() {
         let err = normalize_title(None, "".to_string()).unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(msg) if msg.contains("title")));
+    }
+
+    // ---- parse_model_spec ----
+
+    fn parent_session(model_ref: Option<bamboo_domain::ProviderModelRef>) -> bamboo_agent_core::Session {
+        let mut session = bamboo_agent_core::Session::new("p1", "gpt-test");
+        session.model_ref = model_ref;
+        session
+    }
+
+    #[test]
+    fn model_spec_provider_colon_model_is_explicit() {
+        let parent = parent_session(None);
+        let r = parse_model_spec("anthropic:claude-sonnet-4-6", &parent, None).unwrap();
+        assert_eq!(r.provider, "anthropic");
+        assert_eq!(r.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn model_spec_bare_inherits_parent_provider() {
+        let parent = parent_session(Some(bamboo_domain::ProviderModelRef::new(
+            "openai", "gpt-test",
+        )));
+        let r = parse_model_spec("o4-mini", &parent, Some("anthropic".to_string())).unwrap();
+        assert_eq!(r.provider, "openai"); // parent wins over default
+        assert_eq!(r.model, "o4-mini");
+    }
+
+    #[test]
+    fn model_spec_bare_falls_back_to_default_provider() {
+        let parent = parent_session(None);
+        let r = parse_model_spec("claude-haiku-4-5", &parent, Some("anthropic".to_string())).unwrap();
+        assert_eq!(r.provider, "anthropic");
+    }
+
+    #[test]
+    fn model_spec_bare_without_any_provider_errors() {
+        let parent = parent_session(None);
+        let err = parse_model_spec("mystery-model", &parent, None).unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(msg) if msg.contains("provider")));
+    }
+
+    #[test]
+    fn model_spec_rejects_malformed() {
+        let parent = parent_session(None);
+        assert!(parse_model_spec("  ", &parent, None).is_err());
+        assert!(parse_model_spec("anthropic:", &parent, None).is_err());
+        assert!(parse_model_spec(":model", &parent, None).is_err());
     }
 }
