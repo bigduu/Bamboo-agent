@@ -333,7 +333,8 @@ infra(infra) ─────┘
 | mailbox 接 agent loop(完整 drain→admit) | 常驻 owned actor 的离线收件需求(steering 已用引擎原生 pending 队列等效达成) |
 | 凭证短期 token / 父代理模式 | 安全迭代;`SecretsEnvelope` 已留演进位 |
 | `Limits` 强制执行 | 资源限额需求明确时(父侧 watchdog 已兜总超时) |
-| **`bamboo -p` 编排模式(`--orchestrate`)** | 需要 CLI 一发即跑"会 spawn child 的完整编排 agent"时:headless 起 AppState 走 root session(生产路径 e2e 已证明该装配可行) |
+
+> ✅ **`bamboo -p` = 完整 headless server(已落地,真 LLM 验证)**:full AppState + root 工具面(含 SubAgent,可 spawn child 并走完整 wait/resume 协调)、树静默才退出、`-s <session>` 续跑同一会话。`--echo` 保留为裸 actor 链冒烟;单 actor 快捷路径在 `bamboo actor run`。
 
 ---
 
