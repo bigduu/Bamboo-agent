@@ -18,6 +18,10 @@ use crate::error::{Result, StoreError};
 /// Current spec version written by this crate.
 pub const PROVISION_VERSION: u32 = 1;
 
+/// Upper bound for a spec read from stdin (defense in depth against a
+/// runaway writer; a real spec is a few KB).
+pub const MAX_SPEC_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Everything a worker needs to become a functioning actor. Parent-resolved, flat, complete.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProvisionSpec {
@@ -138,14 +142,19 @@ impl ProvisionSpec {
 
     /// Read a spec from the process's stdin (the parent writes one JSON document and
     /// closes the pipe). Used by worker `main`.
+    ///
+    /// Defense in depth: the read is capped at [`MAX_SPEC_BYTES`] — the pipe is
+    /// trusted (our own parent), but a runaway writer must not OOM the worker.
     pub async fn read_from_stdin() -> Result<Self> {
         use tokio::io::AsyncReadExt;
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         tokio::io::stdin()
-            .read_to_string(&mut buf)
+            .take(MAX_SPEC_BYTES)
+            .read_to_end(&mut buf)
             .await
             .map_err(|e| StoreError::io("<stdin>", e))?;
-        Self::from_json(buf.trim())
+        let text = String::from_utf8_lossy(&buf);
+        Self::from_json(text.trim())
     }
 }
 

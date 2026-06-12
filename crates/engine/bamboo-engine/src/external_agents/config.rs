@@ -254,7 +254,11 @@ mod tests {
 
     #[test]
     fn resolve_runtime_metadata_returns_empty_for_unknown_type() {
-        let config = Config::default();
+        // Hermetic: Config::default() loads the developer's real
+        // ~/.bamboo/config.json, which may set subagents.runtime=actor.
+        // Pin the typed section to its true default for this assertion.
+        let mut config = Config::default();
+        config.subagents = Default::default();
         let metadata = resolve_runtime_metadata(&config, "unknown");
         assert!(metadata.is_empty());
     }

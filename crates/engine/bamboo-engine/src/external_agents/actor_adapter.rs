@@ -182,9 +182,15 @@ impl ExternalChildRunner for ActorChildRunner {
         // steer this child in-band over the existing WS connection. The guard
         // unregisters on every exit path.
         let (live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
-        let _live_guard = super::live::register(&job.child_session_id, live_tx);
+        let live_guard = super::live::register(&job.child_session_id, live_tx);
 
         let result = drive(&mut client, &event_tx, &cancel_token, &mut live_rx).await;
+        // Unregister IMMEDIATELY: after drive returns nobody consumes live_rx,
+        // so a send_message landing in the close/kill window below must see
+        // "not live" and take the durable-queue fallback instead of vanishing.
+        // (Even if one slipped in earlier, send_message also appends it to the
+        // durable transcript, so the next activation still rehydrates it.)
+        drop(live_guard);
 
         let _ = client.close().await;
         spawned.kill().await;

@@ -115,6 +115,10 @@ pub async fn run() -> std::result::Result<(), String> {
 /// `ChildExecutor` backed by the real bamboo agent loop, assembled from a `ProvisionSpec`.
 pub struct BambooRuntimeExecutor {
     agent: bamboo_engine::Agent,
+    /// Same store the agent persists to, kept as the concrete type so steering
+    /// can do a LOCKED read-modify-write (`update_runtime_config`) instead of
+    /// an unlocked load+save that could revert a concurrent loop save.
+    locked_store: Arc<LockedSessionStore>,
     model: Option<String>,
     workspace: Option<String>,
     disabled_tools: Option<BTreeSet<String>>,
@@ -184,6 +188,7 @@ impl BambooRuntimeExecutor {
                 .map_err(|e| format!("init session store: {e}"))?,
         );
         let persistence = Arc::new(LockedSessionStore::new(store.clone()));
+        let locked_store = persistence.clone();
         let skill_manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
             skills_dir: storage_dir.join("skills"),
             project_dir: spec.workspace.clone().map(PathBuf::from),
@@ -216,6 +221,7 @@ impl BambooRuntimeExecutor {
 
         Ok(Self {
             agent,
+            locked_store,
             model: spec.model.as_ref().map(|m| m.model.clone()),
             workspace: spec.workspace.clone(),
             disabled_tools: spec
@@ -283,23 +289,30 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // In-band steering: each ParentFrame::Message lands in the local store's
         // pending queue; the running loop admits it at its next round boundary —
         // exactly the in-process mechanism, reused across the process boundary.
-        let steer_storage = self.agent.storage().clone();
-        let steer_persistence = self.agent.persistence().clone();
+        let steer_store = self.locked_store.clone();
         let steer_session_id = session.id.clone();
         let steer_task = tokio::spawn(async move {
             while let Some(text) = steer.recv().await {
-                if let Ok(Some(mut latest)) = steer_storage.load_session(&steer_session_id).await {
-                    let mut pending = latest.pending_injected_messages().unwrap_or_default();
-                    pending.push(serde_json::json!({
-                        "content": text,
-                        "created_at": chrono::Utc::now(),
-                    }));
-                    latest.set_pending_injected_messages(pending);
-                    if let Err(e) = steer_persistence.save_runtime_session(&mut latest).await {
-                        tracing::warn!("steer message could not be queued: {e}");
+                // LOCKED read-modify-write: load + mutate + save all happen
+                // under the per-session lock, so a concurrent loop save can
+                // neither be reverted by this write nor revert it.
+                let queued = steer_store
+                    .update_runtime_config(&steer_session_id, |latest| {
+                        let mut pending =
+                            latest.pending_injected_messages().unwrap_or_default();
+                        pending.push(serde_json::json!({
+                            "content": text,
+                            "created_at": chrono::Utc::now(),
+                        }));
+                        latest.set_pending_injected_messages(pending);
+                    })
+                    .await;
+                match queued {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        tracing::warn!("steer message dropped: session not found in worker store")
                     }
-                } else {
-                    tracing::warn!("steer message dropped: session not found in worker store");
+                    Err(e) => tracing::warn!("steer message could not be queued: {e}"),
                 }
             }
         });
@@ -351,7 +364,18 @@ impl ChildExecutor for BambooRuntimeExecutor {
 /// Remove sibling actor storage directories whose last modification is older
 /// than `retention`. Best-effort: errors are ignored (another worker may be
 /// GC'ing concurrently); only directories directly under `root` are touched.
+///
+/// Liveness guard: a directory whose name matches a LIVE fabric record (lease
+/// not expired) is never removed — dir mtime alone would misjudge a long-running
+/// actor (>retention) as stale, because file writes inside subdirectories do
+/// not bump the top-level directory's mtime.
 async fn gc_stale_storage(root: PathBuf, retention: std::time::Duration) {
+    let live_ids: std::collections::HashSet<String> = Fabric::at(&root)
+        .discover()
+        .await
+        .map(|records| records.into_iter().map(|r| r.agent_id).collect())
+        .unwrap_or_default();
+
     let Ok(mut rd) = tokio::fs::read_dir(&root).await else {
         return;
     };
@@ -362,6 +386,9 @@ async fn gc_stale_storage(root: PathBuf, retention: std::time::Duration) {
         };
         if !meta.is_dir() {
             continue;
+        }
+        if live_ids.contains(&entry.file_name().to_string_lossy().into_owned()) {
+            continue; // live actor (renewing its lease) — never reap
         }
         let stale = meta
             .modified()

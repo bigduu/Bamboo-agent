@@ -108,6 +108,15 @@ async fn handle_conn<E: ChildExecutor + ?Sized>(stream: TcpStream, executor: Arc
         match msg? {
             Message::Text(t) => match ParentFrame::from_text(t.as_str()) {
                 Ok(ParentFrame::Run(spec)) => {
+                    // A new run supersedes any active run: cancel the previous
+                    // task *before* starting the new one so the old run stops
+                    // emitting events into the shared `out_tx`. Without this the
+                    // old task is orphaned and its output interleaves with the
+                    // new run's. (The old steer sender is dropped implicitly by
+                    // the reassignment of `active_steer` below.)
+                    if let Some(prev) = active_cancel.take() {
+                        prev.cancel();
+                    }
                     let cancel = CancellationToken::new();
                     let (steer_tx, steer_rx) = SteerInbox::channel();
                     active_cancel = Some(cancel.clone());
@@ -133,6 +142,12 @@ async fn handle_conn<E: ChildExecutor + ?Sized>(stream: TcpStream, executor: Arc
         }
     }
 
+    // Parent disconnected / closed: cancel any still-active run so its spawned
+    // task ends and stops feeding the writer. Without this `writer.await` blocks
+    // until the orphaned run finishes on its own.
+    if let Some(c) = active_cancel {
+        c.cancel();
+    }
     drop(out_tx);
     let _ = writer.await;
     Ok(())
@@ -332,5 +347,104 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(TransportError::Protocol(_))));
+    }
+
+    /// Defect A: a second `Run` must cancel the previously active run so the old
+    /// task ends promptly — its `Terminal(Cancelled)` arrives *before* any
+    /// explicit `Cancel` is sent, proving the supersession, not orphaning.
+    #[tokio::test]
+    async fn second_run_cancels_previous() {
+        use crate::executor::{ChildExecutor, ChildOutcome, SteerInbox};
+        use std::time::Duration;
+
+        /// Emits one `token` then parks on its cancel token; always ends
+        /// `Cancelled`. Forces a run that can only finish via cancellation.
+        struct WaitForCancel;
+        #[async_trait::async_trait]
+        impl ChildExecutor for WaitForCancel {
+            async fn run(
+                &self,
+                _spec: RunSpec,
+                events: EventSink,
+                _steer: SteerInbox,
+                cancel: CancellationToken,
+            ) -> ChildOutcome {
+                events.emit(serde_json::json!({"type": "token", "content": "go"}));
+                cancel.cancelled().await;
+                ChildOutcome::cancelled()
+            }
+        }
+
+        let server = WsServer::bind_loopback().await.unwrap();
+        let endpoint = server.ws_endpoint();
+        let srv = tokio::spawn(async move { server.serve_one(Arc::new(WaitForCancel)).await });
+
+        let mut client = ChildClient::connect(&endpoint).await.unwrap();
+
+        // First run: goes live, emits its token, then parks on cancellation.
+        client
+            .send(ParentFrame::Run(RunSpec {
+                assignment: "first".into(),
+                reasoning_effort: None,
+                messages: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        loop {
+            match client.next_frame().await.unwrap() {
+                Some(ChildFrame::Event { event }) if event["content"] == "go" => break,
+                Some(_) => continue,
+                None => panic!("connection closed before first token"),
+            }
+        }
+
+        // Second run: must supersede (cancel) the first — defect A fix.
+        client
+            .send(ParentFrame::Run(RunSpec {
+                assignment: "second".into(),
+                reasoning_effort: None,
+                messages: Vec::new(),
+            }))
+            .await
+            .unwrap();
+
+        // The first run's Terminal must now arrive with no explicit Cancel —
+        // driven solely by the new Run frame. Bound it so a regression fails
+        // fast instead of hanging on the parked first run.
+        let mut first_terminal: Option<TerminalStatus> = None;
+        let drain = async {
+            while let Some(frame) = client.next_frame().await.unwrap() {
+                if let ChildFrame::Terminal { status, .. } = frame {
+                    first_terminal = Some(status);
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), drain)
+            .await
+            .expect("first run's terminal never arrived — new Run did not cancel it");
+        assert_eq!(
+            first_terminal.expect("first terminal status"),
+            TerminalStatus::Cancelled,
+            "previous run should be cancelled by the new Run frame"
+        );
+
+        // The second run is still parked; only an explicit Cancel ends it.
+        client.send(ParentFrame::Cancel).await.unwrap();
+
+        let mut second_terminal: Option<TerminalStatus> = None;
+        while let Some(frame) = client.next_frame().await.unwrap() {
+            if let ChildFrame::Terminal { status, .. } = frame {
+                second_terminal = Some(status);
+                break;
+            }
+        }
+        assert_eq!(
+            second_terminal.expect("second terminal status"),
+            TerminalStatus::Cancelled
+        );
+
+        let _ = client.close().await;
+        let _ = srv.await;
     }
 }
