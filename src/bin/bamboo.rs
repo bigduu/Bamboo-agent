@@ -10,23 +10,27 @@ use std::path::PathBuf;
 #[command(name = "bamboo")]
 #[command(about = "A fully self-contained AI agent backend framework", long_about = None)]
 #[command(
-    after_help = "QUICK RUN:\n  bamboo -p \"your task\"          run an agent on the prompt and print the result\n  bamboo -p \"ping\" --echo        no-key smoke test of the actor chain\n  bamboo -p \"...\" -m provider:model   pin the model"
+    after_help = "QUICK RUN (headless server):\n  bamboo -p \"your task\"               full agent run (incl. sub-agents), print result, exit\n  bamboo -p \"next step\" -s <session>  continue an existing session's loop\n  bamboo -p \"...\" -m provider:model   pin the model\n  bamboo -p \"ping\" --echo             no-key smoke of the actor chain (no server)"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Run an agent on this prompt and print the result (headless one-shot;
-    /// spawns an isolated actor process and streams its output).
+    /// Run a full headless agent on this prompt and print the result. Boots
+    /// the complete server runtime (root tool surface incl. SubAgent, so it
+    /// CAN spawn actor children), finishes when the whole tree finishes.
     #[arg(short = 'p', long = "prompt", global = false)]
     prompt: Option<String>,
 
-    /// With -p: model as 'provider:model' (or a bare model id on the default
-    /// provider). Defaults to defaults.sub_agent, then defaults.chat.
+    /// With -p: continue this existing session instead of creating a new one.
+    #[arg(short = 's', long)]
+    session: Option<String>,
+
+    /// With -p: model as 'provider:model'. Defaults to the session/config default.
     #[arg(short = 'm', long)]
     model: Option<String>,
 
-    /// With -p: working directory for the agent (defaults to the current dir).
+    /// With -p: working directory for a NEW session (defaults to the current dir).
     #[arg(long)]
     workspace: Option<PathBuf>,
 
@@ -34,8 +38,8 @@ struct Cli {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// With -p: use the dependency-free echo executor (no LLM, no key) to
-    /// smoke-test the actor chain.
+    /// With -p: skip the server and run the bare actor chain with the echo
+    /// executor (no LLM, no key) — transport smoke test only.
     #[arg(long)]
     echo: bool,
 
@@ -214,7 +218,7 @@ async fn main() {
         }
     }
 
-    // Top-level quick run: `bamboo -p "<prompt>"` — headless one-shot agent.
+    // Top-level quick run: `bamboo -p "<prompt>"` — a complete headless server.
     let command = match cli.command {
         Some(command) => command,
         None => {
@@ -223,16 +227,45 @@ async fn main() {
                 let _ = Cli::command().print_help();
                 std::process::exit(2);
             };
-            let args = bamboo_agent::actor_cli::ActorRunArgs {
+
+            // --echo stays a bare actor-chain smoke (no server, no key).
+            if cli.echo {
+                let args = bamboo_agent::actor_cli::ActorRunArgs {
+                    prompt,
+                    model: cli.model,
+                    role: "cli".to_string(),
+                    workspace: cli.workspace,
+                    data_dir: cli.data_dir,
+                    echo: true,
+                    raw: cli.raw,
+                };
+                if let Err(e) = bamboo_agent::actor_cli::run(args).await {
+                    eprintln!("run failed: {e}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+
+            // Full headless server: same data-dir conventions as `serve`.
+            let bamboo_home_dir = cli
+                .data_dir
+                .clone()
+                .unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
+            bamboo_config::paths::init_bamboo_dir(bamboo_home_dir.clone());
+            // SAFETY: main thread, before any async runtime work reads the env.
+            unsafe {
+                std::env::set_var("BAMBOO_DATA_DIR", bamboo_home_dir.as_os_str());
+            }
+
+            let args = bamboo_agent::headless::HeadlessArgs {
                 prompt,
+                session: cli.session,
                 model: cli.model,
-                role: "cli".to_string(),
                 workspace: cli.workspace,
-                data_dir: cli.data_dir,
-                echo: cli.echo,
+                data_dir: bamboo_home_dir,
                 raw: cli.raw,
             };
-            if let Err(e) = bamboo_agent::actor_cli::run(args).await {
+            if let Err(e) = bamboo_agent::headless::run(args).await {
                 eprintln!("run failed: {e}");
                 std::process::exit(1);
             }

@@ -52,6 +52,9 @@ pub mod subagent_worker;
 /// The `bamboo actor run` CLI: drive an actor from the terminal.
 pub mod actor_cli;
 
+/// The `bamboo -p` headless server mode: full AppState, one-shot, resumable.
+pub mod headless;
+
 // Server module is now a separate workspace crate
 pub use bamboo_server as server;
 
