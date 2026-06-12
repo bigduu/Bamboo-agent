@@ -133,6 +133,7 @@ pub async fn run(args: ActorRunArgs) -> Result<(), String> {
     });
 
     let mut exit: Result<(), String> = Ok(());
+    let mut streamed_tokens = false;
     loop {
         tokio::select! {
             _ = cancel_rx.recv() => {
@@ -141,14 +142,23 @@ pub async fn run(args: ActorRunArgs) -> Result<(), String> {
             }
             frame = client.next_frame() => {
                 match frame {
-                    Ok(Some(ChildFrame::Event { event })) => print_event(&event, args.raw),
+                    Ok(Some(ChildFrame::Event { event })) => {
+                        if event["type"] == "token" {
+                            streamed_tokens = true;
+                        }
+                        print_event(&event, args.raw);
+                    }
                     Ok(Some(ChildFrame::Terminal { status, result, error })) => {
                         println!();
                         match status {
                             TerminalStatus::Completed => {
                                 eprintln!("✔ completed");
-                                if let Some(r) = result {
-                                    println!("{r}");
+                                // The reply already streamed token-by-token; only
+                                // print the result when nothing was streamed.
+                                if !streamed_tokens {
+                                    if let Some(r) = result {
+                                        println!("{r}");
+                                    }
                                 }
                             }
                             TerminalStatus::Cancelled => {

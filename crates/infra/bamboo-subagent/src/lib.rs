@@ -27,7 +27,10 @@ pub use discovery::Fabric;
 pub use error::{Result, StoreError};
 pub use executor::{ChildExecutor, ChildOutcome, EchoExecutor, EventSink};
 pub use fleet::{spawn_worker, SpawnedChild};
-pub use mailbox::{AdmittedSet, AgentRef, Delivered, InboxKind, InboxMessage, Mailbox, MsgId};
+pub use mailbox::{
+    AdmittedSet, AgentRef, Delivered, InboxKind, InboxMessage, Mailbox, MsgId,
+    ADMITTED_SET_CAPACITY,
+};
 pub use proto::{AgentRecord, ChildFrame, ParentFrame, RunSpec, TerminalStatus};
 pub use provision::{
     ChildIdentity, ExecutorSpec, Limits, ModelRefSpec, ProvisionSpec, ScopedCredential,

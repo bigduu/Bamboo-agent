@@ -144,7 +144,19 @@ impl Mailbox {
         Ok(out)
     }
 
-    /// Acknowledge a processed message: delete it from `cur/`. Idempotent (no-op if gone).
+    /// Acknowledge a processed message by its claimed location (O(1); preferred —
+    /// [`Delivered::cur_path`] carries it). Idempotent (no-op if already gone).
+    pub async fn ack_delivered(&self, delivered: &Delivered) -> Result<()> {
+        match tokio::fs::remove_file(&delivered.cur_path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StoreError::io(&delivered.cur_path, e)),
+        }
+    }
+
+    /// Acknowledge a processed message by id: delete it from `cur/`.
+    /// O(n) directory scan — prefer [`ack_delivered`](Self::ack_delivered)
+    /// when you still hold the [`Delivered`]. Idempotent (no-op if gone).
     pub async fn ack(&self, id: &MsgId) -> Result<()> {
         let needle = format!("-{}.json", id.0);
         let cur = self.cur_dir();
@@ -217,24 +229,59 @@ async fn read_msg(path: &std::path::Path) -> Result<InboxMessage> {
 }
 
 /// Consumer-side dedupe set for at-least-once delivery; persist with the session state.
+///
+/// **Bounded**: keeps the most recent [`ADMITTED_SET_CAPACITY`] ids, evicting the
+/// oldest. Redelivery only ever happens for *recently* claimed-but-unacked
+/// messages, so a bounded recency window is sufficient — and a long-lived actor
+/// can't grow it without limit.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "Vec<MsgId>", into = "Vec<MsgId>")]
 pub struct AdmittedSet {
-    ids: HashSet<MsgId>,
+    order: std::collections::VecDeque<MsgId>,
+    index: HashSet<MsgId>,
 }
+
+/// Max ids an [`AdmittedSet`] retains (oldest evicted beyond this).
+pub const ADMITTED_SET_CAPACITY: usize = 4096;
 
 impl AdmittedSet {
     pub fn contains(&self, id: &MsgId) -> bool {
-        self.ids.contains(id)
+        self.index.contains(id)
     }
     /// Record `id` as admitted. Returns `true` if newly inserted (i.e. should admit now).
     pub fn insert(&mut self, id: MsgId) -> bool {
-        self.ids.insert(id)
+        if !self.index.insert(id.clone()) {
+            return false;
+        }
+        self.order.push_back(id);
+        while self.order.len() > ADMITTED_SET_CAPACITY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.index.remove(&evicted);
+            }
+        }
+        true
     }
     pub fn len(&self) -> usize {
-        self.ids.len()
+        self.order.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
+        self.order.is_empty()
+    }
+}
+
+impl From<Vec<MsgId>> for AdmittedSet {
+    fn from(ids: Vec<MsgId>) -> Self {
+        let mut set = AdmittedSet::default();
+        for id in ids {
+            set.insert(id);
+        }
+        set
+    }
+}
+
+impl From<AdmittedSet> for Vec<MsgId> {
+    fn from(set: AdmittedSet) -> Self {
+        set.order.into_iter().collect()
     }
 }
 
@@ -365,5 +412,36 @@ mod tests {
         assert!(seen.contains(&id));
         assert!(!seen.insert(id.clone())); // redelivery -> skip
         assert_eq!(seen.len(), 1);
+    }
+
+    #[test]
+    fn admitted_set_is_bounded_and_serde_round_trips() {
+        let mut seen = AdmittedSet::default();
+        let first = MsgId::new();
+        seen.insert(first.clone());
+        for _ in 0..ADMITTED_SET_CAPACITY {
+            seen.insert(MsgId::new());
+        }
+        // capacity respected; the oldest id was evicted
+        assert_eq!(seen.len(), ADMITTED_SET_CAPACITY);
+        assert!(!seen.contains(&first));
+
+        // serde round-trip preserves membership (index rebuilt on load)
+        let json = serde_json::to_string(&seen).unwrap();
+        let restored: AdmittedSet = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.len(), seen.len());
+        let probe = Vec::<MsgId>::from(seen.clone())[0].clone();
+        assert!(restored.contains(&probe));
+    }
+
+    #[tokio::test]
+    async fn ack_delivered_removes_by_path() {
+        let (_d, mb) = mailbox();
+        mb.deliver(&msg(1)).await.unwrap();
+        let batch = mb.drain().await.unwrap();
+        mb.ack_delivered(&batch[0]).await.unwrap();
+        assert!(mb.recover().await.unwrap().is_empty()); // cur/ empty
+        // idempotent
+        mb.ack_delivered(&batch[0]).await.unwrap();
     }
 }

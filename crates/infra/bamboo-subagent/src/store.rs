@@ -36,13 +36,19 @@ pub struct ProjectKey(String);
 
 impl ProjectKey {
     /// Derive a filesystem-safe key from a workspace path. Deterministic.
+    ///
+    /// The path is canonicalized when possible (so symlinks/relative spellings
+    /// of the same workspace agree), then folded to a readable slug PLUS a
+    /// short hash of the exact path — the hash disambiguates paths whose
+    /// folded forms collide (`/a/b` vs `/a-b`).
     pub fn from_workspace(workspace: &Path) -> Self {
-        let encoded: String = workspace
-            .to_string_lossy()
+        let canonical = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+        let raw = canonical.to_string_lossy();
+        let folded: String = raw
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
             .collect();
-        ProjectKey(encoded)
+        ProjectKey(format!("{folded}-{:08x}", fnv1a64(raw.as_bytes()) as u32))
     }
 
     /// Wrap an already-computed key verbatim.
@@ -407,6 +413,16 @@ async fn is_dir(entry: &tokio::fs::DirEntry) -> bool {
     }
 }
 
+/// FNV-1a 64-bit — tiny, dependency-free, deterministic path fingerprint.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,6 +634,16 @@ mod tests {
         let after_children: ChildrenIndex = s.read_json(&children_path).await.unwrap();
         assert_eq!(after_index, before_index);
         assert_eq!(after_children, before_children);
+    }
+
+    #[test]
+    fn project_key_distinguishes_colliding_folds_and_is_deterministic() {
+        // `/a/b` and `/a-b` fold to the same slug; the hash must split them.
+        let k1 = ProjectKey::from_workspace(Path::new("/nonexistent/a/b"));
+        let k2 = ProjectKey::from_workspace(Path::new("/nonexistent/a-b"));
+        assert_ne!(k1, k2);
+        // deterministic
+        assert_eq!(k1, ProjectKey::from_workspace(Path::new("/nonexistent/a/b")));
     }
 
     #[tokio::test]
