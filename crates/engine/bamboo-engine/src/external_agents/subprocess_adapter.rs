@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use bamboo_subagent::fleet::spawn_worker;
 use bamboo_subagent::proto::{ChildFrame, ParentFrame, RunSpec, TerminalStatus};
+use bamboo_subagent::provision::{ChildIdentity, ExecutorSpec, ModelRefSpec, ProvisionSpec};
 use bamboo_subagent::transport::ChildClient;
 
 use crate::runtime::execution::{ExternalChildRunner, SpawnJob};
@@ -27,17 +28,60 @@ pub struct SubprocessChildRunner {
     agent_id: String,
     worker_bin: PathBuf,
     fabric_dir: PathBuf,
+    executor: ExecutorSpec,
     spawn_timeout: Duration,
 }
 
 impl SubprocessChildRunner {
-    pub fn new(agent_id: String, worker_bin: PathBuf, fabric_dir: PathBuf) -> Self {
+    pub fn new(
+        agent_id: String,
+        worker_bin: PathBuf,
+        fabric_dir: PathBuf,
+        executor: ExecutorSpec,
+    ) -> Self {
         Self {
             agent_id,
             worker_bin,
             fabric_dir,
+            executor,
             spawn_timeout: Duration::from_secs(30),
         }
+    }
+
+    /// Assemble the parent-resolved provisioning document for this child.
+    fn build_spec(&self, session: &Session, job: &SpawnJob) -> ProvisionSpec {
+        let mut spec = ProvisionSpec::new(
+            ChildIdentity {
+                child_id: job.child_session_id.clone(),
+                parent_id: Some(job.parent_session_id.clone()),
+                project_key: None,
+                role: session
+                    .metadata
+                    .get("subagent_type")
+                    .cloned()
+                    .unwrap_or_else(|| "worker".to_string()),
+            },
+            self.executor.clone(),
+            self.fabric_dir.to_string_lossy().into_owned(),
+        );
+        spec.workspace = session.workspace.clone();
+        // Final model: the session's pinned model_ref (create.model / routing already applied).
+        spec.model = session
+            .model_ref
+            .as_ref()
+            .map(|r| ModelRefSpec {
+                provider: r.provider.clone(),
+                model: r.model.clone(),
+            })
+            .or_else(|| {
+                let m = job.model.trim();
+                (!m.is_empty()).then(|| ModelRefSpec {
+                    provider: String::new(), // worker resolves via its own default provider
+                    model: m.to_string(),
+                })
+            });
+        spec.disabled_tools = job.disabled_tools.clone();
+        spec
     }
 }
 
@@ -57,21 +101,11 @@ impl ExternalChildRunner for SubprocessChildRunner {
         cancel_token: CancellationToken,
     ) -> crate::runtime::runner::Result<()> {
         let assignment = extract_assignment(session);
-        let role = session
-            .metadata
-            .get("subagent_type")
-            .cloned()
-            .unwrap_or_else(|| "worker".to_string());
+        let spec = self.build_spec(session, job);
 
-        let spawned = spawn_worker(
-            &self.worker_bin,
-            &self.fabric_dir,
-            &job.child_session_id,
-            &role,
-            self.spawn_timeout,
-        )
-        .await
-        .map_err(|e| AgentError::LLM(format!("subprocess spawn/register failed: {e}")))?;
+        let spawned = spawn_worker(&self.worker_bin, &spec, self.spawn_timeout)
+            .await
+            .map_err(|e| AgentError::LLM(format!("subprocess spawn/register failed: {e}")))?;
 
         let mut client = ChildClient::connect(&spawned.record.endpoint)
             .await

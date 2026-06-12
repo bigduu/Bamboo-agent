@@ -82,10 +82,25 @@ pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalCh
                 .clone()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::env::temp_dir().join("bamboo-subagents"));
+            let executor = match profile.executor.as_deref() {
+                Some("echo") => bamboo_subagent::provision::ExecutorSpec::Echo,
+                Some("bamboo_runtime") | None => {
+                    bamboo_subagent::provision::ExecutorSpec::BambooRuntime
+                }
+                Some(other) => {
+                    tracing::error!(
+                        "Subprocess agent profile {} has unknown executor '{}'; skipping",
+                        profile.agent_id,
+                        other
+                    );
+                    continue;
+                }
+            };
             runners.push(Arc::new(SubprocessChildRunner::new(
                 profile.agent_id.clone(),
                 std::path::PathBuf::from(worker_bin),
                 fabric_dir,
+                executor,
             )));
             continue;
         }

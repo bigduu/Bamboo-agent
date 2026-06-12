@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use bamboo_subagent::fleet::spawn_worker;
 use bamboo_subagent::proto::{ChildFrame, ParentFrame, RunSpec, TerminalStatus};
+use bamboo_subagent::provision::{ChildIdentity, ExecutorSpec, ProvisionSpec};
 use bamboo_subagent::transport::ChildClient;
 use tempfile::TempDir;
 
@@ -15,8 +16,18 @@ async fn spawn_discover_run_stream_terminal() {
     let dir = TempDir::new().unwrap();
     let fabric = dir.path().join("agents");
 
-    // 1. spawn subprocess + wait for it to self-register (Tier-1 discovery)
-    let spawned = spawn_worker(worker, &fabric, "c1", "demo", Duration::from_secs(15))
+    // 1. spawn subprocess, provision it over stdin, wait for Tier-1 self-registration
+    let spec = ProvisionSpec::new(
+        ChildIdentity {
+            child_id: "c1".into(),
+            parent_id: Some("p1".into()),
+            project_key: None,
+            role: "demo".into(),
+        },
+        ExecutorSpec::Echo,
+        fabric.to_string_lossy().into_owned(),
+    );
+    let spawned = spawn_worker(worker, &spec, Duration::from_secs(15))
         .await
         .expect("worker should spawn and register");
     assert_eq!(spawned.record.agent_id, "c1");

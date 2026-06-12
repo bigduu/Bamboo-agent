@@ -59,13 +59,13 @@ impl WsServer {
     }
 
     /// Serve exactly one connection (owned child / demo), then return.
-    pub async fn serve_one<E: ChildExecutor>(self, executor: Arc<E>) -> TransportResult<()> {
+    pub async fn serve_one<E: ChildExecutor + ?Sized>(self, executor: Arc<E>) -> TransportResult<()> {
         let (stream, _) = self.listener.accept().await?;
         handle_conn(stream, executor).await
     }
 
     /// Serve connections forever (long-running service agent).
-    pub async fn serve<E: ChildExecutor>(self, executor: Arc<E>) -> TransportResult<()> {
+    pub async fn serve<E: ChildExecutor + ?Sized>(self, executor: Arc<E>) -> TransportResult<()> {
         loop {
             let (stream, _) = self.listener.accept().await?;
             let exec = executor.clone();
@@ -76,7 +76,7 @@ impl WsServer {
     }
 }
 
-async fn handle_conn<E: ChildExecutor>(stream: TcpStream, executor: Arc<E>) -> TransportResult<()> {
+async fn handle_conn<E: ChildExecutor + ?Sized>(stream: TcpStream, executor: Arc<E>) -> TransportResult<()> {
     let ws = accept_async(stream).await?;
     let (ws_tx, mut ws_rx) = ws.split();
     // One writer task owns the sink; runs push frames through this channel (decouples read/write).
@@ -122,7 +122,7 @@ async fn writer_task(
     let _ = ws_tx.close().await;
 }
 
-fn start_run<E: ChildExecutor>(
+fn start_run<E: ChildExecutor + ?Sized>(
     executor: Arc<E>,
     spec: RunSpec,
     cancel: CancellationToken,

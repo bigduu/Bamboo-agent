@@ -18,6 +18,7 @@ pub mod executor;
 pub mod fleet;
 pub mod mailbox;
 pub mod proto;
+pub mod provision;
 pub mod registry;
 pub mod store;
 pub mod transport;
@@ -28,6 +29,10 @@ pub use executor::{ChildExecutor, ChildOutcome, EchoExecutor, EventSink};
 pub use fleet::{spawn_worker, SpawnedChild};
 pub use mailbox::{AdmittedSet, AgentRef, Delivered, InboxKind, InboxMessage, Mailbox, MsgId};
 pub use proto::{AgentRecord, ChildFrame, ParentFrame, RunSpec, TerminalStatus};
+pub use provision::{
+    ChildIdentity, ExecutorSpec, Limits, ModelRefSpec, ProvisionSpec, ScopedCredential,
+    SecretsEnvelope, PROVISION_VERSION,
+};
 pub use registry::{RegisterChild, Registration, Registry};
 pub use transport::{ChildClient, TransportError, TransportResult, WsServer};
 pub use store::{

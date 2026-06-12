@@ -27,6 +27,11 @@ pub struct ExternalAgentProfile {
     /// (Tier-1 file fabric). Defaults to a per-user temp dir when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fabric_dir: Option<String>,
+    /// Subprocess protocol only: which engine the worker runs.
+    /// `"bamboo_runtime"` (default) for the real agent loop, `"echo"` for a
+    /// dependency-free smoke run through the whole chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

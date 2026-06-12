@@ -1,17 +1,23 @@
-//! Parent-side fleet helpers: spawn an actor subprocess and discover it.
+//! Parent-side fleet helpers: spawn an actor subprocess, provision it over stdin, discover it.
 //!
-//! This is the minimal `SubagentFleet` surface for the demo/e2e: launch the worker binary, wait
-//! for it to self-register into the Tier-1 fabric, and hand back its [`AgentRecord`] + process
-//! handle. The real engine adapter (`SubprocessChildRunner`) will build on the same primitives.
+//! Bootstrap protocol:
+//! 1. spawn the worker binary with **no arguments** (nothing secret in argv/env),
+//! 2. write one [`ProvisionSpec`] JSON document to its stdin and close the pipe,
+//! 3. poll the Tier-1 fabric until the worker self-registers under `identity.child_id`.
+//!
+//! The real engine adapter (`SubprocessChildRunner`) builds on these primitives.
 
 use std::path::Path;
+use std::process::Stdio;
 use std::time::Duration;
 
+use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, Instant};
 
 use crate::discovery::Fabric;
 use crate::proto::AgentRecord;
+use crate::provision::ProvisionSpec;
 use crate::transport::{TransportError, TransportResult};
 
 /// A spawned actor subprocess plus its discovered record. Killed on drop (`kill_on_drop`).
@@ -31,26 +37,43 @@ impl SpawnedChild {
     }
 }
 
-/// Spawn `worker_bin <child_id> <fabric_dir> <role>`, then poll the fabric until the child
-/// self-registers (or `wait` elapses). On timeout the process is killed and an error returned.
+/// Spawn `worker_bin`, provision it with `spec` over stdin, then poll the fabric until the
+/// worker self-registers (or `wait` elapses). On timeout the process is killed.
 pub async fn spawn_worker(
     worker_bin: &Path,
-    fabric_dir: &Path,
-    child_id: &str,
-    role: &str,
+    spec: &ProvisionSpec,
     wait: Duration,
 ) -> TransportResult<SpawnedChild> {
+    let fabric_dir = Path::new(&spec.fabric_dir);
     tokio::fs::create_dir_all(fabric_dir).await.ok();
 
+    let spec_json = spec
+        .to_json()
+        .map_err(|e| TransportError::Protocol(format!("provision spec encode: {e}")))?;
+
     let mut cmd = Command::new(worker_bin);
-    cmd.arg(child_id).arg(fabric_dir).arg(role);
+    cmd.stdin(Stdio::piped());
     cmd.kill_on_drop(true);
     let mut process = cmd.spawn().map_err(TransportError::Io)?;
 
+    // Feed the spec, then close stdin so the worker sees EOF.
+    {
+        let mut stdin = process
+            .stdin
+            .take()
+            .ok_or_else(|| TransportError::Protocol("worker stdin unavailable".to_string()))?;
+        stdin
+            .write_all(spec_json.as_bytes())
+            .await
+            .map_err(TransportError::Io)?;
+        stdin.shutdown().await.map_err(TransportError::Io)?;
+    }
+
+    let child_id = spec.identity.child_id.clone();
     let fab = Fabric::at(fabric_dir);
     let deadline = Instant::now() + wait;
     loop {
-        if let Ok(Some(record)) = fab.resolve(child_id).await {
+        if let Ok(Some(record)) = fab.resolve(&child_id).await {
             return Ok(SpawnedChild { record, process });
         }
         // bail early if the worker died before registering

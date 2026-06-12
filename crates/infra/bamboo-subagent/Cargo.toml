@@ -14,7 +14,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 async-trait = "0.1"
 futures-util = "0.3"
-tokio = { version = "1", features = ["fs", "io-util", "rt", "rt-multi-thread", "sync", "macros", "net", "time", "process"] }
+tokio = { version = "1", features = ["fs", "io-util", "io-std", "rt", "rt-multi-thread", "sync", "macros", "net", "time", "process"] }
 tokio-util = "0.7"
 tokio-tungstenite = "0.24"
 
