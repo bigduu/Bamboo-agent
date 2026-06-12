@@ -97,8 +97,15 @@ pub trait ChildExecutor: Send + Sync + 'static {
 }
 
 /// Dependency-free executor: streams one `token` event per word, then completes with an echo.
-/// Used by the demo worker and the e2e test to exercise the full transport without a real LLM.
+/// Used by the demo worker and tests to exercise the full transport without a real LLM.
+///
+/// Test hook: an assignment starting with `__sleep_ms:<n>` sleeps (cancellably)
+/// for `n` milliseconds before echoing the rest — this is what lets cancel /
+/// concurrency e2e tests hold a run open deterministically without an LLM.
 pub struct EchoExecutor;
+
+/// Assignment prefix recognized by [`EchoExecutor`] for a cancellable delay.
+pub const ECHO_SLEEP_PREFIX: &str = "__sleep_ms:";
 
 #[async_trait]
 impl ChildExecutor for EchoExecutor {
@@ -109,7 +116,25 @@ impl ChildExecutor for EchoExecutor {
         _steer: SteerInbox,
         cancel: CancellationToken,
     ) -> ChildOutcome {
+        // Optional cancellable delay: any token `__sleep_ms:<n>` in the
+        // assignment (scanned, not just the prefix — child creation may wrap
+        // the prompt in a template). The marker token itself is not echoed.
+        let mut sleep_ms: Option<u64> = None;
+        let mut words: Vec<&str> = Vec::new();
         for word in spec.assignment.split_whitespace() {
+            match word.strip_prefix(ECHO_SLEEP_PREFIX).and_then(|n| n.parse::<u64>().ok()) {
+                Some(ms) if sleep_ms.is_none() => sleep_ms = Some(ms),
+                _ => words.push(word),
+            }
+        }
+        if let Some(ms) = sleep_ms {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {}
+                _ = cancel.cancelled() => return ChildOutcome::cancelled(),
+            }
+        }
+
+        for word in &words {
             if cancel.is_cancelled() {
                 return ChildOutcome::cancelled();
             }
@@ -118,7 +143,7 @@ impl ChildExecutor for EchoExecutor {
             tokio::task::yield_now().await;
         }
         events.emit(serde_json::json!({ "type": "complete" }));
-        ChildOutcome::completed(format!("echo: {}", spec.assignment.trim()))
+        ChildOutcome::completed(format!("echo: {}", words.join(" ")))
     }
 }
 

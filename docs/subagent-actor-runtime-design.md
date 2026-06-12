@@ -334,8 +334,8 @@ infra(infra) ─────┘
 | 凭证短期 token / 父代理模式 | 安全迭代;`SecretsEnvelope` 已留演进位 |
 | `Limits` 强制执行 | 资源限额需求明确时(父侧 watchdog 已兜总超时) |
 | Tier-1 fabric 介质替换(文件目录 → 可插拔) | 多机/容器化部署时:`/tmp` 共享文件系统是单机假设,届时以 `Fabric` 为 seam 换 Redis/etcd/k8s 服务发现(2026-06-12 `-p` 并行自调研发现) |
-| `last_run_status` 双写引入版本号/CAS | 第三轮自检发现(中):cancel 与 background task 的终态写入交错时取决于写顺序;设计级改动,下个迭代 |
-| 测试缺口 Top:`service_agent_concurrent_no_crosstalk` + `cancel_running_child_e2e_actor` | 第三轮测试缺口分析的 风险×成本 前两名 |
+> ✅ **已修(同分支)**:`cancel_child_action` 改为「等待后重载 + 自然终态不覆盖」——既消除把真实 `completed` 错标 `cancelled` 的交错,也消除 stale 快照整体保存冲掉运行期消息的隐患(第三轮 #2 的落地形态;通用 CAS 留待真需要时再引入)。
+> ✅ **已补(同分支)**:第三轮测试缺口前两名——`service_agent_concurrent_no_crosstalk`(双客户端并发零串扰)与 `cancel_running_actor_child_through_the_server`(真 actor 进程运行中取消的全链路 e2e,含 fabric 善后)。
 
 > 📌 **已审定行为(非缺陷)**:watchdog 超时与外部 cancel 并发时终态标 `"timeout"` 而非 `"cancelled"`——超时即取消的根因,该标签信息量更大(第三轮自检 #3 的复核结论)。
 

@@ -425,10 +425,27 @@ pub async fn cancel_child_action(
     parent_id: &str,
     child_session_id: String,
 ) -> Result<serde_json::Value, ChildSessionError> {
-    let mut child = port
+    // Validate ownership before doing anything.
+    let _ = port
         .load_child_for_parent(parent_id, &child_session_id)
         .await?;
     port.cancel_child_run_and_wait(&child_session_id).await?;
+
+    // RELOAD after the wait — writing the pre-wait snapshot would clobber
+    // whatever the finishing run persisted (its terminal status AND any
+    // messages it appended). And if the child completed naturally while the
+    // cancel was in flight, keep that truth instead of mislabeling it.
+    let mut child = port
+        .load_child_for_parent(parent_id, &child_session_id)
+        .await?;
+    let latest_status = child.last_run_status().unwrap_or_default();
+    if matches!(latest_status.as_str(), "completed" | "error") {
+        return Ok(json!({
+            "child_session_id": child_session_id,
+            "status": latest_status,
+            "note": "Child reached a natural terminal state while the cancel was in flight; its real outcome was kept.",
+        }));
+    }
     child.set_last_run_status("cancelled");
     child.set_last_run_error("Cancelled by parent");
     port.save_child_session(&mut child).await?;

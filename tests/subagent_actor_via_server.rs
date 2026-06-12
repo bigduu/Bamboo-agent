@@ -151,3 +151,132 @@ async fn subagent_create_runs_actor_process_through_the_server() {
         Some("actor")
     );
 }
+
+/// Cancel a RUNNING actor child through the server: the cancel must trip the
+/// worker mid-run (cancellable echo sleep), the child must land on
+/// last_run_status="cancelled" (the natural-terminal guard must not mislabel),
+/// and the worker must withdraw its fabric record (process recycled).
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_running_actor_child_through_the_server() {
+    let bamboo_bin = env!("CARGO_BIN_EXE_bamboo");
+    let home = TempDir::new().unwrap();
+    let fabric_dir = home.path().join("fabric");
+
+    let config = serde_json::json!({
+        "provider": "anthropic",
+        "providers": { "anthropic": { "api_key": "test-key", "model": "claude-test" } },
+        "subagents": {
+            "runtime": "actor",
+            "executor": "echo",
+            "worker_bin": bamboo_bin,
+            "worker_args": ["subagent-worker"],
+            "fabric_dir": fabric_dir.to_string_lossy(),
+        }
+    });
+    std::fs::write(
+        home.path().join("config.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+
+    let state = AppState::new(home.path().to_path_buf())
+        .await
+        .expect("app state boots");
+
+    let parent_id = "parent-cancel-e2e";
+    let mut parent = Session::new(parent_id, "claude-test");
+    parent.workspace = Some(home.path().to_string_lossy().into_owned());
+    state.storage.save_session(&parent).await.unwrap();
+    state.session_store.save_session(&parent).await.unwrap();
+
+    let tools = state.tool_factory.get(ToolSurface::Root);
+    let create = ToolCall {
+        id: "t1".into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "SubAgent".into(),
+            arguments: serde_json::json!({
+                "action": "create",
+                "title": "Sleeper",
+                "responsibility": "sleep until cancelled",
+                // 60s cancellable sleep: the run stays open until we cancel.
+                "prompt": "__sleep_ms:60000 never reached",
+                "wait": false,
+                "auto_run": true
+            })
+            .to_string(),
+        },
+    };
+    let mut ctx = ToolExecutionContext::none("t1");
+    ctx.session_id = Some(parent_id);
+    let result = tools.execute_with_context(&create, ctx).await.unwrap();
+    assert!(result.success, "create failed: {}", result.result);
+    let child_id = serde_json::from_str::<serde_json::Value>(&result.result).unwrap()
+        ["child_session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The actor is live once its fabric record appears (self-registration).
+    let record = fabric_dir.join(format!("{child_id}.json"));
+    let mut live = false;
+    for _ in 0..150 {
+        if record.exists() {
+            live = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(live, "actor child never self-registered in the fabric");
+
+    // Cancel the RUNNING actor through the same tool surface.
+    let cancel = ToolCall {
+        id: "t2".into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "SubAgent".into(),
+            arguments: serde_json::json!({
+                "action": "cancel",
+                "child_session_id": child_id
+            })
+            .to_string(),
+        },
+    };
+    let mut ctx = ToolExecutionContext::none("t2");
+    ctx.session_id = Some(parent_id);
+    let result = tools.execute_with_context(&cancel, ctx).await.unwrap();
+    assert!(result.success, "cancel failed: {}", result.result);
+    eprintln!("cancel result: {}", result.result);
+
+    // Terminal state must be "cancelled" (mid-sleep cancel, no natural finish).
+    let mut status = None;
+    for i in 0..100 {
+        if let Ok(Some(child)) = state.storage.load_session(&child_id).await {
+            let s = child
+                .runtime_metadata
+                .as_ref()
+                .and_then(|m| m.last_run_status.clone())
+                .or_else(|| child.metadata.get("last_run_status").cloned());
+            if i % 10 == 0 {
+                eprintln!("poll {i}: status={s:?}");
+            }
+            if matches!(s.as_deref(), Some("cancelled")) {
+                status = s;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(status.as_deref(), Some("cancelled"));
+
+    // The worker withdrew its fabric record on the way out (process recycled).
+    let mut withdrawn = false;
+    for _ in 0..100 {
+        if !record.exists() {
+            withdrawn = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(withdrawn, "worker did not withdraw its fabric record");
+}

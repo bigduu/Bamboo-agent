@@ -335,6 +335,88 @@ mod tests {
         let _ = srv.await;
     }
 
+    /// Service-agent mode: two concurrent connections to one `serve()` must be
+    /// fully isolated — each client sees only its own run's events/terminal,
+    /// and per-connection cancel state (the round-2 fix) must not cross talk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn service_agent_concurrent_no_crosstalk() {
+        use crate::executor::EchoExecutor;
+
+        let server = WsServer::bind_loopback().await.unwrap();
+        let endpoint = server.ws_endpoint();
+        let srv = tokio::spawn(async move { server.serve(Arc::new(EchoExecutor)).await });
+
+        // Client A holds its run open (300ms sleep) while client B runs to
+        // completion — guaranteed overlap.
+        let endpoint_a = endpoint.clone();
+        let a = tokio::spawn(async move {
+            let mut client = ChildClient::connect(&endpoint_a).await.unwrap();
+            client
+                .send(ParentFrame::Run(RunSpec {
+                    assignment: "__sleep_ms:300 alpha only".into(),
+                    reasoning_effort: None,
+                    messages: Vec::new(),
+                }))
+                .await
+                .unwrap();
+            collect_stream(client).await
+        });
+        let endpoint_b = endpoint.clone();
+        let b = tokio::spawn(async move {
+            // Give A a head start so its run is live when B's traffic flows.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mut client = ChildClient::connect(&endpoint_b).await.unwrap();
+            client
+                .send(ParentFrame::Run(RunSpec {
+                    assignment: "beta only".into(),
+                    reasoning_effort: None,
+                    messages: Vec::new(),
+                }))
+                .await
+                .unwrap();
+            collect_stream(client).await
+        });
+
+        let (tokens_a, result_a) = a.await.unwrap();
+        let (tokens_b, result_b) = b.await.unwrap();
+
+        // Each stream carries exactly its own run.
+        assert_eq!(result_a.as_deref(), Some("echo: alpha only"));
+        assert_eq!(result_b.as_deref(), Some("echo: beta only"));
+        assert!(
+            tokens_a.iter().all(|t| !t.contains("beta")),
+            "client A saw B's tokens: {tokens_a:?}"
+        );
+        assert!(
+            tokens_b.iter().all(|t| !t.contains("alpha")),
+            "client B saw A's tokens: {tokens_b:?}"
+        );
+
+        srv.abort();
+    }
+
+    /// Drain a client until Terminal; returns (token contents, result).
+    async fn collect_stream(mut client: ChildClient) -> (Vec<String>, Option<String>) {
+        let mut tokens = Vec::new();
+        let mut result = None;
+        while let Some(frame) = client.next_frame().await.unwrap() {
+            match frame {
+                ChildFrame::Event { event } => {
+                    if let Some(t) = event["content"].as_str() {
+                        tokens.push(t.to_string());
+                    }
+                }
+                ChildFrame::Terminal { status, result: r, .. } => {
+                    assert_eq!(status, TerminalStatus::Completed);
+                    result = r;
+                    break;
+                }
+            }
+        }
+        let _ = client.close().await;
+        (tokens, result)
+    }
+
     /// Orphan defense: with no client, the accept-timeout variant returns
     /// instead of hanging forever.
     #[tokio::test]

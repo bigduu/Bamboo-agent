@@ -194,6 +194,12 @@ impl ExternalChildRunner for ActorChildRunner {
 
         let _ = client.close().await;
         spawned.kill().await;
+        // The kill is forceful (no graceful shutdown), so the worker never got
+        // to withdraw its discovery record — clean it up on its behalf instead
+        // of leaving a stale entry until the lease expires.
+        let _ = bamboo_subagent::discovery::Fabric::at(&self.fabric_dir)
+            .withdraw(&job.child_session_id)
+            .await;
 
         // Write-back: persist the actor's final reply onto the child session so
         // the transcript survives and the NEXT activation sees it as history.

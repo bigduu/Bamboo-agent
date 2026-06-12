@@ -823,6 +823,22 @@
     #[tokio::test]
     async fn cancel_stops_running_child() {
         let harness = build_test_harness().await;
+        // A genuinely RUNNING child carries status "running"/"pending" (every
+        // (re)enqueue path resets it before the run; the terminal status is
+        // only written when the run ends). The fixture's stale "completed"
+        // would otherwise trip the natural-terminal guard in
+        // cancel_child_action, which deliberately refuses to overwrite a
+        // completed/error outcome that landed while the cancel was in flight.
+        {
+            let mut child = harness
+                .storage
+                .load_session(&harness.child_session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            child.set_last_run_status("running");
+            harness.storage.save_session(&child).await.unwrap();
+        }
         let cancel_token = {
             let mut runners = harness.agent_runners.write().await;
             let mut runner = AgentRunner::new();
