@@ -333,6 +333,9 @@ infra(infra) ─────┘
 | mailbox 接 agent loop(完整 drain→admit) | 常驻 owned actor 的离线收件需求(steering 已用引擎原生 pending 队列等效达成) |
 | 凭证短期 token / 父代理模式 | 安全迭代;`SecretsEnvelope` 已留演进位 |
 | `Limits` 强制执行 | 资源限额需求明确时(父侧 watchdog 已兜总超时) |
+| Tier-1 fabric 介质替换(文件目录 → 可插拔) | 多机/容器化部署时:`/tmp` 共享文件系统是单机假设,届时以 `Fabric` 为 seam 换 Redis/etcd/k8s 服务发现(2026-06-12 `-p` 并行自调研发现) |
+
+> 📌 **已修(同分支)**:store 索引写入的"registry 单写者"原为口头契约、无运行时防护——并发误用会静默覆盖 `index.json`(同次自调研发现);已在 `SubagentStore` 内加写串行化兜底。
 
 > ✅ **`bamboo -p` = 完整 headless server(已落地,真 LLM 验证)**:full AppState + root 工具面(含 SubAgent,可 spawn child 并走完整 wait/resume 协调)、树静默才退出、`-s <session>` 续跑同一会话。`--echo` 保留为裸 actor 链冒烟;单 actor 快捷路径在 `bamboo actor run`。
 

@@ -16,7 +16,10 @@
 //! Invariants:
 //! - `session.json` is authoritative; `index.json` / `children.json` are caches, fully
 //!   rebuildable via [`SubagentStore::rebuild_index`].
-//! - Index files have a single writer (the registry); this type does not take cross-process locks.
+//! - Index mutations are serialized within this process by an internal `tokio::sync::Mutex`
+//!   (`write_lock`), so concurrent `upsert_*` / `remove_*` / `rebuild_index` calls cannot
+//!   silently overwrite each other. Cross-process safety still relies on the registry being
+//!   the sole writer (no file-level locking).
 //! - Every write is atomic (temp + rename). Aggregates are kept sorted by id for determinism.
 
 use std::collections::BTreeMap;
@@ -150,11 +153,16 @@ pub trait MetaExtractor: Sync {
 /// Filesystem-backed store rooted at `<root>` (default `~/.bamboo`, injected for tests).
 pub struct SubagentStore {
     root: PathBuf,
+    /// In-process mutex that serializes all index read-modify-write sequences.
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl SubagentStore {
     pub fn open(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            write_lock: tokio::sync::Mutex::new(()),
+        }
     }
 
     // ---- path layout -------------------------------------------------------
@@ -253,6 +261,7 @@ impl SubagentStore {
     // ---- index writes (single-writer = registry) --------------------------
 
     pub async fn upsert_root(&self, key: &ProjectKey, entry: RootEntry) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
         let path = self.index_file(key);
         let mut idx: ProjectIndex = self.read_json(&path).await?;
         match idx.roots.iter_mut().find(|r| r.session_id == entry.session_id) {
@@ -269,6 +278,7 @@ impl SubagentStore {
         parent_id: &str,
         entry: ChildEntry,
     ) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
         // 1. children.json (per parent)
         let cpath = self.children_index_file(key, parent_id);
         let mut cidx: ChildrenIndex = self.read_json(&cpath).await?;
@@ -292,6 +302,7 @@ impl SubagentStore {
         parent_id: &str,
         child_id: &str,
     ) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
         let cpath = self.children_index_file(key, parent_id);
         let mut cidx: ChildrenIndex = self.read_json(&cpath).await?;
         cidx.children.retain(|c| c.child_id != child_id);
@@ -312,6 +323,7 @@ impl SubagentStore {
         key: &ProjectKey,
         extractor: &dyn MetaExtractor,
     ) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
         let sessions = self.sessions_dir(key);
         let mut idx = ProjectIndex::default();
 
@@ -681,5 +693,44 @@ mod tests {
         s.rebuild_index(&k, &Extract).await.unwrap();
         // now converged
         assert!(s.resolve_child(&k, "c1").await.unwrap().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_upserts_do_not_lose_children() {
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let s = Arc::new(SubagentStore::open(dir.path()));
+        let k = key();
+
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let s = s.clone();
+            let k = k.clone();
+            handles.push(tokio::spawn(async move {
+                let child_id = format!("c{i}");
+                let entry = ChildEntry {
+                    child_id: child_id.clone(),
+                    subagent_type: "coder".into(),
+                    status: ChildStatus::Pending,
+                    title: child_id.clone(),
+                    responsibility: format!("do {child_id}"),
+                    updated_at: ts(),
+                };
+                s.upsert_child(&k, "p1", entry).await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let listed = s.list_children(&k, "p1").await.unwrap();
+        assert_eq!(listed.len(), 16, "all 16 children must survive concurrent upserts");
+
+        let resolved = s.resolve_child(&k, "c7").await.unwrap();
+        assert!(
+            resolved.is_some(),
+            "resolve_child(\"c7\") must hit after concurrent upserts"
+        );
     }
 }
