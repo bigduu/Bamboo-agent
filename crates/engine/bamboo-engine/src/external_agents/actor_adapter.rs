@@ -27,6 +27,9 @@ use bamboo_subagent::transport::ChildClient;
 
 use crate::runtime::execution::{ExternalChildRunner, SpawnJob};
 
+/// Default cap on simultaneously running actor processes.
+pub const DEFAULT_MAX_CONCURRENT_ACTORS: usize = 8;
+
 /// Spawns and drives a child session as an independent actor: a `bamboo-subagent` worker process.
 pub struct ActorChildRunner {
     agent_id: String,
@@ -39,10 +42,14 @@ pub struct ActorChildRunner {
     credentials: Vec<ScopedCredential>,
     /// Parent's default provider (used when the child has no explicit one).
     default_provider: String,
+    /// Backpressure: bounds the number of live actor processes; further
+    /// spawns wait for a slot instead of exploding the process table.
+    concurrency: std::sync::Arc<tokio::sync::Semaphore>,
     spawn_timeout: Duration,
 }
 
 impl ActorChildRunner {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent_id: String,
         worker_bin: PathBuf,
@@ -51,6 +58,7 @@ impl ActorChildRunner {
         executor: ExecutorSpec,
         credentials: Vec<ScopedCredential>,
         default_provider: String,
+        max_concurrent: usize,
     ) -> Self {
         Self {
             agent_id,
@@ -60,6 +68,7 @@ impl ActorChildRunner {
             executor,
             credentials,
             default_provider,
+            concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
             spawn_timeout: Duration::from_secs(30),
         }
     }
@@ -135,6 +144,23 @@ impl ExternalChildRunner for ActorChildRunner {
     ) -> crate::runtime::runner::Result<()> {
         let assignment = extract_assignment(session);
         let spec = self.build_spec(session, job);
+        // Rehydration: the child session in the parent's store is the actor's
+        // durable state. Ship the full conversation so a reactivation
+        // (send_message / update / rerun) carries its history.
+        let messages: Vec<serde_json::Value> = session
+            .messages
+            .iter()
+            .filter_map(|m| serde_json::to_value(m).ok())
+            .collect();
+
+        // Backpressure: hold a concurrency slot for the lifetime of the actor
+        // process (cancellation still proceeds — the cancel branch in drive()
+        // runs while we hold the permit).
+        let _slot = self
+            .concurrency
+            .acquire()
+            .await
+            .map_err(|_| AgentError::LLM("actor concurrency limiter closed".to_string()))?;
 
         let spawned = spawn_worker(&self.worker_bin, &self.worker_args, &spec, self.spawn_timeout)
             .await
@@ -147,6 +173,7 @@ impl ExternalChildRunner for ActorChildRunner {
             .send(ParentFrame::Run(RunSpec {
                 assignment,
                 reasoning_effort: None,
+                messages,
             }))
             .await
             .map_err(|e| AgentError::LLM(format!("actor run dispatch failed: {e}")))?;
@@ -155,16 +182,30 @@ impl ExternalChildRunner for ActorChildRunner {
 
         let _ = client.close().await;
         spawned.kill().await;
-        result
+
+        // Write-back: persist the actor's final reply onto the child session so
+        // the transcript survives and the NEXT activation sees it as history.
+        // (run_child_spawn saves the session right after we return.)
+        match result {
+            Ok(Some(text)) => {
+                if !text.is_empty() {
+                    session.add_message(bamboo_agent_core::Message::assistant(text, None));
+                }
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 
 /// Pump child frames -> parent events until a terminal frame (or cancellation).
+/// On success, yields the actor's final result text (for session write-back).
 async fn drive(
     client: &mut ChildClient,
     event_tx: &mpsc::Sender<AgentEvent>,
     cancel_token: &CancellationToken,
-) -> crate::runtime::runner::Result<()> {
+) -> crate::runtime::runner::Result<Option<String>> {
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -179,9 +220,9 @@ async fn drive(
                             let _ = event_tx.send(ev).await;
                         }
                     }
-                    Ok(Some(ChildFrame::Terminal { status, error, .. })) => {
+                    Ok(Some(ChildFrame::Terminal { status, result, error })) => {
                         return match status {
-                            TerminalStatus::Completed => Ok(()),
+                            TerminalStatus::Completed => Ok(result),
                             TerminalStatus::Cancelled => Err(AgentError::Cancelled),
                             TerminalStatus::Error => Err(AgentError::LLM(
                                 error.unwrap_or_else(|| "actor child errored".to_string()),

@@ -66,7 +66,10 @@ async fn main() {
     };
     fab.publish(&record).await.expect("publish discovery record");
 
-    // Serve a single connection, then clean up.
-    let _ = server.serve_one(executor).await;
+    // Serve a single connection, then clean up. Self-terminate if the parent
+    // never connects (orphan defense).
+    let _ = server
+        .serve_one_with_accept_timeout(executor, std::time::Duration::from_secs(120))
+        .await;
     let _ = fab.withdraw(&spec.identity.child_id).await;
 }

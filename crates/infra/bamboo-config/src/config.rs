@@ -273,6 +273,10 @@ pub struct SubagentsConfig {
     /// Per-`subagent_type` exceptions to `runtime` (highest precedence).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub overrides: HashMap<String, SubagentRuntimeMode>,
+    /// Maximum actor processes running at once; further spawns wait their
+    /// turn. Default: 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<usize>,
     /// Expert: custom worker binary. Default: the current bamboo executable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_bin: Option<String>,

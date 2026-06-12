@@ -29,6 +29,13 @@ pub struct RunSpec {
     pub assignment: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Full prior conversation (serialized domain `Message`s, oldest first),
+    /// INCLUDING the assignment's user message when present. The actor's
+    /// durable state lives in the parent's store; each activation rehydrates
+    /// from here — this is what makes send_message/update/rerun carry context
+    /// across one-shot actor processes. Empty = first activation, no history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<serde_json::Value>,
 }
 
 /// Parent → child control/in-band frames.
@@ -91,6 +98,7 @@ mod tests {
             ParentFrame::Run(RunSpec {
                 assignment: "do x".into(),
                 reasoning_effort: None,
+                messages: Vec::new(),
             }),
             ParentFrame::Cancel,
             ParentFrame::Message { text: "hi".into() },
@@ -118,9 +126,23 @@ mod tests {
         let f = ParentFrame::Run(RunSpec {
             assignment: "a".into(),
             reasoning_effort: Some("high".into()),
+            messages: Vec::new(),
         });
         let v: serde_json::Value = serde_json::from_str(&f.to_text()).unwrap();
         assert_eq!(v["kind"], "run");
         assert_eq!(v["assignment"], "a");
+    }
+
+    #[test]
+    fn run_frame_without_messages_parses_backward_compat() {
+        // An old-style frame (no `messages` field) must still parse.
+        let parsed = ParentFrame::from_text(r#"{"kind":"run","assignment":"x"}"#).unwrap();
+        match parsed {
+            ParentFrame::Run(spec) => {
+                assert_eq!(spec.assignment, "x");
+                assert!(spec.messages.is_empty());
+            }
+            other => panic!("expected run frame, got {other:?}"),
+        }
     }
 }

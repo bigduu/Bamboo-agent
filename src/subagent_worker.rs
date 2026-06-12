@@ -84,8 +84,12 @@ pub async fn run() -> std::result::Result<(), String> {
         }
     });
 
-    // Serve a single connection (one-shot child), then clean up.
-    let serve_result = server.serve_one(executor).await;
+    // Serve a single connection (one-shot child), then clean up. If the parent
+    // never connects (e.g. it died right after spawning us), exit on our own
+    // instead of lingering as an orphan.
+    let serve_result = server
+        .serve_one_with_accept_timeout(executor, std::time::Duration::from_secs(120))
+        .await;
     renew.abort();
     let _ = fab.withdraw(&spec.identity.child_id).await;
     serve_result.map_err(|e| format!("serve: {e}"))
@@ -197,13 +201,34 @@ impl ChildExecutor for BambooRuntimeExecutor {
         events: EventSink,
         cancel: CancellationToken,
     ) -> ChildOutcome {
-        // Fresh session per run, in the worker's isolated store.
+        // Fresh session per run, in the worker's isolated store. When the parent
+        // ships prior conversation (a reactivation: send_message/update/rerun),
+        // rehydrate from it — the parent's store is the actor's durable state,
+        // this process is just its activation.
         let mut session = Session::new(
             format!("{}-run", self.child_id),
             self.model.clone().unwrap_or_default(),
         );
         session.workspace = self.workspace.clone();
-        session.add_message(Message::user(run.assignment.clone()));
+        let rehydrated: Vec<Message> = run
+            .messages
+            .iter()
+            .filter_map(|v| serde_json::from_value::<Message>(v.clone()).ok())
+            .collect();
+        if rehydrated.is_empty() {
+            session.add_message(Message::user(run.assignment.clone()));
+        } else {
+            session.messages = rehydrated;
+            // Defensive: execution is driven by the last user message; if the
+            // shipped history somehow lacks one, append the assignment.
+            if !session
+                .messages
+                .iter()
+                .any(|m| matches!(m.role, Role::User))
+            {
+                session.add_message(Message::user(run.assignment.clone()));
+            }
+        }
         bamboo_engine::session_app::execution_prep::prepare_session_for_execution(
             &mut session,
             None,

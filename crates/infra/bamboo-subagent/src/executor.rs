@@ -103,6 +103,7 @@ mod tests {
                 RunSpec {
                     assignment: "alpha beta".into(),
                     reasoning_effort: None,
+                messages: Vec::new(),
                 },
                 sink,
                 CancellationToken::new(),
@@ -130,6 +131,7 @@ mod tests {
                 RunSpec {
                     assignment: "a b c".into(),
                     reasoning_effort: None,
+                messages: Vec::new(),
                 },
                 sink,
                 cancel,

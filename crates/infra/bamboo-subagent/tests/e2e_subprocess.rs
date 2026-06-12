@@ -42,6 +42,7 @@ async fn spawn_discover_run_stream_terminal() {
         .send(ParentFrame::Run(RunSpec {
             assignment: "hello world".into(),
             reasoning_effort: None,
+                messages: Vec::new(),
         }))
         .await
         .unwrap();

@@ -64,6 +64,25 @@ impl WsServer {
         handle_conn(stream, executor).await
     }
 
+    /// Serve exactly one connection, but give up if no client connects within
+    /// `accept_timeout` (orphan defense: a spawned worker whose parent died
+    /// before connecting must not linger forever). An ACTIVE connection is
+    /// never cut short — the timeout only guards the accept.
+    pub async fn serve_one_with_accept_timeout<E: ChildExecutor + ?Sized>(
+        self,
+        executor: Arc<E>,
+        accept_timeout: std::time::Duration,
+    ) -> TransportResult<()> {
+        let (stream, _) = tokio::time::timeout(accept_timeout, self.listener.accept())
+            .await
+            .map_err(|_| {
+                TransportError::Protocol(format!(
+                    "no connection within {accept_timeout:?}; exiting"
+                ))
+            })??;
+        handle_conn(stream, executor).await
+    }
+
     /// Serve connections forever (long-running service agent).
     pub async fn serve<E: ChildExecutor + ?Sized>(self, executor: Arc<E>) -> TransportResult<()> {
         loop {
@@ -207,6 +226,7 @@ mod tests {
             .send(ParentFrame::Run(RunSpec {
                 assignment: "one two".into(),
                 reasoning_effort: None,
+                messages: Vec::new(),
             }))
             .await
             .unwrap();
@@ -230,5 +250,19 @@ mod tests {
 
         let _ = client.close().await;
         let _ = srv.await;
+    }
+
+    /// Orphan defense: with no client, the accept-timeout variant returns
+    /// instead of hanging forever.
+    #[tokio::test]
+    async fn accept_timeout_fires_when_nobody_connects() {
+        let server = WsServer::bind_loopback().await.unwrap();
+        let result = server
+            .serve_one_with_accept_timeout(
+                Arc::new(EchoExecutor),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+        assert!(matches!(result, Err(TransportError::Protocol(_))));
     }
 }

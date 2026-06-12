@@ -115,6 +115,10 @@ pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalCh
                 executor,
                 extract_provider_credentials(config),
                 config.provider.clone(),
+                config
+                    .subagents
+                    .max_concurrent
+                    .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
             )));
             continue;
         }
@@ -220,6 +224,8 @@ fn build_local_actor_runner(
         executor,
         extract_provider_credentials(config),
         config.provider.clone(),
+        sub.max_concurrent
+            .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
     )))
 }
 
