@@ -27,6 +27,7 @@ use crate::runtime::execution::{ExternalChildRunner, SpawnJob};
 pub struct SubprocessChildRunner {
     agent_id: String,
     worker_bin: PathBuf,
+    worker_args: Vec<String>,
     fabric_dir: PathBuf,
     executor: ExecutorSpec,
     spawn_timeout: Duration,
@@ -36,12 +37,14 @@ impl SubprocessChildRunner {
     pub fn new(
         agent_id: String,
         worker_bin: PathBuf,
+        worker_args: Vec<String>,
         fabric_dir: PathBuf,
         executor: ExecutorSpec,
     ) -> Self {
         Self {
             agent_id,
             worker_bin,
+            worker_args,
             fabric_dir,
             executor,
             spawn_timeout: Duration::from_secs(30),
@@ -103,7 +106,7 @@ impl ExternalChildRunner for SubprocessChildRunner {
         let assignment = extract_assignment(session);
         let spec = self.build_spec(session, job);
 
-        let spawned = spawn_worker(&self.worker_bin, &spec, self.spawn_timeout)
+        let spawned = spawn_worker(&self.worker_bin, &self.worker_args, &spec, self.spawn_timeout)
             .await
             .map_err(|e| AgentError::LLM(format!("subprocess spawn/register failed: {e}")))?;
 

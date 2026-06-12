@@ -99,6 +99,7 @@ pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalCh
             runners.push(Arc::new(SubprocessChildRunner::new(
                 profile.agent_id.clone(),
                 std::path::PathBuf::from(worker_bin),
+                profile.worker_args.clone(),
                 fabric_dir,
                 executor,
             )));

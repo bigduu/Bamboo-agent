@@ -46,6 +46,9 @@ pub mod error;
 
 pub mod commands;
 
+/// The `bamboo subagent-worker` actor worker (provision via stdin, serve over WS).
+pub mod subagent_worker;
+
 // Server module is now a separate workspace crate
 pub use bamboo_server as server;
 

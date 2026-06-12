@@ -80,6 +80,9 @@ bamboo-engine = { path = "crates/engine/bamboo-engine" }
 bamboo-tools = { path = "crates/engine/bamboo-tools" }
 bamboo-server = { path = "crates/app/bamboo-server" }
 bamboo-sdk = { path = "crates/app/bamboo-sdk" }
+bamboo-subagent = { path = "crates/infra/bamboo-subagent" }
+bamboo-skills = { path = "crates/infra/bamboo-skills" }
+bamboo-metrics = { path = "crates/infra/bamboo-metrics" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

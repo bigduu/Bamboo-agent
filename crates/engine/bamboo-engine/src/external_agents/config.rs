@@ -23,6 +23,11 @@ pub struct ExternalAgentProfile {
     /// Subprocess protocol only: path to the worker binary to spawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_bin: Option<String>,
+    /// Subprocess protocol only: fixed arguments passed to the worker binary
+    /// (e.g. `["subagent-worker"]` when `worker_bin` is the main `bamboo`
+    /// binary). Per-child data never rides here — it goes in the spec.
+    #[serde(default)]
+    pub worker_args: Vec<String>,
     /// Subprocess protocol only: directory the worker self-registers into
     /// (Tier-1 file fabric). Defaults to a per-user temp dir when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]

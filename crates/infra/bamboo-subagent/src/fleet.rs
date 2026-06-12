@@ -37,10 +37,14 @@ impl SpawnedChild {
     }
 }
 
-/// Spawn `worker_bin`, provision it with `spec` over stdin, then poll the fabric until the
-/// worker self-registers (or `wait` elapses). On timeout the process is killed.
+/// Spawn `worker_bin worker_args…`, provision it with `spec` over stdin, then poll the fabric
+/// until the worker self-registers (or `wait` elapses). On timeout the process is killed.
+///
+/// `worker_args` carries fixed subcommand/flag arguments (e.g. `["subagent-worker"]` for the
+/// main `bamboo` binary) — never per-child data, which all rides in the spec.
 pub async fn spawn_worker(
     worker_bin: &Path,
+    worker_args: &[String],
     spec: &ProvisionSpec,
     wait: Duration,
 ) -> TransportResult<SpawnedChild> {
@@ -52,6 +56,7 @@ pub async fn spawn_worker(
         .map_err(|e| TransportError::Protocol(format!("provision spec encode: {e}")))?;
 
     let mut cmd = Command::new(worker_bin);
+    cmd.args(worker_args);
     cmd.stdin(Stdio::piped());
     cmd.kill_on_drop(true);
     let mut process = cmd.spawn().map_err(TransportError::Io)?;

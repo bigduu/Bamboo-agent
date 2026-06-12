@@ -49,6 +49,14 @@ enum Commands {
         #[arg(long)]
         show_secrets: bool,
     },
+
+    /// Run as a sub-agent worker process (spawned by a parent bamboo server).
+    ///
+    /// Reads a ProvisionSpec JSON document from stdin (the parent writes it and
+    /// closes the pipe), self-registers into the discovery fabric, and serves
+    /// one run over a loopback WebSocket. Not intended for interactive use.
+    #[command(name = "subagent-worker", hide = true)]
+    SubagentWorker,
 }
 
 #[tokio::main]
@@ -68,6 +76,18 @@ async fn main() {
         Commands::Config { .. } => {
             // No file logging for config subcommand; stdout only.
             tracing_subscriber::fmt()
+                .with_target(true)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .init();
+        }
+        Commands::SubagentWorker => {
+            // Worker logs go to stderr only: stdin carries the ProvisionSpec and
+            // stdout stays clean (diagnostics must not corrupt the bootstrap).
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
                 .with_target(true)
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
@@ -147,6 +167,13 @@ async fn main() {
 
             if let Err(e) = result {
                 eprintln!("Failed to start server: {}", e);
+                std::process::exit(1);
+            }
+        }
+
+        Commands::SubagentWorker => {
+            if let Err(e) = bamboo_agent::subagent_worker::run().await {
+                eprintln!("subagent-worker failed: {e}");
                 std::process::exit(1);
             }
         }

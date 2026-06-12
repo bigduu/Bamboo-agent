@@ -27,7 +27,7 @@ async fn spawn_discover_run_stream_terminal() {
         ExecutorSpec::Echo,
         fabric.to_string_lossy().into_owned(),
     );
-    let spawned = spawn_worker(worker, &spec, Duration::from_secs(15))
+    let spawned = spawn_worker(worker, &[], &spec, Duration::from_secs(15))
         .await
         .expect("worker should spawn and register");
     assert_eq!(spawned.record.agent_id, "c1");
