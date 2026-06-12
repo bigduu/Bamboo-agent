@@ -306,13 +306,34 @@ infra(infra) ─────┘
 
 ## 10. 实施切片(设计落地的建议顺序,细节另议)
 
-1. **存储+索引+mailbox**:`store/` + `mailbox/` 模块(project-keyed 布局 + 三索引 + Maildir 收件箱,原子/可重建/幂等),纯逻辑可单测。
-2. **crate 骨架 + 两 seam**:`proto` / `transport` / `registry`(含索引维护)/ `discovery`,塞假 `ChildExecutor` 即可在**不起真实 runtime** 下单测「deliver→drain→admit / register→discover→heartbeat→超时 reap→cancel→激活」。
-3. **child worker(owned)+ WS**:`bamboo subagent-worker`,隔离存储 + 最小 runtime + 自身 WS server,一次性跑通。
-4. **父侧 `SubprocessChildRunner` 接入** `wants_external`:端到端对齐进程内行为(协调层不动,UI 流不变),按 `subagentRouting` 逐 type 灰度,出问题改回 `runtime: bamboo` 零代码回滚。
-5. **按需激活 + 落盘恢复**:idle deactivate / 凉 actor 直接激活 / 重启从索引恢复。
-6. **service agent 模式**:`bamboo agent --role`,Tier 1 文件 fabric,无状态 RPC 优先。
-7. **健壮性/限额**:心跳 reap、孤儿回收、并发上限、资源/沙箱限额、可观测。
+> **状态标注(2026-06-12,分支 `feat/subagent-actor-runtime`,16 checkpoints)**
+> ✅ 已落地并验证 · 🟡 部分落地 · ⏸ 刻意推迟(等消费者)
+
+1. ✅ **存储+索引+mailbox**:`store/` + `mailbox/` 模块(project-keyed 布局 + 三索引 + Maildir 收件箱,原子/可重建/幂等),纯逻辑可单测。
+   *已落地:全套 + ProjectKey 防碰撞(canonicalize+hash)+ AdmittedSet 有界化 + ack O(1)。注:store/mailbox 是已测零件,server 侧消费(持久索引/凉收件)待接。*
+2. ✅ **crate 骨架 + 两 seam**:`proto` / `transport` / `registry`(含索引维护)/ `discovery`,塞假 `ChildExecutor` 即可在**不起真实 runtime** 下单测。
+   *已落地:含 `provision`(stdin 装备契约)与 `fleet`(spawn+发现);假执行器=EchoExecutor。*
+3. ✅ **child worker(owned)+ WS**:`bamboo subagent-worker`,隔离存储 + 最小 runtime + 自身 WS server。
+   *已落地:真 `agent.execute()`(canonical loop,压缩/工具全复用,不 fork loop)+ 凭证经 stdin 内存态(含 provider_instances/加密 key)。*
+4. ✅ **父侧 runner 接入** `wants_external`:`ActorChildRunner`,按配置灰度,零代码回滚。
+   *已落地:一行 `"subagents": {"runtime": "actor"}` 开关 + per-role overrides + `max_concurrent` 背压;真 LLM 与生产路径 e2e 双验证。*
+5. 🟡 **按需激活 + 落盘恢复**:
+   *已落地:重激活带全量上下文(RunSpec.messages rehydration)+ 结果回写 transcript——父存储即真身,进程即缓存。**运行中带内转向**(send_message → live WS → loop round 边界 admit)同样落地。*
+   *待做:凉 actor 的 mailbox 文件收件(离线投递场景,等常驻 owned actor 需求)。*
+6. ✅ **service agent 模式**:`bamboo actor serve/list/call`,Tier 1 文件 fabric,无状态 RPC(每次调用独立 session)。
+7. 🟡 **健壮性/限额**:
+   *已落地:孤儿回收(accept 超时自杀 + kill_on_drop + 续租/注销)、并发上限、存储 GC(7 天)、CLI 可观测(`bamboo -p` / `actor run` 流式)。*
+   *待做:`Limits`(run/idle 超时、max_rounds)已随 spec 下发但 worker 未强制;注册表级心跳 reap(等 Tier-2 路由消费者)。*
+
+### 刻意推迟项(有消费者才做,避免过度建设)
+
+| 项 | 等待的消费者 / 触发条件 |
+|---|---|
+| Tier-2 注册表 HTTP 路由(`/internal/subagents`) | lotus 前端要 actor 健康视图时 |
+| mailbox 接 agent loop(完整 drain→admit) | 常驻 owned actor 的离线收件需求(steering 已用引擎原生 pending 队列等效达成) |
+| 凭证短期 token / 父代理模式 | 安全迭代;`SecretsEnvelope` 已留演进位 |
+| `Limits` 强制执行 | 资源限额需求明确时(父侧 watchdog 已兜总超时) |
+| **`bamboo -p` 编排模式(`--orchestrate`)** | 需要 CLI 一发即跑"会 spawn child 的完整编排 agent"时:headless 起 AppState 走 root session(生产路径 e2e 已证明该装配可行) |
 
 ---
 
