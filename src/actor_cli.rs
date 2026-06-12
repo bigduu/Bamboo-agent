@@ -1,24 +1,33 @@
-//! `bamboo actor run` — drive a sub-agent actor from the terminal.
+//! `bamboo actor …` / `bamboo -p` — drive actors from the terminal.
 //!
-//! Spawns the exact production chain (worker process + stdin ProvisionSpec + fabric
-//! self-register + WebSocket) against the user's real config, streaming events live:
-//!
-//! ```text
-//! bamboo actor run "Summarize this repo"            # real LLM via your config
-//! bamboo actor run --echo "ping"                    # dependency-free smoke run
-//! bamboo actor run --model <provider:model> "..."   # pin the model
-//! ```
+//! - `run`:   spawn an owned one-shot actor, give it a task, stream the output.
+//! - `serve`: become a long-running Tier-1 **service agent** — announce into the
+//!   discovery fabric and serve calls forever (stateless RPC: one isolated
+//!   session per call, design §8).
+//! - `list`:  show live fabric records (who is discoverable right now).
+//! - `call`:  discover a service agent by id or role and send it a task.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
+use chrono::{Duration as ChronoDuration, Utc};
+
 use bamboo_llm::Config;
+use bamboo_subagent::discovery::Fabric;
+use bamboo_subagent::executor::{ChildExecutor, EchoExecutor};
 use bamboo_subagent::fleet::spawn_worker;
-use bamboo_subagent::proto::{ChildFrame, ParentFrame, RunSpec, TerminalStatus};
+use bamboo_subagent::proto::{AgentRecord, ChildFrame, ParentFrame, RunSpec, TerminalStatus};
 use bamboo_subagent::provision::{
     ChildIdentity, ExecutorSpec, ModelRefSpec, ProvisionSpec, ScopedCredential,
 };
-use bamboo_subagent::transport::ChildClient;
+use bamboo_subagent::transport::{ChildClient, WsServer};
+
+use crate::subagent_worker::BambooRuntimeExecutor;
+
+/// Default fabric directory shared by all local actors.
+pub fn default_fabric_dir() -> PathBuf {
+    std::env::temp_dir().join("bamboo-subagents")
+}
 
 pub struct ActorRunArgs {
     pub prompt: String,
@@ -31,71 +40,43 @@ pub struct ActorRunArgs {
     pub raw: bool,
 }
 
+pub struct ActorServeArgs {
+    pub role: String,
+    /// Stable agent id; defaults to `<role>-<short-uuid>`.
+    pub id: Option<String>,
+    pub model: Option<String>,
+    pub workspace: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
+    pub echo: bool,
+}
+
+pub struct ActorCallArgs {
+    /// Agent id (exact) or role (first live match) to call.
+    pub agent: String,
+    pub prompt: String,
+    pub raw: bool,
+}
+
+// ---------------------------------------------------------------------------
+// run — spawn an owned one-shot actor
+// ---------------------------------------------------------------------------
+
 pub async fn run(args: ActorRunArgs) -> Result<(), String> {
-    let data_dir = args
-        .data_dir
-        .clone()
-        .unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
-    // Loads config.json and hydrates encrypted api keys into memory.
-    let config = Config::from_data_dir(Some(data_dir.clone()));
-
-    let credentials = bamboo_engine::external_agents::runtime::extract_provider_credentials(&config);
-
-    // Resolve the model: explicit --model > defaults.sub_agent > defaults.chat.
-    let model = resolve_model(&args.model, &config)?;
-
-    let executor = if args.echo {
-        ExecutorSpec::Echo
-    } else {
-        ExecutorSpec::BambooRuntime
-    };
-    if !args.echo && model.is_none() {
-        return Err(
-            "no model resolved: pass --model provider:model or configure defaults.sub_agent/chat"
-                .to_string(),
-        );
-    }
-
     let child_id = format!("cli-{}", uuid::Uuid::new_v4());
-    let fabric_dir = std::env::temp_dir().join("bamboo-subagents");
-    let workspace = args
-        .workspace
-        .clone()
-        .or_else(|| std::env::current_dir().ok());
-
-    let mut spec = ProvisionSpec::new(
-        ChildIdentity {
-            child_id: child_id.clone(),
-            parent_id: None,
-            project_key: None,
-            role: args.role.clone(),
-        },
-        executor,
-        fabric_dir.to_string_lossy().into_owned(),
-    );
-    spec.workspace = workspace.map(|w| w.to_string_lossy().into_owned());
-    spec.model = model.clone();
-    // Least-privilege: ship only the credential for the resolved provider.
-    if let Some(m) = &model {
-        if let Some(cred) = pick_credential(&credentials, &m.provider) {
-            spec.secrets.provider_credentials.push(cred);
-        } else if !args.echo {
-            return Err(format!(
-                "no credential found for provider '{}' in {}",
-                m.provider,
-                data_dir.display()
-            ));
-        }
-    }
+    let spec = prepare_spec(
+        &child_id,
+        &args.role,
+        &args.model,
+        &args.workspace,
+        &args.data_dir,
+        args.echo,
+    )?;
 
     let worker_bin =
         std::env::current_exe().map_err(|e| format!("cannot locate own executable: {e}"))?;
     eprintln!(
         "▶ spawning actor {child_id} (model: {}, executor: {})",
-        model
-            .as_ref()
-            .map(|m| format!("{}:{}", m.provider, m.model))
-            .unwrap_or_else(|| "-".into()),
+        describe_model(&spec),
         if args.echo { "echo" } else { "bamboo_runtime" },
     );
 
@@ -112,19 +93,163 @@ pub async fn run(args: ActorRunArgs) -> Result<(), String> {
         spawned.record.pid, spawned.record.endpoint
     );
 
-    let mut client = ChildClient::connect(&spawned.record.endpoint)
+    let exit = connect_and_stream(&spawned.record.endpoint, &args.prompt, args.raw).await;
+    spawned.kill().await;
+    exit
+}
+
+// ---------------------------------------------------------------------------
+// serve — long-running Tier-1 service agent
+// ---------------------------------------------------------------------------
+
+pub async fn serve(args: ActorServeArgs) -> Result<(), String> {
+    let agent_id = args
+        .id
+        .clone()
+        .unwrap_or_else(|| format!("{}-{}", args.role, &uuid::Uuid::new_v4().to_string()[..8]));
+    let spec = prepare_spec(
+        &agent_id,
+        &args.role,
+        &args.model,
+        &args.workspace,
+        &args.data_dir,
+        args.echo,
+    )?;
+
+    let executor: std::sync::Arc<dyn ChildExecutor> = if args.echo {
+        std::sync::Arc::new(EchoExecutor)
+    } else {
+        std::sync::Arc::new(BambooRuntimeExecutor::build(&spec).await?)
+    };
+
+    let server = WsServer::bind_loopback()
+        .await
+        .map_err(|e| format!("bind: {e}"))?;
+    let endpoint = server.ws_endpoint();
+
+    let fab = std::sync::Arc::new(Fabric::at(&spec.fabric_dir));
+    let _ = fab.gc().await; // housekeeping: drop expired records
+    let record = AgentRecord {
+        agent_id: agent_id.clone(),
+        role: args.role.clone(),
+        labels: Vec::new(),
+        endpoint: endpoint.clone(),
+        pid: std::process::id(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        started_at: Utc::now(),
+        lease_expires_at: Utc::now() + ChronoDuration::seconds(60),
+    };
+    fab.publish(&record)
+        .await
+        .map_err(|e| format!("announce: {e}"))?;
+
+    // Lease renewal while serving.
+    let renew_fab = fab.clone();
+    let mut renew_record = record.clone();
+    let renew = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(20));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            renew_record.lease_expires_at = Utc::now() + ChronoDuration::seconds(60);
+            if renew_fab.publish(&renew_record).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    eprintln!(
+        "✔ service agent '{agent_id}' (role: {}) announced at {endpoint}",
+        args.role
+    );
+    eprintln!("  serving until Ctrl-C — call it with: bamboo actor call {agent_id} \"<task>\"");
+
+    // Serve forever; Ctrl-C withdraws the record and exits cleanly.
+    let result = tokio::select! {
+        r = server.serve(executor) => r.map_err(|e| format!("serve: {e}")),
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    };
+    renew.abort();
+    let _ = fab.withdraw(&agent_id).await;
+    eprintln!("⏹ service agent '{agent_id}' withdrawn");
+    result
+}
+
+// ---------------------------------------------------------------------------
+// list — discoverable actors right now
+// ---------------------------------------------------------------------------
+
+pub async fn list() -> Result<(), String> {
+    let fab = Fabric::at(default_fabric_dir());
+    let _ = fab.gc().await;
+    let records = fab.discover().await.map_err(|e| format!("discover: {e}"))?;
+    if records.is_empty() {
+        println!("no live actors (fabric: {})", default_fabric_dir().display());
+        return Ok(());
+    }
+    println!("{:<28} {:<12} {:<8} {}", "AGENT", "ROLE", "PID", "ENDPOINT");
+    for r in records {
+        println!(
+            "{:<28} {:<12} {:<8} {}",
+            r.agent_id, r.role, r.pid, r.endpoint
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// call — discover + invoke a service agent
+// ---------------------------------------------------------------------------
+
+pub async fn call(args: ActorCallArgs) -> Result<(), String> {
+    let fab = Fabric::at(default_fabric_dir());
+    let record = match fab
+        .resolve(&args.agent)
+        .await
+        .map_err(|e| format!("resolve: {e}"))?
+    {
+        Some(r) => r,
+        None => {
+            // Fall back to role match: first live agent with this role.
+            fab.discover()
+                .await
+                .map_err(|e| format!("discover: {e}"))?
+                .into_iter()
+                .find(|r| r.role == args.agent)
+                .ok_or_else(|| {
+                    format!(
+                        "no live actor with id or role '{}'; see `bamboo actor list`",
+                        args.agent
+                    )
+                })?
+        }
+    };
+    eprintln!(
+        "▶ calling {} (role: {}, endpoint {})",
+        record.agent_id, record.role, record.endpoint
+    );
+    connect_and_stream(&record.endpoint, &args.prompt, args.raw).await
+}
+
+// ---------------------------------------------------------------------------
+// shared plumbing
+// ---------------------------------------------------------------------------
+
+/// Connect to an actor endpoint, dispatch a run, stream until terminal.
+/// Ctrl-C sends the out-of-band cancel.
+async fn connect_and_stream(endpoint: &str, prompt: &str, raw: bool) -> Result<(), String> {
+    let mut client = ChildClient::connect(endpoint)
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
     client
         .send(ParentFrame::Run(RunSpec {
-            assignment: args.prompt.clone(),
+            assignment: prompt.to_string(),
             reasoning_effort: None,
             messages: Vec::new(),
         }))
         .await
         .map_err(|e| format!("dispatch failed: {e}"))?;
 
-    // Ctrl-C -> out-of-band cancel frame.
     let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -146,24 +271,20 @@ pub async fn run(args: ActorRunArgs) -> Result<(), String> {
                         if event["type"] == "token" {
                             streamed_tokens = true;
                         }
-                        print_event(&event, args.raw);
+                        print_event(&event, raw);
                     }
                     Ok(Some(ChildFrame::Terminal { status, result, error })) => {
                         println!();
                         match status {
                             TerminalStatus::Completed => {
                                 eprintln!("✔ completed");
-                                // The reply already streamed token-by-token; only
-                                // print the result when nothing was streamed.
                                 if !streamed_tokens {
                                     if let Some(r) = result {
                                         println!("{r}");
                                     }
                                 }
                             }
-                            TerminalStatus::Cancelled => {
-                                eprintln!("⏹ cancelled");
-                            }
+                            TerminalStatus::Cancelled => eprintln!("⏹ cancelled"),
                             TerminalStatus::Error => {
                                 exit = Err(error.unwrap_or_else(|| "actor errored".into()));
                             }
@@ -184,8 +305,72 @@ pub async fn run(args: ActorRunArgs) -> Result<(), String> {
     }
 
     let _ = client.close().await;
-    spawned.kill().await;
     exit
+}
+
+/// Resolve config + model + credential into a ProvisionSpec for a local actor.
+fn prepare_spec(
+    child_id: &str,
+    role: &str,
+    model_arg: &Option<String>,
+    workspace: &Option<PathBuf>,
+    data_dir: &Option<PathBuf>,
+    echo: bool,
+) -> Result<ProvisionSpec, String> {
+    let data_dir = data_dir
+        .clone()
+        .unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
+    // Loads config.json and hydrates encrypted api keys into memory.
+    let config = Config::from_data_dir(Some(data_dir.clone()));
+    let credentials =
+        bamboo_engine::external_agents::runtime::extract_provider_credentials(&config);
+
+    let model = resolve_model(model_arg, &config)?;
+    if !echo && model.is_none() {
+        return Err(
+            "no model resolved: pass --model provider:model or configure defaults.sub_agent/chat"
+                .to_string(),
+        );
+    }
+
+    let mut spec = ProvisionSpec::new(
+        ChildIdentity {
+            child_id: child_id.to_string(),
+            parent_id: None,
+            project_key: None,
+            role: role.to_string(),
+        },
+        if echo {
+            ExecutorSpec::Echo
+        } else {
+            ExecutorSpec::BambooRuntime
+        },
+        default_fabric_dir().to_string_lossy().into_owned(),
+    );
+    spec.workspace = workspace
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .map(|w| w.to_string_lossy().into_owned());
+    spec.model = model.clone();
+    if let Some(m) = &model {
+        if let Some(cred) = pick_credential(&credentials, &m.provider) {
+            spec.secrets.provider_credentials.push(cred);
+        } else if !echo {
+            return Err(format!(
+                "no credential found for provider '{}' in {}",
+                m.provider,
+                data_dir.display()
+            ));
+        }
+    }
+    Ok(spec)
+}
+
+fn describe_model(spec: &ProvisionSpec) -> String {
+    spec.model
+        .as_ref()
+        .map(|m| format!("{}:{}", m.provider, m.model))
+        .unwrap_or_else(|| "-".into())
 }
 
 fn print_event(event: &serde_json::Value, raw: bool) {

@@ -32,12 +32,29 @@ use bamboo_subagent::proto::{AgentRecord, RunSpec};
 use bamboo_subagent::provision::{ExecutorSpec, ProvisionSpec};
 use bamboo_subagent::transport::WsServer;
 
+/// How long a finished actor's isolated storage is retained for debugging
+/// before background GC removes it.
+const STORAGE_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
 /// Worker entry point: provision from stdin, build the executor, serve one run, clean up.
 pub async fn run() -> std::result::Result<(), String> {
     // Stage 1: provision (one JSON document on stdin; the parent closes the pipe).
     let spec = ProvisionSpec::read_from_stdin()
         .await
         .map_err(|e| format!("read ProvisionSpec from stdin: {e}"))?;
+
+    // Best-effort housekeeping while we boot: expire stale sibling storage
+    // dirs (default retention 7 days) and stale fabric records.
+    tokio::spawn(gc_stale_storage(
+        std::env::temp_dir().join("bamboo-subagents"),
+        STORAGE_RETENTION,
+    ));
+    {
+        let fab = Fabric::at(&spec.fabric_dir);
+        tokio::spawn(async move {
+            let _ = fab.gc().await;
+        });
+    }
 
     // Stage 2: executor factory.
     let executor: Arc<dyn ChildExecutor> = match &spec.executor {
@@ -222,9 +239,11 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // Fresh session per run, in the worker's isolated store. When the parent
         // ships prior conversation (a reactivation: send_message/update/rerun),
         // rehydrate from it — the parent's store is the actor's durable state,
-        // this process is just its activation.
+        // this process is just its activation. The run id is unique so a
+        // long-running service agent can serve concurrent runs without
+        // storage collisions (stateless-RPC semantics: one session per call).
         let mut session = Session::new(
-            format!("{}-run", self.child_id),
+            format!("{}-run-{}", self.child_id, uuid::Uuid::new_v4()),
             self.model.clone().unwrap_or_default(),
         );
         session.workspace = self.workspace.clone();
@@ -325,6 +344,32 @@ impl ChildExecutor for BambooRuntimeExecutor {
             }
             Err(AgentError::Cancelled) => ChildOutcome::cancelled(),
             Err(e) => ChildOutcome::error(e.to_string()),
+        }
+    }
+}
+
+/// Remove sibling actor storage directories whose last modification is older
+/// than `retention`. Best-effort: errors are ignored (another worker may be
+/// GC'ing concurrently); only directories directly under `root` are touched.
+async fn gc_stale_storage(root: PathBuf, retention: std::time::Duration) {
+    let Ok(mut rd) = tokio::fs::read_dir(&root).await else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > retention);
+        if stale {
+            let _ = tokio::fs::remove_dir_all(entry.path()).await;
         }
     }
 }

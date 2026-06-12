@@ -129,6 +129,50 @@ enum ActorCommands {
         #[arg(long)]
         raw: bool,
     },
+
+    /// Become a long-running service agent: announce into the local discovery
+    /// fabric and serve calls until Ctrl-C (one isolated session per call).
+    Serve {
+        /// Role to announce (how others find you), e.g. "summarizer".
+        #[arg(long, default_value = "service")]
+        role: String,
+
+        /// Stable agent id; defaults to '<role>-<short-uuid>'.
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Model as 'provider:model'; defaults to defaults.sub_agent/chat.
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Working directory for the agent (defaults to the current dir).
+        #[arg(short, long)]
+        workspace: Option<PathBuf>,
+
+        /// Data directory holding config.json (defaults to ~/.bamboo).
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        /// Serve the echo executor (no LLM) — for smoke tests.
+        #[arg(long)]
+        echo: bool,
+    },
+
+    /// List actors currently discoverable in the local fabric.
+    List,
+
+    /// Discover a service agent (by id, or first match by role) and send it a task.
+    Call {
+        /// Agent id (exact) or role (first live match).
+        agent: String,
+
+        /// The task / prompt to send.
+        prompt: String,
+
+        /// Print raw event JSON instead of pretty streaming.
+        #[arg(long)]
+        raw: bool,
+    },
 }
 
 #[tokio::main]
@@ -277,8 +321,8 @@ async fn main() {
             }
         }
 
-        Commands::Actor {
-            command:
+        Commands::Actor { command } => {
+            let result = match command {
                 ActorCommands::Run {
                     prompt,
                     model,
@@ -287,19 +331,48 @@ async fn main() {
                     data_dir,
                     echo,
                     raw,
-                },
-        } => {
-            let args = bamboo_agent::actor_cli::ActorRunArgs {
-                prompt,
-                model,
-                role,
-                workspace,
-                data_dir,
-                echo,
-                raw,
+                } => {
+                    bamboo_agent::actor_cli::run(bamboo_agent::actor_cli::ActorRunArgs {
+                        prompt,
+                        model,
+                        role,
+                        workspace,
+                        data_dir,
+                        echo,
+                        raw,
+                    })
+                    .await
+                }
+                ActorCommands::Serve {
+                    role,
+                    id,
+                    model,
+                    workspace,
+                    data_dir,
+                    echo,
+                } => {
+                    bamboo_agent::actor_cli::serve(bamboo_agent::actor_cli::ActorServeArgs {
+                        role,
+                        id,
+                        model,
+                        workspace,
+                        data_dir,
+                        echo,
+                    })
+                    .await
+                }
+                ActorCommands::List => bamboo_agent::actor_cli::list().await,
+                ActorCommands::Call { agent, prompt, raw } => {
+                    bamboo_agent::actor_cli::call(bamboo_agent::actor_cli::ActorCallArgs {
+                        agent,
+                        prompt,
+                        raw,
+                    })
+                    .await
+                }
             };
-            if let Err(e) = bamboo_agent::actor_cli::run(args).await {
-                eprintln!("actor run failed: {e}");
+            if let Err(e) = result {
+                eprintln!("actor command failed: {e}");
                 std::process::exit(1);
             }
         }
