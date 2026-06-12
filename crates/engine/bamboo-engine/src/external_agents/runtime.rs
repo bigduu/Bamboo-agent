@@ -102,6 +102,8 @@ pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalCh
                 profile.worker_args.clone(),
                 fabric_dir,
                 executor,
+                extract_provider_credentials(config),
+                config.provider.clone(),
             )));
             continue;
         }
@@ -163,4 +165,33 @@ pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalCh
     } else {
         Some(Arc::new(CompositeExternalChildRunner::new(runners)))
     }
+}
+
+/// Snapshot per-provider credentials from the parent config for subprocess
+/// provisioning. Serialized generically so this code does not chase the
+/// per-provider config struct shapes — any slot with a non-empty `api_key`
+/// yields a scoped credential (plus `base_url` when present).
+fn extract_provider_credentials(
+    config: &Config,
+) -> Vec<bamboo_subagent::provision::ScopedCredential> {
+    let Ok(serde_json::Value::Object(providers)) = serde_json::to_value(&config.providers) else {
+        return Vec::new();
+    };
+    providers
+        .into_iter()
+        .filter_map(|(name, slot)| {
+            let api_key = slot.get("api_key")?.as_str()?.trim().to_string();
+            if api_key.is_empty() {
+                return None;
+            }
+            Some(bamboo_subagent::provision::ScopedCredential {
+                provider: name,
+                api_key,
+                base_url: slot
+                    .get("base_url")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            })
+        })
+        .collect()
 }

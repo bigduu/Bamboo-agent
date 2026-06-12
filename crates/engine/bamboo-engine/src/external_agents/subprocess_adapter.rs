@@ -18,7 +18,9 @@ use tokio_util::sync::CancellationToken;
 
 use bamboo_subagent::fleet::spawn_worker;
 use bamboo_subagent::proto::{ChildFrame, ParentFrame, RunSpec, TerminalStatus};
-use bamboo_subagent::provision::{ChildIdentity, ExecutorSpec, ModelRefSpec, ProvisionSpec};
+use bamboo_subagent::provision::{
+    ChildIdentity, ExecutorSpec, ModelRefSpec, ProvisionSpec, ScopedCredential,
+};
 use bamboo_subagent::transport::ChildClient;
 
 use crate::runtime::execution::{ExternalChildRunner, SpawnJob};
@@ -30,6 +32,11 @@ pub struct SubprocessChildRunner {
     worker_args: Vec<String>,
     fabric_dir: PathBuf,
     executor: ExecutorSpec,
+    /// Per-provider credentials snapshotted from the parent config at build
+    /// time; the spec carries only the ONE the child's provider needs.
+    credentials: Vec<ScopedCredential>,
+    /// Parent's default provider (used when the child has no explicit one).
+    default_provider: String,
     spawn_timeout: Duration,
 }
 
@@ -40,6 +47,8 @@ impl SubprocessChildRunner {
         worker_args: Vec<String>,
         fabric_dir: PathBuf,
         executor: ExecutorSpec,
+        credentials: Vec<ScopedCredential>,
+        default_provider: String,
     ) -> Self {
         Self {
             agent_id,
@@ -47,6 +56,8 @@ impl SubprocessChildRunner {
             worker_args,
             fabric_dir,
             executor,
+            credentials,
+            default_provider,
             spawn_timeout: Duration::from_secs(30),
         }
     }
@@ -68,7 +79,8 @@ impl SubprocessChildRunner {
             self.fabric_dir.to_string_lossy().into_owned(),
         );
         spec.workspace = session.workspace.clone();
-        // Final model: the session's pinned model_ref (create.model / routing already applied).
+        // Final model: the session's pinned model_ref (create.model / routing already applied),
+        // falling back to the job's bare model on the parent's default provider.
         spec.model = session
             .model_ref
             .as_ref()
@@ -79,11 +91,27 @@ impl SubprocessChildRunner {
             .or_else(|| {
                 let m = job.model.trim();
                 (!m.is_empty()).then(|| ModelRefSpec {
-                    provider: String::new(), // worker resolves via its own default provider
+                    provider: self.default_provider.clone(),
                     model: m.to_string(),
                 })
             });
         spec.disabled_tools = job.disabled_tools.clone();
+        // Least-privilege secrets: only the credential for the child's provider.
+        let provider = spec
+            .model
+            .as_ref()
+            .map(|m| m.provider.as_str())
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or(&self.default_provider);
+        if let Some(cred) = self.credentials.iter().find(|c| c.provider == provider) {
+            spec.secrets.provider_credentials.push(cred.clone());
+        } else {
+            tracing::warn!(
+                "subprocess child {}: no credential found for provider '{}'",
+                job.child_session_id,
+                provider
+            );
+        }
         spec
     }
 }
