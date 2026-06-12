@@ -98,10 +98,16 @@ pub struct SecretsEnvelope {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScopedCredential {
+    /// Routing key as the parent knows it: a legacy provider name
+    /// ("anthropic") or a provider-instance id (uuid).
     pub provider: String,
     pub api_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Concrete provider protocol to construct ("anthropic", "openai", …).
+    /// Needed when `provider` is an instance id; defaults to `provider`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_type: Option<String>,
 }
 
 impl ProvisionSpec {
@@ -166,6 +172,7 @@ mod tests {
             provider: "anthropic".into(),
             api_key: "sk-test".into(),
             base_url: None,
+            provider_type: None,
         });
         s
     }

@@ -57,6 +57,48 @@ enum Commands {
     /// one run over a loopback WebSocket. Not intended for interactive use.
     #[command(name = "subagent-worker", hide = true)]
     SubagentWorker,
+
+    /// Run a sub-agent actor from the terminal (spawns the real worker
+    /// process + WebSocket chain against your configured providers).
+    Actor {
+        #[command(subcommand)]
+        command: ActorCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ActorCommands {
+    /// Spawn an actor, give it a task, and stream its events live.
+    Run {
+        /// The task / prompt for the actor.
+        prompt: String,
+
+        /// Model as 'provider:model' (or a bare model id on the default
+        /// provider). Defaults to defaults.sub_agent, then defaults.chat.
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Role label published in the discovery record.
+        #[arg(long, default_value = "cli")]
+        role: String,
+
+        /// Working directory for the actor (defaults to the current dir).
+        #[arg(short, long)]
+        workspace: Option<PathBuf>,
+
+        /// Data directory holding config.json (defaults to ~/.bamboo).
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        /// Use the dependency-free echo executor (no LLM, no key needed) to
+        /// smoke-test the whole actor chain.
+        #[arg(long)]
+        echo: bool,
+
+        /// Print raw event JSON instead of pretty streaming.
+        #[arg(long)]
+        raw: bool,
+    },
 }
 
 #[tokio::main]
@@ -83,15 +125,15 @@ async fn main() {
                 )
                 .init();
         }
-        Commands::SubagentWorker => {
-            // Worker logs go to stderr only: stdin carries the ProvisionSpec and
-            // stdout stays clean (diagnostics must not corrupt the bootstrap).
+        Commands::SubagentWorker | Commands::Actor { .. } => {
+            // Worker/CLI logs go to stderr only: stdin/stdout are part of the
+            // bootstrap & streaming protocol and must stay clean.
             tracing_subscriber::fmt()
                 .with_writer(std::io::stderr)
                 .with_target(true)
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
                 )
                 .init();
         }
@@ -174,6 +216,33 @@ async fn main() {
         Commands::SubagentWorker => {
             if let Err(e) = bamboo_agent::subagent_worker::run().await {
                 eprintln!("subagent-worker failed: {e}");
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Actor {
+            command:
+                ActorCommands::Run {
+                    prompt,
+                    model,
+                    role,
+                    workspace,
+                    data_dir,
+                    echo,
+                    raw,
+                },
+        } => {
+            let args = bamboo_agent::actor_cli::ActorRunArgs {
+                prompt,
+                model,
+                role,
+                workspace,
+                data_dir,
+                echo,
+                raw,
+            };
+            if let Err(e) = bamboo_agent::actor_cli::run(args).await {
+                eprintln!("actor run failed: {e}");
                 std::process::exit(1);
             }
         }

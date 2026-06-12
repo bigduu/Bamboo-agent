@@ -49,6 +49,9 @@ pub mod commands;
 /// The `bamboo subagent-worker` actor worker (provision via stdin, serve over WS).
 pub mod subagent_worker;
 
+/// The `bamboo actor run` CLI: drive an actor from the terminal.
+pub mod actor_cli;
+
 // Server module is now a separate workspace crate
 pub use bamboo_server as server;
 

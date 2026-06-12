@@ -122,26 +122,43 @@ impl BambooRuntimeExecutor {
             .await
             .map_err(|e| format!("create storage dir: {e}"))?;
 
-        // Provider: name from the resolved model, else the credential's provider.
-        let cred = spec.secrets.provider_credentials.first();
-        let provider_name = spec
+        // Routing key: the resolved model's provider (may be a legacy name OR a
+        // provider-instance id), else the credential's own key.
+        let provider_key = spec
             .model
             .as_ref()
             .map(|m| m.provider.clone())
             .filter(|p| !p.trim().is_empty())
-            .or_else(|| cred.map(|c| c.provider.clone()))
+            .or_else(|| {
+                spec.secrets
+                    .provider_credentials
+                    .first()
+                    .map(|c| c.provider.clone())
+            })
             .ok_or_else(|| {
                 "provision spec carries neither model.provider nor a credential".to_string()
             })?;
+        let cred = spec
+            .secrets
+            .provider_credentials
+            .iter()
+            .find(|c| c.provider == provider_key)
+            .or_else(|| spec.secrets.provider_credentials.first());
+        // Concrete protocol to construct: the credential's provider_type when the
+        // routing key is an instance id; else the key itself ("anthropic", …).
+        let factory_name = cred
+            .and_then(|c| c.provider_type.clone())
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| provider_key.clone());
 
         // In-memory config: exactly one provider slot, built from the envelope.
         // (Provider config structs are deserialized from a minimal JSON shape so this
         // code does not chase their full field lists.)
-        let config = build_isolated_config(&provider_name, spec)?;
+        let config = build_isolated_config(&factory_name, cred, spec)?;
 
-        let provider = create_provider_by_name(&config, &provider_name, storage_dir.clone())
+        let provider = create_provider_by_name(&config, &factory_name, storage_dir.clone())
             .await
-            .map_err(|e| format!("create provider '{provider_name}': {e}"))?;
+            .map_err(|e| format!("create provider '{factory_name}': {e}"))?;
 
         // Isolated storage / skills / metrics (all under storage_dir).
         let store = Arc::new(
@@ -278,19 +295,14 @@ impl ChildExecutor for BambooRuntimeExecutor {
     }
 }
 
-/// Build the worker's isolated, in-memory `Config`: the chosen provider slot is populated
-/// from the secrets envelope via a minimal JSON shape. Never written to disk.
+/// Build the worker's isolated, in-memory `Config`: one provider slot keyed by the
+/// concrete protocol name (`factory_name`), populated from the scoped credential.
+/// Never written to disk.
 fn build_isolated_config(
-    provider_name: &str,
+    factory_name: &str,
+    cred: Option<&bamboo_subagent::provision::ScopedCredential>,
     spec: &ProvisionSpec,
 ) -> std::result::Result<Config, String> {
-    let cred = spec
-        .secrets
-        .provider_credentials
-        .iter()
-        .find(|c| c.provider == provider_name)
-        .or_else(|| spec.secrets.provider_credentials.first());
-
     let mut slot = serde_json::Map::new();
     if let Some(cred) = cred {
         slot.insert("api_key".into(), cred.api_key.clone().into());
@@ -303,11 +315,11 @@ fn build_isolated_config(
     }
 
     let value = serde_json::json!({
-        "provider": provider_name,
-        "providers": { provider_name: slot },
+        "provider": factory_name,
+        "providers": { factory_name: slot },
     });
     serde_json::from_value::<Config>(value)
-        .map_err(|e| format!("assemble isolated config for '{provider_name}': {e}"))
+        .map_err(|e| format!("assemble isolated config for '{factory_name}': {e}"))
 }
 
 #[cfg(test)]
@@ -330,6 +342,7 @@ mod tests {
             provider: provider.into(),
             api_key: key.into(),
             base_url: None,
+            provider_type: None,
         });
         s.model = model.map(|(p, m)| ModelRefSpec {
             provider: p.into(),
@@ -341,7 +354,9 @@ mod tests {
     #[test]
     fn isolated_config_populates_the_provider_slot() {
         let spec = spec_with("anthropic", "sk-test", Some(("anthropic", "claude-test")));
-        let config = build_isolated_config("anthropic", &spec).unwrap();
+        let config =
+            build_isolated_config("anthropic", spec.secrets.provider_credentials.first(), &spec)
+                .unwrap();
         assert_eq!(config.provider, "anthropic");
         let slot = config.providers.anthropic.expect("anthropic slot");
         assert_eq!(slot.api_key, "sk-test");
@@ -351,7 +366,9 @@ mod tests {
     #[test]
     fn isolated_config_works_for_openai_shape_too() {
         let spec = spec_with("openai", "sk-oa", Some(("openai", "gpt-test")));
-        let config = build_isolated_config("openai", &spec).unwrap();
+        let config =
+            build_isolated_config("openai", spec.secrets.provider_credentials.first(), &spec)
+                .unwrap();
         assert_eq!(config.provider, "openai");
         let slot = config.providers.openai.expect("openai slot");
         assert_eq!(slot.api_key, "sk-oa");

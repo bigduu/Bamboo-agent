@@ -233,27 +233,46 @@ fn build_local_actor_runner(
 /// provisioning. Serialized generically so this code does not chase the
 /// per-provider config struct shapes — any slot with a non-empty `api_key`
 /// yields a scoped credential (plus `base_url` when present).
-fn extract_provider_credentials(
+pub fn extract_provider_credentials(
     config: &Config,
 ) -> Vec<bamboo_subagent::provision::ScopedCredential> {
-    let Ok(serde_json::Value::Object(providers)) = serde_json::to_value(&config.providers) else {
-        return Vec::new();
-    };
-    providers
-        .into_iter()
-        .filter_map(|(name, slot)| {
+    let mut out = Vec::new();
+
+    // Legacy single-instance slots: providers.anthropic / openai / …
+    if let Ok(serde_json::Value::Object(providers)) = serde_json::to_value(&config.providers) {
+        out.extend(providers.into_iter().filter_map(|(name, slot)| {
             let api_key = slot.get("api_key")?.as_str()?.trim().to_string();
             if api_key.is_empty() {
                 return None;
             }
             Some(bamboo_subagent::provision::ScopedCredential {
-                provider: name,
+                provider: name.clone(),
                 api_key,
                 base_url: slot
                     .get("base_url")
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
+                provider_type: Some(name),
             })
+        }));
+    }
+
+    // Multi-instance providers: provider_instances keyed by instance id; the
+    // child routes by instance id, the worker constructs by provider_type.
+    // Read the typed struct directly — `api_key` is hydrated in memory but
+    // deliberately `skip_serializing`, so a serde projection would miss it.
+    out.extend(config.provider_instances.iter().filter_map(|(id, inst)| {
+        let api_key = inst.api_key.trim().to_string();
+        if api_key.is_empty() {
+            return None;
+        }
+        Some(bamboo_subagent::provision::ScopedCredential {
+            provider: id.clone(),
+            api_key,
+            base_url: inst.base_url.clone(),
+            provider_type: Some(inst.provider_type.clone()),
         })
-        .collect()
+    }));
+
+    out
 }
