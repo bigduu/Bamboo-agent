@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::a2a_adapter::A2AExternalChildRunner;
 use super::config::{parse_external_agents, ExternalAgentProtocol};
+use super::subprocess_adapter::SubprocessChildRunner;
 
 /// Composite router that delegates to the first matching external child runner.
 pub struct CompositeExternalChildRunner {
@@ -67,6 +68,28 @@ pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalCh
     let mut runners: Vec<Arc<dyn ExternalChildRunner>> = Vec::new();
 
     for (_agent_id, profile) in agents {
+        // Subprocess protocol: spawn a local worker binary over the bamboo-subagent WS protocol.
+        if matches!(profile.protocol, ExternalAgentProtocol::Subprocess) {
+            let Some(worker_bin) = profile.worker_bin.as_ref() else {
+                tracing::error!(
+                    "Subprocess agent profile {} has no worker_bin; skipping",
+                    profile.agent_id
+                );
+                continue;
+            };
+            let fabric_dir = profile
+                .fabric_dir
+                .clone()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::temp_dir().join("bamboo-subagents"));
+            runners.push(Arc::new(SubprocessChildRunner::new(
+                profile.agent_id.clone(),
+                std::path::PathBuf::from(worker_bin),
+                fabric_dir,
+            )));
+            continue;
+        }
+
         if !matches!(profile.protocol, ExternalAgentProtocol::A2aJsonRpc) {
             tracing::warn!(
                 "External agent profile {} uses unsupported protocol {:?}",

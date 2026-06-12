@@ -20,12 +20,22 @@ pub struct ExternalAgentProfile {
     pub skill: Option<String>,
     #[serde(default)]
     pub allow_non_streaming_fallback: bool,
+    /// Subprocess protocol only: path to the worker binary to spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_bin: Option<String>,
+    /// Subprocess protocol only: directory the worker self-registers into
+    /// (Tier-1 file fabric). Defaults to a per-user temp dir when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabric_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub enum ExternalAgentProtocol {
     #[serde(rename = "a2a_jsonrpc")]
     A2aJsonRpc,
+    /// Local OS subprocess speaking the `bamboo-subagent` WebSocket protocol.
+    #[serde(rename = "subprocess")]
+    Subprocess,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +103,7 @@ pub fn resolve_runtime_metadata(config: &Config, subagent_type: &str) -> HashMap
                     "external.protocol".to_string(),
                     match profile.protocol {
                         ExternalAgentProtocol::A2aJsonRpc => "a2a_jsonrpc".to_string(),
+                        ExternalAgentProtocol::Subprocess => "subprocess".to_string(),
                     },
                 );
                 metadata.insert(

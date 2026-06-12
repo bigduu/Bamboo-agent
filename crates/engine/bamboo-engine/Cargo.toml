@@ -19,6 +19,7 @@ bamboo-metrics = { path = "../../infra/bamboo-metrics" }
 bamboo-skills = { path = "../../infra/bamboo-skills" }
 bamboo-mcp = { path = "../../infra/bamboo-mcp" }
 bamboo-compression = { path = "../../infra/bamboo-compression" }
+bamboo-subagent = { path = "../../infra/bamboo-subagent" }
 bamboo-tools = { path = "../../engine/bamboo-tools" }
 serde = { workspace = true }
 serde_json = "1"
