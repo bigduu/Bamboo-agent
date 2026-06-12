@@ -238,6 +238,74 @@ fn default_true_memory_project_first_dream() -> bool {
     true
 }
 
+/// Where sub-agents execute.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentRuntimeMode {
+    /// Run sub-agents inside the server process (the historical default).
+    #[default]
+    InProcess,
+    /// Run each sub-agent as an isolated OS subprocess (crash isolation,
+    /// true parallelism, per-child resource limits).
+    Subprocess,
+}
+
+/// Sub-agent execution settings.
+///
+/// Friendly path — one switch:
+/// ```json
+/// "subagents": { "runtime": "subprocess" }
+/// ```
+/// Per-role exceptions:
+/// ```json
+/// "subagents": { "runtime": "subprocess", "overrides": { "researcher": "in_process" } }
+/// ```
+/// The worker binary, its arguments, and the discovery directory are derived
+/// automatically (the current `bamboo` executable + `subagent-worker`); the
+/// expert fields below override them only when you run a custom worker.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SubagentsConfig {
+    /// Default runtime for all sub-agents: `in_process` (default) or `subprocess`.
+    #[serde(default)]
+    pub runtime: SubagentRuntimeMode,
+    /// Per-`subagent_type` exceptions to `runtime` (highest precedence).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub overrides: HashMap<String, SubagentRuntimeMode>,
+    /// Expert: custom worker binary. Default: the current bamboo executable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_bin: Option<String>,
+    /// Expert: arguments for the custom worker binary. Default for the
+    /// built-in worker: `["subagent-worker"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_args: Option<Vec<String>>,
+    /// Expert: discovery fabric directory. Default: a per-user temp dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabric_dir: Option<String>,
+    /// Expert: `"echo"` swaps in a dependency-free smoke executor (no LLM)
+    /// to verify the subprocess chain end-to-end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
+}
+
+impl SubagentsConfig {
+    /// Effective runtime mode for one `subagent_type` (override > default).
+    pub fn mode_for(&self, subagent_type: &str) -> SubagentRuntimeMode {
+        self.overrides
+            .get(subagent_type)
+            .copied()
+            .unwrap_or(self.runtime)
+    }
+
+    /// True if any sub-agent could run as a subprocess under this config.
+    pub fn any_subprocess(&self) -> bool {
+        self.runtime == SubagentRuntimeMode::Subprocess
+            || self
+                .overrides
+                .values()
+                .any(|m| *m == SubagentRuntimeMode::Subprocess)
+    }
+}
+
 /// Main configuration structure for Bamboo agent
 ///
 /// Contains all settings needed to run the agent, including provider credentials,
@@ -355,6 +423,16 @@ pub struct Config {
     /// Memory/background summarization settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryConfig>,
+
+    /// Sub-agent execution settings.
+    ///
+    /// The one knob most users need is `runtime`:
+    /// `"subagents": { "runtime": "subprocess" }` runs every sub-agent as an
+    /// isolated OS process (crash isolation, true parallelism). Everything
+    /// else (worker binary, discovery dir) is derived automatically.
+    /// Always serialized so the knob is discoverable in `bamboo config`.
+    #[serde(default)]
+    pub subagents: SubagentsConfig,
 
     /// MCP server configuration.
     ///
@@ -1593,6 +1671,7 @@ impl Config {
             proxy_auth: None,
             proxy_auth_encrypted: None,
             headless_auth: false,
+            subagents: SubagentsConfig::default(),
             provider: default_provider(),
             providers: ProviderConfigs::default(),
             provider_instances: HashMap::new(),

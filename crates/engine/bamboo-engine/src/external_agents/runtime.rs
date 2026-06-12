@@ -56,16 +56,27 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
 
 /// Build an external child runner from the application config.
 ///
-/// Returns `None` if no A2A profiles are configured.
-/// Builds a composite router over all configured A2A profiles so that
-/// `external.agent_id` metadata selects the correct runner.
+/// Returns `None` when nothing routes externally. Builds a composite router
+/// over all configured runners so `external.agent_id` metadata selects the
+/// right one. The friendly `subagents.runtime = "subprocess"` switch
+/// synthesizes a local subprocess runner automatically — worker binary,
+/// arguments, and discovery dir are all derived; no expert tables needed.
 pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalChildRunner>> {
     let agents = parse_external_agents(config);
-    if agents.is_empty() {
-        return None;
-    }
 
     let mut runners: Vec<Arc<dyn ExternalChildRunner>> = Vec::new();
+
+    // Friendly path: one switch in typed config -> built-in local worker.
+    if config.subagents.any_subprocess() {
+        match build_local_subprocess_runner(config) {
+            Ok(runner) => runners.push(runner),
+            Err(e) => tracing::error!("subagents.runtime=subprocess unavailable: {e}"),
+        }
+    }
+
+    if agents.is_empty() && runners.is_empty() {
+        return None;
+    }
 
     for (_agent_id, profile) in agents {
         // Subprocess protocol: spawn a local worker binary over the bamboo-subagent WS protocol.
@@ -165,6 +176,51 @@ pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalCh
     } else {
         Some(Arc::new(CompositeExternalChildRunner::new(runners)))
     }
+}
+
+/// Build the built-in local subprocess runner from the typed `subagents`
+/// config. Everything is derived: worker = the current bamboo executable +
+/// `subagent-worker`, fabric = per-user temp dir — unless expert fields
+/// override them.
+fn build_local_subprocess_runner(
+    config: &Config,
+) -> Result<Arc<dyn ExternalChildRunner>, String> {
+    let sub = &config.subagents;
+
+    let (worker_bin, worker_args) = match &sub.worker_bin {
+        Some(custom) => (
+            std::path::PathBuf::from(custom),
+            sub.worker_args.clone().unwrap_or_default(),
+        ),
+        None => (
+            std::env::current_exe().map_err(|e| format!("cannot locate own executable: {e}"))?,
+            sub.worker_args
+                .clone()
+                .unwrap_or_else(|| vec!["subagent-worker".to_string()]),
+        ),
+    };
+
+    let fabric_dir = sub
+        .fabric_dir
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("bamboo-subagents"));
+
+    let executor = match sub.executor.as_deref() {
+        Some("echo") => bamboo_subagent::provision::ExecutorSpec::Echo,
+        Some("bamboo_runtime") | None => bamboo_subagent::provision::ExecutorSpec::BambooRuntime,
+        Some(other) => return Err(format!("unknown subagents.executor '{other}'")),
+    };
+
+    Ok(Arc::new(SubprocessChildRunner::new(
+        super::config::LOCAL_SUBPROCESS_AGENT_ID.to_string(),
+        worker_bin,
+        worker_args,
+        fabric_dir,
+        executor,
+        extract_provider_credentials(config),
+        config.provider.clone(),
+    )))
 }
 
 /// Snapshot per-provider credentials from the parent config for subprocess

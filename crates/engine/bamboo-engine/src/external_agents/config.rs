@@ -91,14 +91,48 @@ pub fn parse_subagent_routing(config: &Config) -> HashMap<String, SubagentRoutin
     }
 }
 
+/// Synthetic agent id for the built-in local subprocess worker (friendly
+/// `subagents.runtime = "subprocess"` path; no `externalAgents` entry needed).
+pub const LOCAL_SUBPROCESS_AGENT_ID: &str = "local-subprocess";
+
 /// Resolve runtime metadata for a subagent_type based on config routing.
+///
+/// Precedence:
+/// 1. typed `subagents.overrides[type]` (explicit per-role, can force either mode)
+/// 2. legacy `subagentRouting[type]` (expert tables in `config.extra`)
+/// 3. typed `subagents.runtime` global default
 pub fn resolve_runtime_metadata(config: &Config, subagent_type: &str) -> HashMap<String, String> {
+    use bamboo_config::SubagentRuntimeMode;
+
+    let local_subprocess_metadata = || {
+        HashMap::from([
+            ("runtime.kind".to_string(), "external".to_string()),
+            ("external.protocol".to_string(), "subprocess".to_string()),
+            (
+                "external.agent_id".to_string(),
+                LOCAL_SUBPROCESS_AGENT_ID.to_string(),
+            ),
+        ])
+    };
+
+    // 1. Explicit per-role override: decides absolutely (either direction).
+    if let Some(mode) = config.subagents.overrides.get(subagent_type) {
+        return match mode {
+            SubagentRuntimeMode::Subprocess => local_subprocess_metadata(),
+            SubagentRuntimeMode::InProcess => HashMap::new(),
+        };
+    }
+
     let routing = parse_subagent_routing(config);
     let agents = parse_external_agents(config);
 
     let mut metadata = HashMap::new();
 
     let Some(route) = routing.get(subagent_type) else {
+        // 3. No expert routing for this type: apply the typed global default.
+        if config.subagents.runtime == SubagentRuntimeMode::Subprocess {
+            return local_subprocess_metadata();
+        }
         return metadata;
     };
 
@@ -223,5 +257,90 @@ mod tests {
         let config = Config::default();
         let metadata = resolve_runtime_metadata(&config, "unknown");
         assert!(metadata.is_empty());
+    }
+
+    // ---- friendly typed `subagents` config ----
+
+    #[test]
+    fn typed_global_subprocess_routes_every_type() {
+        let mut config = Config::default();
+        config.subagents.runtime = bamboo_config::SubagentRuntimeMode::Subprocess;
+
+        let metadata = resolve_runtime_metadata(&config, "researcher");
+        assert_eq!(metadata.get("runtime.kind"), Some(&"external".to_string()));
+        assert_eq!(
+            metadata.get("external.protocol"),
+            Some(&"subprocess".to_string())
+        );
+        assert_eq!(
+            metadata.get("external.agent_id"),
+            Some(&LOCAL_SUBPROCESS_AGENT_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn typed_override_beats_global_default() {
+        let mut config = Config::default();
+        config.subagents.runtime = bamboo_config::SubagentRuntimeMode::Subprocess;
+        config.subagents.overrides.insert(
+            "researcher".to_string(),
+            bamboo_config::SubagentRuntimeMode::InProcess,
+        );
+
+        // override forces in-process even though the global default is subprocess
+        assert!(resolve_runtime_metadata(&config, "researcher").is_empty());
+        // other types still follow the global default
+        assert!(!resolve_runtime_metadata(&config, "coder").is_empty());
+    }
+
+    #[test]
+    fn typed_override_beats_legacy_routing() {
+        let mut config = Config::default();
+        config.extra.insert(
+            "subagentRouting".to_string(),
+            serde_json::json!({
+                "impl": { "runtime": "external", "agent_id": "remote_impl" }
+            }),
+        );
+        config.subagents.overrides.insert(
+            "impl".to_string(),
+            bamboo_config::SubagentRuntimeMode::Subprocess,
+        );
+
+        let metadata = resolve_runtime_metadata(&config, "impl");
+        // the typed per-role override wins over the legacy expert table
+        assert_eq!(
+            metadata.get("external.agent_id"),
+            Some(&LOCAL_SUBPROCESS_AGENT_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_routing_beats_typed_global_default() {
+        let mut config = Config::default();
+        config.subagents.runtime = bamboo_config::SubagentRuntimeMode::Subprocess;
+        config.extra.insert(
+            "externalAgents".to_string(),
+            serde_json::json!({
+                "remote_impl": {
+                    "agent_id": "remote_impl",
+                    "protocol": "a2a_jsonrpc",
+                    "permission_profile": "remote_limited"
+                }
+            }),
+        );
+        config.extra.insert(
+            "subagentRouting".to_string(),
+            serde_json::json!({
+                "impl": { "runtime": "external", "agent_id": "remote_impl" }
+            }),
+        );
+
+        // explicit legacy per-type routing still selects the remote agent
+        let metadata = resolve_runtime_metadata(&config, "impl");
+        assert_eq!(
+            metadata.get("external.agent_id"),
+            Some(&"remote_impl".to_string())
+        );
     }
 }
