@@ -162,6 +162,35 @@ enum Commands {
         #[command(subcommand)]
         command: ActorCommands,
     },
+
+    /// Run the standalone sub-agent message broker: a WebSocket bus over durable
+    /// per-session mailboxes. The orchestrator and its workers (local subprocess,
+    /// Docker, or SSH/remote) connect here to exchange ask/reply traffic.
+    Broker {
+        #[command(subcommand)]
+        command: BrokerCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum BrokerCommands {
+    /// Serve the broker on a WebSocket endpoint until terminated.
+    Serve {
+        /// Bind address. Use `0.0.0.0:9600` to accept connections from remote /
+        /// containerized workers; `127.0.0.1:9600` for local-only.
+        #[arg(long, default_value = "127.0.0.1:9600")]
+        bind: String,
+
+        /// Bearer token every client must present in its `Hello` frame. Falls
+        /// back to the `BAMBOO_BROKER_TOKEN` env var; required (no default, so a
+        /// broker is never accidentally unauthenticated).
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Durable mailbox storage root. Defaults to `<bamboo_dir>/broker`.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -267,7 +296,10 @@ async fn main() {
                 )
                 .init();
         }
-        Some(Commands::SubagentWorker) | Some(Commands::Actor { .. }) | None => {
+        Some(Commands::SubagentWorker)
+        | Some(Commands::Actor { .. })
+        | Some(Commands::Broker { .. })
+        | None => {
             // Worker/CLI logs go to stderr only: stdin/stdout are part of the
             // bootstrap & streaming protocol and must stay clean. (`None` is
             // the top-level `-p` quick run, or bare `bamboo` -> help.)
@@ -480,6 +512,42 @@ async fn main() {
             };
             if let Err(e) = result {
                 eprintln!("actor command failed: {e}");
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Broker { command } => {
+            let BrokerCommands::Serve { bind, token, root } = command;
+            let token = match token
+                .or_else(|| std::env::var("BAMBOO_BROKER_TOKEN").ok())
+                .filter(|t| !t.is_empty())
+            {
+                Some(t) => t,
+                None => {
+                    eprintln!(
+                        "broker: a Bearer token is required (pass --token or set BAMBOO_BROKER_TOKEN)"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let root =
+                root.unwrap_or_else(|| bamboo_config::paths::resolve_bamboo_dir().join("broker"));
+            let listener = match tokio::net::TcpListener::bind(&bind).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("broker: failed to bind {bind}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let addr = listener
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| bind.clone());
+            tracing::info!(%addr, root = %root.display(), "bamboo broker serving");
+            let core = std::sync::Arc::new(bamboo_broker::BrokerCore::new(root));
+            let server = std::sync::Arc::new(bamboo_broker::BrokerServer::new(core, token));
+            if let Err(e) = server.serve(listener).await {
+                eprintln!("broker server failed: {e}");
                 std::process::exit(1);
             }
         }

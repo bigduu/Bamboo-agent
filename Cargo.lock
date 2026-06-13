@@ -465,6 +465,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bamboo-agent-core",
+ "bamboo-broker",
  "bamboo-config",
  "bamboo-domain",
  "bamboo-engine",
