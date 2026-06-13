@@ -5,6 +5,13 @@ edition = "2021"
 rust-version.workspace = true
 description = "HTTP server and API layer for the Bamboo agent framework"
 license = "MIT"
+# Package only source + build script. The crate directory also holds two
+# dev-only symlinks — `frontend_package` (-> the staged Lotus bundle) and
+# `scripts` (-> the workspace scripts dir) — that point outside the crate.
+# `cargo publish` must not archive them: they fail as "no such file" and
+# shouldn't ship anyway (build.rs degrades gracefully when frontend_package is
+# absent, emitting empty embeds).
+include = ["src/**/*", "build.rs"]
 
 [dependencies]
 # Workspace crates
