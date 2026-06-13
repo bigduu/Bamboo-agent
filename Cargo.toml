@@ -160,6 +160,8 @@ rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 [target.'cfg(windows)'.dependencies]
 # Windows-only OCR via WinRT. Used by the `hooks.image_fallback.mode="ocr"` preflight hook.
 rust_ocr = "0.1.5"
+# Windows sidecar orphan guard: OpenProcess + WaitForSingleObject on the parent shell.
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation"] }
 
 [[bin]]
 name = "bamboo"

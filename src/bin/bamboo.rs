@@ -84,10 +84,24 @@ fn spawn_orphan_guard(shell_pid: u32) {
 }
 
 #[cfg(windows)]
-fn spawn_orphan_guard(_shell_pid: u32) {
-    // TODO(windows): assign the sidecar to a Job Object with KILL_ON_JOB_CLOSE on
-    // the shell side. Until then the graceful kill on the shell's exit handler
-    // covers normal quit; only a hard crash could orphan the backend on Windows.
+fn spawn_orphan_guard(shell_pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
+    // Open a synchronizable handle to the shell and block until it exits, then take
+    // the sidecar down with it. Covers normal quit AND hard kills (the shell runs no
+    // cleanup). If the shell is already gone, OpenProcess fails and we exit at once.
+    std::thread::spawn(move || unsafe {
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, shell_pid);
+        if handle.is_null() {
+            std::process::exit(0);
+        }
+        // INFINITE (0xFFFF_FFFF): wait until the shell process terminates.
+        WaitForSingleObject(handle, u32::MAX);
+        let _ = CloseHandle(handle);
+        std::process::exit(0);
+    });
 }
 
 #[derive(Subcommand)]
