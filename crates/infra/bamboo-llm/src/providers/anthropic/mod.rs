@@ -184,6 +184,41 @@ impl LLMProvider for AnthropicProvider {
             request_overrides::ENDPOINT_MESSAGES,
             Some(model),
         );
+        // DIAGNOSTIC: count image blocks actually present in the OUTGOING request
+        // body (top-level content blocks AND inside tool_result content arrays), so
+        // we can tell with certainty whether a screenshot reaches the wire vs being
+        // dropped before send. image_blocks_on_wire=0 with a screenshot in the
+        // conversation means the image never left bamboo.
+        let image_blocks_on_wire: usize = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|msgs| {
+                msgs.iter()
+                    .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+                    .flatten()
+                    .map(|block| {
+                        let mut n = usize::from(
+                            block.get("type").and_then(|t| t.as_str()) == Some("image"),
+                        );
+                        if let Some(inner) = block.get("content").and_then(|c| c.as_array()) {
+                            n += inner
+                                .iter()
+                                .filter(|b| {
+                                    b.get("type").and_then(|t| t.as_str()) == Some("image")
+                                })
+                                .count();
+                        }
+                        n
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        tracing::info!(
+            "[{}] Anthropic request image_blocks_on_wire={} model='{}'",
+            session_log_id,
+            image_blocks_on_wire,
+            model
+        );
         let mut applied_reasoning_effort = reasoning_effort;
         let mut thinking_enabled = body.get("thinking").is_some();
         let mut thinking_budget_tokens = body

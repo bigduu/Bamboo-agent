@@ -143,15 +143,33 @@ impl McpServerManager {
         drop(client);
 
         let result = match result {
+            // A tool that RAN but reported failure (`is_error`) is still `Ok` at
+            // the protocol level — so without this the QoS/health path would count
+            // it as a success and a server with a wedged capability (e.g. nova when
+            // its capture pipeline is stuck: it answers pings and returns an error
+            // RESULT well within request_timeout_ms, so it never trips a protocol
+            // timeout) would fail forever without ever being recycled.
+            Ok(result) if result.is_error => {
+                let synthetic = McpError::ToolExecution(format!(
+                    "tool '{tool_name}' returned an error result"
+                ));
+                let should_recycle = runtime
+                    .qos
+                    .record_failure(server_id, tool_name, &synthetic)
+                    .await;
+                self.maybe_recycle_server(runtime.value(), should_recycle);
+                result
+            }
             Ok(result) => {
                 runtime.qos.record_success().await;
                 result
             }
             Err(error) => {
-                runtime
+                let should_recycle = runtime
                     .qos
                     .record_failure(server_id, tool_name, &error)
                     .await;
+                self.maybe_recycle_server(runtime.value(), should_recycle);
                 return Err(error);
             }
         };
@@ -168,6 +186,32 @@ impl McpServerManager {
         }
 
         Ok(result)
+    }
+
+    /// Recycle a server that has failed too many times in a row — disconnect (the
+    /// existing child process is killed) and reconnect (a fresh one is spawned).
+    /// Non-blocking: runs in its own task with its own backoff, guarded against
+    /// concurrent runs by `ServerRuntime::reconnecting`. Skipped when recycling
+    /// isn't warranted, reconnect is disabled for the server, or it's shutting down.
+    fn maybe_recycle_server(&self, runtime: &Arc<ServerRuntime>, should_recycle: bool) {
+        if !should_recycle
+            || !runtime.config.reconnect.enabled
+            || runtime.shutdown.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        let manager = self.clone();
+        let runtime = runtime.clone();
+        let server_id = runtime.config.id.clone();
+        warn!(
+            "Recycling MCP server '{}' after repeated tool failures (disconnect + reconnect)",
+            server_id
+        );
+        tokio::spawn(async move {
+            if let Err(e) = manager.attempt_reconnection(runtime).await {
+                warn!("MCP server '{}' recycle failed: {}", server_id, e);
+            }
+        });
     }
 
     /// Get tool info for a specific tool.

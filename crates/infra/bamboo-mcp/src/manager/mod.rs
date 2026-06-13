@@ -25,12 +25,21 @@ mod tests;
 const DEFAULT_MAX_CONCURRENT_CALLS_PER_SERVER: usize = 4;
 const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
 const DEFAULT_CIRCUIT_OPEN_MS: u64 = 5_000;
+/// Consecutive failures (protocol errors OR `is_error` tool results) after which
+/// the server is RECYCLED — disconnected (the child process is killed) and
+/// reconnected (a fresh one is spawned). This catches servers that stay alive at
+/// the protocol level (so health-check pings keep succeeding) yet have a wedged
+/// capability that keeps returning errors — e.g. nova when its ScreenCaptureKit /
+/// replayd pipeline is stuck. A single success resets the counter, so a tool that
+/// merely errors occasionally never trips it.
+const DEFAULT_RECONNECT_FAILURE_THRESHOLD: u32 = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct McpQosConfig {
     max_concurrent_calls: usize,
     circuit_failure_threshold: u32,
     circuit_open_ms: u64,
+    reconnect_failure_threshold: u32,
 }
 
 impl Default for McpQosConfig {
@@ -39,6 +48,7 @@ impl Default for McpQosConfig {
             max_concurrent_calls: DEFAULT_MAX_CONCURRENT_CALLS_PER_SERVER,
             circuit_failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
             circuit_open_ms: DEFAULT_CIRCUIT_OPEN_MS,
+            reconnect_failure_threshold: DEFAULT_RECONNECT_FAILURE_THRESHOLD,
         }
     }
 }
@@ -98,7 +108,12 @@ impl McpServerQos {
         state.circuit_open_until = None;
     }
 
-    async fn record_failure(&self, server_id: &str, tool_name: &str, error: &McpError) {
+    /// Record a failed call (a protocol error OR an `is_error` tool result).
+    /// Returns `true` when the server has failed enough consecutive times that it
+    /// should be RECYCLED (disconnected + reconnected); the caller performs the
+    /// reconnect. The counter is reset on `true` so a recycle isn't re-triggered
+    /// on every subsequent call — a fresh run of failures is needed first.
+    async fn record_failure(&self, server_id: &str, tool_name: &str, error: &McpError) -> bool {
         let mut state = self.state.lock().await;
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
 
@@ -110,6 +125,18 @@ impl McpServerQos {
                 server_id, state.consecutive_failures, tool_name, error
             );
         }
+
+        if state.consecutive_failures >= self.config.reconnect_failure_threshold {
+            warn!(
+                "MCP server '{}' hit {} consecutive failures (tool '{}', last_error={}) — recycling (disconnect + reconnect)",
+                server_id, state.consecutive_failures, tool_name, error
+            );
+            state.consecutive_failures = 0;
+            state.circuit_open_until = None;
+            return true;
+        }
+
+        false
     }
 }
 

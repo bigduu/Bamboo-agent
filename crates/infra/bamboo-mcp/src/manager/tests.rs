@@ -357,6 +357,8 @@ async fn qos_circuit_opens_after_consecutive_failures() {
         max_concurrent_calls: 2,
         circuit_failure_threshold: 2,
         circuit_open_ms: 60_000,
+        // High so the recycle path doesn't reset the counter mid-test.
+        reconnect_failure_threshold: u32::MAX,
     });
 
     let err = McpError::Connection("boom".to_string());
@@ -380,6 +382,8 @@ async fn qos_circuit_recovers_after_open_window() {
         max_concurrent_calls: 1,
         circuit_failure_threshold: 1,
         circuit_open_ms: 5,
+        // High so the recycle path doesn't reset the counter mid-test.
+        reconnect_failure_threshold: u32::MAX,
     });
 
     let err = McpError::Connection("boom".to_string());
@@ -388,4 +392,29 @@ async fn qos_circuit_recovers_after_open_window() {
 
     sleep(Duration::from_millis(15)).await;
     assert!(qos.check_circuit("server-b", "tool-b").await.is_ok());
+}
+
+#[tokio::test]
+async fn qos_signals_recycle_at_reconnect_threshold() {
+    let qos = McpServerQos::new(McpQosConfig {
+        max_concurrent_calls: 1,
+        // High so only the reconnect threshold is exercised here.
+        circuit_failure_threshold: u32::MAX,
+        circuit_open_ms: 5,
+        reconnect_failure_threshold: 3,
+    });
+    let err = McpError::Connection("boom".to_string());
+
+    // Below the threshold: no recycle.
+    assert!(!qos.record_failure("s", "t", &err).await);
+    assert!(!qos.record_failure("s", "t", &err).await);
+    // 3rd consecutive failure: recycle signalled.
+    assert!(qos.record_failure("s", "t", &err).await);
+    // Counter reset after signalling — needs a fresh run of failures.
+    assert!(!qos.record_failure("s", "t", &err).await);
+    // A success resets the run too.
+    qos.record_success().await;
+    assert!(!qos.record_failure("s", "t", &err).await);
+    assert!(!qos.record_failure("s", "t", &err).await);
+    assert!(qos.record_failure("s", "t", &err).await);
 }
