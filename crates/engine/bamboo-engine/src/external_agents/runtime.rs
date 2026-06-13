@@ -54,28 +54,25 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
     }
 }
 
-/// Build an external child runner from the application config.
+/// Build the child runner from the application config.
 ///
-/// Returns `None` when nothing routes externally. Builds a composite router
-/// over all configured runners so `external.agent_id` metadata selects the
-/// right one. The friendly `subagents.runtime = "actor"` switch
-/// synthesizes a local actor runner automatically — worker binary,
-/// arguments, and discovery dir are all derived; no expert tables needed.
-pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalChildRunner>> {
+/// Sub-agents always run as actors (the in-process runtime was removed), so the
+/// built-in **local actor** worker is always part of the composite — its worker
+/// binary, arguments, and discovery dir are all derived; no expert tables
+/// needed. Expert `externalAgents` profiles add extra routers so
+/// `external.agent_id` metadata can pin specific roles to other agents. Returns
+/// a composite router that delegates to the first matching runner.
+pub fn build_external_child_runner(config: &Config) -> Arc<dyn ExternalChildRunner> {
     let agents = parse_external_agents(config);
 
     let mut runners: Vec<Arc<dyn ExternalChildRunner>> = Vec::new();
 
-    // Friendly path: one switch in typed config -> built-in local worker.
-    if config.subagents.any_actor() {
-        match build_local_actor_runner(config) {
-            Ok(runner) => runners.push(runner),
-            Err(e) => tracing::error!("subagents.runtime=actor unavailable: {e}"),
-        }
-    }
-
-    if agents.is_empty() && runners.is_empty() {
-        return None;
+    // The built-in local actor worker is the default runtime for every
+    // sub-agent. Always build it; a build failure here is logged and leaves the
+    // composite without a default handler (dispatch then errors clearly).
+    match build_local_actor_runner(config) {
+        Ok(runner) => runners.push(runner),
+        Err(e) => tracing::error!("local actor sub-agent runner unavailable: {e}"),
     }
 
     for (_agent_id, profile) in agents {
@@ -175,11 +172,7 @@ pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalCh
         runners.push(Arc::new(A2AExternalChildRunner::new(client, profile)));
     }
 
-    if runners.is_empty() {
-        None
-    } else {
-        Some(Arc::new(CompositeExternalChildRunner::new(runners)))
-    }
+    Arc::new(CompositeExternalChildRunner::new(runners))
 }
 
 /// Build the built-in local actor runner from the typed `subagents`

@@ -18,7 +18,7 @@ use bamboo_agent_core::{AgentEvent, Message, Session};
 use bamboo_domain::subagent::{SubagentProfile, ToolPolicy};
 use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
 
-use crate::runtime::execution::spawn::{SpawnContext, SpawnJob};
+use crate::runtime::execution::spawn::{ExternalChildRunner, SpawnContext, SpawnJob};
 use crate::sdk::runner::{ProfileRunner, RunProfileInput};
 use crate::sdk::spawn::run_child_spawn;
 use bamboo_metrics::MetricsCollector;
@@ -114,6 +114,48 @@ impl bamboo_agent_core::tools::ToolExecutor for CatalogToolExecutor {
     }
 }
 
+/// Test-only child runner that drives the child loop in-process. The
+/// production in-process spawn path was removed (sub-agents always run as
+/// actors), but `run_child_spawn`'s orchestration — event ordering, watchdog,
+/// completion/status mapping, persistence — is runner-agnostic. This stand-in
+/// keeps that orchestration under fast, network-free unit test without spinning
+/// up a real actor worker subprocess.
+struct InProcessTestRunner {
+    agent: Arc<crate::Agent>,
+    tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
+}
+
+#[async_trait]
+impl ExternalChildRunner for InProcessTestRunner {
+    async fn should_handle(&self, _session: &Session) -> bool {
+        true
+    }
+
+    async fn execute_external_child(
+        &self,
+        session: &mut Session,
+        job: &SpawnJob,
+        event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> crate::runtime::runner::Result<()> {
+        let mut builder =
+            crate::runtime::ExecuteRequestBuilder::new(String::new(), event_tx, cancel_token)
+                .tools(self.tools.clone())
+                .model_roster(crate::runtime::ModelRoster {
+                    model: Some(job.model.clone()),
+                    provider_name: None,
+                    provider_type: None,
+                    fast: None,
+                    background: None,
+                    summarization: None,
+                });
+        if let Some(disabled) = &job.disabled_tools {
+            builder = builder.disabled_tools(disabled.iter().cloned().collect());
+        }
+        self.agent.execute(session, builder.build()).await
+    }
+}
+
 struct Harness {
     ctx: SpawnContext,
     storage: Arc<dyn Storage>,
@@ -204,13 +246,16 @@ async fn build_harness(
             .expect("test agent should build"),
     );
 
+    let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+        Arc::new(CatalogToolExecutor { names: tool_names });
+
     let ctx = SpawnContext {
-        agent,
-        tools: Arc::new(CatalogToolExecutor { names: tool_names }),
+        agent: agent.clone(),
+        tools: tools.clone(),
         sessions_cache,
         agent_runners,
         session_event_senders,
-        external_child_runner: None,
+        external_child_runner: Arc::new(InProcessTestRunner { agent, tools }),
         provider_router: None,
         app_data_dir: None,
         completion_handler: None,

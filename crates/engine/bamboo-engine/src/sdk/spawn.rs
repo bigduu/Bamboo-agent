@@ -23,10 +23,9 @@ use crate::runtime::execution::runner_lifecycle::{
 };
 use crate::runtime::execution::session_events::get_or_create_event_sender;
 use crate::runtime::execution::spawn::{
-    publish_child_completion_parts, resolve_child_provider_override, watch_child_liveness,
-    watchdog_policy_for_session, SpawnContext, SpawnJob,
+    publish_child_completion_parts, watch_child_liveness, watchdog_policy_for_session,
+    SpawnContext, SpawnJob,
 };
-use crate::runtime::ExecuteRequestBuilder;
 
 /// Launch a single child spawn job.
 ///
@@ -233,16 +232,13 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
     let agent_runners_for_status = ctx.agent_runners.clone();
     let sessions_cache = ctx.sessions_cache.clone();
     let agent = ctx.agent.clone();
-    let tools = ctx.tools.clone();
     let external_runner = ctx.external_child_runner.clone();
     let done = forwarder_done.clone();
     let parent_tx_for_done = parent_tx.clone();
     let parent_id_for_done = job.parent_session_id.clone();
     let child_id_for_done = job.child_session_id.clone();
     let session_event_senders = ctx.session_event_senders.clone();
-    let provider_router = ctx.provider_router.clone();
     let completion_handler = ctx.completion_handler.clone();
-    let app_data_dir = ctx.app_data_dir.clone();
 
     tokio::spawn(async move {
         // Set the child model via the single authoritative pre-execution
@@ -254,65 +250,23 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
             Some(&model),
         );
 
-        let wants_external = session
-            .metadata
-            .get("runtime.kind")
-            .is_some_and(|v| v == "external");
-
-        let result: crate::runtime::runner::Result<()> = if wants_external {
-            if let Some(runner) = external_runner {
-                if runner.should_handle(&session).await {
-                    runner
-                        .execute_external_child(&mut session, &job, mpsc_tx, cancel_token.clone())
-                        .await
-                } else {
-                    Err(bamboo_agent_core::AgentError::LLM(format!(
-                        "No external runner matched child session runtime metadata: agent_id={:?}, protocol={:?}",
-                        session.metadata.get("external.agent_id"),
-                        session.metadata.get("external.protocol"),
-                    )))
-                }
-            } else {
-                Err(bamboo_agent_core::AgentError::LLM(
-                    "Child session requires external runtime, but no external runner is configured"
-                        .to_string(),
-                ))
-            }
+        // Sub-agents always run as actors (the in-process runtime was removed):
+        // dispatch to the composite child runner. The built-in local actor
+        // handles the default case; expert `externalAgents` profiles handle
+        // roles pinned to other agents. `should_handle` selects the right one.
+        let result: crate::runtime::runner::Result<()> = if external_runner
+            .should_handle(&session)
+            .await
+        {
+            external_runner
+                .execute_external_child(&mut session, &job, mpsc_tx, cancel_token.clone())
+                .await
         } else {
-            let (provider_override, provider_name, provider_type) =
-                resolve_child_provider_override(provider_router.as_ref(), &session, &model);
-            let disabled_tools: Option<std::collections::BTreeSet<String>> =
-                job.disabled_tools.map(|v| v.into_iter().collect());
-
-            // Build via the canonical `ExecuteRequestBuilder` so the child spawn
-            // doesn't duplicate the full `ExecuteRequest` field list. The child
-            // only sets the primary model/provider and tools; every other field
-            // (auxiliary roles, reasoning effort, skill selection, image
-            // fallback, gold config) stays at the builder's `None` default —
-            // identical to the previous explicit literal.
-            // `initial_message` is empty: the child agent loop sources it itself.
-            let mut builder =
-                ExecuteRequestBuilder::new(String::new(), mpsc_tx, cancel_token.clone())
-                    .tools(tools)
-                    .model_roster(crate::runtime::ModelRoster {
-                        model: Some(model.clone()),
-                        provider_name,
-                        provider_type,
-                        fast: None,
-                        background: None,
-                        summarization: None,
-                    });
-            if let Some(provider_override) = provider_override {
-                builder = builder.provider_override(provider_override);
-            }
-            if let Some(disabled_tools) = disabled_tools {
-                builder = builder.disabled_tools(disabled_tools);
-            }
-            if let Some(app_data_dir) = app_data_dir {
-                builder = builder.app_data_dir(app_data_dir);
-            }
-
-            agent.execute(&mut session, builder.build()).await
+            Err(bamboo_agent_core::AgentError::LLM(format!(
+                "No child runner matched session runtime metadata: agent_id={:?}, protocol={:?}",
+                session.metadata.get("external.agent_id"),
+                session.metadata.get("external.protocol"),
+            )))
         };
 
         let timeout_error = timeout_reason.read().await.clone();

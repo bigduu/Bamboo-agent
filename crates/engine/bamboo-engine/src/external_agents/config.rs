@@ -97,13 +97,13 @@ pub const LOCAL_ACTOR_AGENT_ID: &str = "local-actor";
 
 /// Resolve runtime metadata for a subagent_type based on config routing.
 ///
-/// Precedence:
-/// 1. typed `subagents.overrides[type]` (explicit per-role, can force either mode)
-/// 2. legacy `subagentRouting[type]` (expert tables in `config.extra`)
-/// 3. typed `subagents.runtime` global default
+/// Sub-agents always run as actors (the in-process runtime was removed), so the
+/// default for every type is the built-in **local actor** worker. The only
+/// exception is the legacy expert `subagentRouting[type]` table, which can still
+/// pin a specific role to an external agent (e.g. a remote `a2a_jsonrpc` service
+/// or a custom actor profile). A legacy `runtime: "bamboo"` entry — which used
+/// to mean in-process — now falls through to the local-actor default.
 pub fn resolve_runtime_metadata(config: &Config, subagent_type: &str) -> HashMap<String, String> {
-    use bamboo_config::SubagentRuntimeMode;
-
     let local_actor_metadata = || {
         HashMap::from([
             ("runtime.kind".to_string(), "external".to_string()),
@@ -115,53 +115,44 @@ pub fn resolve_runtime_metadata(config: &Config, subagent_type: &str) -> HashMap
         ])
     };
 
-    // 1. Explicit per-role override: decides absolutely (either direction).
-    if let Some(mode) = config.subagents.overrides.get(subagent_type) {
-        return match mode {
-            SubagentRuntimeMode::Actor => local_actor_metadata(),
-            SubagentRuntimeMode::InProcess => HashMap::new(),
-        };
-    }
-
     let routing = parse_subagent_routing(config);
     let agents = parse_external_agents(config);
 
-    let mut metadata = HashMap::new();
+    // Legacy expert routing: pin a specific role to an external agent.
+    if let Some(route) = routing.get(subagent_type) {
+        if route.runtime == "external" {
+            let mut metadata = HashMap::new();
+            metadata.insert("runtime.kind".to_string(), "external".to_string());
 
-    let Some(route) = routing.get(subagent_type) else {
-        // 3. No expert routing for this type: apply the typed global default.
-        if config.subagents.runtime == SubagentRuntimeMode::Actor {
-            return local_actor_metadata();
-        }
-        return metadata;
-    };
+            if let Some(agent_id) = &route.agent_id {
+                metadata.insert("external.agent_id".to_string(), agent_id.clone());
 
-    if route.runtime == "external" {
-        metadata.insert("runtime.kind".to_string(), "external".to_string());
-
-        if let Some(agent_id) = &route.agent_id {
-            metadata.insert("external.agent_id".to_string(), agent_id.clone());
-
-            if let Some(profile) = agents.get(agent_id) {
-                metadata.insert(
-                    "external.protocol".to_string(),
-                    match profile.protocol {
-                        ExternalAgentProtocol::A2aJsonRpc => "a2a_jsonrpc".to_string(),
-                        ExternalAgentProtocol::Actor => "actor".to_string(),
-                    },
-                );
-                metadata.insert(
-                    "external.permission_profile".to_string(),
-                    profile.permission_profile.clone(),
-                );
-                if let Some(url) = &profile.agent_card_url {
-                    metadata.insert("external.agent_card_url".to_string(), url.clone());
+                if let Some(profile) = agents.get(agent_id) {
+                    metadata.insert(
+                        "external.protocol".to_string(),
+                        match profile.protocol {
+                            ExternalAgentProtocol::A2aJsonRpc => "a2a_jsonrpc".to_string(),
+                            ExternalAgentProtocol::Actor => "actor".to_string(),
+                        },
+                    );
+                    metadata.insert(
+                        "external.permission_profile".to_string(),
+                        profile.permission_profile.clone(),
+                    );
+                    if let Some(url) = &profile.agent_card_url {
+                        metadata.insert("external.agent_card_url".to_string(), url.clone());
+                    }
                 }
             }
+
+            return metadata;
         }
+        // `runtime: "bamboo"` (or anything non-external): fall through to the
+        // local-actor default below.
     }
 
-    metadata
+    // Default: the built-in local actor worker.
+    local_actor_metadata()
 }
 
 #[cfg(test)]
@@ -253,23 +244,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_runtime_metadata_returns_empty_for_unknown_type() {
-        // Hermetic: Config::default() loads the developer's real
-        // ~/.bamboo/config.json, which may set subagents.runtime=actor.
-        // Pin the typed section to its true default for this assertion.
+    fn unknown_type_defaults_to_local_actor() {
+        // Sub-agents always run as actors: a type with no expert routing
+        // resolves to the built-in local actor worker.
         let mut config = Config::default();
         config.subagents = Default::default();
         let metadata = resolve_runtime_metadata(&config, "unknown");
-        assert!(metadata.is_empty());
+        assert_eq!(metadata.get("runtime.kind"), Some(&"external".to_string()));
+        assert_eq!(
+            metadata.get("external.protocol"),
+            Some(&"actor".to_string())
+        );
+        assert_eq!(
+            metadata.get("external.agent_id"),
+            Some(&LOCAL_ACTOR_AGENT_ID.to_string())
+        );
     }
 
-    // ---- friendly typed `subagents` config ----
-
     #[test]
-    fn typed_global_actor_routes_every_type() {
-        let mut config = Config::default();
-        config.subagents.runtime = bamboo_config::SubagentRuntimeMode::Actor;
-
+    fn every_type_defaults_to_local_actor() {
+        let config = Config::default();
         let metadata = resolve_runtime_metadata(&config, "researcher");
         assert_eq!(metadata.get("runtime.kind"), Some(&"external".to_string()));
         assert_eq!(
@@ -283,36 +277,18 @@ mod tests {
     }
 
     #[test]
-    fn typed_override_beats_global_default() {
-        let mut config = Config::default();
-        config.subagents.runtime = bamboo_config::SubagentRuntimeMode::Actor;
-        config.subagents.overrides.insert(
-            "researcher".to_string(),
-            bamboo_config::SubagentRuntimeMode::InProcess,
-        );
-
-        // override forces in-process even though the global default is subprocess
-        assert!(resolve_runtime_metadata(&config, "researcher").is_empty());
-        // other types still follow the global default
-        assert!(!resolve_runtime_metadata(&config, "coder").is_empty());
-    }
-
-    #[test]
-    fn typed_override_beats_legacy_routing() {
+    fn legacy_bamboo_routing_falls_through_to_local_actor() {
+        // `runtime: "bamboo"` used to mean in-process; with in-process removed
+        // it falls through to the local-actor default.
         let mut config = Config::default();
         config.extra.insert(
             "subagentRouting".to_string(),
             serde_json::json!({
-                "impl": { "runtime": "external", "agent_id": "remote_impl" }
+                "plan": { "runtime": "bamboo" }
             }),
         );
-        config.subagents.overrides.insert(
-            "impl".to_string(),
-            bamboo_config::SubagentRuntimeMode::Actor,
-        );
 
-        let metadata = resolve_runtime_metadata(&config, "impl");
-        // the typed per-role override wins over the legacy expert table
+        let metadata = resolve_runtime_metadata(&config, "plan");
         assert_eq!(
             metadata.get("external.agent_id"),
             Some(&LOCAL_ACTOR_AGENT_ID.to_string())
@@ -320,9 +296,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_routing_beats_typed_global_default() {
+    fn legacy_external_routing_selects_remote_agent() {
         let mut config = Config::default();
-        config.subagents.runtime = bamboo_config::SubagentRuntimeMode::Actor;
         config.extra.insert(
             "externalAgents".to_string(),
             serde_json::json!({
@@ -340,7 +315,7 @@ mod tests {
             }),
         );
 
-        // explicit legacy per-type routing still selects the remote agent
+        // explicit legacy per-type external routing still selects the remote agent
         let metadata = resolve_runtime_metadata(&config, "impl");
         assert_eq!(
             metadata.get("external.agent_id"),

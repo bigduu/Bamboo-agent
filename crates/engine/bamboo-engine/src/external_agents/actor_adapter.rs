@@ -6,9 +6,9 @@
 //! it to self-register into the Tier-1 file fabric, connects, sends the assignment, and
 //! forwards the child's `AgentEvent`s back onto the parent's `event_tx`.
 //!
-//! Gated entirely behind config (`subagents.runtime = "actor"` or the expert
-//! `externalAgents` tables); when nothing routes to an actor, this runner is never built
-//! and default behavior is unchanged.
+//! The built-in **local actor** instance of this runner is the default runtime for
+//! every sub-agent (the in-process runtime was removed). The expert `externalAgents`
+//! tables can additionally route specific roles to other actor/a2a agents.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

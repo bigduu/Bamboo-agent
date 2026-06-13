@@ -51,6 +51,30 @@ impl ToolExecutor for NoopToolExecutor {
     }
 }
 
+/// No-op child runner for these tool/adapter-level tests. Sub-agents always run
+/// as actors now (the in-process spawn path was removed), but these tests
+/// exercise the SubAgent tool + adapter + scheduler bookkeeping — event
+/// emission, wait registration, queueing, manually-seeded runner state — not
+/// real child execution. Background runs resolve immediately as "completed".
+struct NoopChildRunner;
+
+#[async_trait::async_trait]
+impl bamboo_engine::execution::spawn::ExternalChildRunner for NoopChildRunner {
+    async fn should_handle(&self, _session: &Session) -> bool {
+        true
+    }
+
+    async fn execute_external_child(
+        &self,
+        _session: &mut Session,
+        _job: &bamboo_engine::execution::spawn::SpawnJob,
+        _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        _cancel_token: tokio_util::sync::CancellationToken,
+    ) -> bamboo_engine::runner::Result<()> {
+        Ok(())
+    }
+}
+
 fn make_temp_dir(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()))
 }
@@ -142,7 +166,7 @@ async fn build_test_harness_with_resolver(
         sessions_cache: sessions_cache.clone(),
         agent_runners: agent_runners.clone(),
         session_event_senders: session_event_senders.clone(),
-        external_child_runner: None,
+        external_child_runner: Arc::new(NoopChildRunner),
         provider_router: None,
         app_data_dir: None,
         completion_handler: None,

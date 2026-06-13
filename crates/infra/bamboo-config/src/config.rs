@@ -238,41 +238,18 @@ fn default_true_memory_project_first_dream() -> bool {
     true
 }
 
-/// Where sub-agents execute.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SubagentRuntimeMode {
-    /// Run sub-agents inside the server process (the historical default).
-    #[default]
-    InProcess,
-    /// Run each sub-agent as an independent actor: an isolated OS process
-    /// with its own context (crash isolation, true parallelism, per-child
-    /// resource limits). `subprocess` is accepted as an alias.
-    #[serde(alias = "subprocess")]
-    Actor,
-}
-
 /// Sub-agent execution settings.
 ///
-/// Friendly path — one switch:
-/// ```json
-/// "subagents": { "runtime": "actor" }
-/// ```
-/// Per-role exceptions:
-/// ```json
-/// "subagents": { "runtime": "actor", "overrides": { "researcher": "in_process" } }
-/// ```
-/// The worker binary, its arguments, and the discovery directory are derived
-/// automatically (the current `bamboo` executable + `subagent-worker`); the
-/// expert fields below override them only when you run a custom worker.
+/// Sub-agents always run as independent **actor** processes — an isolated OS
+/// process with its own context (crash isolation, true parallelism, per-child
+/// resource limits). The historical in-process runtime was removed, so there is
+/// no longer a runtime toggle (a stray `"runtime"`/`"overrides"` key in an old
+/// config is ignored). The worker binary, its arguments, and the discovery
+/// directory are derived automatically (the current `bamboo` executable +
+/// `subagent-worker`); the expert fields below override them only when you run a
+/// custom worker.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SubagentsConfig {
-    /// Default runtime for all sub-agents: `in_process` (default) or `actor`.
-    #[serde(default)]
-    pub runtime: SubagentRuntimeMode,
-    /// Per-`subagent_type` exceptions to `runtime` (highest precedence).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub overrides: HashMap<String, SubagentRuntimeMode>,
     /// Maximum actor processes running at once; further spawns wait their
     /// turn. Default: 8.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -291,25 +268,6 @@ pub struct SubagentsConfig {
     /// to verify the actor chain end-to-end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
-}
-
-impl SubagentsConfig {
-    /// Effective runtime mode for one `subagent_type` (override > default).
-    pub fn mode_for(&self, subagent_type: &str) -> SubagentRuntimeMode {
-        self.overrides
-            .get(subagent_type)
-            .copied()
-            .unwrap_or(self.runtime)
-    }
-
-    /// True if any sub-agent could run as an actor process under this config.
-    pub fn any_actor(&self) -> bool {
-        self.runtime == SubagentRuntimeMode::Actor
-            || self
-                .overrides
-                .values()
-                .any(|m| *m == SubagentRuntimeMode::Actor)
-    }
 }
 
 /// Main configuration structure for Bamboo agent

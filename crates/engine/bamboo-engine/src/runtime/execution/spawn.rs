@@ -14,8 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Session};
-use bamboo_domain::ProviderModelRef;
-use bamboo_llm::{LLMProvider, ProviderModelRouter};
+use bamboo_llm::ProviderModelRouter;
 
 use crate::runtime::Agent;
 
@@ -58,7 +57,7 @@ pub struct SpawnContext {
     pub sessions_cache: crate::SessionCache,
     pub agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
-    pub external_child_runner: Option<Arc<dyn ExternalChildRunner>>,
+    pub external_child_runner: Arc<dyn ExternalChildRunner>,
     pub provider_router: Option<Arc<ProviderModelRouter>>,
     pub app_data_dir: Option<std::path::PathBuf>,
     /// Optional application-layer completion hook. The engine still emits
@@ -98,28 +97,6 @@ impl SpawnScheduler {
             .await
             .map_err(|_| "spawn scheduler is not running".to_string())
     }
-}
-
-pub(crate) fn child_model_ref(session: &Session, model: &str) -> Option<ProviderModelRef> {
-    if let Some(model_ref) = session.model_ref.clone() {
-        let provider = model_ref.provider.trim();
-        let model_name = model_ref.model.trim();
-        if !provider.is_empty() && !model_name.is_empty() {
-            return Some(ProviderModelRef::new(provider, model_name));
-        }
-    }
-
-    let provider = session
-        .metadata
-        .get("provider_name")
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    let model_name = model.trim();
-    if model_name.is_empty() {
-        return None;
-    }
-    Some(ProviderModelRef::new(provider, model_name))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -278,39 +255,6 @@ pub(crate) async fn watch_child_liveness(
             }
         }
     }
-}
-
-pub(crate) fn resolve_child_provider_override(
-    router: Option<&Arc<ProviderModelRouter>>,
-    session: &Session,
-    model: &str,
-) -> (Option<Arc<dyn LLMProvider>>, Option<String>, Option<String>) {
-    let model_ref = child_model_ref(session, model);
-    let provider_name = model_ref
-        .as_ref()
-        .map(|model_ref| model_ref.provider.clone());
-    let provider_type = if let (Some(router), Some(model_ref)) = (router, model_ref.as_ref()) {
-        router.provider_type_for(model_ref)
-    } else {
-        provider_name.clone()
-    };
-    let provider = router.and_then(|router| {
-        let model_ref = model_ref.as_ref()?;
-        match router.route(model_ref) {
-            Ok(provider) => Some(provider),
-            Err(error) => {
-                tracing::warn!(
-                    session_id = %session.id,
-                    provider = %model_ref.provider,
-                    model = %model_ref.model,
-                    error = %error,
-                    "failed to resolve provider override for child session; falling back to runtime provider"
-                );
-                None
-            }
-        }
-    });
-    (provider, provider_name, provider_type)
 }
 
 /// Drive a single queued spawn job through the canonical child-spawn path.
