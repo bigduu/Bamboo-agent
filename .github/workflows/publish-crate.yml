@@ -61,6 +61,15 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Resolved version: ${VERSION}"
 
+      - name: Refuse to publish the placeholder version
+        # Source ships 0.0.0 on purpose — it's obviously not a real version, so it
+        # can't silently ship. The release train passes the real date-based
+        # version; never publish the 0.0.0 placeholder.
+        if: steps.version.outputs.version == '0.0.0'
+        run: |
+          echo "::error::Bamboo version resolved to the 0.0.0 placeholder. Pass a version input (the release train provides one from the Zenith config)."
+          exit 1
+
       - name: Prepare workspace manifests for publish
         shell: bash
         env:
@@ -108,8 +117,13 @@ jobs:
                       current_section = match.group(1)
                       continue
 
+                  # Match the concrete version line under either [package] (a
+                  # crate that hardcodes its version) or [workspace.package] (the
+                  # single source members inherit via `version.workspace = true`).
+                  # Without the workspace.package case the date version reaches no
+                  # manifest and every crate publishes at the 0.0.0 placeholder.
                   if (
-                      current_section == "package"
+                      current_section in ("package", "workspace.package")
                       and not package_version_done
                       and re.match(r'^version\s*=\s*"[^"]+"\s*$', stripped)
                   ):
