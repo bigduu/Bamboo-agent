@@ -8,11 +8,11 @@ use bamboo_llm::LLMProvider;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use bamboo_metrics::MetricsCollector;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::managers::lifecycle::LifecycleManager;
 use crate::runtime::runner::state_bridge;
 use crate::runtime::task_context::TaskLoopContext;
+use bamboo_metrics::MetricsCollector;
 
 /// Default lifecycle manager that delegates to existing runner functions.
 pub struct DefaultLifecycleManager {

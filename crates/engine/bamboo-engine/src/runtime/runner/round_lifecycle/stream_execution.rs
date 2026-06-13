@@ -134,9 +134,7 @@ fn format_reqwest_transport_error(error: &reqwest::Error) -> String {
 
 fn format_provider_error(error: bamboo_llm::provider::LLMError) -> String {
     match error {
-        bamboo_llm::provider::LLMError::Http(http) => {
-            format_reqwest_transport_error(&http)
-        }
+        bamboo_llm::provider::LLMError::Http(http) => format_reqwest_transport_error(&http),
         other => other.to_string(),
     }
 }
@@ -569,13 +567,13 @@ pub(super) async fn execute_llm_stream(
         .await
     }
     .map_err(|error| {
-            let message = format_provider_error(error);
-            if is_llm_overflow_error(&message) {
-                AgentError::LLMOverflow(message)
-            } else {
-                AgentError::LLM(message)
-            }
-        })?;
+        let message = format_provider_error(error);
+        if is_llm_overflow_error(&message) {
+            AgentError::LLMOverflow(message)
+        } else {
+            AgentError::LLM(message)
+        }
+    })?;
 
     // Send token budget update AFTER LLM call succeeds.
     // This timing gives frontend time to subscribe to /events endpoint.

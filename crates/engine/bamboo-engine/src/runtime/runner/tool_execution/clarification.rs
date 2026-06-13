@@ -2,7 +2,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use tokio::sync::mpsc;
 
-use bamboo_metrics::MetricsCollector;
 use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::{ToolCall, ToolResult};
 use bamboo_agent_core::{AgentEvent, Session};
@@ -11,6 +10,7 @@ use bamboo_domain::TaskItemStatus;
 use bamboo_memory::plan_store::{
     PlanCursorArtifact, PlanSectionArtifact, PlanStateArtifact, PlanStore,
 };
+use bamboo_metrics::MetricsCollector;
 
 use super::events::send_event_with_metrics;
 

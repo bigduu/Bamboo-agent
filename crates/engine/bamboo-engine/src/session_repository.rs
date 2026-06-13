@@ -208,8 +208,7 @@ fn should_prefer_storage(memory_session: &Session, storage_session: &Session) ->
     // still carries a pending question that the (same-age) memory copy lost, so
     // a genuine clarification is never dropped.
     storage_session.updated_at > memory_session.updated_at
-        || (memory_session.pending_question.is_none()
-            && storage_session.pending_question.is_some())
+        || (memory_session.pending_question.is_none() && storage_session.pending_question.is_some())
 }
 
 /// `SessionRepository` is the canonical `RuntimeSessionPersistence`: the runtime

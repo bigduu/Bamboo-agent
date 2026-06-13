@@ -111,33 +111,36 @@ pub async fn handler(
         }),
     };
 
-    let outcome =
-        match bamboo_engine::session_app::execute::prepare_execute(state.as_ref(), config.clone(), input)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return match error {
-                    bamboo_engine::session_app::errors::ExecutePreparationError::NotFound(_) => {
-                        tracing::warn!("[{session_id}] Execute session not found");
-                        HttpResponse::NotFound().json(serde_json::json!({
-                            "error": "Session not found",
-                            "session_id": session_id
-                        }))
-                    }
-                    bamboo_engine::session_app::errors::ExecutePreparationError::LoadFailed(load_err) => {
-                        let err_msg = load_err.to_string();
-                        tracing::error!("[{session_id}] Execute session load error: {err_msg}");
-                        HttpResponse::InternalServerError().json(serde_json::json!({
-                            "error": format!("Failed to load session: {err_msg}")
-                        }))
-                    }
-                    _ => internal_server_error_response(format!(
-                        "Execute preparation failed: {error}"
-                    )),
-                };
-            }
-        };
+    let outcome = match bamboo_engine::session_app::execute::prepare_execute(
+        state.as_ref(),
+        config.clone(),
+        input,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return match error {
+                bamboo_engine::session_app::errors::ExecutePreparationError::NotFound(_) => {
+                    tracing::warn!("[{session_id}] Execute session not found");
+                    HttpResponse::NotFound().json(serde_json::json!({
+                        "error": "Session not found",
+                        "session_id": session_id
+                    }))
+                }
+                bamboo_engine::session_app::errors::ExecutePreparationError::LoadFailed(
+                    load_err,
+                ) => {
+                    let err_msg = load_err.to_string();
+                    tracing::error!("[{session_id}] Execute session load error: {err_msg}");
+                    HttpResponse::InternalServerError().json(serde_json::json!({
+                        "error": format!("Failed to load session: {err_msg}")
+                    }))
+                }
+                _ => internal_server_error_response(format!("Execute preparation failed: {error}")),
+            };
+        }
+    };
 
     match outcome {
         bamboo_engine::session_app::types::ExecutePreparationOutcome::Ready {

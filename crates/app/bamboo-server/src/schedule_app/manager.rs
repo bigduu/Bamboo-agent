@@ -536,17 +536,16 @@ fn resolve_run_config_from_config(
         workspace_path.as_deref(),
     );
 
-    let model_roster = bamboo_engine::ModelRoster::from_areas(
-        Some(model),
-        provider_name,
-        provider_type,
-        areas,
-    );
+    let model_roster =
+        bamboo_engine::ModelRoster::from_areas(Some(model), provider_name, provider_type, areas);
 
     ResolvedRunConfig {
         model_roster,
         reasoning_effort,
-        gold_config: bamboo_engine::model_config_helper::resolve_gold_config(&config_snapshot, None),
+        gold_config: bamboo_engine::model_config_helper::resolve_gold_config(
+            &config_snapshot,
+            None,
+        ),
         system_prompt,
         base_system_prompt: base_system_prompt.to_string(),
         workspace_path,
@@ -557,10 +556,10 @@ fn resolve_run_config_from_config(
 mod build_context_tests {
     use super::resolve_run_config_from_config;
     use super::ScheduleRunJob;
+    use bamboo_config::DefaultsConfig;
+    use bamboo_config::{OpenAIConfig, ProviderConfigs};
     use bamboo_domain::{ProviderModelRef, ScheduleRunConfig};
     use bamboo_llm::{Config, ProviderRegistry};
-    use bamboo_config::{OpenAIConfig, ProviderConfigs};
-    use bamboo_config::DefaultsConfig;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;

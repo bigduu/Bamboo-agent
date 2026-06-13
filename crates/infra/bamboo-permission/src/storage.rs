@@ -276,9 +276,7 @@ pub enum PermissionStorageError {
 pub fn default_storage() -> Option<PermissionStorage> {
     // Keep storage consistent with the unified config.json location:
     // all persisted state lives under `paths::bamboo_dir()` (BAMBOO_DATA_DIR or `${HOME}/.bamboo`).
-    Some(PermissionStorage::new(
-        bamboo_config::paths::bamboo_dir(),
-    ))
+    Some(PermissionStorage::new(bamboo_config::paths::bamboo_dir()))
 }
 
 /// Get the default permission storage for a specific app name

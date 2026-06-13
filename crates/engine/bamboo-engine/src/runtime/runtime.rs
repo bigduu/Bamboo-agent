@@ -12,15 +12,15 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use bamboo_metrics::MetricsCollector;
-use bamboo_skills::SkillManager;
 use bamboo_agent_core::storage::{AttachmentReader, Storage};
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Role, Session};
-use bamboo_domain::ReasoningEffort;
 use bamboo_config::PermissionMode;
+use bamboo_domain::ReasoningEffort;
 use bamboo_llm::Config;
 use bamboo_llm::LLMProvider;
+use bamboo_metrics::MetricsCollector;
+use bamboo_skills::SkillManager;
 
 use crate::runtime::config::{
     AgentLoopConfig, AuxiliaryModelConfig, GoldConfig, ImageFallbackConfig, PromptMemoryFlags,

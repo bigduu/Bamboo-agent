@@ -143,10 +143,10 @@ mod tests {
     use super::*;
     use bamboo_agent_core::tools::ToolSchema;
     use bamboo_agent_core::Message;
+    use bamboo_config::{DefaultsConfig, FeatureFlags};
+    use bamboo_config::{OpenAIConfig, ProviderConfigs};
     use bamboo_domain::{Session, DEFAULT_REASONING_EFFORT};
     use bamboo_llm::{LLMError, LLMProvider, LLMStream};
-    use bamboo_config::{OpenAIConfig, ProviderConfigs};
-    use bamboo_config::{DefaultsConfig, FeatureFlags};
     use std::collections::HashMap;
 
     struct NoopProvider;

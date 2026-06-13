@@ -2,13 +2,13 @@ use actix_web::{web, HttpResponse};
 use futures::StreamExt;
 
 use crate::{app_state::AppState, error::AppError};
-use bamboo_metrics::types::ForwardStatus;
 use bamboo_llm::LLMRequestOptions;
+use bamboo_metrics::types::ForwardStatus;
 
 use super::super::helpers::now_unix_ts;
-use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens};
 use super::output::{build_completed_response, build_output_items};
 use super::PreparedResponsesRequest;
+use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens};
 
 pub(super) async fn handle_non_streaming_response(
     app_state: web::Data<AppState>,
@@ -66,12 +66,8 @@ pub(super) async fn handle_non_streaming_response(
             }
             Ok(bamboo_llm::types::LLMChunk::Token(text)) => content.push_str(&text),
             // Keep parity with streaming behavior: expose reasoning narration as text.
-            Ok(bamboo_llm::types::LLMChunk::ReasoningToken(text)) => {
-                content.push_str(&text)
-            }
-            Ok(bamboo_llm::types::LLMChunk::ToolCalls(calls)) => {
-                tool_calls.extend(calls)
-            }
+            Ok(bamboo_llm::types::LLMChunk::ReasoningToken(text)) => content.push_str(&text),
+            Ok(bamboo_llm::types::LLMChunk::ToolCalls(calls)) => tool_calls.extend(calls),
             Ok(bamboo_llm::types::LLMChunk::Done) => break,
             Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. })
             | Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. }) => {}

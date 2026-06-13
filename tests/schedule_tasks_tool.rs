@@ -15,11 +15,11 @@ use bamboo_agent::agent::{AgentEvent, Message, Session};
 // so this test builds the engine-level runtime directly. The ergonomic
 // `bamboo_agent::agent::Agent` wrapper is exercised separately in tests/agent_sdk.rs.
 use bamboo_agent::server::app_state::AgentRunner;
+use bamboo_agent::server::schedule_app::ScheduleTasksTool;
 use bamboo_agent::server::schedule_app::{ResolvedRunConfig, ScheduleContext};
 use bamboo_agent::server::schedule_app::{
     ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore,
 };
-use bamboo_agent::server::schedule_app::ScheduleTasksTool;
 use bamboo_agent::Config;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{
@@ -132,9 +132,7 @@ fn build_manager(
     let metrics_storage = Arc::new(SqliteMetricsStorage::new(dir.join("metrics.db")));
     let metrics = MetricsCollector::spawn(metrics_storage, 1);
 
-    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(
-        store.clone(),
-    ));
+    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(store.clone()));
 
     let agent = AgentBuilder::new()
         .storage(store.clone())
@@ -172,9 +170,7 @@ fn build_manager(
     let ctx = ScheduleContext {
         schedule_store,
         agent: agent.clone(),
-        persistence: Arc::new(bamboo_storage::LockedSessionStore::new(
-            store.clone(),
-        )),
+        persistence: Arc::new(bamboo_storage::LockedSessionStore::new(store.clone())),
         tools: Arc::new(NoopTools),
         sessions_cache: Arc::new(dashmap::DashMap::new()),
         agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),

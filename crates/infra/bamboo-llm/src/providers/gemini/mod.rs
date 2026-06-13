@@ -11,13 +11,13 @@ use reqwest::{
 };
 use serde_json::json;
 
-use bamboo_config::RequestOverridesConfig;
 use crate::protocol::gemini::GeminiRequest;
 use crate::protocol::ToProvider;
 use crate::provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, Result};
 use crate::providers::common::model_fetcher;
 use crate::providers::common::request_overrides;
 use crate::types::LLMChunk;
+use bamboo_config::RequestOverridesConfig;
 use bamboo_domain::Message;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;

@@ -5,10 +5,10 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
 
+use bamboo_llm::Config;
 use bamboo_skills::access_control;
 use bamboo_skills::resource_helpers::list_skill_resource_paths;
 use bamboo_skills::SkillManager;
-use bamboo_llm::Config;
 
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 

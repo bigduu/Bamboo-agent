@@ -484,7 +484,10 @@ fn stable_prefix_is_byte_stable_across_rounds() {
     };
 
     // Round 1: a short conversation.
-    let round1 = ctx(vec![Message::system("BASE_IDENTITY"), Message::user("first")]);
+    let round1 = ctx(vec![
+        Message::system("BASE_IDENTITY"),
+        Message::user("first"),
+    ]);
     // Round 2: the same session, conversation has grown.
     let round2 = ctx(vec![
         Message::system("BASE_IDENTITY"),
@@ -517,8 +520,7 @@ fn stable_prefix_is_byte_stable_across_rounds() {
     // The cacheable-prefix drift hash is unchanged, so the cache hits.
     assert!(e1.envelope_observability.stable_prefix_hash.is_some());
     assert_eq!(
-        e1.envelope_observability.stable_prefix_hash,
-        e2.envelope_observability.stable_prefix_hash,
+        e1.envelope_observability.stable_prefix_hash, e2.envelope_observability.stable_prefix_hash,
         "stable prefix must not drift between rounds"
     );
 }
@@ -573,7 +575,11 @@ async fn execute_llm_stream_routes_normal_request_through_lanes_with_relocated_g
     // What the provider actually received: the leading system message keeps the
     // static identity but NOT the tool/server guide, which arrives as its own
     // message instead.
-    let messages = llm.requested_messages.lock().expect("messages lock").clone();
+    let messages = llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .clone();
     assert!(matches!(messages[0].role, Role::System));
     assert!(messages[0].content.contains("BASE_IDENTITY"));
     assert!(
@@ -597,10 +603,7 @@ fn build_request_envelope_relocates_tool_guide_into_stable_prefix_lane() {
     // workflow) flows into the tool guide; mark it so we can locate it.
     config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
     let prepared_context = PreparedContext {
-        messages: vec![
-            Message::system("BASE_SYSTEM_IDENTITY"),
-            Message::user("go"),
-        ],
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
         token_usage: usage(0, 24),
         truncation_occurred: false,
         segments_removed: 0,

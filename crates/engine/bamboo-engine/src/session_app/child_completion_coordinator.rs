@@ -8,6 +8,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::Duration;
 
+use crate::execution::{
+    create_event_forwarder, spawn_session_execution, try_reserve_runner, AgentRunner,
+    ChildCompletion, ChildCompletionHandler, RunnerReservation, SessionExecutionArgs,
+};
+use crate::Agent;
 use async_trait::async_trait;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolExecutor;
@@ -15,25 +20,20 @@ use bamboo_agent_core::{AgentEvent, Message, Role, Session, SessionKind};
 use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState,
 };
-use crate::execution::{
-    create_event_forwarder, spawn_session_execution, try_reserve_runner, AgentRunner,
-    ChildCompletion, ChildCompletionHandler, RunnerReservation, SessionExecutionArgs,
-};
-use crate::Agent;
-use bamboo_storage::LockedSessionStore;
 use bamboo_llm::{Config, ProviderModelRouter, ProviderRegistry};
+use bamboo_storage::LockedSessionStore;
 use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
 
+use crate::model_areas::resolve_global_area_models;
+use crate::model_config_helper::{
+    resolve_fast_model, resolve_gold_config, GOLD_CONFIG_METADATA_KEY,
+};
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::session_app::resume::{
     resume_session_execution, ResumeExecutionPort, ResumeSpawnRequest,
 };
 use crate::session_app::types::{ResumeConfigSnapshot, ResumeOutcome};
-use crate::model_areas::resolve_global_area_models;
-use crate::model_config_helper::{
-    resolve_fast_model, resolve_gold_config, GOLD_CONFIG_METADATA_KEY,
-};
 
 const AGENT_RUNTIME_STATE_METADATA_KEY: &str = "agent.runtime.state";
 const RUNTIME_RESUME_MESSAGE_HIDDEN_KEY: &str = "hidden_from_ui";
@@ -87,11 +87,7 @@ async fn derive_completed_child_ids(
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter(|(_, status)| {
-            status
-                .as_deref()
-                .is_some_and(is_terminal_child_status)
-        })
+        .filter(|(_, status)| status.as_deref().is_some_and(is_terminal_child_status))
         .map(|(id, _)| id)
         .collect();
     if !completed.iter().any(|id| id == just_completed_child_id) {
@@ -685,7 +681,10 @@ mod tests {
         });
         let completed = derive_completed_child_ids(&storage, "parent-1", "b").await;
         // Terminal from index: a, c. Plus the just-completed child b folded in.
-        assert_eq!(completed, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            completed,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 
     #[tokio::test]

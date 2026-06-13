@@ -2,11 +2,11 @@
 
 use tokio::sync::mpsc;
 
-use bamboo_metrics::MetricsCollector;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_domain::AgentStatusState;
+use bamboo_metrics::MetricsCollector;
 
 mod completion_event;
 mod completion_metrics;

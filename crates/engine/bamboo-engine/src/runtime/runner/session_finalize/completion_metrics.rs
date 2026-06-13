@@ -1,6 +1,6 @@
-use bamboo_metrics::MetricsCollector;
 use bamboo_agent_core::Session;
 use bamboo_domain::AgentStatusState;
+use bamboo_metrics::MetricsCollector;
 
 pub(super) fn record_session_resolution(
     metrics_collector: Option<&MetricsCollector>,

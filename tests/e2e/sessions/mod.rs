@@ -1,5 +1,5 @@
-use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_config::OpenAIConfig;
+use bamboo_domain::reasoning::ReasoningEffort;
 
 mod crud;
 mod patch_message_safety;

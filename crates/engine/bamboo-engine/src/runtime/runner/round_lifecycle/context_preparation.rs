@@ -1,3 +1,4 @@
+use crate::llm_summarizer::LlmSummarizer;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::session_setup::prompt_envelope::{
     build_external_memory_context_block_from_messages, build_plan_mode_context_block_from_messages,
@@ -7,7 +8,6 @@ use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
     AgentError, AgentEvent, CompressionTriggerType, ContextBlock, Role, Session,
 };
-use crate::llm_summarizer::LlmSummarizer;
 use bamboo_compression::{
     apply_compression_plan, build_forced_compression_plan_with_summary,
     estimate_context_compression_exposure, prepare_hybrid_context, summary_source_messages,

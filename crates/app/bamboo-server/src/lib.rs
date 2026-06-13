@@ -120,9 +120,7 @@ pub mod session_app;
 
 // Re-export shims: these modules were relocated to bamboo-engine; keep the
 // historical bamboo_server::… paths working for external/integration-test refs.
-pub use bamboo_engine::{
-    message_hooks, model_areas, model_config_helper, prompt_defaults,
-};
+pub use bamboo_engine::{message_hooks, model_areas, model_config_helper, prompt_defaults};
 pub use bamboo_metrics::metrics_service;
 // `server_tools` was extracted to the `bamboo-server-tools` crate; keep the
 // historical `bamboo_server::server_tools::…` path working as a re-export shim.

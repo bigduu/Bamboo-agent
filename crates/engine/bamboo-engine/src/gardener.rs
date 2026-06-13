@@ -445,9 +445,7 @@ pub fn spawn_gardener_task(ctx: AutoDreamContext) {
             .filter(|secs| *secs > 0)
             // Fall back to the config default (single source of truth for "daily")
             // when memory config is absent or the interval was set to 0.
-            .unwrap_or_else(|| {
-                bamboo_config::MemoryConfig::default().gardener_interval_secs
-            });
+            .unwrap_or_else(|| bamboo_config::MemoryConfig::default().gardener_interval_secs);
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             ticker.tick().await;
@@ -486,8 +484,8 @@ mod tests {
 
     use bamboo_agent_core::storage::Storage;
     use bamboo_llm::{LLMError, LLMStream, ProviderRegistry};
-    use bamboo_storage::SessionStoreV2;
     use bamboo_memory::memory_store::DurableMemoryType;
+    use bamboo_storage::SessionStoreV2;
 
     #[derive(Clone)]
     struct CannedProvider {

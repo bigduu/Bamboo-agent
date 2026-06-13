@@ -2,13 +2,13 @@
 //!
 //! Creates LLM providers based on configuration.
 
-use bamboo_config::paths::bamboo_dir;
-use bamboo_config::Config;
 use crate::provider::{LLMError, LLMProvider};
 use crate::providers::common::MaskingProviderDecorator;
 use crate::providers::{
     AnthropicProvider, BodhiProvider, CopilotProvider, GeminiProvider, OpenAIProvider,
 };
+use bamboo_config::paths::bamboo_dir;
+use bamboo_config::Config;
 use reqwest::Client;
 use std::sync::Arc;
 

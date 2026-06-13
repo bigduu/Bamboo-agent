@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use bamboo_metrics::TokenUsage as MetricsTokenUsage;
 use crate::runtime::task_context::TaskLoopContext;
 use crate::runtime::task_evaluation::{evaluate_task_progress, TaskEvaluationResult};
 use bamboo_agent_core::{AgentError, AgentEvent, Session, SessionKind};
 use bamboo_domain::task::{TaskBlocker, TaskBlockerKind, TaskEvidence, TaskEvidenceKind};
 use bamboo_domain::{ReasoningEffort, TaskItemStatus};
 use bamboo_llm::LLMProvider;
+use bamboo_metrics::TokenUsage as MetricsTokenUsage;
 
 fn normalize_criterion(value: &str) -> Option<String> {
     let normalized = value

@@ -390,9 +390,12 @@ mod tests {
         mb.ensure_dirs().await.unwrap();
         // a well-formed message + a bogus one
         mb.deliver(&msg(1)).await.unwrap();
-        tokio::fs::write(mb.new_dir().join("00000000000000000001-bogus.json"), b"not json")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            mb.new_dir().join("00000000000000000001-bogus.json"),
+            b"not json",
+        )
+        .await
+        .unwrap();
 
         let batch = mb.drain().await.unwrap();
         assert_eq!(batch.len(), 1); // the good one came through
@@ -441,7 +444,7 @@ mod tests {
         let batch = mb.drain().await.unwrap();
         mb.ack_delivered(&batch[0]).await.unwrap();
         assert!(mb.recover().await.unwrap().is_empty()); // cur/ empty
-        // idempotent
+                                                         // idempotent
         mb.ack_delivered(&batch[0]).await.unwrap();
     }
 }

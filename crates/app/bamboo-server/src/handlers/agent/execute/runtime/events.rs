@@ -2,11 +2,9 @@ use tokio::sync::mpsc;
 use tracing::Instrument;
 
 use crate::app_state::AppState;
-use bamboo_engine::gold_auto_answer::{
-    maybe_auto_answer_pending_question, GoldAutoAnswerOutcome,
-};
 use bamboo_agent_core::AgentEvent;
 use bamboo_engine::config::GoldConfig;
+use bamboo_engine::gold_auto_answer::{maybe_auto_answer_pending_question, GoldAutoAnswerOutcome};
 
 /// Returns true for events that carry critical state a late subscriber must see.
 ///
@@ -370,8 +368,9 @@ mod tests {
                 // into the cache), so polling it here can repeatedly clobber the
                 // freshly-answered session with the stale storage version and
                 // starve convergence under load.
-                let marker_consumed = bamboo_engine::read_cached_session(&state.sessions, session_id)
-                    .is_some_and(|session| !has_pending_clarification_resume(&session));
+                let marker_consumed =
+                    bamboo_engine::read_cached_session(&state.sessions, session_id)
+                        .is_some_and(|session| !has_pending_clarification_resume(&session));
                 let runner_status = {
                     let runners = state.agent_runners.read().await;
                     runners.get(session_id).map(|runner| runner.status.clone())
@@ -824,7 +823,9 @@ mod tests {
         // deterministic rather than racing the memory↔storage convergence.
         let after = timeout(Duration::from_secs(30), async {
             loop {
-                if let Some(session) = bamboo_engine::read_cached_session(&state.sessions, session_id) {
+                if let Some(session) =
+                    bamboo_engine::read_cached_session(&state.sessions, session_id)
+                {
                     let answered = session.pending_question.is_none()
                         && session.messages.iter().any(|message| {
                             message.tool_call_id.as_deref() == Some(tool_call_id)
@@ -937,7 +938,9 @@ mod tests {
         // memory↔storage convergence in `load_session_merged`.
         let after = timeout(Duration::from_secs(30), async {
             loop {
-                if let Some(session) = bamboo_engine::read_cached_session(&state.sessions, session_id) {
+                if let Some(session) =
+                    bamboo_engine::read_cached_session(&state.sessions, session_id)
+                {
                     let answered = session.pending_question.is_none()
                         && session.messages.iter().any(|message| {
                             message.tool_call_id.as_deref() == Some(tool_call_id)

@@ -231,10 +231,12 @@ mod tests {
 
     #[test]
     fn executor_tags_are_stable() {
-        let v: serde_json::Value =
-            serde_json::from_str(&spec().to_json().unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&spec().to_json().unwrap()).unwrap();
         assert_eq!(v["executor"]["kind"], "echo");
-        let cli = ExecutorSpec::CliAdapter { command: "claude".into(), args: vec!["-p".into()] };
+        let cli = ExecutorSpec::CliAdapter {
+            command: "claude".into(),
+            args: vec!["-p".into()],
+        };
         let vv = serde_json::to_value(&cli).unwrap();
         assert_eq!(vv["kind"], "cli_adapter");
         assert_eq!(

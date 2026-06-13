@@ -49,24 +49,23 @@ impl StoreError {
 pub(crate) async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    let dir = path.parent().ok_or_else(|| {
-        StoreError::NotFound(format!("no parent dir for {}", path.display()))
-    })?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| StoreError::NotFound(format!("no parent dir for {}", path.display())))?;
     tokio::fs::create_dir_all(dir)
         .await
         .map_err(|e| StoreError::io(dir, e))?;
 
-    let stem = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file");
+    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     let tmp = dir.join(format!(".{stem}.tmp.{}", uuid::Uuid::new_v4()));
 
     {
         let mut f = tokio::fs::File::create(&tmp)
             .await
             .map_err(|e| StoreError::io(&tmp, e))?;
-        f.write_all(bytes).await.map_err(|e| StoreError::io(&tmp, e))?;
+        f.write_all(bytes)
+            .await
+            .map_err(|e| StoreError::io(&tmp, e))?;
         f.sync_all().await.map_err(|e| StoreError::io(&tmp, e))?;
     }
 

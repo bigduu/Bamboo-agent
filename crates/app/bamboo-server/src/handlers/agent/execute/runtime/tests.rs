@@ -1,10 +1,10 @@
 use crate::app_state::AgentStatus;
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
 
+use bamboo_engine::execution::agent_spawn::terminal_error_event_for_result;
 use bamboo_engine::session_app::execute::{
     consume_pending_conclusion_with_options_resume, has_pending_user_message,
 };
-use bamboo_engine::execution::agent_spawn::terminal_error_event_for_result;
 
 use super::execution::{execution_tool_surface, tools_for_execution};
 use super::session_state::{selected_skill_ids_for_session, selected_skill_mode_for_session};

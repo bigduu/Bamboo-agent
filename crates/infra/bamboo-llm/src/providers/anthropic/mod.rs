@@ -22,13 +22,13 @@ use bamboo_domain::{Message, MessagePart, Role};
 use reqwest::{header::HeaderMap, Client};
 use serde_json::{json, Value};
 
-use bamboo_config::RequestOverridesConfig;
 use crate::cache::{CacheTtl, PromptCachePlan, MAX_ANTHROPIC_CACHE_BREAKPOINTS};
 use crate::provider::LLMRequestOptions;
 use crate::provider::{LLMError, LLMProvider, LLMStream, Result};
 use crate::providers::common::model_fetcher;
 use crate::providers::common::request_overrides;
 use crate::types::LLMChunk;
+use bamboo_config::RequestOverridesConfig;
 use bamboo_domain::ReasoningEffort;
 
 /// Anthropic Messages API provider.
@@ -203,9 +203,7 @@ impl LLMProvider for AnthropicProvider {
                         if let Some(inner) = block.get("content").and_then(|c| c.as_array()) {
                             n += inner
                                 .iter()
-                                .filter(|b| {
-                                    b.get("type").and_then(|t| t.as_str()) == Some("image")
-                                })
+                                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("image"))
                                 .count();
                         }
                         n
@@ -346,10 +344,10 @@ impl LLMProvider for AnthropicProvider {
             ..Default::default()
         };
 
-        let stream = crate::providers::common::sse::llm_stream_from_sse(
-            response,
-            move |event, data| parse_anthropic_sse_event(&mut state, event, data),
-        );
+        let stream =
+            crate::providers::common::sse::llm_stream_from_sse(response, move |event, data| {
+                parse_anthropic_sse_event(&mut state, event, data)
+            });
 
         Ok(stream)
     }
@@ -609,10 +607,11 @@ fn messages_to_anthropic_json(messages: &[Message]) -> (Option<Value>, Vec<Value
 
 /// Whether a message carries at least one image in its content parts.
 fn message_has_image(message: &Message) -> bool {
-    message
-        .content_parts
-        .as_ref()
-        .is_some_and(|parts| parts.iter().any(|p| matches!(p, MessagePart::ImageUrl { .. })))
+    message.content_parts.as_ref().is_some_and(|parts| {
+        parts
+            .iter()
+            .any(|p| matches!(p, MessagePart::ImageUrl { .. }))
+    })
 }
 
 /// `keep_image`: when false, a tool result's images are dropped (replaced by a
@@ -1341,11 +1340,15 @@ mod anthropic_request_building {
             Message::tool_result_with_images("t1", "shot1", true, vec![img("FIRST")]),
             Message::tool_result_with_images("t2", "shot2", true, vec![img("LAST")]),
         ];
-        let out = super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
         let dumped = out.to_string();
         // The most recent image survives; the older one is dropped.
         assert!(dumped.contains("LAST"), "latest screenshot must be sent");
-        assert!(!dumped.contains("FIRST"), "older screenshot must be dropped");
+        assert!(
+            !dumped.contains("FIRST"),
+            "older screenshot must be dropped"
+        );
     }
 
     #[test]

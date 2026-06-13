@@ -4,14 +4,14 @@ use serde_json::json;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use bamboo_engine::session_app::child_session::{
-    self, ChildSessionError, ChildSessionPort, CreateChildInput, ModelCatalogPort,
-    SubagentResolutionPort,
-};
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 use bamboo_domain::session::runtime_state::ChildWaitPolicy;
 use bamboo_domain::subagent::SubagentProfileRegistry;
 use bamboo_domain::ReasoningEffort;
+use bamboo_engine::session_app::child_session::{
+    self, ChildSessionError, ChildSessionPort, CreateChildInput, ModelCatalogPort,
+    SubagentResolutionPort,
+};
 
 // ---------------------------------------------------------------------------
 // Args enum
@@ -332,7 +332,7 @@ Use list/get to inspect existing children; use update/run/send_message/cancel/de
                     "type": "string",
                     "enum": ["create", "wait", "list", "get", "update", "run", "send_message", "cancel", "delete", "list_profiles", "list_models"],
                     "description": "Sub-agent lifecycle operation. To run work in parallel: call create once per child (this no longer suspends the parent — children run in the background), then call wait ONCE to suspend until they all finish. Use list/get to inspect; update/run/send_message/cancel/delete to manage existing children; list_profiles to enumerate available subagent roles before choosing subagent_type; list_models to enumerate the models you can pin a child to via create.model. \
-A create call requires: title, responsibility, prompt, and subagent_type (workspace and subagent_type are optional and default to the parent's workspace / general-purpose). EXAMPLE create: {\"action\":\"create\",\"subagent_type\":\"researcher\",\"title\":\"Analyze auth module\",\"responsibility\":\"Map the auth flow and list its public API\",\"prompt\":\"Read crates/auth/src/lib.rs, summarize the login flow, and list every pub fn.\",\"workspace\":\"/abs/path/to/repo\"}. Then EXAMPLE wait: {\"action\":\"wait\"}."
+        A create call requires: title, responsibility, prompt, and subagent_type (workspace and subagent_type are optional and default to the parent's workspace / general-purpose). EXAMPLE create: {\"action\":\"create\",\"subagent_type\":\"researcher\",\"title\":\"Analyze auth module\",\"responsibility\":\"Map the auth flow and list its public API\",\"prompt\":\"Read crates/auth/src/lib.rs, summarize the login flow, and list every pub fn.\",\"workspace\":\"/abs/path/to/repo\"}. Then EXAMPLE wait: {\"action\":\"wait\"}."
                 },
                 "child_session_id": {
                     "type": "string",
@@ -624,18 +624,15 @@ A create call requires: title, responsibility, prompt, and subagent_type (worksp
                         let child_id = Uuid::new_v4().to_string();
                         // Model precedence: explicit `model` arg > per-subagent_type
                         // routing (resolver) > engine defaults (None).
-                        let model_ref_override = match model
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|m| !m.is_empty())
-                        {
-                            Some(spec) => Some(parse_model_spec(
-                                spec,
-                                &parent,
-                                self.catalog.as_ref().map(|c| c.default_provider()),
-                            )?),
-                            None => self.resolver.resolve_subagent_model(&subagent_type).await,
-                        };
+                        let model_ref_override =
+                            match model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                                Some(spec) => Some(parse_model_spec(
+                                    spec,
+                                    &parent,
+                                    self.catalog.as_ref().map(|c| c.default_provider()),
+                                )?),
+                                None => self.resolver.resolve_subagent_model(&subagent_type).await,
+                            };
                         let model_override = model_ref_override
                             .as_ref()
                             .map(|model_ref| model_ref.model.clone());
@@ -1000,7 +997,9 @@ mod tests {
 
     // ---- parse_model_spec ----
 
-    fn parent_session(model_ref: Option<bamboo_domain::ProviderModelRef>) -> bamboo_agent_core::Session {
+    fn parent_session(
+        model_ref: Option<bamboo_domain::ProviderModelRef>,
+    ) -> bamboo_agent_core::Session {
         let mut session = bamboo_agent_core::Session::new("p1", "gpt-test");
         session.model_ref = model_ref;
         session
@@ -1027,7 +1026,8 @@ mod tests {
     #[test]
     fn model_spec_bare_falls_back_to_default_provider() {
         let parent = parent_session(None);
-        let r = parse_model_spec("claude-haiku-4-5", &parent, Some("anthropic".to_string())).unwrap();
+        let r =
+            parse_model_spec("claude-haiku-4-5", &parent, Some("anthropic".to_string())).unwrap();
         assert_eq!(r.provider, "anthropic");
     }
 

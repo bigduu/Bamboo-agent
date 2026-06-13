@@ -1,7 +1,7 @@
-use bamboo_metrics::MetricsCollector;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ToolCall, ToolSchema};
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
+use bamboo_metrics::MetricsCollector;
 use tokio::sync::mpsc;
 
 use crate::runtime::config::AgentLoopConfig;

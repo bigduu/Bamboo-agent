@@ -1,7 +1,7 @@
 use tokio::sync::mpsc;
 
-use bamboo_metrics::MetricsCollector;
 use bamboo_agent_core::AgentEvent;
+use bamboo_metrics::MetricsCollector;
 
 pub(super) async fn send_event_with_metrics(
     event_tx: &mpsc::Sender<AgentEvent>,

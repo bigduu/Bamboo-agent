@@ -9,10 +9,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use bamboo_config::Config;
-use bamboo_config::ProviderInstanceConfig;
 use crate::provider::{LLMError, LLMProvider};
 use crate::provider_factory::create_provider_by_name;
+use bamboo_config::Config;
+use bamboo_config::ProviderInstanceConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderMetadata {

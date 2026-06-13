@@ -29,10 +29,7 @@ mod tests {
         let openai_msg: OpenAIChatMessage = msg.to_provider().unwrap();
 
         // Verify we can convert internal messages to the OpenAI-compatible API model.
-        assert_eq!(
-            openai_msg.role,
-            bamboo_llm::api::models::Role::User
-        );
+        assert_eq!(openai_msg.role, bamboo_llm::api::models::Role::User);
     }
 
     #[test]
@@ -107,8 +104,7 @@ mod tests {
     #[test]
     fn test_protocol_enums() {
         let openai_type = std::any::type_name::<bamboo_llm::protocol::OpenAIProtocol>();
-        let anthropic_type =
-            std::any::type_name::<bamboo_llm::protocol::AnthropicProtocol>();
+        let anthropic_type = std::any::type_name::<bamboo_llm::protocol::AnthropicProtocol>();
         let gemini_type = std::any::type_name::<bamboo_llm::protocol::GeminiProtocol>();
 
         assert!(openai_type.ends_with("OpenAIProtocol"));

@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use bamboo_agent_core::{AgentError, AgentEvent};
 use crate::runtime::execution::{ExternalChildRunner, SpawnJob};
+use async_trait::async_trait;
 use bamboo_a2a::A2AJsonRpcClient;
+use bamboo_agent_core::{AgentError, AgentEvent};
 use bamboo_llm::Config;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::a2a_adapter::A2AExternalChildRunner;
-use super::config::{parse_external_agents, ExternalAgentProtocol};
 use super::actor_adapter::ActorChildRunner;
+use super::config::{parse_external_agents, ExternalAgentProtocol};
 
 /// Composite router that delegates to the first matching external child runner.
 pub struct CompositeExternalChildRunner {
@@ -186,9 +186,7 @@ pub fn build_external_child_runner(config: &Config) -> Option<Arc<dyn ExternalCh
 /// config. Everything is derived: worker = the current bamboo executable +
 /// `subagent-worker`, fabric = per-user temp dir — unless expert fields
 /// override them.
-fn build_local_actor_runner(
-    config: &Config,
-) -> Result<Arc<dyn ExternalChildRunner>, String> {
+fn build_local_actor_runner(config: &Config) -> Result<Arc<dyn ExternalChildRunner>, String> {
     let sub = &config.subagents;
 
     let (worker_bin, worker_args) = match &sub.worker_bin {

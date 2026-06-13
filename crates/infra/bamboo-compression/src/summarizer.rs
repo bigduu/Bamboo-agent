@@ -208,7 +208,6 @@ impl SummaryManager {
 mod tests {
     use super::*;
 
-
     #[test]
     fn heuristic_summarizer_extracts_user_questions() {
         let summarizer = HeuristicSummarizer::new();

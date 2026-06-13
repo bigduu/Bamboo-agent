@@ -2,12 +2,12 @@ use actix_web::{web, HttpResponse, Responder};
 
 use super::{ChatRequest, ChatResponse};
 use crate::app_state::AppState;
-use bamboo_engine::session_app::chat::{parse_goal_command, GoalCommand};
-use bamboo_engine::session_app::metadata::SessionMetadataService;
 use bamboo_engine::config::GoldConfig;
 use bamboo_engine::model_config_helper::{
     parse_session_gold_config, resolve_gold_config, GOLD_CONFIG_METADATA_KEY,
 };
+use bamboo_engine::session_app::chat::{parse_goal_command, GoalCommand};
+use bamboo_engine::session_app::metadata::SessionMetadataService;
 
 mod images;
 mod request;

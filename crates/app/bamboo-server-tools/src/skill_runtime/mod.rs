@@ -5,9 +5,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
+use bamboo_llm::Config;
 use bamboo_skills::access_control::{SkillAccessError, SkillSessionPort};
 use bamboo_skills::SkillManager;
-use bamboo_llm::Config;
 
 use bamboo_agent_core::tools::ToolError;
 use bamboo_agent_core::Session;

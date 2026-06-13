@@ -298,8 +298,7 @@ async fn main() {
 
             // Load config (with env var overrides already applied)
             // If --data-dir is specified, load from that directory.
-            let mut config =
-                bamboo_llm::Config::from_data_dir(Some(bamboo_home_dir.clone()));
+            let mut config = bamboo_llm::Config::from_data_dir(Some(bamboo_home_dir.clone()));
 
             // Apply CLI argument overrides (highest priority)
             if let Some(p) = port {
@@ -414,10 +413,7 @@ async fn main() {
 
         Commands::Config { path, show_secrets } => {
             if path {
-                println!(
-                    "{}",
-                    bamboo_config::paths::config_json_path().display()
-                );
+                println!("{}", bamboo_config::paths::config_json_path().display());
             } else {
                 let mut config = Config::new();
                 config.normalize_tool_settings();
@@ -460,8 +456,8 @@ fn serialize_config_for_cli(
 #[cfg(test)]
 mod tests {
     use super::serialize_config_for_cli;
-    use bamboo_mcp::{McpServerConfig, StdioConfig, TransportConfig};
     use bamboo_config::{Config, OpenAIConfig, ProviderConfigs, ProxyAuth};
+    use bamboo_mcp::{McpServerConfig, StdioConfig, TransportConfig};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
 

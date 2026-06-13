@@ -59,7 +59,10 @@ impl WsServer {
     }
 
     /// Serve exactly one connection (owned child / demo), then return.
-    pub async fn serve_one<E: ChildExecutor + ?Sized>(self, executor: Arc<E>) -> TransportResult<()> {
+    pub async fn serve_one<E: ChildExecutor + ?Sized>(
+        self,
+        executor: Arc<E>,
+    ) -> TransportResult<()> {
         let (stream, _) = self.listener.accept().await?;
         handle_conn(stream, executor).await
     }
@@ -120,7 +123,10 @@ impl WsServer {
     }
 }
 
-async fn handle_conn<E: ChildExecutor + ?Sized>(stream: TcpStream, executor: Arc<E>) -> TransportResult<()> {
+async fn handle_conn<E: ChildExecutor + ?Sized>(
+    stream: TcpStream,
+    executor: Arc<E>,
+) -> TransportResult<()> {
     let ws = accept_async(stream).await?;
     let (ws_tx, mut ws_rx) = ws.split();
     // One writer task owns the sink; runs push frames through this channel (decouples read/write).
@@ -333,7 +339,10 @@ mod tests {
         let endpoint = server.ws_endpoint();
         let srv = tokio::spawn(async move {
             server
-                .serve_reusable_with_idle_timeout(Arc::new(EchoExecutor), Duration::from_millis(400))
+                .serve_reusable_with_idle_timeout(
+                    Arc::new(EchoExecutor),
+                    Duration::from_millis(400),
+                )
                 .await
         });
 
@@ -483,7 +492,9 @@ mod tests {
                         tokens.push(t.to_string());
                     }
                 }
-                ChildFrame::Terminal { status, result: r, .. } => {
+                ChildFrame::Terminal {
+                    status, result: r, ..
+                } => {
                     assert_eq!(status, TerminalStatus::Completed);
                     result = r;
                     break;

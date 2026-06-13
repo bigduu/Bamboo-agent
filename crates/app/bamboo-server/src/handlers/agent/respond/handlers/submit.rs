@@ -1,8 +1,8 @@
 use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
-use bamboo_engine::session_app::respond::PlanModeTransition;
 use bamboo_agent_core::AgentEvent;
+use bamboo_engine::session_app::respond::PlanModeTransition;
 
 use super::super::types::RespondRequest;
 
@@ -35,7 +35,9 @@ pub async fn submit_response(
     };
 
     let (_session, user_response, plan_mode_transition) =
-        match bamboo_engine::session_app::respond::submit_pending_response(state.as_ref(), input).await {
+        match bamboo_engine::session_app::respond::submit_pending_response(state.as_ref(), input)
+            .await
+        {
             Ok(result) => result,
             Err(error) => {
                 return match error {

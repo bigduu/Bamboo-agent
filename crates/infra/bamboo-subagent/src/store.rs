@@ -45,7 +45,8 @@ impl ProjectKey {
     /// short hash of the exact path — the hash disambiguates paths whose
     /// folded forms collide (`/a/b` vs `/a-b`).
     pub fn from_workspace(workspace: &Path) -> Self {
-        let canonical = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+        let canonical =
+            std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
         let raw = canonical.to_string_lossy();
         let folded: String = raw
             .chars()
@@ -183,7 +184,9 @@ impl SubagentStore {
         self.parent_dir(key, parent_id).join("children.json")
     }
     fn child_dir(&self, key: &ProjectKey, parent_id: &str, child_id: &str) -> PathBuf {
-        self.parent_dir(key, parent_id).join("children").join(child_id)
+        self.parent_dir(key, parent_id)
+            .join("children")
+            .join(child_id)
     }
     fn session_dir(&self, loc: &SessionLoc) -> PathBuf {
         match loc {
@@ -251,11 +254,14 @@ impl SubagentStore {
         child_id: &str,
     ) -> Result<Option<SessionLoc>> {
         let idx: ProjectIndex = self.read_json(&self.index_file(key)).await?;
-        Ok(idx.child_lookup.get(child_id).map(|parent_id| SessionLoc::Child {
-            key: key.clone(),
-            parent_id: parent_id.clone(),
-            child_id: child_id.to_string(),
-        }))
+        Ok(idx
+            .child_lookup
+            .get(child_id)
+            .map(|parent_id| SessionLoc::Child {
+                key: key.clone(),
+                parent_id: parent_id.clone(),
+                child_id: child_id.to_string(),
+            }))
     }
 
     // ---- index writes (single-writer = registry) --------------------------
@@ -264,7 +270,11 @@ impl SubagentStore {
         let _guard = self.write_lock.lock().await;
         let path = self.index_file(key);
         let mut idx: ProjectIndex = self.read_json(&path).await?;
-        match idx.roots.iter_mut().find(|r| r.session_id == entry.session_id) {
+        match idx
+            .roots
+            .iter_mut()
+            .find(|r| r.session_id == entry.session_id)
+        {
             Some(slot) => *slot = entry,
             None => idx.roots.push(entry),
         }
@@ -282,7 +292,11 @@ impl SubagentStore {
         // 1. children.json (per parent)
         let cpath = self.children_index_file(key, parent_id);
         let mut cidx: ChildrenIndex = self.read_json(&cpath).await?;
-        match cidx.children.iter_mut().find(|c| c.child_id == entry.child_id) {
+        match cidx
+            .children
+            .iter_mut()
+            .find(|c| c.child_id == entry.child_id)
+        {
             Some(slot) => *slot = entry.clone(),
             None => cidx.children.push(entry.clone()),
         }
@@ -292,7 +306,8 @@ impl SubagentStore {
         // 2. index.json child_lookup (written after, so a crash converges on rebuild)
         let ipath = self.index_file(key);
         let mut idx: ProjectIndex = self.read_json(&ipath).await?;
-        idx.child_lookup.insert(entry.child_id, parent_id.to_string());
+        idx.child_lookup
+            .insert(entry.child_id, parent_id.to_string());
         self.write_json(&ipath, &idx).await
     }
 
@@ -593,9 +608,12 @@ mod tests {
             key: k.clone(),
             session_id: "p1".into(),
         };
-        s.save_session(&root, &json!({"title": "Parent", "updated_at": ts().to_rfc3339()}))
-            .await
-            .unwrap();
+        s.save_session(
+            &root,
+            &json!({"title": "Parent", "updated_at": ts().to_rfc3339()}),
+        )
+        .await
+        .unwrap();
         s.upsert_root(
             &k,
             RootEntry {
@@ -655,7 +673,10 @@ mod tests {
         let k2 = ProjectKey::from_workspace(Path::new("/nonexistent/a-b"));
         assert_ne!(k1, k2);
         // deterministic
-        assert_eq!(k1, ProjectKey::from_workspace(Path::new("/nonexistent/a/b")));
+        assert_eq!(
+            k1,
+            ProjectKey::from_workspace(Path::new("/nonexistent/a/b"))
+        );
     }
 
     #[tokio::test]
@@ -725,7 +746,11 @@ mod tests {
         }
 
         let listed = s.list_children(&k, "p1").await.unwrap();
-        assert_eq!(listed.len(), 16, "all 16 children must survive concurrent upserts");
+        assert_eq!(
+            listed.len(),
+            16,
+            "all 16 children must survive concurrent upserts"
+        );
 
         let resolved = s.resolve_child(&k, "c7").await.unwrap();
         assert!(

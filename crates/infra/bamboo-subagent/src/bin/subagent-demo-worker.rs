@@ -64,7 +64,9 @@ async fn main() {
         started_at: now,
         lease_expires_at: now + Duration::seconds(60),
     };
-    fab.publish(&record).await.expect("publish discovery record");
+    fab.publish(&record)
+        .await
+        .expect("publish discovery record");
 
     // Reusable workers renew their lease while parked so the parent's pool sees
     // them as live between runs; one-shot workers don't need renewal.

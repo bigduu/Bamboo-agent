@@ -6,8 +6,8 @@ use crate::{app_state::AppState, error::AppError};
 use bamboo_metrics::types::ForwardStatus;
 
 use super::super::conversion::{convert_gemini_to_messages, convert_gemini_tools};
-use crate::handlers::llm_compat::usage::estimate_prompt_tokens;
 use super::runtime::{build_gemini_event_stream, StreamRuntimeContext};
+use crate::handlers::llm_compat::usage::estimate_prompt_tokens;
 
 /// Stream generate content.
 pub async fn stream_generate_content(

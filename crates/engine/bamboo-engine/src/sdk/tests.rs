@@ -146,7 +146,9 @@ async fn build_harness(
     jsonl.init().await.unwrap();
     let storage: Arc<dyn Storage> = Arc::new(jsonl);
 
-    let metrics_storage = Arc::new(bamboo_metrics::SqliteMetricsStorage::new(home.join("metrics.db")));
+    let metrics_storage = Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+        home.join("metrics.db"),
+    ));
     let metrics_collector = MetricsCollector::spawn(metrics_storage, 7);
 
     let sessions_cache: crate::SessionCache = Arc::new(dashmap::DashMap::new());
@@ -193,9 +195,7 @@ async fn build_harness(
             .attachment_reader(session_store.clone())
             .skill_manager(Arc::new(SkillManager::new()))
             .metrics_collector(metrics_collector)
-            .config(Arc::new(RwLock::new(
-                bamboo_llm::Config::default(),
-            )))
+            .config(Arc::new(RwLock::new(bamboo_llm::Config::default())))
             .provider(provider)
             .default_tools(Arc::new(CatalogToolExecutor {
                 names: tool_names.clone(),

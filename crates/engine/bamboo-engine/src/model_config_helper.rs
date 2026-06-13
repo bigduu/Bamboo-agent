@@ -716,11 +716,11 @@ mod tests {
     use super::*;
     use bamboo_agent_core::tools::ToolSchema;
     use bamboo_agent_core::Message;
+    use bamboo_config::CopilotConfig;
+    use bamboo_config::DefaultsConfig;
+    use bamboo_config::{OpenAIConfig, ProviderConfigs};
     use bamboo_domain::ProviderModelRef;
     use bamboo_llm::{LLMProvider, LLMStream};
-    use bamboo_config::{OpenAIConfig, ProviderConfigs};
-    use bamboo_config::DefaultsConfig;
-    use bamboo_config::CopilotConfig;
     use std::collections::HashMap;
 
     struct NoopProvider;

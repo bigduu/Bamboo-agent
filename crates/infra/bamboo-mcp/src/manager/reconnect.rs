@@ -259,8 +259,7 @@ impl McpServerManager {
                 // SSE uses HTTP; ensure it respects user-configured proxy settings when available.
                 if let Some(cfg_handle) = self.config.as_ref() {
                     let cfg = cfg_handle.read().await.clone();
-                    let client = bamboo_llm::http_client::build_http_client(&cfg)
-                        .map_err(|e| {
+                    let client = bamboo_llm::http_client::build_http_client(&cfg).map_err(|e| {
                         McpError::InvalidConfig(format!(
                             "Failed to build HTTP client for MCP SSE transport: {e}"
                         ))
@@ -277,8 +276,7 @@ impl McpServerManager {
                 // Streamable HTTP uses HTTP; respect user-configured proxy settings.
                 if let Some(cfg_handle) = self.config.as_ref() {
                     let cfg = cfg_handle.read().await.clone();
-                    let client = bamboo_llm::http_client::build_http_client(&cfg)
-                        .map_err(|e| {
+                    let client = bamboo_llm::http_client::build_http_client(&cfg).map_err(|e| {
                         McpError::InvalidConfig(format!(
                             "Failed to build HTTP client for MCP StreamableHTTP transport: {e}"
                         ))

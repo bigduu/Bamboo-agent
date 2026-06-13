@@ -6,13 +6,13 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
 
+use bamboo_llm::Config;
 use bamboo_skills::access_control;
 use bamboo_skills::resource_helpers::{
     display_relative_path, normalize_relative_resource_path, page_text_lines, truncate_text,
 };
 use bamboo_skills::runtime_metadata::LAST_RESOURCE_READ_SUMMARY_METADATA_KEY;
 use bamboo_skills::SkillManager;
-use bamboo_llm::Config;
 
 use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext, ToolResult};
 

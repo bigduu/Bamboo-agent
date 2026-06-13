@@ -51,25 +51,22 @@ impl AppState {
         // Load config from the specified data directory
         let config = Config::from_data_dir(Some(bamboo_home_dir.clone()));
 
-        let provider_registry = match bamboo_llm::ProviderRegistry::from_config(
-            &config,
-            bamboo_home_dir.clone(),
-        )
-        .await
-        {
-            Ok(registry) => Arc::new(registry),
-            Err(e) => {
-                tracing::error!("Failed to create provider registry: {}", e);
-                Arc::new(
-                    bamboo_llm::ProviderRegistry::from_config(
-                        &Config::default(),
-                        bamboo_home_dir.clone(),
+        let provider_registry =
+            match bamboo_llm::ProviderRegistry::from_config(&config, bamboo_home_dir.clone()).await
+            {
+                Ok(registry) => Arc::new(registry),
+                Err(e) => {
+                    tracing::error!("Failed to create provider registry: {}", e);
+                    Arc::new(
+                        bamboo_llm::ProviderRegistry::from_config(
+                            &Config::default(),
+                            bamboo_home_dir.clone(),
+                        )
+                        .await
+                        .expect("Cannot create even an empty provider registry"),
                     )
-                    .await
-                    .expect("Cannot create even an empty provider registry"),
-                )
-            }
-        };
+                }
+            };
 
         let provider = provider_registry.get_default().unwrap_or_else(|| {
             let default_provider_name = provider_registry.default_provider_name();
@@ -113,10 +110,8 @@ impl AppState {
         // the dependency arrow pointing down (agent-core no longer imports the
         // infrastructure config crate); the server owns config and provides it here.
         bamboo_agent_core::workspace_state::set_default_workspace_provider(|| {
-            bamboo_llm::Config::from_data_dir(Some(
-                bamboo_config::paths::bamboo_dir(),
-            ))
-            .get_default_work_area_path()
+            bamboo_llm::Config::from_data_dir(Some(bamboo_config::paths::bamboo_dir()))
+                .get_default_work_area_path()
         });
 
         let data_dir = bamboo_home_dir.clone();
@@ -210,8 +205,8 @@ impl AppState {
 
         // Account-scoped durable change feed. Opening the journal recovers the
         // max seq so the sequence counter stays monotonic across restarts.
-        let account_sink =
-            bamboo_engine::events::AccountEventSink::new(data_dir.join("events")).map_err(|e| {
+        let account_sink = bamboo_engine::events::AccountEventSink::new(data_dir.join("events"))
+            .map_err(|e| {
                 AppError::InternalError(anyhow::anyhow!(
                     "failed to initialize account change-feed journal: {e}"
                 ))
@@ -260,8 +255,8 @@ impl AppState {
                 .expect("agent runtime should be fully configured"),
         );
 
-        let child_completion_coordinator = Arc::new(
-            bamboo_engine::ChildCompletionCoordinator::new(
+        let child_completion_coordinator =
+            Arc::new(bamboo_engine::ChildCompletionCoordinator::new(
                 storage.clone(),
                 persistence.clone(),
                 sessions.clone(),
@@ -273,8 +268,7 @@ impl AppState {
                 provider_router.clone(),
                 data_dir.clone(),
                 Some(account_sink.inbox()),
-            ),
-        );
+            ));
 
         // Initialize sub-session spawn scheduler (async background jobs).
         let config_snapshot = config.read().await.clone();

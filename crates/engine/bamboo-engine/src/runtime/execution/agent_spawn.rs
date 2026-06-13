@@ -42,10 +42,7 @@ pub type SessionCache = std::sync::Arc<
 /// `SessionCache` (HTTP handlers, server tools, the app-state loader). It
 /// replaced ~13 verbatim copies of the
 /// `cache.get(id).map(|e| e.value().clone()).map(|a| a.read().clone())` idiom.
-pub fn read_cached_session(
-    cache: &SessionCache,
-    id: &str,
-) -> Option<bamboo_agent_core::Session> {
+pub fn read_cached_session(cache: &SessionCache, id: &str) -> Option<bamboo_agent_core::Session> {
     cache
         .get(id)
         .map(|e| e.value().clone())

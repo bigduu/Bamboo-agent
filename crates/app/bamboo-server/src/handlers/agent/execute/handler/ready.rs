@@ -12,8 +12,8 @@ use actix_web::{web, HttpResponse};
 use std::collections::BTreeSet;
 use tokio::sync::mpsc;
 
-use super::response::{already_running_response, internal_server_error_response, started_response};
 use super::build_sync_info_from_session;
+use super::response::{already_running_response, internal_server_error_response, started_response};
 use crate::app_state::AppState;
 use crate::handlers::agent::execute::runtime::{
     reserve_runner, spawn_agent_execution, spawn_event_forwarder, RunnerReservation,
@@ -50,26 +50,26 @@ pub(super) async fn handle_execute_ready(
     let mut session = ready.session;
     // ---- Reserve runner ----
     let session_tx = state.get_session_event_sender(session_id).await;
-    let (cancel_token, run_id) = match reserve_runner(state.get_ref(), session_id, &session_tx).await
-    {
-        RunnerReservation::Started(token, rid) => {
-            tracing::debug!(
-                "[{}] Execute Ready -> runner reserved & STARTING (run_id={})",
-                session_id,
-                rid
-            );
-            (token, rid)
-        }
-        RunnerReservation::AlreadyRunning(rid) => {
-            tracing::debug!(
-                "[{}] Execute Ready -> runner AlreadyRunning (run_id={}); not spawning",
-                session_id,
-                rid
-            );
-            let sync_info = build_sync_info_from_session(&session);
-            return already_running_response(session_id, sync_info, Some(rid));
-        }
-    };
+    let (cancel_token, run_id) =
+        match reserve_runner(state.get_ref(), session_id, &session_tx).await {
+            RunnerReservation::Started(token, rid) => {
+                tracing::debug!(
+                    "[{}] Execute Ready -> runner reserved & STARTING (run_id={})",
+                    session_id,
+                    rid
+                );
+                (token, rid)
+            }
+            RunnerReservation::AlreadyRunning(rid) => {
+                tracing::debug!(
+                    "[{}] Execute Ready -> runner AlreadyRunning (run_id={}); not spawning",
+                    session_id,
+                    rid
+                );
+                let sync_info = build_sync_info_from_session(&session);
+                return already_running_response(session_id, sync_info, Some(rid));
+            }
+        };
 
     // ---- Save session before spawn (metadata-group merge) ----
     if let Err(error) = state.persistence.merge_save_runtime(&mut session).await {
@@ -90,7 +90,10 @@ pub(super) async fn handle_execute_ready(
             .iter()
             .any(|m| matches!(m.role, bamboo_agent_core::Role::User))
     {
-        crate::title_gen::spawn_title_generation(state.clone().into_inner(), session_id.to_string());
+        crate::title_gen::spawn_title_generation(
+            state.clone().into_inner(),
+            session_id.to_string(),
+        );
     }
 
     let disabled_tools: BTreeSet<String> = disabled_tools_vec.into_iter().collect();
@@ -105,8 +108,11 @@ pub(super) async fn handle_execute_ready(
     );
     // Auxiliary models for the spawn: global config, keyed to the session's
     // resolved provider for fallback — never session-derived model values.
-    let areas =
-        resolve_global_area_models(config_snapshot, &resolved_provider_name, &state.provider_registry);
+    let areas = resolve_global_area_models(
+        config_snapshot,
+        &resolved_provider_name,
+        &state.provider_registry,
+    );
 
     // Build sync info before moving session into SpawnAgentExecution.
     let sync_info = build_sync_info_from_session(&session);

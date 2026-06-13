@@ -8,7 +8,9 @@
 pub mod storage;
 pub mod types;
 
-pub use storage::{MetricsError, MetricsResult, MetricsStorage, SqliteMetricsStorage, ToolCallCompletion};
+pub use storage::{
+    MetricsError, MetricsResult, MetricsStorage, SqliteMetricsStorage, ToolCallCompletion,
+};
 pub use types::{
     DailyMetrics, ForwardEndpointMetrics, ForwardMetricsFilter, ForwardMetricsSummary,
     ForwardRequestMetrics, ForwardStatus, MetricsDateFilter, MetricsSummary, ModelMetrics,

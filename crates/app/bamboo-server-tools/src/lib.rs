@@ -15,9 +15,9 @@ pub mod sub_agent;
 pub mod surface;
 
 pub use compact::CompactContextTool;
-pub use sub_agent::SubAgentTool;
 pub use memory::MemoryTool;
 pub use overlay_executor::OverlayToolExecutor;
 pub use session_inspector::SessionInspectorTool;
 pub use skill_runtime::{LoadSkillTool, ReadSkillResourceTool};
+pub use sub_agent::SubAgentTool;
 pub use surface::{ToolSurface, ToolSurfaceFactory};

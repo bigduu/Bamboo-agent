@@ -143,9 +143,7 @@ impl Tool for WorkspaceTool {
                     if let Some(workspace) = workspace_state::get_workspace(session_id) {
                         return Ok(ToolResult {
                             success: true,
-                            result: bamboo_config::paths::path_to_display_string(
-                                &workspace,
-                            ),
+                            result: bamboo_config::paths::path_to_display_string(&workspace),
                             display_preference: None,
                             images: Vec::new(),
                         });

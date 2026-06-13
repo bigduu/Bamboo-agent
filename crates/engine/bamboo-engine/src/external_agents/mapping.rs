@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 
+use bamboo_a2a::types::{A2ARole, PartContentWire, StreamResponse, TaskState, TaskStatus};
 use bamboo_agent_core::{AgentEvent, TokenUsage};
-use bamboo_a2a::types::{
-    A2ARole, PartContentWire, StreamResponse, TaskState, TaskStatus,
-};
 
 /// Events and metadata updates produced by mapping a single A2A StreamResponse.
 pub struct A2AMappedEvents {
@@ -253,9 +251,7 @@ fn handle_artifact_update(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_a2a::types::{
-        A2ARole, Message, Part, Task, TaskStatus, TaskStatusUpdateEvent,
-    };
+    use bamboo_a2a::types::{A2ARole, Message, Part, Task, TaskStatus, TaskStatusUpdateEvent};
 
     #[test]
     fn a2a_message_text_maps_to_token() {

@@ -336,7 +336,10 @@ pub(crate) fn build_stable_prompt_frame_with_sections(
         },
     ];
 
-    (StablePromptFrame::new(stable_instructions, Vec::new()), sections)
+    (
+        StablePromptFrame::new(stable_instructions, Vec::new()),
+        sections,
+    )
 }
 
 pub(crate) fn build_tool_guide_context(

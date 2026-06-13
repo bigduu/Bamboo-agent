@@ -11,10 +11,10 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use bamboo_metrics::TokenUsage as MetricsTokenUsage;
 use crate::runtime::config::GoldConfig;
 use crate::runtime::stream::handler::consume_llm_stream_silent;
 use crate::runtime::task_context::TaskLoopContext;
+use bamboo_metrics::TokenUsage as MetricsTokenUsage;
 
 /// Evaluation-scoped frame bundling parameters that identify and configure a
 /// single gold evaluation pass.  Passed into [`evaluate_gold`] to keep its

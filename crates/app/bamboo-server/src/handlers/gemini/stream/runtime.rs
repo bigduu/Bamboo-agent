@@ -2,11 +2,11 @@ use actix_web::Error as ActixError;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
-use bamboo_metrics::{ForwardStatus, MetricsCollector};
 use bamboo_llm::{provider::LLMStream, LLMChunk};
+use bamboo_metrics::{ForwardStatus, MetricsCollector};
 
-use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens};
 use super::sse;
+use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens};
 
 #[derive(Clone)]
 pub(super) struct StreamRuntimeContext {

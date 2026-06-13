@@ -25,10 +25,10 @@ use tokio::sync::RwLock;
 
 use bamboo_agent_core::tools::{Tool, ToolExecutor};
 use bamboo_engine::AgentBuilder as EngineAgentBuilder;
+use bamboo_llm::{create_provider_with_dir, Config, LLMProvider};
 use bamboo_metrics::{MetricsCollector, SqliteMetricsStorage};
 use bamboo_skills::{SkillManager, SkillStoreConfig};
 use bamboo_storage::{LockedSessionStore, SessionStoreV2};
-use bamboo_llm::{create_provider_with_dir, Config, LLMProvider};
 use bamboo_tools::ToolRegistry;
 
 use super::Agent;

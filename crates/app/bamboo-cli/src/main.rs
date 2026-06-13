@@ -5,12 +5,12 @@
 
 #![allow(dead_code)]
 
+use bamboo_client_core::{AgentEvent, ChatRequest, ChatResponse};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use eventsource_client::{Client, SSE};
 use futures::StreamExt;
 use launchdarkly_sdk_transport::HyperTransport;
-use bamboo_client_core::{AgentEvent, ChatRequest, ChatResponse};
 use std::io::{self, Write};
 use std::time::Instant;
 
@@ -50,7 +50,6 @@ enum Commands {
     /// View session history
     History,
 }
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

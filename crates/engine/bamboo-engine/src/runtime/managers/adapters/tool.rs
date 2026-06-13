@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use bamboo_metrics::MetricsCollector;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_llm::LLMProvider;
+use bamboo_metrics::MetricsCollector;
 use tokio::sync::mpsc;
 
 use crate::runtime::config::AgentLoopConfig;

@@ -4,8 +4,8 @@ use bytes::Bytes;
 use serde_json::json;
 
 use crate::{app_state::AppState, error::AppError};
-use bamboo_metrics::types::ForwardStatus;
 use bamboo_llm::LLMRequestOptions;
+use bamboo_metrics::types::ForwardStatus;
 
 use super::PreparedCompleteRequest;
 use crate::handlers::anthropic::{

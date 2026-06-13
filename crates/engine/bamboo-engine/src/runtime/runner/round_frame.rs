@@ -13,8 +13,8 @@ use bamboo_agent_core::AgentEvent;
 use bamboo_llm::LLMProvider;
 use tokio::sync::mpsc;
 
-use bamboo_metrics::MetricsCollector;
 use crate::runtime::config::AgentLoopConfig;
+use bamboo_metrics::MetricsCollector;
 
 /// Immutable infrastructure context shared across a single round of execution.
 ///

@@ -12,7 +12,6 @@ use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_llm::Config;
 use bamboo_llm::{LLMChunk, LLMProvider, LLMRequestOptions};
 use bamboo_llm::{ProviderModelRouter, ProviderRegistry};
-use bamboo_storage::{SessionIndexEntry, SessionStoreV2};
 use bamboo_memory::auto_dream::{
     build_consolidation_prompt, build_extraction_prompt, build_rebuild_consolidation_prompt,
     build_refine_consolidation_prompt, derive_session_outline, normalize_dream_notebook_body,
@@ -22,6 +21,7 @@ use bamboo_memory::auto_dream::{
     ConsolidationSessionInfo, DreamCandidateInfo, DreamGenerationMode,
 };
 use bamboo_memory::memory_store::{MemoryScope, MemoryStore};
+use bamboo_storage::{SessionIndexEntry, SessionStoreV2};
 
 const DREAM_RUNTIME_SESSION_ID: &str = "__dream__";
 const DREAM_TRACING_TARGET: &str = "bamboo.auto_dream";

@@ -43,13 +43,11 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                     openai.api_key_encrypted = if api_key.is_empty() {
                         None
                     } else {
-                        Some(
-                            bamboo_config::encryption::encrypt(api_key).map_err(|e| {
-                                AppError::InternalError(anyhow::anyhow!(
-                                    "Failed to encrypt OpenAI api_key: {e}"
-                                ))
-                            })?,
-                        )
+                        Some(bamboo_config::encryption::encrypt(api_key).map_err(|e| {
+                            AppError::InternalError(anyhow::anyhow!(
+                                "Failed to encrypt OpenAI api_key: {e}"
+                            ))
+                        })?)
                     };
                 }
             }
@@ -59,13 +57,11 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                     anthropic.api_key_encrypted = if api_key.is_empty() {
                         None
                     } else {
-                        Some(
-                            bamboo_config::encryption::encrypt(api_key).map_err(|e| {
-                                AppError::InternalError(anyhow::anyhow!(
-                                    "Failed to encrypt Anthropic api_key: {e}"
-                                ))
-                            })?,
-                        )
+                        Some(bamboo_config::encryption::encrypt(api_key).map_err(|e| {
+                            AppError::InternalError(anyhow::anyhow!(
+                                "Failed to encrypt Anthropic api_key: {e}"
+                            ))
+                        })?)
                     };
                 }
             }
@@ -75,13 +71,11 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                     gemini.api_key_encrypted = if api_key.is_empty() {
                         None
                     } else {
-                        Some(
-                            bamboo_config::encryption::encrypt(api_key).map_err(|e| {
-                                AppError::InternalError(anyhow::anyhow!(
-                                    "Failed to encrypt Gemini api_key: {e}"
-                                ))
-                            })?,
-                        )
+                        Some(bamboo_config::encryption::encrypt(api_key).map_err(|e| {
+                            AppError::InternalError(anyhow::anyhow!(
+                                "Failed to encrypt Gemini api_key: {e}"
+                            ))
+                        })?)
                     };
                 }
             }
@@ -91,13 +85,11 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
                     bodhi.api_key_encrypted = if api_key.is_empty() {
                         None
                     } else {
-                        Some(
-                            bamboo_config::encryption::encrypt(api_key).map_err(|e| {
-                                AppError::InternalError(anyhow::anyhow!(
-                                    "Failed to encrypt Bodhi api_key: {e}"
-                                ))
-                            })?,
-                        )
+                        Some(bamboo_config::encryption::encrypt(api_key).map_err(|e| {
+                            AppError::InternalError(anyhow::anyhow!(
+                                "Failed to encrypt Bodhi api_key: {e}"
+                            ))
+                        })?)
                     };
                 }
             }
@@ -111,13 +103,11 @@ pub fn sync_provider_api_keys_encrypted_for_patch(
             instance.api_key_encrypted = if api_key.is_empty() {
                 None
             } else {
-                Some(
-                    bamboo_config::encryption::encrypt(api_key).map_err(|e| {
-                        AppError::InternalError(anyhow::anyhow!(
-                            "Failed to encrypt provider instance api_key for '{instance_id}': {e}"
-                        ))
-                    })?,
-                )
+                Some(bamboo_config::encryption::encrypt(api_key).map_err(|e| {
+                    AppError::InternalError(anyhow::anyhow!(
+                        "Failed to encrypt provider instance api_key for '{instance_id}': {e}"
+                    ))
+                })?)
             };
         }
     }

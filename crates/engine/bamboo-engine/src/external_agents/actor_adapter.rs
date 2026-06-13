@@ -147,9 +147,14 @@ impl ActorChildRunner {
             candidate.worker.kill().await;
         }
 
-        let spawned = spawn_worker(&self.worker_bin, &self.worker_args, spec, self.spawn_timeout)
-            .await
-            .map_err(|e| AgentError::LLM(format!("actor spawn/register failed: {e}")))?;
+        let spawned = spawn_worker(
+            &self.worker_bin,
+            &self.worker_args,
+            spec,
+            self.spawn_timeout,
+        )
+        .await
+        .map_err(|e| AgentError::LLM(format!("actor spawn/register failed: {e}")))?;
         let endpoint = spawned.record.endpoint.clone();
         let agent_id = spawned.record.agent_id.clone();
         Ok(PooledActor {
@@ -286,12 +291,16 @@ impl ExternalChildRunner for ActorChildRunner {
                 // The pooled worker may have died between checkout and connect;
                 // retire it and spawn one fresh, once.
                 self.retire_worker(actor).await;
-                let spawned =
-                    spawn_worker(&self.worker_bin, &self.worker_args, &spec, self.spawn_timeout)
-                        .await
-                        .map_err(|e2| {
-                            AgentError::LLM(format!("actor respawn after reuse miss ({e}): {e2}"))
-                        })?;
+                let spawned = spawn_worker(
+                    &self.worker_bin,
+                    &self.worker_args,
+                    &spec,
+                    self.spawn_timeout,
+                )
+                .await
+                .map_err(|e2| {
+                    AgentError::LLM(format!("actor respawn after reuse miss ({e}): {e2}"))
+                })?;
                 let endpoint = spawned.record.endpoint.clone();
                 let agent_id = spawned.record.agent_id.clone();
                 let client = ChildClient::connect(&endpoint)
@@ -461,8 +470,20 @@ mod tests {
     fn fingerprint_matches_interchangeable_children() {
         // Same role/provider/model/workspace and equal tool sets (order-insensitive)
         // are interchangeable on one warm worker — and differ only in child_id.
-        let a = spec_with("explorer", "p", "m", Some("/ws"), Some(vec!["Bash", "Edit"]));
-        let mut b = spec_with("explorer", "p", "m", Some("/ws"), Some(vec!["Edit", "Bash"]));
+        let a = spec_with(
+            "explorer",
+            "p",
+            "m",
+            Some("/ws"),
+            Some(vec!["Bash", "Edit"]),
+        );
+        let mut b = spec_with(
+            "explorer",
+            "p",
+            "m",
+            Some("/ws"),
+            Some(vec!["Edit", "Bash"]),
+        );
         b.identity.child_id = "other".into();
         assert_eq!(
             ActorChildRunner::fingerprint(&a),
@@ -493,7 +514,13 @@ mod tests {
         );
         assert_ne!(
             base_fp,
-            ActorChildRunner::fingerprint(&spec_with("explorer", "p", "m", Some("/ws"), Some(vec!["Bash"])))
+            ActorChildRunner::fingerprint(&spec_with(
+                "explorer",
+                "p",
+                "m",
+                Some("/ws"),
+                Some(vec!["Bash"])
+            ))
         );
     }
 }

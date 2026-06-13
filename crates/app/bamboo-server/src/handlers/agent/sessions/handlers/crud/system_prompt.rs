@@ -11,9 +11,7 @@ pub async fn get_system_prompt_snapshot(
 ) -> Result<HttpResponse> {
     let session_id = path.into_inner();
 
-    let session = {
-        bamboo_engine::read_cached_session(&state.sessions, &session_id)
-    };
+    let session = { bamboo_engine::read_cached_session(&state.sessions, &session_id) };
 
     let session = match session {
         Some(session) => session,
@@ -38,8 +36,10 @@ pub async fn get_system_prompt_snapshot(
 
     let default_prompt =
         bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
-    let snapshot =
-        bamboo_engine::session_app::system_prompt::build_system_prompt_snapshot(&session, &default_prompt);
+    let snapshot = bamboo_engine::session_app::system_prompt::build_system_prompt_snapshot(
+        &session,
+        &default_prompt,
+    );
 
     Ok(HttpResponse::Ok().json(SessionSystemPromptResponse {
         session_id: session_id.to_string(),

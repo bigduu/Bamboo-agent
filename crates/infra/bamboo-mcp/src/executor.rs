@@ -302,10 +302,8 @@ mod tests {
         assert_eq!(mcp_only.tool_guidance().as_deref(), Some("MCP"));
 
         // Neither present → None (no empty section leaks into the prompt).
-        let neither = CompositeToolExecutor::new(
-            Arc::new(GuidanceStub(None)),
-            Arc::new(GuidanceStub(None)),
-        );
+        let neither =
+            CompositeToolExecutor::new(Arc::new(GuidanceStub(None)), Arc::new(GuidanceStub(None)));
         assert!(neither.tool_guidance().is_none());
     }
 

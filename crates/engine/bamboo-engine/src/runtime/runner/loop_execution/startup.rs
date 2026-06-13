@@ -1,4 +1,3 @@
-use bamboo_metrics::MetricsCollector;
 use crate::runtime::config::{AgentLoopConfig, AuxiliaryModelConfig};
 use crate::runtime::gold_evaluation::{AsyncGoldEvaluationRequest, AsyncGoldEvaluationResult};
 use crate::runtime::runner::task_lifecycle::{
@@ -8,6 +7,7 @@ use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::Session;
 use bamboo_domain::{AgentRuntimeState, AgentStatusState};
+use bamboo_metrics::MetricsCollector;
 
 use super::super::logging::DebugLogger;
 use crate::runtime::runner::state_bridge;

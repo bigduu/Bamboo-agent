@@ -184,7 +184,10 @@ pub async fn list() -> Result<(), String> {
     let _ = fab.gc().await;
     let records = fab.discover().await.map_err(|e| format!("discover: {e}"))?;
     if records.is_empty() {
-        println!("no live actors (fabric: {})", default_fabric_dir().display());
+        println!(
+            "no live actors (fabric: {})",
+            default_fabric_dir().display()
+        );
         return Ok(());
     }
     println!("{:<28} {:<12} {:<8} {}", "AGENT", "ROLE", "PID", "ENDPOINT");

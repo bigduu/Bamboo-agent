@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 pub mod auth;
-use bamboo_config::RequestOverridesConfig;
 use crate::provider::{
     LLMError, LLMProvider, LLMRequestOptions, LLMStream, ProviderModelInfo,
     ResponsesRequestOptions, Result,
 };
 use crate::types::LLMChunk;
 use auth::{CopilotAuthHandler, DeviceCodeResponse};
+use bamboo_config::RequestOverridesConfig;
 use bamboo_domain::Message;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;

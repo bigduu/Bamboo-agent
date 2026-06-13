@@ -12,10 +12,6 @@ use chrono::Utc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use bamboo_metrics::{
-    MetricsCollector, RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
-    TokenUsage as MetricsTokenUsage,
-};
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::loop_execution::startup::{
     resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState,
@@ -30,6 +26,10 @@ use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForChildrenState,
 };
 use bamboo_llm::LLMProvider;
+use bamboo_metrics::{
+    MetricsCollector, RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
+    TokenUsage as MetricsTokenUsage,
+};
 
 use super::super::to_event_token_usage;
 use super::gold::{
@@ -1257,15 +1257,15 @@ mod tests {
         maybe_suspend_for_orphaned_children, should_retry_turn_error,
     };
     use crate::runtime::config::AgentLoopConfig;
+    use crate::runtime::runner::state_bridge;
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
     use bamboo_domain::AgentRuntimeState;
+    use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use bamboo_metrics::{
         RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
         TokenUsage as MetricsTokenUsage,
     };
-    use crate::runtime::runner::state_bridge;
-    use bamboo_agent_core::storage::Storage;
-    use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
-    use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use futures::stream;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1959,22 +1959,33 @@ mod tests {
         let mut session = Session::new("parent-orphan", "model");
         let mut runtime_state = AgentRuntimeState::new("parent-orphan");
 
-        let outcome = maybe_suspend_for_orphaned_children(&mut session, &config, &mut runtime_state)
-            .await
-            .expect("must suspend when active children remain");
+        let outcome =
+            maybe_suspend_for_orphaned_children(&mut session, &config, &mut runtime_state)
+                .await
+                .expect("must suspend when active children remain");
         assert!(outcome.should_break && !outcome.sent_complete);
 
         let wait = runtime_state
             .waiting_for_children
             .expect("durable wait registered");
         // Only the non-terminal children, sorted/deduped.
-        assert_eq!(wait.child_session_ids, vec!["c-pend".to_string(), "c-run".to_string()]);
         assert_eq!(
-            session.metadata.get("runtime.suspend_reason").map(String::as_str),
+            wait.child_session_ids,
+            vec!["c-pend".to_string(), "c-run".to_string()]
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get("runtime.suspend_reason")
+                .map(String::as_str),
             Some("waiting_for_children")
         );
         // Persisted so the coordinator can resume it.
-        let persisted = storage.load_session("parent-orphan").await.unwrap().unwrap();
+        let persisted = storage
+            .load_session("parent-orphan")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(persisted
             .agent_runtime_state
             .and_then(|s| s.waiting_for_children)

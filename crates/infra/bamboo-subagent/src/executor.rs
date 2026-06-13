@@ -122,7 +122,10 @@ impl ChildExecutor for EchoExecutor {
         let mut sleep_ms: Option<u64> = None;
         let mut words: Vec<&str> = Vec::new();
         for word in spec.assignment.split_whitespace() {
-            match word.strip_prefix(ECHO_SLEEP_PREFIX).and_then(|n| n.parse::<u64>().ok()) {
+            match word
+                .strip_prefix(ECHO_SLEEP_PREFIX)
+                .and_then(|n| n.parse::<u64>().ok())
+            {
                 Some(ms) if sleep_ms.is_none() => sleep_ms = Some(ms),
                 _ => words.push(word),
             }
@@ -159,7 +162,7 @@ mod tests {
                 RunSpec {
                     assignment: "alpha beta".into(),
                     reasoning_effort: None,
-                messages: Vec::new(),
+                    messages: Vec::new(),
                 },
                 sink,
                 SteerInbox::disconnected(),
@@ -188,7 +191,7 @@ mod tests {
                 RunSpec {
                     assignment: "a b c".into(),
                     reasoning_effort: None,
-                messages: Vec::new(),
+                    messages: Vec::new(),
                 },
                 sink,
                 SteerInbox::disconnected(),

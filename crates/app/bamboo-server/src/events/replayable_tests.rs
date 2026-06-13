@@ -3,10 +3,10 @@
 //! These live in the server crate (not alongside the engine helper) because
 //! they construct a full `AppState` to exercise the trait-based code path.
 
-use bamboo_engine::events::publish_replayable_session_event;
 use crate::app_state::AppState;
 use bamboo_agent_core::AgentEvent;
 use bamboo_agent_core::TitleSource;
+use bamboo_engine::events::publish_replayable_session_event;
 use bamboo_engine::runtime::execution::runner_state::{AgentRunner, AgentStatus};
 use chrono::Utc;
 

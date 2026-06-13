@@ -633,9 +633,7 @@ pub fn normalize_existing_dream_for_prompt(
 // Config helpers
 // ---------------------------------------------------------------------------
 
-pub fn should_use_dream_refine_mode(
-    memory_cfg: &bamboo_config::MemoryConfig,
-) -> bool {
+pub fn should_use_dream_refine_mode(memory_cfg: &bamboo_config::MemoryConfig) -> bool {
     memory_cfg.dream_refine_mode
 }
 
@@ -671,7 +669,6 @@ pub fn parse_last_consolidated_at(note: &str) -> Option<chrono::DateTime<chrono:
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn truncate_chars_reports_truncation() {
@@ -841,5 +838,4 @@ mod tests {
 
     use bamboo_agent_core::storage::Storage;
     use bamboo_llm::{LLMError, LLMStream};
-
 }

@@ -351,7 +351,9 @@ impl SessionStoreV2 {
 
     async fn runtime_json_path(&self, session_id: &str) -> io::Result<Option<PathBuf>> {
         if let Some(rel) = self.resolve_rel_path(session_id).await {
-            Ok(Some(self.abs_path_from_rel(&rel).join(RUNTIME_SIDECAR_FILE)))
+            Ok(Some(
+                self.abs_path_from_rel(&rel).join(RUNTIME_SIDECAR_FILE),
+            ))
         } else {
             Ok(None)
         }
@@ -1000,10 +1002,7 @@ impl Storage for SessionStoreV2 {
         self.write_runtime_sidecar(&abs_dir, session).await
     }
 
-    async fn load_runtime_control_plane(
-        &self,
-        session_id: &str,
-    ) -> io::Result<Option<Session>> {
+    async fn load_runtime_control_plane(&self, session_id: &str) -> io::Result<Option<Session>> {
         validate_session_id(session_id)?;
         // Prefer the sidecar (cheap: no messages). Fall back to a full load for
         // sessions that predate the sidecar (not yet migrated).
@@ -1106,7 +1105,10 @@ mod tests {
         storage.save_session(&s).await?;
 
         let sidecar_path = storage.runtime_json_path("sc-1").await?.unwrap();
-        assert!(sidecar_path.exists(), "save_session must write runtime.json");
+        assert!(
+            sidecar_path.exists(),
+            "save_session must write runtime.json"
+        );
 
         // Sidecar must NOT carry the message history.
         let side = storage.read_runtime_sidecar("sc-1").await?.unwrap();
@@ -1159,7 +1161,10 @@ mod tests {
         storage.save_runtime_state(&s).await?;
 
         let loaded = storage.load_session("sc-3").await?;
-        assert!(loaded.is_some(), "fallback full save must create the session");
+        assert!(
+            loaded.is_some(),
+            "fallback full save must create the session"
+        );
         assert_eq!(loaded.unwrap().messages.len(), 1);
         Ok(())
     }
@@ -1211,7 +1216,10 @@ mod tests {
             assert_eq!(side.agent_runtime_state.as_ref().unwrap().run_id, run);
         }
         // Full load still returns the messages from session.json.
-        assert_eq!(storage.load_session("mig-a").await?.unwrap().messages.len(), 3);
+        assert_eq!(
+            storage.load_session("mig-a").await?.unwrap().messages.len(),
+            3
+        );
 
         // Marker written; a second run is a no-op.
         let marker = bamboo_home.join(RUNTIME_SIDECAR_MIGRATION_MARKER);
@@ -1224,7 +1232,9 @@ mod tests {
     async fn migration_is_idempotent_and_skips_existing_sidecars() -> io::Result<()> {
         let (storage, _t) = create_temp_storage().await?;
         // Fresh save already writes a sidecar — migration must not double-count it.
-        storage.save_session(&session_with_history("mig-c", 2, "run-C")).await?;
+        storage
+            .save_session(&session_with_history("mig-c", 2, "run-C"))
+            .await?;
         let first = storage.migrate_runtime_sidecars().await?;
         assert_eq!(first, 0, "session saved in new format needs no migration");
         // And a re-run remains a no-op.
@@ -1243,13 +1253,10 @@ mod tests {
 
         // Hand-write a legacy session.json containing children.active_ids and
         // remove the sidecar, simulating pre-split on-disk data.
-        let dir = storage.abs_path_from_rel(
-            &storage.resolve_rel_path("mig-legacy").await.unwrap(),
-        );
+        let dir = storage.abs_path_from_rel(&storage.resolve_rel_path("mig-legacy").await.unwrap());
         s.agent_runtime_state = Some(AgentRuntimeState::new("run-L"));
         let mut value = serde_json::to_value(&s).unwrap();
-        value["agent_runtime_state"]["children"]["active_ids"] =
-            serde_json::json!(["ghost-child"]);
+        value["agent_runtime_state"]["children"]["active_ids"] = serde_json::json!(["ghost-child"]);
         tokio::fs::write(
             dir.join("session.json"),
             serde_json::to_vec_pretty(&value).unwrap(),
@@ -1259,10 +1266,9 @@ mod tests {
 
         assert_eq!(storage.migrate_runtime_sidecars().await?, 1);
 
-        let raw_sidecar = tokio::fs::read_to_string(
-            storage.runtime_json_path("mig-legacy").await?.unwrap(),
-        )
-        .await?;
+        let raw_sidecar =
+            tokio::fs::read_to_string(storage.runtime_json_path("mig-legacy").await?.unwrap())
+                .await?;
         assert!(
             !raw_sidecar.contains("ghost-child") && !raw_sidecar.contains("active_ids"),
             "legacy denormalized children must not survive migration: {raw_sidecar}"

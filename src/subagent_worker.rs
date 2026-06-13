@@ -106,7 +106,9 @@ pub async fn run() -> std::result::Result<(), String> {
     // exit on their own if left idle (orphan/idle defense) rather than lingering.
     let serve_result = if spec.reusable {
         let idle = std::time::Duration::from_secs(spec.limits.idle_timeout_secs.unwrap_or(300));
-        server.serve_reusable_with_idle_timeout(executor, idle).await
+        server
+            .serve_reusable_with_idle_timeout(executor, idle)
+            .await
     } else {
         server
             .serve_one_with_accept_timeout(executor, std::time::Duration::from_secs(120))
@@ -288,7 +290,11 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // queue from storage at every round boundary).
         {
             let mut seed = session.clone();
-            let _ = self.agent.persistence().save_runtime_session(&mut seed).await;
+            let _ = self
+                .agent
+                .persistence()
+                .save_runtime_session(&mut seed)
+                .await;
         }
 
         // In-band steering: each ParentFrame::Message lands in the local store's
@@ -303,8 +309,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 // neither be reverted by this write nor revert it.
                 let queued = steer_store
                     .update_runtime_config(&steer_session_id, |latest| {
-                        let mut pending =
-                            latest.pending_injected_messages().unwrap_or_default();
+                        let mut pending = latest.pending_injected_messages().unwrap_or_default();
                         pending.push(serde_json::json!({
                             "content": text,
                             "created_at": chrono::Utc::now(),
@@ -465,9 +470,12 @@ mod tests {
     #[test]
     fn isolated_config_populates_the_provider_slot() {
         let spec = spec_with("anthropic", "sk-test", Some(("anthropic", "claude-test")));
-        let config =
-            build_isolated_config("anthropic", spec.secrets.provider_credentials.first(), &spec)
-                .unwrap();
+        let config = build_isolated_config(
+            "anthropic",
+            spec.secrets.provider_credentials.first(),
+            &spec,
+        )
+        .unwrap();
         assert_eq!(config.provider, "anthropic");
         let slot = config.providers.anthropic.expect("anthropic slot");
         assert_eq!(slot.api_key, "sk-test");

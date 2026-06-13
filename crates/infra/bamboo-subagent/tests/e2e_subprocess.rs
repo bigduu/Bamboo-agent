@@ -43,7 +43,7 @@ async fn spawn_discover_run_stream_terminal() {
         .send(ParentFrame::Run(RunSpec {
             assignment: "hello world".into(),
             reasoning_effort: None,
-                messages: Vec::new(),
+            messages: Vec::new(),
         }))
         .await
         .unwrap();
@@ -115,7 +115,10 @@ async fn reusable_worker_serves_two_sequential_assignments_same_process() {
             .unwrap();
         let mut result = None;
         while let Some(frame) = client.next_frame().await.unwrap() {
-            if let ChildFrame::Terminal { status, result: r, .. } = frame {
+            if let ChildFrame::Terminal {
+                status, result: r, ..
+            } = frame
+            {
                 assert_eq!(status, TerminalStatus::Completed);
                 result = r;
                 break;
@@ -133,11 +136,7 @@ async fn reusable_worker_serves_two_sequential_assignments_same_process() {
 
     // The worker is still alive and registered (renewing its lease) between runs.
     assert!(
-        Fabric::at(&fabric)
-            .resolve("warm")
-            .await
-            .unwrap()
-            .is_some(),
+        Fabric::at(&fabric).resolve("warm").await.unwrap().is_some(),
         "reusable worker should remain registered between runs"
     );
 

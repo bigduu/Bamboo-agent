@@ -64,9 +64,7 @@ async fn selected_skill_ids_for_session(
 ) -> Option<Vec<String>> {
     let session_id = session_id?;
 
-    let in_memory = {
-        bamboo_engine::read_cached_session(&state.sessions, session_id)
-    };
+    let in_memory = { bamboo_engine::read_cached_session(&state.sessions, session_id) };
 
     let session = match in_memory {
         Some(session) => Some(session),
@@ -85,9 +83,7 @@ async fn selected_skill_mode_for_session(
 ) -> Option<String> {
     let session_id = session_id?;
 
-    let in_memory = {
-        bamboo_engine::read_cached_session(&state.sessions, session_id)
-    };
+    let in_memory = { bamboo_engine::read_cached_session(&state.sessions, session_id) };
 
     let session = match in_memory {
         Some(session) => Some(session),

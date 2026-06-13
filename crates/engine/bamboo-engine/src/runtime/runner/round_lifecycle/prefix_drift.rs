@@ -299,18 +299,30 @@ fn write_session_snapshot(dir: &Path, obs_round: usize, session: &Session) {
 fn write_json<T: serde::Serialize>(path: &Path, value: &T) {
     if let Some(parent) = path.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
-            tracing::debug!("prefix-cache drift: mkdir {} failed: {}", parent.display(), err);
+            tracing::debug!(
+                "prefix-cache drift: mkdir {} failed: {}",
+                parent.display(),
+                err
+            );
             return;
         }
     }
     match serde_json::to_vec_pretty(value) {
         Ok(bytes) => {
             if let Err(err) = std::fs::write(path, bytes) {
-                tracing::debug!("prefix-cache drift: write {} failed: {}", path.display(), err);
+                tracing::debug!(
+                    "prefix-cache drift: write {} failed: {}",
+                    path.display(),
+                    err
+                );
             }
         }
         Err(err) => {
-            tracing::debug!("prefix-cache drift: serialize {} failed: {}", path.display(), err);
+            tracing::debug!(
+                "prefix-cache drift: serialize {} failed: {}",
+                path.display(),
+                err
+            );
         }
     }
 }
@@ -353,7 +365,10 @@ mod tests {
         record_prefix_drift(
             &mut session,
             Some(&dir),
-            &[section("base", "BASE"), section("tool_guide", "long guide text")],
+            &[
+                section("base", "BASE"),
+                section("tool_guide", "long guide text"),
+            ],
         );
         // tool_guide shrinks.
         record_prefix_drift(

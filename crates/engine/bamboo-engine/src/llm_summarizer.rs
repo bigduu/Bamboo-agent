@@ -20,7 +20,6 @@ use bamboo_domain::{
 use bamboo_llm::LLMChunk;
 use bamboo_llm::{LLMProvider, LLMRequestOptions};
 
-
 /// Mode controlling how the LLM summarizer handles existing summaries.
 #[derive(Debug, Clone, Default)]
 pub enum SummaryMode {
@@ -262,10 +261,9 @@ Guidelines:
                     if !content.is_empty() {
                         break;
                     }
-                    return Err(bamboo_compression::types::BudgetError::TokenCountError(format!(
-                        "LLM summarization stream failed: {}",
-                        e
-                    )));
+                    return Err(bamboo_compression::types::BudgetError::TokenCountError(
+                        format!("LLM summarization stream failed: {}", e),
+                    ));
                 }
             }
         }
@@ -286,7 +284,10 @@ impl std::fmt::Debug for LlmSummarizer {
 
 #[async_trait]
 impl Summarizer for LlmSummarizer {
-    async fn summarize(&self, messages: &[Message]) -> Result<String, bamboo_compression::types::BudgetError> {
+    async fn summarize(
+        &self,
+        messages: &[Message],
+    ) -> Result<String, bamboo_compression::types::BudgetError> {
         if messages.is_empty() {
             return Ok("No conversation history to summarize.".to_string());
         }
@@ -326,7 +327,6 @@ impl Summarizer for LlmSummarizer {
         (message_count * 80).min(2000) as u32
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -620,5 +620,4 @@ mod tests {
             "IncrementalMerge user prompt should include the actual summary text"
         );
     }
-
 }

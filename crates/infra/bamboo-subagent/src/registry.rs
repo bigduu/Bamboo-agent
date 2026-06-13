@@ -96,7 +96,12 @@ impl Registry {
     }
 
     /// Deregister: drop from the table and write the final status into the index.
-    pub async fn deregister(&self, child_id: &str, final_status: ChildStatus, now: DateTime<Utc>) -> Result<()> {
+    pub async fn deregister(
+        &self,
+        child_id: &str,
+        final_status: ChildStatus,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
         let reg = self.table.lock().unwrap().remove(child_id);
         if let Some(mut reg) = reg {
             reg.status = final_status;
@@ -184,7 +189,12 @@ mod tests {
         let children = reg.store.list_children(&reg.key, "p1").await.unwrap();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].child_id, "c1");
-        assert!(reg.store.resolve_child(&reg.key, "c1").await.unwrap().is_some());
+        assert!(reg
+            .store
+            .resolve_child(&reg.key, "c1")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -193,12 +203,16 @@ mod tests {
         let now = Utc::now();
         reg.register(reg_input("c1"), now).await.unwrap();
 
-        reg.heartbeat("c1", Some(ChildStatus::Idle), now).await.unwrap();
+        reg.heartbeat("c1", Some(ChildStatus::Idle), now)
+            .await
+            .unwrap();
         assert_eq!(reg.get("c1").unwrap().status, ChildStatus::Idle);
 
-        reg.deregister("c1", ChildStatus::Completed, now).await.unwrap();
+        reg.deregister("c1", ChildStatus::Completed, now)
+            .await
+            .unwrap();
         assert!(reg.get("c1").is_none()); // out of the live table
-        // final status persisted in the index
+                                          // final status persisted in the index
         let children = reg.store.list_children(&reg.key, "p1").await.unwrap();
         assert_eq!(children[0].status, ChildStatus::Completed);
     }

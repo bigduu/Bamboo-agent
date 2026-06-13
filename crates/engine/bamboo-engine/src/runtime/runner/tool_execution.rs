@@ -5,13 +5,13 @@ use std::sync::Arc;
 use futures::future::join_all;
 use tokio::sync::mpsc;
 
-use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_config::PermissionMode;
 use bamboo_llm::LLMProvider;
+use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 
 fn build_context_pressure(session: &Session) -> Option<output_compressor::ContextPressure> {
     let usage = session.token_usage.as_ref()?;

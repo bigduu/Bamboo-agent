@@ -37,8 +37,8 @@ pub use provision::{
     SecretsEnvelope, PROVISION_VERSION,
 };
 pub use registry::{RegisterChild, Registration, Registry};
-pub use transport::{ChildClient, TransportError, TransportResult, WsServer};
 pub use store::{
     ChildEntry, ChildFields, ChildStatus, ChildrenIndex, MetaExtractor, ProjectIndex, ProjectKey,
     RootEntry, RootFields, SessionLoc, SubagentStore,
 };
+pub use transport::{ChildClient, TransportError, TransportResult, WsServer};

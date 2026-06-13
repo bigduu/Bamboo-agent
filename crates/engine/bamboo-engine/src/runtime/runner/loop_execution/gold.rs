@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use bamboo_metrics::RoundStatus as MetricsRoundStatus;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::gold_evaluation::{
     apply_gold_evaluation_result, build_async_gold_evaluation_request, evaluate_gold,
@@ -13,6 +12,7 @@ use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::{AgentError, AgentEvent, GoldCheckpoint, GoldDecision, Message, Session};
 use bamboo_domain::ReasoningEffort;
 use bamboo_llm::LLMProvider;
+use bamboo_metrics::RoundStatus as MetricsRoundStatus;
 
 /// Metadata key tracking how many autonomous Gold continuations have run.
 const GOLD_AUTO_CONTINUE_COUNT_KEY: &str = "gold.auto_continue_count";

@@ -193,9 +193,7 @@ mod tests {
         state.save_and_cache_session(&mut session).await;
 
         // Verify memory cache.
-        let cached = {
-            bamboo_engine::read_cached_session(&state.sessions, session_id)
-        };
+        let cached = { bamboo_engine::read_cached_session(&state.sessions, session_id) };
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().title, "test-title");
 

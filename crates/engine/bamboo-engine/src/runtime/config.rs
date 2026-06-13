@@ -2,19 +2,19 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bamboo_metrics::MetricsCollector;
-use bamboo_skills::SkillManager;
 use bamboo_agent_core::composition::CompositionExecutor;
 use bamboo_agent_core::storage::AttachmentReader;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::GoldConfidence;
 use bamboo_compression::TokenBudget;
+use bamboo_config::MemoryConfig;
+use bamboo_config::PermissionMode;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::RuntimeSessionPersistence;
-use bamboo_config::PermissionMode;
 use bamboo_llm::LLMProvider;
-use bamboo_config::MemoryConfig;
+use bamboo_metrics::MetricsCollector;
+use bamboo_skills::SkillManager;
 use bamboo_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
 

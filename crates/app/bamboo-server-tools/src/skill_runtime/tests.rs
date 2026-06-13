@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use bamboo_skills::{SkillManager, SkillStoreConfig};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolExecutionContext};
 use bamboo_agent_core::Session;
 use bamboo_llm::Config;
+use bamboo_skills::{SkillManager, SkillStoreConfig};
 
 #[test]
 fn parse_loaded_skill_ids_supports_json_and_csv() {
@@ -111,9 +111,7 @@ Use this demo skill."#,
         .await
         .expect("session should be saved");
 
-    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(
-        storage.clone(),
-    ));
+    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
 
     let tool = LoadSkillTool::new(
         skill_manager,
@@ -171,14 +169,16 @@ Use this demo skill."#,
         .save_session(&session)
         .await
         .expect("session should be saved");
-    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(
-        storage.clone(),
-    ));
+    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
 
     let tool = LoadSkillTool::new(
         skill_manager,
         config,
-        bamboo_engine::SessionRepository::new(sessions.clone(), storage.clone(), persistence.clone()),
+        bamboo_engine::SessionRepository::new(
+            sessions.clone(),
+            storage.clone(),
+            persistence.clone(),
+        ),
     );
     let ctx = ToolExecutionContext {
         session_id: Some(session_id),
@@ -241,9 +241,7 @@ Use this demo skill."#,
         .save_session(&session)
         .await
         .expect("session should be saved");
-    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(
-        storage.clone(),
-    ));
+    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
 
     let session_repo =
         bamboo_engine::SessionRepository::new(sessions, storage.clone(), persistence);

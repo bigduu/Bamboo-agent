@@ -56,7 +56,11 @@ impl Fabric {
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(out),
             Err(e) => return Err(StoreError::io(&self.dir, e)),
         };
-        while let Some(ent) = rd.next_entry().await.map_err(|e| StoreError::io(&self.dir, e))? {
+        while let Some(ent) = rd
+            .next_entry()
+            .await
+            .map_err(|e| StoreError::io(&self.dir, e))?
+        {
             let fname = ent.file_name().to_string_lossy().into_owned();
             if fname.starts_with('.') || !fname.ends_with(".json") {
                 continue;
@@ -88,7 +92,11 @@ impl Fabric {
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(StoreError::io(&self.dir, e)),
         };
-        while let Some(ent) = rd.next_entry().await.map_err(|e| StoreError::io(&self.dir, e))? {
+        while let Some(ent) = rd
+            .next_entry()
+            .await
+            .map_err(|e| StoreError::io(&self.dir, e))?
+        {
             let fname = ent.file_name().to_string_lossy().into_owned();
             if fname.starts_with('.') || !fname.ends_with(".json") {
                 continue;
@@ -140,11 +148,18 @@ mod tests {
         let d = TempDir::new().unwrap();
         let fab = Fabric::at(d.path());
         let now = Utc::now();
-        fab.publish(&rec("a", now + Duration::seconds(30))).await.unwrap();
-        fab.publish(&rec("b", now + Duration::seconds(30))).await.unwrap();
+        fab.publish(&rec("a", now + Duration::seconds(30)))
+            .await
+            .unwrap();
+        fab.publish(&rec("b", now + Duration::seconds(30)))
+            .await
+            .unwrap();
 
         let live = fab.discover_as_of(now).await.unwrap();
-        assert_eq!(live.iter().map(|r| r.agent_id.clone()).collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(
+            live.iter().map(|r| r.agent_id.clone()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
         assert!(fab.resolve("a").await.unwrap().is_some());
 
         fab.withdraw("a").await.unwrap();
@@ -158,8 +173,12 @@ mod tests {
         let d = TempDir::new().unwrap();
         let fab = Fabric::at(d.path());
         let now = Utc::now();
-        fab.publish(&rec("fresh", now + Duration::seconds(30))).await.unwrap();
-        fab.publish(&rec("stale", now - Duration::seconds(1))).await.unwrap();
+        fab.publish(&rec("fresh", now + Duration::seconds(30)))
+            .await
+            .unwrap();
+        fab.publish(&rec("stale", now - Duration::seconds(1)))
+            .await
+            .unwrap();
 
         let live = fab.discover_as_of(now).await.unwrap();
         assert_eq!(live.len(), 1);

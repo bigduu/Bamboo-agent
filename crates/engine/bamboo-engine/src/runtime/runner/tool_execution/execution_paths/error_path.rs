@@ -1,8 +1,8 @@
 use tokio::sync::mpsc;
 
-use bamboo_metrics::MetricsCollector;
 use bamboo_agent_core::tools::ToolCall;
 use bamboo_agent_core::{AgentEvent, Message, Session};
+use bamboo_metrics::MetricsCollector;
 
 use super::super::events;
 use super::super::loop_state::RoundExecutionState;

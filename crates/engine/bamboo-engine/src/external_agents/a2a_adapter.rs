@@ -1,8 +1,7 @@
 use std::time::Duration;
 
-use async_trait::async_trait;
-use bamboo_agent_core::{AgentError, AgentEvent, Role, TokenUsage};
 use crate::runtime::execution::{ExternalChildRunner, SpawnJob};
+use async_trait::async_trait;
 use bamboo_a2a::types::{
     A2ARole, CancelTaskRequest, GetTaskRequest, Message, Part, PartContentWire,
     SendMessageConfiguration, SendMessageRequest,
@@ -10,6 +9,7 @@ use bamboo_a2a::types::{
 use bamboo_a2a::{
     validate_agent_card_for_jsonrpc_mvp, A2AAuth, A2AClient, A2AClientConfig, A2AJsonRpcClient,
 };
+use bamboo_agent_core::{AgentError, AgentEvent, Role, TokenUsage};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -409,8 +409,7 @@ async fn recover_task_state(
     client: &A2AJsonRpcClient,
     task_id: &str,
     tenant: Option<String>,
-) -> bamboo_a2a::A2AClientResult<bamboo_a2a::types::StreamResponse>
-{
+) -> bamboo_a2a::A2AClientResult<bamboo_a2a::types::StreamResponse> {
     let task = client
         .get_task(GetTaskRequest {
             tenant,

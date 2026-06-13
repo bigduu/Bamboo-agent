@@ -1,11 +1,11 @@
 use crate::{app_state::AppState, error::AppError};
 use actix_web::{web, HttpResponse};
-use bamboo_metrics::types::ForwardStatus;
 use bamboo_llm::api::models::{
     ChatCompletionResponse, ChatMessage, Content, FunctionCall, ResponseChoice, Role, ToolCall,
     Usage,
 };
 use bamboo_llm::LLMRequestOptions;
+use bamboo_metrics::types::ForwardStatus;
 
 use super::PreparedCompleteRequest;
 use crate::handlers::anthropic::conversion::convert_complete_response;

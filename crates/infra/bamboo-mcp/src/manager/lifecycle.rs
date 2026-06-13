@@ -150,9 +150,8 @@ impl McpServerManager {
             // RESULT well within request_timeout_ms, so it never trips a protocol
             // timeout) would fail forever without ever being recycled.
             Ok(result) if result.is_error => {
-                let synthetic = McpError::ToolExecution(format!(
-                    "tool '{tool_name}' returned an error result"
-                ));
+                let synthetic =
+                    McpError::ToolExecution(format!("tool '{tool_name}' returned an error result"));
                 let should_recycle = runtime
                     .qos
                     .record_failure(server_id, tool_name, &synthetic)

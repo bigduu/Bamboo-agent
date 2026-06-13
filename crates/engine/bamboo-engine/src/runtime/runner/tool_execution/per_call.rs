@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use bamboo_metrics::MetricsCollector;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{
     parse_tool_args_best_effort, ToolCall, ToolExecutionContext, ToolExecutor, ToolResult,
 };
 use bamboo_agent_core::{AgentEvent, Session};
+use bamboo_metrics::MetricsCollector;
 
 use super::execution_paths;
 use super::loop_state::RoundExecutionState;

@@ -20,8 +20,8 @@ pub use session_repository::SessionRepository;
 pub mod title_gen;
 
 pub use app_context::AgentSessionContext;
-pub use session_app::child_completion_coordinator::ChildCompletionCoordinator;
 pub use runtime::execution::agent_spawn::{read_cached_session, SessionCache};
+pub use session_app::child_completion_coordinator::ChildCompletionCoordinator;
 
 // Re-export commonly used types from agent (via dependency)
 pub use bamboo_agent_core::{

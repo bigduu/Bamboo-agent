@@ -13,15 +13,15 @@ use tokio::time::{sleep, Duration, Instant};
 
 use crate::app_state::session_events::get_or_create_event_sender;
 use crate::app_state::{AgentRunner, AgentStatus};
-use bamboo_engine::session_app::child_session::{
-    ChildRunnerInfo, ChildSessionEntry, ChildSessionError, ChildSessionPort, DeleteChildResult,
-    SubagentResolutionPort,
-};
-use bamboo_engine::execution::spawn::{SpawnJob, SpawnScheduler};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::{AgentEvent, Session, SessionKind};
 use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, ChildWaitPolicy, WaitingForChildrenState,
+};
+use bamboo_engine::execution::spawn::{SpawnJob, SpawnScheduler};
+use bamboo_engine::session_app::child_session::{
+    ChildRunnerInfo, ChildSessionEntry, ChildSessionError, ChildSessionPort, DeleteChildResult,
+    SubagentResolutionPort,
 };
 use bamboo_llm::Config;
 use bamboo_storage::{LockedSessionStore, SessionIndexEntry, SessionStoreV2};
@@ -225,11 +225,7 @@ impl ChildSessionAdapter {
             .await
             .unwrap_or_default()
             .into_iter()
-            .filter(|(_, status)| {
-                !status
-                    .as_deref()
-                    .is_some_and(is_terminal_child_status)
-            })
+            .filter(|(_, status)| !status.as_deref().is_some_and(is_terminal_child_status))
             .map(|(id, _)| id)
             .collect()
     }
@@ -273,7 +269,11 @@ impl ChildSessionAdapter {
         // An explicit wait re-asserts the policy on any pre-existing wait state.
         wait.wait_for = policy;
         for (child_session_id, tool_call_id) in batch {
-            if !wait.child_session_ids.iter().any(|id| id == child_session_id) {
+            if !wait
+                .child_session_ids
+                .iter()
+                .any(|id| id == child_session_id)
+            {
                 wait.child_session_ids.push(child_session_id.clone());
             }
             if wait.registered_by_tool_call_id.is_none() {

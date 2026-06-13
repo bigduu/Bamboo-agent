@@ -76,18 +76,16 @@ impl MainstreamServerRequest {
         let reconnect = self.reconnect.unwrap_or_default();
 
         let transport = match (self.command, self.url) {
-            (Some(command), None) => {
-                bamboo_mcp::TransportConfig::Stdio(bamboo_mcp::StdioConfig {
-                    command,
-                    args: self.args,
-                    cwd: self.cwd,
-                    env: self.env,
-                    env_encrypted: self.env_encrypted,
-                    startup_timeout_ms: self
-                        .startup_timeout_ms
-                        .unwrap_or(bamboo_mcp::config::default_startup_timeout()),
-                })
-            }
+            (Some(command), None) => bamboo_mcp::TransportConfig::Stdio(bamboo_mcp::StdioConfig {
+                command,
+                args: self.args,
+                cwd: self.cwd,
+                env: self.env,
+                env_encrypted: self.env_encrypted,
+                startup_timeout_ms: self
+                    .startup_timeout_ms
+                    .unwrap_or(bamboo_mcp::config::default_startup_timeout()),
+            }),
             (None, Some(url)) => bamboo_mcp::TransportConfig::Sse(bamboo_mcp::SseConfig {
                 url,
                 headers: self.headers,

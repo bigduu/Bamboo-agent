@@ -5,8 +5,8 @@ use actix_web::{web, HttpResponse, Result};
 use crate::app_state::AppState;
 use bamboo_agent_core::Session;
 use bamboo_engine::auto_dream::{run_project_auto_dream_once, AutoDreamContext};
-use bamboo_storage::{CleanupMode, CleanupResult};
 use bamboo_memory::memory_store::MemoryStore;
+use bamboo_storage::{CleanupMode, CleanupResult};
 use bamboo_tools::tools::workspace_state;
 
 use super::super::types::CleanupRequest;
@@ -51,9 +51,7 @@ async fn load_session_from_state_or_storage(
     state: &AppState,
     session_id: &str,
 ) -> Result<Option<Session>> {
-    let in_memory = {
-        bamboo_engine::read_cached_session(&state.sessions, session_id)
-    };
+    let in_memory = { bamboo_engine::read_cached_session(&state.sessions, session_id) };
     if in_memory.is_some() {
         return Ok(in_memory);
     }

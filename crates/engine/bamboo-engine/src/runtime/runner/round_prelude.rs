@@ -5,12 +5,12 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use bamboo_metrics::MetricsCollector;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentError, Role, Session};
 use bamboo_llm::LLMProvider;
+use bamboo_metrics::MetricsCollector;
 
 use super::prompt_context::{
     inject_external_memory_into_system_message, inject_goal_into_system_message,

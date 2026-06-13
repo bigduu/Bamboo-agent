@@ -14,10 +14,10 @@ use crate::handlers::agent::metrics::core_handlers::filters::{
 };
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::PromptMemoryObservability;
-use bamboo_storage::SessionStoreV2;
 use bamboo_memory::memory_store::{
     DurableMemoryDocument, MemoryInspectResult, MemoryScope, MemoryStore,
 };
+use bamboo_storage::SessionStoreV2;
 
 fn merge_breakdown(target: &mut BTreeMap<String, u64>, source: &BTreeMap<String, usize>) {
     for (label, count) in source {
@@ -487,8 +487,8 @@ mod tests {
     use tempfile::tempdir;
 
     use bamboo_agent_core::storage::Storage;
-    use bamboo_storage::SessionStoreV2;
     use bamboo_memory::memory_store::DurableMemoryType;
+    use bamboo_storage::SessionStoreV2;
 
     async fn create_session_storage(
         dir: &std::path::Path,

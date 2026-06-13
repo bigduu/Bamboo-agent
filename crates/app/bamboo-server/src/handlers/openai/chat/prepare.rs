@@ -4,10 +4,10 @@ use crate::{app_state::AppState, error::AppError};
 use bamboo_llm::api::models::ChatCompletionRequest;
 
 use super::PreparedChatRequest;
-use crate::handlers::openai::{
-    helpers::{convert_messages, convert_tools, parse_parallel_tool_calls, parse_reasoning_effort},
-};
 use crate::handlers::llm_compat::usage::estimate_prompt_tokens;
+use crate::handlers::openai::helpers::{
+    convert_messages, convert_tools, parse_parallel_tool_calls, parse_reasoning_effort,
+};
 
 pub(super) async fn prepare_chat_request(
     app_state: &web::Data<AppState>,
