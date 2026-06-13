@@ -1,0 +1,24 @@
+[package]
+name = "bamboo-broker"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "Standalone network message broker for sub-agent ask/reply: durable Mailbox queues fronted by a WebSocket bus"
+license = "MIT"
+
+[dependencies]
+bamboo-subagent = { path = "../../infra/bamboo-subagent" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+tracing = "0.1"
+async-trait = "0.1"
+futures-util = "0.3"
+tokio = { version = "1", features = ["fs", "io-util", "rt", "rt-multi-thread", "sync", "macros", "net", "time"] }
+tokio-util = "0.7"
+tokio-tungstenite = "0.24"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
+tempfile = "3"

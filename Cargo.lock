@@ -550,6 +550,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bamboo-broker"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "bamboo-subagent",
+ "chrono",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "bamboo-cli"
 version = "0.0.0"
 dependencies = [

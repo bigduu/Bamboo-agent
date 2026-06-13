@@ -27,6 +27,7 @@ members = [
     "crates/app/bamboo-cli",
     "crates/app/bamboo-tui",
     "crates/app/bamboo-client-core",
+    "crates/app/bamboo-broker",
 ]
 resolver = "2"
 
