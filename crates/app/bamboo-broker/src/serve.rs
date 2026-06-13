@@ -99,6 +99,97 @@ where
     .await
 }
 
+/// Serve an agent backed by any [`ChildExecutor`] over the broker. This is the
+/// production worker: for each inbound `Ask`, it runs the executor with the
+/// question over the agent's accumulated context and replies with the result.
+///
+/// The two ask modes (per `docs/ask-agent-design.md`):
+/// - [`AskMode::Query`] — summarize/extract: runs over a *copy* of the current
+///   context; the exchange is NOT persisted, so the agent's ongoing state is
+///   untouched.
+/// - [`AskMode::Steer`] — insert into the conversation / redirect the goal: the
+///   question + answer are appended to the agent's context, changing what it
+///   carries forward.
+///
+/// A `Task` is treated as a steer (it advances the agent's work). Works with the
+/// real `BambooRuntime` executor in production and with `EchoExecutor` (no LLM)
+/// for deterministic tests.
+pub async fn serve_executor<E>(
+    endpoint: &str,
+    me: AgentRef,
+    token: &str,
+    executor: Arc<E>,
+) -> BrokerResult<()>
+where
+    E: bamboo_subagent::ChildExecutor,
+{
+    let context: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    serve_mailbox(endpoint, me, token, move |msg| {
+        let executor = Arc::clone(&executor);
+        let context = Arc::clone(&context);
+        async move { handle_with_executor(executor.as_ref(), &context, msg).await }
+    })
+    .await
+}
+
+/// Answer one inbound message by running `executor`, applying query/steer
+/// context semantics. Pulled out so the policy is unit-testable.
+async fn handle_with_executor<E>(
+    executor: &E,
+    context: &tokio::sync::Mutex<Vec<serde_json::Value>>,
+    msg: InboxMessage,
+) -> Handled
+where
+    E: bamboo_subagent::ChildExecutor,
+{
+    use bamboo_subagent::{AskBody, AskMode, EventSink, RunSpec, SteerInbox};
+
+    // Resolve (question, persist?) from the message kind.
+    let (question, persist) = match msg.kind {
+        InboxKind::Ask => match serde_json::from_value::<AskBody>(msg.body) {
+            Ok(b) => (b.question, matches!(b.mode, AskMode::Steer)),
+            Err(_) => return Handled::Ack, // malformed Ask: drop without reply
+        },
+        InboxKind::Task => (
+            msg.body
+                .get("assignment")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            true,
+        ),
+        // Replies / handoffs are not answered by this loop.
+        _ => return Handled::Ack,
+    };
+
+    let prior = context.lock().await.clone();
+    let (sink, _discard) = EventSink::channel();
+    let outcome = executor
+        .run(
+            RunSpec {
+                assignment: question.clone(),
+                reasoning_effort: None,
+                messages: prior,
+            },
+            sink,
+            SteerInbox::disconnected(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    let answer = outcome
+        .result
+        .or(outcome.error)
+        .unwrap_or_else(|| "(no result)".to_string());
+
+    if persist {
+        let mut ctx = context.lock().await;
+        ctx.push(serde_json::json!({ "role": "user", "content": question }));
+        ctx.push(serde_json::json!({ "role": "assistant", "content": answer }));
+    }
+    Handled::Reply(answer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +278,111 @@ mod tests {
         assert_eq!(reply.correlation_id, Some(qid));
         let body: ReplyBody = serde_json::from_value(reply.body).unwrap();
         assert_eq!(body.answer, "echo: are you up?");
+    }
+
+    /// Executor that reports how many prior context messages it received — lets
+    /// us prove query (read-only) vs steer (persist) deterministically, no LLM.
+    struct ContextReporter;
+    #[async_trait::async_trait]
+    impl bamboo_subagent::ChildExecutor for ContextReporter {
+        async fn run(
+            &self,
+            spec: bamboo_subagent::RunSpec,
+            _events: bamboo_subagent::EventSink,
+            _steer: bamboo_subagent::SteerInbox,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> bamboo_subagent::ChildOutcome {
+            bamboo_subagent::ChildOutcome::completed(format!("ctx={}", spec.messages.len()))
+        }
+    }
+
+    async fn ask_mode(orch: &mut BrokerClient, to: &str, q: &str, mode: AskMode) -> String {
+        let msg = InboxMessage {
+            id: MsgId::new(),
+            from: AgentRef {
+                session_id: "orch2".into(),
+                role: None,
+            },
+            kind: InboxKind::Ask,
+            body: serde_json::to_value(AskBody {
+                question: q.into(),
+                mode,
+            })
+            .unwrap(),
+            created_at: Utc::now(),
+            correlation_id: None,
+        };
+        let qid = msg.id.clone();
+        orch.deliver(to, msg).await.unwrap();
+        loop {
+            let r = tokio::time::timeout(Duration::from_secs(5), orch.next_message())
+                .await
+                .expect("reply within timeout")
+                .expect("reply present");
+            if r.correlation_id == Some(qid.clone()) {
+                return serde_json::from_value::<ReplyBody>(r.body).unwrap().answer;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn query_is_read_only_steer_persists_context() {
+        let (endpoint, _dir) = start().await;
+
+        // A real serve_executor agent backed by the deterministic ContextReporter.
+        let worker_ep = endpoint.clone();
+        tokio::spawn(async move {
+            let _ = serve_executor(
+                &worker_ep,
+                AgentRef {
+                    session_id: "agent".into(),
+                    role: None,
+                },
+                TOKEN,
+                Arc::new(ContextReporter),
+            )
+            .await;
+        });
+
+        let mut orch = BrokerClient::connect(
+            &endpoint,
+            AgentRef {
+                session_id: "orch2".into(),
+                role: None,
+            },
+            TOKEN,
+        )
+        .await
+        .unwrap();
+        orch.subscribe().await.unwrap();
+
+        // query never persists: context stays empty across queries.
+        assert_eq!(
+            ask_mode(&mut orch, "agent", "q1", AskMode::Query).await,
+            "ctx=0"
+        );
+        assert_eq!(
+            ask_mode(&mut orch, "agent", "q2", AskMode::Query).await,
+            "ctx=0"
+        );
+        // steer runs over the (still empty) context, then persists user+assistant.
+        assert_eq!(
+            ask_mode(&mut orch, "agent", "s1", AskMode::Steer).await,
+            "ctx=0"
+        );
+        // a later query now sees the 2 persisted messages.
+        assert_eq!(
+            ask_mode(&mut orch, "agent", "q3", AskMode::Query).await,
+            "ctx=2"
+        );
+        // a second steer sees 2 then persists 2 more; the next query sees 4.
+        assert_eq!(
+            ask_mode(&mut orch, "agent", "s2", AskMode::Steer).await,
+            "ctx=2"
+        );
+        assert_eq!(
+            ask_mode(&mut orch, "agent", "q4", AskMode::Query).await,
+            "ctx=4"
+        );
     }
 }

@@ -28,5 +28,5 @@ pub use crate::client::BrokerClient;
 pub use crate::core::BrokerCore;
 pub use crate::error::{BrokerError, BrokerResult};
 pub use crate::proto::{BrokerFrame, ClientFrame};
-pub use crate::serve::{serve_loop, serve_mailbox, serve_with, Handled};
+pub use crate::serve::{serve_executor, serve_loop, serve_mailbox, serve_with, Handled};
 pub use crate::server::BrokerServer;
