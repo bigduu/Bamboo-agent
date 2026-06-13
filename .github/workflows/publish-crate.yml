@@ -286,17 +286,19 @@ jobs:
             wait_for_crate "${crate}" "${TARGET_VERSION}"
           }
 
-          crates=(
-            bamboo-domain
-            bamboo-infrastructure
-            bamboo-agent-core
-            bamboo-compression
-            bamboo-memory
-            bamboo-tools
-            bamboo-engine
-            bamboo-server
-            bamboo-agent
-          )
+          # Publish order is derived from the real dependency graph
+          # (scripts/compute-publish-order.py via `cargo metadata`), NOT a
+          # hand-maintained list. The old hand-list had drifted to 9 crates while
+          # the workspace grew to 20 in bamboo-agent's closure — so deps like
+          # bamboo-config were never published and dependents failed with
+          # "no matching package". Computing it keeps publish in lock-step.
+          mapfile -t crates < <(python3 scripts/compute-publish-order.py)
+
+          if [ "${#crates[@]}" -eq 0 ]; then
+            echo "Computed an empty publish order; aborting."
+            exit 1
+          fi
+          echo "Publish order (${#crates[@]} crates): ${crates[*]}"
 
           for crate in "${crates[@]}"; do
             publish_one "${crate}"
