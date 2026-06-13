@@ -1,6 +1,6 @@
 [package]
 name = "bamboo-mcp"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 rust-version.workspace = true
 description = "Model Context Protocol (MCP) client — protocol, transports, executor, manager — for the Bamboo agent framework"

@@ -1,6 +1,6 @@
 [package]
 name = "bamboo-compression"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 rust-version.workspace = true
 description = "Compression utilities for Bamboo sessions and memory workflows"

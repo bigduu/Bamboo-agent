@@ -1,6 +1,6 @@
 [package]
 name = "bamboo-metrics"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 rust-version.workspace = true
 description = "Live metrics pipeline (bus, collector, worker, aggregation) for the Bamboo agent framework"

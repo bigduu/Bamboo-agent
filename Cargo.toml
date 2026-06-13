@@ -31,6 +31,10 @@ members = [
 resolver = "2"
 
 [workspace.package]
+# Single source of truth for every crate's version. The release-train rewrites
+# this one line to the unified release version; all members inherit via
+# `version.workspace = true`. Do NOT hardcode versions in member crates.
+version = "2026.6.5"
 rust-version = "1.84"
 
 [workspace.dependencies]
@@ -42,7 +46,7 @@ thiserror = "1"
 
 [package]
 name = "bamboo-agent"
-version = "2026.6.5"
+version.workspace = true
 edition = "2021"
 rust-version = "1.84"
 license = "MIT"

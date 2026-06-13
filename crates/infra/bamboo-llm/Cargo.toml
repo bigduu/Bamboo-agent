@@ -1,6 +1,6 @@
 [package]
 name = "bamboo-llm"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 rust-version.workspace = true
 description = "LLM provider layer (providers, protocol adapters, streaming, routing, model catalog) for the Bamboo agent framework"

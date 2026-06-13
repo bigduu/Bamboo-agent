@@ -76,7 +76,10 @@ jobs:
 
           root = Path(".")
           target_version = os.environ["TARGET_VERSION"]
-          manifest_paths = [root / "Cargo.toml", *sorted((root / "crates").glob("*/Cargo.toml"))]
+          # crates live at crates/<category>/<crate>/Cargo.toml (two levels deep);
+          # the previous single-level glob matched nothing, so sub-crate manifests
+          # were never processed (path deps weren't versioned for publish).
+          manifest_paths = [root / "Cargo.toml", *sorted((root / "crates").glob("*/*/Cargo.toml"))]
 
           workspace_crates = {}
           for path in manifest_paths:
