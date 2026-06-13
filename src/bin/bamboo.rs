@@ -50,6 +50,46 @@ struct Cli {
     stream_json: bool,
 }
 
+/// Spawn the sidecar orphan guard: a dedicated OS thread that exits the process
+/// when the shell that spawned us goes away.
+///
+/// The primary signal is `getppid()`: when our parent terminates — even via
+/// SIGKILL / force-quit, even while it lingers as an unreaped zombie — the
+/// kernel reparents us to init/launchd *at the moment of termination*, so
+/// `getppid()` changes. That is reap-independent, unlike `kill(pid, 0)` (which
+/// still reports a zombie as alive). The recorded shell PID fully disappearing
+/// is kept as a secondary trigger.
+#[cfg(unix)]
+fn spawn_orphan_guard(shell_pid: u32) {
+    std::thread::spawn(move || {
+        let initial_parent = unsafe { libc::getppid() };
+        loop {
+            let current_parent = unsafe { libc::getppid() };
+            // Reparented away from our original parent (it terminated → the kernel
+            // handed us to init/launchd). This is immediate at the parent's exit and
+            // independent of when its zombie is reaped — unlike `kill(pid, 0)`, which
+            // still reports a not-yet-reaped zombie as alive. The shell PID fully
+            // disappearing is kept as a secondary trigger.
+            let reparented = current_parent != initial_parent || current_parent <= 1;
+            let shell_gone = {
+                let r = unsafe { libc::kill(shell_pid as libc::pid_t, 0) };
+                r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            };
+            if reparented || shell_gone {
+                std::process::exit(0);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    });
+}
+
+#[cfg(windows)]
+fn spawn_orphan_guard(_shell_pid: u32) {
+    // TODO(windows): assign the sidecar to a Job Object with KILL_ON_JOB_CLOSE on
+    // the shell side. Until then the graceful kill on the shell's exit handler
+    // covers normal quit; only a hard crash could orphan the backend on Windows.
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Start the Bamboo HTTP server
@@ -73,6 +113,14 @@ enum Commands {
         /// Number of worker threads (overrides config file)
         #[arg(short, long)]
         workers: Option<usize>,
+
+        /// Exit when this parent process id no longer exists. The Bodhi desktop
+        /// shell spawns `bamboo serve` as a sidecar and passes its own PID here, so
+        /// the backend shuts down if the shell dies — including via SIGKILL /
+        /// force-quit, which run no cleanup. Polled on a dedicated thread, so it is
+        /// independent of the async runtime and of how the parent wired our stdio.
+        #[arg(long)]
+        parent_pid: Option<u32>,
     },
 
     /// Show Bamboo configuration
@@ -282,6 +330,7 @@ async fn main() {
             data_dir,
             static_dir,
             workers,
+            parent_pid,
         } => {
             let bamboo_home_dir = data_dir
                 .clone()
@@ -321,6 +370,16 @@ async fn main() {
                 unsafe {
                     std::env::set_var("BAMBOO_WORKERS", config.server.workers.to_string());
                 }
+            }
+
+            // Orphan guard: when spawned as a sidecar, watch the parent process and
+            // exit if it goes away — normal exit OR SIGKILL/force-quit, which run no
+            // cleanup. Polled on a dedicated OS thread so it is independent of the
+            // async runtime (once actix-web is serving it owns the runtime) and of
+            // how the parent wired our stdio — a Tauri sidecar does not hand us a
+            // pipe whose EOF we could watch, so a PID poll is the portable signal.
+            if let Some(ppid) = parent_pid {
+                spawn_orphan_guard(ppid);
             }
 
             // Start server using the unified config
