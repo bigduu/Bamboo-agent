@@ -1,0 +1,123 @@
+# Remote Mailbox Broker + `ask_agent` over the network
+
+> Supersedes the *transport* section of `ask-agent-design.md`. Builds on Change A
+> (actor-only sub-agents) and continues `remote-actor-plan.md` (remote actors).
+>
+> **Ratified decisions:** ask/reply transport = a **standalone network broker**
+> (`bamboo broker serve`), **WebSocket push**, durable via the existing **`Mailbox`
+> maildir**, **Bearer** auth; also lay the **remote-actor-plan.md P0 seams** now;
+> not-live target → **auto-activate**; answer modes = **`query` + `steer`**.
+
+Why not a file mailbox under a shared dir: it is local-filesystem-only and cannot
+reach a remote worker. The broker puts the durable `Mailbox` behind a network
+endpoint so parent and worker — local or remote — reach it over WS, getting
+durability *and* remote reach together.
+
+---
+
+## Phase 0 — remote-worker seams (= remote-actor-plan.md §6 P0, zero behavior change)
+
+Abstract the three local death-knots into traits; default impls replicate today
+exactly. (Details + line refs in `remote-actor-plan.md` §2.2/§3.)
+
+1. `WorkerLauncher` trait + `LocalSubprocessLauncher` — wraps `fleet.rs::spawn_worker`.
+   Returns `LaunchedWorker { client: ChildClient, kill_handle: Option<…> }`.
+2. `Discovery` trait + `FileFabric` — wraps `discovery.rs::Fabric`
+   (publish/resolve/discover/withdraw/gc).
+3. `WsServer::bind(addr)` / `bind_tls(addr, identity)` — `bind_loopback` stays the default.
+4. `Placement` enum (`Local` | `Remote{endpoint}` | `Schedulable{pool}`) into
+   `ProvisionSpec` (`serde(default)=Local`, forward-compatible).
+- **Acceptance:** `subagent_actor_via_server.rs`, `subagent_worker_e2e.rs`,
+  `e2e_subprocess.rs` all green; `cargo test -p bamboo-subagent` passes; no behavior change.
+
+These seams are what let the broker (Phase 1) place/connect workers locally or remotely
+without the ask path caring where they run.
+
+---
+
+## Phase 1 — `bamboo broker serve` (standalone WS broker)
+
+### Process & wire
+- New hidden subcommand `bamboo broker serve --bind <addr> [--tls] --token <T>`
+  (mirror `subagent-worker` registration in `src/bin/bamboo.rs`).
+- WebSocket server (`WsServer::bind`/`bind_tls`). One WS connection per client
+  (parent or worker). Bearer token in the WS handshake subprotocol / first frame
+  (reuse `ProvisionSpec.secrets` scoped-envelope discipline — token never in argv/env).
+
+### Identity & addressing
+- Each client identifies on connect: `Hello { agent_ref: AgentRef, token }` where
+  `AgentRef.session_id` is the mailbox key. The broker owns one `Mailbox` per
+  `session_id` under its own root: `<broker_root>/mailboxes/<session_id>/{new,cur,corrupt}`.
+
+### Broker frames (new `broker::proto`)
+```
+ClientFrame (client → broker):
+  Hello { agent_ref, token }
+  Deliver { to: session_id, message: InboxMessage }   // enqueue into to's mailbox
+  Subscribe                                            // start receiving my mailbox
+  Ack { id: MsgId }                                    // delete from cur/
+BrokerFrame (broker → client):
+  Welcome { } | Error { reason }
+  Message { message: InboxMessage }                    // pushed from my mailbox (new/→cur/)
+  Delivered { id }                                     // deliver receipt
+```
+- **Durability:** `Deliver` does `Mailbox::deliver` (atomic temp+rename) before acking
+  the sender — survives broker restart. On `Subscribe`, the broker `recover()`s `cur/`
+  then drains `new/`, pushing `Message` frames; consumer `Ack`s to delete. At-least-once;
+  dedupe via `AdmittedSet` (already exists).
+- **Push:** broker watches each subscribed mailbox (notify on `Deliver` to that key +
+  periodic sweep) and pushes promptly — no client polling.
+
+### Reuse
+- `InboxMessage` / `InboxKind::{Ask,Reply}` / `AskBody` / `ReplyBody` / `correlation_id`
+  (Layer 1, already built) are the broker's message schema verbatim.
+- `Mailbox` maildir is the broker's storage verbatim.
+
+---
+
+## Phase 2 — `ask_agent` over the broker
+
+Flow (target = caller's own child / resident; scope guard = send_message's
+Root-caller + `load_child_for_parent`):
+```
+SubAgent action=ask
+  └─ ask_child_action(parent, target, question, mode, timeout)
+       └─ broker.Deliver { to: child_id, Ask{ question, mode }, from: parent, id: ask_id }
+       └─ if target not live → auto-activate:
+            Placement::Local  → LocalSubprocessLauncher (spawn worker; on boot it
+                                 Subscribes to broker, drains the queued Ask)
+            Placement::Remote → ConnectLauncher to the remote endpoint (P1)
+       └─ await BrokerFrame::Message{ Reply{answer}, correlation_id==ask_id } on the
+          parent's own broker subscription, bounded by timeout → Ack → return {answer}
+```
+Worker side (connects to broker instead of/in addition to the parent WS):
+- On boot: `Subscribe`; for each `Ask`: `query` = ephemeral `agent.execute` on a session
+  clone; `steer` = inject as a live user turn; harvest final assistant message; `Deliver`
+  a `Reply{answer, correlation_id=ask.id}` to `from.session_id` (the parent); `Ack` the Ask.
+- Asks serialized per worker (bound LLM load).
+
+Tool: `SubAgentArgs::Ask { child_session_id?|resident_name?, question, mode?, timeout_secs? }`
+→ `tool_result({from, answer, mode, status:"answered"})`. No `SERVER_TOOL_NAMES` change.
+
+---
+
+## Build order (each compiles + tests before the next)
+
+- **P0.1** `WorkerLauncher` + `LocalSubprocessLauncher` (wrap spawn_worker).
+- **P0.2** `Discovery` + `FileFabric` (wrap Fabric).
+- **P0.3** `WsServer::bind`/`bind_tls`; **P0.4** `Placement` into `ProvisionSpec`.
+  → e2e green, no behavior change.
+- **B1** broker crate/binary: frames + WS server + Mailbox-backed routing + auth + tests.
+- **B2** broker client (used by parent adapter and worker).
+- **B3** worker: subscribe + Ask handler (query/steer) + Reply.
+- **B4** engine `ask_child_action` + port + auto-activate via launcher.
+- **B5** `SubAgent action=ask` + resident resolution + description + tests + e2e.
+
+## Layer-1 reconciliation
+Keep `InboxMessage.correlation_id`, `AskMode`, `AskBody`, `ReplyBody` (broker schema).
+Drop `ParentFrame::DrainAsks` (file-nudge, obsolete under the broker) when wiring B3.
+
+## Open/again-confirmable
+- Broker as its own crate `crates/app/bamboo-broker` (lib) + subcommand in the `bamboo` binary.
+- v1 single broker instance; HA/sharding later.
+- Discovery (`RegistryFabric`) can later move onto the broker too (remote-actor-plan.md P2).

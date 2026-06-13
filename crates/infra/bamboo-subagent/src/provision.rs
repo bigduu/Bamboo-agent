@@ -55,6 +55,29 @@ pub struct ProvisionSpec {
     /// run's `messages`, so context stays isolated across reuses.
     #[serde(default)]
     pub reusable: bool,
+    /// Where this actor runs. `Local` (default) — the parent spawns a local
+    /// subprocess. `Remote{endpoint}` — connect to an already-running `wss://`
+    /// worker. `Schedulable{pool}` — a control plane assigns an endpoint.
+    /// Forward-compatible: an older spec without this field defaults to `Local`,
+    /// so behavior is unchanged until a placement is set.
+    #[serde(default)]
+    pub placement: Placement,
+}
+
+/// Where an actor physically runs — a configurable "temperature", not a baked-in
+/// property (see `docs/remote-actor-plan.md` §3.4). Default `Local` keeps today's
+/// behavior; the launcher picks the matching `WorkerLauncher` per variant.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Placement {
+    /// Parent spawns a local subprocess (current behavior).
+    #[default]
+    Local,
+    /// Connect to a resident worker already serving at `endpoint` (e.g.
+    /// `wss://gpu-host:8443`).
+    Remote { endpoint: String },
+    /// Ask a control plane to assign an endpoint from a named pool.
+    Schedulable { pool: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,6 +159,7 @@ impl ProvisionSpec {
             limits: Limits::default(),
             secrets: SecretsEnvelope::default(),
             reusable: false,
+            placement: Placement::default(),
         }
     }
 
@@ -227,6 +251,28 @@ mod tests {
         assert!(parsed.model.is_none());
         assert!(parsed.secrets.provider_credentials.is_empty());
         assert_eq!(parsed.limits, Limits::default());
+        // Placement defaults to Local for a spec that predates the field.
+        assert_eq!(parsed.placement, Placement::Local);
+    }
+
+    #[test]
+    fn placement_defaults_local_and_remote_round_trips() {
+        // Default spec is Local, serialized with kind="local".
+        let v: serde_json::Value = serde_json::from_str(&spec().to_json().unwrap()).unwrap();
+        assert_eq!(v["placement"]["kind"], "local");
+
+        // Remote round-trips with its endpoint.
+        let mut s = spec();
+        s.placement = Placement::Remote {
+            endpoint: "wss://gpu-host:8443".into(),
+        };
+        let parsed = ProvisionSpec::from_json(&s.to_json().unwrap()).unwrap();
+        assert_eq!(
+            parsed.placement,
+            Placement::Remote {
+                endpoint: "wss://gpu-host:8443".into()
+            }
+        );
     }
 
     #[test]

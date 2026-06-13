@@ -60,6 +60,34 @@ pub enum InboxKind {
     Reply,
 }
 
+/// How a sub-agent should answer an [`InboxKind::Ask`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskMode {
+    /// Summarize/extract: answer from the agent's current state via an ephemeral
+    /// side-query (a clone of the session), leaving the live task untouched.
+    #[default]
+    Query,
+    /// Insert into the live conversation / redirect the goal: the question
+    /// becomes a real user turn in the agent's running session, and the
+    /// resulting assistant message is the answer.
+    Steer,
+}
+
+/// Body of an [`InboxKind::Ask`] message (carried in `InboxMessage.body`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AskBody {
+    pub question: String,
+    #[serde(default)]
+    pub mode: AskMode,
+}
+
+/// Body of an [`InboxKind::Reply`] message (carried in `InboxMessage.body`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplyBody {
+    pub answer: String,
+}
+
 /// A message addressed to an actor's mailbox. `body` is the opaque chat payload (domain `Message`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InboxMessage {
@@ -68,6 +96,11 @@ pub struct InboxMessage {
     pub kind: InboxKind,
     pub body: serde_json::Value,
     pub created_at: DateTime<Utc>,
+    /// For an [`InboxKind::Reply`], the [`MsgId`] of the [`InboxKind::Ask`] it
+    /// answers — lets a parent match a reply to the ask it is awaiting. `None`
+    /// for unsolicited messages (Task/Ask/Handoff).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<MsgId>,
 }
 
 /// A claimed message plus its location in `cur/` (for `ack`).
@@ -308,7 +341,59 @@ mod tests {
             kind: InboxKind::Task,
             body: json!({ "seq": seq }),
             created_at: Utc::now(),
+            correlation_id: None,
         }
+    }
+
+    #[test]
+    fn ask_reply_bodies_and_correlation_round_trip() {
+        // Ask body: question + mode (default query).
+        let ask = AskBody {
+            question: "what did you find?".into(),
+            mode: AskMode::Query,
+        };
+        let ask_json = serde_json::to_value(&ask).unwrap();
+        assert_eq!(ask_json["mode"], "query");
+        assert_eq!(serde_json::from_value::<AskBody>(ask_json).unwrap(), ask);
+        // mode defaults to query when absent.
+        let defaulted: AskBody = serde_json::from_value(json!({ "question": "q" })).unwrap();
+        assert_eq!(defaulted.mode, AskMode::Query);
+        // steer round-trips.
+        assert_eq!(
+            serde_json::from_value::<AskMode>(json!("steer")).unwrap(),
+            AskMode::Steer
+        );
+
+        // Reply correlation: a Reply carries the Ask's id.
+        let ask_id = MsgId::new();
+        let reply = InboxMessage {
+            id: MsgId::new(),
+            from: AgentRef {
+                session_id: "child".into(),
+                role: None,
+            },
+            kind: InboxKind::Reply,
+            body: serde_json::to_value(ReplyBody {
+                answer: "found X".into(),
+            })
+            .unwrap(),
+            created_at: Utc::now(),
+            correlation_id: Some(ask_id.clone()),
+        };
+        let round: InboxMessage =
+            serde_json::from_value(serde_json::to_value(&reply).unwrap()).unwrap();
+        assert_eq!(round.correlation_id, Some(ask_id));
+        assert_eq!(round.kind, InboxKind::Reply);
+        // Back-compat: a message serialized without correlation_id still parses.
+        let legacy: InboxMessage = serde_json::from_value(json!({
+            "id": MsgId::new(),
+            "from": { "session_id": "p" },
+            "kind": "task",
+            "body": {},
+            "created_at": Utc::now().to_rfc3339(),
+        }))
+        .unwrap();
+        assert_eq!(legacy.correlation_id, None);
     }
 
     #[tokio::test]

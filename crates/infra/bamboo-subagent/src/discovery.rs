@@ -7,6 +7,7 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::error::{atomic_write, Result, StoreError};
@@ -113,6 +114,47 @@ impl Fabric {
     }
 }
 
+/// The discovery face: publish / resolve / discover / withdraw / gc an
+/// [`AgentRecord`], independent of *where* records live — a local file fabric
+/// today, a network registry (control plane) later (see
+/// `docs/remote-actor-plan.md` §3.3). Lets the fleet hold `Arc<dyn Discovery>`
+/// and stay agnostic to the discovery backend.
+#[async_trait]
+pub trait Discovery: Send + Sync {
+    async fn publish(&self, rec: &AgentRecord) -> Result<()>;
+    async fn resolve(&self, agent_id: &str) -> Result<Option<AgentRecord>>;
+    async fn discover(&self) -> Result<Vec<AgentRecord>>;
+    async fn withdraw(&self, agent_id: &str) -> Result<()>;
+    async fn gc(&self) -> Result<usize>;
+}
+
+/// The default, local discovery backend is the file [`Fabric`]. The alias names
+/// the intent (a *file* fabric) without renaming the existing type or its
+/// call-sites.
+pub type FileFabric = Fabric;
+
+#[async_trait]
+impl Discovery for Fabric {
+    // Each method delegates to the inherent method of the same name. Inherent
+    // methods win method resolution, so existing `fabric.publish(..)` callers are
+    // unchanged (zero behavior change) and these are not self-recursive.
+    async fn publish(&self, rec: &AgentRecord) -> Result<()> {
+        Fabric::publish(self, rec).await
+    }
+    async fn resolve(&self, agent_id: &str) -> Result<Option<AgentRecord>> {
+        Fabric::resolve(self, agent_id).await
+    }
+    async fn discover(&self) -> Result<Vec<AgentRecord>> {
+        Fabric::discover(self).await
+    }
+    async fn withdraw(&self, agent_id: &str) -> Result<()> {
+        Fabric::withdraw(self, agent_id).await
+    }
+    async fn gc(&self) -> Result<usize> {
+        Fabric::gc(self).await
+    }
+}
+
 async fn read_record(path: &Path) -> Result<Option<AgentRecord>> {
     match tokio::fs::read(path).await {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -186,5 +228,22 @@ mod tests {
         assert!(fab.resolve("stale").await.unwrap().is_none());
 
         assert_eq!(fab.gc().await.unwrap(), 1); // stale removed
+    }
+
+    #[tokio::test]
+    async fn fabric_is_usable_as_dyn_discovery() {
+        let d = TempDir::new().unwrap();
+        let fab = Fabric::at(d.path());
+        // Drive it purely through the trait object (object-safety + delegation).
+        let disc: &dyn Discovery = &fab;
+        let now = Utc::now();
+        disc.publish(&rec("x", now + Duration::seconds(30)))
+            .await
+            .unwrap();
+        assert!(disc.resolve("x").await.unwrap().is_some());
+        assert_eq!(disc.discover().await.unwrap().len(), 1);
+        disc.withdraw("x").await.unwrap();
+        assert!(disc.resolve("x").await.unwrap().is_none());
+        assert_eq!(disc.gc().await.unwrap(), 0);
     }
 }

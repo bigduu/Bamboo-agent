@@ -42,11 +42,19 @@ pub struct WsServer {
 }
 
 impl WsServer {
-    /// Bind `127.0.0.1:0` (ephemeral port).
-    pub async fn bind_loopback() -> TransportResult<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    /// Bind an arbitrary address. Pass `0.0.0.0:PORT` for a remotely-reachable
+    /// worker/broker; [`bind_loopback`](Self::bind_loopback) is the local default.
+    /// (TLS — `wss://` — is added with the broker in a later phase; see
+    /// `docs/remote-actor-plan.md` §3.2.)
+    pub async fn bind(addr: SocketAddr) -> TransportResult<Self> {
+        let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
         Ok(Self { listener, addr })
+    }
+
+    /// Bind `127.0.0.1:0` (ephemeral port) — the local default.
+    pub async fn bind_loopback() -> TransportResult<Self> {
+        Self::bind((std::net::Ipv4Addr::LOCALHOST, 0).into()).await
     }
 
     pub fn local_addr(&self) -> SocketAddr {

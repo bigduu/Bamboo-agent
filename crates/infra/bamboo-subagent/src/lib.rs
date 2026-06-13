@@ -16,6 +16,7 @@ pub mod discovery;
 pub mod error;
 pub mod executor;
 pub mod fleet;
+pub mod launcher;
 pub mod mailbox;
 pub mod proto;
 pub mod provision;
@@ -23,17 +24,18 @@ pub mod registry;
 pub mod store;
 pub mod transport;
 
-pub use discovery::Fabric;
+pub use discovery::{Discovery, Fabric, FileFabric};
 pub use error::{Result, StoreError};
 pub use executor::{ChildExecutor, ChildOutcome, EchoExecutor, EventSink, SteerInbox};
 pub use fleet::{spawn_worker, SpawnedChild};
+pub use launcher::{LocalSubprocessLauncher, WorkerLauncher};
 pub use mailbox::{
-    AdmittedSet, AgentRef, Delivered, InboxKind, InboxMessage, Mailbox, MsgId,
-    ADMITTED_SET_CAPACITY,
+    AdmittedSet, AgentRef, AskBody, AskMode, Delivered, InboxKind, InboxMessage, Mailbox, MsgId,
+    ReplyBody, ADMITTED_SET_CAPACITY,
 };
 pub use proto::{AgentRecord, ChildFrame, ParentFrame, RunSpec, TerminalStatus};
 pub use provision::{
-    ChildIdentity, ExecutorSpec, Limits, ModelRefSpec, ProvisionSpec, ScopedCredential,
+    ChildIdentity, ExecutorSpec, Limits, ModelRefSpec, Placement, ProvisionSpec, ScopedCredential,
     SecretsEnvelope, PROVISION_VERSION,
 };
 pub use registry::{RegisterChild, Registration, Registry};
