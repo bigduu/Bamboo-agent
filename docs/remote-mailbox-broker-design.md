@@ -113,6 +113,54 @@ Tool: `SubAgentArgs::Ask { child_session_id?|resident_name?, question, mode?, ti
 - **B4** engine `ask_child_action` + port + auto-activate via launcher.
 - **B5** `SubAgent action=ask` + resident resolution + description + tests + e2e.
 
+---
+
+## SHIPPED (what actually landed)
+
+Branch `feat/subagent-actor-only`. All additive over Change A (actor-only) + Phase 0
+(remote-worker seams). Everything below is implemented and tested.
+
+**Topology (ratified):** single central broker, hub-and-spoke. The broker is a *pure
+message bus* (routes Ask/Reply; never spawns or coordinates brokers). The master deploys
+execution environments (local subprocess / Docker / SSH) that dial home to the broker —
+push model, not mutual discovery.
+
+**Crate `bamboo-broker`** (`crates/app/bamboo-broker`):
+- `proto` — `ClientFrame`(Hello/Deliver/Subscribe/Ack) ↔ `BrokerFrame`(Welcome/Error/Message/Delivered).
+- `core::BrokerCore` — durable per-session `Mailbox` routing, push subscriptions, at-least-once.
+- `server::BrokerServer` — WS bus + Bearer-token handshake (`bamboo broker serve`).
+- `client::BrokerClient` — connect + demux (messages / delivered).
+- `serve::serve_executor` — worker loop; answers each Ask by running a `ChildExecutor`;
+  **query** = read-only over a context copy, **steer** = persist into context. Works with
+  EchoExecutor (no LLM) and the real BambooRuntime executor.
+- `ask::ask_agent` / `ask_over` — orchestrator delivers an Ask and awaits the correlated Reply.
+- `deploy` — `Deployer` + `LocalProcessDeployer` / `DockerDeployer` / `SshDeployer`
+  (all spawn `bamboo broker-agent serve …`; token via env, never argv).
+
+**Deployable agent:** `bamboo broker-agent serve --broker <ws> --token <t> --id <id> [--echo|--model]`
+(`src/broker_agent.rs`) — connects to a broker and serves its mailbox, anywhere.
+
+**In-loop command tool:** `ask_agent` (`bamboo-server-tools`), overlaid on the Root surface
+only when `subagents.broker { endpoint, token }` is configured. A running root agent calls it
+to command another broker-deployed agent (query/steer). No change to the SubAgent tool.
+(Note: realized as a dedicated `ask_agent` tool rather than a `SubAgent` action — the broker
+ask is a different substrate than SubAgent's child-session ports, and an isolated overlay tool
+is lower-risk; `OverlayToolExecutor` routes by tool name so no `SERVER_TOOL_NAMES` change.)
+
+**Transport note:** ask/reply rides the broker's WS-fronted durable mailbox (remote-capable);
+the literal file mailbox is the broker's storage substrate. `ParentFrame::DrainAsks` (the
+interim file-nudge) was dropped.
+
+**Tests (all green):** broker 14 lib + ws_roundtrip 3 + serve/ask integration; `ask_agent_tool`
+2; deploy e2e 3 (real `broker-agent --echo` subprocess via LocalProcessDeployer: single query+steer,
+two-agent independent command, gated live-Docker). Regression: config 110, subagent 41 + e2e 2,
+engine 789, server 850, server-tools 26, actor e2e 3 (server→real worker), session_history 4.
+
+**Deferred (clearly scoped):** `bind_tls`/`wss://` + remote `ConnectLauncher`/`Placement::Remote`
+end-to-end (P1 of `remote-actor-plan.md`; the seams + `Placement` enum are in place); the
+real-LLM broker-agent path is wired but its e2e needs a provider (the deterministic path uses
+`--echo`); federated broker-to-broker (explicitly out of scope — hub-and-spoke chosen).
+
 ## Layer-1 reconciliation
 Keep `InboxMessage.correlation_id`, `AskMode`, `AskBody`, `ReplyBody` (broker schema).
 Drop `ParentFrame::DrainAsks` (file-nudge, obsolete under the broker) when wiring B3.
