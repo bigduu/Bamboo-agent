@@ -8,6 +8,7 @@
 
 pub mod ask_agent;
 pub mod compact;
+pub mod deploy_agent;
 pub mod memory;
 pub mod overlay_executor;
 pub mod session_inspector;
@@ -17,6 +18,7 @@ pub mod surface;
 
 pub use ask_agent::AskAgentTool;
 pub use compact::CompactContextTool;
+pub use deploy_agent::{DeployAgentTool, DeployedRegistry};
 pub use memory::MemoryTool;
 pub use overlay_executor::OverlayToolExecutor;
 pub use session_inspector::SessionInspectorTool;

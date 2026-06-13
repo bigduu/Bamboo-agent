@@ -475,6 +475,7 @@ dependencies = [
  "bamboo-metrics",
  "bamboo-sdk",
  "bamboo-server",
+ "bamboo-server-tools",
  "bamboo-skills",
  "bamboo-storage",
  "bamboo-subagent",

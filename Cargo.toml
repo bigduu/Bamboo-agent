@@ -189,6 +189,7 @@ bamboo-engine = { path = "crates/engine/bamboo-engine" }
 bamboo-metrics = { path = "crates/infra/bamboo-metrics" }
 bamboo-mcp = { path = "crates/infra/bamboo-mcp" }
 bamboo-skills = { path = "crates/infra/bamboo-skills" }
+bamboo-server-tools = { path = "crates/app/bamboo-server-tools" }
 
 [profile.release]
 opt-level = 3

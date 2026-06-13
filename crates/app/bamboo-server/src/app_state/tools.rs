@@ -179,13 +179,29 @@ pub(super) fn build_root_tools(
         crate::tools::OverlayToolExecutor::new(tools_with_schedule, session_inspector_tool),
     );
 
-    // When a broker is configured, root agents also get `ask_agent` to command
-    // other broker-deployed agents (local / Docker / remote) in query/steer mode.
+    // When a broker is configured, root agents also get `ask_agent` (command
+    // broker-deployed agents, query/steer) and `deploy_agent` (spin up new
+    // workers themselves — local / Docker / SSH — wired to the same broker).
     match broker {
         Some(b) if !b.endpoint.trim().is_empty() => {
-            Arc::new(crate::tools::OverlayToolExecutor::new(
+            let with_ask: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
                 tools_with_inspector,
-                Arc::new(crate::tools::AskAgentTool::new(b.endpoint, b.token)),
+                Arc::new(crate::tools::AskAgentTool::new(
+                    b.endpoint.clone(),
+                    b.token.clone(),
+                )),
+            ));
+            // Deployed worker handles are kill-on-drop, so the tool keeps them in
+            // this registry for the server's lifetime (torn down via stop / exit).
+            let registry: crate::tools::DeployedRegistry =
+                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let bamboo_bin =
+                std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("bamboo"));
+            Arc::new(crate::tools::OverlayToolExecutor::new(
+                with_ask,
+                Arc::new(crate::tools::DeployAgentTool::new(
+                    b.endpoint, b.token, bamboo_bin, registry,
+                )),
             ))
         }
         _ => tools_with_inspector,
