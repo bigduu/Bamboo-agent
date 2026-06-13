@@ -190,7 +190,7 @@ pub async fn list() -> Result<(), String> {
         );
         return Ok(());
     }
-    println!("{:<28} {:<12} {:<8} {}", "AGENT", "ROLE", "PID", "ENDPOINT");
+    println!("{:<28} {:<12} {:<8} ENDPOINT", "AGENT", "ROLE", "PID");
     for r in records {
         println!(
             "{:<28} {:<12} {:<8} {}",

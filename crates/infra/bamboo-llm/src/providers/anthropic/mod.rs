@@ -549,7 +549,7 @@ fn messages_to_anthropic_json(messages: &[Message]) -> (Option<Value>, Vec<Value
         .enumerate()
         .filter(|(_, m)| matches!(m.role, Role::Tool) && message_has_image(m))
         .map(|(i, _)| i)
-        .last();
+        .next_back();
 
     for (idx, m) in messages.iter().enumerate() {
         match m.role {
