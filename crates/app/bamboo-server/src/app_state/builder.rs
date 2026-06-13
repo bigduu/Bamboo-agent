@@ -363,6 +363,7 @@ impl AppState {
             config.clone(),
             subagent_profiles.clone(),
             provider_registry.clone(),
+            config_snapshot.subagents.broker.clone(),
         );
 
         child_completion_coordinator

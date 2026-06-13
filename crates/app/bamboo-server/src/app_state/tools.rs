@@ -117,6 +117,7 @@ pub(super) fn build_root_tools(
     config: Arc<RwLock<Config>>,
     subagent_profiles: Arc<bamboo_domain::subagent::SubagentProfileRegistry>,
     provider_registry: Arc<bamboo_llm::ProviderRegistry>,
+    broker: Option<bamboo_config::BrokerClientConfig>,
 ) -> Arc<dyn ToolExecutor> {
     // Shared adapter for the unified child session tool. Cloning the
     // profile registry Arc is cheap and lets us hand the same registry
@@ -174,9 +175,19 @@ pub(super) fn build_root_tools(
         session_store,
         storage,
     ));
+    let tools_with_inspector: Arc<dyn ToolExecutor> = Arc::new(
+        crate::tools::OverlayToolExecutor::new(tools_with_schedule, session_inspector_tool),
+    );
 
-    Arc::new(crate::tools::OverlayToolExecutor::new(
-        tools_with_schedule,
-        session_inspector_tool,
-    ))
+    // When a broker is configured, root agents also get `ask_agent` to command
+    // other broker-deployed agents (local / Docker / remote) in query/steer mode.
+    match broker {
+        Some(b) if !b.endpoint.trim().is_empty() => {
+            Arc::new(crate::tools::OverlayToolExecutor::new(
+                tools_with_inspector,
+                Arc::new(crate::tools::AskAgentTool::new(b.endpoint, b.token)),
+            ))
+        }
+        _ => tools_with_inspector,
+    }
 }

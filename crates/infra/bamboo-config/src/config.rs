@@ -268,6 +268,21 @@ pub struct SubagentsConfig {
     /// to verify the actor chain end-to-end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
+    /// When set, root agents get an `ask_agent` tool that asks broker-deployed
+    /// agents (local / Docker / remote) over this message broker, in `query` or
+    /// `steer` mode. Omit to leave the tool off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker: Option<BrokerClientConfig>,
+}
+
+/// How to reach the central sub-agent message broker (`bamboo broker serve`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BrokerClientConfig {
+    /// Broker WebSocket endpoint, e.g. `ws://broker-host:9600`.
+    pub endpoint: String,
+    /// Bearer token presented in the broker handshake.
+    #[serde(default)]
+    pub token: String,
 }
 
 /// Main configuration structure for Bamboo agent
