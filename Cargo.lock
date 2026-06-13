@@ -438,7 +438,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "bamboo-a2a"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "async-trait",
  "eventsource-stream",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-agent"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "actix-cors",
  "actix-files",
@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-agent-core"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -551,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-cli"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "bamboo-client-core",
@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-client-core"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-compression"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "async-trait",
  "bamboo-domain",
@@ -594,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-config"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -616,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-domain"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-engine"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-infrastructure"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-llm"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-mcp"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "async-trait",
  "bamboo-agent-core",
@@ -761,7 +761,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-memory"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-metrics"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "bamboo-agent-core",
@@ -805,7 +805,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-permission"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-sdk"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "bamboo-agent-core",
  "bamboo-config",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-server"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "actix-cors",
  "actix-files",
@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-server-tools"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "async-trait",
  "bamboo-a2a",
@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-skills"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "async-trait",
  "bamboo-config",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-storage"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "async-trait",
  "bamboo-domain",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-subagent"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-tools"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1030,7 +1030,7 @@ dependencies = [
 
 [[package]]
 name = "bamboo-tui"
-version = "2026.6.5"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "bamboo-client-core",
