@@ -59,6 +59,27 @@ enum SubAgentArgs {
         /// Call `list_models` to see what is available.
         #[serde(default)]
         model: Option<String>,
+        /// Lifecycle: `"oneshot"` (default) creates a fresh throwaway child for
+        /// this task. `"resident"` reuses a long-lived agent identified by
+        /// `name` (scoped to this conversation): the FIRST resident create spins
+        /// one up; later creates with the same `name` route the new task to that
+        /// same agent instead of spawning another — so repeated similar work
+        /// (e.g. an "essayist" handling many essays) stays one agent/one entry,
+        /// not N. Use resident for recurring task types; one-shot for
+        /// independent throwaway work.
+        #[serde(default)]
+        lifecycle: Option<String>,
+        /// Resident reuse key (required when `lifecycle="resident"`; defaults to
+        /// `subagent_type`). The stable name of the resident agent to create or
+        /// reuse, e.g. `"essayist"`.
+        #[serde(default)]
+        name: Option<String>,
+        /// For a resident agent, how successive tasks treat prior context:
+        /// `"reset"` (default — each task is independent, prior context cleared)
+        /// or `"accumulate"` (the agent remembers earlier tasks). Set on first
+        /// create; honored on reuse.
+        #[serde(default)]
+        context: Option<String>,
     },
     /// Suspend the parent run until its background child sessions finish.
     ///
@@ -383,6 +404,20 @@ A create call requires: title, responsibility, prompt, and subagent_type (worksp
                 "model": {
                     "type": "string",
                     "description": "For create: explicit model for the child as 'provider:model' (e.g. 'anthropic:claude-sonnet-4-6'), or a bare model id to use the parent's provider. Takes precedence over per-role model routing. Pick a cheaper/faster model for simple fan-outs and a stronger model for hard reasoning. Call list_models first to see what is available; omit to use the configured default for the chosen subagent_type."
+                },
+                "lifecycle": {
+                    "type": "string",
+                    "enum": ["oneshot", "resident"],
+                    "description": "For create: 'oneshot' (default) spins up a fresh throwaway child for this task. 'resident' reuses ONE long-lived agent (identified by 'name', scoped to this conversation) across many tasks — the first resident create spins it up, later creates with the same name route the new task to that same agent instead of spawning another. Use resident for recurring task types (e.g. an 'essayist' that writes many essays — one agent, one panel entry, not N); use oneshot for independent throwaway work."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "For create with lifecycle=resident: the resident agent's stable reuse key, e.g. 'essayist'. Required to reuse a resident; defaults to subagent_type when omitted. Reusing the same name routes the new task to the existing resident agent."
+                },
+                "context": {
+                    "type": "string",
+                    "enum": ["reset", "accumulate"],
+                    "description": "For create with lifecycle=resident: how the resident treats prior tasks. 'reset' (default) makes each task independent (clears prior context). 'accumulate' makes the agent remember earlier tasks (useful for a researcher building up knowledge). Set on first create; honored on reuse."
                 }
             },
             "required": ["action"],
@@ -458,6 +493,9 @@ A create call requires: title, responsibility, prompt, and subagent_type (worksp
                 wait,
                 reasoning_effort,
                 model,
+                lifecycle,
+                name,
+                context,
             } => {
                 let title = normalize_title(title, description)?;
                 let responsibility = normalize_required_text(responsibility, "responsibility")?;
@@ -488,59 +526,159 @@ A create call requires: title, responsibility, prompt, and subagent_type (worksp
                     ));
                 }
 
-                let child_id = Uuid::new_v4().to_string();
-                // Model precedence: explicit `model` arg > per-subagent_type
-                // routing (resolver) > engine defaults (None).
-                let model_ref_override = match model
+                let should_auto_run = auto_run.unwrap_or(true);
+
+                // Resident routing: `lifecycle="resident"` reuses the existing
+                // resident agent of the same `name` in this root tree (one stable
+                // agent/entry for recurring work) instead of minting a new child.
+                // `reset` (default) replaces the resident's task and reruns it;
+                // `accumulate` appends the task to its history. The FIRST resident
+                // create (none found yet) falls through to a normal create tagged
+                // as resident.
+                let is_resident = lifecycle.as_deref().map(str::trim) == Some("resident");
+                let resident_name = is_resident.then(|| {
+                    name.as_deref()
+                        .map(str::trim)
+                        .filter(|n| !n.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| subagent_type.clone())
+                });
+                let resident_context = context
                     .as_deref()
                     .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                {
-                    Some(spec) => Some(parse_model_spec(
-                        spec,
-                        &parent,
-                        self.catalog.as_ref().map(|c| c.default_provider()),
-                    )?),
-                    None => self.resolver.resolve_subagent_model(&subagent_type).await,
+                    .filter(|c| matches!(*c, "reset" | "accumulate"))
+                    .unwrap_or("reset")
+                    .to_string();
+                let existing_resident = match resident_name.as_deref() {
+                    Some(rname) => {
+                        // Children are created with `root_session_id == parent.id`
+                        // (a flat tree; children cannot spawn children), so the
+                        // parent's id is the tree root key for the lookup.
+                        self.sessions.find_resident_child(&parent.id, rname).await
+                    }
+                    None => None,
                 };
-                let model_override = model_ref_override
-                    .as_ref()
-                    .map(|model_ref| model_ref.model.clone());
-                let runtime_metadata = self.resolver.resolve_runtime_metadata(&subagent_type).await;
-                let system_prompt_override =
-                    Some(self.resolver.resolve_subagent_prompt(&subagent_type));
 
-                let should_auto_run = auto_run.unwrap_or(true);
-                let result = child_session::create_child_action(
-                    self.sessions.as_ref(),
-                    CreateChildInput {
-                        parent_session: parent.clone(),
-                        child_id: child_id.clone(),
-                        title: title.clone(),
-                        responsibility: responsibility.clone(),
-                        assignment_prompt: prompt.clone(),
-                        subagent_type: subagent_type.clone(),
-                        workspace: workspace.clone(),
-                        model_override,
-                        model_ref_override,
-                        runtime_metadata,
-                        system_prompt_override,
-                        auto_run: should_auto_run,
-                        reasoning_effort,
-                    },
-                )
-                .await
-                .map_err(tool_error_from_child_session)?;
+                let (child_session_id, child_model, reused) =
+                    if let Some(existing_id) = existing_resident {
+                        // A resident processes tasks serially. If it is still running
+                        // a previous task, stop it first: otherwise `reset` would
+                        // truncate the session while the runner writes back (a
+                        // corrupting race + a possible duplicate spawn job), and
+                        // `accumulate` would queue a message into a run that may end
+                        // before picking it up (the task would never execute). After
+                        // cancel the resident is idle, so both paths apply cleanly.
+                        if self.sessions.is_child_running(&existing_id).await {
+                            self.sessions
+                                .cancel_child_run_and_wait(&existing_id)
+                                .await
+                                .map_err(tool_error_from_child_session)?;
+                        }
+                        // Reuse: reset => update (truncate + new task) then rerun;
+                        // accumulate => send the task as a new message (auto-runs).
+                        if resident_context == "accumulate" {
+                            child_session::send_message_to_child_action(
+                                self.sessions.as_ref(),
+                                &parent,
+                                existing_id.clone(),
+                                format!("# Task: {title}\n\n{responsibility}\n\n{prompt}"),
+                                Some(should_auto_run),
+                                Some(false),
+                            )
+                            .await
+                            .map_err(tool_error_from_child_session)?;
+                        } else {
+                            child_session::update_child_action(
+                                self.sessions.as_ref(),
+                                &parent.id,
+                                existing_id.clone(),
+                                Some(title.clone()),
+                                Some(responsibility.clone()),
+                                Some(prompt.clone()),
+                                Some(subagent_type.clone()),
+                                Some(true),
+                                reasoning_effort,
+                            )
+                            .await
+                            .map_err(tool_error_from_child_session)?;
+                            if should_auto_run {
+                                let child = self
+                                    .sessions
+                                    .load_child_for_parent(&parent.id, &existing_id)
+                                    .await
+                                    .map_err(tool_error_from_child_session)?;
+                                self.sessions
+                                    .enqueue_child_run(&parent, &child)
+                                    .await
+                                    .map_err(tool_error_from_child_session)?;
+                            }
+                        }
+                        let model = self
+                            .sessions
+                            .load_child_for_parent(&parent.id, &existing_id)
+                            .await
+                            .map(|c| c.model)
+                            .unwrap_or_default();
+                        (existing_id, model, true)
+                    } else {
+                        let child_id = Uuid::new_v4().to_string();
+                        // Model precedence: explicit `model` arg > per-subagent_type
+                        // routing (resolver) > engine defaults (None).
+                        let model_ref_override = match model
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|m| !m.is_empty())
+                        {
+                            Some(spec) => Some(parse_model_spec(
+                                spec,
+                                &parent,
+                                self.catalog.as_ref().map(|c| c.default_provider()),
+                            )?),
+                            None => self.resolver.resolve_subagent_model(&subagent_type).await,
+                        };
+                        let model_override = model_ref_override
+                            .as_ref()
+                            .map(|model_ref| model_ref.model.clone());
+                        let runtime_metadata =
+                            self.resolver.resolve_runtime_metadata(&subagent_type).await;
+                        let system_prompt_override =
+                            Some(self.resolver.resolve_subagent_prompt(&subagent_type));
+                        let result = child_session::create_child_action(
+                            self.sessions.as_ref(),
+                            CreateChildInput {
+                                parent_session: parent.clone(),
+                                child_id: child_id.clone(),
+                                title: title.clone(),
+                                responsibility: responsibility.clone(),
+                                assignment_prompt: prompt.clone(),
+                                subagent_type: subagent_type.clone(),
+                                workspace: workspace.clone(),
+                                model_override,
+                                model_ref_override,
+                                runtime_metadata,
+                                system_prompt_override,
+                                auto_run: should_auto_run,
+                                reasoning_effort,
+                                lifecycle: resident_name.as_ref().map(|_| "resident".to_string()),
+                                resident_name: resident_name.clone(),
+                                resident_context: resident_name
+                                    .as_ref()
+                                    .map(|_| resident_context.clone()),
+                            },
+                        )
+                        .await
+                        .map_err(tool_error_from_child_session)?;
+                        (result.child_session_id, result.model, false)
+                    };
 
                 // Ensure index entry is visible immediately (best-effort).
-                self.sessions
-                    .ensure_child_indexed(&result.child_session_id)
-                    .await;
+                self.sessions.ensure_child_indexed(&child_session_id).await;
 
-                ctx.emit_tool_token(format!(
-                    "Spawned child session: {}",
-                    result.child_session_id
-                ))
+                ctx.emit_tool_token(if reused {
+                    format!("Reused resident agent: {child_session_id}")
+                } else {
+                    format!("Spawned child session: {child_session_id}")
+                })
                 .await;
 
                 // `wait=true` preserves the legacy one-shot behavior: register a
@@ -550,11 +688,7 @@ A create call requires: title, responsibility, prompt, and subagent_type (worksp
                 let should_wait = should_auto_run && wait.unwrap_or(false);
                 if should_wait {
                     self.sessions
-                        .register_parent_wait_for_child(
-                            &parent.id,
-                            &result.child_session_id,
-                            None,
-                        )
+                        .register_parent_wait_for_child(&parent.id, &child_session_id, None)
                         .await
                         .map_err(tool_error_from_child_session)?;
                 }
@@ -579,11 +713,14 @@ A create call requires: title, responsibility, prompt, and subagent_type (worksp
                     "responsibility": responsibility,
                     "prompt": prompt,
                     "subagent_type": subagent_type,
-                    "child_session_id": result.child_session_id,
+                    "child_session_id": child_session_id,
                     "parent_session_id": parent_session_id,
-                    "model": result.model,
+                    "model": child_model,
                     "reasoning_effort": reasoning_effort.map(|effort| effort.as_str()),
                     "status": status,
+                    "lifecycle": resident_name.as_ref().map(|_| "resident"),
+                    "resident_name": resident_name.clone(),
+                    "reused": reused,
                     "note": note,
                 });
                 if should_wait {

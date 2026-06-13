@@ -571,6 +571,110 @@
     }
 
     #[tokio::test]
+    async fn resident_create_reuses_same_child_session() {
+        let harness = build_test_harness().await;
+        let ctx = |tcid: &'static str| ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: tcid,
+            event_tx: None,
+            available_tool_schemas: None,
+        };
+        let create = |name_task: &'static str, prompt: &'static str| {
+            json!({
+                "action": "create",
+                "lifecycle": "resident",
+                "name": "essayist",
+                "title": name_task,
+                "responsibility": "Write a short essay",
+                "prompt": prompt,
+                "workspace": "/tmp/test-workspace",
+                "auto_run": false
+            })
+        };
+
+        // First resident create: spins up the essayist.
+        let r1 = harness
+            .tool
+            .execute_with_context(create("Essay: 溪流", "Write ~150 words about 溪流."), ctx("tc1"))
+            .await
+            .expect("first resident create");
+        let p1: serde_json::Value = serde_json::from_str(&r1.result).unwrap();
+        let id1 = p1["child_session_id"].as_str().unwrap().to_string();
+        assert_eq!(p1["reused"], json!(false));
+        assert_eq!(p1["lifecycle"], "resident");
+
+        // In production storage and the session index are the SAME SessionStoreV2,
+        // so a child save auto-indexes (find_resident_child reads that index). This
+        // harness uses a separate index store, so mirror the production effect by
+        // indexing the freshly-created resident explicitly.
+        let child1 = harness
+            .storage
+            .load_session(&id1)
+            .await
+            .unwrap()
+            .expect("child1 saved");
+        harness
+            .adapter
+            .session_store
+            .save_session(&child1)
+            .await
+            .unwrap();
+
+        // Second resident create with the SAME name: reuses the same session.
+        let r2 = harness
+            .tool
+            .execute_with_context(create("Essay: 山峰", "Write ~150 words about 山峰."), ctx("tc2"))
+            .await
+            .expect("second resident create");
+        let p2: serde_json::Value = serde_json::from_str(&r2.result).unwrap();
+        assert_eq!(
+            p2["child_session_id"].as_str().unwrap(),
+            id1,
+            "resident reuse must return the same child session"
+        );
+        assert_eq!(p2["reused"], json!(true));
+
+        // The reused child carries the resident metadata tags.
+        let child = harness
+            .storage
+            .load_session(&id1)
+            .await
+            .unwrap()
+            .expect("child exists");
+        assert_eq!(
+            child.metadata.get("lifecycle").map(String::as_str),
+            Some("resident")
+        );
+        assert_eq!(
+            child.metadata.get("resident_name").map(String::as_str),
+            Some("essayist")
+        );
+
+        // A one-shot create makes a DIFFERENT session.
+        let r3 = harness
+            .tool
+            .execute_with_context(
+                json!({
+                    "action": "create",
+                    "title": "OneShot",
+                    "responsibility": "Independent task",
+                    "prompt": "Do something unrelated.",
+                    "workspace": "/tmp/test-workspace",
+                    "auto_run": false
+                }),
+                ctx("tc3"),
+            )
+            .await
+            .expect("oneshot create");
+        let p3: serde_json::Value = serde_json::from_str(&r3.result).unwrap();
+        assert_ne!(
+            p3["child_session_id"].as_str().unwrap(),
+            id1,
+            "one-shot create must be a new session"
+        );
+    }
+
+    #[tokio::test]
     async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create() {
         let harness = build_test_harness().await;
 

@@ -68,6 +68,26 @@ pub async fn create_child_action(
         "assignment_prompt".to_string(),
         input.assignment_prompt.clone(),
     );
+    // Resident-agent tagging (plain metadata, like `responsibility` above). Only
+    // a resident carries these; their presence is how a later create reuses this
+    // session instead of minting a new one. Mirrored into the session index so
+    // the lookup + the frontend can read them without loading session.json.
+    if input.lifecycle.as_deref() == Some("resident") {
+        child
+            .metadata
+            .insert("lifecycle".to_string(), "resident".to_string());
+        if let Some(name) = input.resident_name.clone().filter(|n| !n.trim().is_empty()) {
+            child.metadata.insert("resident_name".to_string(), name);
+        }
+        child.metadata.insert(
+            "resident_context".to_string(),
+            input
+                .resident_context
+                .clone()
+                .filter(|c| matches!(c.as_str(), "reset" | "accumulate"))
+                .unwrap_or_else(|| "reset".to_string()),
+        );
+    }
     child.set_last_run_status("pending");
     child.clear_last_run_error();
 

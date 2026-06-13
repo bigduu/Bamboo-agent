@@ -101,12 +101,17 @@ pub async fn run() -> std::result::Result<(), String> {
         }
     });
 
-    // Serve a single connection (one-shot child), then clean up. If the parent
-    // never connects (e.g. it died right after spawning us), exit on our own
-    // instead of lingering as an orphan.
-    let serve_result = server
-        .serve_one_with_accept_timeout(executor, std::time::Duration::from_secs(120))
-        .await;
+    // Reusable actors serve connection-after-connection so the parent can pool
+    // and reuse them; one-shot children serve a single connection then exit. Both
+    // exit on their own if left idle (orphan/idle defense) rather than lingering.
+    let serve_result = if spec.reusable {
+        let idle = std::time::Duration::from_secs(spec.limits.idle_timeout_secs.unwrap_or(300));
+        server.serve_reusable_with_idle_timeout(executor, idle).await
+    } else {
+        server
+            .serve_one_with_accept_timeout(executor, std::time::Duration::from_secs(120))
+            .await
+    };
     renew.abort();
     let _ = fab.withdraw(&spec.identity.child_id).await;
     serve_result.map_err(|e| format!("serve: {e}"))

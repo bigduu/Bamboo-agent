@@ -46,6 +46,14 @@ pub struct SessionSummary {
     /// and for legacy children created before this field was introduced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_type: Option<String>,
+    /// Child lifecycle mirrored from `session.metadata["lifecycle"]`:
+    /// `"resident"` for a reusable resident agent, else absent (one-shot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
+    /// For a resident agent, the stable reuse key mirrored from
+    /// `session.metadata["resident_name"]` (so the frontend can group residents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident_name: Option<String>,
     /// Whether the session currently has a pending question awaiting user response.
     /// Sourced from `SessionIndexEntry.has_pending_question` for list endpoints
     /// and from `session.has_pending_question()` for detail endpoints.
@@ -90,6 +98,8 @@ impl SessionSummary {
             last_run_error: entry.last_run_error,
             token_usage: entry.token_usage,
             subagent_type: entry.subagent_type,
+            lifecycle: entry.lifecycle,
+            resident_name: entry.resident_name,
             has_pending_question: entry.has_pending_question,
             plan_mode: entry.plan_mode,
             running_child_count: 0,
@@ -365,6 +375,8 @@ mod tests {
             last_run_error: None,
             token_usage: None,
             subagent_type: None,
+            lifecycle: None,
+            resident_name: None,
             has_pending_question: false,
             plan_mode: None,
             running_child_count: 0,
@@ -405,6 +417,8 @@ mod tests {
             last_run_error: None,
             token_usage: None,
             subagent_type: None,
+            lifecycle: None,
+            resident_name: None,
             has_pending_question: false,
             plan_mode: None,
             running_child_count: 0,
@@ -532,6 +546,8 @@ mod tests {
             last_run_error: None,
             token_usage: None,
             subagent_type: None,
+            lifecycle: None,
+            resident_name: None,
             has_pending_question: false,
             plan_mode: None,
             running_child_count: 0,

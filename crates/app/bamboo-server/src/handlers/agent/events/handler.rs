@@ -91,5 +91,11 @@ pub async fn handler(
         "[{}] Events -> LIVE stream opened (kept open, awaiting runner events)",
         session_id,
     );
-    live_stream_response(budget_event_to_replay, critical_events_to_replay, receiver)
+    live_stream_response(
+        budget_event_to_replay,
+        critical_events_to_replay,
+        receiver,
+        state.clone(),
+        session_id,
+    )
 }

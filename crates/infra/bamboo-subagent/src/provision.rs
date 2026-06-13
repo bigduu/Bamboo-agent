@@ -47,6 +47,14 @@ pub struct ProvisionSpec {
     pub limits: Limits,
     #[serde(default)]
     pub secrets: SecretsEnvelope,
+    /// When true the worker serves connection-after-connection (a warm, reusable
+    /// actor) instead of exiting after one run. The parent pools such workers and
+    /// reuses an idle one for the next assignment with a matching fingerprint
+    /// (role/provider/model/workspace/tools), so N sibling sub-agents no longer
+    /// mean N processes. Each run still gets a fresh session rehydrated from the
+    /// run's `messages`, so context stays isolated across reuses.
+    #[serde(default)]
+    pub reusable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -127,6 +135,7 @@ impl ProvisionSpec {
             disabled_tools: None,
             limits: Limits::default(),
             secrets: SecretsEnvelope::default(),
+            reusable: false,
         }
     }
 

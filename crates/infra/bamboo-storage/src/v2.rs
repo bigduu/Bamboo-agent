@@ -142,6 +142,16 @@ pub struct SessionIndexEntry {
     /// field was introduced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_type: Option<String>,
+    /// Child lifecycle: `Some("resident")` for a reusable resident agent (a
+    /// stable session reused for successive tasks); `None`/absent for the
+    /// default one-shot child. Mirrored from `session.metadata["lifecycle"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
+    /// For a resident agent, the stable reuse key (scoped to `root_session_id`).
+    /// Mirrored from `session.metadata["resident_name"]`; lets a later
+    /// `SubAgent.create` find and reuse the resident without loading session.json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -491,6 +501,16 @@ impl SessionStoreV2 {
             .cloned()
             .filter(|v| !v.trim().is_empty());
         let subagent_type = session.subagent_type().filter(|v| !v.trim().is_empty());
+        let lifecycle = session
+            .metadata
+            .get("lifecycle")
+            .cloned()
+            .filter(|v| !v.trim().is_empty());
+        let resident_name = session
+            .metadata
+            .get("resident_name")
+            .cloned()
+            .filter(|v| !v.trim().is_empty());
         let gold_config_json = session
             .metadata
             .get("gold_config")
@@ -530,6 +550,8 @@ impl SessionStoreV2 {
                     last_run_error,
                     token_usage: session.token_usage.clone(),
                     subagent_type,
+                    lifecycle,
+                    resident_name,
                 },
             );
             Ok(())

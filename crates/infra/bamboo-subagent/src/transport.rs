@@ -83,6 +83,31 @@ impl WsServer {
         handle_conn(stream, executor).await
     }
 
+    /// Serve connection-after-connection for a **reusable** actor, one at a time.
+    ///
+    /// Unlike [`serve`], connections are handled serially (the next accept waits
+    /// for the current run to finish) so a pooled worker never runs two
+    /// assignments at once — preserving per-run context isolation. Unlike
+    /// [`serve_one`], the worker survives a connection close and is ready for the
+    /// next assignment. Exits when no new connection arrives within `idle_timeout`
+    /// (so an unreused worker reclaims itself instead of lingering forever). An
+    /// active run is never cut short — the timeout only guards the idle accept.
+    pub async fn serve_reusable_with_idle_timeout<E: ChildExecutor + ?Sized>(
+        self,
+        executor: Arc<E>,
+        idle_timeout: std::time::Duration,
+    ) -> TransportResult<()> {
+        loop {
+            let accept = tokio::time::timeout(idle_timeout, self.listener.accept()).await;
+            let (stream, _) = match accept {
+                Ok(res) => res?,
+                Err(_) => return Ok(()), // idle: reclaim self, clean exit
+            };
+            // Handle this assignment to completion before accepting the next.
+            let _ = handle_conn(stream, executor.clone()).await;
+        }
+    }
+
     /// Serve connections forever (long-running service agent).
     pub async fn serve<E: ChildExecutor + ?Sized>(self, executor: Arc<E>) -> TransportResult<()> {
         loop {
@@ -275,6 +300,58 @@ mod tests {
 
         let _ = client.close().await;
         let _ = srv.await;
+    }
+
+    async fn run_once(endpoint: &str, assignment: &str) -> (TerminalStatus, Option<String>) {
+        let mut client = ChildClient::connect(endpoint).await.unwrap();
+        client
+            .send(ParentFrame::Run(RunSpec {
+                assignment: assignment.into(),
+                reasoning_effort: None,
+                messages: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        let mut terminal = None;
+        while let Some(frame) = client.next_frame().await.unwrap() {
+            if let ChildFrame::Terminal { status, result, .. } = frame {
+                terminal = Some((status, result));
+                break;
+            }
+        }
+        let _ = client.close().await;
+        terminal.expect("terminal frame")
+    }
+
+    /// A reusable worker serves connection-after-connection (the pool's reuse
+    /// path), then reclaims itself once left idle past the timeout.
+    #[tokio::test]
+    async fn reusable_server_serves_sequential_connections_then_idles_out() {
+        use std::time::Duration;
+
+        let server = WsServer::bind_loopback().await.unwrap();
+        let endpoint = server.ws_endpoint();
+        let srv = tokio::spawn(async move {
+            server
+                .serve_reusable_with_idle_timeout(Arc::new(EchoExecutor), Duration::from_millis(400))
+                .await
+        });
+
+        // Two SEQUENTIAL assignments land on the SAME warm worker.
+        let (s1, r1) = run_once(&endpoint, "first").await;
+        assert_eq!(s1, TerminalStatus::Completed);
+        assert_eq!(r1.as_deref(), Some("echo: first"));
+
+        let (s2, r2) = run_once(&endpoint, "second").await;
+        assert_eq!(s2, TerminalStatus::Completed);
+        assert_eq!(r2.as_deref(), Some("echo: second"));
+
+        // No further connection: the worker idles out and exits cleanly.
+        let exited = tokio::time::timeout(Duration::from_secs(5), srv).await;
+        assert!(
+            matches!(exited, Ok(Ok(Ok(())))),
+            "reusable server should idle out cleanly, got {exited:?}"
+        );
     }
 
     /// Mid-run steering: a `Message` frame reaches the active run's SteerInbox.

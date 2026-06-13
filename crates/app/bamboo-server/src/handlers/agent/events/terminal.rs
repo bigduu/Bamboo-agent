@@ -121,7 +121,7 @@ pub(super) fn session_prevents_terminal_event(session: Option<&Session>) -> bool
         .is_some_and(|runtime| matches!(runtime.status, AgentStatusState::Suspended))
 }
 
-async fn has_running_child(state: &web::Data<AppState>, session_id: &str) -> bool {
+pub(super) async fn has_running_child(state: &web::Data<AppState>, session_id: &str) -> bool {
     let running_session_ids: Vec<String> = {
         let runners = state.agent_runners.read().await;
         runners

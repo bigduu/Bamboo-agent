@@ -438,6 +438,33 @@ impl ChildSessionPort for ChildSessionAdapter {
             .collect()
     }
 
+    async fn find_resident_child(
+        &self,
+        root_session_id: &str,
+        resident_name: &str,
+    ) -> Option<String> {
+        let name = resident_name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        // Scan the index for a child in this root tree tagged with the resident
+        // name. Prefer the most recently updated if (defensively) more than one
+        // exists. Index-backed: no session.json loads.
+        let mut best: Option<(String, chrono::DateTime<chrono::Utc>)> = None;
+        for entry in self.session_store.list_index_entries().await {
+            if entry.kind == SessionKind::Child
+                && entry.root_session_id == root_session_id
+                && entry.resident_name.as_deref() == Some(name)
+            {
+                match &best {
+                    Some((_, ts)) if *ts >= entry.updated_at => {}
+                    _ => best = Some((entry.id.clone(), entry.updated_at)),
+                }
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
     async fn enqueue_child_run(
         &self,
         parent: &Session,

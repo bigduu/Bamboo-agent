@@ -157,6 +157,15 @@ pub struct CreateChildInput {
     /// only need a quick lookup should not pay for `xhigh` reasoning
     /// just because the orchestrator is running at `xhigh`.
     pub reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
+    /// Lifecycle of this child: `Some("resident")` marks a reusable resident
+    /// agent (one stable session reused for successive tasks under the same
+    /// root); `None`/`Some("oneshot")` is the default throwaway child.
+    pub lifecycle: Option<String>,
+    /// For a resident agent, the stable reuse key (scoped to the root session).
+    pub resident_name: Option<String>,
+    /// For a resident agent, how successive tasks treat prior context:
+    /// `"reset"` (default — independent tasks) or `"accumulate"` (remember).
+    pub resident_context: Option<String>,
 }
 
 /// Result of creating a child session.
@@ -224,6 +233,16 @@ pub trait ChildSessionPort: Send + Sync {
 
     /// The parent's currently-active (non-terminal) child session ids.
     async fn active_child_ids(&self, parent_session_id: &str) -> Vec<String>;
+
+    /// Find an existing resident agent in the same root tree by its stable
+    /// `resident_name`, returning its child session id if one exists. Used to
+    /// reuse a resident agent for a new task instead of minting a new child.
+    /// Index-backed (matches `root_session_id` + `metadata["resident_name"]`).
+    async fn find_resident_child(
+        &self,
+        root_session_id: &str,
+        resident_name: &str,
+    ) -> Option<String>;
 
     /// Best-effort: ensure the child's session-index entry is visible
     /// immediately after creation (the index is otherwise eventually
