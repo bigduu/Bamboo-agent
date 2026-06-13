@@ -258,8 +258,8 @@ jobs:
 
           publish_one() {
             local crate="$1"
-            local output
-            local status
+            local output status attempt=1
+            local max_attempts=25
 
             if crate_exists "${crate}" "${TARGET_VERSION}"; then
               echo "${crate}@${TARGET_VERSION} already exists on crates.io; skipping publish."
@@ -267,23 +267,48 @@ jobs:
               return 0
             fi
 
-            echo "Publishing ${crate}@${TARGET_VERSION}"
-            set +e
-            output="$(cargo publish --allow-dirty -p "${crate}" 2>&1)"
-            status=$?
-            set -e
+            while [ "${attempt}" -le "${max_attempts}" ]; do
+              echo "Publishing ${crate}@${TARGET_VERSION} (attempt ${attempt}/${max_attempts})"
+              set +e
+              output="$(cargo publish --allow-dirty -p "${crate}" 2>&1)"
+              status=$?
+              set -e
+              echo "${output}"
 
-            echo "${output}"
-
-            if [ ${status} -ne 0 ]; then
-              if echo "${output}" | grep -qi "already exists on crates.io index"; then
-                echo "${crate}@${TARGET_VERSION} already exists on crates.io index; continuing."
-              else
-                return ${status}
+              if [ ${status} -eq 0 ] || echo "${output}" | grep -qi "already exists on crates.io index"; then
+                wait_for_crate "${crate}" "${TARGET_VERSION}"
+                return 0
               fi
-            fi
 
-            wait_for_crate "${crate}" "${TARGET_VERSION}"
+              # crates.io throttles brand-new crate names (HTTP 429). This only
+              # bites while bootstrapping never-before-published names; publishing
+              # new versions of existing crates is not limited this way. Honor the
+              # advertised retry time and try again.
+              if echo "${output}" | grep -qi "429 Too Many Requests"; then
+                local retry_after wait_s target_epoch now_epoch
+                retry_after="$(printf '%s\n' "${output}" | grep -oiE "try again after [A-Za-z0-9:, ]*GMT" | head -1 | sed -E 's/^try again after //I')"
+                wait_s=120
+                if [ -n "${retry_after}" ]; then
+                  target_epoch="$(date -u -d "${retry_after}" +%s 2>/dev/null || echo 0)"
+                  now_epoch="$(date -u +%s)"
+                  if [ "${target_epoch}" -gt 0 ]; then
+                    wait_s=$(( target_epoch - now_epoch + 10 ))
+                  fi
+                fi
+                [ "${wait_s}" -lt 15 ] && wait_s=15
+                [ "${wait_s}" -gt 1200 ] && wait_s=1200
+                echo "Rate limited by crates.io; waiting ${wait_s}s before retrying ${crate} (until ${retry_after:-unknown})..."
+                sleep "${wait_s}"
+                attempt=$((attempt + 1))
+                continue
+              fi
+
+              # Any other failure is fatal.
+              return ${status}
+            done
+
+            echo "Gave up on ${crate} after ${max_attempts} attempts (persistent rate limiting)."
+            return 1
           }
 
           # Publish order is derived from the real dependency graph
