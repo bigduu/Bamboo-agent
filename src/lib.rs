@@ -61,8 +61,18 @@ pub use bamboo_server as server;
 // Ergonomic re-export: `bamboo_agent::tools` → `bamboo_tools` for backward compatibility.
 pub use bamboo_tools as tools;
 
-// Compatibility re-export matching the published crate API (`bamboo_agent::core::...`).
-pub use bamboo_infrastructure as core;
+// Compatibility surface matching the PUBLISHED crate API (`bamboo_agent::core::...`).
+// `core` mirrors the infrastructure crate, plus a back-compat re-export of `paths`
+// and `ProxyAuth` — which moved out of `bamboo_infrastructure` into `bamboo_config`
+// in the 2026.6 reorg. Downstream consumers (e.g. bodhi) build against the published
+// bamboo-agent where these still live under `core::`; re-exporting them here keeps a
+// single `core::` import compiling against this local checkout too. The explicit
+// names take precedence over the glob, so there is no conflict.
+// See memory: bodhi-ci-builds-against-published-bamboo.
+pub mod core {
+    pub use bamboo_config::{paths, ProxyAuth};
+    pub use bamboo_infrastructure::*;
+}
 
 // Re-export infrastructure crate so consumers can access config, paths, encryption, etc.
 // via `bamboo_agent::infrastructure::...`
