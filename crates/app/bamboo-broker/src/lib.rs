@@ -16,16 +16,22 @@
 //! - [`core`] — [`BrokerCore`], the transport-agnostic routing engine (tested in-process).
 //! - the WebSocket server + auth + `bamboo broker serve` wiring layer on top (added next).
 
+pub mod ask;
 pub mod client;
 pub mod core;
+pub mod deploy;
 pub mod proto;
 pub mod serve;
 pub mod server;
 
 mod error;
 
+pub use crate::ask::{ask_agent, ask_over};
 pub use crate::client::BrokerClient;
 pub use crate::core::BrokerCore;
+pub use crate::deploy::{
+    AgentDeployment, DeployedAgent, Deployer, DockerDeployer, LocalProcessDeployer, SshDeployer,
+};
 pub use crate::error::{BrokerError, BrokerResult};
 pub use crate::proto::{BrokerFrame, ClientFrame};
 pub use crate::serve::{serve_executor, serve_loop, serve_mailbox, serve_with, Handled};

@@ -49,6 +49,10 @@ pub mod commands;
 /// The `bamboo subagent-worker` actor worker (provision via stdin, serve over WS).
 pub mod subagent_worker;
 
+/// The `bamboo broker-agent serve` worker: connect to a central broker and
+/// answer Ask/Task (query/steer) for its mailbox; deployable local/Docker/remote.
+pub mod broker_agent;
+
 /// The `bamboo actor run` CLI: drive an actor from the terminal.
 pub mod actor_cli;
 

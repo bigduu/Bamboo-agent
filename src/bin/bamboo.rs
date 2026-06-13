@@ -170,6 +170,15 @@ enum Commands {
         #[command(subcommand)]
         command: BrokerCommands,
     },
+
+    /// Run a broker-connected agent: connect to a central broker and answer
+    /// Ask/Task (query/steer) for this agent's mailbox. Deploy locally, in
+    /// Docker, or on a remote host — it only needs `--broker` + `--token`.
+    #[command(name = "broker-agent")]
+    BrokerAgent {
+        #[command(subcommand)]
+        command: BrokerAgentCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -190,6 +199,40 @@ enum BrokerCommands {
         /// Durable mailbox storage root. Defaults to `<bamboo_dir>/broker`.
         #[arg(long)]
         root: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum BrokerAgentCommands {
+    /// Connect to a broker and serve this agent's mailbox until terminated.
+    Serve {
+        /// Broker WebSocket endpoint, e.g. `ws://broker-host:9600`.
+        #[arg(long)]
+        broker: String,
+
+        /// Bearer token (falls back to the `BAMBOO_BROKER_TOKEN` env var).
+        #[arg(long)]
+        token: Option<String>,
+
+        /// This agent's mailbox key / session id — how it is addressed.
+        #[arg(long)]
+        id: String,
+
+        /// Optional role/profile label.
+        #[arg(long)]
+        role: Option<String>,
+
+        /// Optional model `provider:model` (real mode).
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Optional workspace directory for file tools (real mode).
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// Use the dependency-free echo executor (no LLM) — for smoke tests.
+        #[arg(long)]
+        echo: bool,
     },
 }
 
@@ -299,6 +342,7 @@ async fn main() {
         Some(Commands::SubagentWorker)
         | Some(Commands::Actor { .. })
         | Some(Commands::Broker { .. })
+        | Some(Commands::BrokerAgent { .. })
         | None => {
             // Worker/CLI logs go to stderr only: stdin/stdout are part of the
             // bootstrap & streaming protocol and must stay clean. (`None` is
@@ -548,6 +592,45 @@ async fn main() {
             let server = std::sync::Arc::new(bamboo_broker::BrokerServer::new(core, token));
             if let Err(e) = server.serve(listener).await {
                 eprintln!("broker server failed: {e}");
+                std::process::exit(1);
+            }
+        }
+
+        Commands::BrokerAgent { command } => {
+            let BrokerAgentCommands::Serve {
+                broker,
+                token,
+                id,
+                role,
+                model,
+                workspace,
+                echo,
+            } = command;
+            let token = match token
+                .or_else(|| std::env::var("BAMBOO_BROKER_TOKEN").ok())
+                .filter(|t| !t.is_empty())
+            {
+                Some(t) => t,
+                None => {
+                    eprintln!(
+                        "broker-agent: a Bearer token is required (pass --token or set BAMBOO_BROKER_TOKEN)"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let result =
+                bamboo_agent::broker_agent::run(bamboo_agent::broker_agent::BrokerAgentArgs {
+                    broker,
+                    token,
+                    id,
+                    role,
+                    model,
+                    workspace,
+                    echo,
+                })
+                .await;
+            if let Err(e) = result {
+                eprintln!("broker-agent failed: {e}");
                 std::process::exit(1);
             }
         }
