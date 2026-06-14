@@ -40,20 +40,19 @@ pub(super) async fn write_model_limits_file(
     match value {
         None => remove_file_if_exists(&path).await,
         Some(value) => {
-            // Diff-only storage: a row identical to the global default carries no
-            // information, so drop it. This keeps `model_limits.json` to genuine
-            // overrides and lets future default changes propagate to everyone.
+            // Persist ALL user-provided overrides, including rows that happen to
+            // match the current global default. The previous diff-only design
+            // silently dropped rows matching the compile-time default, which made
+            // it impossible to explicitly pin a model whose real limit equals the
+            // default — and when the default later changed, those implicit
+            // settings were lost.
             let limits: Vec<ModelLimit> = serde_json::from_value(value.clone())?;
-            let overrides: Vec<ModelLimit> = limits
-                .into_iter()
-                .filter(|limit| !bamboo_compression::limits::is_default_limit(limit))
-                .collect();
 
-            if overrides.is_empty() {
+            if limits.is_empty() {
                 return remove_file_if_exists(&path).await;
             }
 
-            let content = serde_json::to_string_pretty(&overrides)?;
+            let content = serde_json::to_string_pretty(&limits)?;
             tokio::fs::write(&path, content)
                 .await
                 .map_err(AppError::StorageError)?;

@@ -23,7 +23,7 @@ struct ModelLimitDefaultsResponse {
 }
 
 /// Returns the single global model-limit default from the backend
-/// source-of-truth (`200K` context / `64K` output).
+/// source-of-truth (`1M` context / `64K` output).
 pub async fn get_model_limit_defaults() -> Result<HttpResponse, AppError> {
     let limit = default_model_limit();
     let default = ModelLimitDefault {
@@ -66,9 +66,9 @@ mod tests {
 
         let default = &payload.model_limits[0];
         assert_eq!(default.model_pattern, "default");
-        assert_eq!(default.max_context_tokens, 200_000);
+        assert_eq!(default.max_context_tokens, 1_000_000);
         assert_eq!(default.max_output_tokens, 64_000);
-        // Safety margin scales with context window: max(200_000 / 100, 1_000).
-        assert_eq!(default.safety_margin, 2_000);
+        // Safety margin scales with context window: max(1_000_000 / 100, 1_000).
+        assert_eq!(default.safety_margin, 10_000);
     }
 }

@@ -113,21 +113,19 @@ async fn remove_config_file_if_exists_deletes_model_limits_file() {
     assert!(!path.exists());
 }
 
-// --- Diff-only storage (integration over the persistence seam) ------------
+// --- Full persistence (all user-provided overrides are stored) ------------
 
-/// Saving a mix of a real override and a no-op (default-equal) row must persist
-/// only the real override, then read it back through the same seam GET uses.
+/// All user-provided rows must be persisted, including rows that happen to
+/// match the global default.
 #[actix_web::test]
-async fn write_model_limits_file_drops_default_equal_rows_round_trip() {
+async fn write_model_limits_file_persists_all_rows_round_trip() {
     let dir = tempdir().expect("temp dir should be created");
 
     write_model_limits_file(
         dir.path(),
         Some(&serde_json::json!([
-            // Real override: smaller context than the 200K default.
             { "model_pattern": "gpt-4o", "max_context_tokens": 128000, "max_output_tokens": 16384 },
-            // No-op: identical to the global default (200K / 64K, no safety margin).
-            { "model_pattern": "some-default-model", "max_context_tokens": 200000, "max_output_tokens": 64000 }
+            { "model_pattern": "some-default-model", "max_context_tokens": 1000000, "max_output_tokens": 64000 }
         ])),
     )
     .await
@@ -139,15 +137,15 @@ async fn write_model_limits_file_drops_default_equal_rows_round_trip() {
         .expect("file should exist");
 
     let rows = persisted.as_array().expect("array");
-    assert_eq!(rows.len(), 1, "default-equal row must be dropped");
+    assert_eq!(rows.len(), 2, "all rows must be persisted");
     assert_eq!(rows[0]["model_pattern"], "gpt-4o");
-    assert_eq!(rows[0]["max_context_tokens"], 128000);
+    assert_eq!(rows[1]["model_pattern"], "some-default-model");
 }
 
-/// Saving only no-op rows must remove the file entirely so everything falls
-/// back to the global default.
+/// Saving an empty overrides array must remove the file entirely so
+/// everything falls back to the global default.
 #[actix_web::test]
-async fn write_model_limits_file_removes_file_when_all_rows_default_equal() {
+async fn write_model_limits_file_removes_file_when_empty() {
     let dir = tempdir().expect("temp dir should be created");
     let path = model_limits_file_path(dir.path());
 
@@ -159,19 +157,17 @@ async fn write_model_limits_file_removes_file_when_all_rows_default_equal() {
     .await
     .expect("seed file");
 
-    // User reverts everything to default → all rows are no-ops.
+    // User clears all overrides → empty array.
     write_model_limits_file(
         dir.path(),
-        Some(&serde_json::json!([
-            { "model_pattern": "gpt-4o", "max_context_tokens": 200000, "max_output_tokens": 64000 }
-        ])),
+        Some(&serde_json::json!([])),
     )
     .await
     .expect("write should succeed");
 
     assert!(
         !path.exists(),
-        "file should be removed when no overrides remain"
+        "file should be removed when overrides list is empty"
     );
     assert!(read_model_limits_file(dir.path())
         .await
@@ -179,10 +175,9 @@ async fn write_model_limits_file_removes_file_when_all_rows_default_equal() {
         .is_none());
 }
 
-/// An explicit safety margin is a real override even at the default size and
-/// must be persisted.
+/// An explicit safety margin must be persisted alongside the override.
 #[actix_web::test]
-async fn write_model_limits_file_keeps_default_size_with_custom_safety_margin() {
+async fn write_model_limits_file_keeps_custom_safety_margin() {
     let dir = tempdir().expect("temp dir should be created");
 
     write_model_limits_file(
@@ -204,12 +199,12 @@ async fn write_model_limits_file_keeps_default_size_with_custom_safety_margin() 
 }
 
 /// End-to-end over the real HTTP handlers + `AppState`: POST a config carrying
-/// `model_limits` (one real override + one no-op), then GET it back. Asserts:
-/// - only the real override is persisted (diff-only),
+/// `model_limits` (two overrides), then GET it back. Asserts:
+/// - ALL overrides are persisted (including default-equal rows),
 /// - `config.json` does NOT carry the `model_limits` key (it is split out),
 /// - GET re-injects `model_limits` from the dedicated file.
 #[actix_web::test]
-async fn set_then_get_bamboo_config_round_trips_only_overrides() {
+async fn set_then_get_bamboo_config_round_trips_all_overrides() {
     use crate::app_state::AppState;
     use actix_web::{test, web, App};
 
@@ -241,14 +236,15 @@ async fn set_then_get_bamboo_config_round_trips_only_overrides() {
     let post_resp = test::call_service(&app, post).await;
     assert!(post_resp.status().is_success(), "set config should succeed");
 
-    // Diff-only: only the real override survives on disk.
+    // All overrides survive on disk (no diff-only filtering).
     let on_disk = read_model_limits_file(&data_dir)
         .await
         .expect("read should succeed")
         .expect("model_limits.json should exist");
     let rows = on_disk.as_array().expect("array");
-    assert_eq!(rows.len(), 1, "no-op row must be dropped");
+    assert_eq!(rows.len(), 2, "all rows must be persisted");
     assert_eq!(rows[0]["model_pattern"], "gpt-4o");
+    assert_eq!(rows[1]["model_pattern"], "noop");
 
     // config.json must not carry the model_limits key.
     let config_text = tokio::fs::read_to_string(config_file_path(&data_dir))
@@ -267,7 +263,7 @@ async fn set_then_get_bamboo_config_round_trips_only_overrides() {
     let limits = body["model_limits"]
         .as_array()
         .expect("model_limits should be present in GET response");
-    assert_eq!(limits.len(), 1);
+    assert_eq!(limits.len(), 2);
     assert_eq!(limits[0]["model_pattern"], "gpt-4o");
     assert_eq!(limits[0]["max_context_tokens"], 128000);
 }

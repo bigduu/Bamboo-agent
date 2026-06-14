@@ -18,9 +18,9 @@ use std::path::PathBuf;
 pub const DEFAULT_MODEL_PATTERN: &str = "default";
 
 /// Global default context window applied to any model without a provider
-/// metadata value or a user override. 200K is a mainstream range across
-/// current frontier models.
-pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 200_000;
+/// metadata value or a user override. 1M reflects the current mainstream
+/// range across frontier models (Claude 3.5, GPT-4o, Gemini 1.5, etc.).
+pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 1_000_000;
 
 /// Global default maximum output tokens.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 64_000;
@@ -29,7 +29,7 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 64_000;
 /// window via [`ModelLimit::get_safety_margin`]).
 pub const DEFAULT_SAFETY_MARGIN: u32 = 1000;
 
-/// Build the single global default limit (`200K` context / `64K` output).
+/// Build the single global default limit (`1M` context / `64K` output).
 pub fn default_model_limit() -> ModelLimit {
     builtin_limit(
         DEFAULT_MODEL_PATTERN,
@@ -289,10 +289,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_limit_is_200k_64k() {
+    fn default_limit_is_1m_64k() {
         let limit = default_model_limit();
         assert_eq!(limit.model_pattern, DEFAULT_MODEL_PATTERN);
-        assert_eq!(limit.max_context_tokens, 200_000);
+        assert_eq!(limit.max_context_tokens, 1_000_000);
         assert_eq!(limit.get_max_output_tokens(), 64_000);
     }
 
@@ -331,7 +331,7 @@ mod tests {
         let registry = ModelLimitsRegistry::new();
         let limit = registry.get_or_default("unknown-model-xyz");
         assert_eq!(limit.model_pattern, DEFAULT_MODEL_PATTERN);
-        assert_eq!(limit.max_context_tokens, 200_000);
+        assert_eq!(limit.max_context_tokens, 1_000_000);
         assert_eq!(limit.get_max_output_tokens(), 64_000);
     }
 
@@ -457,14 +457,14 @@ mod tests {
         // Unknown model with no override falls back to the single global default.
         let unknown = registry.get_or_default("brand-new-frontier-model");
         assert_eq!(unknown.model_pattern, DEFAULT_MODEL_PATTERN);
-        assert_eq!(unknown.max_context_tokens, 200_000);
+        assert_eq!(unknown.max_context_tokens, 1_000_000);
         assert_eq!(unknown.get_max_output_tokens(), 64_000);
     }
 
     #[test]
     fn create_budget_for_model_uses_global_default_for_any_model() {
         let budget = create_budget_for_model("anything-at-all", crate::BudgetStrategy::default());
-        assert_eq!(budget.max_context_tokens, 200_000);
+        assert_eq!(budget.max_context_tokens, 1_000_000);
         assert_eq!(budget.max_output_tokens, 64_000);
     }
 }
