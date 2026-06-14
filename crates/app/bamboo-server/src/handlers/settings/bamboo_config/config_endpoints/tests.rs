@@ -158,12 +158,9 @@ async fn write_model_limits_file_removes_file_when_empty() {
     .expect("seed file");
 
     // User clears all overrides → empty array.
-    write_model_limits_file(
-        dir.path(),
-        Some(&serde_json::json!([])),
-    )
-    .await
-    .expect("write should succeed");
+    write_model_limits_file(dir.path(), Some(&serde_json::json!([])))
+        .await
+        .expect("write should succeed");
 
     assert!(
         !path.exists(),
