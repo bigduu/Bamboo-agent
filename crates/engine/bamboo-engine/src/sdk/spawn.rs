@@ -254,20 +254,18 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         // dispatch to the composite child runner. The built-in local actor
         // handles the default case; expert `externalAgents` profiles handle
         // roles pinned to other agents. `should_handle` selects the right one.
-        let result: crate::runtime::runner::Result<()> = if external_runner
-            .should_handle(&session)
-            .await
-        {
-            external_runner
-                .execute_external_child(&mut session, &job, mpsc_tx, cancel_token.clone())
-                .await
-        } else {
-            Err(bamboo_agent_core::AgentError::LLM(format!(
+        let result: crate::runtime::runner::Result<()> =
+            if external_runner.should_handle(&session).await {
+                external_runner
+                    .execute_external_child(&mut session, &job, mpsc_tx, cancel_token.clone())
+                    .await
+            } else {
+                Err(bamboo_agent_core::AgentError::LLM(format!(
                 "No child runner matched session runtime metadata: agent_id={:?}, protocol={:?}",
                 session.metadata.get("external.agent_id"),
                 session.metadata.get("external.protocol"),
             )))
-        };
+            };
 
         let timeout_error = timeout_reason.read().await.clone();
         let (status, error) = if let Some(reason) = timeout_error {
