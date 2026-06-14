@@ -589,6 +589,54 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 ),
             ],
         )),
+        "deploy_agent" => Some(guide(
+            "deploy_agent",
+            ToolCategory::TaskManagement,
+            "Spin up a new worker agent on demand and manage its lifecycle. action=deploy launches a fresh broker-agent as a local subprocess (env=local), a Docker container (env=docker, needs image), or a remote SSH host (env=ssh, needs host); it joins the same message broker, inherits your MCP servers + skills, and returns an id you then drive with ask_agent. action=list shows running workers; action=stop tears one down. Use it to scale yourself out — parallel hands locally, sandboxed work in Docker, or compute on another machine.",
+            "Do not use when an existing worker (deploy_agent action=list) can take the task — reuse it with ask_agent instead of deploying a duplicate; do not use for in-context delegation that does not need a separate process (use SubAgent); always action=stop workers once their work is collected.",
+            &["ask_agent", "SubAgent"],
+            vec![
+                example(
+                    "Deploy a local worker",
+                    json!({"action":"deploy","env":"local","role":"tester","model":"anthropic:claude-opus-4-8"}),
+                    "Use for an extra parallel agent on this machine; the returned id is ask_agent's target.",
+                ),
+                example(
+                    "Deploy a sandboxed Docker worker",
+                    json!({"action":"deploy","env":"docker","image":"bamboo:latest","role":"researcher"}),
+                    "Use for isolated/clean-env work; your bamboo home is mounted so it shares your config.",
+                ),
+                example(
+                    "Deploy on a remote host",
+                    json!({"action":"deploy","env":"ssh","host":"user@build-box","role":"builder"}),
+                    "Use to run work near other machines or to borrow remote compute.",
+                ),
+                example(
+                    "List then stop a worker",
+                    json!({"action":"stop","id":"agent-7f8e9d"}),
+                    "Use action=list to see running workers, then action=stop once a worker's work is done.",
+                ),
+            ],
+        )),
+        "ask_agent" => Some(guide(
+            "ask_agent",
+            ToolCategory::TaskManagement,
+            "Command another running agent (deployed locally, in Docker, or on a remote host) over the message broker and get its answer back synchronously. target is the agent's broker id (from deploy_agent, or a peer's session id). mode=query (default) is READ-ONLY — the target summarizes/extracts from its current state without changing course, safe to poll repeatedly. mode=steer is WRITE — your question is injected into the target's live conversation to redirect or advance its work (assign the next task, hand off context).",
+            "Do not use to talk to yourself or to an agent that does not exist yet — deploy it with deploy_agent first; do not use mode=steer when you only want to read progress (use query); for in-context delegation without a separate process, use SubAgent instead.",
+            &["deploy_agent", "SubAgent"],
+            vec![
+                example(
+                    "Poll a worker's progress (read-only)",
+                    json!({"target":"agent-1a2b3c","question":"Summarize the auth flow you found so far.","mode":"query"}),
+                    "Use query to pull a result or check status without disturbing the target's work.",
+                ),
+                example(
+                    "Reassign or advance a worker (steer)",
+                    json!({"target":"agent-1a2b3c","question":"Now write the fix to src/auth.rs and run the tests.","mode":"steer","timeout_secs":180}),
+                    "Use steer to inject a new task into the target's conversation; raise timeout_secs for slow work.",
+                ),
+            ],
+        )),
         _ => None,
     }
 }
@@ -661,5 +709,38 @@ mod tests {
                 .and_then(|value| value.as_str())
                 == Some("merge")
         }));
+    }
+
+    #[test]
+    fn broker_server_tools_have_fallback_guide_specs() {
+        // deploy_agent: covers all three placements + a steer example via ask_agent.
+        let deploy = builtin_guide_spec("deploy_agent").expect("deploy_agent guide should exist");
+        assert_eq!(deploy.tool_name, "deploy_agent");
+        assert!(deploy.related_tools.iter().any(|t| t == "ask_agent"));
+        for env in ["local", "docker", "ssh"] {
+            assert!(
+                deploy.examples.iter().any(|example| example
+                    .parameters
+                    .get("env")
+                    .and_then(|value| value.as_str())
+                    == Some(env)),
+                "deploy_agent guide should show an env={env} example"
+            );
+        }
+
+        // ask_agent: must teach both query (read-only) and steer (write) modes.
+        let ask = builtin_guide_spec("ask_agent").expect("ask_agent guide should exist");
+        assert_eq!(ask.tool_name, "ask_agent");
+        assert!(ask.related_tools.iter().any(|t| t == "deploy_agent"));
+        for mode in ["query", "steer"] {
+            assert!(
+                ask.examples.iter().any(|example| example
+                    .parameters
+                    .get("mode")
+                    .and_then(|value| value.as_str())
+                    == Some(mode)),
+                "ask_agent guide should show a mode={mode} example"
+            );
+        }
     }
 }

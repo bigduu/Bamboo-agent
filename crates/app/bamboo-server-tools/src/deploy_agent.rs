@@ -203,11 +203,33 @@ impl Tool for DeployAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Deploy a new worker agent on demand and manage it. action=deploy spins up a broker-agent \
-         (env=local subprocess, docker container, or ssh remote host) wired to the message broker \
-         and returns its id — then command it with ask_agent(target=<id>). action=stop tears one \
-         down; action=list shows running workers. Use this to scale out work to fresh agents, \
-         locally or on other machines."
+        "Spin up a NEW worker agent on demand, anywhere, and manage its lifecycle. This is how you \
+         scale yourself out: you deploy a fresh broker-agent, then drive it with ask_agent. The \
+         worker connects back to the same message broker you are on, and inherits your MCP servers \
+         + skills (via the orchestrator MCP proxy), so it can do real work — not just echo.\n\
+         \n\
+         THREE PLACEMENTS (action=deploy, pick with `env`):\n\
+         - env=local (default) — a subprocess on THIS machine. Fastest; use for extra parallel \
+         hands here.\n\
+         - env=docker — a container (requires `image`, e.g. \"bamboo:latest\"). Isolated; your \
+         bamboo home is mounted so it shares your config. Use for sandboxed or clean-env work.\n\
+         - env=ssh — a process on a REMOTE host (requires `host`, e.g. \"user@box\"). Use to run \
+         work near other machines/data or to borrow remote compute.\n\
+         \n\
+         OTHER ACTIONS: action=stop (id=…) tears a worker down and frees it; action=list shows the \
+         workers you currently have running. Workers are kept alive until you stop them or the \
+         server exits.\n\
+         \n\
+         WORKED EXAMPLE (scale out, use, tear down):\n\
+         1. deploy_agent(action=deploy, env=local, role=\"tester\", model=\"anthropic:claude-opus-4-8\") \
+         → returns id \"agent-7f8e9d\".\n\
+         2. ask_agent(target=\"agent-7f8e9d\", question=\"Run the full test suite and report \
+         failures.\", mode=steer).\n\
+         3. deploy_agent(action=list) → confirm it (and any siblings) are running.\n\
+         4. deploy_agent(action=stop, id=\"agent-7f8e9d\") → once its work is collected.\n\
+         \n\
+         Tip: use echo=true to deploy a dependency-free no-LLM worker for a connectivity smoke test \
+         before committing to a real model. Returned id is what you pass as ask_agent's `target`."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
