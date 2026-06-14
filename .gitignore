@@ -2,6 +2,10 @@
 /target/
 **/*.rs.bk
 
+# Vendored crates (host-side `cargo vendor` for offline docker builds; never
+# committed — CI builds from crates.io directly)
+/vendor/
+
 # IDEs
 .idea/
 .vscode/

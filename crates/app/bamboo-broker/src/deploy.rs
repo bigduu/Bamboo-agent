@@ -138,10 +138,13 @@ pub struct DockerDeployer {
     pub bamboo_in_image: String,
     /// e.g. `Some("host")` so the container can reach a `127.0.0.1` broker.
     pub network: Option<String>,
-    /// Host bamboo home dir to mount read-only at `/root/.bamboo`, so the
-    /// containerized worker reads the orchestrator's config — and thereby syncs
-    /// its MCP servers + skills. (Trusted-local convenience; it also exposes the
-    /// config's secrets to the container — P3 will scope this down.)
+    /// Host bamboo home dir to seed the worker from: mounted read-only at
+    /// `/seed`, then config + encryption key + skills are copied into the
+    /// container's writable data dir at startup, so the worker reads the
+    /// orchestrator's config (MCP servers + skills + provider creds) while
+    /// keeping an isolated, writable data dir. (Trusted-local convenience; it
+    /// also exposes the config's secrets to the container — P3 will scope this
+    /// down.)
     pub mount_home: Option<PathBuf>,
 }
 
@@ -186,12 +189,49 @@ impl DockerDeployer {
             a.push(net.clone());
         }
         if let Some(home) = &self.mount_home {
+            // Seed the worker from the orchestrator's home, but DON'T run on a
+            // read-only mount of it: the worker writes the moment it starts
+            // (skill-store builtin sync, session/event persistence), so a
+            // `:ro` data dir fails with EROFS. Instead mount the home read-only
+            // at /seed and copy just the credentials + skills into the image's
+            // writable BAMBOO_DATA_DIR at startup. The worker gets an isolated,
+            // fully writable data dir and the orchestrator's home stays pristine
+            // (no shared session store, no concurrent-write corruption).
             a.push("-v".into());
-            a.push(format!("{}:/root/.bamboo:ro", home.display()));
+            a.push(format!("{}:/seed:ro", home.display()));
+            // Override the entrypoint to a shell that seeds /data then execs the
+            // in-image bamboo. (Default ENTRYPOINT is `bamboo`; we need the copy
+            // step first.) BAMBOO_DATA_DIR comes from the image ENV (/data).
+            a.push("--entrypoint".into());
+            a.push("/bin/sh".into());
+            a.push(self.image.clone());
+            let mut script = String::from(
+                "BAMBOO_DATA_DIR=\"${BAMBOO_DATA_DIR:-/data}\"; export BAMBOO_DATA_DIR; \
+                 mkdir -p \"$BAMBOO_DATA_DIR\"; \
+                 for f in config.json .bamboo_encryption_key; do \
+                   [ -e \"/seed/$f\" ] && cp -f \"/seed/$f\" \"$BAMBOO_DATA_DIR/\"; \
+                 done; \
+                 [ -d /seed/skills ] && cp -rf /seed/skills \"$BAMBOO_DATA_DIR/\"; \
+                 exec ",
+            );
+            script.push_str(&sh_quote(&self.bamboo_in_image));
+            for arg in agent_argv(d) {
+                script.push(' ');
+                script.push_str(&sh_quote(&arg));
+            }
+            a.push("-c".into());
+            a.push(script);
+        } else {
+            // No seed: run the in-image bamboo directly. Override the entrypoint
+            // to the bamboo binary, then pass the broker-agent args. The image's
+            // default ENTRYPOINT is already `bamboo`, so pushing `bamboo` as the
+            // first command arg would double up (`bamboo bamboo broker-agent
+            // serve` → unrecognized subcommand).
+            a.push("--entrypoint".to_string());
+            a.push(self.bamboo_in_image.clone());
+            a.push(self.image.clone());
+            a.extend(agent_argv(d));
         }
-        a.push(self.image.clone());
-        a.push(self.bamboo_in_image.clone());
-        a.extend(agent_argv(d));
         a
     }
 }
@@ -339,10 +379,13 @@ mod tests {
         assert!(a.contains(&"BAMBOO_BROKER_TOKEN=tok".to_string()));
         assert!(a.contains(&"--network".to_string()) && a.contains(&"host".to_string()));
         assert!(a.contains(&"bamboo:latest".to_string()));
-        // the in-image bamboo + the broker-agent args follow the image.
+        // --entrypoint bamboo precedes the image; the command after the image is
+        // the broker-agent invocation directly (no doubled `bamboo`).
+        assert!(a
+            .windows(2)
+            .any(|w| w == ["--entrypoint".to_string(), "bamboo".to_string()]));
         let img = a.iter().position(|x| x == "bamboo:latest").unwrap();
-        assert_eq!(a[img + 1], "bamboo");
-        assert_eq!(a[img + 2], "broker-agent");
+        assert_eq!(a[img + 1], "broker-agent");
     }
 
     #[test]
@@ -385,7 +428,20 @@ mod tests {
     fn docker_argv_mounts_home_when_set() {
         let d = DockerDeployer::new("img").mount_home("/home/u/.bamboo");
         let a = d.argv(&dep(), "c");
+        // Home is mounted read-only at /seed (not the data dir itself).
         assert!(a.contains(&"-v".to_string()));
-        assert!(a.iter().any(|x| x == "/home/u/.bamboo:/root/.bamboo:ro"));
+        assert!(a.iter().any(|x| x == "/home/u/.bamboo:/seed:ro"));
+        // Entrypoint is a shell that seeds /data then execs bamboo broker-agent.
+        assert!(a
+            .windows(2)
+            .any(|w| w == ["--entrypoint".to_string(), "/bin/sh".to_string()]));
+        let script = a.last().unwrap();
+        assert!(script.contains("/seed/config.json") || script.contains("config.json"));
+        assert!(script.contains("cp -rf /seed/skills"));
+        assert!(script.contains("exec 'bamboo' 'broker-agent' 'serve'"));
+        // The broker token must never appear on argv (it rides as -e env).
+        assert!(!a
+            .iter()
+            .any(|x| x.contains("tok") && !x.starts_with("BAMBOO_BROKER_TOKEN=")));
     }
 }

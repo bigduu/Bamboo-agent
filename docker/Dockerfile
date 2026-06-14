@@ -1,24 +1,28 @@
 # Bamboo (bamboo-agent) container image
 #
-# Builds the `bamboo` binary and runs the unified HTTP server.
+# Builds the `bamboo` binary and ships it on a slim Debian runtime. The image
+# serves two roles:
+#   - default: the unified HTTP server (`bamboo serve`, the ENTRYPOINT/CMD below)
+#   - broker worker: the orchestrator's DockerDeployer overrides the entrypoint
+#     to seed a writable data dir and run `bamboo broker-agent serve ...`
 #
 # NOTE: Pin the builder image to the same Debian release as the runtime image.
 # Using `rust:latest` can move to a newer glibc (e.g. 2.39) while the runtime
 # stays on Bookworm (glibc 2.36), producing:
 #   /lib/.../libc.so.6: version `GLIBC_2.39' not found
-#
 # Keep builder+runtime aligned to avoid glibc ABI mismatches.
 
 FROM rust:1-bookworm AS builder
 
 WORKDIR /app
 
-# Copy the full workspace: root bin (src + build.rs), crates/ members,
-# and builtin_skills/ (embedded by bamboo-skills' build.rs). .dockerignore
-# keeps target/.git out of the build context.
+# Copy the full workspace. `.dockerignore` keeps target/ and .git out;
+# builtin_skills/ is embedded by bamboo-skills' build.rs (include_bytes!), so it
+# must stay in the build context (do NOT exclude **/*.md).
 COPY . .
 
-# Build just the bamboo binary (release, workspace-aware)
+# Build from crates.io (default sparse registry). Builds on CI runners with
+# direct registry access — no vendoring, no registry mirrors.
 RUN cargo build --release --locked --bin bamboo
 
 # ===== Runtime image =====

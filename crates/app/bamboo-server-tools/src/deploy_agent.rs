@@ -120,8 +120,10 @@ impl DeployAgentTool {
                 // No `--network host`: the worker stays on an isolated bridge
                 // network and reaches the host broker via host.docker.internal
                 // (DockerDeployer adds the host-gateway alias + the endpoint is
-                // rewritten below). Mount the orchestrator's bamboo home read-only
-                // so the worker reads the same config (MCP servers + skills).
+                // rewritten below). Seed the worker from the orchestrator's
+                // bamboo home (mounted read-only, copied into the container's
+                // writable data dir) so it reads the same config (MCP servers +
+                // skills + provider creds).
                 Box::new(
                     DockerDeployer::new(image)
                         .mount_home(bamboo_config::paths::resolve_bamboo_dir()),
