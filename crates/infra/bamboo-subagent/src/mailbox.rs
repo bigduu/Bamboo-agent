@@ -58,6 +58,12 @@ pub enum InboxKind {
     Ask,
     Handoff,
     Reply,
+    /// A worker→orchestrator MCP proxy request (fetch the proxiable tool manifest,
+    /// or invoke one of those tools). The orchestrator runs the real (host-bound)
+    /// MCP server and answers with [`InboxKind::McpReply`].
+    McpRequest,
+    /// The orchestrator's answer to an [`InboxKind::McpRequest`].
+    McpReply,
 }
 
 /// How a sub-agent should answer an [`InboxKind::Ask`].

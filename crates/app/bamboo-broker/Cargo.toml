@@ -8,6 +8,7 @@ license = "MIT"
 
 [dependencies]
 bamboo-subagent = { path = "../../infra/bamboo-subagent" }
+bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

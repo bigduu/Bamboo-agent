@@ -20,19 +20,21 @@ pub mod ask;
 pub mod client;
 pub mod core;
 pub mod deploy;
+pub mod mcp;
 pub mod proto;
 pub mod serve;
 pub mod server;
 
 mod error;
 
-pub use crate::ask::{ask_agent, ask_over};
+pub use crate::ask::{ask_agent, ask_over, request_over};
 pub use crate::client::BrokerClient;
 pub use crate::core::BrokerCore;
 pub use crate::deploy::{
     AgentDeployment, DeployedAgent, Deployer, DockerDeployer, LocalProcessDeployer, SshDeployer,
 };
 pub use crate::error::{BrokerError, BrokerResult};
+pub use crate::mcp::{serve_mcp_proxy, McpProxyExecutor, McpReply, McpRequest, ProxiedResult};
 pub use crate::proto::{BrokerFrame, ClientFrame};
 pub use crate::serve::{serve_executor, serve_loop, serve_mailbox, serve_with, Handled};
 pub use crate::server::BrokerServer;

@@ -76,6 +76,47 @@ pub async fn ask_over(
     }
 }
 
+/// Generic correlated request/reply over an existing connected + subscribed
+/// client: deliver a message of `kind` carrying `body` to `target`, then wait
+/// for the reply whose `correlation_id` matches and return its body. Up to
+/// `timeout`. (The MCP proxy and `ask` both build on this.)
+pub async fn request_over(
+    client: &mut BrokerClient,
+    me: &AgentRef,
+    target: &str,
+    kind: InboxKind,
+    body: serde_json::Value,
+    timeout: Duration,
+) -> BrokerResult<serde_json::Value> {
+    let msg = InboxMessage {
+        id: MsgId::new(),
+        from: me.clone(),
+        kind,
+        body,
+        created_at: Utc::now(),
+        correlation_id: None,
+    };
+    let qid = msg.id.clone();
+    client.deliver(target, msg).await?;
+
+    loop {
+        match tokio::time::timeout(timeout, client.next_message()).await {
+            Ok(Some(reply)) if reply.correlation_id.as_ref() == Some(&qid) => return Ok(reply.body),
+            Ok(Some(_)) => continue,
+            Ok(None) => {
+                return Err(BrokerError::Transport(
+                    "connection closed before reply".into(),
+                ))
+            }
+            Err(_) => {
+                return Err(BrokerError::Transport(format!(
+                    "request to '{target}' timed out after {timeout:?}"
+                )))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

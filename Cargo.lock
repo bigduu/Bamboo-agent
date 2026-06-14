@@ -556,6 +556,7 @@ name = "bamboo-broker"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "bamboo-agent-core",
  "bamboo-subagent",
  "chrono",
  "futures-util",
