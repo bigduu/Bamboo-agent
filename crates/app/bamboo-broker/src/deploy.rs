@@ -236,14 +236,32 @@ impl SshDeployer {
     /// `ssh` argv: the host, then a single remote command string (env prefix +
     /// bamboo + args, each shell-quoted). `-tt` so a local kill propagates.
     fn argv(&self, d: &AgentDeployment) -> Vec<String> {
+        // Reverse-tunnel the broker port to the remote's loopback (`-R`), so the
+        // worker reaches the host broker via 127.0.0.1 over THIS ssh connection —
+        // no host-reachable IP and no inbound access to the remote needed (the
+        // broker can stay bound to 127.0.0.1). The worker is then pointed at the
+        // tunnel mouth on the remote loopback.
+        let port = broker_port(&d.broker_endpoint);
+        let mut a = vec!["-tt".to_string()];
+        if let Some(p) = port {
+            a.push("-R".to_string());
+            a.push(format!("{p}:127.0.0.1:{p}"));
+        }
+        a.push(self.host.clone());
+
+        let mut tunneled = d.clone();
+        if let Some(p) = port {
+            tunneled.broker_endpoint = format!("ws://127.0.0.1:{p}");
+        }
         let mut remote = format!("BAMBOO_BROKER_TOKEN={}", sh_quote(&d.token));
         remote.push(' ');
         remote.push_str(&sh_quote(&self.bamboo_on_remote));
-        for arg in agent_argv(d) {
+        for arg in agent_argv(&tunneled) {
             remote.push(' ');
             remote.push_str(&sh_quote(&arg));
         }
-        vec!["-tt".to_string(), self.host.clone(), remote]
+        a.push(remote);
+        a
     }
 }
 
@@ -264,6 +282,13 @@ impl Deployer for SshDeployer {
 /// Minimal POSIX single-quote escaping for an SSH remote command argument.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Parse the port out of a `ws://host:port[/path]` broker endpoint, for the
+/// reverse tunnel (`ssh -R port:127.0.0.1:port`).
+fn broker_port(endpoint: &str) -> Option<u16> {
+    let after_host = endpoint.rsplit_once(':')?.1;
+    after_host.split(['/', '?']).next()?.parse().ok()
 }
 
 #[cfg(test)]
@@ -312,15 +337,21 @@ mod tests {
     }
 
     #[test]
-    fn ssh_argv_quotes_remote_command_with_env_prefix() {
+    fn ssh_argv_reverse_tunnels_broker_and_quotes_remote() {
         let s = SshDeployer::new("gpu-host");
-        let a = s.argv(&dep());
+        let a = s.argv(&dep()); // dep() broker_endpoint = ws://broker:9600
         assert_eq!(a[0], "-tt");
-        assert_eq!(a[1], "gpu-host");
-        let remote = &a[2];
+        // reverse tunnel: remote loopback :9600 -> host-side broker :9600
+        assert_eq!(a[1], "-R");
+        assert_eq!(a[2], "9600:127.0.0.1:9600");
+        assert_eq!(a[3], "gpu-host");
+        let remote = &a[4];
         assert!(remote.starts_with("BAMBOO_BROKER_TOKEN='tok'"));
         assert!(remote.contains("broker-agent"));
-        assert!(remote.contains("ws://broker:9600"));
+        // the worker connects to the tunnel mouth on the remote loopback,
+        // not the host-side endpoint.
+        assert!(remote.contains("ws://127.0.0.1:9600"));
+        assert!(!remote.contains("ws://broker:9600"));
     }
 
     #[test]
