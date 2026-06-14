@@ -57,8 +57,9 @@ fn main() -> io::Result<()> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
-    // builtin_skills lives at the workspace root: crates/bamboo-agent-skill/../../builtin_skills
-    let builtin_root = manifest_dir.join("../../builtin_skills");
+    // builtin_skills lives at the workspace root. This crate sits at
+    // crates/infra/bamboo-skills, so the repo root is three levels up.
+    let builtin_root = manifest_dir.join("../../../builtin_skills");
     println!("cargo:rerun-if-changed={}", builtin_root.display());
 
     let dest = out_dir.join("builtin_skills_embedded.rs");
@@ -79,7 +80,7 @@ fn main() -> io::Result<()> {
         let relative_unix = to_unix_path(&relative);
         writeln!(
             file,
-            "    (\"{relative}\", include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../../builtin_skills/{relative}\"))),",
+            "    (\"{relative}\", include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../../../builtin_skills/{relative}\"))),",
             relative = relative_unix
         )?;
     }
