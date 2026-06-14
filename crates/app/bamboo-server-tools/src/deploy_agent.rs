@@ -143,6 +143,8 @@ impl DeployAgentTool {
             model,
             workspace,
             echo,
+            // Deployed workers proxy MCP to the orchestrator (single MCP host).
+            mcp_proxy: Some(bamboo_broker::ORCHESTRATOR_ID.to_string()),
         };
         let handle = deployer
             .deploy(&deployment)

@@ -83,6 +83,22 @@ pub struct Capabilities {
     /// empty isolated dir.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills_dir: Option<String>,
+    /// When set, the worker proxies its MCP tool calls to the orchestrator over
+    /// the broker (host-bound servers like nova run only there). Mutually
+    /// exclusive with `mcp` direct-sync — proxy covers all MCP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_proxy: Option<McpProxyConfig>,
+}
+
+/// How a worker reaches the orchestrator's MCP proxy over the broker.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct McpProxyConfig {
+    /// The orchestrator's broker mailbox id (proxy requests go here).
+    pub orchestrator: String,
+    /// Broker WebSocket endpoint.
+    pub endpoint: String,
+    /// Bearer token for the broker.
+    pub token: String,
 }
 
 /// Where an actor physically runs — a configurable "temperature", not a baked-in

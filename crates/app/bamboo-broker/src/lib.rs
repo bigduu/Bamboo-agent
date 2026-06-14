@@ -27,6 +27,10 @@ pub mod server;
 
 mod error;
 
+/// The orchestrator's broker mailbox id — where workers send MCP proxy requests
+/// and where `serve_mcp_proxy` listens. A fixed well-known id (single MCP host).
+pub const ORCHESTRATOR_ID: &str = "bamboo-orchestrator";
+
 pub use crate::ask::{ask_agent, ask_over, request_over};
 pub use crate::client::BrokerClient;
 pub use crate::core::BrokerCore;
@@ -38,3 +42,4 @@ pub use crate::mcp::{serve_mcp_proxy, McpProxyExecutor, McpReply, McpRequest, Pr
 pub use crate::proto::{BrokerFrame, ClientFrame};
 pub use crate::serve::{serve_executor, serve_loop, serve_mailbox, serve_with, Handled};
 pub use crate::server::BrokerServer;
+pub use bamboo_subagent::AgentRef;

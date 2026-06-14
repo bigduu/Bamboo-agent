@@ -62,6 +62,7 @@ async fn deploy_local_broker_agent_and_ask_it_query_and_steer() {
             model: None,
             workspace: None,
             echo: true,
+            mcp_proxy: None,
         })
         .await
         .expect("deploy local broker-agent subprocess");
@@ -117,6 +118,7 @@ async fn orchestrator_commands_two_deployed_agents_independently() {
                     model: None,
                     workspace: None,
                     echo: true,
+                    mcp_proxy: None,
                 })
                 .await
                 .expect("deploy agent"),
@@ -178,6 +180,7 @@ async fn docker_deploy_gated() {
             model: None,
             workspace: None,
             echo: true,
+            mcp_proxy: None,
         })
         .await
         .expect("docker run broker-agent");

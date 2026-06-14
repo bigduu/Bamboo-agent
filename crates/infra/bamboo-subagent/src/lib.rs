@@ -35,8 +35,8 @@ pub use mailbox::{
 };
 pub use proto::{AgentRecord, ChildFrame, ParentFrame, RunSpec, TerminalStatus};
 pub use provision::{
-    Capabilities, ChildIdentity, ExecutorSpec, Limits, ModelRefSpec, Placement, ProvisionSpec,
-    ScopedCredential, SecretsEnvelope, PROVISION_VERSION,
+    Capabilities, ChildIdentity, ExecutorSpec, Limits, McpProxyConfig, ModelRefSpec, Placement,
+    ProvisionSpec, ScopedCredential, SecretsEnvelope, PROVISION_VERSION,
 };
 pub use registry::{RegisterChild, Registration, Registry};
 pub use store::{

@@ -30,6 +30,9 @@ pub struct BrokerAgentArgs {
     pub workspace: Option<String>,
     /// Use the dependency-free `EchoExecutor` (no LLM) — smoke tests / wiring.
     pub echo: bool,
+    /// When set, proxy all MCP tool calls to this orchestrator id over the broker
+    /// (host-bound servers run only there) instead of syncing servers directly.
+    pub mcp_proxy: Option<String>,
 }
 
 /// Connect to the broker and serve until the connection drops.
@@ -96,9 +99,19 @@ fn build_spec(args: &BrokerAgentArgs) -> Result<ProvisionSpec, String> {
     // reads THIS host's config — the same machine for a local deploy, or a
     // mounted bamboo home for Docker. (Host-bound stdio MCP is excluded here;
     // P2 will proxy it over the broker.)
-    let portable = portable_mcp(&config.mcp);
-    if !portable.servers.is_empty() {
-        spec.capabilities.mcp = serde_json::to_value(&portable).ok();
+    // MCP: proxy to the orchestrator (covers ALL MCP, incl. host-bound stdio)
+    // when configured; otherwise sync the portable (URL) subset for direct use.
+    if let Some(orchestrator) = &args.mcp_proxy {
+        spec.capabilities.mcp_proxy = Some(bamboo_subagent::McpProxyConfig {
+            orchestrator: orchestrator.clone(),
+            endpoint: args.broker.clone(),
+            token: args.token.clone(),
+        });
+    } else {
+        let portable = portable_mcp(&config.mcp);
+        if !portable.servers.is_empty() {
+            spec.capabilities.mcp = serde_json::to_value(&portable).ok();
+        }
     }
     let skills_dir = bamboo_config::paths::resolve_bamboo_dir().join("skills");
     if skills_dir.is_dir() {

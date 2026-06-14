@@ -272,6 +272,31 @@ impl AppState {
 
         // Initialize sub-session spawn scheduler (async background jobs).
         let config_snapshot = config.read().await.clone();
+
+        // When a broker is configured, run the MCP proxy service: deployed
+        // workers forward their (host-bound) MCP tool calls here, and we execute
+        // them against this orchestrator's real MCP servers (single MCP host).
+        if let Some(broker) = config_snapshot.subagents.broker.clone() {
+            if !broker.endpoint.trim().is_empty() {
+                let backend: std::sync::Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+                    std::sync::Arc::new(bamboo_mcp::executor::McpToolExecutor::new(
+                        mcp_manager.clone(),
+                        mcp_manager.tool_index(),
+                    ));
+                tokio::spawn(async move {
+                    let me = bamboo_broker::AgentRef {
+                        session_id: bamboo_broker::ORCHESTRATOR_ID.to_string(),
+                        role: Some("orchestrator".into()),
+                    };
+                    if let Err(e) =
+                        bamboo_broker::serve_mcp_proxy(&broker.endpoint, me, &broker.token, backend)
+                            .await
+                    {
+                        tracing::warn!("MCP proxy service ended: {e}");
+                    }
+                });
+            }
+        }
         let external_runner =
             bamboo_engine::external_agents::runtime::build_external_child_runner(&config_snapshot);
         let spawn_scheduler = build_spawn_scheduler(

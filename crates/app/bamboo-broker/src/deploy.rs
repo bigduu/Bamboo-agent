@@ -30,6 +30,8 @@ pub struct AgentDeployment {
     pub workspace: Option<String>,
     /// Run the dependency-free echo executor (no LLM).
     pub echo: bool,
+    /// Proxy MCP to this orchestrator id over the broker (host-bound servers).
+    pub mcp_proxy: Option<String>,
 }
 
 /// Brings up a broker-agent in some environment and returns a handle to it.
@@ -87,6 +89,10 @@ fn agent_argv(d: &AgentDeployment) -> Vec<String> {
     }
     if d.echo {
         a.push("--echo".into());
+    }
+    if let Some(orchestrator) = &d.mcp_proxy {
+        a.push("--mcp-proxy".into());
+        a.push(orchestrator.clone());
     }
     a
 }
@@ -265,6 +271,7 @@ mod tests {
             model: None,
             workspace: None,
             echo: true,
+            mcp_proxy: None,
         }
     }
 

@@ -221,10 +221,36 @@ impl BambooRuntimeExecutor {
         let builtin: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(
             bamboo_tools::BuiltinToolExecutor::new_with_config(config.clone()),
         );
-        // Compose orchestrator-synced MCP servers (the portable / URL subset) on
-        // top of builtin tools when provided. Absent for actor children, so they
-        // keep builtin-only behavior. A parse/connect failure degrades to builtin.
-        let default_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+        // MCP composition (absent for actor children → builtin-only, unchanged):
+        //   1. mcp_proxy set → proxy ALL MCP to the orchestrator over the broker
+        //      (it runs the host-bound servers like nova; P2).
+        //   2. else mcp set → connect the synced portable (URL) servers directly (P1).
+        // A parse/connect failure degrades to builtin.
+        let default_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = if let Some(proxy) =
+            spec.capabilities.mcp_proxy.as_ref()
+        {
+            let proxy_id = format!("{}#mcp", spec.identity.child_id);
+            match bamboo_broker::McpProxyExecutor::connect(
+                &proxy.endpoint,
+                proxy_id,
+                &proxy.token,
+                &proxy.orchestrator,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            {
+                Ok(p) => {
+                    let proxy_exec: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(p);
+                    Arc::new(bamboo_mcp::executor::CompositeToolExecutor::new(
+                        builtin, proxy_exec,
+                    ))
+                }
+                Err(e) => {
+                    tracing::warn!("MCP proxy unavailable, continuing without it: {e}");
+                    builtin
+                }
+            }
+        } else {
             match spec.capabilities.mcp.as_ref() {
                 Some(mcp_value) => {
                     match serde_json::from_value::<bamboo_domain::mcp_config::McpConfig>(
@@ -251,7 +277,8 @@ impl BambooRuntimeExecutor {
                     }
                 }
                 None => builtin,
-            };
+            }
+        };
 
         let agent = bamboo_engine::Agent::builder()
             .storage(store.clone())

@@ -233,6 +233,11 @@ enum BrokerAgentCommands {
         /// Use the dependency-free echo executor (no LLM) — for smoke tests.
         #[arg(long)]
         echo: bool,
+
+        /// Proxy all MCP tool calls to this orchestrator id over the broker
+        /// (host-bound MCP servers run only there).
+        #[arg(long = "mcp-proxy")]
+        mcp_proxy: Option<String>,
     },
 }
 
@@ -605,6 +610,7 @@ async fn main() {
                 model,
                 workspace,
                 echo,
+                mcp_proxy,
             } = command;
             let token = match token
                 .or_else(|| std::env::var("BAMBOO_BROKER_TOKEN").ok())
@@ -627,6 +633,7 @@ async fn main() {
                     model,
                     workspace,
                     echo,
+                    mcp_proxy,
                 })
                 .await;
             if let Err(e) = result {
