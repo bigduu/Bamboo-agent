@@ -241,7 +241,16 @@ impl SshDeployer {
         // no host-reachable IP and no inbound access to the remote needed (the
         // broker can stay bound to 127.0.0.1). The worker is then pointed at the
         // tunnel mouth on the remote loopback.
-        let port = broker_port(&d.broker_endpoint);
+        // Same-host ssh (localhost): the worker shares the host's loopback and
+        // reaches the broker directly — skip the reverse tunnel, which would only
+        // collide with the broker on the same port. Remote hosts get the -R tunnel.
+        let host_only = self.host.rsplit('@').next().unwrap_or(self.host.as_str());
+        let same_host = matches!(host_only, "localhost" | "127.0.0.1" | "::1");
+        let port = if same_host {
+            None
+        } else {
+            broker_port(&d.broker_endpoint)
+        };
         let mut a = vec!["-tt".to_string()];
         if let Some(p) = port {
             a.push("-R".to_string());
@@ -352,6 +361,19 @@ mod tests {
         // not the host-side endpoint.
         assert!(remote.contains("ws://127.0.0.1:9600"));
         assert!(!remote.contains("ws://broker:9600"));
+    }
+
+    #[test]
+    fn ssh_argv_skips_reverse_tunnel_for_same_host() {
+        // Same-host (localhost) deploy: no -R (it would collide with the broker
+        // on the same port); the worker uses the broker endpoint directly.
+        let s = SshDeployer::new("localhost");
+        let a = s.argv(&dep());
+        assert_eq!(a[0], "-tt");
+        assert_eq!(a[1], "localhost");
+        assert!(!a.iter().any(|x| x == "-R"));
+        let remote = a.last().unwrap();
+        assert!(remote.contains("ws://broker:9600"));
     }
 
     #[test]
