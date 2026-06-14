@@ -280,6 +280,35 @@ impl BambooRuntimeExecutor {
             }
         };
 
+        // Give the deployed worker the skill-runtime tools (load_skill /
+        // read_skill_resource) over its synced skills_dir, so it can pull a
+        // skill's full SKILL.md — not just see the description. The orchestrator's
+        // root surface has these; the worker previously only had the builtin set.
+        let default_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = {
+            let session_repo = bamboo_engine::SessionRepository::new(
+                Arc::new(dashmap::DashMap::new()),
+                store.clone(),
+                persistence.clone(),
+            );
+            let load_skill = Arc::new(bamboo_server::tools::LoadSkillTool::new(
+                skill_manager.clone(),
+                config.clone(),
+                session_repo.clone(),
+            ));
+            let read_skill = Arc::new(bamboo_server::tools::ReadSkillResourceTool::new(
+                skill_manager.clone(),
+                config.clone(),
+                session_repo,
+            ));
+            let with_load = Arc::new(bamboo_server::tools::OverlayToolExecutor::new(
+                default_tools,
+                load_skill,
+            ));
+            Arc::new(bamboo_server::tools::OverlayToolExecutor::new(
+                with_load, read_skill,
+            ))
+        };
+
         let agent = bamboo_engine::Agent::builder()
             .storage(store.clone())
             .persistence(persistence)
