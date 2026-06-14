@@ -27,6 +27,10 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/bamboo
+  # The docker/* actions still bundle a Node.js 20 runtime; GitHub force-migrates
+  # JS actions to Node 24 on 2026-06-16. Opt in now so this workflow runs on
+  # Node 24 ahead of the cutover (consistent with the repo-wide Node 24 sweep).
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build:
