@@ -56,34 +56,38 @@ impl DeployAgentTool {
     }
 }
 
+/// Parameters for `action=deploy`, grouped so the deploy call stays tidy.
+#[derive(Debug, Deserialize)]
+struct DeployParams {
+    /// Worker id (its broker mailbox key). Auto-generated when omitted.
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    /// `provider:model` for the worker's agent (ignored when `echo`).
+    #[serde(default)]
+    model: Option<String>,
+    /// Where to run it: `local` (default), `docker`, or `ssh`.
+    #[serde(default)]
+    env: Option<String>,
+    /// Docker image (required when `env=docker`).
+    #[serde(default)]
+    image: Option<String>,
+    /// Remote host (required when `env=ssh`).
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Run the dependency-free echo executor (no LLM) — smoke/testing.
+    #[serde(default)]
+    echo: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum DeployArgs {
     /// Deploy a new worker and return its id.
-    Deploy {
-        /// Worker id (its broker mailbox key). Auto-generated when omitted.
-        #[serde(default)]
-        id: Option<String>,
-        #[serde(default)]
-        role: Option<String>,
-        /// `provider:model` for the worker's agent (ignored when `echo`).
-        #[serde(default)]
-        model: Option<String>,
-        /// Where to run it: `local` (default), `docker`, or `ssh`.
-        #[serde(default)]
-        env: Option<String>,
-        /// Docker image (required when `env=docker`).
-        #[serde(default)]
-        image: Option<String>,
-        /// Remote host (required when `env=ssh`).
-        #[serde(default)]
-        host: Option<String>,
-        #[serde(default)]
-        workspace: Option<String>,
-        /// Run the dependency-free echo executor (no LLM) — smoke/testing.
-        #[serde(default)]
-        echo: bool,
-    },
+    Deploy(DeployParams),
     /// Stop a previously-deployed worker and remove it.
     Stop { id: String },
     /// List currently-deployed workers.
@@ -91,17 +95,17 @@ enum DeployArgs {
 }
 
 impl DeployAgentTool {
-    async fn deploy(
-        &self,
-        id: Option<String>,
-        role: Option<String>,
-        model: Option<String>,
-        env: Option<String>,
-        image: Option<String>,
-        host: Option<String>,
-        workspace: Option<String>,
-        echo: bool,
-    ) -> Result<ToolResult, ToolError> {
+    async fn deploy(&self, params: DeployParams) -> Result<ToolResult, ToolError> {
+        let DeployParams {
+            id,
+            role,
+            model,
+            env,
+            image,
+            host,
+            workspace,
+            echo,
+        } = params;
         let id = id.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| {
             format!("agent-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
         });
@@ -263,19 +267,7 @@ impl Tool for DeployAgentTool {
         let parsed: DeployArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid deploy_agent args: {e}")))?;
         match parsed {
-            DeployArgs::Deploy {
-                id,
-                role,
-                model,
-                env,
-                image,
-                host,
-                workspace,
-                echo,
-            } => {
-                self.deploy(id, role, model, env, image, host, workspace, echo)
-                    .await
-            }
+            DeployArgs::Deploy(params) => self.deploy(params).await,
             DeployArgs::Stop { id } => self.stop(id).await,
             DeployArgs::List => self.list().await,
         }
