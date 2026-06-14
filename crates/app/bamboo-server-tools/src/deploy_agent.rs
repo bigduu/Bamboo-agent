@@ -113,7 +113,14 @@ impl DeployAgentTool {
                 let image = image.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
                     ToolError::InvalidArguments("env=docker requires `image`".to_string())
                 })?;
-                Box::new(DockerDeployer::new(image).network("host"))
+                // Mount the orchestrator's bamboo home read-only so the
+                // containerized worker reads the same config — syncing its MCP
+                // servers + skills (its build_spec reads that mounted config).
+                Box::new(
+                    DockerDeployer::new(image)
+                        .network("host")
+                        .mount_home(bamboo_config::paths::resolve_bamboo_dir()),
+                )
             }
             "ssh" => {
                 let host = host.filter(|s| !s.trim().is_empty()).ok_or_else(|| {

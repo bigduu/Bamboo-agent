@@ -132,6 +132,11 @@ pub struct DockerDeployer {
     pub bamboo_in_image: String,
     /// e.g. `Some("host")` so the container can reach a `127.0.0.1` broker.
     pub network: Option<String>,
+    /// Host bamboo home dir to mount read-only at `/root/.bamboo`, so the
+    /// containerized worker reads the orchestrator's config — and thereby syncs
+    /// its MCP servers + skills. (Trusted-local convenience; it also exposes the
+    /// config's secrets to the container — P3 will scope this down.)
+    pub mount_home: Option<PathBuf>,
 }
 
 impl DockerDeployer {
@@ -141,10 +146,15 @@ impl DockerDeployer {
             docker_bin: "docker".into(),
             bamboo_in_image: "bamboo".into(),
             network: None,
+            mount_home: None,
         }
     }
     pub fn network(mut self, net: impl Into<String>) -> Self {
         self.network = Some(net.into());
+        self
+    }
+    pub fn mount_home(mut self, host_bamboo_dir: impl Into<PathBuf>) -> Self {
+        self.mount_home = Some(host_bamboo_dir.into());
         self
     }
 
@@ -160,6 +170,10 @@ impl DockerDeployer {
         if let Some(net) = &self.network {
             a.push("--network".into());
             a.push(net.clone());
+        }
+        if let Some(home) = &self.mount_home {
+            a.push("-v".into());
+            a.push(format!("{}:/root/.bamboo:ro", home.display()));
         }
         a.push(self.image.clone());
         a.push(self.bamboo_in_image.clone());
@@ -297,5 +311,13 @@ mod tests {
     #[test]
     fn sh_quote_escapes_single_quotes() {
         assert_eq!(sh_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn docker_argv_mounts_home_when_set() {
+        let d = DockerDeployer::new("img").mount_home("/home/u/.bamboo");
+        let a = d.argv(&dep(), "c");
+        assert!(a.contains(&"-v".to_string()));
+        assert!(a.iter().any(|x| x == "/home/u/.bamboo:/root/.bamboo:ro"));
     }
 }

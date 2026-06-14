@@ -196,8 +196,16 @@ impl BambooRuntimeExecutor {
         );
         let persistence = Arc::new(LockedSessionStore::new(store.clone()));
         let locked_store = persistence.clone();
+        // Synced skills dir (orchestrator's user/project skills) when provided,
+        // else the worker's isolated (empty) dir — unchanged for actor children.
+        let skills_dir = spec
+            .capabilities
+            .skills_dir
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| storage_dir.join("skills"));
         let skill_manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
-            skills_dir: storage_dir.join("skills"),
+            skills_dir,
             project_dir: spec.workspace.clone().map(PathBuf::from),
             active_mode: None,
         }));
@@ -210,9 +218,40 @@ impl BambooRuntimeExecutor {
         let metrics_collector = MetricsCollector::spawn(metrics_storage, 90);
 
         let config = Arc::new(tokio::sync::RwLock::new(config));
-        let default_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(
+        let builtin: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(
             bamboo_tools::BuiltinToolExecutor::new_with_config(config.clone()),
         );
+        // Compose orchestrator-synced MCP servers (the portable / URL subset) on
+        // top of builtin tools when provided. Absent for actor children, so they
+        // keep builtin-only behavior. A parse/connect failure degrades to builtin.
+        let default_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+            match spec.capabilities.mcp.as_ref() {
+                Some(mcp_value) => {
+                    match serde_json::from_value::<bamboo_domain::mcp_config::McpConfig>(
+                        mcp_value.clone(),
+                    ) {
+                        Ok(mcp_config) => {
+                            let mcp_manager =
+                                Arc::new(bamboo_mcp::manager::McpServerManager::new_with_config(
+                                    config.clone(),
+                                ));
+                            mcp_manager.initialize_from_config(&mcp_config).await;
+                            let mcp_tools = Arc::new(bamboo_mcp::executor::McpToolExecutor::new(
+                                mcp_manager.clone(),
+                                mcp_manager.tool_index(),
+                            ));
+                            Arc::new(bamboo_mcp::executor::CompositeToolExecutor::new(
+                                builtin, mcp_tools,
+                            ))
+                        }
+                        Err(e) => {
+                            tracing::warn!("ignoring synced MCP config (parse error): {e}");
+                            builtin
+                        }
+                    }
+                }
+                None => builtin,
+            };
 
         let agent = bamboo_engine::Agent::builder()
             .storage(store.clone())

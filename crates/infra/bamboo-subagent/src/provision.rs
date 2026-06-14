@@ -62,6 +62,27 @@ pub struct ProvisionSpec {
     /// so behavior is unchanged until a placement is set.
     #[serde(default)]
     pub placement: Placement,
+    /// Capabilities synced from the orchestrator so a deployed worker matches its
+    /// toolset (MCP servers + user skills). Empty for plain actor children (no
+    /// behavior change); a deployed broker-agent fills these.
+    #[serde(default)]
+    pub capabilities: Capabilities,
+}
+
+/// Orchestrator-synced extras for a worker. Forward-compatible (all optional);
+/// an older spec without these leaves the worker on builtin tools + isolated
+/// skills exactly as before.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Capabilities {
+    /// Serialized MCP config — opaque to this leaf crate; the worker deserializes
+    /// it into the domain `McpConfig`. Typically the portable (SSE /
+    /// streamable-http) subset; host-bound stdio servers are excluded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<serde_json::Value>,
+    /// Directory of user/project skills the worker should load, instead of an
+    /// empty isolated dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills_dir: Option<String>,
 }
 
 /// Where an actor physically runs — a configurable "temperature", not a baked-in
@@ -160,6 +181,7 @@ impl ProvisionSpec {
             secrets: SecretsEnvelope::default(),
             reusable: false,
             placement: Placement::default(),
+            capabilities: Capabilities::default(),
         }
     }
 
@@ -273,6 +295,35 @@ mod tests {
                 endpoint: "wss://gpu-host:8443".into()
             }
         );
+    }
+
+    #[test]
+    fn capabilities_default_empty_and_round_trip() {
+        // Default spec carries no synced capabilities (actor children unaffected).
+        assert_eq!(spec().capabilities, Capabilities::default());
+
+        // Round-trips with content.
+        let mut s = spec();
+        s.capabilities = Capabilities {
+            mcp: Some(serde_json::json!({ "version": 1, "servers": [] })),
+            skills_dir: Some("/home/u/.bamboo/skills".into()),
+        };
+        let parsed = ProvisionSpec::from_json(&s.to_json().unwrap()).unwrap();
+        assert_eq!(
+            parsed.capabilities.skills_dir.as_deref(),
+            Some("/home/u/.bamboo/skills")
+        );
+        assert!(parsed.capabilities.mcp.is_some());
+
+        // Backward compat: a spec without `capabilities` defaults to empty.
+        let minimal = serde_json::json!({
+            "version": 1,
+            "identity": { "child_id": "c" },
+            "executor": { "kind": "echo" },
+            "fabric_dir": "/tmp/f",
+        });
+        let parsed = ProvisionSpec::from_json(&minimal.to_string()).unwrap();
+        assert_eq!(parsed.capabilities, Capabilities::default());
     }
 
     #[test]

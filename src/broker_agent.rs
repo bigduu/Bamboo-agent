@@ -90,7 +90,41 @@ fn build_spec(args: &BrokerAgentArgs) -> Result<ProvisionSpec, String> {
     spec.model = args.model.as_deref().and_then(parse_model);
     spec.workspace = args.workspace.clone();
     spec.secrets.provider_credentials = credentials;
+
+    // Sync the orchestrator's capabilities so the deployed worker matches its
+    // toolset: the portable (URL-based) MCP servers + the user skills dir. This
+    // reads THIS host's config — the same machine for a local deploy, or a
+    // mounted bamboo home for Docker. (Host-bound stdio MCP is excluded here;
+    // P2 will proxy it over the broker.)
+    let portable = portable_mcp(&config.mcp);
+    if !portable.servers.is_empty() {
+        spec.capabilities.mcp = serde_json::to_value(&portable).ok();
+    }
+    let skills_dir = bamboo_config::paths::resolve_bamboo_dir().join("skills");
+    if skills_dir.is_dir() {
+        spec.capabilities.skills_dir = Some(skills_dir.to_string_lossy().into_owned());
+    }
+
     Ok(spec)
+}
+
+/// The portable (URL-based: SSE / streamable-http) enabled MCP servers — the ones
+/// a worker can connect to directly wherever it runs. Host-bound `stdio` servers
+/// (a local binary, e.g. nova) are excluded; P2 proxies those over the broker.
+fn portable_mcp(
+    mcp: &bamboo_domain::mcp_config::McpConfig,
+) -> bamboo_domain::mcp_config::McpConfig {
+    use bamboo_domain::mcp_config::TransportConfig;
+    let servers = mcp
+        .servers
+        .iter()
+        .filter(|s| s.enabled && !matches!(s.transport, TransportConfig::Stdio(_)))
+        .cloned()
+        .collect();
+    bamboo_domain::mcp_config::McpConfig {
+        version: mcp.version,
+        servers,
+    }
 }
 
 /// Parse `provider:model`; a bare value leaves the provider empty (resolved by
@@ -133,5 +167,24 @@ mod tests {
             })
         );
         assert_eq!(parse_model("   "), None);
+    }
+
+    #[test]
+    fn portable_mcp_keeps_url_servers_drops_stdio_and_disabled() {
+        // The security-relevant filter: never sync host-bound stdio servers (a
+        // local binary) to a worker; keep only enabled URL-based servers.
+        let mcp: bamboo_domain::mcp_config::McpConfig = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "servers": [
+                { "id": "web",  "enabled": true,  "transport": { "type": "sse", "url": "https://w/sse" } },
+                { "id": "nova", "enabled": true,  "transport": { "type": "stdio", "command": "nova" } },
+                { "id": "off",  "enabled": false, "transport": { "type": "sse", "url": "https://o/sse" } },
+            ]
+        }))
+        .expect("mcp config deserializes");
+
+        let portable = portable_mcp(&mcp);
+        let ids: Vec<_> = portable.servers.iter().map(|s| s.id.clone()).collect();
+        assert_eq!(ids, vec!["web"]); // stdio (nova) and disabled (off) dropped
     }
 }

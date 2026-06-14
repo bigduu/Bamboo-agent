@@ -87,6 +87,7 @@ bamboo-server = { path = "crates/app/bamboo-server" }
 bamboo-sdk = { path = "crates/app/bamboo-sdk" }
 bamboo-subagent = { path = "crates/infra/bamboo-subagent" }
 bamboo-broker = { path = "crates/app/bamboo-broker" }
+bamboo-mcp = { path = "crates/infra/bamboo-mcp" }
 bamboo-skills = { path = "crates/infra/bamboo-skills" }
 bamboo-metrics = { path = "crates/infra/bamboo-metrics" }
 
