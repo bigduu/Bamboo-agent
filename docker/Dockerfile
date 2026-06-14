@@ -13,14 +13,13 @@ FROM rust:1-bookworm AS builder
 
 WORKDIR /app
 
-# Copy manifest first for better build caching
-COPY Cargo.toml Cargo.lock ./
+# Copy the full workspace: root bin (src + build.rs), crates/ members,
+# and builtin_skills/ (embedded by bamboo-skills' build.rs). .dockerignore
+# keeps target/.git out of the build context.
+COPY . .
 
-# Copy source
-COPY src ./src
-
-# Build release binary
-RUN cargo build --release --locked
+# Build just the bamboo binary (release, workspace-aware)
+RUN cargo build --release --locked --bin bamboo
 
 # ===== Runtime image =====
 FROM debian:bookworm-slim

@@ -172,6 +172,14 @@ impl DockerDeployer {
             container.to_string(),
             "-e".to_string(),
             format!("BAMBOO_BROKER_TOKEN={}", d.token),
+            // Reach a broker on the host via `host.docker.internal` without
+            // `--network host`: Docker Desktop / orbstack provide this name
+            // automatically, and the `--add-host` (host-gateway = the host's
+            // bridge IP) makes it resolve on native Linux Docker too. The
+            // worker's broker endpoint should therefore use host.docker.internal,
+            // not the host's loopback, while staying on an isolated bridge net.
+            "--add-host".to_string(),
+            "host.docker.internal:host-gateway".to_string(),
         ];
         if let Some(net) = &self.network {
             a.push("--network".into());

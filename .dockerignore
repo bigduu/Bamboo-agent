@@ -1,10 +1,9 @@
 target
 .git
 .github
-docs
-tests
-examples
-**/*.md
+/docs
+/tests
+/examples
 **/*.log
 .DS_Store
 

@@ -117,12 +117,13 @@ impl DeployAgentTool {
                 let image = image.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
                     ToolError::InvalidArguments("env=docker requires `image`".to_string())
                 })?;
-                // Mount the orchestrator's bamboo home read-only so the
-                // containerized worker reads the same config — syncing its MCP
-                // servers + skills (its build_spec reads that mounted config).
+                // No `--network host`: the worker stays on an isolated bridge
+                // network and reaches the host broker via host.docker.internal
+                // (DockerDeployer adds the host-gateway alias + the endpoint is
+                // rewritten below). Mount the orchestrator's bamboo home read-only
+                // so the worker reads the same config (MCP servers + skills).
                 Box::new(
                     DockerDeployer::new(image)
-                        .network("host")
                         .mount_home(bamboo_config::paths::resolve_bamboo_dir()),
                 )
             }
@@ -139,10 +140,21 @@ impl DeployAgentTool {
             }
         };
 
+        // A container cannot reach the host's loopback; for docker, address the
+        // broker via host.docker.internal (the deployer maps it to the host
+        // gateway). local/ssh keep the configured endpoint as-is.
+        let broker_endpoint = if env == "docker" {
+            self.broker_endpoint
+                .replace("127.0.0.1", "host.docker.internal")
+                .replace("localhost", "host.docker.internal")
+        } else {
+            self.broker_endpoint.clone()
+        };
+
         let deployment = AgentDeployment {
             id: id.clone(),
             role,
-            broker_endpoint: self.broker_endpoint.clone(),
+            broker_endpoint,
             token: self.broker_token.clone(),
             model,
             workspace,
