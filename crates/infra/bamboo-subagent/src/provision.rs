@@ -323,6 +323,7 @@ mod tests {
         s.capabilities = Capabilities {
             mcp: Some(serde_json::json!({ "version": 1, "servers": [] })),
             skills_dir: Some("/home/u/.bamboo/skills".into()),
+            mcp_proxy: None,
         };
         let parsed = ProvisionSpec::from_json(&s.to_json().unwrap()).unwrap();
         assert_eq!(
