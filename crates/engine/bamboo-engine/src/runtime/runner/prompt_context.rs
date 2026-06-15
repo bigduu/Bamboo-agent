@@ -58,6 +58,14 @@ pub(super) fn strip_existing_skill_context(prompt: &str) -> String {
     system_sections::strip_existing_skill_context(prompt)
 }
 
+pub(super) fn append_core_agent_directives(base_prompt: &str, directives: &str) -> String {
+    system_sections::append_core_agent_directives(base_prompt, directives)
+}
+
+pub(super) fn strip_existing_core_directives(prompt: &str) -> String {
+    system_sections::strip_existing_core_directives(prompt)
+}
+
 pub(super) fn strip_existing_tool_guide_context(prompt: &str) -> String {
     system_sections::strip_existing_tool_guide_context(prompt)
 }

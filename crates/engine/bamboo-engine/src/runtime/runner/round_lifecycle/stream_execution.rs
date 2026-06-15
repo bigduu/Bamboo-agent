@@ -6,8 +6,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::prompt_context::{
-    strip_existing_external_memory, strip_existing_plan_mode_instructions,
-    strip_existing_plan_runtime_context, strip_existing_task_list,
+    strip_existing_core_directives, strip_existing_external_memory,
+    strip_existing_plan_mode_instructions, strip_existing_plan_runtime_context,
+    strip_existing_task_list,
 };
 use crate::runtime::runner::session_setup::prompt_envelope::{
     assemble_prompt_envelope, build_conversation_summary_context_block,
@@ -181,12 +182,25 @@ fn derive_system_remainder_message(
     let without_task_list = strip_existing_task_list(&without_external_memory);
     let without_plan_mode = strip_existing_plan_mode_instructions(&without_task_list);
     let without_plan_runtime = strip_existing_plan_runtime_context(&without_plan_mode);
-    let trimmed = without_plan_runtime.trim();
+    // Framework directives always live in the assembled system field and are not
+    // part of the persisted base, so strip them from both sides before comparing.
+    // The directives are inserted INTO the `base` section (between the base text
+    // and the skill/tool-guide/workspace/env contexts) — not as a leading prefix
+    // of the whole frame — so stripping them from both the persisted message and
+    // the reference makes the comparison apples-to-apples (base+contexts vs
+    // base+contexts). Without it, the directive-bearing reference no longer equals
+    // the directive-free persisted base, so the dedup falls through and re-emits
+    // the entire base as a redundant system message. Stripping both sides also
+    // discards a STALE directive block in an old persisted message, so the current
+    // directives (already in the system field) win.
+    let without_directives = strip_existing_core_directives(&without_plan_runtime);
+    let trimmed = without_directives.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    let stable_trimmed = stable_instructions.trim();
+    let stable_without_directives = strip_existing_core_directives(stable_instructions);
+    let stable_trimmed = stable_without_directives.trim();
     if stable_trimmed.is_empty() {
         return Some(Message::system(trimmed.to_string()));
     }
@@ -196,8 +210,21 @@ fn derive_system_remainder_message(
     }
 
     if let Some(remainder) = trimmed.strip_prefix(stable_trimmed) {
+        // Persisted ⊇ reference: the persisted message carries genuine extra
+        // content beyond the assembled system field — re-emit only that tail.
         let remainder = remainder.trim();
         return (!remainder.is_empty()).then(|| Message::system(remainder.to_string()));
+    }
+
+    // Persisted ⊆ reference: the persisted message (typically the bare configured
+    // base, since contexts are injected only at request time) sits at the head of
+    // the assembled system field, and the remainder is framework-injected context
+    // (workspace/skill/tool-guide/env) already present in the system field and the
+    // relocated context messages. There is nothing extra to surface, so do not
+    // re-emit the base into the conversation every round. The `\n` boundary check
+    // avoids a mid-token false prefix (e.g. "base" vs "basement").
+    if stable_trimmed.starts_with(&format!("{trimmed}\n")) {
+        return None;
     }
 
     Some(Message::system(trimmed.to_string()))
@@ -333,14 +360,23 @@ fn build_request_envelope(
     };
     let tool_guide = section("tool_guide");
     let relocate_tool_guide = !tool_guide.trim().is_empty();
+    // Keep ONLY cross-session-invariant content in the system field: the static
+    // identity (`base`) plus the globally-stable env snapshot. Session-variable
+    // context — workspace path, project instruction overlay (CLAUDE.md/AGENTS.md),
+    // loaded skills — is relocated into context-block MESSAGES placed AFTER the
+    // large, invariant tool guide (see `session_context_messages` below). This
+    // keeps the cacheable prefix (system + tool guide) byte-identical across
+    // sessions and across a mid-session workspace/skill injection, which is what
+    // lets an automatic prefix cache (OpenAI/GLM-style, which has no explicit
+    // breakpoints) actually hit on the big block instead of re-reading it.
     let lane_system = if relocate_tool_guide {
         merge_with_optional_contexts(
             &section("base"),
-            Some(&section("workspace")),
-            Some(&section("instruction")),
+            None,
+            None,
             Some(&section("env")),
-            &section("skill"),
-            "", // tool_guide moves to a fixed prefix message below
+            "",
+            "", // tool guide + session context move to fixed prefix messages below
         )
     } else {
         envelope.stable_instructions.clone()
@@ -357,6 +393,50 @@ fn build_request_envelope(
     });
     let tool_guide_breakpoint_id = tool_guide_message.as_ref().map(|m| m.id.clone());
 
+    // Session-variable context (workspace path, project instruction overlay,
+    // loaded skills), relocated to ride AFTER the invariant tool guide so it never
+    // shifts the cached head. Each block is session-stable and emitted only when
+    // present; keeping them as separate blocks lets an unchanged block stay inside
+    // the shared prefix even when a sibling changes. The instruction overlay keeps
+    // Critical priority so its authority survives the move out of the system field.
+    let session_context_messages: Vec<Message> = if relocate_tool_guide {
+        [
+            (
+                ContextBlockType::Workspace,
+                ContextBlockPriority::High,
+                "Workspace",
+                section("workspace"),
+            ),
+            (
+                ContextBlockType::InstructionOverlay,
+                ContextBlockPriority::Critical,
+                "Project Instructions",
+                section("instruction"),
+            ),
+            (
+                ContextBlockType::SkillContext,
+                ContextBlockPriority::High,
+                "Loaded Skills",
+                section("skill"),
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, _, _, content)| !content.trim().is_empty())
+        .map(|(block_type, priority, title, content)| {
+            ContextBlock::new(
+                block_type,
+                priority,
+                ContextBlockStability::SessionStable,
+                title,
+                content,
+            )
+            .render_runtime_context_message()
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
+
     // Responses-API view mirrors the relocation: the guide leaves `instructions`
     // and rides at the front of the input messages.
     let instructions = if relocate_tool_guide {
@@ -369,6 +449,7 @@ fn build_request_envelope(
     if let Some(message) = tool_guide_message.clone() {
         responses_input_messages.push(message);
     }
+    responses_input_messages.extend(session_context_messages.clone());
     responses_input_messages.extend(responses_view.input_messages);
     responses_input_messages.extend(volatile_context_messages.clone());
 
@@ -376,6 +457,7 @@ fn build_request_envelope(
     if let Some(message) = tool_guide_message {
         stable_prefix_messages.push(message);
     }
+    stable_prefix_messages.extend(session_context_messages);
 
     let lanes = PromptLanes {
         stable_instructions: lane_system,

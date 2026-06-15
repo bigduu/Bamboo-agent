@@ -4,6 +4,8 @@ const TOOL_GUIDE_START_MARKER: &str = "<!-- BAMBOO_TOOL_GUIDE_START -->";
 const TOOL_GUIDE_END_MARKER: &str = "<!-- BAMBOO_TOOL_GUIDE_END -->";
 const ENV_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_ENV_CONTEXT_START -->";
 const ENV_CONTEXT_END_MARKER: &str = "<!-- BAMBOO_ENV_CONTEXT_END -->";
+const CORE_DIRECTIVES_START_MARKER: &str = "<!-- BAMBOO_CORE_DIRECTIVES_START -->";
+const CORE_DIRECTIVES_END_MARKER: &str = "<!-- BAMBOO_CORE_DIRECTIVES_END -->";
 
 pub(super) fn merge_system_prompt_with_contexts(
     base_prompt: &str,
@@ -48,6 +50,36 @@ pub(super) fn strip_existing_skill_context(prompt: &str) -> String {
     strip_existing_prompt_block(prompt, SKILL_CONTEXT_START_MARKER, SKILL_CONTEXT_END_MARKER)
 }
 
+pub(super) fn strip_existing_core_directives(prompt: &str) -> String {
+    strip_existing_prompt_block(
+        prompt,
+        CORE_DIRECTIVES_START_MARKER,
+        CORE_DIRECTIVES_END_MARKER,
+    )
+}
+
+/// Append framework-invariant agent directives to a (user-swappable) base prompt.
+///
+/// The directives are wrapped in markers and any pre-existing directive block is
+/// stripped first, so this is idempotent across rounds and the directives survive
+/// even when the user fully replaces the base prompt. Returns the (stripped) base
+/// unchanged when `directives` is empty.
+pub(super) fn append_core_agent_directives(base_prompt: &str, directives: &str) -> String {
+    let stripped = strip_existing_core_directives(base_prompt);
+    let directives = directives.trim();
+    if directives.is_empty() {
+        return stripped;
+    }
+    let wrapped =
+        format!("{CORE_DIRECTIVES_START_MARKER}\n{directives}\n{CORE_DIRECTIVES_END_MARKER}");
+    let stripped = stripped.trim();
+    if stripped.is_empty() {
+        wrapped
+    } else {
+        format!("{stripped}\n\n{wrapped}")
+    }
+}
+
 pub(super) fn strip_existing_tool_guide_context(prompt: &str) -> String {
     strip_existing_prompt_block(prompt, TOOL_GUIDE_START_MARKER, TOOL_GUIDE_END_MARKER)
 }
@@ -90,4 +122,55 @@ pub(super) fn strip_existing_prompt_block(
     }
 
     current
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_DIRECTIVES: &str = "Investigate before you conclude.";
+
+    #[test]
+    fn appends_directives_to_non_empty_base() {
+        let out = append_core_agent_directives("Custom base.", SAMPLE_DIRECTIVES);
+        assert!(out.starts_with("Custom base."));
+        assert!(out.contains(CORE_DIRECTIVES_START_MARKER));
+        assert!(out.contains(SAMPLE_DIRECTIVES));
+        assert!(out.contains(CORE_DIRECTIVES_END_MARKER));
+    }
+
+    #[test]
+    fn append_is_idempotent_across_rounds() {
+        let once = append_core_agent_directives("Base.", SAMPLE_DIRECTIVES);
+        let twice = append_core_agent_directives(&once, SAMPLE_DIRECTIVES);
+        assert_eq!(once, twice);
+        assert_eq!(twice.matches(CORE_DIRECTIVES_START_MARKER).count(), 1);
+    }
+
+    #[test]
+    fn directives_survive_a_fully_overridden_base() {
+        // A user-provided system-prompt.md that drops every builtin instruction
+        // must still carry the framework directives.
+        let user_override = "You are Grumpy. Answer in one word.";
+        let out = append_core_agent_directives(user_override, SAMPLE_DIRECTIVES);
+        assert!(out.contains(SAMPLE_DIRECTIVES));
+    }
+
+    #[test]
+    fn empty_directives_leaves_base_unchanged() {
+        assert_eq!(append_core_agent_directives("Base.", "   "), "Base.");
+    }
+
+    #[test]
+    fn real_core_directives_cover_investigation_and_adversarial_verification() {
+        let directives = crate::runtime::context::CORE_AGENT_DIRECTIVES;
+        let lower = directives.to_ascii_lowercase();
+        assert!(lower.contains("investigate"));
+        assert!(lower.contains("verify"));
+        assert!(lower.contains("adversarial"));
+        // And they actually ride on top of an overridden base.
+        let assembled = append_core_agent_directives("Custom user base.", directives);
+        assert!(assembled.contains("Custom user base."));
+        assert!(assembled.contains(CORE_DIRECTIVES_START_MARKER));
+    }
 }

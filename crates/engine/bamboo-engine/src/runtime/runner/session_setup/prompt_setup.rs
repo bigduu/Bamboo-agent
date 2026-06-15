@@ -10,7 +10,8 @@ use bamboo_agent_core::{
 use bamboo_tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder};
 
 use super::super::prompt_context::{
-    merge_system_prompt_with_contexts, strip_existing_external_memory,
+    append_core_agent_directives, merge_system_prompt_with_contexts,
+    strip_existing_core_directives, strip_existing_external_memory,
     strip_existing_plan_mode_instructions, strip_existing_plan_runtime_context,
     strip_existing_task_list,
 };
@@ -284,7 +285,14 @@ pub(crate) fn build_stable_prompt_frame_with_sections(
         .and_then(crate::runtime::context::instruction::build_instruction_prompt_context);
     let env_context = extract_env_context(&raw_base_prompt)
         .or_else(crate::runtime::context::build_env_prompt_context);
-    let base_prompt = normalize_base_prompt(&raw_base_prompt);
+    // Framework-invariant operating directives ride on top of the (user-swappable)
+    // base so they survive a custom `system-prompt.md` override. Folded into the
+    // `base` section here so they land in the cacheable system field without
+    // touching the lane/cache-breakpoint assembly downstream.
+    let base_prompt = append_core_agent_directives(
+        &normalize_base_prompt(&raw_base_prompt),
+        crate::runtime::context::CORE_AGENT_DIRECTIVES,
+    );
 
     let skill_context = session
         .metadata
@@ -650,7 +658,12 @@ fn normalize_base_prompt(prompt: &str) -> String {
     let without_task_list = strip_existing_task_list(&without_external_memory);
     let without_plan_mode = strip_existing_plan_mode_instructions(&without_task_list);
     let without_plan_runtime = strip_existing_plan_runtime_context(&without_plan_mode);
-    merge_system_prompt_with_contexts(&without_plan_runtime, "", "")
+    // Strip framework directives too, so normalize yields a clean base uniformly
+    // with every other framework-injected section. They are re-added (idempotent)
+    // by `append_core_agent_directives` during assembly; stripping here keeps a
+    // clean base even if directives ever leak into a persisted System message.
+    let without_directives = strip_existing_core_directives(&without_plan_runtime);
+    merge_system_prompt_with_contexts(&without_directives, "", "")
 }
 
 pub(crate) fn merge_with_optional_contexts(

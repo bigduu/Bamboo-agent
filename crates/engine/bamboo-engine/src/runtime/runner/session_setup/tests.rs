@@ -735,6 +735,13 @@ fn build_stable_prompt_frame_includes_base_and_stable_contexts() {
     assert!(stable
         .stable_instructions
         .contains("environment variables were explicitly configured by the user inside Bodhi"));
+    // Framework-invariant directives ride on top of even a fully custom override
+    // base (`config.system_prompt`), so they are present regardless of the user's
+    // base prompt.
+    assert!(stable
+        .stable_instructions
+        .contains("Investigate before you conclude"));
+    assert!(stable.stable_instructions.contains("Verify your own work"));
     assert!(stable.stable_prefix_messages.is_empty());
 }
 

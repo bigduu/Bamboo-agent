@@ -138,6 +138,52 @@ fn test_config(system_prompt: &str) -> crate::runtime::config::AgentLoopConfig {
     }
 }
 
+/// The system field that a base prompt resolves to once the framework-invariant
+/// agent directives are folded in — mirrors what `build_stable_prompt_frame_*`
+/// produces for a bare base (no workspace/env/skill/tool-guide contexts).
+fn expected_system_field(base: &str) -> String {
+    crate::runtime::runner::prompt_context::append_core_agent_directives(
+        base,
+        crate::runtime::context::CORE_AGENT_DIRECTIVES,
+    )
+}
+
+#[test]
+fn system_remainder_none_when_persisted_base_absorbed_by_directive_system() {
+    // Persisted System message holds the base WITHOUT directives; the assembled
+    // system field is that same base WITH the framework directives appended. The
+    // base is fully absorbed by the system field, so no duplicate system message
+    // is re-emitted into the conversation.
+    let persisted = bamboo_agent_core::Message::system("You are Bodhi. Do good work.");
+    let stable = expected_system_field("You are Bodhi. Do good work.");
+    assert!(super::derive_system_remainder_message(&persisted, &stable).is_none());
+}
+
+#[test]
+fn system_remainder_none_when_bare_base_is_prefix_of_context_bearing_system() {
+    // Production shape: the persisted System message is the bare configured base
+    // (contexts are injected only at request time), while the assembled system
+    // field appends framework contexts (workspace/skill/tool-guide/env). The bare
+    // base is fully contained at the head, so it is absorbed — no redundant
+    // re-emission of the base into the conversation. (This would FAIL before the
+    // subset-prefix fix, which re-emitted the whole base every round.)
+    let persisted = bamboo_agent_core::Message::system("You are Bodhi. Do good work.");
+    let stable = "You are Bodhi. Do good work.\n\nWorkspace path: /tmp/x\n\n## Skill\nuse it";
+    assert!(super::derive_system_remainder_message(&persisted, stable).is_none());
+}
+
+#[test]
+fn system_remainder_keeps_genuinely_extra_persisted_content() {
+    // The persisted base carries trailing content not present in the system field.
+    // Stripping directives from both sides must NOT swallow that genuine extra —
+    // it is re-emitted as a remainder message.
+    let persisted = bamboo_agent_core::Message::system("Base.\n\nExtra operator note.");
+    let stable = expected_system_field("Base.");
+    let remainder = super::derive_system_remainder_message(&persisted, &stable)
+        .expect("genuinely-extra persisted content must be re-emitted");
+    assert!(remainder.content.contains("Extra operator note"));
+}
+
 fn usage(summary_tokens: u32, total_tokens: u32) -> TokenUsageBreakdown {
     TokenUsageBreakdown {
         system_tokens: 10,
@@ -210,13 +256,13 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
         .clone();
     assert_eq!(requested_messages.len(), 1);
     assert!(matches!(requested_messages[0].role, Role::System));
-    assert_eq!(requested_messages[0].content, "system");
+    assert_eq!(requested_messages[0].content, expected_system_field("system"));
     assert_eq!(
         llm.requested_instructions
             .lock()
             .expect("instructions lock")
             .as_deref(),
-        Some("system")
+        Some(expected_system_field("system").as_str())
     );
 
     let first = event_rx.recv().await.expect("budget event expected");
@@ -411,7 +457,7 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
             .lock()
             .expect("instructions lock")
             .as_deref(),
-        Some("system")
+        Some(expected_system_field("system").as_str())
     );
 }
 
@@ -669,6 +715,107 @@ fn build_request_envelope_relocates_tool_guide_into_stable_prefix_lane() {
     );
 }
 
+#[test]
+fn build_request_envelope_relocates_session_context_after_tool_guide() {
+    // Session-variable context (here: loaded-skill context) must leave the static
+    // system field and ride as a typed context-block message positioned AFTER the
+    // large invariant tool guide — so it never shifts the cached head.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-sessionctx", "test-model");
+    session.metadata.insert(
+        "skill.context".to_string(),
+        "SKILL_CONTEXT_MARKER loaded skill body".to_string(),
+    );
+    let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    // Not in the cacheable, invariant system field.
+    assert!(
+        !envelope
+            .lanes
+            .stable_instructions
+            .contains("SKILL_CONTEXT_MARKER"),
+        "session-variable skill context must leave the system prompt"
+    );
+
+    // Rides as a typed, never-compressed, session-stable context-block message.
+    let msgs = &envelope.lanes.stable_prefix_messages;
+    let skill_pos = msgs
+        .iter()
+        .position(|m| m.content.contains("SKILL_CONTEXT_MARKER"))
+        .expect("skill context relocated into a stable-prefix message");
+    assert!(msgs[skill_pos]
+        .content
+        .contains("context_type: skill_context"));
+    assert!(msgs[skill_pos].never_compress);
+
+    // Positioned AFTER the large invariant tool guide.
+    let guide_pos = msgs
+        .iter()
+        .position(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
+        .expect("tool guide present");
+    assert!(
+        guide_pos < skill_pos,
+        "session context must follow the tool guide in the cached prefix"
+    );
+}
+
+#[test]
+fn lane_system_is_invariant_to_session_variable_context() {
+    // The cache win: two sessions that differ ONLY in session-variable context
+    // (here loaded skills) must produce a byte-identical system field, so the big
+    // invariant prefix (system + tool guide) can share an automatic prefix cache
+    // across sessions instead of diverging at the first variable byte. (Fails on
+    // the old layout, which merged the skill block into the system prompt.)
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+    let ctx = || PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let mut with_skill = Session::new("sess-a", "test-model");
+    with_skill
+        .metadata
+        .insert("skill.context".to_string(), "SKILL_A body".to_string());
+    let without_skill = Session::new("sess-b", "test-model");
+
+    let e_with = super::build_request_envelope(&with_skill, &ctx(), &config, &[]);
+    let e_without = super::build_request_envelope(&without_skill, &ctx(), &config, &[]);
+
+    assert_eq!(
+        e_with.lanes.stable_instructions, e_without.lanes.stable_instructions,
+        "system field must be invariant to session-variable context"
+    );
+    // The relocated invariant guide block is identical too (same cached block).
+    let guide = |e: &super::PreparedRequestEnvelope| {
+        e.lanes
+            .stable_prefix_messages
+            .iter()
+            .find(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
+            .map(|m| m.content.clone())
+            .expect("guide present")
+    };
+    assert_eq!(guide(&e_with), guide(&e_without));
+}
+
 #[tokio::test]
 async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
     let _env_lock = isolate_prompt_safe_env_cache();
@@ -745,7 +892,7 @@ async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
             .lock()
             .expect("instructions lock")
             .as_deref(),
-        Some("system")
+        Some(expected_system_field("system").as_str())
     );
     assert_eq!(
         *llm.requested_store.lock().expect("store lock"),
@@ -1030,7 +1177,7 @@ async fn execute_llm_stream_keeps_previous_response_id_when_local_summary_or_com
             .lock()
             .expect("instructions lock")
             .as_deref(),
-        Some("system")
+        Some(expected_system_field("system").as_str())
     );
     assert_eq!(
         llm.requested_session_id
@@ -1114,7 +1261,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
             .lock()
             .expect("instructions lock")
             .as_deref(),
-        Some("system")
+        Some(expected_system_field("system").as_str())
     );
     assert_eq!(
         *llm.requested_store.lock().expect("store lock"),
@@ -1216,7 +1363,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot_instance_p
             .lock()
             .expect("instructions lock")
             .as_deref(),
-        Some("system")
+        Some(expected_system_field("system").as_str())
     );
     assert!(!session
         .metadata
