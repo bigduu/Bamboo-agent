@@ -11,6 +11,7 @@ use bamboo_metrics::MetricsCollector;
 use super::loop_state::RoundExecutionState;
 
 mod error_path;
+mod goal;
 mod success_path;
 mod workspace;
 

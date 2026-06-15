@@ -8,6 +8,72 @@ use bamboo_engine::session_app::chat::{
     resolve_selected_skill_ids, resolve_workspace_path,
 };
 
+/// Regression: `/goal off` and `/goal clear` must clear the stale runtime
+/// `goal.state` (status / continuation budget / double-check eval history).
+/// Previously the cleanup was gated behind `should_resume`, so only
+/// `/goal <prompt>` (set-prompt) reached it and off/clear left it behind —
+/// surfacing a stale "complete" badge over the history API.
+#[actix_web::test]
+async fn goal_off_and_clear_remove_stale_goal_state() {
+    use crate::AppState;
+    use bamboo_engine::session_app::chat::GoalCommand;
+    use tempfile::tempdir;
+
+    const STALE_GOAL_STATE: &str = r#"{"objective":"ship it","status":"complete","continuation_count":2,"eval_history":[{"checkpoint":"terminal","iteration":3,"decision":"achieved","confidence":"high","reasoning":"done","recorded_at":"t"}],"created_at":"t","updated_at":"t"}"#;
+
+    let temp_dir = tempdir().expect("tempdir");
+    bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state");
+
+    for (session_id, cmd) in [
+        ("goal-off-test", GoalCommand::Off),
+        ("goal-clear-test", GoalCommand::Clear),
+    ] {
+        // Seed a session carrying a stale, finished goal.state + a spread of
+        // stale `gold.*` runtime snapshot keys (incl. ones that were NOT on the
+        // old explicit removal list), plus the config key which must survive.
+        let mut session = Session::new(session_id, "model");
+        session
+            .metadata
+            .insert("goal.state".to_string(), STALE_GOAL_STATE.to_string());
+        for (k, v) in [
+            ("gold.evaluation_count", "7"),
+            ("gold.last_reasoning", "old reasoning"),
+            ("gold.last_checkpoint", "terminal"),
+            ("gold.last_iteration", "7"),
+            ("gold.last_decision", "achieved"),
+        ] {
+            session.metadata.insert(k.to_string(), v.to_string());
+        }
+        state.save_and_cache_session(&mut session).await;
+
+        let _ = super::handle_goal_command(&state, session_id, &cmd).await;
+
+        let reloaded = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("load")
+            .expect("session exists");
+        assert!(
+            !reloaded.metadata.contains_key("goal.state"),
+            "goal.state must be cleared after /goal {cmd:?}"
+        );
+        assert!(
+            !reloaded.metadata.keys().any(|k| k.starts_with("gold.")),
+            "no gold.* runtime keys may remain after /goal {cmd:?}"
+        );
+        // The config (key `gold_config`, no dot) is managed by the handler and
+        // must still be present — the prefix wipe must not remove it.
+        assert!(
+            reloaded.metadata.contains_key("gold_config"),
+            "gold_config must be preserved after /goal {cmd:?}"
+        );
+    }
+}
+
 #[test]
 fn validate_and_normalize_model_rejects_empty_values() {
     let response = validate_and_normalize_model("   ").expect_err("model should be required");

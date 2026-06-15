@@ -49,6 +49,15 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
         tool_schemas.retain(|schema| !config.disabled_tools.contains(&schema.function.name));
     }
 
+    // The `update_goal` self-report tool is only meaningful while the autonomous
+    // goal loop is active; hide it from every ordinary session so it never
+    // tempts the model when no goal is set.
+    if !config.goal_loop_active() {
+        tool_schemas.retain(|schema| {
+            schema.function.name != bamboo_tools::tools::goal::UPDATE_GOAL_TOOL_NAME
+        });
+    }
+
     let activated = activated_discoverable_tools(session);
 
     // Replace descriptions for inactive discoverable tools with short summaries.

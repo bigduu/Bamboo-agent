@@ -143,6 +143,10 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "session_inspector",
     "compact_context",
     "Sleep",
+    // The goal self-report tool records a status only; the durable goal-state
+    // mutation happens in the engine, and it touches no user-facing state, so it
+    // never needs approval.
+    "update_goal",
 ];
 
 /// Classify a tool call as read-only or mutating.

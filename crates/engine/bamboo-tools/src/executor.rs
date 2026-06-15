@@ -13,7 +13,7 @@ use crate::tools::{
     BashOutputTool, BashTool, ConclusionWithOptionsTool, EditTool, EnterPlanModeTool,
     ExitPlanModeTool, GetFileInfoTool, GlobTool, GrepTool, JsReplTool, KillShellTool,
     NotebookEditTool, ReadTool, RequestPermissionsTool, SessionNoteTool, SleepTool, TaskTool,
-    ToolRegistry, WebFetchTool, WebSearchTool, WorkspaceTool, WriteTool,
+    ToolRegistry, UpdateGoalTool, WebFetchTool, WebSearchTool, WorkspaceTool, WriteTool,
 };
 use bamboo_llm::Config;
 use tokio::sync::RwLock;
@@ -171,6 +171,7 @@ impl BuiltinToolExecutor {
         let _ = registry.register(GetFileInfoTool::new());
         let _ = registry.register(GlobTool::new());
         let _ = registry.register(GrepTool::new());
+        let _ = registry.register(UpdateGoalTool::new());
         let _ = registry.register(JsReplTool::new());
         let _ = registry.register(KillShellTool::new());
         let _ = registry.register(SessionNoteTool::new());

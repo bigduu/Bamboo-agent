@@ -8,7 +8,7 @@
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
+pub const BUILTIN_TOOL_NAMES: [&str; 22] = [
     "conclusion_with_options",
     "Bash",
     "BashOutput",
@@ -26,6 +26,7 @@ pub const BUILTIN_TOOL_NAMES: [&str; 21] = [
     "request_permissions",
     "Sleep",
     "Task",
+    "update_goal",
     "WebFetch",
     "WebSearch",
     "Workspace",

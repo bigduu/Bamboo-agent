@@ -143,6 +143,15 @@ pub async fn handler(
         .get(bamboo_engine::model_config_helper::GOLD_CONFIG_METADATA_KEY)
         .and_then(|raw| serde_json::from_str::<bamboo_engine::config::GoldConfig>(raw).ok());
 
+    // Include the runtime goal state (status, continuation count, and the
+    // side-channel double-check eval history) so the frontend can show live
+    // goal progress, not just the configured objective. Stored as a JSON blob
+    // under `goal.state` (see `bamboo_engine::runtime::goal_state`).
+    let goal_state = session
+        .metadata
+        .get("goal.state")
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+
     let mut response = serde_json::json!({
         "session_id": session_id,
         "messages": messages,
@@ -155,6 +164,13 @@ pub async fn handler(
             .as_object_mut()
             .unwrap()
             .insert("gold_config".to_string(), serde_json::to_value(gc).unwrap());
+    }
+
+    if let Some(gs) = goal_state {
+        response
+            .as_object_mut()
+            .unwrap()
+            .insert("goal_state".to_string(), gs);
     }
 
     HttpResponse::Ok().json(response)
@@ -233,6 +249,64 @@ mod tests {
         .await;
         assert_eq!(delta["is_delta"], true);
         assert_eq!(seqs(&delta["messages"]), vec!["m2", "m3"]);
+    }
+
+    #[actix_web::test]
+    async fn history_response_includes_goal_state() {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let mut session = Session::new("hist-goal", "model");
+        session.add_message(Message::user("do it"));
+        // Seed the durable goal state exactly as the engine persists it.
+        session.metadata.insert(
+            "goal.state".to_string(),
+            serde_json::json!({
+                "objective": "ship it",
+                "status": "complete",
+                "continuation_count": 1,
+                "eval_history": [{
+                    "checkpoint": "terminal",
+                    "iteration": 3,
+                    "decision": "achieved",
+                    "confidence": "high",
+                    "reasoning": "verified against current state",
+                    "recorded_at": "2026-06-16T00:00:00Z"
+                }],
+                "created_at": "2026-06-16T00:00:00Z",
+                "updated_at": "2026-06-16T00:00:00Z"
+            })
+            .to_string(),
+        );
+        state.save_and_cache_session(&mut session).await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let resp: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/history/hist-goal")
+                .to_request(),
+        )
+        .await;
+
+        // The runtime goal state is surfaced so the frontend can show live progress.
+        assert_eq!(resp["goal_state"]["status"], "complete");
+        assert_eq!(resp["goal_state"]["continuation_count"], 1);
+        assert_eq!(resp["goal_state"]["eval_history"][0]["decision"], "achieved");
+        assert_eq!(
+            resp["goal_state"]["eval_history"][0]["checkpoint"],
+            "terminal"
+        );
     }
 
     #[actix_web::test]

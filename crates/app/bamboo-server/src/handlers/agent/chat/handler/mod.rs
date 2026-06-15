@@ -251,18 +251,26 @@ async fn handle_goal_command(
         }
     }
 
-    // For `/goal <prompt>`, inject a runtime instruction that opens a brief
-    // goal-clarification turn, and reset gold auto-continue counters so the
-    // mini-loop starts fresh.
-    if should_resume {
-        if let Some(mut session) = state.load_session_merged(session_id).await {
-            // Reset gold auto-continue runtime state.
-            session.metadata.remove("gold.auto_continue_count");
-            session.metadata.remove("gold.last_continue_requested_at");
-            session.metadata.remove("gold.last_evaluation");
-            session.metadata.remove("gold.last_decision");
-            session.metadata.remove("gold.last_confidence");
+    // Reset stale goal runtime state on ANY goal-config change — off / clear / on
+    // / set-prompt — not just set-prompt. Otherwise a finished goal's status and
+    // its double-check eval history linger in `goal.state` and keep being
+    // surfaced to the frontend (and over the history API) after the goal is
+    // turned off or cleared. The suspension reset + clarification turn below are
+    // specific to `/goal <prompt>` and stay gated on `should_resume`.
+    if let Some(mut session) = state.load_session_merged(session_id).await {
+        // Drop ALL `gold.*` runtime snapshot keys by prefix — last_evaluation /
+        // last_decision / last_confidence / last_reasoning / last_checkpoint /
+        // last_iteration / evaluation_count (written by
+        // `apply_gold_evaluation_result`) plus the legacy auto_continue_count — so
+        // this list can't drift out of sync with what the evaluator writes. The
+        // config lives under `gold_config` (no dot), so it is left untouched.
+        session.metadata.retain(|key, _| !key.starts_with("gold."));
+        // Durable goal state (status, continuation budget, declared status, and
+        // the double-check eval history). Keyed by
+        // `goal_state::GOAL_STATE_METADATA_KEY`.
+        session.metadata.remove("goal.state");
 
+        if should_resume {
             // Reset runtime suspension so execute can proceed.
             if let Some(runtime_state) = session.agent_runtime_state.as_mut() {
                 runtime_state.status = bamboo_domain::AgentStatusState::Idle;
@@ -289,9 +297,9 @@ async fn handle_goal_command(
                 "runtime_kind": "gold_goal_resume"
             }));
             session.add_message(resume_msg);
-
-            state.save_and_cache_session(&mut session).await;
         }
+
+        state.save_and_cache_session(&mut session).await;
     }
 
     // Parse back the persisted config for the response.

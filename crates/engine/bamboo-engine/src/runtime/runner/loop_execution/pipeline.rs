@@ -33,8 +33,8 @@ use bamboo_metrics::{
 
 use super::super::to_event_token_usage;
 use super::gold::{
-    apply_completed_gold_evaluation, apply_gold_terminal_continue, drain_in_flight_gold_evaluation,
-    evaluate_gold_terminal, poll_completed_gold_evaluation, spawn_gold_evaluation_if_needed,
+    apply_completed_gold_evaluation, drain_in_flight_gold_evaluation, evaluate_gold_terminal,
+    poll_completed_gold_evaluation, spawn_gold_evaluation_if_needed,
     start_queued_gold_evaluation_if_idle, GoldTerminalDecision,
 };
 use crate::runtime::runner::state_bridge;
@@ -442,10 +442,12 @@ async fn handle_no_tool_calls(
 ) -> TurnOutcome {
     session.add_message(Message::assistant_with_reasoning(content, None, reasoning));
 
-    // Terminal Gold gate: when a goal is set with auto-continue, decide whether
-    // to keep working toward it INSTEAD of completing. Running this inside the
-    // loop means the run emits a single terminal `Complete` only when Gold is
-    // truly done — keeping `is_running` accurate and the SSE stream open.
+    // Terminal goal gate: when an autonomous goal is active, decide whether to
+    // keep working toward it INSTEAD of completing. The agent self-reports
+    // completion via `update_goal`, and a side-channel Gold double-check
+    // verifies the objective before the run actually stops. Running this inside
+    // the loop means the run emits a single terminal `Complete` only when the
+    // goal is truly done — keeping `is_running` accurate and the SSE stream open.
     let decision = evaluate_gold_terminal(
         session,
         task_context,
@@ -460,12 +462,11 @@ async fn handle_no_tool_calls(
     .await;
 
     let outcome = match decision {
-        GoldTerminalDecision::Continue(result) => {
-            let next_count = apply_gold_terminal_continue(session, config, &result);
+        GoldTerminalDecision::Continue { continuation_count } => {
             tracing::info!(
-                "[{}] Gold terminal gate: continuing toward goal (continuation {})",
+                "[{}] Goal terminal gate: continuing toward goal (continuation {})",
                 session_id,
-                next_count
+                continuation_count
             );
             TurnOutcome {
                 should_break: false,
@@ -1257,6 +1258,9 @@ mod tests {
         maybe_suspend_for_orphaned_children, should_retry_turn_error,
     };
     use crate::runtime::config::AgentLoopConfig;
+    use crate::runtime::goal_state::{
+        ensure_goal_state, read_goal_state, write_goal_state, GoalDeclaredStatus, GoalRuntimeStatus,
+    };
     use crate::runtime::runner::state_bridge;
     use bamboo_agent_core::storage::Storage;
     use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
@@ -1386,7 +1390,7 @@ mod tests {
         let metadata = last.metadata.as_ref().expect("runtime metadata");
         assert_eq!(
             metadata.get("runtime_kind").and_then(|v| v.as_str()),
-            Some("gold_continue_resume")
+            Some("goal_continue")
         );
 
         // Drain events: a Gold evaluation was emitted, but NO Complete.
@@ -1448,6 +1452,328 @@ mod tests {
             saw_complete,
             "Complete must be emitted when gold is achieved"
         );
+    }
+
+    /// End-to-end goal loop across multiple terminal rounds:
+    /// 1. The agent finishes prematurely (no tool calls) without declaring done.
+    ///    The side-channel double-check says "continue" → the loop VETOES the
+    ///    stop, persists the verdict, and injects the completion-audit prompt.
+    /// 2. The agent does the work and declares completion via `update_goal`
+    ///    (simulated here through the same `goal_state` API the tool's post-exec
+    ///    handler uses).
+    /// 3. On the next terminal round the double-check confirms ("achieved") →
+    ///    the run stops with exactly one terminal `Complete` and status Complete,
+    ///    and both double-check verdicts are persisted in the goal's eval trail.
+    #[tokio::test]
+    async fn e2e_goal_loop_continue_then_declare_then_complete() {
+        let mut session = Session::new("session-e2e", "model");
+        let config = gold_continue_config();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+
+        // --- Round 1: premature finish, undeclared, judge says continue ---
+        let r1 = super::handle_no_tool_calls(
+            "I think that's everything.".to_string(),
+            None,
+            5,
+            5,
+            round_usage(),
+            &mut session,
+            &tx,
+            None,
+            "round-1",
+            "session-e2e",
+            &config,
+            &None,
+            "model",
+            1,
+            Arc::new(ScriptedGoldProvider {
+                decision: "continue",
+                confidence: "high",
+            }),
+        )
+        .await;
+        assert!(!r1.should_break, "undeclared + continue → keep working");
+        assert!(!r1.sent_complete);
+
+        let st = read_goal_state(&session).expect("goal state persisted after round 1");
+        assert_eq!(st.continuation_count, 1);
+        assert_eq!(st.status, GoalRuntimeStatus::Active);
+        assert_eq!(st.eval_history.len(), 1);
+        assert!(session
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains("update_goal"));
+
+        // --- Agent declares completion via update_goal (post-exec handler) ---
+        let mut st = ensure_goal_state(&session, "finish the task");
+        st.declare(GoalDeclaredStatus::Complete, 2);
+        write_goal_state(&mut session, st);
+
+        // --- Round 2: declared complete, judge confirms "achieved" → stop ---
+        let r2 = super::handle_no_tool_calls(
+            "Done — shipped and verified.".to_string(),
+            None,
+            5,
+            5,
+            round_usage(),
+            &mut session,
+            &tx,
+            None,
+            "round-2",
+            "session-e2e",
+            &config,
+            &None,
+            "model",
+            2,
+            Arc::new(ScriptedGoldProvider {
+                decision: "achieved",
+                confidence: "high",
+            }),
+        )
+        .await;
+        assert!(r2.should_break, "declared complete + achieved → stop");
+        assert!(r2.sent_complete);
+
+        let st = read_goal_state(&session).expect("goal state persisted after round 2");
+        assert_eq!(st.status, GoalRuntimeStatus::Complete);
+        assert_eq!(st.declared_status, None, "declaration cleared after acting");
+        assert_eq!(st.eval_history.len(), 2, "both double-checks persisted");
+
+        drop(tx);
+        let mut completes = 0;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::Complete { .. }) {
+                completes += 1;
+            }
+        }
+        assert_eq!(
+            completes, 1,
+            "exactly one terminal Complete across the whole loop"
+        );
+    }
+
+    /// The double-check must be able to VETO a premature `update_goal(complete)`:
+    /// the agent declared done, but the evaluator confidently says continue.
+    #[tokio::test]
+    async fn e2e_goal_loop_double_check_vetoes_premature_complete() {
+        let mut session = Session::new("session-e2e2", "model");
+        let config = gold_continue_config();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        // Agent prematurely declares completion.
+        let mut st = ensure_goal_state(&session, "finish the task");
+        st.declare(GoalDeclaredStatus::Complete, 1);
+        write_goal_state(&mut session, st);
+
+        let outcome = super::handle_no_tool_calls(
+            "All done!".to_string(),
+            None,
+            5,
+            5,
+            round_usage(),
+            &mut session,
+            &tx,
+            None,
+            "round-1",
+            "session-e2e2",
+            &config,
+            &None,
+            "model",
+            1,
+            Arc::new(ScriptedGoldProvider {
+                decision: "continue",
+                confidence: "high",
+            }),
+        )
+        .await;
+
+        assert!(!outcome.should_break, "premature completion vetoed");
+        assert!(!outcome.sent_complete);
+        let st = read_goal_state(&session).expect("goal state persisted");
+        assert_eq!(st.status, GoalRuntimeStatus::Active);
+        assert_eq!(st.declared_status, None, "stale declaration cleared on veto");
+        assert_eq!(st.continuation_count, 1);
+    }
+
+    /// Full-loop e2e through `run_pipeline`, exercising the REAL wiring:
+    /// the model calls the `update_goal` tool (round 1) → it is dispatched by the
+    /// builtin executor → the post-exec handler records the declaration into the
+    /// durable goal state → on the next terminal round the side-channel
+    /// double-check confirms achievement → the run stops as Complete.
+    ///
+    /// The scripted provider distinguishes main-agent calls (`request_purpose =
+    /// "agent_loop"`) from the Gold double-check (`"gold_evaluation"`).
+    struct GoalLoopE2eProvider {
+        main_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for GoalLoopE2eProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+            options: Option<&bamboo_llm::LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            let purpose = options
+                .and_then(|o| o.request_purpose.as_deref())
+                .unwrap_or("agent_loop");
+
+            if purpose == "gold_evaluation" {
+                // The double-check confirms the goal is achieved.
+                let call = bamboo_agent_core::tools::ToolCall {
+                    id: "gold-1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: bamboo_agent_core::tools::FunctionCall {
+                        name: "report_gold_evaluation".to_string(),
+                        arguments: r#"{"decision":"achieved","confidence":"high","reasoning":"objective verified"}"#.to_string(),
+                    },
+                };
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::ToolCalls(vec![call])),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+
+            // Main agent rounds.
+            let n = self
+                .main_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                // Round 1: declare completion via the update_goal tool.
+                let call = bamboo_agent_core::tools::ToolCall {
+                    id: "ug-1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: bamboo_agent_core::tools::FunctionCall {
+                        name: "update_goal".to_string(),
+                        arguments: r#"{"status":"complete"}"#.to_string(),
+                    },
+                };
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::ToolCalls(vec![call])),
+                    Ok(LLMChunk::Done),
+                ])))
+            } else {
+                // Round 2: finish with a plain message (no tool calls) → terminal.
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token(
+                        "Done — shipped and verified.".to_string(),
+                    )),
+                    Ok(LLMChunk::Done),
+                ])))
+            }
+        }
+    }
+
+    fn e2e_loop_state(session_id: &str) -> crate::runtime::runner::loop_execution::startup::LoopRunState
+    {
+        use crate::runtime::runner::loop_execution::startup::{
+            GoldEvaluationState, LoopRunState, OverflowRecoveryState, TaskEvaluationState,
+        };
+        LoopRunState {
+            session_id: session_id.to_string(),
+            model_name: "model".to_string(),
+            metrics_collector: None,
+            debug_logger: crate::runtime::runner::logging::DebugLogger::new(false),
+            task_context: None,
+            overflow_recovery: OverflowRecoveryState::default(),
+            task_evaluation: TaskEvaluationState::default(),
+            gold_evaluation: GoldEvaluationState {
+                in_flight: None,
+                completed: None,
+                queued_request: None,
+            },
+            auxiliary_models: crate::runtime::config::AuxiliaryModelConfig::default(),
+            runtime_state: AgentRuntimeState::new(session_id),
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_full_loop_update_goal_tool_then_double_check_completes() {
+        use crate::runtime::config::PromptMemoryFlags;
+
+        let mut session = Session::new("session-full-e2e", "model");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let llm: Arc<dyn LLMProvider> = Arc::new(GoalLoopE2eProvider {
+            main_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        // The real builtin executor — it registers and dispatches `update_goal`.
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+            Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+
+        let config = AgentLoopConfig {
+            gold_config: Some(crate::runtime::config::GoldConfig {
+                enabled: true,
+                auto_continue_enabled: true,
+                goal: Some("ship it".to_string()),
+                max_auto_continuations: 3,
+                ..crate::runtime::config::GoldConfig::default()
+            }),
+            // Disable memory/recall injection so the loop makes no auxiliary LLM
+            // calls beyond the scripted main + gold ones.
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+            },
+            model_name: Some("model".to_string()),
+            max_rounds: 5,
+            ..AgentLoopConfig::default()
+        };
+
+        let mut state = e2e_loop_state("session-full-e2e");
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let sent_complete = super::run_pipeline(
+            &mut session,
+            &tx,
+            llm,
+            tools,
+            &cancel,
+            &config,
+            &mut state,
+        )
+        .await
+        .expect("pipeline runs to completion");
+
+        assert!(sent_complete, "the run emits a terminal Complete");
+
+        // The durable goal state reflects the full lifecycle.
+        let goal_state = read_goal_state(&session).expect("goal state persisted");
+        assert_eq!(goal_state.status, GoalRuntimeStatus::Complete);
+        assert_eq!(
+            goal_state.declared_status, None,
+            "declaration cleared after the terminal gate acted"
+        );
+        assert!(
+            !goal_state.eval_history.is_empty(),
+            "the double-check verdict was persisted into the goal's eval trail"
+        );
+
+        // Exactly one terminal Complete across the whole loop.
+        drop(tx);
+        let mut completes = 0;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::Complete { .. }) {
+                completes += 1;
+            }
+        }
+        assert_eq!(completes, 1, "exactly one terminal Complete");
     }
 
     #[derive(Default)]

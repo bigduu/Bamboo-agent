@@ -370,6 +370,19 @@ impl AgentLoopConfig {
             .filter(|cfg| cfg.enabled)
             .and_then(GoldConfig::effective_goal)
     }
+
+    /// Whether the Codex-style autonomous goal loop is active for this run.
+    ///
+    /// This requires Gold to be enabled, a goal to be set, AND auto-continue to
+    /// be on. Only then is the `update_goal` self-report tool surfaced to the
+    /// model and the terminal double-check allowed to veto a premature stop.
+    /// When Gold is enabled without auto-continue, the evaluator stays purely
+    /// observational (legacy behavior).
+    pub fn goal_loop_active(&self) -> bool {
+        self.gold_config.as_ref().is_some_and(|cfg| {
+            cfg.enabled && cfg.auto_continue_enabled && cfg.effective_goal().is_some()
+        })
+    }
 }
 
 #[cfg(test)]

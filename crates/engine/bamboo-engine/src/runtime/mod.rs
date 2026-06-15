@@ -5,6 +5,7 @@ pub mod complexity_classifier;
 pub mod config;
 pub mod context;
 pub mod execution;
+pub mod goal_state;
 pub mod gold_evaluation;
 pub mod hooks;
 pub mod managers;

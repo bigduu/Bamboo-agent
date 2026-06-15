@@ -267,6 +267,20 @@ pub enum AgentEvent {
         reasoning: String,
     },
 
+    /// Emitted whenever the runtime goal state changes — a new status
+    /// (active/complete/blocked/…), an incremented continuation count, or a
+    /// freshly recorded side-channel double-check verdict. Lets the UI reflect
+    /// live goal progress without re-fetching history. Ephemeral: it rides only
+    /// the per-session `/events/{id}` stream; reconnecting clients read the
+    /// authoritative `goal_state` from the history endpoint instead.
+    GoalStatusChanged {
+        /// Session identifier
+        session_id: String,
+        /// Full serialized goal state — identical shape to the history
+        /// response's `goal_state` field (see `bamboo_engine::runtime::goal_state`).
+        goal_state: serde_json::Value,
+    },
+
     /// Emitted when token budget is prepared (after context truncation)
     TokenBudgetUpdated {
         /// Token budget details
@@ -549,6 +563,7 @@ impl AgentEvent {
             | AgentEvent::TaskEvaluationCompleted { session_id, .. }
             | AgentEvent::GoldEvaluationStarted { session_id, .. }
             | AgentEvent::GoldEvaluationCompleted { session_id, .. }
+            | AgentEvent::GoalStatusChanged { session_id, .. }
             | AgentEvent::PlanModeEntered { session_id, .. }
             | AgentEvent::PlanModeExited { session_id, .. }
             | AgentEvent::PlanFileUpdated { session_id, .. }

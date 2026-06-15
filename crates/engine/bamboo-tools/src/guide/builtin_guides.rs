@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 22] = [
     "conclusion_with_options",
     "Bash",
     "BashOutput",
@@ -24,6 +24,7 @@ pub const BUILTIN_GUIDE_NAMES: [&str; 21] = [
     "request_permissions",
     "Sleep",
     "Task",
+    "update_goal",
     "WebFetch",
     "WebSearch",
     "Workspace",
@@ -488,6 +489,18 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Wait before next poll",
                 json!({"seconds":2,"reason":"wait for background process output"}),
                 "Use short waits between repeated status checks.",
+            )],
+        )),
+        "update_goal" => Some(guide(
+            "update_goal",
+            ToolCategory::TaskManagement,
+            "Signal the autonomous session goal's status: status \"complete\" only when the full objective is achieved and you can prove every requirement is satisfied; status \"blocked\" only after the same blocker has persisted for at least three consecutive goal turns.",
+            "Do not call to pause/resume or for ordinary task updates; do not mark complete merely because you are stopping or the budget is nearly spent. Completion is reverified by a side-channel check before the run ends.",
+            &["Task"],
+            vec![example(
+                "Mark the goal achieved",
+                json!({"status":"complete"}),
+                "Call only once every requirement is proven satisfied by current-state evidence.",
             )],
         )),
         "load_skill" => Some(guide(

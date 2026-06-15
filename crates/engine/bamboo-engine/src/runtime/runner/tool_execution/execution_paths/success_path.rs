@@ -4,7 +4,7 @@ use bamboo_agent_core::tools::{handle_tool_result_with_agentic_support, ToolHand
 use bamboo_agent_core::AgentEvent;
 
 use super::super::{clarification, events, task, tool_error_collector};
-use super::{workspace, SuccessPathContext};
+use super::{goal, workspace, SuccessPathContext};
 
 pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -> bool {
     task::track_task_progress(
@@ -29,6 +29,8 @@ pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -
     .await;
 
     workspace::maybe_apply_workspace_update(ctx.session, ctx.tool_call, ctx.result, ctx.session_id);
+
+    goal::maybe_apply_goal_update(ctx.session, ctx.tool_call, ctx.result, ctx.config, ctx.round);
 
     if clarification::maybe_handle_user_question_tool(
         ctx.tool_call,
