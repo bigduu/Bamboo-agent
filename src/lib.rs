@@ -56,6 +56,10 @@ pub mod broker_agent;
 /// The `bamboo actor run` CLI: drive an actor from the terminal.
 pub mod actor_cli;
 
+/// The `bamboo health|status|sessions|stop` admin CLI: a thin HTTP client over a
+/// running `bamboo serve` for operators (health probe, session list/stop).
+pub mod admin_cli;
+
 /// The `bamboo -p` headless server mode: full AppState, one-shot, resumable.
 pub mod headless;
 

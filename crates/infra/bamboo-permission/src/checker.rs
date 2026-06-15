@@ -133,6 +133,14 @@ pub trait PermissionChecker: Send + Sync {
     /// permission type and matching resources will return `false`.
     fn grant_session_permission(&self, perm_type: PermissionType, resource: String);
 
+    /// Override the active permission mode at runtime.
+    ///
+    /// Used by headless entrypoints (e.g. `bamboo -p --permission-mode=bypass`)
+    /// that have no interactive approver, so a tool-using run is not stranded at
+    /// the first gated tool. The default is a no-op; mode-aware implementations
+    /// apply it to their shared config so it takes effect for subsequent checks.
+    fn set_permission_mode(&self, _mode: PermissionMode) {}
+
     /// Check permission and either grant or request confirmation
     ///
     /// This is a convenience method that:
@@ -458,6 +466,12 @@ impl PermissionChecker for ModeAwarePermissionChecker {
 
     fn grant_session_permission(&self, perm_type: PermissionType, resource: String) {
         self.inner.grant_session_permission(perm_type, resource);
+    }
+
+    fn set_permission_mode(&self, mode: PermissionMode) {
+        // Shared `Arc<PermissionConfig>` with `inner`, and `mode()` is read per
+        // check, so this takes effect immediately for subsequent gating.
+        self.config.set_mode(mode);
     }
 }
 

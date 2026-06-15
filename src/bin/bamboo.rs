@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "bamboo")]
+#[command(version)]
 #[command(about = "A fully self-contained AI agent backend framework", long_about = None)]
 #[command(
     after_help = "QUICK RUN (headless server):\n  bamboo -p \"your task\"               full agent run (incl. sub-agents), print result, exit\n  bamboo -p \"next step\" -s <session>  continue an existing session's loop\n  bamboo -p \"...\" -m provider:model   pin the model\n  bamboo -p \"ping\" --echo             no-key smoke of the actor chain (no server)"
@@ -48,6 +49,13 @@ struct Cli {
     /// final {"type":"result",...} envelope. Pipe-safe (logs go to stderr).
     #[arg(long = "stream-json", alias = "raw")]
     stream_json: bool,
+
+    /// With -p: permission mode for the headless run, which has no interactive
+    /// approver. One of: default | plan | accept-edits | dont-ask | bypass.
+    /// Use `bypass` to let a tool-using agent run unattended (otherwise the run
+    /// stalls at the first permission-gated tool such as Bash).
+    #[arg(long = "permission-mode")]
+    permission_mode: Option<String>,
 }
 
 /// Spawn the sidecar orphan guard: a dedicated OS thread that exits the process
@@ -179,6 +187,61 @@ enum Commands {
         #[command(subcommand)]
         command: BrokerAgentCommands,
     },
+
+    /// Probe a running server's health endpoint. Exits non-zero if it is
+    /// unreachable or reports unhealthy — usable as a readiness check.
+    Health {
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// One-screen overview of a running server: address, health, session counts.
+    Status {
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// List sessions on a running server (stop one with `bamboo stop <id>`).
+    Sessions {
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+
+    /// Stop a running agent session's loop by id (POST /api/v1/stop/{id}).
+    Stop {
+        /// Session id to stop.
+        session_id: String,
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+}
+
+/// Connection options shared by the admin subcommands (`health` / `status` /
+/// `sessions` / `stop`). Resolves which running server to talk to.
+#[derive(clap::Args, Clone)]
+struct ConnArgs {
+    /// Full base URL of the server, e.g. `http://127.0.0.1:9562`.
+    /// Overrides `--port` / `--data-dir`.
+    #[arg(long)]
+    server_url: Option<String>,
+
+    /// Server port (defaults to the configured port, normally 9562).
+    #[arg(long)]
+    port: Option<u16>,
+
+    /// Data dir holding config.json, to resolve the port/bind (defaults to ~/.bamboo).
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+}
+
+impl From<ConnArgs> for bamboo_agent::admin_cli::ConnArgs {
+    fn from(c: ConnArgs) -> Self {
+        bamboo_agent::admin_cli::ConnArgs {
+            server_url: c.server_url,
+            port: c.port,
+            data_dir: c.data_dir,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -348,6 +411,10 @@ async fn main() {
         | Some(Commands::Actor { .. })
         | Some(Commands::Broker { .. })
         | Some(Commands::BrokerAgent { .. })
+        | Some(Commands::Health { .. })
+        | Some(Commands::Status { .. })
+        | Some(Commands::Sessions { .. })
+        | Some(Commands::Stop { .. })
         | None => {
             // Worker/CLI logs go to stderr only: stdin/stdout are part of the
             // bootstrap & streaming protocol and must stay clean. (`None` is
@@ -409,6 +476,7 @@ async fn main() {
                 workspace: cli.workspace,
                 data_dir: bamboo_home_dir,
                 stream_json: cli.stream_json,
+                permission_mode: cli.permission_mode,
             };
             if let Err(e) = bamboo_agent::headless::run(args).await {
                 eprintln!("run failed: {e}");
@@ -663,6 +731,34 @@ async fn main() {
                         std::process::exit(1);
                     }
                 }
+            }
+        }
+
+        Commands::Health { conn } => {
+            if let Err(e) = bamboo_agent::admin_cli::health(conn.into()).await {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Status { conn } => {
+            if let Err(e) = bamboo_agent::admin_cli::status(conn.into()).await {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Sessions { conn } => {
+            if let Err(e) = bamboo_agent::admin_cli::sessions_list(conn.into()).await {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Stop { session_id, conn } => {
+            if let Err(e) = bamboo_agent::admin_cli::stop(conn.into(), &session_id).await {
+                eprintln!("{e}");
+                std::process::exit(1);
             }
         }
     }
