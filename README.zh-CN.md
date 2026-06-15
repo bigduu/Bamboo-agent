@@ -35,16 +35,18 @@ Bamboo 是一个能在你自己电脑上运行的 AI 助理"大脑"。它不只�
 
 ## 架构
 
-Bamboo 是一个 Cargo **workspace**：根目录是一个很薄的二进制（`bamboo-agent`，提供 `bamboo` 命令），真正的逻辑分布在 `crates/` 下的多个 crate 中。生产服务由 `crates/bamboo-server` 提供——没有重复的服务实现。`bamboo-agent-core` 只依赖 `bamboo-domain`，保持核心抽象的纯净。
+Bamboo 是一个 Cargo **workspace**：根目录是一个很薄的二进制（`bamboo-agent`，提供 `bamboo` 命令），真正的逻辑按四层组织在 `crates/` 下——`crates/core/`（类型与接口）、`crates/infra/`（独立服务）、`crates/engine/`（核心逻辑）、`crates/app/`（可执行文件与入口）。生产服务由 `crates/app/bamboo-server` 提供——没有重复的服务实现。`bamboo-agent-core` 只依赖 `bamboo-domain`，保持核心抽象的纯净。
 
 ```mermaid
 graph TD
-  CLI["bamboo (root bin)<br/>serve / config"] --> SRV[bamboo-server<br/>Actix HTTP + SSE, routes, schedules, workflows, MCP wiring]
-  SRV --> ENG[bamboo-engine<br/>agent runtime, auto-dream, gardener, skills, MCP, metrics]
+  CLI["bamboo (root bin)<br/>serve / config / -p headless / actor / broker"] --> SRV[bamboo-server<br/>Actix HTTP + SSE, routes, schedules, workflows]
+  SRV --> ENG[bamboo-engine<br/>agent runtime, auto-dream, gardener, metrics]
   ENG --> CORE[bamboo-agent-core<br/>core abstractions]
   CORE --> DOM[bamboo-domain<br/>pure domain types]
   ENG --> MEM[bamboo-memory<br/>session notes, durable memory, plan store, budget]
   ENG --> CMP[bamboo-compression<br/>token budgeting, summarizer, limits]
+  ENG --> SKILLS[bamboo-skills<br/>selection, access control, runtime metadata]
+  ENG --> MCP[bamboo-mcp<br/>MCP client: manager, protocol, transports, tool_index]
   ENG --> TOOLS[bamboo-tools<br/>22 built-in tools, registry, guides, permissions]
   ENG --> INFRA[bamboo-infrastructure<br/>config, LLM providers, session store]
   SRV --> INFRA
@@ -53,8 +55,14 @@ graph TD
   CLI2["bamboo-cli / bamboo-tui<br/>thin clients over HTTP"] -.-> SRV
 ```
 
-**Workspace 成员**（来自 `Cargo.toml`）：
-`bamboo-domain`、`bamboo-infrastructure`、`bamboo-engine`、`bamboo-agent-core`、`bamboo-memory`、`bamboo-compression`、`bamboo-tools`、`bamboo-cli`、`bamboo-server`、`bamboo-tui`，以及根二进制 `bamboo-agent`。
+**Workspace 成员**（来自 `Cargo.toml`），按层级组织：
+
+- **`crates/core/`** — `bamboo-domain`（纯领域类型）、`bamboo-agent-core`（核心抽象）
+- **`crates/infra/`** — `bamboo-config`、`bamboo-llm`、`bamboo-storage`、`bamboo-a2a`、`bamboo-infrastructure`、`bamboo-memory`、`bamboo-metrics`、`bamboo-notification`、`bamboo-skills`、`bamboo-mcp`、`bamboo-permission`、`bamboo-compression`、`bamboo-subagent`、`bamboo-analytics`（仅开发用）
+- **`crates/engine/`** — `bamboo-engine`、`bamboo-tools`
+- **`crates/app/`** — `bamboo-server`、`bamboo-server-tools`、`bamboo-sdk`、`bamboo-cli`、`bamboo-tui`、`bamboo-client-core`、`bamboo-broker`
+
+…以及根二进制 `bamboo-agent`。
 
 **在 Zenith 中的位置：** lotus（React UI）与 bamboo 通过 **HTTP** 通信；bodhi（Tauri 外壳）只是承载界面的容器。bamboo 是执行引擎，bodhi-server（Go）负责账号/持久化/计费与 LLM 代理。
 
@@ -62,7 +70,7 @@ graph TD
 
 ## 旗舰能力深读
 
-### 记忆系统 · `crates/bamboo-memory`
+### 记忆系统 · `crates/infra/bamboo-memory`
 
 记忆分三层：
 
@@ -76,7 +84,7 @@ graph TD
 
 > 为什么重要：记忆系统让助理在长期使用中越来越懂你的项目，而成本可控、数据本地。
 
-### 上下文压缩 · `crates/bamboo-compression`
+### 上下文压缩 · `crates/infra/bamboo-compression`
 
 长会话不会无限膨胀。Bamboo 用**混合策略**：滚动摘要（rolling summary）+ 近期消息窗口（recent window）。
 
@@ -88,7 +96,7 @@ graph TD
 
 > 为什么重要：助理可以做长时间、多步骤的工作而不会因上下文溢出而崩溃或"失忆"。
 
-### 技能系统 · `crates/bamboo-engine/src/skills`
+### 技能系统 · `crates/infra/bamboo-skills`
 
 技能（skills）是可启用的能力包。运行时按会话元数据解析"已选技能"（支持 JSON 数组或逗号分隔的旧格式），并对**未选技能**做轻量、基于请求提示（request hint）的相关性挑选注入上下文（上限 `MAX_UNSELECTED_SKILLS_IN_CONTEXT = 24`），避免把所有技能都塞进提示词。还包含访问控制与运行时元数据。
 
@@ -99,7 +107,7 @@ graph TD
 - **工具**（`bamboo-tools`，**22 个内置**，在 `executor.rs::register_builtin_tools` 注册）：`Bash`、`BashOutput`、`KillShell`、`Read`、`Write`、`Edit`、`NotebookEdit`、`Glob`、`Grep`、`GetFileInfo`、`Workspace`、`WebFetch`、`WebSearch`、`JsRepl`、`Task`、`Sleep`、`EnterPlanMode`、`ExitPlanMode`、`RequestPermissions`、`SessionNote`、`ConclusionWithOptions` 等。工具带**使用指南（guides）**注入运行时、**权限/策略感知**执行路径，以及并行执行支持（`parallel.rs`）。
 - **工作流** — 声明式装载（`bamboo-server/src/workflow/loader.rs`），通过 `/bamboo/workflows` 暴露。
 - **调度** — cron 风格的触发引擎与存储（`bamboo-server/src/schedules/`：`manager`、`trigger_engine`、`session_factory`、`store`）。
-- **MCP** — Model Context Protocol 客户端（`bamboo-engine/src/mcp/`：`manager`、`protocol`、`transports`、`tool_index`），通过 `/mcp`、`/servers` 路由管理外部工具服务器。
+- **MCP** — Model Context Protocol 客户端（`crates/infra/bamboo-mcp/`：`manager`、`protocol`、`transports`、`tool_index`），通过 `/mcp`、`/servers` 路由管理外部工具服务器。
 
 ---
 
@@ -117,8 +125,20 @@ bamboo serve
 ```
 
 `bamboo serve` 支持的参数（均覆盖配置文件）：
-`--port`、`--bind`、`--data-dir`、`--static-dir`、`--workers`。
-另一个子命令 `bamboo config [--path] [--show-secrets]` 用于查看配置。
+`--port`、`--bind`、`--data-dir`、`--static-dir`、`--workers`（外加 `--parent-pid`：当该 PID 消失时进程自动退出，用于 sidecar 守护）。
+
+**其他子命令**（完整列表见 `bamboo --help` / `bamboo <cmd> --help`）：
+
+| 命令 | 作用 |
+|---|---|
+| `bamboo serve` | 启动 HTTP/SSE 服务（见上）。 |
+| `bamboo config [--path] [--show-secrets]` | 查看解析后的配置。 |
+| `bamboo -p "<prompt>"` | 一次性 **headless** 智能体运行（启动完整运行时，含子代理，打印结果后退出）。可选 `-s <session>` 继续会话、`-m provider:model` 指定模型、`--workspace`、`--data-dir`、`--stream-json`（stdout 输出 NDJSON）、`--echo`（无 key 的链路冒烟）。 |
+| `bamboo actor run\|serve\|list\|call` | 从终端驱动子代理 actor fabric（启动并流式输出、作为服务常驻、发现、或发送任务）。 |
+| `bamboo broker serve` | 运行独立的子代理消息 broker（基于持久 mailbox 的 WebSocket 总线）。 |
+| `bamboo broker-agent serve` | 运行连接到 broker 的代理（本地 / Docker / 远程），为其 mailbox 应答 Ask/Task。 |
+
+（`bamboo subagent-worker` 也存在，但它是服务端派生的内部 worker 进程，不用于交互。）
 
 **默认值**（已对照代码核实）：
 
@@ -150,10 +170,10 @@ curl -N http://127.0.0.1:9562/api/v1/stream
 
 ### 作为 Rust SDK 直接调用（进程内）
 
-不需要起服务——**同一套 agent loop** 可以直接在进程内跑起来。`bamboo_agent` crate 是引擎之上的一层符合人体工学的**门面（facade）**：你只需给出 model 和一段 instruction，`.with_defaults_for_data_dir` 会从 `~/.bamboo` 装配好八项运行时依赖（storage、persistence、attachment reader、skills、metrics、config、provider、默认工具集），随后 `agent.run(&mut session, input)` 驱动一轮（内部自动消费事件），`agent.run_stream(session, input)` 则通过 `mpsc` channel 把 `AgentEvent` 流式吐回来。每条调用最终都汇入引擎那唯一一条 canonical 执行路径——门面绝不另起一套 loop。符合人体工学的类型都在 `bamboo_agent::agent`（`Agent`、`AgentBuilder`、`ExecuteRequestBuilder`，以及重导出的 `AgentEvent`、`Session` 等）。
+不需要起服务——**同一套 agent loop** 可以直接在进程内跑起来。`bamboo_sdk` crate 是引擎之上的一层符合人体工学的**门面（facade）**：你只需给出 model 和一段 instruction，`.with_defaults_for_data_dir` 会从 `~/.bamboo` 装配好八项运行时依赖（storage、persistence、attachment reader、skills、metrics、config、provider、默认工具集），随后 `agent.run(&mut session, input)` 驱动一轮（内部自动消费事件），`agent.run_stream(session, input)` 则通过 `mpsc` channel 把 `AgentEvent` 流式吐回来。每条调用最终都汇入引擎那唯一一条 canonical 执行路径——门面绝不另起一套 loop。符合人体工学的类型都在 `bamboo_sdk::agent`（`Agent`、`AgentBuilder`、`ExecuteRequestBuilder`，以及重导出的 `AgentEvent`、`Session` 等）。
 
 ```rust
-use bamboo_agent::agent::{Agent, Session};
+use bamboo_sdk::agent::{Agent, Session};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -190,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
 
 ```toml
 [dependencies]
-bamboo-agent = { git = "https://github.com/bigduu/Bamboo-agent" }
+bamboo-sdk = { git = "https://github.com/bigduu/Bamboo-agent" }
 tokio = { version = "1", features = ["full"] }
 dirs = "5"
 anyhow = "1"

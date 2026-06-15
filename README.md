@@ -35,16 +35,18 @@ If Bodhi is the AI product you see, **Bamboo is the engine running underneath it
 
 ## Architecture
 
-Bamboo is a Cargo **workspace**: a thin root binary (`bamboo-agent`, which exposes the `bamboo` command) sits on top of focused crates under `crates/`. The live server is `crates/bamboo-server` (there is no duplicate server tree). `bamboo-agent-core` depends **only** on `bamboo-domain`, keeping the core abstractions clean.
+Bamboo is a Cargo **workspace**: a thin root binary (`bamboo-agent`, which exposes the `bamboo` command) sits on top of focused crates organized into four tiers — `crates/core/` (types + interfaces), `crates/infra/` (independent services), `crates/engine/` (core logic), and `crates/app/` (executables + entry points). The live server is `crates/app/bamboo-server` (there is no duplicate server tree). `bamboo-agent-core` depends **only** on `bamboo-domain`, keeping the core abstractions clean.
 
 ```mermaid
 graph TD
-  CLI["bamboo (root bin)<br/>serve / config"] --> SRV[bamboo-server<br/>Actix HTTP + SSE, routes, schedules, workflows, MCP wiring]
-  SRV --> ENG[bamboo-engine<br/>agent runtime, auto-dream, gardener, skills, MCP, metrics]
+  CLI["bamboo (root bin)<br/>serve / config / -p headless / actor / broker"] --> SRV[bamboo-server<br/>Actix HTTP + SSE, routes, schedules, workflows]
+  SRV --> ENG[bamboo-engine<br/>agent runtime, auto-dream, gardener, metrics]
   ENG --> CORE[bamboo-agent-core<br/>core abstractions]
   CORE --> DOM[bamboo-domain<br/>pure domain types]
   ENG --> MEM[bamboo-memory<br/>session notes, durable memory, plan store, budget]
   ENG --> CMP[bamboo-compression<br/>token budgeting, summarizer, limits]
+  ENG --> SKILLS[bamboo-skills<br/>selection, access control, runtime metadata]
+  ENG --> MCP[bamboo-mcp<br/>MCP client: manager, protocol, transports, tool_index]
   ENG --> TOOLS[bamboo-tools<br/>22 built-in tools, registry, guides, permissions]
   ENG --> INFRA[bamboo-infrastructure<br/>config, LLM providers, session store]
   SRV --> INFRA
@@ -53,8 +55,14 @@ graph TD
   CLI2["bamboo-cli / bamboo-tui<br/>thin clients over HTTP"] -.-> SRV
 ```
 
-**Workspace members** (from `Cargo.toml`):
-`bamboo-domain`, `bamboo-infrastructure`, `bamboo-engine`, `bamboo-agent-core`, `bamboo-memory`, `bamboo-compression`, `bamboo-tools`, `bamboo-cli`, `bamboo-server`, `bamboo-tui`, plus the root `bamboo-agent` bin.
+**Workspace members** (from `Cargo.toml`), organized by tier:
+
+- **`crates/core/`** — `bamboo-domain` (pure domain types), `bamboo-agent-core` (core abstractions)
+- **`crates/infra/`** — `bamboo-config`, `bamboo-llm`, `bamboo-storage`, `bamboo-a2a`, `bamboo-infrastructure`, `bamboo-memory`, `bamboo-metrics`, `bamboo-notification`, `bamboo-skills`, `bamboo-mcp`, `bamboo-permission`, `bamboo-compression`, `bamboo-subagent`, `bamboo-analytics` (dev-only)
+- **`crates/engine/`** — `bamboo-engine`, `bamboo-tools`
+- **`crates/app/`** — `bamboo-server`, `bamboo-server-tools`, `bamboo-sdk`, `bamboo-cli`, `bamboo-tui`, `bamboo-client-core`, `bamboo-broker`
+
+…plus the root `bamboo-agent` binary.
 
 **Place in the Zenith stack:** lotus (the React UI) and bamboo communicate over **HTTP**; bodhi (the Tauri shell) is just the container that hosts the interface. Bamboo is the execution engine, and bodhi-server (Go) handles accounts/persistence/billing and the LLM proxy.
 
@@ -62,7 +70,7 @@ graph TD
 
 ## Signature Deep-Dives
 
-### Memory System · `crates/bamboo-memory`
+### Memory System · `crates/infra/bamboo-memory`
 
 Memory has three layers:
 
@@ -76,7 +84,7 @@ Memory has three layers:
 
 > Why it matters: the memory system lets the assistant understand your project better over long-term use, while keeping cost controlled and data local.
 
-### Context Compression · `crates/bamboo-compression`
+### Context Compression · `crates/infra/bamboo-compression`
 
 Long conversations don't grow without bound. Bamboo uses a **hybrid strategy**: a rolling summary + a recent message window.
 
@@ -88,7 +96,7 @@ Long conversations don't grow without bound. Bamboo uses a **hybrid strategy**: 
 
 > Why it matters: the assistant can do long, multi-step work without crashing from context overflow or "losing its memory."
 
-### Skill System · `crates/bamboo-engine/src/skills`
+### Skill System · `crates/infra/bamboo-skills`
 
 Skills are enableable capability bundles. At runtime it resolves the "selected skills" from session metadata (supporting JSON arrays or the legacy comma-separated format), and performs lightweight, request-hint-based relevance selection for **unselected skills** to inject into context (capped at `MAX_UNSELECTED_SKILLS_IN_CONTEXT = 24`), avoiding stuffing every skill into the prompt. It also includes access control and runtime metadata.
 
@@ -99,7 +107,7 @@ Built-in skills live in `builtin_skills/`: `docx`, `pdf`, `pptx`, `xlsx`, `skill
 - **Tools** (`bamboo-tools`, **22 built-in**, registered in `executor.rs::register_builtin_tools`): `Bash`, `BashOutput`, `KillShell`, `Read`, `Write`, `Edit`, `NotebookEdit`, `Glob`, `Grep`, `GetFileInfo`, `Workspace`, `WebFetch`, `WebSearch`, `JsRepl`, `Task`, `Sleep`, `EnterPlanMode`, `ExitPlanMode`, `RequestPermissions`, `SessionNote`, `ConclusionWithOptions`, and more. Tools come with **usage guides** injected at runtime, a **permission/policy-aware** execution path, and parallel execution support (`parallel.rs`).
 - **Workflows** — declarative loading (`bamboo-server/src/workflow/loader.rs`), exposed via `/bamboo/workflows`.
 - **Schedules** — a cron-style trigger engine and store (`bamboo-server/src/schedules/`: `manager`, `trigger_engine`, `session_factory`, `store`).
-- **MCP** — Model Context Protocol client (`bamboo-engine/src/mcp/`: `manager`, `protocol`, `transports`, `tool_index`), managing external tool servers via the `/mcp`, `/servers` routes.
+- **MCP** — Model Context Protocol client (`crates/infra/bamboo-mcp/`: `manager`, `protocol`, `transports`, `tool_index`), managing external tool servers via the `/mcp`, `/servers` routes.
 
 ---
 
@@ -117,8 +125,20 @@ bamboo serve
 ```
 
 Arguments supported by `bamboo serve` (all override the config file):
-`--port`, `--bind`, `--data-dir`, `--static-dir`, `--workers`.
-The other subcommand, `bamboo config [--path] [--show-secrets]`, is used to inspect configuration.
+`--port`, `--bind`, `--data-dir`, `--static-dir`, `--workers` (plus `--parent-pid`, a sidecar orphan-guard: the process exits when that PID goes away).
+
+**Other subcommands** (`bamboo --help` / `bamboo <cmd> --help` for the full list):
+
+| Command | What it does |
+|---|---|
+| `bamboo serve` | Start the HTTP/SSE server (above). |
+| `bamboo config [--path] [--show-secrets]` | Inspect the resolved configuration. |
+| `bamboo -p "<prompt>"` | One-shot **headless** agent run (boots the full runtime incl. sub-agents, prints the result, exits). Optional `-s <session>` to continue, `-m provider:model` to pin the model, `--workspace`, `--data-dir`, `--stream-json` (NDJSON on stdout), `--echo` (keyless transport smoke). |
+| `bamboo actor run\|serve\|list\|call` | Drive the sub-agent actor fabric from the terminal (spawn + stream, run as a service, discover, or send a task). |
+| `bamboo broker serve` | Run the standalone sub-agent message broker (WebSocket bus over durable mailboxes). |
+| `bamboo broker-agent serve` | Run a broker-connected agent (local / Docker / remote) that answers Ask/Task for its mailbox. |
+
+(`bamboo subagent-worker` also exists but is an internal worker process spawned by the server — not for interactive use.)
 
 **Defaults** (verified against code):
 
@@ -151,10 +171,10 @@ curl -N http://127.0.0.1:9562/api/v1/stream
 
 ### Use it as a Rust SDK (in-process)
 
-No server needed — the **same agent loop** runs in-process. The `bamboo_agent` crate is an ergonomic **facade** over the engine: you supply a model and an instruction, `.with_defaults_for_data_dir` wires the eight runtime dependencies (storage, persistence, attachment reader, skills, metrics, config, provider, default tools) from `~/.bamboo`, and then `agent.run(&mut session, input)` drives one turn (draining events internally) while `agent.run_stream(session, input)` streams `AgentEvent`s back over an `mpsc` channel. Every call funnels into the engine's single canonical execution path — the facade never forks the loop. The ergonomic types live in `bamboo_agent::agent` (`Agent`, `AgentBuilder`, `ExecuteRequestBuilder`, plus re-exported `AgentEvent`, `Session`, …).
+No server needed — the **same agent loop** runs in-process. The `bamboo_sdk` crate is an ergonomic **facade** over the engine: you supply a model and an instruction, `.with_defaults_for_data_dir` wires the eight runtime dependencies (storage, persistence, attachment reader, skills, metrics, config, provider, default tools) from `~/.bamboo`, and then `agent.run(&mut session, input)` drives one turn (draining events internally) while `agent.run_stream(session, input)` streams `AgentEvent`s back over an `mpsc` channel. Every call funnels into the engine's single canonical execution path — the facade never forks the loop. The ergonomic types live in `bamboo_sdk::agent` (`Agent`, `AgentBuilder`, `ExecuteRequestBuilder`, plus re-exported `AgentEvent`, `Session`, …).
 
 ```rust
-use bamboo_agent::agent::{Agent, Session};
+use bamboo_sdk::agent::{Agent, Session};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -186,19 +206,21 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-> Don't need the event stream? `agent.run(&mut session, input).await?` drives the turn to completion and leaves the answer as the last message on `session`. For full control over per-request overrides (split fast/background/summarization models, skill selection, provider handles, …) drop one layer down to `bamboo_engine`'s `ExecuteRequest` / `ExecuteRequestBuilder` and `agent.execute(&mut session, req)` — the same path the facade calls.
+> **Precondition:** `with_defaults_for_data_dir` reads `~/.bamboo/config.json` (the same config `bamboo serve` uses) and needs the active provider configured with a non-empty `api_key` — otherwise provider creation returns an error (here surfaced by `.expect`). A fresh data dir with no `config.json` defaults to `anthropic` with no key and will fail; `copilot` is the only provider that authenticates keyless (cached OAuth). Set the key in the config file, or pass `.api_key("sk-…")` on the builder before `with_defaults_for_data_dir`.
+
+> Don't need the event stream? `agent.run(&mut session, input).await?` drives the turn to completion and leaves the answer as the last message on `session`. For full control over per-request overrides (split fast/background/summarization models, skill selection, provider handles, …) build an `ExecuteRequest` with `ExecuteRequestBuilder` (both re-exported from `bamboo_sdk::agent`) and call `agent.execute(&mut session, req)` — the same canonical engine path `run` / `run_stream` funnel into.
 
 Add the facade crate as a dependency (path or git):
 
 ```toml
 [dependencies]
-bamboo-agent = { git = "https://github.com/bigduu/Bamboo-agent" }
+bamboo-sdk = { git = "https://github.com/bigduu/Bamboo-agent" }
 tokio = { version = "1", features = ["full"] }
 dirs = "5"
 anyhow = "1"
 ```
 
-> Prefer not to manage these dependencies yourself? Run `bamboo serve` and use the HTTP API above — it drives the exact same loop. The full type reference lives in [`docs/guides/API.md`](./docs/guides/API.md).
+> Prefer not to manage these dependencies yourself? Run `bamboo serve` and use the HTTP API above — it drives the exact same loop. The full SDK type reference is the rustdoc at [docs.rs/bamboo-agent](https://docs.rs/bamboo-agent) (the published crate re-exports the facade as `bamboo_agent::agent`); [`docs/guides/API.md`](./docs/guides/API.md) covers the HTTP/SSE surface.
 
 ### Example configuration
 
