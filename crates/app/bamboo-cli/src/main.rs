@@ -15,8 +15,8 @@ use std::io::{self, Write};
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "copilot-agent-cli")]
-#[command(about = "CLI tool for copilot-agent")]
+#[command(name = "bamboo-cli")]
+#[command(about = "Thin HTTP/SSE client for the Bamboo agent server")]
 #[command(version)]
 struct Cli {
     #[arg(long, default_value = "http://localhost:9562")]
@@ -442,7 +442,7 @@ async fn run_interactive_chat(
 ) -> anyhow::Result<()> {
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    println!("{}", "🤖 Copilot Agent Interactive Chat".cyan().bold());
+    println!("{}", "🤖 Bamboo Interactive Chat".cyan().bold());
     println!("{}", format!("Session ID: {}", session_id).dimmed());
     println!("{}", "Type 'exit' or 'quit' to leave".dimmed());
 
@@ -492,10 +492,10 @@ async fn get_history(
 ) -> anyhow::Result<()> {
     let session_id = match session_id {
         Some(id) => id,
-        None => {
-            println!("{}", "❌ Please provide --session-id".red());
-            return Ok(());
-        }
+        // `--session-id` is a global optional arg shared with chat/send/stream
+        // (which auto-generate a UUID), so clap can't enforce it per-subcommand.
+        // Fail loudly with a non-zero exit so scripted callers can detect it.
+        None => anyhow::bail!("history requires --session-id"),
     };
 
     let url = format!("{}/api/v1/history/{}", server_url, session_id);
