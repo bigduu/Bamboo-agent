@@ -12,6 +12,7 @@ pub(super) struct StreamAccumulationState {
     thinking_tokens: u64,
     cache_creation_input_tokens: u64,
     cache_read_input_tokens: u64,
+    input_tokens: u64,
 }
 
 impl StreamAccumulationState {
@@ -26,6 +27,7 @@ impl StreamAccumulationState {
             thinking_tokens: 0,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
+            input_tokens: 0,
         }
     }
 
@@ -54,10 +56,14 @@ impl StreamAccumulationState {
         self.thinking_tokens = thinking_tokens;
     }
 
-    pub(super) fn record_cache(&mut self, creation: u64, read: u64) {
+    pub(super) fn record_cache(&mut self, creation: u64, read: u64, input: u64) {
         self.cache_creation_input_tokens =
             self.cache_creation_input_tokens.saturating_add(creation);
         self.cache_read_input_tokens = self.cache_read_input_tokens.saturating_add(read);
+        // input_tokens is the (fixed) fresh prompt size, reported once in
+        // message_start. Take the max rather than accumulating so a delta that
+        // echoes it does not double-count.
+        self.input_tokens = self.input_tokens.max(input);
     }
 
     pub(super) fn into_output(self) -> StreamHandlingOutput {
@@ -71,6 +77,7 @@ impl StreamAccumulationState {
             thinking_tokens: self.thinking_tokens,
             cache_creation_input_tokens: self.cache_creation_input_tokens,
             cache_read_input_tokens: self.cache_read_input_tokens,
+            input_tokens: self.input_tokens,
         }
     }
 }

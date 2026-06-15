@@ -37,6 +37,10 @@ fn other_io_error(message: impl Into<String>) -> io::Error {
 /// `session.json` in each session directory.
 const RUNTIME_SIDECAR_FILE: &str = "runtime.json";
 
+/// Filename of the append-only per-LLM-call token-usage log, stored alongside
+/// `session.json` in each session directory. One JSON line per call.
+const TOKEN_USAGE_FILE: &str = "token-usage.jsonl";
+
 /// Marker (under `bamboo_home_dir`) recording that the one-shot runtime sidecar
 /// migration has completed, so it is skipped on subsequent boots.
 const RUNTIME_SIDECAR_MIGRATION_MARKER: &str = ".runtime_sidecar_migrated";
@@ -1027,6 +1031,35 @@ impl Storage for SessionStoreV2 {
             .map(|entry| (entry.id.clone(), entry.last_run_status.clone()))
             .collect())
     }
+
+    async fn append_token_usage_record(
+        &self,
+        session_id: &str,
+        json_line: &str,
+    ) -> io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        validate_session_id(session_id)?;
+        // Resolve the session's own directory. If it isn't indexed yet (no
+        // initial save has happened), skip silently — this is an analysis
+        // sidecar, never authoritative state.
+        let Some(rel) = self.resolve_rel_path(session_id).await else {
+            return Ok(());
+        };
+        let path = self.abs_path_from_rel(&rel).join(TOKEN_USAGE_FILE);
+
+        // Exactly one line per record, regardless of how the caller framed it.
+        let mut line = json_line.trim_end_matches('\n').to_string();
+        line.push('\n');
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        file.write_all(line.as_bytes()).await?;
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -1096,6 +1129,47 @@ mod tests {
     async fn read_session_json_raw(storage: &SessionStoreV2, id: &str) -> String {
         let path = storage.session_json_path(id).await.unwrap().unwrap();
         tokio::fs::read_to_string(path).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn append_token_usage_record_writes_jsonl_in_session_dir() -> io::Result<()> {
+        let (storage, _t) = create_temp_storage().await?;
+        let s = session_with_history("tu-1", 1, "run-A");
+        storage.save_session(&s).await?;
+
+        storage
+            .append_token_usage_record("tu-1", r#"{"round":1,"cache_read_input_tokens":0}"#)
+            .await?;
+        // A trailing newline in the caller's line must not produce a blank line.
+        storage
+            .append_token_usage_record("tu-1", "{\"round\":2,\"cache_read_input_tokens\":9000}\n")
+            .await?;
+
+        let rel = storage.resolve_rel_path("tu-1").await.unwrap();
+        let path = storage.abs_path_from_rel(&rel).join(TOKEN_USAGE_FILE);
+        assert!(path.exists(), "token-usage.jsonl should sit in the session dir");
+
+        let contents = tokio::fs::read_to_string(&path).await?;
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per appended record");
+        assert!(lines[0].contains("\"round\":1"));
+        assert!(lines[1].contains("\"round\":2"));
+        // Each line is valid standalone JSON.
+        for line in lines {
+            serde_json::from_str::<serde_json::Value>(line).expect("each line is valid JSON");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_token_usage_record_is_noop_for_unindexed_session() -> io::Result<()> {
+        let (storage, _t) = create_temp_storage().await?;
+        // No save_session → not indexed yet. Must not error, must not create a file.
+        storage
+            .append_token_usage_record("never-saved", r#"{"round":1}"#)
+            .await?;
+        assert!(storage.resolve_rel_path("never-saved").await.is_none());
+        Ok(())
     }
 
     #[tokio::test]

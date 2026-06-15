@@ -60,6 +60,24 @@ pub trait Storage: Send + Sync {
         let _ = parent_session_id;
         Ok(Vec::new())
     }
+
+    /// Append one analysis record — a single JSON line — to the session's
+    /// dedicated, append-only token-usage log, stored alongside the session's
+    /// other files in its per-session directory.
+    ///
+    /// One line is written per LLM call so the full per-round history (cache
+    /// read/creation, output, budget breakdown) survives for offline cost/cache
+    /// analysis — unlike `session.json`, which only keeps the latest overwritten
+    /// usage snapshot. Backends without a per-session directory keep the default
+    /// no-op, so this is always safe to call.
+    async fn append_token_usage_record(
+        &self,
+        session_id: &str,
+        json_line: &str,
+    ) -> std::io::Result<()> {
+        let _ = (session_id, json_line);
+        Ok(())
+    }
 }
 
 /// Attachment reader for `bamboo-attachment://<session_id>/<attachment_id>` references.

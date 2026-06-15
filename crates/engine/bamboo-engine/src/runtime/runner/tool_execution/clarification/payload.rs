@@ -21,10 +21,21 @@ pub(super) struct UserQuestionPayload {
 /// - `conclusion_with_options` — general purpose question
 /// - `ExitPlanMode` — plan confirmation
 /// - `request_permissions` — permission approval request
+/// - any tool whose result is a synthesized permission-approval prompt (the
+///   permission checker gates a mutating tool and returns the same shape as
+///   `request_permissions`, tagged with `display_preference = "request_permissions"`)
 pub(super) fn should_handle_user_question_tool(tool_call: &ToolCall, result: &ToolResult) -> bool {
+    if !result.success {
+        return false;
+    }
     let normalized = bamboo_tools::normalize_tool_ref(&tool_call.function.name)
         .unwrap_or_else(|| tool_call.function.name.trim().to_string());
-    PAUSE_TOOLS.contains(&normalized.as_str()) && result.success
+    if PAUSE_TOOLS.contains(&normalized.as_str()) {
+        return true;
+    }
+    // A permission gate can synthesize an approval request for any tool; it is
+    // tagged with this display preference (same payload request_permissions returns).
+    result.display_preference.as_deref() == Some("request_permissions")
 }
 
 pub(super) fn parse_user_question_payload(result_content: &str) -> Option<UserQuestionPayload> {

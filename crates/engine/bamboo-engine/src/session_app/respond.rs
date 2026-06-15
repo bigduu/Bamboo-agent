@@ -2,6 +2,7 @@
 
 use bamboo_agent_core::{PendingQuestion, Session};
 use bamboo_domain::session::runtime_state::{AgentRuntimeState, PlanModeState, PlanModeStatus};
+use bamboo_tools::permission::PermissionType;
 use chrono::Utc;
 
 use super::errors::RespondError;
@@ -11,6 +12,13 @@ use super::types::RespondInput;
 
 const CLARIFICATION_RESUME_PENDING_KEY: &str = "clarification_resume_pending";
 const CONCLUSION_WITH_OPTIONS_RESUME_PENDING_KEY: &str = "conclusion_with_options_resume_pending";
+
+/// Session-metadata key marking a tool call that was approved through a permission
+/// prompt and must be RE-EXECUTED on resume. The gated tool never actually ran
+/// (the permission gate intercepted it before execution), so on approval the
+/// server resume adapter re-runs it and writes the real output back — instead of
+/// leaving the model to infer/fabricate it. Value = the tool_call_id.
+pub const PERMISSION_REEXECUTE_METADATA_KEY: &str = "permission.reexecute_tool_call_id";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseSource {
@@ -41,7 +49,15 @@ pub enum PlanModeTransition {
 pub async fn submit_pending_response(
     repo: &dyn SessionAccess,
     input: RespondInput,
-) -> Result<(Session, String, Option<PlanModeTransition>), RespondError> {
+) -> Result<
+    (
+        Session,
+        String,
+        Option<PlanModeTransition>,
+        Vec<(PermissionType, String)>,
+    ),
+    RespondError,
+> {
     submit_pending_response_with_source(repo, input, ResponseSource::Human).await
 }
 
@@ -49,7 +65,15 @@ pub async fn submit_pending_response_with_source(
     repo: &dyn SessionAccess,
     input: RespondInput,
     response_source: ResponseSource,
-) -> Result<(Session, String, Option<PlanModeTransition>), RespondError> {
+) -> Result<
+    (
+        Session,
+        String,
+        Option<PlanModeTransition>,
+        Vec<(PermissionType, String)>,
+    ),
+    RespondError,
+> {
     // ---- Load session (merged for respond to pick up in-memory pending question) ----
     let mut session = repo
         .load_merged(&input.session_id)
@@ -77,6 +101,24 @@ pub async fn submit_pending_response_with_source(
     );
 
     let reviewed_plan = extract_exit_plan_from_tool_result_message(&session, &tool_call_id);
+
+    // Permission grants implied by approving a permission prompt. Read from the
+    // (still-unmodified) synthesized tool-result payload, BEFORE it is overwritten
+    // by the user's selection below.
+    let permission_grants = if is_permission_approval(&input.user_response) {
+        extract_permission_grants_from_tool_result_message(&session, &tool_call_id)
+    } else {
+        Vec::new()
+    };
+    if !permission_grants.is_empty() {
+        // Approved a permission prompt: mark the gated tool call for re-execution
+        // on resume so the operation actually runs (real output) rather than the
+        // model inferring it. Consumed by the server resume adapter.
+        session.metadata.insert(
+            PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
+            tool_call_id.clone(),
+        );
+    }
 
     // ---- Update or append tool result message ----
     let found = update_or_append_tool_result_message(
@@ -141,7 +183,12 @@ pub async fn submit_pending_response_with_source(
         input.session_id
     );
 
-    Ok((session, input.user_response, plan_mode_transition))
+    Ok((
+        session,
+        input.user_response,
+        plan_mode_transition,
+        permission_grants,
+    ))
 }
 
 /// Apply plan mode state transitions based on the pending question tool and user response.
@@ -276,6 +323,67 @@ fn extract_exit_plan_from_tool_result_message(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+/// Detect whether the user response approves a pending permission request.
+///
+/// Permission prompts (synthesized by the permission gate, and the
+/// `request_permissions` tool) offer exactly `["Approve", "Deny"]`.
+fn is_permission_approval(user_response: &str) -> bool {
+    user_response.trim().eq_ignore_ascii_case("approve")
+}
+
+/// Extract the permission grants implied by an approved permission prompt.
+///
+/// Reads the pending tool-result message (still the synthesized
+/// `awaiting_permission_approval` payload, before it is overwritten by the
+/// user's selection) and returns the `(PermissionType, resource)` pairs the
+/// caller should grant for the session. Handles both the single-gated-tool shape
+/// (top-level `permission_type` + `resource`) and the `request_permissions` shape
+/// (a `permissions` array).
+fn extract_permission_grants_from_tool_result_message(
+    session: &Session,
+    tool_call_id: &str,
+) -> Vec<(PermissionType, String)> {
+    let message = match session
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some(tool_call_id))
+    {
+        Some(message) => message,
+        None => return Vec::new(),
+    };
+    let payload = match serde_json::from_str::<serde_json::Value>(&message.content) {
+        Ok(payload) => payload,
+        Err(_) => return Vec::new(),
+    };
+    if payload.get("status").and_then(|value| value.as_str())
+        != Some("awaiting_permission_approval")
+    {
+        return Vec::new();
+    }
+
+    let parse_one = |value: &serde_json::Value| -> Option<(PermissionType, String)> {
+        let type_value = value
+            .get("permission_type")
+            .or_else(|| value.get("type"))?
+            .clone();
+        let perm_type: PermissionType = serde_json::from_value(type_value).ok()?;
+        let resource = value.get("resource")?.as_str()?.trim().to_string();
+        if resource.is_empty() {
+            return None;
+        }
+        Some((perm_type, resource))
+    };
+
+    if let Some(array) = payload
+        .get("permissions")
+        .and_then(|value| value.as_array())
+    {
+        array.iter().filter_map(parse_one).collect()
+    } else {
+        parse_one(&payload).into_iter().collect()
+    }
 }
 
 #[cfg(test)]

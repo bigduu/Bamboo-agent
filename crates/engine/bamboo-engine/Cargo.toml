@@ -62,3 +62,8 @@ http = "1"
 
 [features]
 test-utils = []
+# Write the per-call token-usage JSONL sidecar (for the bamboo-analytics dev
+# tool). The emit is also active automatically in any debug build, so dev
+# `cargo run`/tests get it for free; this feature is the explicit escape hatch
+# to force it on in a `--release` build. Off (and silent) in release otherwise.
+token-usage-log = []

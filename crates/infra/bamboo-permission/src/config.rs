@@ -61,7 +61,11 @@ impl PermissionType {
 }
 
 /// Risk level for permission types
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Ordered `Low < Medium < High` (derived from declaration order), so a risk
+/// level can be compared against a confirmation threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RiskLevel {
     Low,
     Medium,
@@ -590,6 +594,11 @@ pub struct PermissionConfig {
     enabled: AtomicBool,
     /// Active permission mode controlling auto-approval behavior
     mode: RwLock<PermissionMode>,
+    /// Minimum risk level that requires confirmation when no explicit rule or
+    /// session grant matches. Operations below this threshold are auto-allowed.
+    /// Defaults to `Low` (confirm everything) to preserve legacy behavior; the
+    /// server sets it to `High` for the "ask on high-risk" posture.
+    confirm_threshold: RwLock<RiskLevel>,
 }
 
 impl Default for PermissionConfig {
@@ -607,6 +616,7 @@ impl PermissionConfig {
             session_grant_duration: Duration::from_secs(30 * 60), // 30 minutes
             enabled: AtomicBool::new(true),
             mode: RwLock::new(PermissionMode::Default),
+            confirm_threshold: RwLock::new(RiskLevel::Low),
         }
     }
 
@@ -618,6 +628,7 @@ impl PermissionConfig {
             session_grant_duration: session_duration,
             enabled: AtomicBool::new(enabled),
             mode: RwLock::new(PermissionMode::Default),
+            confirm_threshold: RwLock::new(RiskLevel::Low),
         }
     }
 
@@ -639,6 +650,26 @@ impl PermissionConfig {
     /// Set the permission mode
     pub fn set_mode(&self, mode: PermissionMode) {
         *self.mode.write().expect("mode lock poisoned") = mode;
+    }
+
+    /// Get the minimum risk level that requires confirmation.
+    pub fn confirm_threshold(&self) -> RiskLevel {
+        *self
+            .confirm_threshold
+            .read()
+            .expect("confirm_threshold lock poisoned")
+    }
+
+    /// Set the minimum risk level that requires confirmation.
+    ///
+    /// Operations whose risk level is below `threshold` are auto-allowed when no
+    /// explicit rule or session grant matches. For example, `High` means only
+    /// high-risk operations (execute command, delete, git write, terminal) ask.
+    pub fn set_confirm_threshold(&self, threshold: RiskLevel) {
+        *self
+            .confirm_threshold
+            .write()
+            .expect("confirm_threshold lock poisoned") = threshold;
     }
 
     /// Get the session grant duration
@@ -760,7 +791,9 @@ impl PermissionConfig {
         match self.is_whitelist_allowed(perm_type, resource) {
             Some(true) => false, // Explicitly allowed
             Some(false) => true, // Explicitly denied (requires override)
-            None => true,        // No rule found, require confirmation
+            // No rule found: require confirmation only when the operation's risk
+            // level meets the configured threshold; lower-risk ops auto-allow.
+            None => perm_type.risk_level() >= self.confirm_threshold(),
         }
     }
 
@@ -771,6 +804,7 @@ impl PermissionConfig {
             enabled: self.is_enabled(),
             session_grant_duration_secs: self.session_grant_duration.as_secs(),
             mode: Some(self.mode()),
+            confirm_threshold: Some(self.confirm_threshold()),
         }
     }
 
@@ -783,6 +817,7 @@ impl PermissionConfig {
         }
 
         let mode = config.mode.unwrap_or_default();
+        let confirm_threshold = config.confirm_threshold.unwrap_or(RiskLevel::Low);
 
         Self {
             whitelist,
@@ -790,6 +825,7 @@ impl PermissionConfig {
             session_grant_duration: Duration::from_secs(config.session_grant_duration_secs),
             enabled: AtomicBool::new(config.enabled),
             mode: RwLock::new(mode),
+            confirm_threshold: RwLock::new(confirm_threshold),
         }
     }
 
@@ -823,6 +859,9 @@ impl PermissionConfig {
         // Mode from other takes precedence
         merged.set_mode(other.mode());
 
+        // Confirmation threshold from other takes precedence
+        merged.set_confirm_threshold(other.confirm_threshold());
+
         // Enabled flag from other takes precedence
         merged.set_enabled(other.is_enabled());
 
@@ -836,6 +875,8 @@ pub struct SerializablePermissionConfig {
     pub session_grant_duration_secs: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<PermissionMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_threshold: Option<RiskLevel>,
 }
 
 impl Default for SerializablePermissionConfig {
@@ -845,6 +886,7 @@ impl Default for SerializablePermissionConfig {
             enabled: true,
             session_grant_duration_secs: 30 * 60, // 30 minutes
             mode: None,
+            confirm_threshold: None,
         }
     }
 }
@@ -1471,5 +1513,63 @@ mod integration_tests {
         assert!(!PermissionMode::AcceptEdits.description().is_empty());
         assert!(!PermissionMode::DontAsk.description().is_empty());
         assert!(!PermissionMode::BypassPermissions.description().is_empty());
+    }
+
+    #[test]
+    fn test_confirm_threshold_defaults_to_low() {
+        let config = PermissionConfig::new();
+        assert_eq!(config.confirm_threshold(), RiskLevel::Low);
+        // With the default Low threshold, every (medium/high) op needs confirmation.
+        assert!(config.needs_confirmation(PermissionType::WriteFile, "/tmp/x.txt"));
+        assert!(config.needs_confirmation(PermissionType::ExecuteCommand, "ls"));
+    }
+
+    #[test]
+    fn test_confirm_threshold_high_auto_allows_below_high() {
+        let config = PermissionConfig::new();
+        config.set_confirm_threshold(RiskLevel::High);
+        // Medium-risk ops auto-allow (no confirmation) ...
+        assert!(!config.needs_confirmation(PermissionType::WriteFile, "/tmp/x.txt"));
+        assert!(!config.needs_confirmation(PermissionType::HttpRequest, "api.example.com"));
+        // ... high-risk ops still require confirmation.
+        assert!(config.needs_confirmation(PermissionType::ExecuteCommand, "rm -rf /"));
+        assert!(config.needs_confirmation(PermissionType::DeleteOperation, "/etc/passwd"));
+        assert!(config.needs_confirmation(PermissionType::GitWrite, "push"));
+        assert!(config.needs_confirmation(PermissionType::TerminalSession, "sh"));
+    }
+
+    #[test]
+    fn test_confirm_threshold_explicit_deny_overrides_auto_allow() {
+        let config = PermissionConfig::new();
+        config.set_confirm_threshold(RiskLevel::High);
+        // An explicit deny rule still forces confirmation for a medium-risk op.
+        config.add_rule(PermissionRule::new(
+            PermissionType::WriteFile,
+            "/secret/*",
+            false,
+        ));
+        assert!(config.needs_confirmation(PermissionType::WriteFile, "/secret/x.txt"));
+        // Other medium-risk writes still auto-allow.
+        assert!(!config.needs_confirmation(PermissionType::WriteFile, "/tmp/x.txt"));
+    }
+
+    #[test]
+    fn test_confirm_threshold_serialize_roundtrip() {
+        let config = PermissionConfig::new();
+        config.set_confirm_threshold(RiskLevel::High);
+        let serializable = config.to_serializable();
+        assert_eq!(serializable.confirm_threshold, Some(RiskLevel::High));
+        let json = serde_json::to_string(&serializable).unwrap();
+        assert!(json.contains("high"));
+        let restored = PermissionConfig::from_serializable(serde_json::from_str(&json).unwrap());
+        assert_eq!(restored.confirm_threshold(), RiskLevel::High);
+    }
+
+    #[test]
+    fn test_confirm_threshold_backward_compat_defaults_low() {
+        // Old serialized config without confirm_threshold → defaults to Low.
+        let json = r#"{"whitelist":[],"enabled":true,"session_grant_duration_secs":1800}"#;
+        let restored = PermissionConfig::from_serializable(serde_json::from_str(json).unwrap());
+        assert_eq!(restored.confirm_threshold(), RiskLevel::Low);
     }
 }

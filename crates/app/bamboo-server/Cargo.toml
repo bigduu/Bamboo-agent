@@ -22,6 +22,7 @@ bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
 bamboo-tools = { path = "../../engine/bamboo-tools" }
 bamboo-server-tools = { path = "../../app/bamboo-server-tools" }
 bamboo-metrics = { path = "../../infra/bamboo-metrics" }
+bamboo-notification = { path = "../../infra/bamboo-notification" }
 bamboo-mcp = { path = "../../infra/bamboo-mcp" }
 bamboo-broker = { path = "../bamboo-broker" }
 bamboo-skills = { path = "../../infra/bamboo-skills" }

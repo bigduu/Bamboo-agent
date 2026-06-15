@@ -13,6 +13,7 @@ pub mod history;
 pub mod mcp;
 pub mod messages;
 pub mod metrics;
+pub mod notifications;
 pub mod prompt_presets;
 pub mod respond;
 pub mod schedules;

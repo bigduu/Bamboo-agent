@@ -912,15 +912,23 @@ pub fn parse_anthropic_sse_event(
                             .get("cache_read_input_tokens")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
-                        if cache_creation > 0 || cache_read > 0 {
+                        // Non-cached fresh input — reported once, here in
+                        // message_start. Disjoint from the two cache counts.
+                        let input_tokens = usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if cache_creation > 0 || cache_read > 0 || input_tokens > 0 {
                             tracing::info!(
-                                "Anthropic stream message_start cache_creation={} cache_read={}",
+                                "Anthropic stream message_start input={} cache_creation={} cache_read={}",
+                                input_tokens,
                                 cache_creation,
                                 cache_read,
                             );
                             return Ok(Some(LLMChunk::CacheUsage {
                                 cache_creation_input_tokens: cache_creation,
                                 cache_read_input_tokens: cache_read,
+                                input_tokens,
                             }));
                         }
                     }
@@ -965,6 +973,10 @@ pub fn parse_anthropic_sse_event(
                                 .get("cache_read_input_tokens")
                                 .and_then(|value| value.as_u64())
                                 .unwrap_or(0);
+                            let input_tokens = usage
+                                .get("input_tokens")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0);
 
                             if let Some(thinking_tokens) = thinking_tokens {
                                 state.saw_thinking_signal = true;
@@ -979,11 +991,14 @@ pub fn parse_anthropic_sse_event(
                                 );
                             }
 
-                            // Emit CacheUsage if any cache activity.
+                            // Emit CacheUsage if any cache activity. input_tokens
+                            // is normally only present in message_start; pass it
+                            // through if a delta echoes it (the handler de-dups).
                             if cache_creation > 0 || cache_read > 0 {
                                 return Ok(Some(LLMChunk::CacheUsage {
                                     cache_creation_input_tokens: cache_creation,
                                     cache_read_input_tokens: cache_read,
+                                    input_tokens,
                                 }));
                             }
 

@@ -53,14 +53,20 @@ pub(super) async fn handle_chunk_result(
         Ok(LLMChunk::CacheUsage {
             cache_creation_input_tokens,
             cache_read_input_tokens,
+            input_tokens,
         }) => {
             tracing::debug!(
-                "[{}] Cache usage: creation={}, read={}",
+                "[{}] Cache usage: creation={}, read={}, input={}",
                 session_id,
                 cache_creation_input_tokens,
-                cache_read_input_tokens
+                cache_read_input_tokens,
+                input_tokens
             );
-            state.record_cache(cache_creation_input_tokens, cache_read_input_tokens);
+            state.record_cache(
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                input_tokens,
+            );
             Ok(())
         }
         Ok(LLMChunk::UsageSummary {

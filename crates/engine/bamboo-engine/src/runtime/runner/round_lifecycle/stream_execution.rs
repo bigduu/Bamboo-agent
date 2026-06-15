@@ -27,7 +27,7 @@ use bamboo_agent_core::{
 use bamboo_compression::PreparedContext;
 use bamboo_domain::ReasoningEffort;
 use bamboo_llm::provider::ResponsesRequestOptions;
-use bamboo_llm::{LLMProvider, LLMRequestOptions, PromptCachePlan, PromptLanes};
+use bamboo_llm::{CacheTtl, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptLanes};
 use bamboo_tools::exposure::activated_discoverable_tools;
 
 /// LLM-stream frame bundling per-request identification, observability, and
@@ -410,7 +410,16 @@ fn build_request_envelope(
         cache_tools: true,
         cache_system: true,
         breakpoint_message_ids,
-        ..PromptCachePlan::default()
+        // Use the 1-hour extended cache TTL for the whole stable prefix
+        // (tools + system + tool guide + summary + conversation history). The
+        // default 5-minute TTL expires across any pause longer than 5 min
+        // (waiting on the user, slow tools, long model think time), forcing a
+        // full re-read of the large append-only history — including big tool
+        // results — at full price. The 1-hour TTL survives those gaps; the 2x
+        // write premium is paid once and amortized over many 0.1x cache reads.
+        // Gated behind the `extended-cache-ttl-2025-04-11` beta header, which
+        // the Anthropic provider adds whenever the plan's TTL is Extended.
+        ttl: CacheTtl::Extended,
     };
 
     PreparedRequestEnvelope {
@@ -637,6 +646,56 @@ pub(super) async fn execute_llm_stream(
             stream_output.output_tokens,
             stream_output.thinking_tokens,
         );
+    }
+
+    // Append a per-call record to the session's dedicated, append-only
+    // `token-usage.jsonl` (next to session.json) for offline cache/cost
+    // analysis. `session.token_usage` only keeps the latest overwritten
+    // snapshot; this log keeps the full per-round history. `cache_creation`
+    // lives only on the stream output (not on the budget snapshot), so it is
+    // read from there.
+    //
+    // Gated to dev: active in any debug build, and in release only when the
+    // `token-usage-log` feature is enabled. `cfg!(...)` keeps the code compiled
+    // either way (no unused-binding churn); the compiler eliminates the block in
+    // a release build with the feature off, so nothing is written.
+    if cfg!(any(debug_assertions, feature = "token-usage-log")) {
+        if let Some(persistence) = config.persistence.as_ref() {
+            let record = crate::token_usage_log::TokenUsageRecord::new(
+                chrono::Utc::now().to_rfc3339(),
+                session_id,
+                model,
+                provider_name.unwrap_or(""),
+                session.messages.len(),
+                session.token_usage.as_ref(),
+                stream_output.cache_creation_input_tokens,
+                stream_output.cache_read_input_tokens,
+                stream_output.input_tokens,
+                stream_output.output_tokens,
+                stream_output.thinking_tokens,
+            );
+            match record.to_json_line() {
+                Ok(line) => {
+                    if let Err(error) = persistence
+                        .append_token_usage_record(session_id, &line)
+                        .await
+                    {
+                        tracing::warn!(
+                            "[{}] Failed to append token-usage record: {}",
+                            session_id,
+                            error
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "[{}] Failed to serialize token-usage record: {}",
+                        session_id,
+                        error
+                    );
+                }
+            }
+        }
     }
 
     if supports_previous_response_id {

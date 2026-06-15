@@ -503,6 +503,32 @@ pub enum AgentEvent {
         /// Error message
         message: String,
     },
+
+    /// A user-facing notification derived from agent activity by the backend
+    /// notification policy. Clients render this (e.g. an OS desktop notification)
+    /// after applying their own presence checks (window focus). The decision of
+    /// *whether* to notify — category, priority, preference gating, dedup — is
+    /// made server-side in `bamboo-notification`; the client just delivers it.
+    Notification {
+        /// Unique id (for client-side dedup / dismissal).
+        id: String,
+        /// Session this notification is about.
+        session_id: String,
+        /// Category, e.g. `needs_approval` | `needs_clarification` | `run_completed`
+        /// | `run_failed` | `subagent_completed` | `context_critical`.
+        category: String,
+        /// Priority: `high` | `normal` | `low`.
+        priority: String,
+        /// Short title line.
+        title: String,
+        /// Body text.
+        body: String,
+        /// Stable key for client-side coalescing within a short window.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dedup_key: Option<String>,
+        /// RFC3339 creation timestamp.
+        created_at: String,
+    },
 }
 
 impl AgentEvent {
@@ -533,7 +559,8 @@ impl AgentEvent {
             | AgentEvent::SessionDeleted { session_id, .. }
             | AgentEvent::SessionCleared { session_id, .. }
             | AgentEvent::MessageAppended { session_id, .. }
-            | AgentEvent::ExecutionStarted { session_id, .. } => Some(session_id.as_str()),
+            | AgentEvent::ExecutionStarted { session_id, .. }
+            | AgentEvent::Notification { session_id, .. } => Some(session_id.as_str()),
             AgentEvent::SubAgentStarted {
                 parent_session_id, ..
             }

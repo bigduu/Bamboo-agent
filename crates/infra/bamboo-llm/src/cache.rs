@@ -106,9 +106,16 @@ pub fn cache_usage_from_openai_usage(usage: &Value) -> Option<LLMChunk> {
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    // Non-cached fresh input = total prompt input minus the cached portion.
+    let prompt = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     (cached > 0).then_some(LLMChunk::CacheUsage {
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: cached,
+        input_tokens: prompt.saturating_sub(cached),
     })
 }
 
@@ -119,9 +126,14 @@ pub fn cache_usage_from_gemini_usage(usage_metadata: &Value) -> Option<LLMChunk>
         .get("cachedContentTokenCount")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let prompt = usage_metadata
+        .get("promptTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     (cached > 0).then_some(LLMChunk::CacheUsage {
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: cached,
+        input_tokens: prompt.saturating_sub(cached),
     })
 }
 

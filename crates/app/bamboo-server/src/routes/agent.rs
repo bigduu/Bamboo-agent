@@ -188,6 +188,15 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 "/respond/{session_id}/pending",
                 web::get().to(agent::respond::get_pending_question),
             )
+            // Notification preferences (backend-owned; replaces frontend localStorage)
+            .route(
+                "/notifications/preferences",
+                web::get().to(agent::notifications::get_preferences),
+            )
+            .route(
+                "/notifications/preferences",
+                web::put().to(agent::notifications::update_preferences),
+            )
             .route(
                 "/sessions/{session_id}",
                 web::delete().to(agent::delete::handler),

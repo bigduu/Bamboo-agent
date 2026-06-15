@@ -13,6 +13,7 @@ use bamboo_engine::model_config_helper::{
     resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
 };
 use bamboo_engine::session_app::provider_model::session_effective_model_ref;
+use bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY;
 use bamboo_engine::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
 use tokio::sync::broadcast;
 
@@ -147,23 +148,166 @@ impl ResumeExecutionPort for AppStateResumeRef {
             ),
         };
 
-        spawn_agent_execution(SpawnAgentExecution {
-            state: state.clone(),
-            session_id,
-            session,
-            is_child_session,
-            provider_name: resolved_provider_name,
-            provider_override: None,
-            model_roster,
-            reasoning_effort,
-            reasoning_effort_source,
-            disabled_tools: config.disabled_tools,
-            disabled_skill_ids: config.disabled_skill_ids,
-            cancel_token,
-            mpsc_tx,
-            image_fallback,
-            gold_config,
-            app_data_dir: Some(state.app_data_dir.clone()),
+        // If the user just approved a permission prompt, the gated tool call was
+        // intercepted before it ran — its result is only a placeholder. The grant
+        // has already been recorded (by the respond handler) on the shared
+        // permission checker, so re-execute the tool now for real, write the
+        // output back, then start the loop. This happens off the /respond response
+        // path (in this spawned task) and streams via the same mpsc → forwarder,
+        // so the re-run shows up live and the model sees genuine output instead of
+        // inferring it. The common (non-permission) resume path is unchanged.
+        let reexecute_tool_call_id = session
+            .metadata
+            .get(PERMISSION_REEXECUTE_METADATA_KEY)
+            .cloned();
+        let reexecute_tool_call_id = match reexecute_tool_call_id {
+            None => {
+                spawn_agent_execution(SpawnAgentExecution {
+                    state: state.clone(),
+                    session_id,
+                    session,
+                    is_child_session,
+                    provider_name: resolved_provider_name,
+                    provider_override: None,
+                    model_roster,
+                    reasoning_effort,
+                    reasoning_effort_source,
+                    disabled_tools: config.disabled_tools,
+                    disabled_skill_ids: config.disabled_skill_ids,
+                    cancel_token,
+                    mpsc_tx,
+                    image_fallback,
+                    gold_config,
+                    app_data_dir: Some(state.app_data_dir.clone()),
+                });
+                return;
+            }
+            Some(id) => id,
+        };
+
+        tokio::spawn(async move {
+            let mut session = session;
+            session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
+
+            if let Some(tool_call) = find_pending_tool_call(&session, &reexecute_tool_call_id) {
+                let executor = state.tools_for(crate::tools::ToolSurface::Root);
+                let tool_name = tool_call.function.name.clone();
+                let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
+                    == bamboo_tools::orchestrator::ToolMutability::Mutating;
+
+                // Frame the re-run with the same lifecycle events the normal loop
+                // emits (via ToolEmitter) so the frontend updates the tool card
+                // (running → finished) and ToolComplete carries the REAL output —
+                // raw execute_with_context only streams tool tokens, not lifecycle.
+                let mut emitter =
+                    bamboo_tools::ToolEmitter::new(&tool_call.id, &tool_name, is_mutating);
+                emitter.set_auto_approved(true);
+                let _ = mpsc_tx
+                    .send(emitter.begin().clone().into_agent_event())
+                    .await;
+
+                let exec_result = {
+                    let ctx = bamboo_agent_core::tools::ToolExecutionContext {
+                        session_id: Some(session.id.as_str()),
+                        tool_call_id: reexecute_tool_call_id.as_str(),
+                        event_tx: Some(&mpsc_tx),
+                        available_tool_schemas: None,
+                    };
+                    executor.execute_with_context(&tool_call, ctx).await
+                };
+
+                let (content, success) = match exec_result {
+                    Ok(tool_result) => {
+                        let _ = mpsc_tx
+                            .send(
+                                emitter
+                                    .finish(Some("Re-executed after approval".to_string()))
+                                    .clone()
+                                    .into_agent_event(),
+                            )
+                            .await;
+                        let _ = mpsc_tx
+                            .send(bamboo_agent_core::AgentEvent::ToolComplete {
+                                tool_call_id: tool_call.id.clone(),
+                                result: tool_result.clone(),
+                            })
+                            .await;
+                        (tool_result.result, tool_result.success)
+                    }
+                    Err(error) => {
+                        let message =
+                            format!("Tool re-execution after approval failed: {error}");
+                        let _ = mpsc_tx
+                            .send(emitter.error(message.clone()).clone().into_agent_event())
+                            .await;
+                        (message, false)
+                    }
+                };
+
+                tracing::info!(
+                    "[{}] Re-executed approved tool '{}' ({}) -> success={}",
+                    session_id,
+                    tool_name,
+                    reexecute_tool_call_id,
+                    success
+                );
+                apply_tool_result(&mut session, &reexecute_tool_call_id, content, success);
+                state.save_and_cache_session(&mut session).await;
+            } else {
+                tracing::warn!(
+                    "[{}] Permission re-exec marker set but tool call '{}' not found in history",
+                    session_id,
+                    reexecute_tool_call_id
+                );
+            }
+
+            spawn_agent_execution(SpawnAgentExecution {
+                state: state.clone(),
+                session_id,
+                session,
+                is_child_session,
+                provider_name: resolved_provider_name,
+                provider_override: None,
+                model_roster,
+                reasoning_effort,
+                reasoning_effort_source,
+                disabled_tools: config.disabled_tools,
+                disabled_skill_ids: config.disabled_skill_ids,
+                cancel_token,
+                mpsc_tx,
+                image_fallback,
+                gold_config,
+                app_data_dir: Some(state.app_data_dir.clone()),
+            });
         });
+    }
+}
+
+/// Find the original tool call (with its arguments) by id in the session history.
+fn find_pending_tool_call(
+    session: &bamboo_agent_core::Session,
+    tool_call_id: &str,
+) -> Option<bamboo_agent_core::tools::ToolCall> {
+    session.messages.iter().find_map(|message| {
+        message
+            .tool_calls
+            .as_ref()
+            .and_then(|calls| calls.iter().find(|call| call.id == tool_call_id).cloned())
+    })
+}
+
+/// Overwrite the tool-result message for `tool_call_id` with the real tool output.
+fn apply_tool_result(
+    session: &mut bamboo_agent_core::Session,
+    tool_call_id: &str,
+    content: String,
+    success: bool,
+) {
+    for message in &mut session.messages {
+        if message.tool_call_id.as_deref() == Some(tool_call_id) {
+            message.content = content;
+            message.tool_success = Some(success);
+            return;
+        }
     }
 }

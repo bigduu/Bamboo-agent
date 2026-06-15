@@ -124,6 +124,9 @@ impl AppState {
         let config = Arc::new(RwLock::new(config));
 
         let permission_checker = load_permission_checker(&bamboo_home_dir).await;
+        let notification_service = Arc::new(bamboo_notification::NotificationService::new(
+            bamboo_home_dir.join("notification_preferences.json"),
+        ));
         let mcp_manager = init_mcp_manager(config.clone());
         let skill_manager = init_skill_manager(&data_dir).await;
         let metrics_service = init_metrics_service(&data_dir).await?;
@@ -190,7 +193,7 @@ impl AppState {
 
         let base_tools = build_base_tools(
             config.clone(),
-            permission_checker,
+            permission_checker.clone(),
             mcp_manager.clone(),
             skill_manager.clone(),
             storage.clone(),
@@ -419,6 +422,8 @@ impl AppState {
             schedule_store,
             schedule_manager,
             tool_factory,
+            permission_checker,
+            notification_service,
             subagent_profiles,
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             skill_manager,

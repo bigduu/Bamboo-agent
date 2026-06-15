@@ -1,0 +1,18 @@
+[package]
+name = "bamboo-analytics"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "DuckDB-backed offline analytics over Bamboo session token-usage logs"
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+# Bundled DuckDB: links the native engine (tens of MB). Isolated in this crate
+# so only callers that want analytics pay for it; the engine/server do not.
+duckdb = { version = "1", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"

@@ -272,6 +272,7 @@ async fn execute_llm_stream_emits_final_budget_event_with_stream_usage() {
         LLMChunk::CacheUsage {
             cache_creation_input_tokens: 21,
             cache_read_input_tokens: 34,
+            input_tokens: 12,
         },
         LLMChunk::UsageSummary {
             output_tokens: 56,
@@ -459,6 +460,9 @@ fn build_request_envelope_tails_volatile_context_and_sets_cache_breakpoints() {
     assert!(envelope.cache_plan.cache_system);
     assert!(envelope.cache_plan.cache_tools);
     assert!(envelope.cache_plan.is_breakpoint(&last_user_id));
+    // The stable prefix uses the 1-hour extended TTL so the cache survives
+    // pauses longer than the 5-minute default and big tool results keep hitting.
+    assert_eq!(envelope.cache_plan.ttl, bamboo_llm::CacheTtl::Extended);
 }
 
 #[test]

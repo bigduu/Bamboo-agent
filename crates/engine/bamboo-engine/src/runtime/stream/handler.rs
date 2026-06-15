@@ -19,6 +19,7 @@ pub struct StreamHandlingOutput {
     pub thinking_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+    pub input_tokens: u64,
 }
 
 pub async fn consume_llm_stream(

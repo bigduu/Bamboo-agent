@@ -12,6 +12,46 @@ members = [
     "crates/infra/bamboo-infrastructure",
     "crates/infra/bamboo-memory",
     "crates/infra/bamboo-metrics",
+    "crates/infra/bamboo-notification",
+    "crates/infra/bamboo-skills",
+    "crates/infra/bamboo-mcp",
+    "crates/infra/bamboo-permission",
+    "crates/infra/bamboo-compression",
+    "crates/infra/bamboo-subagent",
+    "crates/infra/bamboo-analytics",
+    # Engine — core logic
+    "crates/engine/bamboo-engine",
+    "crates/engine/bamboo-tools",
+    # App — executables + entry points
+    "crates/app/bamboo-server",
+    "crates/app/bamboo-server-tools",
+    "crates/app/bamboo-sdk",
+    "crates/app/bamboo-cli",
+    "crates/app/bamboo-tui",
+    "crates/app/bamboo-client-core",
+    "crates/app/bamboo-broker",
+]
+# Bare `cargo build`/`test`/`check` (no `-p`/`--workspace`) operate on these.
+# `bamboo-analytics` is intentionally omitted: it is a dev-only analysis tool
+# that links the heavy bundled DuckDB engine, so it stays out of default builds
+# (including release builds that run a bare `cargo build`). It is still a full
+# workspace member, so `cargo build -p bamboo-analytics` and its `report`
+# example work on demand. NOTE: an explicit `cargo build --workspace` overrides
+# this and DOES build it — add `--exclude bamboo-analytics` there to skip it.
+default-members = [
+    ".",
+    # Core — types + interfaces
+    "crates/core/bamboo-domain",
+    "crates/core/bamboo-agent-core",
+    # Infra — independent services
+    "crates/infra/bamboo-config",
+    "crates/infra/bamboo-llm",
+    "crates/infra/bamboo-storage",
+    "crates/infra/bamboo-a2a",
+    "crates/infra/bamboo-infrastructure",
+    "crates/infra/bamboo-memory",
+    "crates/infra/bamboo-metrics",
+    "crates/infra/bamboo-notification",
     "crates/infra/bamboo-skills",
     "crates/infra/bamboo-mcp",
     "crates/infra/bamboo-permission",

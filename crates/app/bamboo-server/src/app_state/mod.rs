@@ -223,6 +223,16 @@ pub struct AppState {
     /// `state.tools_for(ToolSurface::Child)` for child sessions, etc.
     pub tool_factory: crate::tools::ToolSurfaceFactory,
 
+    /// Shared tool-execution permission checker — the same `Arc` the tool
+    /// executors use. Retained so request handlers can record session grants
+    /// when the user approves a permission prompt (see the respond handler).
+    pub permission_checker: Arc<dyn bamboo_tools::permission::PermissionChecker>,
+
+    /// Backend notification policy service (preferences + dedup + per-session
+    /// relays). Classifies agent events into `AgentEvent::Notification` for
+    /// clients to render; preferences are persisted server-side.
+    pub notification_service: Arc<bamboo_notification::NotificationService>,
+
     /// Subagent profile registry (role definitions for child sessions).
     ///
     /// Composed from built-in profiles + user/project/env overrides at

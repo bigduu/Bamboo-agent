@@ -211,7 +211,10 @@ where
         reasoning_effort: session.reasoning_effort,
     };
 
-    let (updated_session, _submitted_answer, plan_mode_transition) =
+    // Gold (eval) auto-answers do not record permission grants; eval sessions
+    // should run with a permissive posture (e.g. BypassPermissions) so they never
+    // pause for approval in the first place.
+    let (updated_session, _submitted_answer, plan_mode_transition, _permission_grants) =
         match submit_pending_response_with_source(state, respond_input, ResponseSource::Gold).await
         {
             Ok(result) => result,

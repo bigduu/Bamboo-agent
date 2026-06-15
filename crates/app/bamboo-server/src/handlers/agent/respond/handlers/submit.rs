@@ -34,7 +34,7 @@ pub async fn submit_response(
         reasoning_effort: req.reasoning_effort,
     };
 
-    let (_session, user_response, plan_mode_transition) =
+    let (_session, user_response, plan_mode_transition, permission_grants) =
         match bamboo_engine::session_app::respond::submit_pending_response(state.as_ref(), input)
             .await
         {
@@ -63,6 +63,22 @@ pub async fn submit_response(
                 };
             }
         };
+
+    // Record session grants for any permission prompt the user approved, so the
+    // resumed run's re-attempt of the gated operation passes the checker without
+    // prompting again. `state.permission_checker` shares the same PermissionConfig
+    // the tool executor checks against.
+    for (perm_type, resource) in &permission_grants {
+        state
+            .permission_checker
+            .grant_session_permission(*perm_type, resource.clone());
+        tracing::info!(
+            "[{}] Granted session permission {:?} for: {}",
+            session_id,
+            perm_type,
+            resource
+        );
+    }
 
     if let Some(event) = plan_mode_transition
         .as_ref()

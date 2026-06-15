@@ -219,6 +219,16 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         self.save(session).await
     }
+
+    async fn append_token_usage_record(
+        &self,
+        session_id: &str,
+        json_line: &str,
+    ) -> std::io::Result<()> {
+        self.storage
+            .append_token_usage_record(session_id, json_line)
+            .await
+    }
 }
 
 #[cfg(test)]

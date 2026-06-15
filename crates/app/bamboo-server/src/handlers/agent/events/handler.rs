@@ -37,6 +37,10 @@ pub async fn handler(
     let sender = state.get_session_event_sender(&session_id).await;
     let receiver = sender.subscribe();
 
+    // Ensure a backend notification relay is running for this session so that
+    // approval/clarification/context/subagent events surface as notifications.
+    state.ensure_notification_relay(&session_id, sender.clone());
+
     // Snapshot runner info (if present). After restarts we may not have runners in-memory,
     // so don't rely solely on this for "already completed" detection.
     let runner_snapshot = {

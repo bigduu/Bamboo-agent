@@ -10,6 +10,12 @@ pub enum LLMChunk {
     CacheUsage {
         cache_creation_input_tokens: u64,
         cache_read_input_tokens: u64,
+        /// Non-cached "fresh" input tokens billed at the base rate — disjoint
+        /// from the cache read/creation counts. With all three, the precise
+        /// prompt size is `input + cache_read + cache_creation` and the exact
+        /// cache-hit ratio is `cache_read / that_sum`. `0` when the provider
+        /// does not report it on this event.
+        input_tokens: u64,
     },
     /// Token usage summary at the end of an Anthropic response.
     UsageSummary {

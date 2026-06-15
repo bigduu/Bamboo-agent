@@ -289,11 +289,17 @@ impl ToolExecutor for BuiltinToolExecutor {
                             )));
                         }
                         Err(PermissionError::ConfirmationRequired {
-                            permission_type: _,
+                            permission_type,
                             resource: _,
                         }) => {
-                            // Emit approval request so the frontend can show it
+                            // Interactive sessions pause for approval by reusing the
+                            // same pending-question pipeline as `request_permissions`:
+                            // synthesize an "awaiting_permission_approval" result that
+                            // the engine recognizes (via display_preference) and turns
+                            // into a NeedClarification pause. On approval the respond
+                            // handler records a session grant so the re-attempt passes.
                             if let Some(tx) = ctx.event_tx {
+                                // Keep emitting the structured approval event for observers.
                                 let _ = tx
                                     .send(bamboo_agent_core::AgentEvent::ToolApprovalRequested {
                                         tool_call_id: call.id.clone(),
@@ -301,7 +307,31 @@ impl ToolExecutor for BuiltinToolExecutor {
                                         parameters: args.clone(),
                                     })
                                     .await;
+
+                                let question = format!(
+                                    "**Permission required**\n\nThe `{}` tool needs approval to {} on:\n\n`{}`",
+                                    tool_name,
+                                    permission_type.description(),
+                                    resource
+                                );
+                                let payload = serde_json::json!({
+                                    "status": "awaiting_permission_approval",
+                                    "question": question,
+                                    "permission_type": permission_type,
+                                    "resource": resource,
+                                    "options": ["Approve", "Deny"],
+                                    "allow_custom": false,
+                                });
+                                return Ok(ToolResult {
+                                    success: true,
+                                    result: payload.to_string(),
+                                    display_preference: Some("request_permissions".to_string()),
+                                    images: Vec::new(),
+                                });
                             }
+
+                            // Non-interactive (no event sink to surface the prompt):
+                            // fail closed rather than silently proceeding.
                             return Err(ToolError::Execution(format!(
                                 "Permission approval required for: {}",
                                 resource
