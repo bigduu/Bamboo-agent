@@ -183,6 +183,31 @@ impl Agent {
         event_rx
     }
 
+    /// Escape hatch for full per-request control: run a fully-specified
+    /// [`ExecuteRequest`] (split fast/background/summarization models, provider
+    /// handle, skill selection, custom event channel, cancellation token, …) on
+    /// `session` via the single canonical engine execution path — the same path
+    /// [`run`](Self::run) / [`run_stream`](Self::run_stream) funnel into.
+    ///
+    /// Unlike `run`/`run_stream`, this does NOT apply the builder's configured
+    /// instruction or model: the caller owns the request entirely. Build it with
+    /// [`ExecuteRequestBuilder`].
+    ///
+    /// ```rust,ignore
+    /// let (tx, _rx) = tokio::sync::mpsc::channel(256);
+    /// let req = ExecuteRequestBuilder::new("investigate X", tx, Default::default())
+    ///     .model("claude-sonnet-4-6")
+    ///     .build();
+    /// agent.execute(&mut session, req).await?;
+    /// ```
+    pub async fn execute(
+        &self,
+        session: &mut Session,
+        request: ExecuteRequest,
+    ) -> Result<(), AgentError> {
+        self.inner.execute(session, request).await
+    }
+
     /// Shared execution path: prepare the session (system prompt + model), build
     /// the [`ExecuteRequest`], and delegate to the canonical engine execution
     /// path. Tool restriction is applied via the agent's executor (built time).

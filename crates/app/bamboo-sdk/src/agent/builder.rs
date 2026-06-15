@@ -162,6 +162,16 @@ impl AgentBuilder {
     /// dependencies set before it. Call `with_defaults_for_data_dir` FIRST, then
     /// override individual dependencies (e.g. [`provider`](Self::provider)) AFTER
     /// it to make those overrides take precedence.
+    ///
+    /// # Precondition
+    ///
+    /// `<data_dir>/config.json` must define the active provider with a non-empty
+    /// `api_key` (the same config `bamboo serve` reads). A fresh data dir with no
+    /// `config.json` defaults to the `anthropic` provider with no key, so step 6
+    /// (`create_provider_with_dir`) returns `Err("failed to create provider: …")`.
+    /// The `copilot` provider is the only one that can authenticate keyless (via
+    /// its cached OAuth token). Set the key via the config file, or pass it on the
+    /// builder with [`api_key`](Self::api_key) **before** calling this method.
     pub async fn with_defaults_for_data_dir(mut self, data_dir: PathBuf) -> Result<Self, String> {
         // 1. Config.
         let mut config = Config::from_data_dir(Some(data_dir.clone()));
@@ -253,37 +263,101 @@ impl Default for AgentBuilder {
     }
 }
 
-/// Apply `api_key` to the active provider's in-memory config slot when that
-/// provider config already exists. Logs a warning otherwise (the SDK does not
-/// fabricate a full provider config struct).
+/// Apply `api_key` to the active provider's in-memory config slot.
+///
+/// If the provider stanza already exists, its key is overwritten. If it is
+/// absent (the common default-config / no-`config.json` case), a minimal stanza
+/// is **fabricated** from `{"api_key": …}` — every other field is serde-default
+/// (all `Option`/`Vec`/`flatten`), so `.api_key("sk-…")` alone is enough to make
+/// a fresh data dir usable. Only the keyed providers (`openai` / `anthropic` /
+/// `gemini`) are fabricated; other providers (e.g. `copilot`, which authenticates
+/// via cached OAuth rather than a plain key) fall through to a warning.
 fn apply_api_key(config: &mut Config, api_key: &str) {
-    let key = api_key.to_string();
+    // A minimal `{"api_key": …}` stanza; every other provider-config field
+    // deserializes to its serde default, so the target type is inferred from
+    // the assignment below (no `serde` trait import needed).
+    let stanza = || serde_json::json!({ "api_key": api_key });
+
     let applied = match config.provider.as_str() {
-        "openai" => config
-            .providers
-            .openai
-            .as_mut()
-            .map(|c| c.api_key = key.clone())
-            .is_some(),
-        "anthropic" => config
-            .providers
-            .anthropic
-            .as_mut()
-            .map(|c| c.api_key = key.clone())
-            .is_some(),
-        "gemini" => config
-            .providers
-            .gemini
-            .as_mut()
-            .map(|c| c.api_key = key.clone())
-            .is_some(),
+        "openai" => match config.providers.openai.as_mut() {
+            Some(c) => {
+                c.api_key = api_key.to_string();
+                true
+            }
+            None => {
+                config.providers.openai = serde_json::from_value(stanza()).ok();
+                config.providers.openai.is_some()
+            }
+        },
+        "anthropic" => match config.providers.anthropic.as_mut() {
+            Some(c) => {
+                c.api_key = api_key.to_string();
+                true
+            }
+            None => {
+                config.providers.anthropic = serde_json::from_value(stanza()).ok();
+                config.providers.anthropic.is_some()
+            }
+        },
+        "gemini" => match config.providers.gemini.as_mut() {
+            Some(c) => {
+                c.api_key = api_key.to_string();
+                true
+            }
+            None => {
+                config.providers.gemini = serde_json::from_value(stanza()).ok();
+                config.providers.gemini.is_some()
+            }
+        },
         _ => false,
     };
     if !applied {
         tracing::warn!(
             provider = %config.provider,
-            "AgentBuilder::api_key: no existing provider config for active provider; \
-             api_key not applied (configure the provider in config.json first)"
+            "AgentBuilder::api_key: key not applied — the active provider either \
+             takes no plain api_key (e.g. copilot uses cached OAuth) or its config \
+             could not be built from a key alone"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_api_key;
+    use bamboo_llm::Config;
+
+    /// `.api_key()` must FABRICATE a usable stanza for each keyed provider when
+    /// the config has none — i.e. a key-only JSON deserializes into the provider
+    /// config. If a provider struct ever gains a required, non-`#[serde(default)]`
+    /// field, `serde_json::from_value` fails and this test catches it (instead of
+    /// the feature silently degrading to a confusing runtime warning).
+    #[test]
+    fn api_key_fabricates_stanza_for_keyed_providers() {
+        for provider in ["openai", "anthropic", "gemini"] {
+            let mut config = Config::default();
+            config.provider = provider.to_string();
+            // Force the absent-stanza (fabricate) path.
+            config.providers.openai = None;
+            config.providers.anthropic = None;
+            config.providers.gemini = None;
+
+            apply_api_key(&mut config, "sk-test-123");
+
+            let key = match provider {
+                "openai" => config.providers.openai.as_ref().map(|c| c.api_key.as_str()),
+                "anthropic" => config
+                    .providers
+                    .anthropic
+                    .as_ref()
+                    .map(|c| c.api_key.as_str()),
+                "gemini" => config.providers.gemini.as_ref().map(|c| c.api_key.as_str()),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                key,
+                Some("sk-test-123"),
+                "expected a fabricated {provider} stanza carrying the api_key"
+            );
+        }
     }
 }

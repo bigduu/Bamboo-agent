@@ -1081,6 +1081,7 @@ dependencies = [
  "bamboo-skills",
  "bamboo-storage",
  "bamboo-tools",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
