@@ -137,8 +137,12 @@ Arguments supported by `bamboo serve` (all override the config file):
 | `bamboo actor run\|serve\|list\|call` | Drive the sub-agent actor fabric from the terminal (spawn + stream, run as a service, discover, or send a task). |
 | `bamboo broker serve` | Run the standalone sub-agent message broker (WebSocket bus over durable mailboxes). |
 | `bamboo broker-agent serve` | Run a broker-connected agent (local / Docker / remote) that answers Ask/Task for its mailbox. |
+| `bamboo health` | Probe a running server's `/health` (exit non-zero if unreachable/unhealthy — usable as a readiness check). |
+| `bamboo status` | One-screen overview of a running server: address, health, session counts. |
+| `bamboo sessions` | List sessions on a running server (stop one with `bamboo stop <id>`). |
+| `bamboo stop <session_id>` | Stop a running session's agent loop. |
 
-(`bamboo subagent-worker` also exists but is an internal worker process spawned by the server — not for interactive use.)
+The admin commands (`health` / `status` / `sessions` / `stop`) are thin HTTP clients over a running `bamboo serve`; point them at a non-default server with `--server-url` / `--port` / `--data-dir`. (`bamboo subagent-worker` also exists but is an internal worker process spawned by the server — not for interactive use.)
 
 **Defaults** (verified against code):
 

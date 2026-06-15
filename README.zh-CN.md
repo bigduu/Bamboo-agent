@@ -137,8 +137,12 @@ bamboo serve
 | `bamboo actor run\|serve\|list\|call` | 从终端驱动子代理 actor fabric（启动并流式输出、作为服务常驻、发现、或发送任务）。 |
 | `bamboo broker serve` | 运行独立的子代理消息 broker（基于持久 mailbox 的 WebSocket 总线）。 |
 | `bamboo broker-agent serve` | 运行连接到 broker 的代理（本地 / Docker / 远程），为其 mailbox 应答 Ask/Task。 |
+| `bamboo health` | 探测运行中服务的 `/health`（不可达/不健康时以非零退出，可用作就绪检查）。 |
+| `bamboo status` | 运行中服务的一屏概览：地址、健康状态、会话数。 |
+| `bamboo sessions` | 列出运行中服务的会话（用 `bamboo stop <id>` 停止某个会话）。 |
+| `bamboo stop <session_id>` | 停止某个运行中会话的 agent loop。 |
 
-（`bamboo subagent-worker` 也存在，但它是服务端派生的内部 worker 进程，不用于交互。）
+管理类命令（`health` / `status` / `sessions` / `stop`）是针对运行中 `bamboo serve` 的轻量 HTTP 客户端；用 `--server-url` / `--port` / `--data-dir` 指向非默认服务。（`bamboo subagent-worker` 也存在，但它是服务端派生的内部 worker 进程，不用于交互。）
 
 **默认值**（已对照代码核实）：
 

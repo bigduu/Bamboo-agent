@@ -106,14 +106,19 @@ Subscribe to real-time agent events via Server-Sent Events (SSE).
 **Event Format:**
 
 ```
-data: {"type":"TextDelta","delta":"Hello"}
-data: {"type":"Complete","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}
+data: {"type":"token","content":"Hello"}
+data: {"type":"tool_start","tool_call_id":"call_1","tool_name":"Read","arguments":{"file_path":"README.md"}}
+data: {"type":"tool_complete","tool_call_id":"call_1","result":{ /* ToolResult */ }}
+data: {"type":"complete","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}
 ```
+
+The `type` discriminant is the snake_case form of the `AgentEvent` variant (the enum is `#[serde(tag = "type", rename_all = "snake_case")]`).
 
 **Terminal Events:**
 
-- `Complete` - Agent finished successfully
-- `Error` - Agent encountered an error
+- `complete` - Agent finished successfully
+- `cancelled` - Run cancelled by the user
+- `error` - Agent encountered an error
 
 **Example (JavaScript):**
 
@@ -436,14 +441,27 @@ All endpoints return consistent error responses:
 
 ### AgentEvent Types
 
-| Type | Description | Fields |
-|------|-------------|--------|
-| `TextDelta` | Partial text generation | `delta` |
-| `ToolCall` | Agent calling a tool | `tool_call` |
-| `ToolResult` | Tool execution completed | `tool_result` |
-| `TokenBudgetUpdated` | Token usage updated | `usage` |
-| `Complete` | Execution completed | `usage` |
-| `Error` | Execution failed | `message` |
+The `type` field is the snake_case name of the `AgentEvent` variant
+(`crates/core/bamboo-agent-core/src/agent/events.rs`). The most common
+streaming variants:
+
+| `type` | Description | Fields |
+|--------|-------------|--------|
+| `token` | Assistant text token | `content` |
+| `reasoning_token` | Reasoning/thinking token | `content` |
+| `tool_token` | Live output from a running tool | `tool_call_id`, `content` |
+| `tool_start` | Tool execution started | `tool_call_id`, `tool_name`, `arguments` |
+| `tool_complete` | Tool finished successfully | `tool_call_id`, `result` |
+| `tool_error` | Tool failed | `tool_call_id`, `error` |
+| `token_budget_updated` | Token usage / budget update | `usage` |
+| `complete` | Execution finished | `usage` |
+| `cancelled` | Run cancelled by the user | `message` |
+| `error` | Execution failed | `message` |
+
+The enum also carries session-, task-, plan-, and sub-agent-lifecycle variants
+(e.g. `tool_lifecycle`, `need_clarification`, `task_list_updated`,
+`sub_agent_started`, `plan_mode_entered`, `message_appended`); consult
+`events.rs` for the exhaustive list and exact field shapes.
 
 ---
 
