@@ -729,9 +729,23 @@ async fn maybe_apply_host_context_compression_supports_mid_turn_phase() {
     );
 }
 
+/// Put the session into active plan mode so the canonical plan-mode/plan-runtime
+/// blocks (built directly from session state, not reparsed from markers) render.
+fn activate_plan_mode(session: &mut Session) {
+    use bamboo_domain::session::runtime_state::{AgentRuntimeState, PlanModeState, PlanModeStatus};
+    session.agent_runtime_state = Some(AgentRuntimeState::new("run-1"));
+    session.agent_runtime_state.as_mut().unwrap().plan_mode = Some(PlanModeState {
+        entered_at: chrono::Utc::now(),
+        pre_permission_mode: "default".to_string(),
+        plan_file_path: None,
+        status: PlanModeStatus::Designing,
+    });
+}
+
 #[tokio::test]
 async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_summary_prompt() {
     let mut session = Session::new("session-cp-mid-turn-context-blocks", "test-model");
+    activate_plan_mode(&mut session);
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 1200,
         max_output_tokens: 200,
@@ -832,6 +846,7 @@ async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_su
 #[tokio::test]
 async fn pre_turn_host_context_compression_includes_available_context_blocks_in_summary_prompt() {
     let mut session = Session::new("session-cp-pre-turn-context-blocks", "test-model");
+    activate_plan_mode(&mut session);
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 1200,
         max_output_tokens: 200,

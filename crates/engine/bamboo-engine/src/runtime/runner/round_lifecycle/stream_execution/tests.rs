@@ -1186,9 +1186,23 @@ async fn execute_llm_stream_continuation_includes_plan_mode_and_runtime_dynamic_
         "responses.previous_response_id".to_string(),
         "resp_prev".to_string(),
     );
+    // Plan mode active in session STATE — the plan_runtime/plan_mode volatile
+    // blocks are now built directly from this, not reparsed from system markers.
+    {
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, PlanModeState, PlanModeStatus,
+        };
+        session.agent_runtime_state = Some(AgentRuntimeState::new("run-1"));
+        session.agent_runtime_state.as_mut().unwrap().plan_mode = Some(PlanModeState {
+            entered_at: chrono::Utc::now(),
+            pre_permission_mode: "default".to_string(),
+            plan_file_path: None,
+            status: PlanModeStatus::Exploring,
+        });
+    }
 
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
-    let system_prompt = "system\n\n<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_START -->\n=== DURABLE PLAN EXECUTION CONTEXT ===\n\nResume rule\n<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_END -->\n\n<!-- BAMBOO_PLAN_MODE_START -->\n=== PLAN MODE ACTIVE ===\n\nEXPLORE\n<!-- BAMBOO_PLAN_MODE_END -->";
+    let system_prompt = "system";
     let config = test_config(system_prompt);
     let prepared_context = PreparedContext {
         messages: vec![

@@ -739,7 +739,6 @@ pub(super) async fn run_pipeline(
             session,
             config.prompt_memory_flags,
             Some(&runtime_context),
-            config.app_data_dir.as_deref(),
         )
         .await;
 

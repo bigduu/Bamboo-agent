@@ -49,10 +49,6 @@ impl StablePromptFrame {
 
 const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
 const EXTERNAL_MEMORY_END_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_END -->";
-const PLAN_MODE_START_MARKER: &str = "<!-- BAMBOO_PLAN_MODE_START -->";
-const PLAN_MODE_END_MARKER: &str = "<!-- BAMBOO_PLAN_MODE_END -->";
-const PLAN_RUNTIME_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_START -->";
-const PLAN_RUNTIME_CONTEXT_END_MARKER: &str = "<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_END -->";
 
 pub(crate) fn render_context_block_message(block: &ContextBlock) -> Message {
     block.render_runtime_context_message()
@@ -178,6 +174,46 @@ pub(crate) fn build_goal_context_block(goal: Option<&str>) -> Option<ContextBloc
     ))
 }
 
+/// Build the per-round plan-mode block directly from session state (the active
+/// `PlanModeState`), replacing the legacy inject-into-system + reparse path.
+/// Returns `None` when plan mode is inactive.
+pub(crate) fn build_plan_mode_context_block(session: &Session) -> Option<ContextBlock> {
+    let text = crate::runtime::runner::prompt_context::render_plan_mode_section(session)?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(ContextBlock::new(
+        ContextBlockType::PlanModeState,
+        ContextBlockPriority::High,
+        ContextBlockStability::RoundDynamic,
+        "Plan Mode State",
+        trimmed,
+    ))
+}
+
+/// Build the per-round durable plan-execution block directly from session state
+/// plus persisted plan artifacts, replacing the legacy inject + reparse path.
+/// Returns `None` when plan mode is inactive.
+pub(crate) fn build_plan_runtime_context_block(
+    session: &Session,
+    app_data_dir: Option<&std::path::Path>,
+) -> Option<ContextBlock> {
+    let text =
+        crate::runtime::runner::prompt_context::render_plan_runtime_section(session, app_data_dir)?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(ContextBlock::new(
+        ContextBlockType::PlanRuntimeState,
+        ContextBlockPriority::High,
+        ContextBlockStability::RoundDynamic,
+        "Durable Plan Execution Context",
+        trimmed,
+    ))
+}
+
 #[cfg(test)]
 pub(crate) fn build_external_memory_context_block(session: &Session) -> Option<ContextBlock> {
     build_external_memory_context_block_from_messages(&session.messages)
@@ -208,60 +244,6 @@ pub(crate) fn build_external_memory_context_block_from_messages(
         ContextBlockPriority::Medium,
         ContextBlockStability::RoundDynamic,
         "External Memory (Persistent)",
-        trimmed,
-    ))
-}
-
-pub(crate) fn build_plan_mode_context_block_from_messages(
-    messages: &[Message],
-) -> Option<ContextBlock> {
-    let system_message = messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))?;
-    let content = extract_wrapped_section(
-        &system_message.content,
-        PLAN_MODE_START_MARKER,
-        PLAN_MODE_END_MARKER,
-    )?;
-    let trimmed = strip_wrapped_markers(&content, PLAN_MODE_START_MARKER, PLAN_MODE_END_MARKER);
-    if trimmed.trim().is_empty() {
-        return None;
-    }
-
-    Some(ContextBlock::new(
-        ContextBlockType::PlanModeState,
-        ContextBlockPriority::High,
-        ContextBlockStability::RoundDynamic,
-        "Plan Mode State",
-        trimmed,
-    ))
-}
-
-pub(crate) fn build_plan_runtime_context_block_from_messages(
-    messages: &[Message],
-) -> Option<ContextBlock> {
-    let system_message = messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))?;
-    let content = extract_wrapped_section(
-        &system_message.content,
-        PLAN_RUNTIME_CONTEXT_START_MARKER,
-        PLAN_RUNTIME_CONTEXT_END_MARKER,
-    )?;
-    let trimmed = strip_wrapped_markers(
-        &content,
-        PLAN_RUNTIME_CONTEXT_START_MARKER,
-        PLAN_RUNTIME_CONTEXT_END_MARKER,
-    );
-    if trimmed.trim().is_empty() {
-        return None;
-    }
-
-    Some(ContextBlock::new(
-        ContextBlockType::PlanRuntimeState,
-        ContextBlockPriority::High,
-        ContextBlockStability::RoundDynamic,
-        "Durable Plan Execution Context",
         trimmed,
     ))
 }
@@ -447,33 +429,50 @@ mod tests {
     }
 
     #[test]
-    fn build_plan_mode_context_block_extracts_wrapped_system_section() {
-        let messages = vec![Message::system(
-            "Base prompt\n\n<!-- BAMBOO_PLAN_MODE_START -->\n=== PLAN MODE ACTIVE ===\n\nEXPLORE\n<!-- BAMBOO_PLAN_MODE_END -->",
-        )];
+    fn build_plan_mode_context_block_renders_from_session_state() {
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, PlanModeState, PlanModeStatus,
+        };
+        let mut session = Session::new("session-plan-mode-block", "model");
+        session.agent_runtime_state = Some(AgentRuntimeState::new("run-1"));
+        session.agent_runtime_state.as_mut().unwrap().plan_mode = Some(PlanModeState {
+            entered_at: chrono::Utc::now(),
+            pre_permission_mode: "default".to_string(),
+            plan_file_path: None,
+            status: PlanModeStatus::Exploring,
+        });
 
-        let block = build_plan_mode_context_block_from_messages(&messages)
-            .expect("plan mode block should exist");
+        let block = build_plan_mode_context_block(&session).expect("plan mode block should exist");
 
         assert_eq!(block.block_type, ContextBlockType::PlanModeState);
         assert_eq!(block.priority, ContextBlockPriority::High);
         assert!(block.content.contains("PLAN MODE ACTIVE"));
-        assert!(!block.content.contains("BAMBOO_PLAN_MODE_START"));
+        // Inactive plan mode → no block.
+        assert!(build_plan_mode_context_block(&Session::new("s2", "model")).is_none());
     }
 
     #[test]
-    fn build_plan_runtime_context_block_extracts_wrapped_system_section() {
-        let messages = vec![Message::system(
-            "Base prompt\n\n<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_START -->\n=== DURABLE PLAN EXECUTION CONTEXT ===\n\nResume rule\n<!-- BAMBOO_PLAN_RUNTIME_CONTEXT_END -->",
-        )];
+    fn build_plan_runtime_context_block_renders_from_session_state() {
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, PlanModeState, PlanModeStatus,
+        };
+        let mut session = Session::new("session-plan-runtime-block", "model");
+        session.agent_runtime_state = Some(AgentRuntimeState::new("run-1"));
+        session.agent_runtime_state.as_mut().unwrap().plan_mode = Some(PlanModeState {
+            entered_at: chrono::Utc::now(),
+            pre_permission_mode: "default".to_string(),
+            plan_file_path: None,
+            status: PlanModeStatus::Designing,
+        });
 
-        let block = build_plan_runtime_context_block_from_messages(&messages)
+        let block = build_plan_runtime_context_block(&session, None)
             .expect("plan runtime block should exist");
 
         assert_eq!(block.block_type, ContextBlockType::PlanRuntimeState);
         assert_eq!(block.priority, ContextBlockPriority::High);
         assert!(block.content.contains("DURABLE PLAN EXECUTION CONTEXT"));
-        assert!(!block.content.contains("BAMBOO_PLAN_RUNTIME_CONTEXT_START"));
+        // Inactive plan mode → no block.
+        assert!(build_plan_runtime_context_block(&Session::new("s2", "model"), None).is_none());
     }
 
     #[test]

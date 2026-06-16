@@ -100,15 +100,21 @@ pub(super) fn strip_existing_plan_runtime_context(prompt: &str) -> String {
     plan_runtime::strip_existing_plan_runtime_context(prompt)
 }
 
-pub(crate) fn inject_plan_mode_instructions(session: &mut bamboo_agent_core::Session) {
-    plan_mode::inject_plan_mode_instructions(session);
+/// Render the plan-mode section text from session state (`None` when inactive).
+/// The agent loop builds this into a volatile `PlanModeState` block rather than
+/// injecting it into the system message.
+pub(crate) fn render_plan_mode_section(session: &bamboo_agent_core::Session) -> Option<String> {
+    plan_mode::render_plan_mode_section(session)
 }
 
-pub(crate) fn inject_plan_runtime_context_into_system_message(
-    session: &mut bamboo_agent_core::Session,
+/// Render the durable plan-execution context text from session state plus
+/// persisted plan artifacts (`None` when plan mode is inactive). Built into a
+/// volatile `PlanRuntimeState` block.
+pub(crate) fn render_plan_runtime_section(
+    session: &bamboo_agent_core::Session,
     app_data_dir: Option<&std::path::Path>,
-) {
-    plan_runtime::inject_plan_runtime_context_into_system_message(session, app_data_dir);
+) -> Option<String> {
+    plan_runtime::build_plan_runtime_context(session, app_data_dir)
 }
 
 #[cfg(test)]
