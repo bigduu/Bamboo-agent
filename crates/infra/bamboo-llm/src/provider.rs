@@ -3,6 +3,7 @@
 //! This module defines the interface for LLM (Large Language Model) providers,
 //! enabling support for multiple LLM backends through a common trait.
 
+use crate::prompt_ir::PromptIR;
 use crate::types::LLMChunk;
 use async_trait::async_trait;
 use bamboo_domain::Message;
@@ -304,6 +305,41 @@ pub trait LLMProvider: Send + Sync {
         let messages = lanes.flatten();
         self.chat_stream_with_options(&messages, tools, max_output_tokens, model, options)
             .await
+    }
+
+    /// Stream from the canonical [`PromptIR`] — the rich, provider-agnostic
+    /// request that supersedes [`PromptLanes`] as the single entry point.
+    ///
+    /// A provider renders the IR into its own wire format by calling the lowering
+    /// methods ([`PromptIR::system_field`], [`PromptIR::body_chat`],
+    /// [`PromptIR::responses_input`], [`PromptIR::continuation_delta`]). The IR
+    /// carries the stateful Responses continuation, so an adapter derives the
+    /// delta itself instead of the engine pre-baking it.
+    ///
+    /// The default implementation reproduces today's behavior exactly: a
+    /// continuation routes [`PromptIR::continuation_delta`] through
+    /// [`chat_stream_with_options`](Self::chat_stream_with_options); a normal
+    /// request reconstructs the lanes ([`PromptIR::to_lanes`]) and routes through
+    /// [`chat_stream_lanes`](Self::chat_stream_lanes) so a block-native provider
+    /// still renders structurally. Providers override this to consume the IR
+    /// directly.
+    async fn chat_stream_ir(
+        &self,
+        ir: &PromptIR,
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
+        if ir.continuation.is_some() {
+            let delta = ir.continuation_delta();
+            self.chat_stream_with_options(&delta, tools, max_output_tokens, model, options)
+                .await
+        } else {
+            let lanes = ir.to_lanes();
+            self.chat_stream_lanes(&lanes, tools, max_output_tokens, model, options)
+                .await
+        }
     }
 
     /// Lists available models from this provider

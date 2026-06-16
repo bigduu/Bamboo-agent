@@ -20,6 +20,7 @@
 use bamboo_domain::{Message, PromptBlock};
 
 use crate::cache::PromptCachePlan;
+use crate::provider::PromptLanes;
 
 /// The provider-agnostic canonical request the engine emits once per round.
 /// Supersedes `PromptLanes` as the provider entry point.
@@ -141,6 +142,26 @@ impl PromptIR {
         }
         out.extend(self.body_chat());
         out
+    }
+
+    /// Reconstruct the legacy [`PromptLanes`] from the IR — the `SystemRemainder`
+    /// and `VolatileTail` runs are merged back into the conversation lane, exactly
+    /// as the engine built the lanes before the IR. A transitional bridge so a
+    /// provider that still consumes lanes (its `chat_stream_lanes` override)
+    /// renders byte-identically during the migration. `to_lanes().flatten()`
+    /// equals [`flatten`](Self::flatten).
+    pub fn to_lanes(&self) -> PromptLanes {
+        let mut conversation_messages = Vec::new();
+        conversation_messages.extend_from_slice(self.run(SegmentRole::SystemRemainder));
+        conversation_messages.extend_from_slice(self.run(SegmentRole::Conversation));
+        conversation_messages.extend_from_slice(self.run(SegmentRole::VolatileTail));
+        PromptLanes {
+            stable_instructions: self.system_text.clone(),
+            system_blocks: self.system_blocks.clone(),
+            stable_prefix_messages: self.run(SegmentRole::StablePrefix).to_vec(),
+            dynamic_context_messages: self.run(SegmentRole::DynamicContext).to_vec(),
+            conversation_messages,
+        }
     }
 
     /// Responses-API input view (system rides `instructions`, not the array):
@@ -335,5 +356,13 @@ mod tests {
     fn responses_input_equals_body_chat() {
         let ir = fixture_ir();
         assert_eq!(shape(&ir.responses_input()), shape(&ir.body_chat()));
+    }
+
+    #[test]
+    fn to_lanes_round_trips_flatten() {
+        // The transitional bridge must reproduce the exact flat bytes, so a
+        // provider routed through the reconstructed lanes is byte-identical.
+        let ir = fixture_ir();
+        assert_eq!(shape(&ir.to_lanes().flatten()), shape(&ir.flatten()));
     }
 }

@@ -29,8 +29,8 @@ use bamboo_compression::PreparedContext;
 use bamboo_domain::ReasoningEffort;
 use bamboo_llm::provider::ResponsesRequestOptions;
 use bamboo_llm::{
-    CacheTtl, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR, PromptLanes, Segment,
-    SegmentRole,
+    CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR, PromptLanes,
+    Segment, SegmentRole,
 };
 use bamboo_tools::exposure::activated_discoverable_tools;
 
@@ -793,7 +793,8 @@ pub(super) async fn execute_llm_stream(
         None
     };
 
-    let prepared_envelope = build_request_envelope(session, prepared_context, config, tool_schemas);
+    let mut prepared_envelope =
+        build_request_envelope(session, prepared_context, config, tool_schemas);
     // Side-channel diagnostic: record whether the cacheable stable prefix drifted
     // from the previous round (esp. shrinks, which drop cached content). Never
     // affects what is sent below.
@@ -825,38 +826,60 @@ pub(super) async fn execute_llm_stream(
     planned.render.log(session_id);
     persist_request_render_metadata(session, &planned.render);
 
-    // Normal request → canonical lanes (provider renders system + cache
-    // breakpoints structurally; default impl flattens to the same bytes). The
-    // Responses-API continuation path sends only a delta of messages, which the
-    // lane model doesn't represent, so it stays on the flat
-    // `chat_stream_with_options` entry point.
-    let stream = if planned.is_continuation {
-        llm.chat_stream_with_options(
-            &planned.continuation_messages,
-            tool_schemas,
-            Some(max_output_tokens),
-            model,
-            Some(&planned.request_options),
-        )
-        .await
-    } else {
-        llm.chat_stream_lanes(
-            &prepared_envelope.lanes,
-            tool_schemas,
-            Some(max_output_tokens),
-            model,
-            Some(&planned.request_options),
-        )
-        .await
+    // Set the stateful Responses continuation on the IR (boundary = the last
+    // assistant turn in the conversation run) so the adapter — or the default
+    // lowering — derives the delta itself from addressable runs.
+    if let Some(response_id) = previous_response_id.as_deref() {
+        let last_committed_assistant_id = prepared_envelope
+            .ir
+            .run(SegmentRole::Conversation)
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, Role::Assistant))
+            .map(|message| message.id.clone());
+        prepared_envelope.ir.continuation = Some(Continuation {
+            previous_response_id: response_id.to_string(),
+            last_committed_assistant_id,
+        });
     }
-    .map_err(|error| {
-        let message = format_provider_error(error);
-        if is_llm_overflow_error(&message) {
-            AgentError::LLMOverflow(message)
-        } else {
-            AgentError::LLM(message)
-        }
-    })?;
+
+    // Migration safety net (removed in the final cleanup phase): the IR-derived
+    // continuation delta must reproduce exactly what the legacy plan would have
+    // sent. Cheap content-sequence check, debug builds only.
+    debug_assert!(
+        !planned.is_continuation
+            || prepared_envelope
+                .ir
+                .continuation_delta()
+                .iter()
+                .map(|message| &message.content)
+                .eq(planned
+                    .continuation_messages
+                    .iter()
+                    .map(|message| &message.content)),
+        "IR continuation delta diverged from the legacy delta"
+    );
+
+    // ONE canonical dispatch: every provider renders the IR. The default lowering
+    // is byte-identical to the prior lanes / continuation-delta paths (golden
+    // tests); block-native and Responses providers override `chat_stream_ir`.
+    let stream = llm
+        .chat_stream_ir(
+            &prepared_envelope.ir,
+            tool_schemas,
+            Some(max_output_tokens),
+            model,
+            Some(&planned.request_options),
+        )
+        .await
+        .map_err(|error| {
+            let message = format_provider_error(error);
+            if is_llm_overflow_error(&message) {
+                AgentError::LLMOverflow(message)
+            } else {
+                AgentError::LLM(message)
+            }
+        })?;
 
     // Send token budget update AFTER LLM call succeeds.
     // This timing gives frontend time to subscribe to /events endpoint.
