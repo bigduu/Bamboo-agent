@@ -114,6 +114,7 @@ pub enum BuiltinTool {
     RequestPermissions,
     Sleep,
     Task,
+    UpdateGoal,
     WebFetch,
     WebSearch,
     Workspace,
@@ -122,7 +123,7 @@ pub enum BuiltinTool {
 
 impl BuiltinTool {
     /// Every built-in tool, in the canonical order of [`BUILTIN_TOOL_NAMES`].
-    pub const ALL: [BuiltinTool; 21] = [
+    pub const ALL: [BuiltinTool; 22] = [
         BuiltinTool::ConclusionWithOptions,
         BuiltinTool::Bash,
         BuiltinTool::BashOutput,
@@ -140,6 +141,7 @@ impl BuiltinTool {
         BuiltinTool::RequestPermissions,
         BuiltinTool::Sleep,
         BuiltinTool::Task,
+        BuiltinTool::UpdateGoal,
         BuiltinTool::WebFetch,
         BuiltinTool::WebSearch,
         BuiltinTool::Workspace,
@@ -166,6 +168,7 @@ impl BuiltinTool {
             BuiltinTool::RequestPermissions => "request_permissions",
             BuiltinTool::Sleep => "Sleep",
             BuiltinTool::Task => "Task",
+            BuiltinTool::UpdateGoal => "update_goal",
             BuiltinTool::WebFetch => "WebFetch",
             BuiltinTool::WebSearch => "WebSearch",
             BuiltinTool::Workspace => "Workspace",
