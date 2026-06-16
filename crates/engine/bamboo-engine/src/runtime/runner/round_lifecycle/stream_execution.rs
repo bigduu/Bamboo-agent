@@ -234,11 +234,15 @@ fn derive_system_remainder_message(
 }
 
 struct PreparedRequestEnvelope {
+    /// Legacy merged-system flat list. Superseded by `ir` for dispatch (Phase C);
+    /// retained as a reference for the golden byte-equivalence tests until the
+    /// final cleanup phase deletes the legacy path.
+    #[allow(dead_code)]
     chat_messages: Vec<Message>,
-    /// Canonical, provider-facing prompt structure (the four lanes). Its
-    /// `flatten()` reproduces `chat_messages` exactly, so routing the normal
-    /// (non-continuation) request through `chat_stream_lanes` is byte-identical
-    /// until providers override it to consume the lanes structurally.
+    /// Legacy four-lane structure. Superseded by `ir` for dispatch (Phase C); the
+    /// golden test asserts `ir.flatten()` is byte-equal to `lanes.flatten()`, so
+    /// it is kept as the reference until the final cleanup phase.
+    #[allow(dead_code)]
     lanes: PromptLanes,
     /// Rich canonical request IR (supersedes `lanes` as the provider entry point
     /// during the migration). Built from the SAME pieces as `lanes` but with
@@ -256,6 +260,9 @@ struct PreparedRequestEnvelope {
     /// never sits inside the cached prefix.
     volatile_context_messages: Vec<Message>,
     instructions: Option<String>,
+    /// Legacy envelope observability. Superseded by `RequestRenderObservability`
+    /// (sourced from `ir`); retained for the migration, removed in cleanup.
+    #[allow(dead_code)]
     envelope_observability:
         crate::runtime::runner::session_setup::prompt_envelope::PromptEnvelopeObservability,
     /// Prompt-cache plan for this request (cacheable system/tools plus rolling
