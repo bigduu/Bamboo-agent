@@ -461,6 +461,10 @@ fn build_request_envelope(
 
     let lanes = PromptLanes {
         stable_instructions: lane_system,
+        // Populated in the system-field block migration (Step 4); empty here so
+        // `system_text()`/`flatten()` fall back to `stable_instructions` →
+        // byte-identical wire output.
+        system_blocks: Vec::new(),
         stable_prefix_messages,
         dynamic_context_messages: envelope.dynamic_context_messages.clone(),
         conversation_messages: {

@@ -6,6 +6,7 @@
 use crate::types::LLMChunk;
 use async_trait::async_trait;
 use bamboo_domain::Message;
+use bamboo_domain::PromptBlock;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;
 use futures::Stream;
@@ -138,7 +139,18 @@ pub struct LLMRequestOptions {
 pub struct PromptLanes {
     /// Static system instructions — the cacheable base. Rendered into the
     /// provider's dedicated system field, NOT the message array.
+    ///
+    /// Legacy concatenated form. During the content-block migration this is the
+    /// fallback when [`system_blocks`](Self::system_blocks) is empty; once the
+    /// engine populates `system_blocks`, the effective system text comes from
+    /// [`PromptLanes::system_text`] (blocks joined by `"\n\n"`, byte-identical).
     pub stable_instructions: String,
+    /// Structured system field: the cacheable base/core-directives/env as
+    /// discrete [`PromptBlock`]s. Empty until the engine assembly is migrated;
+    /// when present it supersedes `stable_instructions`. A block-aware provider
+    /// (e.g. Anthropic) can render one wire block per entry with per-block
+    /// `cache_control`; other providers flatten it via `system_text()`.
+    pub system_blocks: Vec<PromptBlock>,
     /// Session-stable context messages (tool guide, connected MCP servers'
     /// guidance, workspace, env, skills): fixed positions that change rarely. The
     /// stable cache prefix ends after these.
@@ -151,6 +163,27 @@ pub struct PromptLanes {
 }
 
 impl PromptLanes {
+    /// The effective system-field text: the structured [`system_blocks`] joined
+    /// by `"\n\n"` (skipping empties) when present, else the legacy
+    /// [`stable_instructions`] string. Kept byte-identical across the migration —
+    /// the join of `[base, core_directives, env]` block texts reproduces the
+    /// previously-concatenated `stable_instructions`.
+    ///
+    /// [`system_blocks`]: Self::system_blocks
+    /// [`stable_instructions`]: Self::stable_instructions
+    pub fn system_text(&self) -> String {
+        if self.system_blocks.is_empty() {
+            self.stable_instructions.clone()
+        } else {
+            self.system_blocks
+                .iter()
+                .map(|b| b.text.as_str())
+                .filter(|t| !t.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        }
+    }
+
     /// Flatten the lanes into one message list in canonical order — the exact
     /// shape a provider that has NOT yet been migrated to consume lanes still
     /// expects, so the default trait path stays byte-identical to today.
@@ -160,8 +193,9 @@ impl PromptLanes {
                 + self.dynamic_context_messages.len()
                 + self.conversation_messages.len(),
         );
-        if !self.stable_instructions.trim().is_empty() {
-            messages.push(Message::system(self.stable_instructions.trim().to_string()));
+        let system = self.system_text();
+        if !system.trim().is_empty() {
+            messages.push(Message::system(system.trim().to_string()));
         }
         messages.extend(self.stable_prefix_messages.iter().cloned());
         messages.extend(self.dynamic_context_messages.iter().cloned());
@@ -306,6 +340,7 @@ mod tests {
             stable_prefix_messages: vec![Message::user("tool-guide")],
             dynamic_context_messages: vec![Message::user("task-snapshot")],
             conversation_messages: vec![Message::user("real ask")],
+            ..PromptLanes::default()
         };
         let flat = lanes.flatten();
         assert_eq!(flat.len(), 4);
@@ -353,6 +388,7 @@ mod tests {
             stable_prefix_messages: vec![Message::user("guide")],
             dynamic_context_messages: vec![Message::user("dyn")],
             conversation_messages: vec![Message::user("ask")],
+            ..PromptLanes::default()
         };
         let _ = cap
             .chat_stream_lanes(&lanes, &[], None, "m", None)
@@ -381,6 +417,36 @@ mod tests {
         let flat = lanes.flatten();
         assert_eq!(flat.len(), 1);
         assert!(matches!(flat[0].role, bamboo_domain::Role::User));
+    }
+
+    #[test]
+    fn system_text_prefers_blocks_and_joins_byte_identical() {
+        use bamboo_domain::{ContextBlockType, PromptBlock};
+        // Legacy path: no blocks → stable_instructions verbatim.
+        let legacy = PromptLanes {
+            stable_instructions: "base\n\nenv".into(),
+            ..PromptLanes::default()
+        };
+        assert_eq!(legacy.system_text(), "base\n\nenv");
+
+        // Block path: [base, env] joined by "\n\n" reproduces the legacy string
+        // byte-for-byte (the invariant Step 4 relies on). stable_instructions is
+        // ignored once system_blocks is non-empty.
+        let with_blocks = PromptLanes {
+            stable_instructions: "IGNORED".into(),
+            system_blocks: vec![
+                PromptBlock::new("base", ContextBlockType::Base, "base"),
+                // an empty block is skipped in the join
+                PromptBlock::new("skill", ContextBlockType::SkillContext, "   "),
+                PromptBlock::new("env", ContextBlockType::EnvSnapshot, "env"),
+            ],
+            ..PromptLanes::default()
+        };
+        assert_eq!(with_blocks.system_text(), "base\n\nenv");
+        // flatten() renders the same system text into the system message.
+        let flat = with_blocks.flatten();
+        assert_eq!(flat[0].content, "base\n\nenv");
+        assert!(matches!(flat[0].role, bamboo_domain::Role::System));
     }
 
     #[derive(Clone, Default)]
