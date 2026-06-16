@@ -285,14 +285,15 @@ pub(crate) fn build_stable_prompt_frame_with_sections(
         .and_then(crate::runtime::context::instruction::build_instruction_prompt_context);
     let env_context = extract_env_context(&raw_base_prompt)
         .or_else(crate::runtime::context::build_env_prompt_context);
-    // Framework-invariant operating directives ride on top of the (user-swappable)
-    // base so they survive a custom `system-prompt.md` override. Folded into the
-    // `base` section here so they land in the cacheable system field without
-    // touching the lane/cache-breakpoint assembly downstream.
-    let base_prompt = append_core_agent_directives(
-        &normalize_base_prompt(&raw_base_prompt),
-        crate::runtime::context::CORE_AGENT_DIRECTIVES,
-    );
+    // Base identity and the framework-invariant operating directives are kept as
+    // SEPARATE structured sections (`base` / `core_directives`) so downstream
+    // assembly can emit them as discrete content blocks instead of one glued
+    // string. `base_prompt` (the two folded together, the way it shipped before)
+    // is still produced for the legacy `stable_instructions` string consumed by
+    // the non-relocate fallback path.
+    let base_only = normalize_base_prompt(&raw_base_prompt);
+    let core_directives = crate::runtime::context::CORE_AGENT_DIRECTIVES.to_string();
+    let base_prompt = append_core_agent_directives(&base_only, &core_directives);
 
     let skill_context = session
         .metadata
@@ -320,7 +321,11 @@ pub(crate) fn build_stable_prompt_frame_with_sections(
     let sections = vec![
         StablePrefixSection {
             name: "base",
-            content: base_prompt,
+            content: base_only,
+        },
+        StablePrefixSection {
+            name: "core_directives",
+            content: core_directives,
         },
         StablePrefixSection {
             name: "workspace",

@@ -17,7 +17,7 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
     envelope_to_chat_messages, envelope_to_responses_view,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
-    build_stable_prompt_frame_with_sections, merge_with_optional_contexts, StablePrefixSection,
+    build_stable_prompt_frame_with_sections, StablePrefixSection,
 };
 use bamboo_agent_core::agent::events::TokenBudgetUsage;
 use bamboo_agent_core::tools::ToolSchema;
@@ -369,16 +369,43 @@ fn build_request_envelope(
     // sessions and across a mid-session workspace/skill injection, which is what
     // lets an automatic prefix cache (OpenAI/GLM-style, which has no explicit
     // breakpoints) actually hit on the big block instead of re-reading it.
+    // Assemble the cross-session-invariant system field as DISCRETE structured
+    // blocks (identity `base`, framework `core_directives`, globally-stable
+    // `env`) instead of one glued string. `system_blocks` is the structured form
+    // (observability/analysis + a block-native provider can render one wire block
+    // per entry); `lane_system` is their byte join for the legacy string wire
+    // path. Session-variable context (workspace/instruction/skill) is still
+    // relocated into context-block MESSAGES after the tool guide below.
+    let mut system_blocks: Vec<bamboo_domain::PromptBlock> = [
+        ("base", bamboo_domain::ContextBlockType::Base),
+        (
+            "core_directives",
+            bamboo_domain::ContextBlockType::CoreDirectives,
+        ),
+        ("env", bamboo_domain::ContextBlockType::EnvSnapshot),
+    ]
+    .into_iter()
+    .filter_map(|(name, kind)| {
+        let text = section(name);
+        (!text.trim().is_empty()).then(|| {
+            bamboo_domain::PromptBlock::new(name, kind, text)
+                .with_stability(bamboo_domain::ContextBlockStability::Stable)
+        })
+    })
+    .collect();
+    // The single system cache breakpoint anchors on the last system block.
+    if let Some(last) = system_blocks.last_mut() {
+        last.cache_anchor = true;
+    }
     let lane_system = if relocate_tool_guide {
-        merge_with_optional_contexts(
-            &section("base"),
-            None,
-            None,
-            Some(&section("env")),
-            "",
-            "", // tool guide + session context move to fixed prefix messages below
-        )
+        system_blocks
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     } else {
+        // Zero-tools fallback: keep the legacy merged system string and no blocks.
+        system_blocks.clear();
         envelope.stable_instructions.clone()
     };
     let tool_guide_message = relocate_tool_guide.then(|| {
@@ -461,10 +488,7 @@ fn build_request_envelope(
 
     let lanes = PromptLanes {
         stable_instructions: lane_system,
-        // Populated in the system-field block migration (Step 4); empty here so
-        // `system_text()`/`flatten()` fall back to `stable_instructions` →
-        // byte-identical wire output.
-        system_blocks: Vec::new(),
+        system_blocks,
         stable_prefix_messages,
         dynamic_context_messages: envelope.dynamic_context_messages.clone(),
         conversation_messages: {
