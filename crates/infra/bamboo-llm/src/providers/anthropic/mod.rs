@@ -18,13 +18,13 @@ use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use bamboo_domain::ToolSchema;
-use bamboo_domain::{Message, MessagePart, Role};
+use bamboo_domain::{Message, MessagePart, PromptBlock, Role};
 use reqwest::{header::HeaderMap, Client};
 use serde_json::{json, Value};
 
 use crate::cache::{CacheTtl, PromptCachePlan, MAX_ANTHROPIC_CACHE_BREAKPOINTS};
 use crate::provider::LLMRequestOptions;
-use crate::provider::{LLMError, LLMProvider, LLMStream, Result};
+use crate::provider::{LLMError, LLMProvider, LLMStream, PromptLanes, Result};
 use crate::providers::common::model_fetcher;
 use crate::providers::common::request_overrides;
 use crate::types::LLMChunk;
@@ -141,6 +141,75 @@ impl LLMProvider for AnthropicProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
+        self.stream_messages_inner(messages, &[], tools, max_output_tokens, model, options)
+            .await
+    }
+
+    /// Canonical entry point: render Bamboo's [`PromptLanes`] into the Anthropic
+    /// wire. When the lanes carry structured `system_blocks`, the system field is
+    /// built per-block (and the conversation lanes flow straight through, never
+    /// collapsing the system into the message list); otherwise this flattens the
+    /// lanes, byte-identical to the legacy request.
+    async fn chat_stream_lanes(
+        &self,
+        lanes: &PromptLanes,
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
+        if lanes.system_blocks.is_empty() {
+            return self
+                .stream_messages_inner(
+                    &lanes.flatten(),
+                    &[],
+                    tools,
+                    max_output_tokens,
+                    model,
+                    options,
+                )
+                .await;
+        }
+        let mut messages = Vec::with_capacity(
+            lanes.stable_prefix_messages.len()
+                + lanes.dynamic_context_messages.len()
+                + lanes.conversation_messages.len(),
+        );
+        messages.extend(lanes.stable_prefix_messages.iter().cloned());
+        messages.extend(lanes.dynamic_context_messages.iter().cloned());
+        messages.extend(lanes.conversation_messages.iter().cloned());
+        self.stream_messages_inner(
+            &messages,
+            &lanes.system_blocks,
+            tools,
+            max_output_tokens,
+            model,
+            options,
+        )
+        .await
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>> {
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        model_fetcher::fetch_model_list(&self.client, &url, headers, "Anthropic").await
+    }
+}
+
+impl AnthropicProvider {
+    /// Build and stream one Anthropic Messages request. `system_blocks`, when
+    /// non-empty, is the canonical structured system field; otherwise the system
+    /// is taken from the `System` messages in `messages`.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_messages_inner(
+        &self,
+        messages: &[Message],
+        system_blocks: &[PromptBlock],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
         let max_tokens = max_output_tokens.unwrap_or(self.max_tokens);
         let reasoning_effort = options
             .and_then(|o| o.reasoning_effort)
@@ -168,8 +237,9 @@ impl LLMProvider for AnthropicProvider {
 
         tracing::debug!("Anthropic provider using model: {}", model);
 
-        let mut body = build_anthropic_request_with_cache(
+        let mut body = build_anthropic_request_with_cache_blocks(
             messages,
+            system_blocks,
             tools,
             model,
             max_tokens,
@@ -269,8 +339,9 @@ impl LLMProvider for AnthropicProvider {
                     model
                 );
 
-                let mut fallback_body = build_anthropic_request_with_cache(
+                let mut fallback_body = build_anthropic_request_with_cache_blocks(
                     messages,
+                    system_blocks,
                     tools,
                     model,
                     max_tokens,
@@ -351,12 +422,6 @@ impl LLMProvider for AnthropicProvider {
 
         Ok(stream)
     }
-
-    async fn list_models(&self) -> Result<Vec<String>> {
-        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
-        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
-        model_fetcher::fetch_model_list(&self.client, &url, headers, "Anthropic").await
-    }
 }
 
 /// Build an Anthropic Messages API request body from internal message/tool types.
@@ -395,9 +460,43 @@ pub fn build_anthropic_request(
 /// clamped to [`MAX_ANTHROPIC_CACHE_BREAKPOINTS`]; when there are more
 /// candidates than the budget, the breakpoints nearest the end of the
 /// conversation win (they cover the largest stable prefix).
+/// Delegates to [`build_anthropic_request_with_cache_blocks`] with no structured
+/// system blocks, so the system field is rendered from the `System` messages in
+/// `messages` exactly as before.
 #[allow(clippy::too_many_arguments)]
 pub fn build_anthropic_request_with_cache(
     messages: &[Message],
+    tools: &[ToolSchema],
+    model: &str,
+    max_tokens: u32,
+    stream: bool,
+    reasoning_effort: Option<ReasoningEffort>,
+    parallel_tool_calls: Option<bool>,
+    cache: Option<&PromptCachePlan>,
+) -> Value {
+    build_anthropic_request_with_cache_blocks(
+        messages,
+        &[],
+        tools,
+        model,
+        max_tokens,
+        stream,
+        reasoning_effort,
+        parallel_tool_calls,
+        cache,
+    )
+}
+
+/// Like [`build_anthropic_request_with_cache`] but renders the `system` field
+/// from Bamboo's canonical structured `system_blocks` — one Anthropic system text
+/// block per [`PromptBlock`] — when they are present. The single system
+/// `cache_control` breakpoint still lands on the last block, so caching behavior
+/// is unchanged; only the structure (N text blocks vs one joined block) differs.
+/// With empty `system_blocks` this is byte-identical to the legacy path.
+#[allow(clippy::too_many_arguments)]
+pub fn build_anthropic_request_with_cache_blocks(
+    messages: &[Message],
+    system_blocks: &[PromptBlock],
     tools: &[ToolSchema],
     model: &str,
     max_tokens: u32,
@@ -414,7 +513,8 @@ pub fn build_anthropic_request_with_cache(
     let plan = cache.unwrap_or(&default_plan);
     let ttl = plan.ttl;
 
-    let (mut system, mut anthropic_messages, message_ids) = messages_to_anthropic_json(messages);
+    let (mut system, mut anthropic_messages, message_ids) =
+        messages_to_anthropic_json(messages, system_blocks);
 
     // Anthropic honors at most MAX_ANTHROPIC_CACHE_BREAKPOINTS `cache_control`
     // markers per request. Spend the budget on the most stable regions first
@@ -531,12 +631,32 @@ fn anthropic_thinking_from_effort(
     }))
 }
 
+/// Render Bamboo's canonical structured system blocks into an Anthropic `system`
+/// value: an array with one `{ "type": "text", ... }` block per non-empty
+/// [`PromptBlock`]. Returns `None` when there are no non-empty blocks, so callers
+/// fall back to the legacy joined-text path.
+fn system_blocks_to_anthropic_value(system_blocks: &[PromptBlock]) -> Option<Value> {
+    let blocks: Vec<Value> = system_blocks
+        .iter()
+        .filter(|b| !b.text.trim().is_empty())
+        .map(|b| json!({ "type": "text", "text": b.text }))
+        .collect();
+    (!blocks.is_empty()).then_some(Value::Array(blocks))
+}
+
 /// Convert internal messages to the Anthropic wire shape.
 ///
 /// Returns the optional `system` block array, the message array, and a parallel
 /// vector of the originating message id for each output message (so the caller
 /// can place cache breakpoints by id, robust to the tool-result merging below).
-fn messages_to_anthropic_json(messages: &[Message]) -> (Option<Value>, Vec<Value>, Vec<String>) {
+///
+/// When `system_blocks` is non-empty it is the canonical, structured source for
+/// the system field (each block → its own text block); otherwise the system field
+/// is the joined `System`-message text (legacy, byte-identical).
+fn messages_to_anthropic_json(
+    messages: &[Message],
+    system_blocks: &[PromptBlock],
+) -> (Option<Value>, Vec<Value>, Vec<String>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut out: Vec<Value> = Vec::new();
     let mut out_ids: Vec<String> = Vec::new();
@@ -595,12 +715,14 @@ fn messages_to_anthropic_json(messages: &[Message]) -> (Option<Value>, Vec<Value
     // The system prompt's cache breakpoint is applied by the caller based on the
     // cache plan, since whether the system prompt is stable enough to cache is a
     // policy decision, not a serialization detail.
-    let system = if system_parts.is_empty() {
-        None
-    } else {
-        let joined = system_parts.join("\n\n");
-        Some(json!([{ "type": "text", "text": joined }]))
-    };
+    // Structured `system_blocks` (the canonical content-block form) supersede the
+    // joined System-message text when present: each block renders as its own
+    // Anthropic system text block, so the provider consumes Bamboo's block array
+    // structurally. With no blocks, fall back to the legacy join (byte-identical).
+    let system = system_blocks_to_anthropic_value(system_blocks).or_else(|| {
+        (!system_parts.is_empty())
+            .then(|| json!([{ "type": "text", "text": system_parts.join("\n\n") }]))
+    });
 
     (system, out, out_ids)
 }
@@ -1282,6 +1404,78 @@ mod anthropic_request_building {
             super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
 
         assert!(out.get("system").is_none());
+    }
+
+    #[test]
+    fn structured_system_blocks_render_as_discrete_blocks_with_terminal_cache_control() {
+        use bamboo_domain::{ContextBlockType, PromptBlock};
+        // The canonical structured system field: three blocks in, three Anthropic
+        // system text blocks out — the provider consumes Bamboo's block array
+        // structurally instead of a pre-joined string.
+        let system_blocks = vec![
+            PromptBlock::new("base", ContextBlockType::Base, "BASE identity"),
+            PromptBlock::new(
+                "core_directives",
+                ContextBlockType::CoreDirectives,
+                "CORE rules",
+            ),
+            PromptBlock::new("env", ContextBlockType::EnvSnapshot, "ENV snapshot"),
+        ];
+        let messages = vec![Message::user("Hi")];
+
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &system_blocks,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            None,
+        );
+
+        let system = out["system"].as_array().expect("system is a block array");
+        assert_eq!(system.len(), 3, "one wire block per PromptBlock");
+        assert_eq!(system[0]["text"], "BASE identity");
+        assert_eq!(system[1]["text"], "CORE rules");
+        assert_eq!(system[2]["text"], "ENV snapshot");
+        assert!(system.iter().all(|b| b["type"] == "text"));
+        // Exactly ONE system cache breakpoint, on the LAST block (the default plan
+        // caches the system) — identical caching to the single-joined-block form.
+        assert!(system[0].get("cache_control").is_none());
+        assert!(system[1].get("cache_control").is_none());
+        assert_eq!(system[2]["cache_control"]["type"], "ephemeral");
+        // The user turn is untouched in the message array.
+        assert_eq!(out["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn empty_system_blocks_fall_back_to_joined_system_messages() {
+        use bamboo_domain::PromptBlock;
+        // With no structured blocks, the system comes from the `System` messages,
+        // byte-identical to the legacy path (multiple messages join into one block).
+        let messages = vec![
+            Message::system("You are helpful."),
+            Message::system("Be concise."),
+            Message::user("Hi"),
+        ];
+        let no_blocks: Vec<PromptBlock> = Vec::new();
+
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &no_blocks,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            None,
+        );
+        let system = out["system"].as_array().expect("system array");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["text"], "You are helpful.\n\nBe concise.");
     }
 
     #[test]
