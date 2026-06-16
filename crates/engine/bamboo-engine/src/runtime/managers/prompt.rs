@@ -27,7 +27,4 @@ pub trait PromptManager: Send + Sync {
 
     /// Refresh external memory injection into an existing system message.
     async fn refresh_external_memory(&self, session: &mut Session, config: &AgentLoopConfig);
-
-    /// Refresh the task list section in the system prompt.
-    fn refresh_task_list(&self, session: &mut Session);
 }

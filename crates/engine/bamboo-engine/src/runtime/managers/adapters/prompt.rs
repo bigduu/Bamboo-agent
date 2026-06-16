@@ -89,8 +89,4 @@ impl PromptManager for DefaultPromptManager {
         )
         .await;
     }
-
-    fn refresh_task_list(&self, session: &mut Session) {
-        crate::runtime::runner::prompt_context::inject_task_list_into_system_message(session);
-    }
 }

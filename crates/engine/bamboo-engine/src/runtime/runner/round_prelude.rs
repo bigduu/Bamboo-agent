@@ -13,8 +13,8 @@ use bamboo_llm::LLMProvider;
 use bamboo_metrics::MetricsCollector;
 
 use super::prompt_context::{
-    inject_external_memory_into_system_message, inject_task_list_into_system_message,
-    PromptMemoryRuntimeContext, PROMPT_MEMORY_OBSERVABILITY_KEY,
+    inject_external_memory_into_system_message, PromptMemoryRuntimeContext,
+    PROMPT_MEMORY_OBSERVABILITY_KEY,
 };
 use super::session_setup::prompt_setup::{persist_prompt_snapshot_metadata, PromptAssemblyReport};
 use bamboo_agent_core::PromptSnapshot;
@@ -36,8 +36,6 @@ pub(crate) struct RoundPreludeFrame<'a> {
 
 const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
 const EXTERNAL_MEMORY_END_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_END -->";
-const TASK_LIST_START_MARKER: &str = "<!-- BAMBOO_TASK_LIST_START -->";
-const TASK_LIST_END_MARKER: &str = "<!-- BAMBOO_TASK_LIST_END -->";
 const RUNTIME_PROMPT_FLAGS_KEY: &str = "runtime_prompt_component_flags";
 const RUNTIME_PROMPT_LENGTHS_KEY: &str = "runtime_prompt_component_lengths";
 const RUNTIME_PROMPT_SECTION_LAYOUT_KEY: &str = "runtime_prompt_section_layout";
@@ -48,10 +46,9 @@ pub(crate) async fn refresh_round_prompt_context(
     runtime_context: Option<&PromptMemoryRuntimeContext>,
 ) {
     inject_external_memory_into_system_message(session, prompt_memory_flags, runtime_context).await;
-    inject_task_list_into_system_message(session);
-    // Goal, plan-mode, and plan-runtime context are NOT injected into the system
-    // message — they are built as dedicated volatile blocks directly from session
-    // state during request assembly (goal-leak fix + cache-stable system prefix).
+    // Task list, goal, plan-mode, and plan-runtime context are NOT injected into
+    // the system message — they are built as dedicated volatile blocks directly
+    // from session state during request assembly (cache-stable system prefix).
 
     let session_id = session.id.clone();
     let prompt_for_metadata = session
@@ -125,7 +122,10 @@ fn ensure_not_cancelled(
 // ---- prompt metadata ----
 
 fn persist_round_prompt_metadata(session: &mut Session, prompt: &str) {
-    let sections = build_round_prompt_sections(prompt);
+    // Task list is sourced from session state (not reparsed from a system-message
+    // marker), since it now rides a volatile block instead of being injected.
+    let task_list_text = session.format_task_list_for_prompt();
+    let sections = build_round_prompt_sections(prompt, &task_list_text);
     let report = PromptAssemblyReport::from_sections(sections, prompt);
     session.metadata.insert(
         RUNTIME_PROMPT_FLAGS_KEY.to_string(),
@@ -152,10 +152,7 @@ fn persist_round_prompt_metadata(session: &mut Session, prompt: &str) {
             EXTERNAL_MEMORY_END_MARKER,
         )
     });
-    let task_list = extract_wrapped_section(prompt, TASK_LIST_START_MARKER, TASK_LIST_END_MARKER)
-        .map(|section| {
-            strip_wrapped_markers(&section, TASK_LIST_START_MARKER, TASK_LIST_END_MARKER)
-        });
+    let task_list = (!task_list_text.trim().is_empty()).then(|| task_list_text.clone());
 
     let mut snapshot = super::session_setup::prompt_setup::read_prompt_snapshot_metadata(session)
         .unwrap_or_else(|| PromptSnapshot {
@@ -209,6 +206,7 @@ fn persist_round_prompt_metadata(session: &mut Session, prompt: &str) {
 
 fn build_round_prompt_sections(
     prompt: &str,
+    task_list: &str,
 ) -> Vec<super::session_setup::prompt_setup::PromptSection> {
     use super::session_setup::prompt_setup::{PromptLayer, PromptSection};
 
@@ -218,8 +216,6 @@ fn build_round_prompt_sections(
         EXTERNAL_MEMORY_END_MARKER,
     )
     .unwrap_or_default();
-    let task_list = extract_wrapped_section(prompt, TASK_LIST_START_MARKER, TASK_LIST_END_MARKER)
-        .unwrap_or_default();
 
     vec![
         PromptSection::new("round_base_prompt", PromptLayer::CoreStatic, false, prompt),
@@ -262,16 +258,13 @@ fn log_round_prompt_refresh_summary(session_id: &str, prompt: &str) {
         EXTERNAL_MEMORY_START_MARKER,
         EXTERNAL_MEMORY_END_MARKER,
     );
-    let task_list_len = wrapped_section_len(prompt, TASK_LIST_START_MARKER, TASK_LIST_END_MARKER);
 
     tracing::info!(
-        "[{}] Round prompt refresh summary: effective_len={} chars, has_external_memory={}, external_memory_len={}, has_task_list={}, task_list_len={}",
+        "[{}] Round prompt refresh summary: effective_len={} chars, has_external_memory={}, external_memory_len={}",
         session_id,
         prompt.len(),
         external_memory_len > 0,
         external_memory_len,
-        task_list_len > 0,
-        task_list_len,
     );
 }
 
