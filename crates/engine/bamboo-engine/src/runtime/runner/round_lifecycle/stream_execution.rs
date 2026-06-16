@@ -12,9 +12,9 @@ use crate::runtime::runner::prompt_context::{
 };
 use crate::runtime::runner::session_setup::prompt_envelope::{
     assemble_prompt_envelope, build_conversation_summary_context_block,
-    build_external_memory_context_block_from_messages, build_plan_mode_context_block_from_messages,
-    build_plan_runtime_context_block_from_messages, build_task_list_context_block,
-    envelope_to_chat_messages, envelope_to_responses_view,
+    build_external_memory_context_block_from_messages, build_goal_context_block,
+    build_plan_mode_context_block_from_messages, build_plan_runtime_context_block_from_messages,
+    build_task_list_context_block, envelope_to_chat_messages, envelope_to_responses_view,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
@@ -280,6 +280,12 @@ fn build_request_envelope(
         volatile_blocks.push(block);
     }
     if let Some(block) = build_task_list_context_block(session) {
+        volatile_blocks.push(block);
+    }
+    // Session goal rides the volatile tail (built directly from the active goal),
+    // NOT injected into the system message — so a goal change never invalidates
+    // the cached system prefix (goal-leak fix).
+    if let Some(block) = build_goal_context_block(config.active_goal()) {
         volatile_blocks.push(block);
     }
     if let Some(block) = build_plan_runtime_context_block_from_messages(&prepared_context.messages)

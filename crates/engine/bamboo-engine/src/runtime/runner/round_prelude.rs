@@ -13,10 +13,9 @@ use bamboo_llm::LLMProvider;
 use bamboo_metrics::MetricsCollector;
 
 use super::prompt_context::{
-    inject_external_memory_into_system_message, inject_goal_into_system_message,
-    inject_plan_mode_instructions, inject_plan_runtime_context_into_system_message,
-    inject_task_list_into_system_message, PromptMemoryRuntimeContext,
-    PROMPT_MEMORY_OBSERVABILITY_KEY,
+    inject_external_memory_into_system_message, inject_plan_mode_instructions,
+    inject_plan_runtime_context_into_system_message, inject_task_list_into_system_message,
+    PromptMemoryRuntimeContext, PROMPT_MEMORY_OBSERVABILITY_KEY,
 };
 use super::session_setup::prompt_setup::{persist_prompt_snapshot_metadata, PromptAssemblyReport};
 use bamboo_agent_core::PromptSnapshot;
@@ -49,11 +48,11 @@ pub(crate) async fn refresh_round_prompt_context(
     prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     app_data_dir: Option<&std::path::Path>,
-    goal: Option<&str>,
 ) {
     inject_external_memory_into_system_message(session, prompt_memory_flags, runtime_context).await;
     inject_task_list_into_system_message(session);
-    inject_goal_into_system_message(session, goal);
+    // Goal is no longer injected into the system message — it is built as a
+    // dedicated volatile block during request assembly (goal-leak fix).
     inject_plan_runtime_context_into_system_message(session, app_data_dir);
     inject_plan_mode_instructions(session);
 
@@ -320,7 +319,6 @@ pub(crate) async fn prepare_round(
         config.prompt_memory_flags,
         Some(&runtime_context),
         config.app_data_dir.as_deref(),
-        config.active_goal(),
     )
     .await;
     update_task_round_state(task_context, round, max_rounds);

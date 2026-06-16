@@ -161,6 +161,23 @@ pub(crate) fn build_task_list_context_block(session: &Session) -> Option<Context
     ))
 }
 
+/// Build the per-round session-goal block directly from the active goal.
+///
+/// Placed by the caller in the volatile tail (alongside task/memory/plan) so the
+/// goal — which changes per session/round — never sits in the cached system
+/// prefix. Replaces the old `inject_goal_into_system_message` path, which leaked
+/// the goal into the `base` system block. Returns `None` when there is no goal.
+pub(crate) fn build_goal_context_block(goal: Option<&str>) -> Option<ContextBlock> {
+    let objective = goal.map(str::trim).filter(|value| !value.is_empty())?;
+    Some(ContextBlock::new(
+        ContextBlockType::GoalState,
+        ContextBlockPriority::Critical,
+        ContextBlockStability::RoundDynamic,
+        "Session Goal",
+        crate::runtime::runner::prompt_context::render_goal_section(objective),
+    ))
+}
+
 #[cfg(test)]
 pub(crate) fn build_external_memory_context_block(session: &Session) -> Option<ContextBlock> {
     build_external_memory_context_block_from_messages(&session.messages)

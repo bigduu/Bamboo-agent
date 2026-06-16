@@ -11,7 +11,7 @@ use bamboo_tools::guide::{context::GuideBuildContext, EnhancedPromptBuilder};
 
 use super::super::prompt_context::{
     append_core_agent_directives, merge_system_prompt_with_contexts,
-    strip_existing_core_directives, strip_existing_external_memory,
+    strip_existing_core_directives, strip_existing_external_memory, strip_existing_goal,
     strip_existing_plan_mode_instructions, strip_existing_plan_runtime_context,
     strip_existing_task_list,
 };
@@ -663,11 +663,15 @@ fn normalize_base_prompt(prompt: &str) -> String {
     let without_task_list = strip_existing_task_list(&without_external_memory);
     let without_plan_mode = strip_existing_plan_mode_instructions(&without_task_list);
     let without_plan_runtime = strip_existing_plan_runtime_context(&without_plan_mode);
+    // The session goal now rides a dedicated volatile block, never the system
+    // field. Strip any goal left in a legacy persisted System message so it can't
+    // re-leak into the cached `base` block (the goal-leak fix).
+    let without_goal = strip_existing_goal(&without_plan_runtime);
     // Strip framework directives too, so normalize yields a clean base uniformly
     // with every other framework-injected section. They are re-added (idempotent)
     // by `append_core_agent_directives` during assembly; stripping here keeps a
     // clean base even if directives ever leak into a persisted System message.
-    let without_directives = strip_existing_core_directives(&without_plan_runtime);
+    let without_directives = strip_existing_core_directives(&without_goal);
     merge_system_prompt_with_contexts(&without_directives, "", "")
 }
 

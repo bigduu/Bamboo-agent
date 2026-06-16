@@ -78,11 +78,14 @@ pub(crate) fn inject_task_list_into_system_message(session: &mut bamboo_agent_co
     task::inject_task_list_into_system_message(session);
 }
 
-pub(crate) fn inject_goal_into_system_message(
-    session: &mut bamboo_agent_core::Session,
-    goal: Option<&str>,
-) {
-    goal::inject_goal_into_system_message(session, goal);
+/// Render the session-goal section body (for the volatile [`GoalState`] block).
+pub(crate) fn render_goal_section(objective: &str) -> String {
+    goal::render_goal_section(objective)
+}
+
+/// Strip a legacy goal block from a (possibly persisted) system prompt.
+pub(super) fn strip_existing_goal(prompt: &str) -> String {
+    goal::strip_existing_goal(prompt)
 }
 
 pub(super) fn strip_existing_task_list(prompt: &str) -> String {
