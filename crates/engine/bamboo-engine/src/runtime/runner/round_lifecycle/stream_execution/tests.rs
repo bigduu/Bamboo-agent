@@ -256,7 +256,10 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
         .clone();
     assert_eq!(requested_messages.len(), 1);
     assert!(matches!(requested_messages[0].role, Role::System));
-    assert_eq!(requested_messages[0].content, expected_system_field("system"));
+    assert_eq!(
+        requested_messages[0].content,
+        expected_system_field("system")
+    );
     assert_eq!(
         llm.requested_instructions
             .lock()
@@ -814,6 +817,174 @@ fn lane_system_is_invariant_to_session_variable_context() {
             .expect("guide present")
     };
     assert_eq!(guide(&e_with), guide(&e_without));
+}
+
+#[test]
+fn system_field_is_assembled_as_discrete_base_core_env_blocks() {
+    // Step 4 invariant: the cross-session-invariant system field is carried as a
+    // STRUCTURED ARRAY of typed PromptBlocks (identity `base`, framework
+    // `core_directives`, globally-stable `env`) — not one glued string. A
+    // block-native provider can render one wire block per entry; the single
+    // system cache breakpoint anchors on the LAST block.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-sysblocks", "test-model");
+    let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    // A non-empty tool/server guide triggers the static-system relocation under
+    // which the system field is emitted as discrete blocks.
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let blocks = &envelope.lanes.system_blocks;
+
+    // Discrete, structured, and non-empty.
+    assert!(!blocks.is_empty(), "system field must be structured blocks");
+    // Identity `base` leads and carries the configured base identity.
+    assert_eq!(blocks[0].id, "base");
+    assert_eq!(blocks[0].kind, bamboo_domain::ContextBlockType::Base);
+    assert!(blocks[0].text.contains("BASE_SYSTEM_IDENTITY"));
+    // Framework `core_directives` is its own block (always present, non-empty).
+    let core = blocks
+        .iter()
+        .find(|b| b.id == "core_directives")
+        .expect("core_directives is a discrete block");
+    assert_eq!(core.kind, bamboo_domain::ContextBlockType::CoreDirectives);
+    assert!(!core.text.trim().is_empty());
+    // Every system block is marked Stable (it forms the cacheable head).
+    assert!(blocks
+        .iter()
+        .all(|b| b.stability == bamboo_domain::ContextBlockStability::Stable));
+    // Exactly the LAST block is the cache anchor (one system breakpoint).
+    assert!(blocks.last().expect("non-empty").cache_anchor);
+    assert_eq!(
+        blocks.iter().filter(|b| b.cache_anchor).count(),
+        1,
+        "exactly one system cache breakpoint, on the last block"
+    );
+    // The tool guide is NOT a system block — it rides as a relocated message.
+    assert!(blocks
+        .iter()
+        .all(|b| !b.text.contains("NOVA_GUIDANCE_MARKER")));
+}
+
+#[test]
+fn system_blocks_join_is_byte_identical_to_lane_system_string() {
+    // The structured `system_blocks` and the legacy joined `stable_instructions`
+    // string are two views of the SAME bytes: their `"\n\n"` join must reproduce
+    // the string wire exactly, so flipping a provider to the structured form
+    // changes nothing on the wire.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-sysblocks-join", "test-model");
+    let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let joined = envelope
+        .lanes
+        .system_blocks
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    assert_eq!(
+        envelope.lanes.stable_instructions, joined,
+        "joined system blocks must reproduce the string system field byte-for-byte"
+    );
+    // `system_text()` is the provider-facing accessor; it returns the same bytes.
+    assert_eq!(envelope.lanes.system_text(), joined);
+}
+
+#[test]
+fn goal_rides_volatile_tail_and_never_leaks_into_system_blocks() {
+    // Goal-leak fix (step 6a): a per-session goal is built as a dedicated volatile
+    // GoalState block in the tail — NOT injected into the cached system prefix —
+    // so changing the goal never invalidates the cached system head.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-goal-block", "test-model");
+    let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+    config.gold_config = Some(crate::runtime::config::GoldConfig {
+        enabled: true,
+        goal: Some("SHIP_THE_RELEASE_GOAL".to_string()),
+        ..Default::default()
+    });
+    assert_eq!(config.active_goal(), Some("SHIP_THE_RELEASE_GOAL"));
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    // Goal does NOT leak into any system block, nor the joined system string.
+    assert!(envelope
+        .lanes
+        .system_blocks
+        .iter()
+        .all(|b| !b.text.contains("SHIP_THE_RELEASE_GOAL")));
+    assert!(!envelope
+        .lanes
+        .stable_instructions
+        .contains("SHIP_THE_RELEASE_GOAL"));
+
+    // It rides the volatile tail as a typed GoalState context block.
+    let goal_msg = envelope
+        .volatile_context_messages
+        .iter()
+        .find(|m| m.content.contains("context_type: goal_state"))
+        .expect("goal rides the volatile tail as a goal_state block");
+    assert!(goal_msg.content.contains("SHIP_THE_RELEASE_GOAL"));
+}
+
+#[test]
+fn zero_tools_fallback_keeps_merged_system_string_and_no_blocks() {
+    // When there is no tool/server guide (no tools, no MCP guidance), the static
+    // relocation does not apply: the system field stays the legacy merged string
+    // and `system_blocks` is empty (the string remains byte-authoritative).
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-zero-tools", "test-model");
+    let config = test_config("BASE_SYSTEM_IDENTITY");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    assert!(
+        envelope.lanes.system_blocks.is_empty(),
+        "no relocation → no structured system blocks"
+    );
+    assert!(envelope
+        .lanes
+        .stable_instructions
+        .contains("BASE_SYSTEM_IDENTITY"));
 }
 
 #[tokio::test]
