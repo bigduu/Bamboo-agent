@@ -176,10 +176,12 @@ impl PromptIR {
             .and_then(|continuation| continuation.last_committed_assistant_id.as_deref())
         {
             Some(id) => match conversation.iter().rposition(|message| message.id == id) {
-                Some(index) => &conversation[index + 1..],
-                // Boundary churned away (compression / id wipe) → fail open to the
-                // whole conversation, matching the no-assistant fallback.
-                None => conversation,
+                // New turns exist after the boundary → send exactly those.
+                Some(index) if index + 1 < conversation.len() => &conversation[index + 1..],
+                // Nothing new after the boundary, OR the boundary churned away
+                // (compression / id wipe) → fail open to the whole conversation,
+                // matching the legacy `continuation_messages` None fallback.
+                _ => conversation,
             },
             None => conversation,
         }
@@ -294,6 +296,24 @@ mod tests {
             vec![(Role::User, "u2".to_string())],
             "delta is the conversation strictly after the committed assistant turn"
         );
+    }
+
+    #[test]
+    fn continuation_delta_falls_open_when_boundary_is_last_message() {
+        // Boundary = the last message (nothing new after it). Legacy
+        // continuation_messages returns None here → whole conversation; the IR
+        // must match (NOT an empty delta).
+        let conversation = vec![Message::user("u1"), Message::assistant("a1", None)];
+        let assistant_id = conversation[1].id.clone();
+        let ir = PromptIR {
+            segments: vec![Segment::new(SegmentRole::Conversation, conversation)],
+            continuation: Some(Continuation {
+                previous_response_id: "resp".to_string(),
+                last_committed_assistant_id: Some(assistant_id),
+            }),
+            ..PromptIR::default()
+        };
+        assert_eq!(ir.continuation_delta().len(), 2, "nothing new → whole conv");
     }
 
     #[test]
