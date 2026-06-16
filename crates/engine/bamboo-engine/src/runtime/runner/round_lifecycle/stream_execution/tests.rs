@@ -1065,6 +1065,130 @@ fn plan_llm_request_continuation_path_builds_delta() {
     );
 }
 
+fn message_shape(messages: &[bamboo_agent_core::Message]) -> Vec<(Role, String)> {
+    messages
+        .iter()
+        .map(|m| (m.role.clone(), m.content.clone()))
+        .collect()
+}
+
+#[test]
+fn envelope_ir_flatten_is_byte_equal_to_lanes() {
+    // GOLDEN: the rich IR's flat lowering reproduces the exact bytes the lanes
+    // path sends today — across a non-empty SystemRemainder + VolatileTail.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-ir-golden", "test-model");
+    // A persisted System message that diverges from the assembled system field
+    // becomes a SystemRemainder run — the case that must stay byte-stable.
+    session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Tasks".to_string(),
+        items: vec![TaskItem {
+            id: "t1".to_string(),
+            description: "do it".to_string(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER guide".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("PERSISTED OPERATOR NOTE"),
+            Message::user("u1"),
+            Message::assistant("a1", None),
+            Message::user("u2"),
+        ],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    // The fixture must actually exercise the runs we care about.
+    assert!(
+        !envelope
+            .ir
+            .run(bamboo_llm::SegmentRole::SystemRemainder)
+            .is_empty(),
+        "fixture should produce a SystemRemainder run"
+    );
+    assert!(
+        !envelope
+            .ir
+            .run(bamboo_llm::SegmentRole::VolatileTail)
+            .is_empty(),
+        "fixture should produce a VolatileTail run"
+    );
+    assert_eq!(
+        message_shape(&envelope.ir.flatten()),
+        message_shape(&envelope.lanes.flatten()),
+        "ir.flatten() must be byte-equal to lanes.flatten()"
+    );
+    assert_eq!(envelope.ir.system_field(), envelope.lanes.system_text());
+}
+
+#[test]
+fn envelope_ir_continuation_delta_is_byte_equal_to_legacy_delta() {
+    // GOLDEN: the IR-derived continuation delta reproduces the exact bytes the
+    // legacy plan_llm_request delta sends — including the SystemRemainder-FIRST
+    // ordering that differs from the chat view.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-ir-delta-golden", "test-model");
+    session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
+    let config = test_config("BASE_IDENTITY");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("PERSISTED OPERATOR NOTE"),
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let planned = super::plan_llm_request(
+        &envelope,
+        Some("resp_prev"),
+        "session-ir-delta-golden",
+        None,
+        0,
+    );
+
+    // Build the IR continuation the way the engine will at dispatch: boundary =
+    // the last assistant turn in the Conversation run.
+    let conversation = envelope.ir.run(bamboo_llm::SegmentRole::Conversation);
+    let last_assistant_id = conversation
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::Assistant))
+        .map(|m| m.id.clone());
+    let mut ir = envelope.ir.clone();
+    ir.continuation = Some(bamboo_llm::Continuation {
+        previous_response_id: "resp_prev".to_string(),
+        last_committed_assistant_id: last_assistant_id,
+    });
+
+    assert_eq!(
+        message_shape(&ir.continuation_delta()),
+        message_shape(&planned.continuation_messages),
+        "ir.continuation_delta() must be byte-equal to the legacy delta"
+    );
+}
+
 #[tokio::test]
 async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
     let _env_lock = isolate_prompt_safe_env_cache();

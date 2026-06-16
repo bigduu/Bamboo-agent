@@ -28,7 +28,10 @@ use bamboo_agent_core::{
 use bamboo_compression::PreparedContext;
 use bamboo_domain::ReasoningEffort;
 use bamboo_llm::provider::ResponsesRequestOptions;
-use bamboo_llm::{CacheTtl, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptLanes};
+use bamboo_llm::{
+    CacheTtl, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR, PromptLanes, Segment,
+    SegmentRole,
+};
 use bamboo_tools::exposure::activated_discoverable_tools;
 
 /// LLM-stream frame bundling per-request identification, observability, and
@@ -237,6 +240,13 @@ struct PreparedRequestEnvelope {
     /// (non-continuation) request through `chat_stream_lanes` is byte-identical
     /// until providers override it to consume the lanes structurally.
     lanes: PromptLanes,
+    /// Rich canonical request IR (supersedes `lanes` as the provider entry point
+    /// during the migration). Built from the SAME pieces as `lanes` but with
+    /// `system_remainder` and the volatile tail as their OWN addressable runs, so
+    /// an adapter can derive the chat / Responses-input / continuation-delta views
+    /// itself. `continuation` is filled in at dispatch time. Verified byte-equal
+    /// to `lanes`/the legacy delta by the golden tests.
+    ir: PromptIR,
     responses_input_messages: Vec<Message>,
     system_remainder_messages: Vec<Message>,
     dynamic_context_messages: Vec<Message>,
@@ -539,9 +549,38 @@ fn build_request_envelope(
         ttl: CacheTtl::Extended,
     };
 
+    // Rich canonical IR built from the SAME pieces as `lanes`, but keeping
+    // `system_remainder` and the volatile tail as their OWN addressable runs (in
+    // `lanes` they are merged into the conversation tail). `continuation` is set
+    // at dispatch time. The golden tests assert `ir.flatten()` is byte-equal to
+    // `lanes.flatten()` and `ir.continuation_delta()` to the legacy delta.
+    let ir = PromptIR {
+        system_text: lanes.stable_instructions.clone(),
+        system_blocks: lanes.system_blocks.clone(),
+        segments: vec![
+            Segment::new(
+                SegmentRole::StablePrefix,
+                lanes.stable_prefix_messages.clone(),
+            ),
+            Segment::new(
+                SegmentRole::DynamicContext,
+                lanes.dynamic_context_messages.clone(),
+            ),
+            Segment::new(
+                SegmentRole::SystemRemainder,
+                system_remainder_messages.clone(),
+            ),
+            Segment::new(SegmentRole::Conversation, conversation_messages.clone()),
+            Segment::new(SegmentRole::VolatileTail, volatile_context_messages.clone()),
+        ],
+        cache: cache_plan.clone(),
+        continuation: None,
+    };
+
     PreparedRequestEnvelope {
         chat_messages,
         lanes,
+        ir,
         responses_input_messages,
         system_remainder_messages,
         dynamic_context_messages: envelope.dynamic_context_messages.clone(),
@@ -681,28 +720,32 @@ fn plan_llm_request(
         cache: Some(envelope.cache_plan.clone()),
     };
 
+    // Observability is sourced from the IR (the single canonical structure), so
+    // the recorded shape can't drift from what the lowering methods actually send.
+    // `conversation_messages` is now a TRUE count (the volatile tail is its own
+    // run, no longer merged in).
     let render = RequestRenderObservability {
         wire: if is_continuation {
             "responses_continuation"
         } else {
             "lanes"
         },
-        system_block_count: envelope.lanes.system_blocks.len(),
-        system_chars: envelope.lanes.stable_instructions.len(),
-        stable_prefix_messages: envelope.lanes.stable_prefix_messages.len(),
-        dynamic_context_messages: envelope.lanes.dynamic_context_messages.len(),
-        conversation_messages: envelope.lanes.conversation_messages.len(),
-        volatile_context_messages: envelope.volatile_context_messages.len(),
+        system_block_count: envelope.ir.system_blocks.len(),
+        system_chars: envelope.ir.system_field().len(),
+        stable_prefix_messages: envelope.ir.run(SegmentRole::StablePrefix).len(),
+        dynamic_context_messages: envelope.ir.run(SegmentRole::DynamicContext).len(),
+        conversation_messages: envelope.ir.run(SegmentRole::Conversation).len(),
+        volatile_context_messages: envelope.ir.run(SegmentRole::VolatileTail).len(),
         request_message_count: if is_continuation {
             continuation_delta.len()
         } else {
-            envelope.chat_messages.len()
+            envelope.ir.flatten().len()
         },
         tool_count,
-        cache_system: envelope.cache_plan.cache_system,
-        cache_tools: envelope.cache_plan.cache_tools,
-        cache_breakpoints: envelope.cache_plan.breakpoint_message_ids.len(),
-        cache_ttl: cache_ttl_label(envelope.cache_plan.ttl),
+        cache_system: envelope.ir.cache.cache_system,
+        cache_tools: envelope.ir.cache.cache_tools,
+        cache_breakpoints: envelope.ir.cache.breakpoint_message_ids.len(),
+        cache_ttl: cache_ttl_label(envelope.ir.cache.ttl),
     };
 
     LlmRequestPlan {
