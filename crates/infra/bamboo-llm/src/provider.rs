@@ -163,16 +163,21 @@ pub struct PromptLanes {
 }
 
 impl PromptLanes {
-    /// The effective system-field text: the structured [`system_blocks`] joined
-    /// by `"\n\n"` (skipping empties) when present, else the legacy
-    /// [`stable_instructions`] string. Kept byte-identical across the migration —
-    /// the join of `[base, core_directives, env]` block texts reproduces the
-    /// previously-concatenated `stable_instructions`.
+    /// The effective system-field text for the flatten / non-block-native path
+    /// (OpenAI/Gemini/Copilot and the default trait impl).
+    ///
+    /// [`stable_instructions`] is the **byte-authoritative** source: the engine
+    /// assembles the exact wire string there, so the auto-prefix cache on those
+    /// providers stays byte-identical regardless of how [`system_blocks`] is
+    /// structured. [`system_blocks`] is the parallel structured form used by a
+    /// block-native provider (Anthropic) to render one wire block per entry with
+    /// per-block `cache_control`; it is only the fallback here when
+    /// `stable_instructions` is empty.
     ///
     /// [`system_blocks`]: Self::system_blocks
     /// [`stable_instructions`]: Self::stable_instructions
     pub fn system_text(&self) -> String {
-        if self.system_blocks.is_empty() {
+        if !self.stable_instructions.is_empty() {
             self.stable_instructions.clone()
         } else {
             self.system_blocks
@@ -420,33 +425,34 @@ mod tests {
     }
 
     #[test]
-    fn system_text_prefers_blocks_and_joins_byte_identical() {
+    fn system_text_prefers_authoritative_string_else_joins_blocks() {
         use bamboo_domain::{ContextBlockType, PromptBlock};
-        // Legacy path: no blocks → stable_instructions verbatim.
-        let legacy = PromptLanes {
-            stable_instructions: "base\n\nenv".into(),
-            ..PromptLanes::default()
-        };
-        assert_eq!(legacy.system_text(), "base\n\nenv");
+        let blocks = vec![
+            PromptBlock::new("base", ContextBlockType::Base, "base"),
+            // an empty block is skipped in the fallback join
+            PromptBlock::new("skill", ContextBlockType::SkillContext, "   "),
+            PromptBlock::new("env", ContextBlockType::EnvSnapshot, "env"),
+        ];
 
-        // Block path: [base, env] joined by "\n\n" reproduces the legacy string
-        // byte-for-byte (the invariant Step 4 relies on). stable_instructions is
-        // ignored once system_blocks is non-empty.
-        let with_blocks = PromptLanes {
-            stable_instructions: "IGNORED".into(),
-            system_blocks: vec![
-                PromptBlock::new("base", ContextBlockType::Base, "base"),
-                // an empty block is skipped in the join
-                PromptBlock::new("skill", ContextBlockType::SkillContext, "   "),
-                PromptBlock::new("env", ContextBlockType::EnvSnapshot, "env"),
-            ],
+        // Authoritative: stable_instructions is the byte-frozen wire source for
+        // the flatten path — it wins even when system_blocks is present, so
+        // OpenAI/GLM bytes never change as the structured side-channel evolves.
+        let authoritative = PromptLanes {
+            stable_instructions: "AUTHORITATIVE".into(),
+            system_blocks: blocks.clone(),
             ..PromptLanes::default()
         };
-        assert_eq!(with_blocks.system_text(), "base\n\nenv");
-        // flatten() renders the same system text into the system message.
-        let flat = with_blocks.flatten();
-        assert_eq!(flat[0].content, "base\n\nenv");
-        assert!(matches!(flat[0].role, bamboo_domain::Role::System));
+        assert_eq!(authoritative.system_text(), "AUTHORITATIVE");
+        assert_eq!(authoritative.flatten()[0].content, "AUTHORITATIVE");
+
+        // Fallback: when stable_instructions is empty, the blocks are joined by
+        // "\n\n" (empties skipped) — the path a future block-native engine uses.
+        let fallback = PromptLanes {
+            stable_instructions: String::new(),
+            system_blocks: blocks,
+            ..PromptLanes::default()
+        };
+        assert_eq!(fallback.system_text(), "base\n\nenv");
     }
 
     #[derive(Clone, Default)]
