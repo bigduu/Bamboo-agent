@@ -904,3 +904,28 @@ fn persist_runtime_prompt_metadata(session: &mut Session, report: &PromptAssembl
         report.section_layout_value(),
     );
 }
+
+#[cfg(test)]
+mod block_refactor_tests {
+    use super::normalize_base_prompt;
+
+    /// Regression guard for the goal-leak fix: a goal block left in a legacy
+    /// persisted System message must be stripped by `normalize_base_prompt`, so
+    /// it never re-enters the cached `base` system block. The goal now rides a
+    /// dedicated volatile tail block instead.
+    #[test]
+    fn normalize_strips_legacy_goal_block_so_it_cannot_leak_into_base() {
+        let with_goal = "You are Bodhi.\n\n\
+<!-- BAMBOO_GOAL_START -->\n## Session Goal\nship the feature\n<!-- BAMBOO_GOAL_END -->";
+        let base = normalize_base_prompt(with_goal);
+        assert!(base.contains("You are Bodhi."));
+        assert!(
+            !base.contains("BAMBOO_GOAL_START"),
+            "goal markers must be stripped from base"
+        );
+        assert!(
+            !base.contains("ship the feature"),
+            "goal text must not leak into the cached base block"
+        );
+    }
+}
