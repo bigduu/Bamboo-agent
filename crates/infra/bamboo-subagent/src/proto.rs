@@ -45,6 +45,13 @@ pub enum ParentFrame {
     Run(RunSpec),
     Cancel,
     Message { text: String },
+    /// Reply to a [`ChildFrame::SubagentRequest`] — the host's result for a
+    /// SubAgent tool call the worker proxied back over this same WS. `id`
+    /// correlates to the request; `body` is the proxied tool result JSON.
+    SubagentReply {
+        id: String,
+        body: serde_json::Value,
+    },
 }
 
 /// Child → parent event/terminal frames.
@@ -53,12 +60,25 @@ pub enum ParentFrame {
 pub enum ChildFrame {
     /// One agent event, serialized verbatim (the real `AgentEvent` lands here as JSON).
     Event { event: serde_json::Value },
+    /// The worker's `SubAgent` tool call, proxied to the host over this WS so a
+    /// nested sub-agent's grandchildren are created in the host store (parented
+    /// to this worker's host session). The host answers with
+    /// [`ParentFrame::SubagentReply`] carrying the same `id`.
+    SubagentRequest {
+        id: String,
+        body: serde_json::Value,
+    },
     Terminal {
         status: TerminalStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// Full worker transcript (serialized domain `Message`s) shipped on
+        /// suspend so the host can persist it onto the child session and
+        /// rehydrate the worker on resume. Empty for non-suspend terminals.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        transcript: Vec<serde_json::Value>,
     },
 }
 
@@ -68,6 +88,10 @@ pub enum TerminalStatus {
     Completed,
     Error,
     Cancelled,
+    /// The worker's loop suspended (it spawned its own sub-agents and is waiting
+    /// on them). Non-terminal to the host: the completion coordinator resumes
+    /// the worker (re-dispatch) once its children finish.
+    Suspended,
 }
 
 impl ParentFrame {
@@ -117,8 +141,30 @@ mod tests {
             status: TerminalStatus::Completed,
             result: Some("done".into()),
             error: None,
+            transcript: Vec::new(),
         };
         assert_eq!(ChildFrame::from_text(&t.to_text()).unwrap(), t);
+
+        // Suspend terminal carries the worker transcript.
+        let s = ChildFrame::Terminal {
+            status: TerminalStatus::Suspended,
+            result: None,
+            error: None,
+            transcript: vec![serde_json::json!({"role":"assistant","content":"x"})],
+        };
+        assert_eq!(ChildFrame::from_text(&s.to_text()).unwrap(), s);
+
+        // SubAgent request/reply round-trip over the per-child WS.
+        let req = ChildFrame::SubagentRequest {
+            id: "r1".into(),
+            body: serde_json::json!({"action":"create"}),
+        };
+        assert_eq!(ChildFrame::from_text(&req.to_text()).unwrap(), req);
+        let reply = ParentFrame::SubagentReply {
+            id: "r1".into(),
+            body: serde_json::json!({"success":true}),
+        };
+        assert_eq!(ParentFrame::from_text(&reply.to_text()).unwrap(), reply);
     }
 
     #[test]

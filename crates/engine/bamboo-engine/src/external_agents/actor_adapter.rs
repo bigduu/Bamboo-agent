@@ -392,12 +392,39 @@ async fn drive(
                             let _ = event_tx.send(ev).await;
                         }
                     }
-                    Ok(Some(ChildFrame::Terminal { status, result, error })) => {
+                    Ok(Some(ChildFrame::SubagentRequest { id, .. })) => {
+                        // A nested worker child proxied a SubAgent tool call back
+                        // to the host. The host-side handler that runs the real
+                        // SubAgent tool (parenting grandchildren under this child)
+                        // is not wired here yet — answer with a graceful error so
+                        // the worker's tool call fails cleanly instead of hanging.
+                        let body = serde_json::json!({
+                            "success": false,
+                            "result": "nested sub-agent spawn is not available in this build",
+                            "display_preference": null,
+                        });
+                        if client
+                            .send(ParentFrame::SubagentReply { id, body })
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!("failed to answer subagent_request; connection failing");
+                        }
+                    }
+                    Ok(Some(ChildFrame::Terminal { status, result, error, .. })) => {
                         return match status {
                             TerminalStatus::Completed => Ok(result),
                             TerminalStatus::Cancelled => Err(AgentError::Cancelled),
                             TerminalStatus::Error => Err(AgentError::LLM(
                                 error.unwrap_or_else(|| "actor child errored".to_string()),
+                            )),
+                            // The suspend/resume round-trip (host re-dispatch of a
+                            // nested parent) is not wired here yet; a worker in
+                            // this build never emits Suspended, so this is
+                            // unreachable in practice.
+                            TerminalStatus::Suspended => Err(AgentError::LLM(
+                                "nested sub-agent suspend received but resume transport is not wired"
+                                    .to_string(),
                             )),
                         };
                     }

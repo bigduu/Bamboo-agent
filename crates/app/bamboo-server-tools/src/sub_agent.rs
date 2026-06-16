@@ -302,6 +302,14 @@ fn parse_model_spec(
     Ok(bamboo_domain::ProviderModelRef::new(provider, spec))
 }
 
+/// The `SubAgent` tool description. Exposed standalone so a nested worker's
+/// SubAgent proxy can advertise the identical tool to its own LLM (no drift).
+pub fn subagent_tool_description() -> &'static str {
+    "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. A child session is a full agent that runs independently under the current root session with its own conversation context and the full toolset, streams progress back to the parent via sub_agent_* events, and can be reopened from the Sub-agents panel. \
+PARALLEL FAN-OUT (important): action=create now runs the child in the BACKGROUND and returns immediately WITHOUT suspending the parent. To launch several agents in parallel, call create once per child (ideally several creates in a single turn), then call action=wait ONCE to suspend until they finish. Do NOT pass wait=true on each create for parallel work — that would serialize them (suspend after the first). action=wait defaults to waiting on every active child; if you forget to call it, the runtime auto-waits at the end of the turn so results are never lost. \
+Use list/get to inspect existing children; use update/run/send_message/cancel/delete to manage existing children. Use only when the user explicitly asks for delegation/parallelism or when a side task would otherwise flood the main context. Do not use for simple one-step tasks. IMPORTANT: When a child fails or needs redirection, prefer send_message over creating a duplicate child. Use list before create to avoid spawning redundant children."
+}
+
 #[async_trait]
 impl Tool for SubAgentTool {
     fn name(&self) -> &str {
@@ -309,9 +317,7 @@ impl Tool for SubAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. A child session is a full agent that runs independently under the current root session with its own conversation context and the full toolset, streams progress back to the parent via sub_agent_* events, and can be reopened from the Sub-agents panel. \
-PARALLEL FAN-OUT (important): action=create now runs the child in the BACKGROUND and returns immediately WITHOUT suspending the parent. To launch several agents in parallel, call create once per child (ideally several creates in a single turn), then call action=wait ONCE to suspend until they finish. Do NOT pass wait=true on each create for parallel work — that would serialize them (suspend after the first). action=wait defaults to waiting on every active child; if you forget to call it, the runtime auto-waits at the end of the turn so results are never lost. \
-Use list/get to inspect existing children; use update/run/send_message/cancel/delete to manage existing children. Use only when the user explicitly asks for delegation/parallelism or when a side task would otherwise flood the main context. Do not use for simple one-step tasks. IMPORTANT: When a child fails or needs redirection, prefer send_message over creating a duplicate child. Use list before create to avoid spawning redundant children."
+        subagent_tool_description()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

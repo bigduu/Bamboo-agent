@@ -5,22 +5,66 @@
 //! [`EchoExecutor`] is a dependency-free stand-in used by the demo worker and tests.
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::proto::{RunSpec, TerminalStatus};
+
+/// A single host-callback request: an executor proxies a `SubAgent` tool call
+/// back to the host over the run's WS and awaits the reply.
+pub struct HostRequest {
+    pub body: serde_json::Value,
+    pub reply: oneshot::Sender<serde_json::Value>,
+}
+
+/// Host-callback bridge handed to an executor (via [`EventSink`]) so a nested
+/// sub-agent can create/wait on its OWN sub-agents on the host — over the same
+/// per-child WebSocket, no broker needed. Absent for tests/[`EchoExecutor`].
+#[derive(Clone)]
+pub struct HostBridge {
+    req_tx: mpsc::UnboundedSender<HostRequest>,
+}
+
+impl HostBridge {
+    /// Create a bridge + the receiver the transport pumps to the wire.
+    pub fn channel() -> (Self, mpsc::UnboundedReceiver<HostRequest>) {
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        (HostBridge { req_tx }, req_rx)
+    }
+    /// Proxy one SubAgent tool call to the host and await its reply JSON.
+    pub async fn subagent_call(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let (reply, rx) = oneshot::channel();
+        self.req_tx
+            .send(HostRequest { body, reply })
+            .map_err(|_| "host bridge closed".to_string())?;
+        rx.await.map_err(|_| "host bridge dropped reply".to_string())
+    }
+}
 
 /// Sink an executor emits events into; the transport forwards each as a `ChildFrame::Event`.
 #[derive(Clone)]
 pub struct EventSink {
     tx: mpsc::UnboundedSender<serde_json::Value>,
+    host: Option<HostBridge>,
 }
 
 impl EventSink {
     /// Create a sink + the receiver the transport pumps to the wire.
     pub fn channel() -> (Self, mpsc::UnboundedReceiver<serde_json::Value>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (EventSink { tx }, rx)
+        (EventSink { tx, host: None }, rx)
+    }
+    /// Attach a host-callback bridge (the transport wires this for real runs).
+    pub fn with_host_bridge(mut self, bridge: HostBridge) -> Self {
+        self.host = Some(bridge);
+        self
+    }
+    /// The host-callback bridge, if this run was wired with one.
+    pub fn host(&self) -> Option<&HostBridge> {
+        self.host.as_ref()
     }
     /// Emit one event (serialized agent event). Dropped silently if the peer is gone.
     pub fn emit(&self, event: serde_json::Value) {
@@ -28,12 +72,15 @@ impl EventSink {
     }
 }
 
-/// Result of running a task to completion.
+/// Result of running a task to completion (or suspension).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChildOutcome {
     pub status: TerminalStatus,
     pub result: Option<String>,
     pub error: Option<String>,
+    /// Full worker transcript, shipped only on suspend so the host can persist
+    /// it onto the child session and rehydrate the worker on resume.
+    pub transcript: Vec<serde_json::Value>,
 }
 
 impl ChildOutcome {
@@ -42,6 +89,7 @@ impl ChildOutcome {
             status: TerminalStatus::Completed,
             result: Some(result.into()),
             error: None,
+            transcript: Vec::new(),
         }
     }
     pub fn error(msg: impl Into<String>) -> Self {
@@ -49,6 +97,7 @@ impl ChildOutcome {
             status: TerminalStatus::Error,
             result: None,
             error: Some(msg.into()),
+            transcript: Vec::new(),
         }
     }
     pub fn cancelled() -> Self {
@@ -56,6 +105,17 @@ impl ChildOutcome {
             status: TerminalStatus::Cancelled,
             result: None,
             error: None,
+            transcript: Vec::new(),
+        }
+    }
+    /// The worker suspended to wait on its own sub-agents; ship the full
+    /// transcript so the host can resume it later.
+    pub fn suspended(transcript: Vec<serde_json::Value>) -> Self {
+        Self {
+            status: TerminalStatus::Suspended,
+            result: None,
+            error: None,
+            transcript,
         }
     }
 }

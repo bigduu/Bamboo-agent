@@ -276,7 +276,10 @@ async fn connect_and_stream(endpoint: &str, prompt: &str, raw: bool) -> Result<(
                         }
                         print_event(&event, raw);
                     }
-                    Ok(Some(ChildFrame::Terminal { status, result, error })) => {
+                    Ok(Some(ChildFrame::SubagentRequest { .. })) => {
+                        // This CLI does not host nested spawning; ignore.
+                    }
+                    Ok(Some(ChildFrame::Terminal { status, result, error, .. })) => {
                         println!();
                         match status {
                             TerminalStatus::Completed => {
@@ -288,6 +291,7 @@ async fn connect_and_stream(endpoint: &str, prompt: &str, raw: bool) -> Result<(
                                 }
                             }
                             TerminalStatus::Cancelled => eprintln!("⏹ cancelled"),
+                            TerminalStatus::Suspended => eprintln!("⏸ suspended (waiting on sub-agents)"),
                             TerminalStatus::Error => {
                                 exit = Err(error.unwrap_or_else(|| "actor errored".into()));
                             }

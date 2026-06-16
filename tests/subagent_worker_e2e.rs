@@ -65,6 +65,7 @@ async fn real_bamboo_binary_serves_a_subagent_run() {
                     saw_token = true;
                 }
             }
+            ChildFrame::SubagentRequest { .. } => {}
             ChildFrame::Terminal { status, result, .. } => {
                 terminal = Some((status, result));
                 break;

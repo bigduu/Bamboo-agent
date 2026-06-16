@@ -5,19 +5,26 @@
 //!   trips the run's token (out-of-band, never queued behind events).
 //! - Parent side: [`ChildClient`] sends [`ParentFrame`]s and reads [`ChildFrame`]s.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_async, connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
-use crate::executor::{ChildExecutor, EventSink, SteerInbox};
+use crate::executor::{ChildExecutor, EventSink, HostBridge, SteerInbox};
 use crate::proto::{ChildFrame, ParentFrame, RunSpec};
+
+/// Pending host-callback replies, keyed by request id, shared between the
+/// per-run pump (which inserts) and the connection read loop (which resolves
+/// them on [`ParentFrame::SubagentReply`]).
+type PendingReplies = Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -141,11 +148,20 @@ async fn handle_conn<E: ChildExecutor + ?Sized>(
     let (out_tx, out_rx) = mpsc::unbounded_channel::<ChildFrame>();
     let writer = tokio::spawn(writer_task(ws_tx, out_rx));
 
+    // Host-callback replies for SubAgent calls the active run proxies back to
+    // the host over this WS (nested sub-agents). Shared with each run's pump.
+    let pending: PendingReplies = Arc::new(Mutex::new(HashMap::new()));
+
     let mut active_cancel: Option<CancellationToken> = None;
     let mut active_steer: Option<mpsc::UnboundedSender<String>> = None;
     while let Some(msg) = ws_rx.next().await {
         match msg? {
             Message::Text(t) => match ParentFrame::from_text(t.as_str()) {
+                Ok(ParentFrame::SubagentReply { id, body }) => {
+                    if let Some(reply) = pending.lock().expect("pending lock").remove(&id) {
+                        let _ = reply.send(body);
+                    }
+                }
                 Ok(ParentFrame::Run(spec)) => {
                     // A new run supersedes any active run: cancel the previous
                     // task *before* starting the new one so the old run stops
@@ -160,7 +176,14 @@ async fn handle_conn<E: ChildExecutor + ?Sized>(
                     let (steer_tx, steer_rx) = SteerInbox::channel();
                     active_cancel = Some(cancel.clone());
                     active_steer = Some(steer_tx);
-                    start_run(executor.clone(), spec, steer_rx, cancel, out_tx.clone());
+                    start_run(
+                        executor.clone(),
+                        spec,
+                        steer_rx,
+                        cancel,
+                        out_tx.clone(),
+                        pending.clone(),
+                    );
                 }
                 Ok(ParentFrame::Cancel) => {
                     if let Some(c) = &active_cancel {
@@ -210,6 +233,7 @@ fn start_run<E: ChildExecutor + ?Sized>(
     steer: SteerInbox,
     cancel: CancellationToken,
     out_tx: mpsc::UnboundedSender<ChildFrame>,
+    pending: PendingReplies,
 ) {
     let (sink, mut ev_rx) = EventSink::channel();
     let out_fwd = out_tx.clone();
@@ -221,13 +245,40 @@ fn start_run<E: ChildExecutor + ?Sized>(
             }
         }
     });
+
+    // Host-callback pump: each SubAgent call the executor proxies back becomes a
+    // `SubagentRequest` on the wire; its reply (a `SubagentReply` resolved in
+    // `handle_conn`) is delivered to the awaiting oneshot via `pending`.
+    let (bridge, mut req_rx) = HostBridge::channel();
+    let sink = sink.with_host_bridge(bridge);
+    let out_req = out_tx.clone();
+    let pending_for_pump = pending.clone();
+    let ids = AtomicU64::new(0);
+    let pump = tokio::spawn(async move {
+        while let Some(req) = req_rx.recv().await {
+            let id = format!("sa-{}", ids.fetch_add(1, Ordering::Relaxed));
+            pending_for_pump
+                .lock()
+                .expect("pending lock")
+                .insert(id.clone(), req.reply);
+            if out_req
+                .send(ChildFrame::SubagentRequest { id, body: req.body })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
     tokio::spawn(async move {
         let outcome = executor.run(spec, sink, steer, cancel).await;
         let _ = fwd.await; // flush all events before the terminal frame
+        pump.abort(); // no more host callbacks after the run ends
         let _ = out_tx.send(ChildFrame::Terminal {
             status: outcome.status,
             result: outcome.result,
             error: outcome.error,
+            transcript: outcome.transcript,
         });
     });
 }
@@ -300,6 +351,7 @@ mod tests {
         while let Some(frame) = client.next_frame().await.unwrap() {
             match frame {
                 ChildFrame::Event { event } => events.push(event),
+                ChildFrame::SubagentRequest { .. } => {}
                 ChildFrame::Terminal { status, result, .. } => {
                     terminal = Some((status, result));
                     break;
@@ -500,6 +552,7 @@ mod tests {
                         tokens.push(t.to_string());
                     }
                 }
+                ChildFrame::SubagentRequest { .. } => {}
                 ChildFrame::Terminal {
                     status, result: r, ..
                 } => {
