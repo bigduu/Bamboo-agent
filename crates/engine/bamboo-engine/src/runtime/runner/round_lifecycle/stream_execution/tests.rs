@@ -1189,6 +1189,48 @@ fn envelope_ir_continuation_delta_is_byte_equal_to_legacy_delta() {
     );
 }
 
+#[test]
+fn envelope_ir_responses_input_is_byte_equal_to_legacy() {
+    // GOLDEN: the IR's Responses-input view reproduces the engine's pre-baked
+    // responses_input_messages, so Phase D (adapter derives it from the IR) is a
+    // byte-identical move on the Responses wire.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-ir-resp", "test-model");
+    session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
+    session.metadata.insert(
+        "skill.context".to_string(),
+        "SKILL_CONTEXT_MARKER body".to_string(),
+    );
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER guide".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("PERSISTED OPERATOR NOTE"),
+            Message::user("u1"),
+            Message::assistant("a1", None),
+            Message::user("u2"),
+        ],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    assert_eq!(
+        message_shape(&envelope.ir.responses_input()),
+        message_shape(&envelope.responses_input_messages),
+        "ir.responses_input() must reproduce the engine's responses_input_messages"
+    );
+    assert_eq!(
+        envelope.ir.system_field(),
+        envelope.instructions.clone().unwrap_or_default(),
+        "ir.system_field() must equal the Responses instructions"
+    );
+}
+
 #[tokio::test]
 async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
     let _env_lock = isolate_prompt_safe_env_cache();
