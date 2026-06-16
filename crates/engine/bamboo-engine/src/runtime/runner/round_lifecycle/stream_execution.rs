@@ -554,6 +554,173 @@ fn build_request_envelope(
     }
 }
 
+/// Session metadata key holding the latest [`RequestRenderObservability`] JSON.
+const SESSION_REQUEST_RENDER_KEY: &str = "llm_request_render";
+
+/// Structured, observable record of how the canonical request was rendered for
+/// the provider this round — the single place the engine's request-shaping
+/// decision is captured: the wire path, the system-field shape, per-lane message
+/// counts, and the cache plan. Logged and persisted to session metadata so the
+/// rendered request is inspectable after the fact.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct RequestRenderObservability {
+    /// `"lanes"` (canonical structured path) or `"responses_continuation"` (delta).
+    pub wire: &'static str,
+    /// Structured system blocks (0 → the system field is a single joined string).
+    pub system_block_count: usize,
+    pub system_chars: usize,
+    pub stable_prefix_messages: usize,
+    pub dynamic_context_messages: usize,
+    pub conversation_messages: usize,
+    pub volatile_context_messages: usize,
+    /// Messages actually sent: the continuation delta size, or the full chat list.
+    pub request_message_count: usize,
+    pub tool_count: usize,
+    pub cache_system: bool,
+    pub cache_tools: bool,
+    pub cache_breakpoints: usize,
+    pub cache_ttl: &'static str,
+}
+
+impl RequestRenderObservability {
+    fn log(&self, session_id: &str) {
+        tracing::info!(
+            "[{}] LLM request render: wire={} system_blocks={} system_chars={} stable_prefix_msgs={} dynamic_ctx_msgs={} conversation_msgs={} volatile_ctx_msgs={} request_msgs={} tools={} cache(system={}, tools={}, breakpoints={}, ttl={})",
+            session_id,
+            self.wire,
+            self.system_block_count,
+            self.system_chars,
+            self.stable_prefix_messages,
+            self.dynamic_context_messages,
+            self.conversation_messages,
+            self.volatile_context_messages,
+            self.request_message_count,
+            self.tool_count,
+            self.cache_system,
+            self.cache_tools,
+            self.cache_breakpoints,
+            self.cache_ttl,
+        );
+    }
+}
+
+/// The fully-resolved provider request the engine will dispatch, plus its
+/// observability. Produced once per round by [`plan_llm_request`] — the single
+/// home for turning the canonical envelope/[`PromptLanes`] into a concrete
+/// provider request and choosing the wire path. This consolidates what used to
+/// be inline branching in `execute_llm_stream`, so the request-shaping capability
+/// is one testable unit with a structured, inspectable result.
+struct LlmRequestPlan {
+    /// Continuation (flat) delta messages; empty on the lanes path.
+    continuation_messages: Vec<Message>,
+    request_options: LLMRequestOptions,
+    /// `true` → dispatch the Responses-API continuation (flat) path; `false` →
+    /// the canonical lanes path.
+    is_continuation: bool,
+    render: RequestRenderObservability,
+}
+
+fn cache_ttl_label(ttl: CacheTtl) -> &'static str {
+    if ttl == CacheTtl::Extended {
+        "1h"
+    } else {
+        "5m"
+    }
+}
+
+/// Turn the canonical request envelope into a concrete provider request and pick
+/// the wire path. The Responses-API specifics (instructions / input view /
+/// continuation delta) are assembled here in ONE place rather than inline at the
+/// dispatch site; the returned [`LlmRequestPlan::render`] records the decision.
+fn plan_llm_request(
+    envelope: &PreparedRequestEnvelope,
+    previous_response_id: Option<&str>,
+    session_id: &str,
+    reasoning_effort: Option<ReasoningEffort>,
+    tool_count: usize,
+) -> LlmRequestPlan {
+    let is_continuation = previous_response_id.is_some();
+
+    // Responses-API continuation sends only the new messages since the last
+    // stored assistant response (the delta), tail-ordered to match the non-delta
+    // layout. The lanes path sends the full canonical structure instead.
+    let continuation_delta = if is_continuation {
+        let mut delta = envelope.system_remainder_messages.clone();
+        delta.extend(envelope.dynamic_context_messages.clone());
+        if let Some(conversation_delta) = continuation_messages(&envelope.conversation_messages) {
+            delta.extend_from_slice(conversation_delta);
+        } else {
+            delta.extend(envelope.conversation_messages.clone());
+        }
+        delta.extend(envelope.volatile_context_messages.clone());
+        delta
+    } else {
+        Vec::new()
+    };
+
+    let mut responses_options = ResponsesRequestOptions {
+        store: Some(false),
+        // Encourage the model to emit visible narration alongside tool calls.
+        text_verbosity: Some("high".to_string()),
+        reasoning_summary: Some("auto".to_string()),
+        include: Some(vec!["reasoning.encrypted_content".to_string()]),
+        instructions: envelope.instructions.clone(),
+        input_messages: Some(envelope.responses_input_messages.clone()),
+        ..Default::default()
+    };
+    if let Some(response_id) = previous_response_id {
+        responses_options.previous_response_id = Some(response_id.to_string());
+    }
+
+    let request_options = LLMRequestOptions {
+        session_id: Some(session_id.to_string()),
+        reasoning_effort,
+        parallel_tool_calls: Some(true),
+        responses: Some(responses_options),
+        request_purpose: Some("agent_loop".to_string()),
+        cache: Some(envelope.cache_plan.clone()),
+    };
+
+    let render = RequestRenderObservability {
+        wire: if is_continuation {
+            "responses_continuation"
+        } else {
+            "lanes"
+        },
+        system_block_count: envelope.lanes.system_blocks.len(),
+        system_chars: envelope.lanes.stable_instructions.len(),
+        stable_prefix_messages: envelope.lanes.stable_prefix_messages.len(),
+        dynamic_context_messages: envelope.lanes.dynamic_context_messages.len(),
+        conversation_messages: envelope.lanes.conversation_messages.len(),
+        volatile_context_messages: envelope.volatile_context_messages.len(),
+        request_message_count: if is_continuation {
+            continuation_delta.len()
+        } else {
+            envelope.chat_messages.len()
+        },
+        tool_count,
+        cache_system: envelope.cache_plan.cache_system,
+        cache_tools: envelope.cache_plan.cache_tools,
+        cache_breakpoints: envelope.cache_plan.breakpoint_message_ids.len(),
+        cache_ttl: cache_ttl_label(envelope.cache_plan.ttl),
+    };
+
+    LlmRequestPlan {
+        continuation_messages: continuation_delta,
+        request_options,
+        is_continuation,
+        render,
+    }
+}
+
+fn persist_request_render_metadata(session: &mut Session, render: &RequestRenderObservability) {
+    if let Ok(value) = serde_json::to_string(render) {
+        session
+            .metadata
+            .insert(SESSION_REQUEST_RENDER_KEY.to_string(), value);
+    }
+}
+
 pub(super) async fn execute_llm_stream(
     session: &mut Session,
     config: &AgentLoopConfig,
@@ -592,94 +759,41 @@ pub(super) async fn execute_llm_stream(
         config.app_data_dir.as_deref(),
         &prepared_envelope.stable_prefix_sections,
     );
-    let request_messages_buf = if previous_response_id.is_some() {
-        let mut delta_messages = prepared_envelope.system_remainder_messages.clone();
-        delta_messages.extend(prepared_envelope.dynamic_context_messages.clone());
-        if let Some(conversation_delta) =
-            continuation_messages(&prepared_envelope.conversation_messages)
-        {
-            delta_messages.extend_from_slice(conversation_delta);
-        } else {
-            delta_messages.extend(prepared_envelope.conversation_messages.clone());
-        }
-        // Volatile context is re-sent each turn (it changes every round) and
-        // belongs at the tail, matching the non-delta ordering.
-        delta_messages.extend(prepared_envelope.volatile_context_messages.clone());
-        delta_messages
-    } else {
-        prepared_envelope.chat_messages.clone()
-    };
-    let request_messages = request_messages_buf.as_slice();
-
-    let mut responses_options = ResponsesRequestOptions {
-        store: Some(false),
-        // Encourage the model to emit visible narration alongside tool calls.
-        text_verbosity: Some("high".to_string()),
-        reasoning_summary: Some("auto".to_string()),
-        include: Some(vec!["reasoning.encrypted_content".to_string()]),
-        instructions: prepared_envelope.instructions.clone(),
-        input_messages: Some(prepared_envelope.responses_input_messages.clone()),
-        ..Default::default()
-    };
-    if let Some(response_id) = previous_response_id.as_deref() {
-        responses_options.previous_response_id = Some(response_id.to_string());
-    }
-    // Cache plan computed by the envelope: stable system prompt + tool
-    // definitions, plus rolling summary and conversation-tail breakpoints. The
-    // envelope keeps per-round volatile content (task list, recalled memory, plan
-    // state) in trailing context-block messages, so everything up to the
+    // Single home for turning the canonical envelope into a concrete provider
+    // request + choosing the wire path. The cache plan keeps per-round volatile
+    // content in trailing context-block messages, so everything up to the
     // conversation-tail breakpoint is byte-stable across rounds and caches
-    // incrementally — a stable, growing cache read instead of one that swings or
-    // drops to zero.
-    let request_options = LLMRequestOptions {
-        session_id: Some(session_id.to_string()),
+    // incrementally.
+    let planned = plan_llm_request(
+        &prepared_envelope,
+        previous_response_id.as_deref(),
+        session_id,
         reasoning_effort,
-        parallel_tool_calls: Some(true),
-        responses: Some(responses_options),
-        request_purpose: Some("agent_loop".to_string()),
-        cache: Some(prepared_envelope.cache_plan.clone()),
-    };
-
+        tool_schemas.len(),
+    );
     if !supports_previous_response_id {
         tracing::debug!(
             "[{}] Responses API previous_response_id disabled for provider={}",
             session_id,
             provider_name.unwrap_or("unknown")
         );
-    } else if let Some(response_id) = previous_response_id.as_deref() {
-        tracing::debug!(
-            "[{}] Continuing Responses API turn with previous_response_id={} using {} delta messages ({} total messages in context)",
-            session_id,
-            response_id,
-            request_messages.len(),
-            request_messages_buf.len()
-        );
     }
+    // Structured, inspectable record of how this request was rendered.
+    planned.render.log(session_id);
+    persist_request_render_metadata(session, &planned.render);
 
-    tracing::info!(
-        "[{}] LLM request: model={}, parallel_tool_calls={:?}, reasoning_effort={:?}, tools={}, messages={}, responses_input_messages={}, dynamic_context_messages={}, envelope_blocks={:?}",
-        session_id,
-        model,
-        request_options.parallel_tool_calls,
-        request_options.reasoning_effort,
-        tool_schemas.len(),
-        request_messages.len(),
-        prepared_envelope.responses_input_messages.len(),
-        prepared_envelope.envelope_observability.dynamic_context_message_count,
-        prepared_envelope.envelope_observability.included_block_types,
-    );
     // Normal request → canonical lanes (provider renders system + cache
-    // breakpoints structurally; default impl flattens to the same bytes as
-    // `request_messages`). The Responses-API continuation path sends only a delta
-    // of messages, which the lane model doesn't represent, so it stays on the
-    // flat `chat_stream_with_options` entry point.
-    let stream = if previous_response_id.is_some() {
+    // breakpoints structurally; default impl flattens to the same bytes). The
+    // Responses-API continuation path sends only a delta of messages, which the
+    // lane model doesn't represent, so it stays on the flat
+    // `chat_stream_with_options` entry point.
+    let stream = if planned.is_continuation {
         llm.chat_stream_with_options(
-            request_messages,
+            &planned.continuation_messages,
             tool_schemas,
             Some(max_output_tokens),
             model,
-            Some(&request_options),
+            Some(&planned.request_options),
         )
         .await
     } else {
@@ -688,7 +802,7 @@ pub(super) async fn execute_llm_stream(
             tool_schemas,
             Some(max_output_tokens),
             model,
-            Some(&request_options),
+            Some(&planned.request_options),
         )
         .await
     }

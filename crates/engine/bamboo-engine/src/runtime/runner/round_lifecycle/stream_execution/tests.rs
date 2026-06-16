@@ -987,6 +987,84 @@ fn zero_tools_fallback_keeps_merged_system_string_and_no_blocks() {
         .contains("BASE_SYSTEM_IDENTITY"));
 }
 
+#[test]
+fn plan_llm_request_lanes_path_records_observability() {
+    // The single request-planning seam: a normal request takes the canonical
+    // lanes path and the render descriptor captures the system shape + cache plan.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-plan", "test-model");
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER guide".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    let planned = super::plan_llm_request(&envelope, None, "session-plan", None, 3);
+
+    assert!(!planned.is_continuation);
+    assert_eq!(planned.render.wire, "lanes");
+    assert!(planned.continuation_messages.is_empty());
+    // System rendered as structured blocks (tool guide present → relocation on).
+    assert!(planned.render.system_block_count >= 1);
+    assert_eq!(planned.render.tool_count, 3);
+    // Cache plan surfaced into the observability + carried in the request options.
+    assert!(planned.render.cache_system);
+    assert_eq!(planned.render.cache_ttl, "1h");
+    assert!(planned.request_options.cache.is_some());
+    assert!(planned.request_options.responses.is_some());
+}
+
+#[test]
+fn plan_llm_request_continuation_path_builds_delta() {
+    // A Responses-API continuation takes the flat delta path: only the messages
+    // after the last assistant turn are sent, and the render reflects that.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-plan-cont", "test-model");
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("system"),
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    let planned =
+        super::plan_llm_request(&envelope, Some("resp_prev"), "session-plan-cont", None, 0);
+
+    assert!(planned.is_continuation);
+    assert_eq!(planned.render.wire, "responses_continuation");
+    // Delta is the tool result after the last assistant turn — NOT the full convo.
+    assert!(!planned.continuation_messages.is_empty());
+    assert_eq!(
+        planned.render.request_message_count,
+        planned.continuation_messages.len()
+    );
+    assert_eq!(
+        planned
+            .request_options
+            .responses
+            .as_ref()
+            .and_then(|r| r.previous_response_id.as_deref()),
+        Some("resp_prev")
+    );
+}
+
 #[tokio::test]
 async fn execute_llm_stream_continues_responses_turn_with_delta_messages() {
     let _env_lock = isolate_prompt_safe_env_cache();
