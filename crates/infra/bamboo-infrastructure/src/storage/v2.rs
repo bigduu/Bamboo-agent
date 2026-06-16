@@ -311,11 +311,8 @@ impl SessionStoreV2 {
                         "child session missing root_session_id/parent_session_id",
                     ));
                 }
-                if parent_id != root_id {
-                    return Err(other_io_error(
-                        "child session parent_session_id must equal root_session_id (no nesting)",
-                    ));
-                }
+                // Nesting is allowed: a child's parent may itself be a child.
+                // All descendants live flat under the tree root's directory.
                 validate_session_id(root_id)?;
                 Self::child_rel_path(root_id, &session.id)
             }

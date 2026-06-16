@@ -262,7 +262,7 @@ pub(crate) async fn watch_child_liveness(
 /// ANTI-FORK: this is a 1-line delegator to [`crate::sdk::spawn::run_child_spawn`],
 /// which is the single implementation of the spawn/execute/finalize logic. The
 /// `SpawnScheduler` queue mechanics (above) remain here; the body lives in the SDK
-/// core so both the scheduler and the ergonomic `ProfileRunner` funnel into it.
+/// core so both the scheduler and the ergonomic `ChildRunner` funnel into it.
 async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
     crate::sdk::spawn::run_child_spawn(ctx, job).await
 }

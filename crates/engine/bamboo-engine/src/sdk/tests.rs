@@ -1,7 +1,7 @@
 //! Phase 2 SDK runner tests (S-T2.1 .. S-T2.5).
 //!
 //! These exercise the canonical spawn core (`run_child_spawn`) and the ergonomic
-//! `ProfileRunner` facade directly at the engine level, using a mock LLM provider
+//! `ChildRunner` facade directly at the engine level, using a mock LLM provider
 //! to avoid network I/O.
 
 use std::collections::HashMap;
@@ -15,11 +15,10 @@ use tokio::sync::{broadcast, RwLock};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{ToolCall, ToolError, ToolResult, ToolSchema};
 use bamboo_agent_core::{AgentEvent, Message, Session};
-use bamboo_domain::subagent::{SubagentProfile, ToolPolicy};
 use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
 
 use crate::runtime::execution::spawn::{ExternalChildRunner, SpawnContext, SpawnJob};
-use crate::sdk::runner::{ProfileRunner, RunProfileInput};
+use crate::sdk::runner::{ChildRunner, RunChildInput};
 use crate::sdk::spawn::run_child_spawn;
 use bamboo_metrics::MetricsCollector;
 use bamboo_skills::SkillManager;
@@ -87,8 +86,7 @@ impl LLMProvider for HangingProvider {
     }
 }
 
-/// Tool executor exposing a fixed catalog, so `disabled_tools_for_profile` has
-/// real tool names to filter against.
+/// Tool executor exposing a fixed catalog of tool names.
 struct CatalogToolExecutor {
     names: Vec<String>,
 }
@@ -308,34 +306,6 @@ async fn collect_until_completed_with_budget(
     }
 }
 
-fn researcher_allowlist() -> SubagentProfile {
-    SubagentProfile {
-        id: "researcher".to_string(),
-        display_name: "Researcher".to_string(),
-        description: String::new(),
-        system_prompt: "research".to_string(),
-        tools: ToolPolicy::Allowlist {
-            allow: vec!["Read".to_string(), "Grep".to_string()],
-        },
-        model_hint: None,
-        default_responsibility: None,
-        ui: Default::default(),
-    }
-}
-
-fn inherit_profile() -> SubagentProfile {
-    SubagentProfile {
-        id: "general-purpose".to_string(),
-        display_name: "General".to_string(),
-        description: String::new(),
-        system_prompt: "general".to_string(),
-        tools: ToolPolicy::Inherit,
-        model_hint: None,
-        default_responsibility: None,
-        ui: Default::default(),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // S-T2.1 — run_child_spawn integration: ordering + persisted status
 // ---------------------------------------------------------------------------
@@ -420,11 +390,14 @@ async fn s_t2_1_run_child_spawn_emits_started_event_completed_in_order() {
 }
 
 // ---------------------------------------------------------------------------
-// S-T2.2 — ProfileRunner Allowlist → disabled_tools excludes non-allowlisted
+// S-T2.2 — Sub-agents are full agents: ChildRunner never trims tools.
+//
+// There are no per-role tool policies anymore; the runner always emits
+// `disabled_tools: None` regardless of the live tool catalog.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn s_t2_2_run_profile_allowlist_disables_non_allowlisted_tools() {
+async fn s_t2_2_run_child_never_disables_tools() {
     let tool_names = vec![
         "Read".to_string(),
         "Grep".to_string(),
@@ -432,41 +405,17 @@ async fn s_t2_2_run_profile_allowlist_disables_non_allowlisted_tools() {
         "Write".to_string(),
     ];
     let harness = build_harness(Arc::new(CompletedProvider), tool_names, &[]).await;
-    let runner = ProfileRunner::new(harness.ctx.clone());
+    let runner = ChildRunner::new(harness.ctx.clone());
 
-    let input = RunProfileInput {
+    let input = RunChildInput {
         child_session_id: harness.child_session_id.clone(),
         parent_session_id: harness.parent_session_id.clone(),
         model: "gpt-5".to_string(),
     };
-    let job = runner.build_job(&researcher_allowlist(), &input);
-    let disabled = job.disabled_tools.expect("allowlist yields disabled tools");
-
-    assert!(disabled.contains(&"Edit".to_string()));
-    assert!(disabled.contains(&"Write".to_string()));
-    assert!(!disabled.contains(&"Read".to_string()));
-    assert!(!disabled.contains(&"Grep".to_string()));
-}
-
-// ---------------------------------------------------------------------------
-// S-T2.3 — ProfileRunner Inherit → disabled_tools empty/None
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn s_t2_3_run_profile_inherit_has_no_disabled_tools() {
-    let tool_names = vec!["Read".to_string(), "Edit".to_string()];
-    let harness = build_harness(Arc::new(CompletedProvider), tool_names, &[]).await;
-    let runner = ProfileRunner::new(harness.ctx.clone());
-
-    let input = RunProfileInput {
-        child_session_id: harness.child_session_id.clone(),
-        parent_session_id: harness.parent_session_id.clone(),
-        model: "gpt-5".to_string(),
-    };
-    let job = runner.build_job(&inherit_profile(), &input);
+    let job = runner.build_job(&input);
     assert!(
         job.disabled_tools.is_none(),
-        "Inherit policy must not disable any tools"
+        "sub-agents are full agents; the runner must never trim tools"
     );
 }
 
@@ -475,22 +424,19 @@ async fn s_t2_3_run_profile_inherit_has_no_disabled_tools() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn s_t2_4_run_profile_model_override_is_persisted() {
+async fn s_t2_4_run_child_model_override_is_persisted() {
     let harness = build_harness(Arc::new(CompletedProvider), Vec::new(), &[]).await;
-    let runner = ProfileRunner::new(harness.ctx.clone());
+    let runner = ChildRunner::new(harness.ctx.clone());
 
     // Child session was persisted with model "gpt-5"; run with a different model.
     let override_model = "claude-3-7-sonnet";
     let mut parent_rx = harness.parent_rx.resubscribe();
     runner
-        .run_profile(
-            &inherit_profile(),
-            RunProfileInput {
-                child_session_id: harness.child_session_id.clone(),
-                parent_session_id: harness.parent_session_id.clone(),
-                model: override_model.to_string(),
-            },
-        )
+        .run_child(RunChildInput {
+            child_session_id: harness.child_session_id.clone(),
+            parent_session_id: harness.parent_session_id.clone(),
+            model: override_model.to_string(),
+        })
         .await
         .unwrap();
 

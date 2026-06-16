@@ -1,8 +1,6 @@
 use actix_web::{dev::HttpServiceFactory, web};
 
-use crate::handlers::{
-    command, copilot_auth, settings, skill, subagent_profiles, tools, workspace,
-};
+use crate::handlers::{command, copilot_auth, settings, skill, tools, workspace};
 
 fn bamboo_v1_scope() -> impl HttpServiceFactory {
     web::scope("/v1")
@@ -130,11 +128,6 @@ fn bamboo_v1_scope() -> impl HttpServiceFactory {
             web::get().to(skill::get_available_workflows),
         )
         .route("/skills/{id}", web::get().to(skill::get_skill))
-        // Subagent profile routes
-        .route(
-            "/subagent_profiles",
-            web::get().to(subagent_profiles::list_subagent_profiles),
-        )
         // Tools routes
         .route("/tools/execute", web::post().to(tools::execute_tool))
         // Workspace routes

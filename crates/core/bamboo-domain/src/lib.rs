@@ -25,9 +25,6 @@ pub mod workflow;
 // Storage port definitions (moved from application-agent)
 pub mod storage;
 
-// Subagent profile definitions (additive — not yet wired into runtime).
-pub mod subagent;
-
 // Shared prompt markers (deduped from server/engine).
 pub mod prompt_markers;
 

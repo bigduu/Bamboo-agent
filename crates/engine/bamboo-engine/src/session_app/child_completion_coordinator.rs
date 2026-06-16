@@ -16,7 +16,7 @@ use crate::Agent;
 use async_trait::async_trait;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{AgentEvent, Message, Role, Session, SessionKind};
+use bamboo_agent_core::{AgentEvent, Message, Role, Session};
 use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState,
 };
@@ -163,14 +163,6 @@ fn wait_policy_satisfied(
     }
 }
 
-/// Maximum number of characters of the child's final assistant content that
-/// will be embedded into the hidden runtime resume message. Anything longer is
-/// truncated with a marker so the root LLM can still call `SubAgent.get` to
-/// fetch the full child output if needed.
-const RUNTIME_RESUME_CHILD_RESULT_MAX_CHARS: usize = 4000;
-const RUNTIME_RESUME_CHILD_RESULT_TRUNCATION_MARKER: &str =
-    "\n\n[... child final response truncated; call SubAgent.get for full content ...]";
-
 /// Extract the child session's last assistant content, if any. Returns `None`
 /// when the child produced no assistant message (e.g. errored before the first
 /// model response, or only emitted tool messages).
@@ -184,17 +176,6 @@ fn child_final_assistant_text(child: &Session) -> Option<String> {
         .filter(|content| !content.trim().is_empty())
 }
 
-fn truncate_for_resume(content: &str) -> String {
-    if content.chars().count() <= RUNTIME_RESUME_CHILD_RESULT_MAX_CHARS {
-        return content.to_string();
-    }
-    let head: String = content
-        .chars()
-        .take(RUNTIME_RESUME_CHILD_RESULT_MAX_CHARS)
-        .collect();
-    format!("{head}{RUNTIME_RESUME_CHILD_RESULT_TRUNCATION_MARKER}")
-}
-
 fn runtime_resume_message(
     completion: &ChildCompletion,
     remaining_children: usize,
@@ -205,8 +186,13 @@ fn runtime_resume_message(
         completion.child_session_id, completion.status, remaining_children
     );
 
-    let truncated_response = child_final_response.map(truncate_for_resume);
-    if let Some(response) = truncated_response.as_deref() {
+    // Fold the child's full final response back into the parent — no
+    // truncation. Sub-agents are first-class agents whose complete conclusion
+    // should be available to the parent without an extra `SubAgent.get` round
+    // trip. The message is left compressible (see `never_compress` below) so a
+    // long transcript can still be reclaimed under parent compaction.
+    let final_response = child_final_response.map(str::to_string);
+    if let Some(response) = final_response.as_deref() {
         body.push_str("\n\nChild final response:\n");
         body.push_str(response);
     } else if let Some(error) = completion.error.as_deref() {
@@ -229,9 +215,12 @@ fn runtime_resume_message(
         "child_status": completion.status,
         "child_error": completion.error,
         "completed_at": completion.completed_at,
-        "child_final_response_included": truncated_response.is_some(),
+        "child_final_response_included": final_response.is_some(),
     }));
-    message.never_compress = true;
+    // Allow parent-side compaction to reclaim this (now untruncated) message if
+    // the parent context grows — important once children nest and fold full
+    // results upward. The `SubAgent.get` hint preserves recoverability.
+    message.never_compress = false;
     message
 }
 
@@ -360,15 +349,11 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             return;
         };
 
-        if parent.kind != SessionKind::Root {
-            tracing::warn!(
-                parent_session_id = %completion.parent_session_id,
-                child_session_id = %completion.child_session_id,
-                "child completion parent is not a root session"
-            );
-            return;
-        }
-
+        // A parent may itself be a child (nested sub-agents): the rest of this
+        // handler is kind-agnostic — it operates on `completion.parent_session_id`,
+        // inspects that session's own `waiting_for_children` runtime state, and
+        // resumes it. (Previously this bailed unless the parent was Root, which
+        // silently dropped grandchild completions.)
         let mut runtime_state = read_runtime_state(&parent);
 
         // Single source of truth: reconstruct the completed-child set from the
@@ -747,17 +732,14 @@ mod tests {
     }
 
     #[test]
-    fn truncate_for_resume_passthrough_when_short() {
-        let s = "hello world";
-        assert_eq!(truncate_for_resume(s), s);
-    }
-
-    #[test]
-    fn truncate_for_resume_truncates_long_content() {
-        let long: String = "a".repeat(RUNTIME_RESUME_CHILD_RESULT_MAX_CHARS + 100);
-        let truncated = truncate_for_resume(&long);
-        assert!(truncated.len() > RUNTIME_RESUME_CHILD_RESULT_MAX_CHARS);
-        assert!(truncated.ends_with(RUNTIME_RESUME_CHILD_RESULT_TRUNCATION_MARKER));
+    fn runtime_resume_message_folds_full_response_without_truncation() {
+        // A very long child final response is folded in verbatim (no 4000-char
+        // cap, no truncation marker).
+        let completion = make_completion("completed");
+        let long: String = "a".repeat(10_000);
+        let message = runtime_resume_message(&completion, 0, Some(&long));
+        assert!(message.content.contains(&long));
+        assert!(!message.content.contains("truncated"));
     }
 
     #[test]
@@ -766,7 +748,9 @@ mod tests {
         let message = runtime_resume_message(&completion, 0, Some("the answer is 42"));
 
         assert!(matches!(message.role, Role::User));
-        assert!(message.never_compress);
+        // Folded child results are now compressible so the parent context can
+        // reclaim them under compaction.
+        assert!(!message.never_compress);
         assert!(message.content.contains("Child final response:"));
         assert!(message.content.contains("the answer is 42"));
 

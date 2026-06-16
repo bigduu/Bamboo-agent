@@ -42,12 +42,6 @@ pub struct ChildSessionAdapter {
     pub(crate) subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
     /// Application config for resolving subagent routing and external agent profiles.
     pub(crate) config: Arc<RwLock<Config>>,
-    /// Subagent profile registry. Used to resolve `subagent_type` →
-    /// `system_prompt` and tool surface filter.
-    pub(crate) subagent_profiles: Arc<bamboo_domain::subagent::SubagentProfileRegistry>,
-    /// Cached list of all available tool names from the base executor.
-    /// Used to compute the complement set for Allowlist policies.
-    pub(crate) tool_names: Vec<String>,
     /// Coalesces concurrent parent-wait registrations for the same parent that
     /// arrive in one spawn round (the LLM emitting several `SubAgent.create`
     /// calls at once → `join_all`) into a single parent persist. See
@@ -118,18 +112,6 @@ impl ChildSessionAdapter {
     pub async fn resolve_runtime_metadata(&self, subagent_type: &str) -> HashMap<String, String> {
         let config = self.config.read().await;
         bamboo_engine::external_agents::config::resolve_runtime_metadata(&config, subagent_type)
-    }
-
-    /// Resolve the canonical system prompt for the given `subagent_type`.
-    ///
-    /// Always returns a prompt: unknown / empty `subagent_type` values fall
-    /// back to the `general-purpose` profile (whose prompt is byte-equal to
-    /// the legacy `CHILD_SYSTEM_PROMPT`).
-    pub fn resolve_subagent_prompt(&self, subagent_type: &str) -> String {
-        self.subagent_profiles
-            .resolve(subagent_type)
-            .system_prompt
-            .clone()
     }
 
     /// Register a durable parent wait for an enqueued child session.
@@ -337,10 +319,6 @@ impl SubagentResolutionPort for ChildSessionAdapter {
     ) -> std::collections::HashMap<String, String> {
         ChildSessionAdapter::resolve_runtime_metadata(self, subagent_type).await
     }
-
-    fn resolve_subagent_prompt(&self, subagent_type: &str) -> String {
-        ChildSessionAdapter::resolve_subagent_prompt(self, subagent_type)
-    }
 }
 
 #[async_trait]
@@ -481,28 +459,10 @@ impl ChildSessionPort for ChildSessionAdapter {
             ));
         }
 
-        // Resolve profile policy into schema-level disabled_tools.
-        let disabled_tools = child
-            .subagent_type()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .and_then(|subagent_type| {
-                let profile = self.subagent_profiles.resolve(&subagent_type);
-                match &profile.tools {
-                    bamboo_domain::subagent::ToolPolicy::Inherit => None,
-                    policy => {
-                        let names = bamboo_domain::subagent::disabled_tools_for_profile(
-                            policy,
-                            &self.tool_names,
-                        );
-                        if names.is_empty() {
-                            None
-                        } else {
-                            Some(names)
-                        }
-                    }
-                }
-            });
+        // Sub-agents are full agents with the full toolset: no per-role tool
+        // trimming. (The unrelated global `config.disabled_tools` path feeds
+        // `SpawnJob.disabled_tools` elsewhere; it is never computed here.)
+        let disabled_tools = None;
 
         // NOTE: enqueue only *runs* the child in the background. Registering the
         // parent's wait (which suspends the parent) is now an explicit, separate

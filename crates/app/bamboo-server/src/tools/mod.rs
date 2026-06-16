@@ -17,7 +17,6 @@ pub use bamboo_server_tools::{
 
 pub mod child_session_adapter;
 pub mod model_catalog;
-pub mod policy_aware;
 
 // Integration tests that wire `SubAgentTool` to a real `ChildSessionAdapter`
 // (the tool itself + its pure unit tests live in `bamboo-server-tools`).
@@ -34,4 +33,3 @@ pub type OptionalSubagentModelResolver = Option<SubagentModelResolver>;
 // Re-export server-specific tool types for convenience
 pub use child_session_adapter::ChildSessionAdapter;
 pub use model_catalog::RegistryModelCatalog;
-pub use policy_aware::PolicyAwareToolExecutor;

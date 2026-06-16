@@ -173,12 +173,6 @@ async fn build_test_harness_with_resolver(
         account_feed_inbox: None,
     }));
 
-    let test_profiles = std::sync::Arc::new(
-        bamboo_domain::subagent::SubagentProfileRegistry::builder()
-            .extend(bamboo_engine::profiles::builtin::builtin_profiles())
-            .build()
-            .expect("builtin subagent profiles must build"),
-    );
     let adapter = Arc::new(ChildSessionAdapter {
         session_store,
         storage: storage.clone(),
@@ -189,11 +183,9 @@ async fn build_test_harness_with_resolver(
         session_event_senders,
         subagent_model_resolver,
         config: Arc::new(RwLock::new(bamboo_llm::Config::default())),
-        subagent_profiles: test_profiles.clone(),
-        tool_names: Vec::new(),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
     });
-    let tool = SubAgentTool::new(adapter.clone(), adapter.clone(), test_profiles);
+    let tool = SubAgentTool::new(adapter.clone(), adapter.clone());
 
     TestHarness {
         tool,
@@ -303,26 +295,26 @@ fn ctx_for<'a>(session_id: &'a str, tool_call_id: &'static str) -> ToolExecution
 }
 
 #[tokio::test]
-async fn create_without_subagent_type_defaults_to_general_purpose() {
+async fn create_without_subagent_type_defaults_to_worker_label() {
     let harness = build_test_harness().await;
     let result = harness
         .tool
         .execute_with_context(
             json!({
                 "action": "create",
-                "title": "No Role Child",
+                "title": "No Label Child",
                 "responsibility": "Do work",
                 "prompt": "Do the work",
                 "workspace": "/tmp/ws"
                 // subagent_type intentionally omitted
             }),
-            ctx_for(&harness.parent_session_id, "tc_no_role"),
+            ctx_for(&harness.parent_session_id, "tc_no_label"),
         )
         .await
         .expect("create must succeed without subagent_type");
 
     let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
-    assert_eq!(payload["subagent_type"].as_str(), Some("general-purpose"));
+    assert_eq!(payload["subagent_type"].as_str(), Some("worker"));
 }
 
 #[tokio::test]
@@ -1315,103 +1307,6 @@ async fn delete_removes_child() {
     assert!(child.is_none());
 }
 
-/// `action=list_profiles` returns every built-in profile (without
-/// the `system_prompt` body), reports the registry's fallback id,
-/// and uses the registry's stable insertion order. The shape of
-/// this payload is a public contract — UI / LLM rely on it.
-#[tokio::test]
-async fn list_profiles_returns_builtin_catalog() {
-    let harness = build_test_harness().await;
-
-    let result = harness
-        .tool
-        .execute_with_context(
-            json!({"action": "list_profiles"}),
-            ToolExecutionContext {
-                session_id: Some(harness.parent_session_id.as_str()),
-                tool_call_id: "tool_call_list_profiles",
-                event_tx: None,
-                available_tool_schemas: None,
-            },
-        )
-        .await
-        .expect("list_profiles should succeed");
-
-    let payload: serde_json::Value =
-        serde_json::from_str(&result.result).expect("tool result should be JSON");
-
-    // Top-level shape.
-    let profiles = payload["profiles"]
-        .as_array()
-        .expect("list_profiles must return a `profiles` array");
-    assert!(
-        profiles.len() >= 6,
-        "expected at least 6 built-in profiles, got {}",
-        profiles.len()
-    );
-    assert_eq!(payload["count"], profiles.len());
-    assert_eq!(payload["fallback_id"], "general-purpose");
-
-    // Required fields per profile, and explicit guarantee that we
-    // do NOT leak `system_prompt` (could be very large).
-    for entry in profiles {
-        assert!(entry.get("id").and_then(|v| v.as_str()).is_some());
-        assert!(entry.get("display_name").and_then(|v| v.as_str()).is_some());
-        assert!(entry.get("tools").is_some());
-        assert!(
-            entry.get("system_prompt").is_none(),
-            "system_prompt must NOT be returned by list_profiles",
-        );
-    }
-
-    // Built-in catalogue must include the documented baseline ids
-    // so the LLM can rely on them being present.
-    let ids: Vec<&str> = profiles
-        .iter()
-        .map(|p| p["id"].as_str().unwrap_or(""))
-        .collect();
-    for required in [
-        "general-purpose",
-        "plan",
-        "researcher",
-        "coder",
-        "reviewer",
-        "tester",
-    ] {
-        assert!(
-            ids.contains(&required),
-            "built-in profile `{required}` missing from list_profiles output (got: {ids:?})"
-        );
-    }
-}
-
-/// `list_profiles` is read-only and must not require a real,
-/// loadable parent session. We pass a non-existent session_id and
-/// expect success (registry is consulted directly, no session
-/// lookup is performed).
-#[tokio::test]
-async fn list_profiles_does_not_load_parent_session() {
-    let harness = build_test_harness().await;
-
-    let result = harness
-        .tool
-        .execute_with_context(
-            json!({"action": "list_profiles"}),
-            ToolExecutionContext {
-                session_id: Some("non-existent-session-id"),
-                tool_call_id: "tool_call_list_profiles_no_session",
-                event_tx: None,
-                available_tool_schemas: None,
-            },
-        )
-        .await
-        .expect("list_profiles should succeed even when the parent session id is unknown");
-
-    let payload: serde_json::Value =
-        serde_json::from_str(&result.result).expect("tool result should be JSON");
-    assert!(payload["profiles"].as_array().is_some());
-}
-
 #[tokio::test]
 async fn create_requires_workspace() {
     let harness = build_test_harness().await;
@@ -1490,195 +1385,5 @@ async fn create_sets_child_workspace() {
         child.workspace,
         Some("/tmp/test-workspace".to_string()),
         "child workspace should be set from create args"
-    );
-}
-
-// -----------------------------------------------------------------------
-// S-T5.2 — End-to-end policy enforcement for a read-only allowlist child.
-//
-// The `researcher` builtin profile is a read-only Allowlist. A researcher
-// child must have mutating tools (Edit/Write) enforced by BOTH halves of
-// the tool-policy machinery (TD-7):
-//   1. Discovery (schema): the profile's `disabled_tools` — computed by
-//      `disabled_tools_for_profile` over the real builtin tool surface —
-//      contains Edit and Write, so they are absent from the advertised
-//      schema for the child.
-//   2. Execution (safety net): `PolicyAwareToolExecutor` rejects an Edit /
-//      Write call from a `subagent_type=researcher` child at execute time,
-//      while still permitting allowlisted tools (Read).
-//
-// This pins the anti-fork invariant: the same canonical profile drives both
-// layers; there is no forked policy definition.
-// -----------------------------------------------------------------------
-
-/// A recording executor used to prove the runtime safety net forwards vs
-/// blocks calls. Forwards always succeed; blocked calls never reach it.
-struct PolicyRecordingExecutor {
-    executed: Arc<RwLock<Vec<String>>>,
-}
-
-#[async_trait::async_trait]
-impl ToolExecutor for PolicyRecordingExecutor {
-    async fn execute(
-        &self,
-        call: &ToolCall,
-    ) -> std::result::Result<
-        bamboo_agent_core::tools::ToolResult,
-        bamboo_agent_core::tools::ToolError,
-    > {
-        self.executed.write().await.push(call.function.name.clone());
-        Ok(bamboo_agent_core::tools::ToolResult {
-            success: true,
-            result: "ok".to_string(),
-            display_preference: None,
-            images: Vec::new(),
-        })
-    }
-
-    async fn execute_with_context(
-        &self,
-        call: &ToolCall,
-        _ctx: bamboo_agent_core::tools::ToolExecutionContext<'_>,
-    ) -> std::result::Result<
-        bamboo_agent_core::tools::ToolResult,
-        bamboo_agent_core::tools::ToolError,
-    > {
-        self.executed.write().await.push(call.function.name.clone());
-        Ok(bamboo_agent_core::tools::ToolResult {
-            success: true,
-            result: "ok".to_string(),
-            display_preference: None,
-            images: Vec::new(),
-        })
-    }
-
-    fn list_tools(&self) -> Vec<ToolSchema> {
-        Vec::new()
-    }
-}
-
-fn researcher_builtin_profile() -> bamboo_domain::subagent::SubagentProfile {
-    bamboo_engine::profiles::builtin::builtin_profiles()
-        .into_iter()
-        .find(|p| p.id == "researcher")
-        .expect("researcher builtin profile must exist")
-}
-
-fn make_tool_call(name: &str) -> ToolCall {
-    ToolCall {
-        id: "policy_call".to_string(),
-        tool_type: "function".to_string(),
-        function: bamboo_agent_core::tools::FunctionCall {
-            name: name.to_string(),
-            arguments: "{}".to_string(),
-        },
-    }
-}
-
-#[test]
-fn researcher_disabled_tools_block_edit_and_write_in_schema() {
-    // Layer 1 (discovery): the schema-level disabled set excludes mutating
-    // tools for the read-only researcher allowlist.
-    let researcher = researcher_builtin_profile();
-    let all_tool_names: Vec<String> = bamboo_domain::tool_names::BUILTIN_TOOL_NAMES
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
-    let disabled =
-        bamboo_domain::subagent::disabled_tools_for_profile(&researcher.tools, &all_tool_names);
-
-    assert!(
-        disabled.iter().any(|t| t == "Edit"),
-        "researcher schema must disable Edit; disabled={disabled:?}"
-    );
-    assert!(
-        disabled.iter().any(|t| t == "Write"),
-        "researcher schema must disable Write; disabled={disabled:?}"
-    );
-    // Sanity: an allowlisted read-only tool stays enabled.
-    assert!(
-        !disabled.iter().any(|t| t == "Read"),
-        "researcher schema must keep Read enabled; disabled={disabled:?}"
-    );
-}
-
-#[tokio::test]
-async fn researcher_child_blocks_edit_and_write_at_execute() {
-    // Layer 2 (execution safety net): a researcher child has Edit / Write
-    // rejected at execute time by PolicyAwareToolExecutor, while Read is
-    // still forwarded. Uses the canonical builtin registry + the new
-    // `bamboo_tools` path via the server's re-export shim.
-    let executed = Arc::new(RwLock::new(Vec::<String>::new()));
-    let inner: Arc<dyn ToolExecutor> = Arc::new(PolicyRecordingExecutor {
-        executed: executed.clone(),
-    });
-
-    let registry = Arc::new(
-        bamboo_domain::subagent::SubagentProfileRegistry::builder()
-            .extend(bamboo_engine::profiles::builtin::builtin_profiles())
-            .build()
-            .expect("builtin subagent profiles must build"),
-    );
-
-    let mut child = Session::new_child("researcher-child", "root", "test-model", "Research child");
-    child
-        .metadata
-        .insert("subagent_type".to_string(), "researcher".to_string());
-    let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
-    sessions.insert(
-        "researcher-child".to_string(),
-        Arc::new(parking_lot::RwLock::new(child)),
-    );
-
-    let executor = crate::tools::PolicyAwareToolExecutor::new(inner, registry, sessions);
-
-    let ctx = bamboo_agent_core::tools::ToolExecutionContext {
-        session_id: Some("researcher-child"),
-        tool_call_id: "policy_call",
-        event_tx: None,
-        available_tool_schemas: None,
-    };
-
-    // Edit blocked at execute.
-    let edit_err = executor
-        .execute_with_context(&make_tool_call("Edit"), ctx)
-        .await
-        .expect_err("Edit must be blocked for a researcher child");
-    match edit_err {
-        bamboo_agent_core::tools::ToolError::Execution(msg) => {
-            assert!(msg.contains("Edit"), "error should name the tool: {msg}");
-            assert!(
-                msg.contains("researcher"),
-                "error should name the subagent_type: {msg}"
-            );
-        }
-        other => panic!("expected Execution error, got {other:?}"),
-    }
-
-    // Write blocked at execute.
-    let write_err = executor
-        .execute_with_context(&make_tool_call("Write"), ctx)
-        .await
-        .expect_err("Write must be blocked for a researcher child");
-    assert!(
-        matches!(
-            write_err,
-            bamboo_agent_core::tools::ToolError::Execution(ref msg) if msg.contains("Write")
-        ),
-        "Write must be rejected with an Execution error naming the tool"
-    );
-
-    // Allowlisted Read still forwarded to the inner executor.
-    executor
-        .execute_with_context(&make_tool_call("Read"), ctx)
-        .await
-        .expect("Read is allowlisted and must be forwarded");
-
-    // Only Read reached the inner executor; Edit/Write were stopped above it.
-    assert_eq!(
-        executed.read().await.as_slice(),
-        &["Read".to_string()],
-        "only the allowlisted Read should reach the inner executor"
     );
 }

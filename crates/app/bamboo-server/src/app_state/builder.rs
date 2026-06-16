@@ -215,30 +215,9 @@ impl AppState {
                 ))
             })?;
 
-        // Subagent profile registry: built-ins + user/project/env overrides.
-        // Loaded here (rather than further down) so we can wrap the child
-        // tool executor with `PolicyAwareToolExecutor` before it is handed
-        // to the spawn scheduler. Workspace path is intentionally `None` —
-        // the registry is a process-wide singleton; per-workspace overrides
-        // can still be picked up via `BAMBOO_SUBAGENT_PROFILES_FILE` or by
-        // resolving against `<bamboo_home_dir>/subagent_profiles.json`.
-        let subagent_profiles = bamboo_engine::profiles::load_registry(&bamboo_home_dir, None)
-            .map_err(|e| {
-                crate::error::AppError::InternalError(anyhow::anyhow!(
-                    "failed to load subagent profile registry: {e}"
-                ))
-            })?;
-
-        // Child tools intentionally do not expose `SubAgent` (no nested
-        // child spawns). They are wrapped by `PolicyAwareToolExecutor` so
-        // that each child's `subagent_type` metadata is consulted to
-        // enforce its `ToolPolicy` (allow/deny/inherit) at tool-call time.
-        let child_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
-            Arc::new(crate::tools::PolicyAwareToolExecutor::new(
-                base_tools.clone(),
-                subagent_profiles.clone(),
-                sessions.clone(),
-            ));
+        // Sub-agents are full agents with the full toolset (no per-role tool
+        // trimming): the child tool surface is the plain base tools.
+        let child_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = base_tools.clone();
 
         // Unified agent runtime (shared resources for all execution paths).
         // default_tools = base_tools (builtin + MCP + memory + skills) as a safe fallback.
@@ -389,7 +368,6 @@ impl AppState {
             session_event_senders.clone(),
             subagent_model_resolver,
             config.clone(),
-            subagent_profiles.clone(),
             provider_registry.clone(),
             config_snapshot.subagents.broker.clone(),
         );
@@ -424,7 +402,6 @@ impl AppState {
             tool_factory,
             permission_checker,
             notification_service,
-            subagent_profiles,
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             skill_manager,
             mcp_manager,

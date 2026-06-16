@@ -7,8 +7,9 @@ use serde_json::json;
 use super::helpers::{
     compute_status_guidance, format_child_assignment, map_child_entry, metadata_text,
     normalize_non_empty_optional, normalize_required_text, replace_or_append_last_user_message,
-    resolve_system_prompt, truncate_after_index, truncate_after_last_user,
+    truncate_after_index, truncate_after_last_user,
 };
+use super::DELEGATION_NOTE;
 use super::{
     ChildSessionError, ChildSessionPort, CreateChildInput, CreateChildResult, QueuedInjectedMessage,
 };
@@ -20,9 +21,13 @@ pub async fn create_child_action(
     use crate::runner::refresh_prompt_snapshot;
     use bamboo_agent_core::Message;
 
-    let mut child = Session::new_child(
+    // Use `new_child_of` so the child inherits the parent's tree root and a
+    // depth of parent+1. For a root parent this is identical to the old
+    // flat-tree behavior; for a child parent it enables nesting while keeping
+    // `root_session_id` constant across the whole tree (completion/SSE keying).
+    let mut child = Session::new_child_of(
         input.child_id.clone(),
-        input.parent_session.id.clone(),
+        &input.parent_session,
         input
             .model_ref_override
             .as_ref()
@@ -96,17 +101,27 @@ pub async fn create_child_action(
         child.metadata.insert(key, value);
     }
 
-    let system_prompt = resolve_system_prompt(
-        &input.subagent_type,
-        input.system_prompt_override.as_deref(),
-    );
+    // Sub-agents are first-class agents: assemble the SAME base system prompt a
+    // top-level (root) session uses, then append a short delegation note. The
+    // runtime context enhancement (workspace / instructions / tool guide /
+    // memory / task list) is applied uniformly by the runner to whatever base
+    // prompt the session carries — there is no root-only gate — so swapping the
+    // base prompt is all that's needed to make a child behave like a full agent.
+    let base_prompt = {
+        let global = crate::prompt_defaults::read_global_default_system_prompt_template();
+        if global.trim().is_empty() {
+            crate::context::DEFAULT_BASE_PROMPT.to_string()
+        } else {
+            global
+        }
+    };
+    let system_prompt = format!("{base_prompt}\n\n{DELEGATION_NOTE}");
 
-    child.metadata.insert(
-        "base_system_prompt".to_string(),
-        system_prompt.clone().into_owned(),
-    );
+    child
+        .metadata
+        .insert("base_system_prompt".to_string(), system_prompt.clone());
 
-    child.add_message(Message::system(system_prompt.as_ref()));
+    child.add_message(Message::system(&system_prompt));
 
     // Child sessions get more aggressive compression: trigger at 70% instead
     // of the default 85%, target 35% instead of 40%. This prevents long child

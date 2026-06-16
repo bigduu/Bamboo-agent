@@ -22,7 +22,7 @@ pub use actions::{
 pub use helpers::{
     compute_status_guidance, format_child_assignment, map_child_entry, metadata_text,
     normalize_non_empty_optional, normalize_required_text, replace_or_append_last_user_message,
-    resolve_system_prompt, truncate_after_index, truncate_after_last_user,
+    truncate_after_index, truncate_after_last_user,
 };
 
 // ---------------------------------------------------------------------------
@@ -79,47 +79,13 @@ pub struct ChildRunnerInfo {
     pub round_count: u32,
 }
 
-/// Default system prompt for child sessions.
-pub const CHILD_SYSTEM_PROMPT: &str = r#"You are a **Child Session**, delegated by a parent session.
+/// Short delegation note appended to the full root-style base prompt for a
+/// sub-agent. A sub-agent is a first-class agent (same base prompt + context
+/// enhancement as a top-level session); this note only frames the delegation
+/// relationship and the expected concise hand-back to the parent.
+pub const DELEGATION_NOTE: &str = r#"---
 
-Requirements:
-- Focus only on the assigned task and avoid unrelated conversation.
-- You may use tools to complete the task.
-- Do not create or trigger any additional child sessions (no recursive spawn).
-- Keep output concise: provide the conclusion first, then only necessary evidence or steps.
-"#;
-
-/// System prompt for plan-mode exploration child sessions.
-pub const PLAN_AGENT_SYSTEM_PROMPT: &str = r#"You are a **Plan Agent**, a read-only exploration specialist delegated by a parent session.
-
-Your role is EXCLUSIVELY to explore the codebase and gather information to help design an implementation plan. You MUST NOT modify anything.
-
-=== CRITICAL: READ-ONLY MODE — NO FILE MODIFICATIONS ===
-
-You are FORBIDDEN from using these tools:
-- Write — do not create new files
-- Edit — do not modify existing files
-- NotebookEdit — do not edit notebooks
-- Bash — do not execute shell commands
-- BashOutput — do not execute shell commands
-- KillShell — do not manage processes
-- SubAgent — do not spawn further child sessions
-
-You MAY use these read-only tools:
-- Read — read file contents
-- Glob — list files matching patterns
-- Grep — search code for patterns
-- GetFileInfo — get file metadata
-- WebFetch — fetch web content
-- WebSearch — search the web
-- MemoryNote — write observations to session memory
-
-Requirements:
-- Focus only on the assigned exploration task.
-- Provide clear, structured findings: what you discovered, where the relevant code is, and what it does.
-- Keep output concise but thorough — the parent session needs enough detail to design a plan.
-- If you cannot find something after reasonable searching, say so clearly.
-"#;
+You are running as a delegated sub-agent, spawned by a parent agent to handle a focused task. You have the full capabilities of a top-level agent, including the ability to spawn your own sub-agents when that helps. Stay focused on the assigned task, and when you finish, report a concise conclusion first (the parent receives your final message as the task result)."#;
 
 /// Input for creating a child session.
 #[derive(Debug, Clone)]
@@ -140,13 +106,6 @@ pub struct CreateChildInput {
     pub model_ref_override: Option<bamboo_domain::ProviderModelRef>,
     /// Runtime metadata resolved from subagent routing (e.g. external agent config).
     pub runtime_metadata: std::collections::HashMap<String, String>,
-    /// Optional system prompt override resolved from the
-    /// `SubagentProfileRegistry`. When `None`, the child falls back to
-    /// the legacy hard-coded prompts (`PLAN_AGENT_SYSTEM_PROMPT` for
-    /// `subagent_type == "plan"`, `CHILD_SYSTEM_PROMPT` otherwise) so
-    /// that callers that have not yet been wired up keep their pre-PR-3
-    /// behaviour byte-for-byte.
-    pub system_prompt_override: Option<String>,
     /// Whether to immediately enqueue the child for execution.
     /// Defaults to `true`.
     pub auto_run: bool,
@@ -254,13 +213,13 @@ pub trait ChildSessionPort: Send + Sync {
 // Subagent resolution port
 // ---------------------------------------------------------------------------
 
-/// Resolves subagent-type–specific configuration (model, runtime metadata,
-/// system prompt) for the `SubAgent` tool.
+/// Resolves subagent-type–specific configuration (model, runtime metadata)
+/// for the `SubAgent` tool.
 ///
 /// Kept separate from [`ChildSessionPort`] (session CRUD/lifecycle/state): this
-/// port is pure `subagent_type` → config resolution. The server layer
-/// implements it; the tool depends only on the trait, carrying no `AppState`
-/// coupling.
+/// port is pure `subagent_type` → config resolution (cross-provider model
+/// routing + actor/external-agent metadata). The server layer implements it;
+/// the tool depends only on the trait, carrying no `AppState` coupling.
 #[async_trait]
 pub trait SubagentResolutionPort: Send + Sync {
     /// Provider+model ref for a `subagent_type`, or `None` to use defaults.
@@ -271,10 +230,6 @@ pub trait SubagentResolutionPort: Send + Sync {
 
     /// Runtime metadata (e.g. external-agent routing) for a `subagent_type`.
     async fn resolve_runtime_metadata(&self, subagent_type: &str) -> HashMap<String, String>;
-
-    /// Canonical system prompt for a `subagent_type` (falls back to
-    /// `general-purpose` for unknown/empty values; never empty).
-    fn resolve_subagent_prompt(&self, subagent_type: &str) -> String;
 }
 
 /// Models available from one configured provider (best-effort listing).

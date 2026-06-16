@@ -325,11 +325,10 @@ impl SessionStoreV2 {
                         "child session missing root_session_id/parent_session_id",
                     ));
                 }
-                if parent_id != root_id {
-                    return Err(other_io_error(
-                        "child session parent_session_id must equal root_session_id (no nesting)",
-                    ));
-                }
+                // Nesting is allowed: a child's parent may itself be a child.
+                // All descendants live flat under the tree root's directory
+                // (`child_rel_path` keys on `root_id`, which stays constant for
+                // the whole tree), so depth needs no path change.
                 validate_session_id(root_id)?;
                 Self::child_rel_path(root_id, &session.id)
             }
@@ -1419,6 +1418,32 @@ mod tests {
         let (storage, _temp_dir) = create_temp_storage().await?;
         let loaded = storage.load_session("nonexistent").await?;
         assert!(loaded.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nested_grandchild_persists_under_root() -> io::Result<()> {
+        // Nesting: a grandchild whose parent is itself a child (parent != root)
+        // must persist (previously rejected with "no nesting") and load back
+        // with its real parent lineage. All descendants live flat under the
+        // tree root's directory.
+        let (storage, _t) = create_temp_storage().await?;
+        let root = Session::new("root-1", "m");
+        storage.save_session(&root).await?;
+        let child = Session::new_child_of("child-1", &root, "m", "c");
+        storage.save_session(&child).await?;
+        let grandchild = Session::new_child_of("gc-1", &child, "m", "g");
+        storage.save_session(&grandchild).await?;
+
+        let loaded = storage.load_session("gc-1").await?.expect("grandchild");
+        assert_eq!(loaded.parent_session_id.as_deref(), Some("child-1"));
+        assert_eq!(loaded.root_session_id, "root-1");
+        assert_eq!(loaded.spawn_depth, 2);
+
+        // The grandchild is indexed under the tree root, keyed by its real parent.
+        let entry = storage.get_index_entry("gc-1").await.expect("indexed");
+        assert_eq!(entry.parent_session_id.as_deref(), Some("child-1"));
+        assert_eq!(entry.root_session_id, "root-1");
         Ok(())
     }
 
