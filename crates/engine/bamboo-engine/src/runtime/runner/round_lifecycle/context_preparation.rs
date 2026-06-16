@@ -1,7 +1,7 @@
 use crate::llm_summarizer::LlmSummarizer;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::session_setup::prompt_envelope::{
-    build_external_memory_context_block_from_messages, build_plan_mode_context_block,
+    build_external_memory_context_block, build_plan_mode_context_block,
     build_plan_runtime_context_block, build_task_list_context_block,
 };
 use bamboo_agent_core::tools::ToolSchema;
@@ -19,8 +19,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 use super::super::prompt_context::{
-    strip_existing_env_context, strip_existing_external_memory, strip_existing_skill_context,
-    strip_existing_task_list, strip_existing_tool_guide_context,
+    strip_existing_env_context, strip_existing_skill_context, strip_existing_tool_guide_context,
 };
 
 mod logging;
@@ -106,11 +105,12 @@ fn emit_context_pressure_notification(
 type DegradationStripFn = fn(&str) -> String;
 type DegradationLevel = (&'static str, DegradationStripFn);
 
+// External memory and task list no longer live in the system message (they ride
+// volatile blocks built from session state/field), so they are not strippable
+// here — overflow sheds them via conversation/tail compression instead.
 const DEGRADATION_LEVELS: &[DegradationLevel] = &[
     ("tool_guide", strip_existing_tool_guide_context),
     ("skill_context", strip_existing_skill_context),
-    ("external_memory", strip_existing_external_memory),
-    ("task_list", strip_existing_task_list),
     ("env_context", strip_existing_env_context),
 ];
 
@@ -139,7 +139,7 @@ fn build_compression_context_blocks(
     if let Some(block) = build_task_list_context_block(session) {
         blocks.push(block);
     }
-    if let Some(block) = build_external_memory_context_block_from_messages(&session.messages) {
+    if let Some(block) = build_external_memory_context_block(session) {
         blocks.push(block);
     }
     // Plan blocks come straight from session state, not reparsed markers.

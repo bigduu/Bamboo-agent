@@ -47,9 +47,6 @@ impl StablePromptFrame {
     }
 }
 
-const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
-const EXTERNAL_MEMORY_END_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_END -->";
-
 pub(crate) fn render_context_block_message(block: &ContextBlock) -> Message {
     block.render_runtime_context_message()
 }
@@ -112,26 +109,6 @@ pub(crate) fn envelope_to_chat_messages(envelope: &PromptEnvelope) -> Vec<Messag
 pub struct ResponsesPromptView {
     pub instructions: Option<String>,
     pub input_messages: Vec<Message>,
-}
-
-fn extract_wrapped_section(prompt: &str, start_marker: &str, end_marker: &str) -> Option<String> {
-    let start_idx = prompt.find(start_marker)?;
-    let section_start = start_idx + start_marker.len();
-    let end_rel_idx = prompt[section_start..].find(end_marker)?;
-    let section_end = section_start + end_rel_idx;
-    let section = prompt[start_idx..section_end + end_marker.len()].trim();
-    (!section.is_empty()).then(|| section.to_string())
-}
-
-fn strip_wrapped_markers(section: &str, start_marker: &str, end_marker: &str) -> String {
-    section
-        .trim()
-        .strip_prefix(start_marker)
-        .map(str::trim_start)
-        .and_then(|value| value.strip_suffix(end_marker).map(str::trim_end))
-        .unwrap_or(section)
-        .trim()
-        .to_string()
 }
 
 pub(crate) fn build_task_list_context_block(session: &Session) -> Option<ContextBlock> {
@@ -214,31 +191,15 @@ pub(crate) fn build_plan_runtime_context_block(
     ))
 }
 
-#[cfg(test)]
+/// Build the volatile external-memory block from the session field that the async
+/// refresh populates (external memory is the one ASYNC volatile producer).
+/// Returns `None` when there is no external memory this round.
 pub(crate) fn build_external_memory_context_block(session: &Session) -> Option<ContextBlock> {
-    build_external_memory_context_block_from_messages(&session.messages)
-}
-
-pub(crate) fn build_external_memory_context_block_from_messages(
-    messages: &[Message],
-) -> Option<ContextBlock> {
-    let system_message = messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))?;
-    let content = extract_wrapped_section(
-        &system_message.content,
-        EXTERNAL_MEMORY_START_MARKER,
-        EXTERNAL_MEMORY_END_MARKER,
-    )?;
-    let trimmed = strip_wrapped_markers(
-        &content,
-        EXTERNAL_MEMORY_START_MARKER,
-        EXTERNAL_MEMORY_END_MARKER,
-    );
-    if trimmed.trim().is_empty() {
+    let content = crate::runtime::runner::prompt_context::render_external_memory_section(session)?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
         return None;
     }
-
     Some(ContextBlock::new(
         ContextBlockType::ExternalMemory,
         ContextBlockPriority::Medium,
@@ -412,11 +373,12 @@ mod tests {
     }
 
     #[test]
-    fn build_external_memory_context_block_extracts_wrapped_system_section() {
+    fn build_external_memory_context_block_reads_session_field() {
         let mut session = Session::new("session-external-memory-block", "model");
-        session.add_message(Message::system(
-            "Base prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\nSession note body\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->",
-        ));
+        session.metadata.insert(
+            crate::runtime::runner::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY.to_string(),
+            "## External Memory (Persistent)\n\nSession note body".to_string(),
+        );
 
         let block = build_external_memory_context_block(&session)
             .expect("external memory block should exist");
@@ -425,7 +387,8 @@ mod tests {
         assert_eq!(block.priority, ContextBlockPriority::Medium);
         assert!(block.content.contains("## External Memory (Persistent)"));
         assert!(block.content.contains("Session note body"));
-        assert!(!block.content.contains("BAMBOO_EXTERNAL_MEMORY_START"));
+        // No external memory field → no block.
+        assert!(build_external_memory_context_block(&Session::new("s2", "model")).is_none());
     }
 
     #[test]

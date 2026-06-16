@@ -34,8 +34,6 @@ pub(crate) struct RoundPreludeFrame<'a> {
 
 // ---- prompt_updates functions ----
 
-const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
-const EXTERNAL_MEMORY_END_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_END -->";
 const RUNTIME_PROMPT_FLAGS_KEY: &str = "runtime_prompt_component_flags";
 const RUNTIME_PROMPT_LENGTHS_KEY: &str = "runtime_prompt_component_lengths";
 const RUNTIME_PROMPT_SECTION_LAYOUT_KEY: &str = "runtime_prompt_section_layout";
@@ -122,10 +120,15 @@ fn ensure_not_cancelled(
 // ---- prompt metadata ----
 
 fn persist_round_prompt_metadata(session: &mut Session, prompt: &str) {
-    // Task list is sourced from session state (not reparsed from a system-message
-    // marker), since it now rides a volatile block instead of being injected.
+    // Task list and external memory are sourced from session state/field (not
+    // reparsed from system-message markers), since they ride volatile blocks now.
     let task_list_text = session.format_task_list_for_prompt();
-    let sections = build_round_prompt_sections(prompt, &task_list_text);
+    let external_memory = super::prompt_context::render_external_memory_section(session);
+    let sections = build_round_prompt_sections(
+        prompt,
+        &task_list_text,
+        external_memory.as_deref().unwrap_or_default(),
+    );
     let report = PromptAssemblyReport::from_sections(sections, prompt);
     session.metadata.insert(
         RUNTIME_PROMPT_FLAGS_KEY.to_string(),
@@ -140,18 +143,6 @@ fn persist_round_prompt_metadata(session: &mut Session, prompt: &str) {
         report.section_layout_value(),
     );
 
-    let external_memory = extract_wrapped_section(
-        prompt,
-        EXTERNAL_MEMORY_START_MARKER,
-        EXTERNAL_MEMORY_END_MARKER,
-    )
-    .map(|section| {
-        strip_wrapped_markers(
-            &section,
-            EXTERNAL_MEMORY_START_MARKER,
-            EXTERNAL_MEMORY_END_MARKER,
-        )
-    });
     let task_list = (!task_list_text.trim().is_empty()).then(|| task_list_text.clone());
 
     let mut snapshot = super::session_setup::prompt_setup::read_prompt_snapshot_metadata(session)
@@ -207,15 +198,9 @@ fn persist_round_prompt_metadata(session: &mut Session, prompt: &str) {
 fn build_round_prompt_sections(
     prompt: &str,
     task_list: &str,
+    external_memory: &str,
 ) -> Vec<super::session_setup::prompt_setup::PromptSection> {
     use super::session_setup::prompt_setup::{PromptLayer, PromptSection};
-
-    let external_memory = extract_wrapped_section(
-        prompt,
-        EXTERNAL_MEMORY_START_MARKER,
-        EXTERNAL_MEMORY_END_MARKER,
-    )
-    .unwrap_or_default();
 
     vec![
         PromptSection::new("round_base_prompt", PromptLayer::CoreStatic, false, prompt),
@@ -234,51 +219,12 @@ fn build_round_prompt_sections(
     ]
 }
 
-fn extract_wrapped_section(prompt: &str, start_marker: &str, end_marker: &str) -> Option<String> {
-    let start_idx = prompt.find(start_marker)?;
-    let section_start = start_idx + start_marker.len();
-    let end_rel_idx = prompt[section_start..].find(end_marker)?;
-    let section_end = section_start + end_rel_idx;
-    let section = prompt[start_idx..section_end + end_marker.len()].trim();
-    (!section.is_empty()).then(|| section.to_string())
-}
-
-fn strip_wrapped_markers(section: &str, start_marker: &str, end_marker: &str) -> String {
-    section
-        .trim()
-        .trim_start_matches(start_marker)
-        .trim_end_matches(end_marker)
-        .trim()
-        .to_string()
-}
-
 fn log_round_prompt_refresh_summary(session_id: &str, prompt: &str) {
-    let external_memory_len = wrapped_section_len(
-        prompt,
-        EXTERNAL_MEMORY_START_MARKER,
-        EXTERNAL_MEMORY_END_MARKER,
-    );
-
     tracing::info!(
-        "[{}] Round prompt refresh summary: effective_len={} chars, has_external_memory={}, external_memory_len={}",
+        "[{}] Round prompt refresh summary: effective_len={} chars",
         session_id,
         prompt.len(),
-        external_memory_len > 0,
-        external_memory_len,
     );
-}
-
-fn wrapped_section_len(prompt: &str, start_marker: &str, end_marker: &str) -> usize {
-    let Some(start_idx) = prompt.find(start_marker) else {
-        return 0;
-    };
-    let section_start = start_idx + start_marker.len();
-    let Some(end_rel_idx) = prompt[section_start..].find(end_marker) else {
-        return 0;
-    };
-    prompt[section_start..section_start + end_rel_idx]
-        .trim()
-        .len()
 }
 
 // ---- Main prepare_round function (for lifecycle adapter) ----

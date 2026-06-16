@@ -1112,16 +1112,18 @@ async fn execute_llm_stream_continuation_includes_external_memory_dynamic_block(
         "responses.previous_response_id".to_string(),
         "resp_prev".to_string(),
     );
+    // External memory rides a session field now (the async refresh populates it),
+    // not a system-message marker.
+    session.metadata.insert(
+        crate::runtime::runner::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY.to_string(),
+        "## External Memory (Persistent)\n\nSession note body".to_string(),
+    );
 
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
-    let config = test_config(
-        "system\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\nSession note body\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->",
-    );
+    let config = test_config("system");
     let prepared_context = PreparedContext {
         messages: vec![
-            Message::system(
-                "system\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\nSession note body\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->",
-            ),
+            Message::system("system"),
             Message::user("run a tool"),
             Message::assistant("calling tool", None),
             Message::tool_result("call_1", "{\"ok\":true}"),

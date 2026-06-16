@@ -15,6 +15,12 @@ use super::system_sections::strip_existing_prompt_block;
 
 const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
 const EXTERNAL_MEMORY_END_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_END -->";
+/// Session metadata key holding the rendered external-memory section body
+/// (marker-free). Written each round by the async refresh; read by the request
+/// assembler to build the volatile `ExternalMemory` block. External memory is the
+/// one ASYNC volatile producer, so it is computed once per round and cached here
+/// rather than reparsed from the system message.
+pub(crate) const EXTERNAL_MEMORY_RENDERED_KEY: &str = "external_memory_rendered";
 /// Max chars per-topic shown in the system prompt.
 const SESSION_NOTE_PROMPT_MAX_CHARS_PER_TOPIC: usize = 4_000;
 /// Max total chars for all rendered session-note topics combined.
@@ -109,6 +115,25 @@ pub(super) fn strip_existing_external_memory(prompt: &str) -> String {
     )
 }
 
+/// Extract the marker-free body from a freshly-rendered external-memory section.
+fn extract_external_memory_inner(full_section: &str) -> String {
+    full_section
+        .trim()
+        .strip_prefix(EXTERNAL_MEMORY_START_MARKER)
+        .and_then(|rest| rest.strip_suffix(EXTERNAL_MEMORY_END_MARKER))
+        .map(|inner| inner.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// The rendered external-memory section body for this round (marker-free), or
+/// `None` when there is nothing to surface. Read from the session field populated
+/// by the async refresh.
+pub(crate) fn rendered_external_memory_section(session: &Session) -> Option<String> {
+    let content = session.metadata.get(EXTERNAL_MEMORY_RENDERED_KEY)?;
+    let trimmed = content.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
     let mut out = String::new();
     for (count, ch) in value.chars().enumerate() {
@@ -145,19 +170,10 @@ pub(super) async fn inject_external_memory_into_system_message_with_store(
     prompt_memory_flags: PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
 ) {
-    let Some(system_message_index) = session
-        .messages
-        .iter()
-        .position(|message| matches!(message.role, bamboo_agent_core::Role::System))
-    else {
-        return;
-    };
-
-    // Remove any previously injected memory block, then re-append a fresh
-    // memory section for this round.
-    let base_prompt =
-        strip_existing_external_memory(&session.messages[system_message_index].content);
-
+    // Computed each round and cached in a session field (NOT injected into the
+    // system message), so a per-round memory change never invalidates the cached
+    // system prefix; the request assembler reads the field to build a volatile
+    // block.
     let session_id = session.id.clone();
     let resolved_project_key = resolve_prompt_project_key(session);
     let session_note_snippets = load_session_note_snippets(memory, session_id.as_str()).await;
@@ -226,8 +242,14 @@ pub(super) async fn inject_external_memory_into_system_message_with_store(
         &render_parts,
     );
 
-    session.messages[system_message_index].content =
-        format!("{}{}", base_prompt.trim_end(), render_parts.full_section);
+    let inner = extract_external_memory_inner(&render_parts.full_section);
+    if inner.trim().is_empty() {
+        session.metadata.remove(EXTERNAL_MEMORY_RENDERED_KEY);
+    } else {
+        session
+            .metadata
+            .insert(EXTERNAL_MEMORY_RENDERED_KEY.to_string(), inner);
+    }
     persist_prompt_memory_observability(session, &observability);
 
     tracing::info!(

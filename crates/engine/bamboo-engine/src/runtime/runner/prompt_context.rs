@@ -7,7 +7,9 @@ mod plan_runtime;
 mod system_sections;
 mod task;
 
-pub(crate) use external_memory::{PromptMemoryRuntimeContext, PROMPT_MEMORY_OBSERVABILITY_KEY};
+pub(crate) use external_memory::{
+    PromptMemoryRuntimeContext, EXTERNAL_MEMORY_RENDERED_KEY, PROMPT_MEMORY_OBSERVABILITY_KEY,
+};
 
 pub(crate) async fn inject_external_memory_into_system_message(
     session: &mut bamboo_agent_core::Session,
@@ -40,6 +42,15 @@ pub(super) async fn inject_external_memory_into_system_message_with_store(
 
 pub(super) fn strip_existing_external_memory(prompt: &str) -> String {
     external_memory::strip_existing_external_memory(prompt)
+}
+
+/// The rendered external-memory section for this round, read from the session
+/// field the async refresh populates (`None` when there is none). Built into a
+/// volatile `ExternalMemory` block by the request assembler.
+pub(crate) fn render_external_memory_section(
+    session: &bamboo_agent_core::Session,
+) -> Option<String> {
+    external_memory::rendered_external_memory_section(session)
 }
 
 pub(super) fn merge_system_prompt_with_contexts(

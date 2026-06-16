@@ -125,12 +125,8 @@ async fn inject_external_memory_includes_global_dream_fallback_and_session_note_
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("Global Dream Summary (fallback)"));
     assert!(system_prompt.contains("Durable cross-session insight"));
@@ -183,12 +179,8 @@ async fn inject_external_memory_includes_project_memory_index_and_omits_global_d
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Project Durable Memory Index"));
     assert!(system_prompt.contains("Release freeze begins next week"));
@@ -252,12 +244,8 @@ async fn inject_external_memory_excludes_other_project_memory_index_content() {
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Project Durable Memory Index"));
     assert!(system_prompt.contains("Project A release rule"));
@@ -305,12 +293,8 @@ async fn inject_external_memory_truncates_project_memory_index_and_adds_freshnes
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Project Durable Memory Index"));
     assert!(system_prompt.contains("showing "));
@@ -351,12 +335,8 @@ async fn inject_external_memory_truncates_multi_topic_content_and_is_idempotent(
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert_eq!(
         system_prompt
@@ -411,12 +391,8 @@ async fn inject_external_memory_renders_relevant_memory_section_for_project_hits
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Relevant Durable Memories"));
     assert!(system_prompt.contains("User prefers concise answers"));
@@ -477,12 +453,8 @@ async fn inject_external_memory_adds_stale_guidance_for_old_relevant_memory_hits
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Relevant Durable Memories"));
     assert!(system_prompt.contains("Release freeze policy"));
@@ -518,12 +490,8 @@ async fn inject_external_memory_omits_relevant_memory_section_when_no_match_exis
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(!system_prompt.contains("### Relevant Durable Memories"));
 }
@@ -570,12 +538,8 @@ async fn inject_external_memory_limits_relevant_memories_to_top_k() {
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Relevant Durable Memories"));
     assert_eq!(system_prompt.matches("Summary:").count(), 3);
@@ -635,12 +599,8 @@ async fn inject_external_memory_uses_global_relevant_memory_fallback_only_when_p
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Relevant Durable Memories"));
     assert!(system_prompt.contains("Global release guidance"));
@@ -683,12 +643,8 @@ async fn inject_external_memory_prefers_project_dream_over_global_fallback() {
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Project Dream Summary"));
     assert!(system_prompt.contains("Project dream context"));
@@ -725,12 +681,8 @@ async fn inject_external_memory_uses_global_dream_fallback_when_project_dream_an
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(system_prompt.contains("### Global Dream Summary (fallback)"));
     assert!(system_prompt.contains("Global fallback dream"));
@@ -778,12 +730,8 @@ async fn inject_external_memory_omits_project_index_when_project_prompt_injectio
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(!system_prompt.contains("### Project Durable Memory Index"));
     assert!(!system_prompt.contains("Project release rule"));
@@ -861,12 +809,8 @@ async fn inject_external_memory_omits_relevant_recall_and_uses_global_dream_when
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     assert!(!system_prompt.contains("### Relevant Durable Memories"));
     assert!(system_prompt.contains("### Global Dream Summary (fallback)"));
@@ -957,12 +901,8 @@ async fn inject_external_memory_uses_model_rerank_for_relevant_memories_when_ena
     )
     .await;
 
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .expect("system prompt should exist");
+    let system_prompt = super::render_external_memory_section(&session)
+        .expect("external memory section should be rendered");
 
     let reranked_pos = system_prompt
         .find("Mobile launch blocker")
