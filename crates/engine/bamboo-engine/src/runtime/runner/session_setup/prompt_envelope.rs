@@ -1,32 +1,16 @@
 use bamboo_agent_core::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, Message, Session,
 };
-use serde::{Deserialize, Serialize};
 
-/// Structured request envelope used to separate stable instructions,
-/// dynamic runtime context, and conversation history before provider-specific
-/// serialization.
+/// Structured request envelope separating the stable instructions, the
+/// session-stable prefix messages, and the per-round dynamic context blocks. The
+/// engine reads these three runs straight into the canonical [`PromptIR`]; the
+/// conversation window and the wire-specific projections live on the IR, not here.
 #[derive(Debug, Clone, Default)]
 pub struct PromptEnvelope {
     pub stable_instructions: String,
     pub stable_prefix_messages: Vec<Message>,
     pub dynamic_context_messages: Vec<Message>,
-    pub conversation_messages: Vec<Message>,
-    pub observability: PromptEnvelopeObservability,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PromptEnvelopeObservability {
-    pub stable_instructions_chars: usize,
-    pub stable_prefix_message_count: usize,
-    pub dynamic_context_message_count: usize,
-    pub conversation_message_count: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stable_prefix_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dynamic_context_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub included_block_types: Vec<ContextBlockType>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,64 +35,23 @@ pub(crate) fn render_context_block_message(block: &ContextBlock) -> Message {
     block.render_runtime_context_message()
 }
 
-/// Assemble a [`PromptEnvelope`] from stable frame, context blocks and the
-/// final conversation message window.
+/// Assemble a [`PromptEnvelope`] from the stable frame and the per-round dynamic
+/// context blocks. The conversation window is threaded directly into the IR by the
+/// caller, so it is not stored here.
 pub(crate) fn assemble_prompt_envelope(
     stable: StablePromptFrame,
     dynamic_blocks: Vec<ContextBlock>,
-    conversation_messages: Vec<Message>,
 ) -> PromptEnvelope {
     let dynamic_context_messages: Vec<Message> = dynamic_blocks
         .iter()
         .map(render_context_block_message)
         .collect();
 
-    let observability = PromptEnvelopeObservability {
-        stable_instructions_chars: stable.stable_instructions.len(),
-        stable_prefix_message_count: stable.stable_prefix_messages.len(),
-        dynamic_context_message_count: dynamic_context_messages.len(),
-        conversation_message_count: conversation_messages.len(),
-        stable_prefix_hash: None,
-        dynamic_context_hash: None,
-        included_block_types: dynamic_blocks
-            .iter()
-            .map(|block| block.block_type)
-            .collect(),
-    };
-
     PromptEnvelope {
         stable_instructions: stable.stable_instructions,
         stable_prefix_messages: stable.stable_prefix_messages,
         dynamic_context_messages,
-        conversation_messages,
-        observability,
     }
-}
-
-/// Convert a [`PromptEnvelope`] into a Chat Completions compatible message list.
-///
-/// This helper is intentionally lightweight for the skeleton phase and will be
-/// expanded when the execution path is switched over to use envelopes.
-pub(crate) fn envelope_to_chat_messages(envelope: &PromptEnvelope) -> Vec<Message> {
-    let mut messages = Vec::new();
-
-    if !envelope.stable_instructions.trim().is_empty() {
-        messages.push(Message::system(
-            envelope.stable_instructions.trim().to_string(),
-        ));
-    }
-
-    messages.extend(envelope.stable_prefix_messages.clone());
-    messages.extend(envelope.dynamic_context_messages.clone());
-    messages.extend(envelope.conversation_messages.clone());
-
-    messages
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ResponsesPromptView {
-    pub instructions: Option<String>,
-    pub input_messages: Vec<Message>,
 }
 
 pub(crate) fn build_task_list_context_block(session: &Session) -> Option<ContextBlock> {
@@ -228,30 +171,6 @@ pub(crate) fn build_conversation_summary_context_block(session: &Session) -> Opt
     ))
 }
 
-/// Convert a [`PromptEnvelope`] into a Responses-style view.
-pub(crate) fn envelope_to_responses_view(envelope: &PromptEnvelope) -> ResponsesPromptView {
-    let instructions = envelope
-        .stable_instructions
-        .trim()
-        .is_empty()
-        .then_some(String::new())
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            let trimmed = envelope.stable_instructions.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        });
-
-    let mut input_messages = Vec::new();
-    input_messages.extend(envelope.stable_prefix_messages.clone());
-    input_messages.extend(envelope.dynamic_context_messages.clone());
-    input_messages.extend(envelope.conversation_messages.clone());
-
-    ResponsesPromptView {
-        instructions,
-        input_messages,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn assemble_prompt_envelope_tracks_counts_and_block_types() {
+    fn assemble_prompt_envelope_renders_dynamic_blocks_into_messages() {
         let stable = StablePromptFrame::new("stable instructions", vec![Message::user("stable")]);
         let blocks = vec![ContextBlock::new(
             ContextBlockType::ConversationSummary,
@@ -289,63 +208,15 @@ mod tests {
             "Summary",
             "old context",
         )];
-        let conversation = vec![Message::assistant("answer", None)];
 
-        let envelope = assemble_prompt_envelope(stable, blocks, conversation);
+        let envelope = assemble_prompt_envelope(stable, blocks);
 
-        assert_eq!(envelope.observability.stable_prefix_message_count, 1);
-        assert_eq!(envelope.observability.dynamic_context_message_count, 1);
-        assert_eq!(envelope.observability.conversation_message_count, 1);
-        assert_eq!(
-            envelope.observability.included_block_types,
-            vec![ContextBlockType::ConversationSummary]
-        );
-    }
-
-    #[test]
-    fn envelope_to_chat_messages_includes_single_stable_system_prefix() {
-        let stable = StablePromptFrame::new("stable instructions", vec![Message::user("stable")]);
-        let blocks = vec![ContextBlock::new(
-            ContextBlockType::TaskSnapshot,
-            ContextBlockPriority::High,
-            ContextBlockStability::RoundDynamic,
-            "Task",
-            "do the thing",
-        )];
-        let envelope = assemble_prompt_envelope(stable, blocks, vec![Message::user("latest user")]);
-
-        let messages = envelope_to_chat_messages(&envelope);
-
-        assert!(matches!(
-            messages.first().map(|m| &m.role),
-            Some(Role::System)
-        ));
-        assert_eq!(messages.len(), 4);
-    }
-
-    #[test]
-    fn envelope_to_responses_view_uses_instructions_without_system_message() {
-        let stable = StablePromptFrame::new("stable instructions", vec![Message::user("stable")]);
-        let envelope = assemble_prompt_envelope(
-            stable,
-            vec![ContextBlock::new(
-                ContextBlockType::TaskSnapshot,
-                ContextBlockPriority::High,
-                ContextBlockStability::RoundDynamic,
-                "Task",
-                "do the thing",
-            )],
-            vec![Message::user("latest user")],
-        );
-
-        let view = envelope_to_responses_view(&envelope);
-
-        assert_eq!(view.instructions.as_deref(), Some("stable instructions"));
-        assert_eq!(view.input_messages.len(), 3);
-        assert!(!matches!(
-            view.input_messages.first().map(|m| &m.role),
-            Some(Role::System)
-        ));
+        assert_eq!(envelope.stable_instructions, "stable instructions");
+        assert_eq!(envelope.stable_prefix_messages.len(), 1);
+        assert_eq!(envelope.dynamic_context_messages.len(), 1);
+        assert!(envelope.dynamic_context_messages[0]
+            .content
+            .contains("BAMBOO_CONTEXT_BLOCK_START"));
     }
 
     #[test]

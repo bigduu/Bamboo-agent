@@ -10,6 +10,7 @@ use reqwest::{
 };
 use serde_json::Value;
 
+use crate::prompt_ir::PromptIR;
 use crate::provider::{
     LLMError, LLMProvider, LLMRequestOptions, LLMStream, ResponsesRequestOptions, Result,
 };
@@ -296,6 +297,37 @@ impl LLMProvider for OpenAIProvider {
     ) -> Result<LLMStream> {
         self.chat_stream_with_options(messages, tools, max_output_tokens, model, None)
             .await
+    }
+
+    async fn chat_stream_ir(
+        &self,
+        ir: &PromptIR,
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
+        // Pure adapter: derive the Responses-API wire view (input array,
+        // instructions, previous_response_id) from the canonical IR rather than the
+        // engine pre-baking it. The Chat-Completions path uses the flat lowering
+        // (`continuation_delta` mid-tool-loop, else `flatten`); a Responses model
+        // ignores that flat list in favour of `responses.input_messages` below.
+        let messages = if ir.continuation.is_some() {
+            ir.continuation_delta()
+        } else {
+            ir.flatten()
+        };
+        let mut effective_options = options.cloned().unwrap_or_default();
+        effective_options.responses =
+            Some(ir.responses_request_options(effective_options.responses.as_ref()));
+        self.chat_stream_with_options(
+            &messages,
+            tools,
+            max_output_tokens,
+            model,
+            Some(&effective_options),
+        )
+        .await
     }
 
     async fn chat_stream_with_options(

@@ -13,8 +13,7 @@ use crate::runtime::runner::prompt_context::{
 use crate::runtime::runner::session_setup::prompt_envelope::{
     assemble_prompt_envelope, build_conversation_summary_context_block,
     build_external_memory_context_block, build_goal_context_block, build_plan_mode_context_block,
-    build_plan_runtime_context_block, build_task_list_context_block, envelope_to_chat_messages,
-    envelope_to_responses_view,
+    build_plan_runtime_context_block, build_task_list_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
@@ -59,14 +58,6 @@ fn session_previous_response_id(session: &Session) -> Option<&str> {
         .map(String::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-}
-
-fn continuation_messages(messages: &[Message]) -> Option<&[Message]> {
-    let last_assistant_index = messages
-        .iter()
-        .rposition(|message| matches!(message.role, Role::Assistant))?;
-    let continuation = messages.get(last_assistant_index + 1..)?;
-    (!continuation.is_empty()).then_some(continuation)
 }
 
 fn provider_supports_previous_response_id(provider_type: Option<&str>) -> bool {
@@ -234,35 +225,15 @@ fn derive_system_remainder_message(
 }
 
 struct PreparedRequestEnvelope {
-    /// Legacy merged-system flat list. Superseded by `ir` for dispatch (Phase C);
-    /// retained as a reference for the golden byte-equivalence tests until the
-    /// final cleanup phase deletes the legacy path.
-    #[allow(dead_code)]
-    chat_messages: Vec<Message>,
-    /// The single canonical request: system field + ordered, addressable message
-    /// runs (system_remainder and the volatile tail are their OWN runs), plus the
-    /// cache plan. `continuation` is filled in at dispatch time. Every provider
-    /// renders its wire from this via `chat_stream_ir`.
+    /// The single canonical request and SOLE source of truth: system field +
+    /// ordered, addressable message runs (system_remainder and the volatile tail are
+    /// their OWN runs) + the cache plan (`ir.cache`). `continuation` is filled in at
+    /// dispatch time. Every provider renders its wire from this via `chat_stream_ir`;
+    /// every wire view (chat / Responses-input / continuation-delta) is derived by
+    /// the IR's lowering methods, so there are no parallel pre-baked message vecs.
     ir: PromptIR,
-    responses_input_messages: Vec<Message>,
-    system_remainder_messages: Vec<Message>,
-    dynamic_context_messages: Vec<Message>,
-    conversation_messages: Vec<Message>,
-    /// Per-round volatile context (recalled memory, task list, plan state),
-    /// rendered as messages and placed after the conversation history so it
-    /// never sits inside the cached prefix.
-    volatile_context_messages: Vec<Message>,
-    instructions: Option<String>,
-    /// Legacy envelope observability. Superseded by `RequestRenderObservability`
-    /// (sourced from `ir`); retained for the migration, removed in cleanup.
-    #[allow(dead_code)]
-    envelope_observability:
-        crate::runtime::runner::session_setup::prompt_envelope::PromptEnvelopeObservability,
-    /// Prompt-cache plan for this request (cacheable system/tools plus rolling
-    /// summary and conversation-tail breakpoints).
-    cache_plan: PromptCachePlan,
     /// Per-section breakdown of the cacheable stable prefix, kept for prompt-cache
-    /// drift diagnostics (not sent to the provider).
+    /// drift diagnostics (not sent to the provider; not part of the wire IR).
     stable_prefix_sections: Vec<StablePrefixSection>,
 }
 
@@ -329,32 +300,21 @@ fn build_request_envelope(
         }
     }
 
-    let mut envelope_conversation_messages = system_remainder_messages.clone();
-    envelope_conversation_messages.extend(conversation_messages.clone());
-    // Last message of the cached region (before the volatile context appended
-    // below). A rolling breakpoint here lets the growing conversation cache
-    // incrementally turn over turn.
-    let conversation_breakpoint_id = envelope_conversation_messages
+    // Last message of the cached region (the SystemRemainder+Conversation runs,
+    // before the volatile context appended below). A rolling breakpoint here lets
+    // the growing conversation cache incrementally turn over turn.
+    let conversation_breakpoint_id = conversation_messages
         .last()
+        .or_else(|| system_remainder_messages.last())
         .map(|message| message.id.clone());
 
-    let mut envelope =
-        assemble_prompt_envelope(stable_frame, front_blocks, envelope_conversation_messages);
-    // Fill the (otherwise unset) stable-prefix hash so per-round drift can be
-    // observed and so the value surfaces in envelope observability/logs.
-    envelope.observability.stable_prefix_hash =
-        Some(super::prefix_drift::hash_sections(&stable_prefix_sections));
+    let envelope = assemble_prompt_envelope(stable_frame, front_blocks);
     // The only front block is the conversation summary (if present); its rendered
     // message id becomes the summary breakpoint.
     let summary_breakpoint_id = envelope
         .dynamic_context_messages
         .last()
         .map(|message| message.id.clone());
-
-    let responses_view = envelope_to_responses_view(&envelope);
-    let mut chat_messages = envelope_to_chat_messages(&envelope);
-    chat_messages.extend(volatile_context_messages.clone());
-    let envelope_observability = envelope.observability.clone();
 
     // Canonical prompt structure — where Bamboo OWNS assembly and providers are
     // pure adapters.
@@ -364,10 +324,9 @@ fn build_request_envelope(
     // of the system prompt and INTO a fixed prefix MESSAGE: the system keeps only
     // the static identity/workspace/env/skill, and the large, session-stable guide
     // rides as a typed context block at a known position with its own cache
-    // breakpoint. Applied to BOTH the chat lanes and the Responses-API view, so
-    // every provider family gets the same static-system structure. (The legacy
-    // `chat_messages` keeps the merged system, used only for the continuation
-    // delta and logging.)
+    // breakpoint — so every provider family gets the same static-system structure.
+    // The IR's lowering methods derive the chat / Responses-input / continuation
+    // views from these runs; the engine no longer pre-bakes any of them.
     let section = |name: &str| -> String {
         stable_prefix_sections
             .iter()
@@ -481,22 +440,10 @@ fn build_request_envelope(
         Vec::new()
     };
 
-    // Responses-API view mirrors the relocation: the guide leaves `instructions`
-    // and rides at the front of the input messages.
-    let instructions = if relocate_tool_guide {
-        let trimmed = lane_system.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    } else {
-        responses_view.instructions
-    };
-    let mut responses_input_messages = Vec::new();
-    if let Some(message) = tool_guide_message.clone() {
-        responses_input_messages.push(message);
-    }
-    responses_input_messages.extend(session_context_messages.clone());
-    responses_input_messages.extend(responses_view.input_messages);
-    responses_input_messages.extend(volatile_context_messages.clone());
-
+    // The Responses-API view (instructions = stable system, guide leading the input
+    // array) is no longer pre-baked here: the IR carries the system field + the
+    // ordered runs, and the OpenAI/Copilot adapter derives `instructions` /
+    // `input_messages` from it via `PromptIR::responses_request_options`.
     let mut stable_prefix_messages = envelope.stable_prefix_messages.clone();
     if let Some(message) = tool_guide_message {
         stable_prefix_messages.push(message);
@@ -557,21 +504,12 @@ fn build_request_envelope(
             Segment::new(SegmentRole::Conversation, conversation_messages.clone()),
             Segment::new(SegmentRole::VolatileTail, volatile_context_messages.clone()),
         ],
-        cache: cache_plan.clone(),
+        cache: cache_plan,
         continuation: None,
     };
 
     PreparedRequestEnvelope {
-        chat_messages,
         ir,
-        responses_input_messages,
-        system_remainder_messages,
-        dynamic_context_messages: envelope.dynamic_context_messages.clone(),
-        conversation_messages,
-        volatile_context_messages,
-        instructions,
-        envelope_observability,
-        cache_plan,
         stable_prefix_sections,
     }
 }
@@ -633,12 +571,7 @@ impl RequestRenderObservability {
 /// be inline branching in `execute_llm_stream`, so the request-shaping capability
 /// is one testable unit with a structured, inspectable result.
 struct LlmRequestPlan {
-    /// Continuation (flat) delta messages; empty on the lanes path.
-    continuation_messages: Vec<Message>,
     request_options: LLMRequestOptions,
-    /// `true` → dispatch the Responses-API continuation (flat) path; `false` →
-    /// the canonical lanes path.
-    is_continuation: bool,
     render: RequestRenderObservability,
 }
 
@@ -650,49 +583,31 @@ fn cache_ttl_label(ttl: CacheTtl) -> &'static str {
     }
 }
 
-/// Turn the canonical request envelope into a concrete provider request and pick
-/// the wire path. The Responses-API specifics (instructions / input view /
-/// continuation delta) are assembled here in ONE place rather than inline at the
-/// dispatch site; the returned [`LlmRequestPlan::render`] records the decision.
+/// Turn the canonical request envelope into a concrete provider request. The
+/// envelope's `ir.continuation` must already be set (at dispatch time) when this is
+/// a stateful Responses turn. This builds only the request POLICY — store /
+/// verbosity / reasoning / include / cache — and never the prompt wire view: the
+/// provider derives `instructions` / `input_messages` / the continuation delta from
+/// the IR itself. The returned [`LlmRequestPlan::render`] records the decision.
 fn plan_llm_request(
     envelope: &PreparedRequestEnvelope,
-    previous_response_id: Option<&str>,
     session_id: &str,
     reasoning_effort: Option<ReasoningEffort>,
     tool_count: usize,
 ) -> LlmRequestPlan {
-    let is_continuation = previous_response_id.is_some();
+    let is_continuation = envelope.ir.continuation.is_some();
 
-    // Responses-API continuation sends only the new messages since the last
-    // stored assistant response (the delta), tail-ordered to match the non-delta
-    // layout. The lanes path sends the full canonical structure instead.
-    let continuation_delta = if is_continuation {
-        let mut delta = envelope.system_remainder_messages.clone();
-        delta.extend(envelope.dynamic_context_messages.clone());
-        if let Some(conversation_delta) = continuation_messages(&envelope.conversation_messages) {
-            delta.extend_from_slice(conversation_delta);
-        } else {
-            delta.extend(envelope.conversation_messages.clone());
-        }
-        delta.extend(envelope.volatile_context_messages.clone());
-        delta
-    } else {
-        Vec::new()
-    };
-
-    let mut responses_options = ResponsesRequestOptions {
+    // The engine sets request POLICY only. The Responses prompt wire view
+    // (instructions / input_messages / previous_response_id) is derived by the
+    // OpenAI/Copilot adapter from the IR via `responses_request_options`.
+    let responses_options = ResponsesRequestOptions {
         store: Some(false),
         // Encourage the model to emit visible narration alongside tool calls.
         text_verbosity: Some("high".to_string()),
         reasoning_summary: Some("auto".to_string()),
         include: Some(vec!["reasoning.encrypted_content".to_string()]),
-        instructions: envelope.instructions.clone(),
-        input_messages: Some(envelope.responses_input_messages.clone()),
         ..Default::default()
     };
-    if let Some(response_id) = previous_response_id {
-        responses_options.previous_response_id = Some(response_id.to_string());
-    }
 
     let request_options = LLMRequestOptions {
         session_id: Some(session_id.to_string()),
@@ -700,13 +615,11 @@ fn plan_llm_request(
         parallel_tool_calls: Some(true),
         responses: Some(responses_options),
         request_purpose: Some("agent_loop".to_string()),
-        cache: Some(envelope.cache_plan.clone()),
+        cache: Some(envelope.ir.cache.clone()),
     };
 
-    // Observability is sourced from the IR (the single canonical structure), so
-    // the recorded shape can't drift from what the lowering methods actually send.
-    // `conversation_messages` is now a TRUE count (the volatile tail is its own
-    // run, no longer merged in).
+    // Observability is sourced from the IR (the single canonical structure), so the
+    // recorded shape can't drift from what the lowering methods actually send.
     let render = RequestRenderObservability {
         wire: if is_continuation {
             "responses_continuation"
@@ -720,7 +633,7 @@ fn plan_llm_request(
         conversation_messages: envelope.ir.run(SegmentRole::Conversation).len(),
         volatile_context_messages: envelope.ir.run(SegmentRole::VolatileTail).len(),
         request_message_count: if is_continuation {
-            continuation_delta.len()
+            envelope.ir.continuation_delta().len()
         } else {
             envelope.ir.flatten().len()
         },
@@ -732,9 +645,7 @@ fn plan_llm_request(
     };
 
     LlmRequestPlan {
-        continuation_messages: continuation_delta,
         request_options,
-        is_continuation,
         render,
     }
 }
@@ -786,14 +697,31 @@ pub(super) async fn execute_llm_stream(
         config.app_data_dir.as_deref(),
         &prepared_envelope.stable_prefix_sections,
     );
+    // Set the stateful Responses continuation on the IR (boundary = the last
+    // assistant turn in the conversation run) BEFORE planning, so the provider — or
+    // the default lowering — derives the delta itself from addressable runs and the
+    // plan's wire label reflects it.
+    if let Some(response_id) = previous_response_id.as_deref() {
+        let last_committed_assistant_id = prepared_envelope
+            .ir
+            .run(SegmentRole::Conversation)
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, Role::Assistant))
+            .map(|message| message.id.clone());
+        prepared_envelope.ir.continuation = Some(Continuation {
+            previous_response_id: response_id.to_string(),
+            last_committed_assistant_id,
+        });
+    }
+
     // Single home for turning the canonical envelope into a concrete provider
-    // request + choosing the wire path. The cache plan keeps per-round volatile
-    // content in trailing context-block messages, so everything up to the
+    // request (request POLICY + observability). The cache plan keeps per-round
+    // volatile content in trailing context-block messages, so everything up to the
     // conversation-tail breakpoint is byte-stable across rounds and caches
     // incrementally.
     let planned = plan_llm_request(
         &prepared_envelope,
-        previous_response_id.as_deref(),
         session_id,
         reasoning_effort,
         tool_schemas.len(),
@@ -809,43 +737,9 @@ pub(super) async fn execute_llm_stream(
     planned.render.log(session_id);
     persist_request_render_metadata(session, &planned.render);
 
-    // Set the stateful Responses continuation on the IR (boundary = the last
-    // assistant turn in the conversation run) so the adapter — or the default
-    // lowering — derives the delta itself from addressable runs.
-    if let Some(response_id) = previous_response_id.as_deref() {
-        let last_committed_assistant_id = prepared_envelope
-            .ir
-            .run(SegmentRole::Conversation)
-            .iter()
-            .rev()
-            .find(|message| matches!(message.role, Role::Assistant))
-            .map(|message| message.id.clone());
-        prepared_envelope.ir.continuation = Some(Continuation {
-            previous_response_id: response_id.to_string(),
-            last_committed_assistant_id,
-        });
-    }
-
-    // Migration safety net (removed in the final cleanup phase): the IR-derived
-    // continuation delta must reproduce exactly what the legacy plan would have
-    // sent. Cheap content-sequence check, debug builds only.
-    debug_assert!(
-        !planned.is_continuation
-            || prepared_envelope
-                .ir
-                .continuation_delta()
-                .iter()
-                .map(|message| &message.content)
-                .eq(planned
-                    .continuation_messages
-                    .iter()
-                    .map(|message| &message.content)),
-        "IR continuation delta diverged from the legacy delta"
-    );
-
     // ONE canonical dispatch: every provider renders the IR. The default lowering
-    // is byte-identical to the prior lanes / continuation-delta paths (golden
-    // tests); block-native and Responses providers override `chat_stream_ir`.
+    // (chat / continuation-delta) and the provider overrides (Anthropic block-native
+    // system, OpenAI/Copilot Responses view) all derive their wire from this IR.
     let stream = llm
         .chat_stream_ir(
             &prepared_envelope.ir,

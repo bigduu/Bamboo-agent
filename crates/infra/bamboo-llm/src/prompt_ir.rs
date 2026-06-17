@@ -162,6 +162,30 @@ impl PromptIR {
         out
     }
 
+    /// Lower to the OpenAI/Copilot Responses-API request options: the input array
+    /// (the stable system rides top-level `instructions`, NOT the array), the
+    /// trimmed `instructions`, and the stateful `previous_response_id` — merged onto
+    /// `base`, which carries the engine's request POLICY (store / verbosity /
+    /// reasoning summary / include list). This is the adapter seam: a Responses
+    /// provider derives its wire view from the canonical IR here instead of the
+    /// engine pre-baking it. `instructions` is trimmed to stay byte-identical to the
+    /// wire `build_responses_body` produces (which trims) regardless of how the
+    /// system field was assembled.
+    pub fn responses_request_options(
+        &self,
+        base: Option<&crate::provider::ResponsesRequestOptions>,
+    ) -> crate::provider::ResponsesRequestOptions {
+        let mut options = base.cloned().unwrap_or_default();
+        options.input_messages = Some(self.responses_input());
+        let system = self.system_field();
+        let trimmed = system.trim();
+        options.instructions = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        if let Some(continuation) = self.continuation.as_ref() {
+            options.previous_response_id = Some(continuation.previous_response_id.clone());
+        }
+        options
+    }
+
     /// New conversation since the last committed assistant turn (the delta of the
     /// `Conversation` run). Reproduces the legacy `rposition(Role::Assistant)`
     /// semantics, pinned by id so the engine commits the boundary instead of
@@ -325,6 +349,52 @@ mod tests {
     fn responses_input_equals_body_chat() {
         let ir = fixture_ir();
         assert_eq!(shape(&ir.responses_input()), shape(&ir.body_chat()));
+    }
+
+    #[test]
+    fn responses_request_options_derives_input_instructions_and_continuation() {
+        use crate::provider::ResponsesRequestOptions;
+        // Base carries the engine's request POLICY only.
+        let base = ResponsesRequestOptions {
+            store: Some(false),
+            text_verbosity: Some("high".to_string()),
+            ..Default::default()
+        };
+        let ir = PromptIR {
+            continuation: Some(Continuation {
+                previous_response_id: "resp_prev".to_string(),
+                last_committed_assistant_id: None,
+            }),
+            ..fixture_ir()
+        };
+
+        let options = ir.responses_request_options(Some(&base));
+        // Policy preserved.
+        assert_eq!(options.store, Some(false));
+        assert_eq!(options.text_verbosity.as_deref(), Some("high"));
+        // Prompt wire view derived from the IR.
+        assert_eq!(options.instructions.as_deref(), Some("SYSTEM"));
+        assert_eq!(
+            shape(options.input_messages.as_deref().unwrap()),
+            shape(&ir.responses_input()),
+            "input_messages is the full responses_input view (system rides instructions)"
+        );
+        assert_eq!(options.previous_response_id.as_deref(), Some("resp_prev"));
+    }
+
+    #[test]
+    fn responses_request_options_omits_instructions_when_system_blank() {
+        use crate::provider::ResponsesRequestOptions;
+        let ir = PromptIR {
+            system_text: "   ".to_string(),
+            ..PromptIR::default()
+        };
+        let options = ir.responses_request_options(None);
+        assert!(
+            options.instructions.is_none(),
+            "blank system field → no instructions (matches legacy None)"
+        );
+        assert!(options.previous_response_id.is_none());
     }
 
     #[test]

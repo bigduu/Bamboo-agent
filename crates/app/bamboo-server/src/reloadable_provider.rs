@@ -4,7 +4,7 @@ use tokio::sync::RwLock;
 
 use bamboo_agent_core::{tools::ToolSchema, Message};
 use bamboo_llm::provider::{LLMProvider, LLMRequestOptions, Result};
-use bamboo_llm::LLMStream;
+use bamboo_llm::{LLMStream, PromptIR};
 
 /// An `LLMProvider` wrapper that always delegates to the latest provider stored in a shared lock.
 ///
@@ -50,6 +50,23 @@ impl LLMProvider for ReloadableProvider {
         let provider = self.current().await;
         provider
             .chat_stream_with_options(messages, tools, max_output_tokens, model, options)
+            .await
+    }
+
+    async fn chat_stream_ir(
+        &self,
+        ir: &PromptIR,
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
+        // Delegate the canonical IR straight through so the underlying provider's
+        // `chat_stream_ir` override is preserved (NOT collapsed to a flat list by
+        // the trait default).
+        let provider = self.current().await;
+        provider
+            .chat_stream_ir(ir, tools, max_output_tokens, model, options)
             .await
     }
 

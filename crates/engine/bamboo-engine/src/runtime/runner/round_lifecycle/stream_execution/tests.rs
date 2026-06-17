@@ -59,14 +59,26 @@ impl LLMProvider for MockLlmProvider {
         options: Option<&LLMRequestOptions>,
     ) -> bamboo_llm::provider::Result<LLMStream> {
         *self.ir_invoked.lock().expect("ir_invoked lock") = true;
-        // Mirror the default lowering so `requested_messages` is still captured.
+        // Faithful Responses-provider adapter: derive the flat messages AND the
+        // Responses wire options (instructions / input_messages / previous_response_id)
+        // from the IR, exactly like the OpenAI/Copilot overrides — so the captured
+        // request reflects what a real adapter sends, not an engine pre-bake.
         let messages = if ir.continuation.is_some() {
             ir.continuation_delta()
         } else {
             ir.flatten()
         };
-        self.chat_stream_with_options(&messages, tools, max_output_tokens, model, options)
-            .await
+        let mut effective_options = options.cloned().unwrap_or_default();
+        effective_options.responses =
+            Some(ir.responses_request_options(effective_options.responses.as_ref()));
+        self.chat_stream_with_options(
+            &messages,
+            tools,
+            max_output_tokens,
+            model,
+            Some(&effective_options),
+        )
+        .await
     }
 
     async fn chat_stream_with_options(
@@ -501,22 +513,24 @@ fn build_request_envelope_tails_volatile_context_and_sets_cache_breakpoints() {
     let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
 
     // Volatile task context is rendered and placed at the very tail, out of the
-    // cacheable prefix.
-    assert_eq!(envelope.volatile_context_messages.len(), 1);
-    let last = envelope
-        .chat_messages
-        .last()
-        .expect("chat messages present");
+    // cacheable prefix — it is its own run AND the last message of the flat wire.
+    assert_eq!(
+        envelope.ir.run(bamboo_llm::SegmentRole::VolatileTail).len(),
+        1
+    );
+    let last = envelope.ir.flatten();
+    let last = last.last().expect("flat messages present");
     assert!(last.content.contains("context_type: task_snapshot"));
 
     // Plan caches system + tools and puts a rolling breakpoint on the last
-    // conversation message (just before the volatile tail).
-    assert!(envelope.cache_plan.cache_system);
-    assert!(envelope.cache_plan.cache_tools);
-    assert!(envelope.cache_plan.is_breakpoint(&last_user_id));
+    // conversation message (just before the volatile tail). The cache plan is the
+    // IR's (`ir.cache`), the SOLE authority.
+    assert!(envelope.ir.cache.cache_system);
+    assert!(envelope.ir.cache.cache_tools);
+    assert!(envelope.ir.cache.is_breakpoint(&last_user_id));
     // The stable prefix uses the 1-hour extended TTL so the cache survives
     // pauses longer than the 5-minute default and big tool results keep hitting.
-    assert_eq!(envelope.cache_plan.ttl, bamboo_llm::CacheTtl::Extended);
+    assert_eq!(envelope.ir.cache.ttl, bamboo_llm::CacheTtl::Extended);
 }
 
 #[test]
@@ -574,11 +588,20 @@ fn stable_prefix_is_byte_stable_across_rounds() {
     };
     assert_eq!(guide(&e1), guide(&e2), "guide prefix must stay byte-stable");
 
-    // The cacheable-prefix drift hash is unchanged, so the cache hits.
-    assert!(e1.envelope_observability.stable_prefix_hash.is_some());
+    // The cacheable-prefix sections are byte-identical across rounds, so the cache
+    // hits. Compare the (name, content) of every section directly — the strongest
+    // form of the old drift-hash check.
+    let sections = |e: &super::PreparedRequestEnvelope| -> Vec<(String, String)> {
+        e.stable_prefix_sections
+            .iter()
+            .map(|s| (s.name.to_string(), s.content.clone()))
+            .collect()
+    };
+    assert!(!e1.stable_prefix_sections.is_empty());
     assert_eq!(
-        e1.envelope_observability.stable_prefix_hash, e2.envelope_observability.stable_prefix_hash,
-        "stable prefix must not drift between rounds"
+        sections(&e1),
+        sections(&e2),
+        "stable prefix sections must not drift between rounds"
     );
 }
 
@@ -694,13 +717,15 @@ fn build_request_envelope_relocates_tool_guide_into_stable_prefix_lane() {
     assert!(guide.never_compress);
 
     // And that relocated, session-stable message earns its own cache breakpoint.
-    assert!(envelope.cache_plan.is_breakpoint(&guide.id));
+    assert!(envelope.ir.cache.is_breakpoint(&guide.id));
 
-    // The Responses-API view mirrors the relocation: the guide leaves
-    // `instructions` and rides at the FRONT of the input messages — so every
-    // provider family gets the same static-system structure.
+    // The Responses-API view (derived by the adapter from the IR) mirrors the
+    // relocation: the guide leaves `instructions` (the system field) and rides at
+    // the FRONT of the input messages — so every provider family gets the same
+    // static-system structure.
+    let responses = envelope.ir.responses_request_options(None);
     assert!(
-        !envelope
+        !responses
             .instructions
             .as_deref()
             .unwrap_or_default()
@@ -708,9 +733,10 @@ fn build_request_envelope_relocates_tool_guide_into_stable_prefix_lane() {
         "tool/server guide must be removed from Responses instructions"
     );
     assert!(
-        envelope
-            .responses_input_messages
-            .first()
+        responses
+            .input_messages
+            .as_deref()
+            .and_then(|m| m.first())
             .is_some_and(|m| m.content.contains("NOVA_GUIDANCE_MARKER")),
         "tool/server guide leads the Responses input messages"
     );
@@ -942,7 +968,8 @@ fn goal_rides_volatile_tail_and_never_leaks_into_system_blocks() {
 
     // It rides the volatile tail as a typed GoalState context block.
     let goal_msg = envelope
-        .volatile_context_messages
+        .ir
+        .run(bamboo_llm::SegmentRole::VolatileTail)
         .iter()
         .find(|m| m.content.contains("context_type: goal_state"))
         .expect("goal rides the volatile tail as a goal_state block");
@@ -994,11 +1021,11 @@ fn plan_llm_request_lanes_path_records_observability() {
     };
     let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
 
-    let planned = super::plan_llm_request(&envelope, None, "session-plan", None, 3);
+    let planned = super::plan_llm_request(&envelope, "session-plan", None, 3);
 
-    assert!(!planned.is_continuation);
+    // No continuation set on the IR → the canonical lanes wire.
+    assert!(envelope.ir.continuation.is_none());
     assert_eq!(planned.render.wire, "lanes");
-    assert!(planned.continuation_messages.is_empty());
     // System rendered as structured blocks (tool guide present → relocation on).
     assert!(planned.render.system_block_count >= 1);
     assert_eq!(planned.render.tool_count, 3);
@@ -1030,27 +1057,24 @@ fn plan_llm_request_continuation_path_builds_delta() {
         prompt_cached_tool_outputs: 0,
         prompt_cached_tool_tokens_saved: 0,
     };
-    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let envelope = with_ir_continuation(
+        super::build_request_envelope(&session, &prepared_context, &config, &[]),
+        "resp_prev",
+    );
 
-    let planned =
-        super::plan_llm_request(&envelope, Some("resp_prev"), "session-plan-cont", None, 0);
+    let planned = super::plan_llm_request(&envelope, "session-plan-cont", None, 0);
 
-    assert!(planned.is_continuation);
     assert_eq!(planned.render.wire, "responses_continuation");
     // Delta is the tool result after the last assistant turn — NOT the full convo.
-    assert!(!planned.continuation_messages.is_empty());
-    assert_eq!(
-        planned.render.request_message_count,
-        planned.continuation_messages.len()
-    );
-    assert_eq!(
-        planned
-            .request_options
-            .responses
-            .as_ref()
-            .and_then(|r| r.previous_response_id.as_deref()),
-        Some("resp_prev")
-    );
+    let delta = envelope.ir.continuation_delta();
+    assert!(!delta.is_empty());
+    assert_eq!(planned.render.request_message_count, delta.len());
+    // The provider derives previous_response_id from the IR continuation (the engine
+    // no longer pre-bakes it into the request options).
+    let responses = envelope
+        .ir
+        .responses_request_options(planned.request_options.responses.as_ref());
+    assert_eq!(responses.previous_response_id.as_deref(), Some("resp_prev"));
 }
 
 fn message_shape(messages: &[bamboo_agent_core::Message]) -> Vec<(Role, String)> {
@@ -1058,6 +1082,27 @@ fn message_shape(messages: &[bamboo_agent_core::Message]) -> Vec<(Role, String)>
         .iter()
         .map(|m| (m.role.clone(), m.content.clone()))
         .collect()
+}
+
+/// Mirror the engine dispatch: set the stateful Responses continuation on the IR
+/// (boundary = the last assistant turn in the Conversation run), as
+/// `execute_llm_stream` does before planning/dispatch.
+fn with_ir_continuation(
+    mut envelope: super::PreparedRequestEnvelope,
+    previous_response_id: &str,
+) -> super::PreparedRequestEnvelope {
+    let last_committed_assistant_id = envelope
+        .ir
+        .run(bamboo_llm::SegmentRole::Conversation)
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::Assistant))
+        .map(|m| m.id.clone());
+    envelope.ir.continuation = Some(bamboo_llm::Continuation {
+        previous_response_id: previous_response_id.to_string(),
+        last_committed_assistant_id,
+    });
+    envelope
 }
 
 #[test]
@@ -1144,10 +1189,12 @@ fn envelope_ir_flatten_orders_runs_canonically() {
 }
 
 #[test]
-fn envelope_ir_continuation_delta_is_byte_equal_to_legacy_delta() {
-    // GOLDEN: the IR-derived continuation delta reproduces the exact bytes the
-    // legacy plan_llm_request delta sends — including the SystemRemainder-FIRST
-    // ordering that differs from the chat view.
+fn engine_continuation_delta_puts_remainder_first_then_conversation_tail() {
+    // GOLDEN: the engine's continuation (boundary = last assistant in the
+    // Conversation run) yields a delta that is exactly SystemRemainder FIRST, then
+    // the conversation tail after the committed assistant turn — the
+    // deliberately-different ordering from the chat view, asserted self-contained
+    // against the IR (no legacy pre-bake to compare to).
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-ir-delta-golden", "test-model");
     session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
@@ -1167,47 +1214,21 @@ fn envelope_ir_continuation_delta_is_byte_equal_to_legacy_delta() {
         prompt_cached_tool_tokens_saved: 0,
     };
 
-    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
-    let planned = super::plan_llm_request(
-        &envelope,
-        Some("resp_prev"),
-        "session-ir-delta-golden",
-        None,
-        0,
+    let envelope = with_ir_continuation(
+        super::build_request_envelope(&session, &prepared_context, &config, &[]),
+        "resp_prev",
     );
 
-    // Build the IR continuation the way the engine will at dispatch: boundary =
-    // the last assistant turn in the Conversation run.
-    let conversation = envelope.ir.run(bamboo_llm::SegmentRole::Conversation);
-    let last_assistant_id = conversation
-        .iter()
-        .rev()
-        .find(|m| matches!(m.role, Role::Assistant))
-        .map(|m| m.id.clone());
-    let mut ir = envelope.ir.clone();
-    ir.continuation = Some(bamboo_llm::Continuation {
-        previous_response_id: "resp_prev".to_string(),
-        last_committed_assistant_id: last_assistant_id,
-    });
-
-    let ir_delta = ir.continuation_delta();
+    // Remainder (the persisted operator note) leads; the conversation tail is only
+    // the tool result after the committed assistant turn.
+    let delta = message_shape(&envelope.ir.continuation_delta());
     assert_eq!(
-        message_shape(&ir_delta),
-        message_shape(&planned.continuation_messages),
-        "ir.continuation_delta() must be byte-equal to the legacy delta"
-    );
-    // Beyond (role, content): the delta carries the EXACT same message instances,
-    // so compare ids too. The migration debug_assert is content-only, so this is
-    // the strong guard (review finding #6).
-    let ir_ids: Vec<&String> = ir_delta.iter().map(|m| &m.id).collect();
-    let legacy_ids: Vec<&String> = planned
-        .continuation_messages
-        .iter()
-        .map(|m| &m.id)
-        .collect();
-    assert_eq!(
-        ir_ids, legacy_ids,
-        "delta must carry the same message ids, not just the same content"
+        delta,
+        vec![
+            (Role::System, "PERSISTED OPERATOR NOTE".to_string()),
+            (Role::Tool, "{\"ok\":true}".to_string()),
+        ],
+        "delta = SystemRemainder FIRST, then the post-assistant conversation tail"
     );
 }
 
@@ -1239,14 +1260,17 @@ fn responses_continuation_uses_full_input_not_the_delta() {
         prompt_cached_tool_tokens_saved: 0,
     };
 
-    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
-    let planned =
-        super::plan_llm_request(&envelope, Some("resp_prev"), "session-resp-cont", None, 0);
-    let responses = planned
-        .request_options
-        .responses
-        .as_ref()
-        .expect("responses options present");
+    let envelope = with_ir_continuation(
+        super::build_request_envelope(&session, &prepared_context, &config, &[]),
+        "resp_prev",
+    );
+    let planned = super::plan_llm_request(&envelope, "session-resp-cont", None, 0);
+
+    // The adapter derives the Responses wire view from the IR + the engine's request
+    // POLICY (planned.request_options.responses).
+    let responses = envelope
+        .ir
+        .responses_request_options(planned.request_options.responses.as_ref());
 
     let input = responses
         .input_messages
@@ -1259,7 +1283,7 @@ fn responses_continuation_uses_full_input_not_the_delta() {
     );
     assert_eq!(responses.previous_response_id.as_deref(), Some("resp_prev"));
     assert!(
-        input.len() > planned.continuation_messages.len(),
+        input.len() > envelope.ir.continuation_delta().len(),
         "FULL Responses input must exceed the smaller continuation delta"
     );
 }
@@ -1283,7 +1307,7 @@ fn ir_cache_matches_request_options_cache() {
     };
 
     let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
-    let planned = super::plan_llm_request(&envelope, None, "session-cache-dup", None, 0);
+    let planned = super::plan_llm_request(&envelope, "session-cache-dup", None, 0);
     let options_cache = planned
         .request_options
         .cache
@@ -1340,10 +1364,12 @@ fn cache_anchor_marks_only_the_last_system_block() {
 }
 
 #[test]
-fn envelope_ir_responses_input_is_byte_equal_to_legacy() {
-    // GOLDEN: the IR's Responses-input view reproduces the engine's pre-baked
-    // responses_input_messages, so Phase D (adapter derives it from the IR) is a
-    // byte-identical move on the Responses wire.
+fn ir_responses_view_orders_guide_skill_conversation_and_lifts_system_to_instructions() {
+    // GOLDEN: the adapter-derived Responses view (`PromptIR::responses_request_options`)
+    // is the canonical Responses wire — the tool guide leads the input array, the
+    // relocated skill context follows, the conversation comes after, and the stable
+    // system field is lifted to top-level `instructions` (NOT a leading system
+    // message in the array).
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-ir-resp", "test-model");
     session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
@@ -1369,15 +1395,32 @@ fn envelope_ir_responses_input_is_byte_equal_to_legacy() {
     };
 
     let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    // responses_input() == body_chat() (system rides instructions, not the array).
+    let input = message_shape(&envelope.ir.responses_input());
+    let pos = |needle: &str| input.iter().position(|(_, c)| c.contains(needle));
+    let guide = pos("NOVA_GUIDANCE_MARKER").expect("tool guide present");
+    let skill = pos("SKILL_CONTEXT_MARKER").expect("relocated skill context present");
+    let conversation = pos("u1").expect("conversation present");
+    assert!(
+        guide < skill && skill < conversation,
+        "guide leads, then relocated skill context, then the conversation"
+    );
+    assert!(
+        !matches!(input.first(), Some((Role::System, _))),
+        "the stable system rides instructions, so the input array does not LEAD with a system message"
+    );
+
+    // The adapter lifts the system field to top-level instructions (trimmed).
+    let responses = envelope.ir.responses_request_options(None);
     assert_eq!(
-        message_shape(&envelope.ir.responses_input()),
-        message_shape(&envelope.responses_input_messages),
-        "ir.responses_input() must reproduce the engine's responses_input_messages"
+        responses.instructions.as_deref(),
+        Some(envelope.ir.system_field().trim()),
+        "instructions = the trimmed system field"
     );
     assert_eq!(
-        envelope.ir.system_field(),
-        envelope.instructions.clone().unwrap_or_default(),
-        "ir.system_field() must equal the Responses instructions"
+        responses.input_messages.map(|m| message_shape(&m)),
+        Some(input),
+        "input_messages == ir.responses_input()"
     );
 }
 

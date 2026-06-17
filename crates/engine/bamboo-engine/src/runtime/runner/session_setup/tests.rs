@@ -1,15 +1,10 @@
 use async_trait::async_trait;
 
-use super::prompt_envelope::{
-    assemble_prompt_envelope, envelope_to_responses_view, StablePromptFrame,
-};
+use super::prompt_envelope::StablePromptFrame;
 use super::prompt_setup::build_stable_prompt_frame_with_sections;
 use super::tool_schemas::resolve_available_tool_schemas_for_session;
 use bamboo_agent_core::agent::types::{TaskItem, TaskItemStatus, TaskList};
 use bamboo_agent_core::tools::{FunctionSchema, ToolCall, ToolExecutor, ToolResult, ToolSchema};
-use bamboo_agent_core::{
-    ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
-};
 use bamboo_agent_core::{Message, Session};
 use chrono::Utc;
 
@@ -803,26 +798,13 @@ fn build_stable_prompt_frame_strips_round_dynamic_prompt_blocks() {
 }
 
 #[test]
-fn prompt_envelope_skeleton_can_render_responses_view() {
+fn stable_prompt_frame_carries_instructions_and_prefix_messages() {
+    // The stable frame is what feeds the IR's system field + StablePrefix run; the
+    // Responses-input/chat projections are derived by the IR's lowering methods, not
+    // a per-envelope converter.
     let stable =
         StablePromptFrame::new("Stable instructions", vec![Message::user("stable prefix")]);
-    let envelope = assemble_prompt_envelope(
-        stable,
-        vec![ContextBlock::new(
-            ContextBlockType::TaskSnapshot,
-            ContextBlockPriority::High,
-            ContextBlockStability::RoundDynamic,
-            "Current Task Snapshot",
-            "- build prompt envelope skeleton",
-        )],
-        vec![Message::user("latest user turn")],
-    );
-
-    let view = envelope_to_responses_view(&envelope);
-
-    assert_eq!(view.instructions.as_deref(), Some("Stable instructions"));
-    assert_eq!(view.input_messages.len(), 3);
-    assert!(view.input_messages[1]
-        .content
-        .contains("BAMBOO_CONTEXT_BLOCK_START"));
+    assert_eq!(stable.stable_instructions, "Stable instructions");
+    assert_eq!(stable.stable_prefix_messages.len(), 1);
+    assert_eq!(stable.stable_prefix_messages[0].content, "stable prefix");
 }

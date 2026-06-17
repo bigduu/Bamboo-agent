@@ -49,20 +49,6 @@ fn sha256_hex(content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Stable hash over the full ordered set of prefix sections, suitable for the
-/// `stable_prefix_hash` observability field.
-pub(super) fn hash_sections(sections: &[StablePrefixSection]) -> String {
-    let mut hasher = Sha256::new();
-    for section in sections {
-        hasher.update(section.name.as_bytes());
-        hasher.update([0u8]);
-        hasher.update((section.content.len() as u64).to_le_bytes());
-        hasher.update(section.content.as_bytes());
-        hasher.update([0u8]);
-    }
-    format!("{:x}", hasher.finalize())
-}
-
 /// Per-section state persisted between rounds for cheap change detection.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct SectionState {
