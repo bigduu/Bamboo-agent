@@ -203,12 +203,17 @@ pub trait LLMProvider: Send + Sync {
     /// carries the stateful Responses continuation, so an adapter derives the
     /// delta itself rather than the engine pre-baking it.
     ///
-    /// The default implementation flattens the IR — a continuation sends
-    /// [`PromptIR::continuation_delta`], a normal request sends
-    /// [`PromptIR::flatten`] — and delegates to
-    /// [`chat_stream_with_options`](Self::chat_stream_with_options), byte-identical
-    /// to the pre-IR request. Providers (e.g. Anthropic, OpenAI/Copilot Responses)
-    /// override this to consume the IR structurally.
+    /// The default implementation lowers the IR for BOTH wire families and
+    /// delegates to [`chat_stream_with_options`](Self::chat_stream_with_options):
+    /// - the flat message list (`continuation_delta` mid-tool-loop, else `flatten`)
+    ///   for the Chat-Completions path;
+    /// - the Responses-API view (`instructions` / `input_messages` /
+    ///   `previous_response_id`) derived via [`PromptIR::responses_request_options`]
+    ///   and merged onto the request POLICY, so a Responses provider works WITHOUT
+    ///   overriding this method (Chat-Completions providers ignore those options).
+    ///
+    /// This is byte-identical to the pre-IR request. Block-native providers (e.g.
+    /// Anthropic) still override this to consume `system_blocks` structurally.
     async fn chat_stream_ir(
         &self,
         ir: &PromptIR,
@@ -222,8 +227,17 @@ pub trait LLMProvider: Send + Sync {
         } else {
             ir.flatten()
         };
-        self.chat_stream_with_options(&messages, tools, max_output_tokens, model, options)
-            .await
+        let mut effective_options = options.cloned().unwrap_or_default();
+        effective_options.responses =
+            Some(ir.responses_request_options(effective_options.responses.as_ref()));
+        self.chat_stream_with_options(
+            &messages,
+            tools,
+            max_output_tokens,
+            model,
+            Some(&effective_options),
+        )
+        .await
     }
 
     /// Lists available models from this provider
@@ -262,10 +276,11 @@ mod tests {
     async fn chat_stream_ir_default_flattens_and_delegates() {
         use crate::prompt_ir::{PromptIR, Segment, SegmentRole};
 
-        // A provider that captures whatever message list it is handed.
+        // A provider that captures the message list AND the options it is handed.
         #[derive(Default)]
         struct Capture {
             seen: Arc<Mutex<Vec<Message>>>,
+            seen_responses: Arc<Mutex<Option<crate::provider::ResponsesRequestOptions>>>,
         }
         #[async_trait]
         impl LLMProvider for Capture {
@@ -284,9 +299,11 @@ mod tests {
                 _t: &[ToolSchema],
                 _mt: Option<u32>,
                 _model: &str,
-                _o: Option<&LLMRequestOptions>,
+                o: Option<&LLMRequestOptions>,
             ) -> Result<LLMStream> {
                 *self.seen.lock().expect("seen lock") = messages.to_vec();
+                *self.seen_responses.lock().expect("resp lock") =
+                    o.and_then(|value| value.responses.clone());
                 Ok(Box::pin(stream::iter(Vec::<Result<LLMChunk>>::new())))
             }
         }
@@ -316,6 +333,24 @@ mod tests {
         // system + guide + dyn + ask
         assert_eq!(seen.len(), 4);
         assert!(matches!(seen[0].role, bamboo_domain::Role::System));
+
+        // SAFETY NET: the default also derives the Responses-API view from the IR, so
+        // a Responses provider works without overriding `chat_stream_ir`. instructions
+        // = the (trimmed) system field; input_messages = the full responses_input view
+        // (system lifted out, so it does not lead with a system message).
+        let responses = cap
+            .seen_responses
+            .lock()
+            .expect("resp lock")
+            .clone()
+            .expect("default derives Responses options from the IR");
+        assert_eq!(responses.instructions.as_deref(), Some("sys"));
+        let input = responses.input_messages.expect("input_messages derived");
+        assert_eq!(
+            input.iter().map(|m| m.content.clone()).collect::<Vec<_>>(),
+            vec!["guide".to_string(), "dyn".to_string(), "ask".to_string()],
+            "input_messages is the responses_input view: NO leading system message"
+        );
     }
 
     #[derive(Clone, Default)]

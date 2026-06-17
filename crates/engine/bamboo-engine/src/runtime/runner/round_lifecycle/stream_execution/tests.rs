@@ -1189,15 +1189,32 @@ fn envelope_ir_flatten_orders_runs_canonically() {
 }
 
 #[test]
-fn engine_continuation_delta_puts_remainder_first_then_conversation_tail() {
-    // GOLDEN: the engine's continuation (boundary = last assistant in the
-    // Conversation run) yields a delta that is exactly SystemRemainder FIRST, then
-    // the conversation tail after the committed assistant turn — the
-    // deliberately-different ordering from the chat view, asserted self-contained
-    // against the IR (no legacy pre-bake to compare to).
+fn engine_continuation_delta_orders_all_four_runs() {
+    // GOLDEN: the engine's continuation delta exercises ALL FOUR runs in the
+    // canonical delta order — SystemRemainder FIRST, then DynamicContext (summary),
+    // then the conversation tail after the committed assistant turn, then the
+    // VolatileTail — the deliberately-different ordering from the chat view. The
+    // fixture populates EVERY run so the full ordering is verified (not just
+    // remainder + tail), and the tail is id-pinned to the exact post-boundary
+    // message instance.
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-ir-delta-golden", "test-model");
     session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
+    // DynamicContext run: a conversation summary (rides the front/dynamic context).
+    session.conversation_summary = Some(ConversationSummary::new("DELTA_SUMMARY_MARKER", 2, 50));
+    // VolatileTail run: a task list.
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Tasks".to_string(),
+        items: vec![TaskItem {
+            id: "t1".to_string(),
+            description: "DELTA_TASK_MARKER".to_string(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
     let config = test_config("BASE_IDENTITY");
     let prepared_context = PreparedContext {
         messages: vec![
@@ -1206,7 +1223,7 @@ fn engine_continuation_delta_puts_remainder_first_then_conversation_tail() {
             Message::assistant("calling tool", None),
             Message::tool_result("call_1", "{\"ok\":true}"),
         ],
-        token_usage: usage(0, 22),
+        token_usage: usage(2, 40),
         truncation_occurred: false,
         segments_removed: 0,
         compressed_message_ids: Vec::new(),
@@ -1219,16 +1236,49 @@ fn engine_continuation_delta_puts_remainder_first_then_conversation_tail() {
         "resp_prev",
     );
 
-    // Remainder (the persisted operator note) leads; the conversation tail is only
-    // the tool result after the committed assistant turn.
-    let delta = message_shape(&envelope.ir.continuation_delta());
+    let delta = envelope.ir.continuation_delta();
+    let shape = message_shape(&delta);
+    let pos = |needle: &str| {
+        shape
+            .iter()
+            .position(|(_, c)| c.contains(needle))
+            .unwrap_or_else(|| panic!("delta missing {needle}: {shape:?}"))
+    };
+    // All four runs present, in canonical delta order.
     assert_eq!(
-        delta,
-        vec![
-            (Role::System, "PERSISTED OPERATOR NOTE".to_string()),
-            (Role::Tool, "{\"ok\":true}".to_string()),
-        ],
-        "delta = SystemRemainder FIRST, then the post-assistant conversation tail"
+        pos("PERSISTED OPERATOR NOTE"),
+        0,
+        "SystemRemainder is FIRST"
+    );
+    assert!(matches!(shape[0].0, Role::System));
+    assert!(
+        pos("PERSISTED OPERATOR NOTE") < pos("DELTA_SUMMARY_MARKER"),
+        "remainder before the dynamic-context summary"
+    );
+    assert!(
+        pos("DELTA_SUMMARY_MARKER") < pos("{\"ok\":true}"),
+        "dynamic-context summary before the conversation tail"
+    );
+    assert!(
+        pos("{\"ok\":true}") < pos("DELTA_TASK_MARKER"),
+        "conversation tail before the volatile tail"
+    );
+
+    // The tail is ONLY the post-assistant message (the tool result), pinned by the
+    // exact message id from the Conversation run — NOT the whole conversation.
+    let conversation = envelope.ir.run(bamboo_llm::SegmentRole::Conversation);
+    let tool_result_id = &conversation.last().expect("tool result present").id;
+    assert!(
+        delta
+            .iter()
+            .any(|m| &m.id == tool_result_id && matches!(m.role, Role::Tool)),
+        "delta carries the exact post-boundary message instance (id-pinned)"
+    );
+    assert!(
+        !delta
+            .iter()
+            .any(|m| m.content == "run a tool" || m.content == "calling tool"),
+        "pre-boundary turns (user + committed assistant) are NOT in the delta"
     );
 }
 
@@ -1410,17 +1460,34 @@ fn ir_responses_view_orders_guide_skill_conversation_and_lifts_system_to_instruc
         "the stable system rides instructions, so the input array does not LEAD with a system message"
     );
 
-    // The adapter lifts the system field to top-level instructions (trimmed).
+    // The adapter lifts the stable system to top-level instructions. Asserted by
+    // CONTENT (not by re-deriving from system_field, which would be tautological):
+    // instructions carries the base identity but NOT the relocated guide/skill —
+    // proving the guide/skill left the system and ride the input array instead.
     let responses = envelope.ir.responses_request_options(None);
-    assert_eq!(
-        responses.instructions.as_deref(),
-        Some(envelope.ir.system_field().trim()),
-        "instructions = the trimmed system field"
+    let instructions = responses.instructions.expect("instructions lifted");
+    assert!(
+        instructions.contains("BASE_IDENTITY"),
+        "instructions carries the stable base identity"
     );
-    assert_eq!(
-        responses.input_messages.map(|m| message_shape(&m)),
-        Some(input),
-        "input_messages == ir.responses_input()"
+    assert!(
+        !instructions.contains("NOVA_GUIDANCE_MARKER")
+            && !instructions.contains("SKILL_CONTEXT_MARKER"),
+        "the relocated guide + skill are NOT in instructions (they ride the input array)"
+    );
+    assert!(
+        instructions == instructions.trim(),
+        "instructions are trimmed (byte-faithful to build_responses_body)"
+    );
+    // The adapter wires the responses_input view as the Responses input array.
+    let wired = responses
+        .input_messages
+        .expect("input_messages derived")
+        .iter()
+        .any(|m| m.content.contains("NOVA_GUIDANCE_MARKER"));
+    assert!(
+        wired,
+        "input_messages carries the relocated guide (the responses_input view)"
     );
 }
 
