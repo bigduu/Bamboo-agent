@@ -282,47 +282,21 @@ pub trait LLMProvider: Send + Sync {
             .await
     }
 
-    /// Stream a completion from the canonical [`PromptLanes`] contract — the
-    /// structure-preserving entry point.
-    ///
-    /// The provider receives the prompt LAYERS (static system, stable prefix,
-    /// dynamic context, conversation) and is expected to render them into its own
-    /// dialect: place the system block in its system field and the cache
-    /// breakpoint at the structural stable↔dynamic boundary, rather than
-    /// re-deriving both from a flattened message list.
-    ///
-    /// The default implementation flattens the lanes ([`PromptLanes::flatten`])
-    /// and delegates to [`LLMProvider::chat_stream_with_options`], so a provider
-    /// that has not yet been migrated produces exactly the request it does today.
-    async fn chat_stream_lanes(
-        &self,
-        lanes: &PromptLanes,
-        tools: &[ToolSchema],
-        max_output_tokens: Option<u32>,
-        model: &str,
-        options: Option<&LLMRequestOptions>,
-    ) -> Result<LLMStream> {
-        let messages = lanes.flatten();
-        self.chat_stream_with_options(&messages, tools, max_output_tokens, model, options)
-            .await
-    }
-
-    /// Stream from the canonical [`PromptIR`] — the rich, provider-agnostic
-    /// request that supersedes [`PromptLanes`] as the single entry point.
+    /// Stream from the canonical [`PromptIR`] — the single, rich, provider-agnostic
+    /// request the engine emits once per round.
     ///
     /// A provider renders the IR into its own wire format by calling the lowering
     /// methods ([`PromptIR::system_field`], [`PromptIR::body_chat`],
     /// [`PromptIR::responses_input`], [`PromptIR::continuation_delta`]). The IR
     /// carries the stateful Responses continuation, so an adapter derives the
-    /// delta itself instead of the engine pre-baking it.
+    /// delta itself rather than the engine pre-baking it.
     ///
-    /// The default implementation reproduces today's behavior exactly: a
-    /// continuation routes [`PromptIR::continuation_delta`] through
-    /// [`chat_stream_with_options`](Self::chat_stream_with_options); a normal
-    /// request reconstructs the lanes ([`PromptIR::to_lanes`]) and routes through
-    /// [`chat_stream_lanes`](Self::chat_stream_lanes) so a block-native provider
-    /// still renders structurally. Providers override this to consume the IR
-    /// directly.
+    /// The default implementation flattens the IR — a continuation sends
+    /// [`PromptIR::continuation_delta`], a normal request sends
+    /// [`PromptIR::flatten`] — and delegates to
+    /// [`chat_stream_with_options`](Self::chat_stream_with_options), byte-identical
+    /// to the pre-IR request. Providers (e.g. Anthropic, OpenAI/Copilot Responses)
+    /// override this to consume the IR structurally.
     async fn chat_stream_ir(
         &self,
         ir: &PromptIR,
@@ -331,15 +305,13 @@ pub trait LLMProvider: Send + Sync {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
-        if ir.continuation.is_some() {
-            let delta = ir.continuation_delta();
-            self.chat_stream_with_options(&delta, tools, max_output_tokens, model, options)
-                .await
+        let messages = if ir.continuation.is_some() {
+            ir.continuation_delta()
         } else {
-            let lanes = ir.to_lanes();
-            self.chat_stream_lanes(&lanes, tools, max_output_tokens, model, options)
-                .await
-        }
+            ir.flatten()
+        };
+        self.chat_stream_with_options(&messages, tools, max_output_tokens, model, options)
+            .await
     }
 
     /// Lists available models from this provider
@@ -393,7 +365,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_stream_lanes_default_flattens_and_delegates() {
+    async fn chat_stream_ir_default_flattens_and_delegates() {
+        use crate::prompt_ir::{PromptIR, Segment, SegmentRole};
+
         // A provider that captures whatever message list it is handed.
         #[derive(Default)]
         struct Capture {
@@ -408,7 +382,7 @@ mod tests {
                 _mt: Option<u32>,
                 _model: &str,
             ) -> Result<LLMStream> {
-                unreachable!("default chat_stream_lanes must route via chat_stream_with_options")
+                unreachable!("default chat_stream_ir must route via chat_stream_with_options")
             }
             async fn chat_stream_with_options(
                 &self,
@@ -424,21 +398,23 @@ mod tests {
         }
 
         let cap = Capture::default();
-        let lanes = PromptLanes {
-            stable_instructions: "sys".into(),
-            stable_prefix_messages: vec![Message::user("guide")],
-            dynamic_context_messages: vec![Message::user("dyn")],
-            conversation_messages: vec![Message::user("ask")],
-            ..PromptLanes::default()
+        let ir = PromptIR {
+            system_text: "sys".into(),
+            segments: vec![
+                Segment::new(SegmentRole::StablePrefix, vec![Message::user("guide")]),
+                Segment::new(SegmentRole::DynamicContext, vec![Message::user("dyn")]),
+                Segment::new(SegmentRole::Conversation, vec![Message::user("ask")]),
+            ],
+            ..PromptIR::default()
         };
         let _ = cap
-            .chat_stream_lanes(&lanes, &[], None, "m", None)
+            .chat_stream_ir(&ir, &[], None, "m", None)
             .await
-            .expect("lanes stream");
+            .expect("ir stream");
 
         let seen = cap.seen.lock().expect("seen lock").clone();
-        let expected = lanes.flatten();
-        assert_eq!(seen.len(), expected.len(), "delegates the flattened lanes");
+        let expected = ir.flatten();
+        assert_eq!(seen.len(), expected.len(), "delegates the flattened IR");
         for (got, want) in seen.iter().zip(expected.iter()) {
             assert_eq!(got.role, want.role);
             assert_eq!(got.content, want.content);

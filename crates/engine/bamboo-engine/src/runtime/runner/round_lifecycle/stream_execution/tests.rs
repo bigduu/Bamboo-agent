@@ -34,8 +34,8 @@ struct MockLlmProvider {
     requested_text_verbosity: Mutex<Option<String>>,
     requested_instructions: Mutex<Option<String>>,
     /// Set when the engine routed this request through the canonical
-    /// `chat_stream_lanes` entry point (the normal, non-continuation path).
-    lanes_invoked: Mutex<bool>,
+    /// `chat_stream_ir` entry point.
+    ir_invoked: Mutex<bool>,
 }
 
 #[async_trait]
@@ -50,17 +50,22 @@ impl LLMProvider for MockLlmProvider {
         panic!("chat_stream should not be called directly in this test");
     }
 
-    async fn chat_stream_lanes(
+    async fn chat_stream_ir(
         &self,
-        lanes: &bamboo_llm::PromptLanes,
+        ir: &bamboo_llm::PromptIR,
         tools: &[bamboo_agent_core::tools::ToolSchema],
         max_output_tokens: Option<u32>,
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> bamboo_llm::provider::Result<LLMStream> {
-        *self.lanes_invoked.lock().expect("lanes_invoked lock") = true;
-        // Mirror the default behavior so `requested_messages` is still captured.
-        self.chat_stream_with_options(&lanes.flatten(), tools, max_output_tokens, model, options)
+        *self.ir_invoked.lock().expect("ir_invoked lock") = true;
+        // Mirror the default lowering so `requested_messages` is still captured.
+        let messages = if ir.continuation.is_some() {
+            ir.continuation_delta()
+        } else {
+            ir.flatten()
+        };
+        self.chat_stream_with_options(&messages, tools, max_output_tokens, model, options)
             .await
     }
 
@@ -126,7 +131,7 @@ fn mock_llm(chunks: Vec<LLMChunk>) -> Arc<MockLlmProvider> {
         requested_include: Mutex::new(None),
         requested_text_verbosity: Mutex::new(None),
         requested_instructions: Mutex::new(None),
-        lanes_invoked: Mutex::new(false),
+        ir_invoked: Mutex::new(false),
     })
 }
 
@@ -619,10 +624,10 @@ async fn execute_llm_stream_routes_normal_request_through_lanes_with_relocated_g
     .await
     .expect("execute llm stream");
 
-    // Normal (non-continuation) requests go through the canonical lanes entry.
+    // Requests go through the single canonical IR entry point.
     assert!(
-        *llm.lanes_invoked.lock().expect("lanes_invoked lock"),
-        "normal request must route through chat_stream_lanes"
+        *llm.ir_invoked.lock().expect("ir_invoked lock"),
+        "request must route through chat_stream_ir"
     );
 
     // What the provider actually received: the leading system message keeps the
