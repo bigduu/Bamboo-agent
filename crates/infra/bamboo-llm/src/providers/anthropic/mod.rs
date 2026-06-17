@@ -23,8 +23,9 @@ use reqwest::{header::HeaderMap, Client};
 use serde_json::{json, Value};
 
 use crate::cache::{CacheTtl, PromptCachePlan, MAX_ANTHROPIC_CACHE_BREAKPOINTS};
+use crate::prompt_ir::PromptIR;
 use crate::provider::LLMRequestOptions;
-use crate::provider::{LLMError, LLMProvider, LLMStream, PromptLanes, Result};
+use crate::provider::{LLMError, LLMProvider, LLMStream, Result};
 use crate::providers::common::model_fetcher;
 use crate::providers::common::request_overrides;
 use crate::types::LLMChunk;
@@ -150,37 +151,30 @@ impl LLMProvider for AnthropicProvider {
     /// built per-block (and the conversation lanes flow straight through, never
     /// collapsing the system into the message list); otherwise this flattens the
     /// lanes, byte-identical to the legacy request.
-    async fn chat_stream_lanes(
+    /// Render the canonical [`PromptIR`] into the Anthropic wire: the structured
+    /// system field rides `system_blocks` (per-block `cache_control`), and the
+    /// body is `ir.body_chat()`. Anthropic re-sends the full message array each
+    /// turn (the prompt-cache breakpoints absorb the stable prefix) and never uses
+    /// `previous_response_id`, so the IR continuation is not consulted here. Falls
+    /// back to `ir.flatten()` when there are no structured system blocks (the
+    /// zero-tools path), byte-identical to the legacy lanes rendering.
+    async fn chat_stream_ir(
         &self,
-        lanes: &PromptLanes,
+        ir: &PromptIR,
         tools: &[ToolSchema],
         max_output_tokens: Option<u32>,
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
-        if lanes.system_blocks.is_empty() {
+        if ir.system_blocks.is_empty() {
             return self
-                .stream_messages_inner(
-                    &lanes.flatten(),
-                    &[],
-                    tools,
-                    max_output_tokens,
-                    model,
-                    options,
-                )
+                .stream_messages_inner(&ir.flatten(), &[], tools, max_output_tokens, model, options)
                 .await;
         }
-        let mut messages = Vec::with_capacity(
-            lanes.stable_prefix_messages.len()
-                + lanes.dynamic_context_messages.len()
-                + lanes.conversation_messages.len(),
-        );
-        messages.extend(lanes.stable_prefix_messages.iter().cloned());
-        messages.extend(lanes.dynamic_context_messages.iter().cloned());
-        messages.extend(lanes.conversation_messages.iter().cloned());
+        let messages = ir.body_chat();
         self.stream_messages_inner(
             &messages,
-            &lanes.system_blocks,
+            &ir.system_blocks,
             tools,
             max_output_tokens,
             model,
