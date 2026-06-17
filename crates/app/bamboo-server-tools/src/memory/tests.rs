@@ -37,6 +37,7 @@ fn test_context<'a>(session_id: &'a str) -> ToolExecutionContext<'a> {
         tool_call_id: "tool-call-1",
         event_tx: None,
         available_tool_schemas: None,
+        bypass_permissions: false,
     }
 }
 

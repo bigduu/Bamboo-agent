@@ -45,6 +45,7 @@ async fn ask_agent_tool_queries_a_broker_agent() {
         tool_call_id: "tc1",
         event_tx: None,
         available_tool_schemas: None,
+        bypass_permissions: false,
     };
     let result = tool
         .execute_with_context(
@@ -73,6 +74,7 @@ async fn ask_agent_tool_rejects_unknown_mode() {
         tool_call_id: "tc2",
         event_tx: None,
         available_tool_schemas: None,
+        bypass_permissions: false,
     };
     let err = tool
         .execute_with_context(

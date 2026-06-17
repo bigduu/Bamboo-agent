@@ -125,6 +125,11 @@ pub struct SessionIndexEntry {
     /// APIs can surface plan mode without loading every session.json.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_mode: Option<bamboo_domain::PlanModeState>,
+    /// Per-session "bypass permissions" toggle mirrored into the index from
+    /// `session.agent_runtime_state.bypass_permissions`, so the session-list API
+    /// can surface it without loading every session.json.
+    #[serde(default)]
+    pub bypass_permissions: bool,
     /// Last known run status for this session
     /// ("pending" | "running" | "completed" | "error" | "cancelled" | "skipped").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -525,6 +530,10 @@ impl SessionStoreV2 {
             .agent_runtime_state
             .as_ref()
             .and_then(|state| state.plan_mode.clone());
+        let bypass_permissions = session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| state.bypass_permissions);
         self.update_index(|index| {
             index.sessions.insert(
                 session.id.clone(),
@@ -551,6 +560,7 @@ impl SessionStoreV2 {
                     has_attachments,
                     has_pending_question: session.has_pending_question(),
                     plan_mode,
+                    bypass_permissions,
                     last_run_status,
                     last_run_error,
                     token_usage: session.token_usage.clone(),

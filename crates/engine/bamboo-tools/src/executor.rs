@@ -279,9 +279,25 @@ impl ToolExecutor for BuiltinToolExecutor {
             if let Some(contexts) =
                 check_permissions(&tool_name, &args).map_err(permission_error_to_tool_error)?
             {
+                // "Always ask" rules (configured patterns + built-in dangerous
+                // commands) force a confirmation even under bypass. Everything
+                // else is skipped when this session is in "bypass permissions"
+                // mode (scoped per-session via its runtime state).
+                let force_ask =
+                    permission_checker.requires_forced_confirmation(&tool_name, &args);
                 for context in contexts {
+                    if ctx.bypass_permissions && !force_ask {
+                        continue;
+                    }
                     let resource = context.resource.clone();
-                    match permission_checker.check_or_request(context).await {
+                    // Forced confirmations route through `check_or_request_forced`
+                    // so the active mode/bypass cannot suppress the prompt.
+                    let decision = if force_ask {
+                        permission_checker.check_or_request_forced(context).await
+                    } else {
+                        permission_checker.check_or_request(context).await
+                    };
+                    match decision {
                         Ok(true) => {}
                         Ok(false) => {
                             return Err(ToolError::Execution(format!(
@@ -882,6 +898,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bypass_permissions_skips_checker() {
+        // Even with a deny-all checker, a context flagged `bypass_permissions`
+        // must skip the permission check entirely and let the write through.
+        let checker = Arc::new(crate::permission::DenyDangerousPermissionChecker);
+        let executor = make_executor(Some(checker));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bypass_allows_write.txt");
+        let path_str = path.to_str().unwrap();
+
+        let call = make_tool_call("Write", json!({"file_path": path_str, "content": "ok"}));
+        let ctx = ToolExecutionContext {
+            session_id: Some("s-bypass"),
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: true,
+        };
+        let result = executor.execute_with_context(&call, ctx).await;
+
+        assert!(result.is_ok(), "bypass should allow the write: {result:?}");
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn test_forced_ask_rule_overrides_bypass() {
+        // A configured "always ask" rule must force a confirmation even when the
+        // session is in bypass mode. With no event sink the executor fails closed
+        // (approval required) rather than silently writing.
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config.set_ask_rules(["Write(/etc/**)".to_string()]);
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = make_executor(Some(checker));
+
+        let call = make_tool_call("Write", json!({"file_path": "/etc/forced.conf", "content": "x"}));
+        let ctx = ToolExecutionContext {
+            session_id: Some("s-forced"),
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: true,
+        };
+        let result = executor.execute_with_context(&call, ctx).await;
+
+        assert!(
+            matches!(result, Err(ToolError::Execution(ref m)) if m.contains("approval required")),
+            "forced ask rule should block under bypass: {result:?}"
+        );
+        assert!(fs::metadata("/etc/forced.conf").await.is_err());
+    }
+
+    #[tokio::test]
     async fn tool_can_stream_events_via_execute_with_context() {
         struct StreamingTool;
 
@@ -937,6 +1004,7 @@ mod tests {
                     tool_call_id: &call.id,
                     event_tx: Some(&tx),
                     available_tool_schemas: None,
+                    bypass_permissions: false,
                 },
             )
             .await

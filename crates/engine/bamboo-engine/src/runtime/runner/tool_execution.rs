@@ -187,6 +187,8 @@ async fn execute_and_apply_single_tool_call(
                     round,
                     tools,
                     config,
+                    session_flags:
+                        bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session(session),
                 })
                 .await
             }
@@ -475,6 +477,11 @@ pub(crate) async fn execute_round_tool_calls(
             let parallel_start = std::time::Instant::now();
             let per_tool_timeout = std::time::Duration::from_secs(config.per_tool_timeout_secs);
             let batch_timeout = std::time::Duration::from_secs(config.parallel_batch_timeout_secs);
+            // Derive once before the parallel borrow; the Copy flags struct is
+            // captured by each concurrent task (we can't borrow `&mut session`
+            // inside them).
+            let session_flags =
+                bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session(session);
             let outcomes = tokio::time::timeout(
                 batch_timeout,
                 join_all(batch.iter().map(|tool_call| {
@@ -491,6 +498,7 @@ pub(crate) async fn execute_round_tool_calls(
                                 round,
                                 tools,
                                 config,
+                                session_flags,
                             }),
                         )
                         .await

@@ -248,6 +248,11 @@ pub struct AgentRuntimeState {
     pub checkpoints: Vec<HookCheckpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_mode: Option<PlanModeState>,
+    /// When `true`, this session skips all tool permission checks (the
+    /// "bypass permissions" mode). Scoped to a single session so concurrent
+    /// sessions are unaffected; persisted in `runtime.json`.
+    #[serde(default)]
+    pub bypass_permissions: bool,
 }
 
 impl AgentRuntimeState {
@@ -266,6 +271,7 @@ impl AgentRuntimeState {
             waiting_for_children: None,
             checkpoints: Vec::new(),
             plan_mode: None,
+            bypass_permissions: false,
         }
     }
 }
@@ -286,6 +292,7 @@ impl Default for AgentRuntimeState {
             waiting_for_children: None,
             checkpoints: Vec::new(),
             plan_mode: None,
+            bypass_permissions: false,
         }
     }
 }

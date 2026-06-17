@@ -50,6 +50,12 @@ const PRIVILEGE_ESCALATION_COMMANDS: &[&str] = &["sudo", "su", "doas", "run0", "
 const PERMISSION_MODIFICATION_COMMANDS: &[&str] = &["chmod", "chown", "chgrp", "chattr"];
 
 /// Sensitive paths that should not be redirected to.
+///
+/// NOTE: deliberately excludes the benign pseudo-devices `/dev/null`,
+/// `/dev/zero`, `/dev/random`, `/dev/urandom` — redirecting to them is a
+/// ubiquitous, harmless idiom (`2>/dev/null`). Flagging them produced a `Deny`
+/// verdict that forced approval on ordinary commands even under bypass. Only
+/// block devices and system files that can brick/compromise the host belong here.
 const SENSITIVE_REDIRECT_PATHS: &[&str] = &[
     "/etc/passwd",
     "/etc/shadow",
@@ -59,10 +65,6 @@ const SENSITIVE_REDIRECT_PATHS: &[&str] = &[
     "/dev/hd",
     "/dev/nvme",
     "/dev/mmcblk",
-    "/dev/null",
-    "/dev/zero",
-    "/dev/random",
-    "/dev/urandom",
     "/dev/mem",
     "/dev/kmem",
     "/dev/port",
@@ -1043,6 +1045,40 @@ fn check_heredoc_expansions_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Redirect-to-/dev/null is benign, not a sensitive-path Deny ----
+
+    #[test]
+    fn redirect_to_dev_null_is_not_denied() {
+        for cmd in [
+            "git stash 2>/dev/null",
+            "rm -f foo.tmp 2>/dev/null",
+            "ls >/dev/null 2>&1",
+            "grep -c foo bar 2>/dev/null; echo done",
+        ] {
+            let a = analyze_command(cmd);
+            assert_ne!(
+                a.verdict,
+                BashVerdict::Deny,
+                "`{cmd}` should not be Deny (redirect to /dev/null is benign)"
+            );
+            assert!(
+                !a.warnings
+                    .iter()
+                    .any(|w| w.kind == BashWarningKind::RedirectToSensitivePath),
+                "`{cmd}` should not flag RedirectToSensitivePath"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_to_block_device_still_denied() {
+        // Overwriting a real block device / system file must remain a hard Deny.
+        let a = analyze_command("echo x > /dev/sda");
+        assert_eq!(a.verdict, BashVerdict::Deny);
+        let a = analyze_command("echo x > /etc/passwd");
+        assert_eq!(a.verdict, BashVerdict::Deny);
+    }
 
     // ---- Safe commands ----
 

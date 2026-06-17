@@ -132,6 +132,13 @@ pub(super) async fn initialize_loop_state(
     let auxiliary_models = resolve_auxiliary_models(config);
 
     let mut runtime_state = AgentRuntimeState::new(&session_id);
+    // "Bypass permissions" is a per-session sticky toggle (set via PATCH /sessions
+    // and persisted in runtime.json). Each run rebuilds a fresh runtime state, so
+    // carry the flag forward from the prior state instead of resetting it.
+    runtime_state.bypass_permissions = session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|prev| prev.bypass_permissions);
     runtime_state.llm.model_name = Some(model_name.clone());
     runtime_state.llm.provider_name = config.provider_name.clone();
     runtime_state.llm.fast_model_name = auxiliary_models.fast_model_name.clone();

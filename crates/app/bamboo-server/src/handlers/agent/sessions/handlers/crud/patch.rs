@@ -148,7 +148,8 @@ pub async fn patch_session(
         || req.provider.is_some()
         || req.model.is_some()
         || req.reasoning_effort.is_some()
-        || req.clear_reasoning_effort.unwrap_or(false);
+        || req.clear_reasoning_effort.unwrap_or(false)
+        || req.bypass_permissions.is_some();
 
     if touches_non_metadata {
         let request_model_ref = derive_model_ref(
@@ -188,6 +189,16 @@ pub async fn patch_session(
                     session.reasoning_effort = None;
                 } else if let Some(reasoning_effort) = req.reasoning_effort {
                     session.reasoning_effort = Some(reasoning_effort);
+                }
+
+                // Per-session "bypass permissions" toggle. Stored on the session's
+                // runtime state (runtime.json), creating it on demand so the flag
+                // can be set before the session's first run.
+                if let Some(bypass) = req.bypass_permissions {
+                    session
+                        .agent_runtime_state
+                        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+                        .bypass_permissions = bypass;
                 }
 
                 model_changed

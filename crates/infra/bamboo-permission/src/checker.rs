@@ -141,6 +141,35 @@ pub trait PermissionChecker: Send + Sync {
     /// apply it to their shared config so it takes effect for subsequent checks.
     fn set_permission_mode(&self, _mode: PermissionMode) {}
 
+    /// Access the underlying mutable [`PermissionConfig`] when the implementation
+    /// is config-backed. Used by settings/admin endpoints to read and update
+    /// persisted rules (e.g. the "always ask" patterns). The default returns
+    /// `None`; config-backed implementations return their shared config.
+    fn permission_config(&self) -> Option<Arc<PermissionConfig>> {
+        None
+    }
+
+    /// Whether this tool call matches an "always ask" rule (configured pattern
+    /// or built-in dangerous-command detection) and must therefore force a user
+    /// confirmation REGARDLESS of the active permission mode — including
+    /// `BypassPermissions`. The default returns `false`; config-backed
+    /// implementations consult their [`PermissionConfig`].
+    fn requires_forced_confirmation(&self, _tool_name: &str, _args: &serde_json::Value) -> bool {
+        false
+    }
+
+    /// Like [`check_or_request`](Self::check_or_request) but IGNORES the active
+    /// permission mode/bypass. Used to enforce "always ask" rules even under
+    /// bypass. The default delegates to `check_or_request`, which is correct for
+    /// mode-unaware implementations; mode-aware wrappers override this to route
+    /// through their inner (mode-unaware) checker.
+    async fn check_or_request_forced(
+        &self,
+        ctx: PermissionContext,
+    ) -> Result<bool, PermissionError> {
+        self.check_or_request(ctx).await
+    }
+
     /// Check permission and either grant or request confirmation
     ///
     /// This is a convenience method that:
@@ -197,6 +226,14 @@ impl PermissionChecker for ConfigPermissionChecker {
     fn grant_session_permission(&self, perm_type: PermissionType, resource: String) {
         self.config.grant_session_permission(perm_type, resource);
     }
+
+    fn requires_forced_confirmation(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+        self.config.requires_forced_confirmation(tool_name, args)
+    }
+
+    fn permission_config(&self) -> Option<Arc<PermissionConfig>> {
+        Some(self.config.clone())
+    }
 }
 
 /// A permission checker that wraps another checker and logs all permission checks
@@ -243,6 +280,21 @@ impl<T: PermissionChecker> PermissionChecker for LoggingPermissionChecker<T> {
             resource
         );
         self.inner.grant_session_permission(perm_type, resource);
+    }
+
+    fn requires_forced_confirmation(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+        self.inner.requires_forced_confirmation(tool_name, args)
+    }
+
+    async fn check_or_request_forced(
+        &self,
+        ctx: PermissionContext,
+    ) -> Result<bool, PermissionError> {
+        self.inner.check_or_request_forced(ctx).await
+    }
+
+    fn permission_config(&self) -> Option<Arc<PermissionConfig>> {
+        self.inner.permission_config()
     }
 }
 
@@ -472,6 +524,25 @@ impl PermissionChecker for ModeAwarePermissionChecker {
         // Shared `Arc<PermissionConfig>` with `inner`, and `mode()` is read per
         // check, so this takes effect immediately for subsequent gating.
         self.config.set_mode(mode);
+    }
+
+    fn requires_forced_confirmation(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+        self.config.requires_forced_confirmation(tool_name, args)
+    }
+
+    async fn check_or_request_forced(
+        &self,
+        ctx: PermissionContext,
+    ) -> Result<bool, PermissionError> {
+        // Route through the inner (mode-unaware) checker so the active mode —
+        // including BypassPermissions — does NOT suppress the forced prompt.
+        // Session grants still short-circuit, so a re-attempt after approval
+        // passes.
+        self.inner.check_or_request(ctx).await
+    }
+
+    fn permission_config(&self) -> Option<Arc<PermissionConfig>> {
+        Some(self.config.clone())
     }
 }
 

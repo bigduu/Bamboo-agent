@@ -86,6 +86,14 @@ fn bamboo_v1_scope() -> impl HttpServiceFactory {
             web::post().to(settings::validate_keyword_entries),
         )
         .route(
+            "/bamboo/permission/ask-rules",
+            web::get().to(settings::get_permission_ask_rules),
+        )
+        .route(
+            "/bamboo/permission/ask-rules",
+            web::put().to(settings::update_permission_ask_rules),
+        )
+        .route(
             "/bamboo/settings/provider",
             web::get().to(settings::get_provider_config),
         )
