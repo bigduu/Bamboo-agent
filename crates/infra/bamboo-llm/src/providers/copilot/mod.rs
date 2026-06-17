@@ -13,7 +13,7 @@ use crate::provider::{
 };
 use crate::types::LLMChunk;
 use auth::{CopilotAuthHandler, DeviceCodeResponse};
-use bamboo_config::RequestOverridesConfig;
+use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
 use bamboo_domain::Message;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;
@@ -58,6 +58,7 @@ pub struct CopilotProvider {
     responses_only_models: Vec<String>,
     default_reasoning_effort: Option<ReasoningEffort>,
     request_overrides: Option<RequestOverridesConfig>,
+    masking_config: KeywordMaskingConfig,
     models_cache: RwLock<Option<CopilotModelsCache>>,
 }
 
@@ -80,6 +81,7 @@ impl CopilotProvider {
             responses_only_models: vec![],
             default_reasoning_effort: None,
             request_overrides: None,
+            masking_config: KeywordMaskingConfig::default(),
             models_cache: RwLock::new(None),
         }
     }
@@ -96,6 +98,7 @@ impl CopilotProvider {
             responses_only_models: vec![],
             default_reasoning_effort: None,
             request_overrides: None,
+            masking_config: KeywordMaskingConfig::default(),
             models_cache: RwLock::new(None),
         }
     }
@@ -131,6 +134,7 @@ impl CopilotProvider {
             responses_only_models: vec![],
             default_reasoning_effort: None,
             request_overrides: None,
+            masking_config: KeywordMaskingConfig::default(),
             models_cache: RwLock::new(None),
         }
     }
@@ -138,6 +142,13 @@ impl CopilotProvider {
     /// Configure models that must use Responses API upstream.
     pub fn with_responses_only_models(mut self, models: Vec<String>) -> Self {
         self.responses_only_models = models;
+        self
+    }
+
+    /// Configure keyword masking applied as a last-moment scan of every outbound
+    /// request body (see [`crate::masking`]).
+    pub fn with_masking(mut self, masking_config: KeywordMaskingConfig) -> Self {
+        self.masking_config = masking_config;
         self
     }
 
@@ -618,6 +629,8 @@ impl CopilotProvider {
             request_overrides::ENDPOINT_RESPONSES,
             Some(model),
         );
+        // Last-moment scan: mask every text value in the fully-assembled body.
+        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
 
         tracing::debug!(
             "[{}] Copilot provider using Responses API model: {}",
@@ -745,6 +758,7 @@ impl CopilotProvider {
                         request_overrides::ENDPOINT_RESPONSES,
                         Some(model),
                     );
+                    crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
                     let fallback_headers = self.build_llm_headers(
                         token,
                         messages,
@@ -1183,6 +1197,7 @@ impl LLMProvider for CopilotProvider {
             request_overrides::ENDPOINT_CHAT_COMPLETIONS,
             Some(upstream_model),
         );
+        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
         tracing::info!(
             "[{}] Copilot request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} [{}]",
             session_log_id,
@@ -1324,6 +1339,10 @@ impl LLMProvider for CopilotProvider {
                         self.request_overrides.as_ref(),
                         request_overrides::ENDPOINT_CHAT_COMPLETIONS,
                         Some(upstream_model),
+                    );
+                    crate::masking::mask_outbound_body(
+                        &mut body_no_reasoning,
+                        &self.masking_config,
                     );
 
                     let retry_headers = self.build_llm_headers(

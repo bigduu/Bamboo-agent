@@ -2413,4 +2413,52 @@ mod tests {
             other => panic!("expected reasoning token, got {other:?}"),
         }
     }
+
+    #[test]
+    fn last_moment_scan_masks_tool_call_arguments_in_a_real_responses_body() {
+        // End-to-end: the REAL Responses body builder emits an assistant tool call
+        // as a `function_call` item with `arguments`. The last-moment outbound scan
+        // must mask the secret inside those arguments (the gap field-by-field masking
+        // missed) while leaving call_id / name intact.
+        use crate::masking::mask_outbound_body;
+        use bamboo_config::keyword_masking::{KeywordEntry, MatchType};
+        use bamboo_config::KeywordMaskingConfig;
+
+        let messages = vec![
+            Message::user("look up hunter2 please"),
+            Message::assistant(
+                "calling",
+                Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "search".to_string(),
+                        arguments: r#"{"q":"hunter2"}"#.to_string(),
+                    },
+                }]),
+            ),
+        ];
+        let mut body = build_responses_body("gpt-5.4", &messages, &[], None, None, None, None);
+        let config = KeywordMaskingConfig {
+            entries: vec![KeywordEntry {
+                pattern: "hunter2".to_string(),
+                match_type: MatchType::Exact,
+                enabled: true,
+            }],
+        };
+        mask_outbound_body(&mut body, &config);
+
+        let input = body["input"].as_array().expect("input array");
+        // The user message text is masked.
+        assert_eq!(input[0]["content"], "look up [MASKED] please");
+        // The function_call arguments are masked (the previously-missed field)...
+        let function_call = input
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("function_call item");
+        assert_eq!(function_call["arguments"], r#"{"q":"[MASKED]"}"#);
+        // ...but the correlation id and tool name are preserved.
+        assert_eq!(function_call["call_id"], "call_1");
+        assert_eq!(function_call["name"], "search");
+    }
 }

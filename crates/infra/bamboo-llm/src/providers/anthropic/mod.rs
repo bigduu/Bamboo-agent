@@ -29,7 +29,7 @@ use crate::provider::{LLMError, LLMProvider, LLMStream, Result};
 use crate::providers::common::model_fetcher;
 use crate::providers::common::request_overrides;
 use crate::types::LLMChunk;
-use bamboo_config::RequestOverridesConfig;
+use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
 use bamboo_domain::ReasoningEffort;
 
 /// Anthropic Messages API provider.
@@ -40,6 +40,7 @@ pub struct AnthropicProvider {
     max_tokens: u32,
     default_reasoning_effort: Option<ReasoningEffort>,
     request_overrides: Option<RequestOverridesConfig>,
+    masking_config: KeywordMaskingConfig,
 }
 
 impl AnthropicProvider {
@@ -51,7 +52,15 @@ impl AnthropicProvider {
             max_tokens: 1024,
             default_reasoning_effort: None,
             request_overrides: None,
+            masking_config: KeywordMaskingConfig::default(),
         }
+    }
+
+    /// Configure keyword masking applied as a last-moment scan of every outbound
+    /// request body (see [`crate::masking`]).
+    pub fn with_masking(mut self, masking_config: KeywordMaskingConfig) -> Self {
+        self.masking_config = masking_config;
+        self
     }
 
     /// Overrides the internal HTTP client (e.g., to enable a proxy).
@@ -243,6 +252,8 @@ impl AnthropicProvider {
             request_overrides::ENDPOINT_MESSAGES,
             Some(model),
         );
+        // Last-moment scan: mask every text value in the fully-assembled body.
+        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
         // DIAGNOSTIC: count image blocks actually present in the OUTGOING request
         // body (top-level content blocks AND inside tool_result content arrays), so
         // we can tell with certainty whether a screenshot reaches the wire vs being
@@ -345,6 +356,7 @@ impl AnthropicProvider {
                     request_overrides::ENDPOINT_MESSAGES,
                     Some(model),
                 );
+                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
                 applied_reasoning_effort = None;
                 thinking_enabled = false;
                 thinking_budget_tokens = None;

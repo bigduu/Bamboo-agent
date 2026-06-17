@@ -3,7 +3,6 @@
 //! Creates LLM providers based on configuration.
 
 use crate::provider::{LLMError, LLMProvider};
-use crate::providers::common::MaskingProviderDecorator;
 use crate::providers::{
     AnthropicProvider, BodhiProvider, CopilotProvider, GeminiProvider, OpenAIProvider,
 };
@@ -83,10 +82,7 @@ pub async fn create_provider_by_name(
                     tracing::warn!("Copilot silent authentication failed: {}. Use POST /v1/bamboo/copilot/auth/start to authenticate.", e);
                 }
             }
-            Ok(Arc::new(MaskingProviderDecorator::new(
-                provider,
-                masking_config.clone(),
-            )))
+            Ok(Arc::new(provider.with_masking(masking_config.clone())))
         }
 
         "openai" => {
@@ -117,10 +113,7 @@ pub async fn create_provider_by_name(
             provider = provider.with_reasoning_effort(openai_config.reasoning_effort);
             provider = provider.with_request_overrides(openai_config.request_overrides.clone());
 
-            Ok(Arc::new(MaskingProviderDecorator::new(
-                provider,
-                masking_config.clone(),
-            )))
+            Ok(Arc::new(provider.with_masking(masking_config.clone())))
         }
 
         "anthropic" => {
@@ -149,10 +142,7 @@ pub async fn create_provider_by_name(
             provider = provider.with_reasoning_effort(anthropic_config.reasoning_effort);
             provider = provider.with_request_overrides(anthropic_config.request_overrides.clone());
 
-            Ok(Arc::new(MaskingProviderDecorator::new(
-                provider,
-                masking_config.clone(),
-            )))
+            Ok(Arc::new(provider.with_masking(masking_config.clone())))
         }
 
         "gemini" => {
@@ -178,10 +168,7 @@ pub async fn create_provider_by_name(
             provider = provider.with_reasoning_effort(gemini_config.reasoning_effort);
             provider = provider.with_request_overrides(gemini_config.request_overrides.clone());
 
-            Ok(Arc::new(MaskingProviderDecorator::new(
-                provider,
-                masking_config.clone(),
-            )))
+            Ok(Arc::new(provider.with_masking(masking_config.clone())))
         }
 
         "bodhi" => {
@@ -210,10 +197,7 @@ pub async fn create_provider_by_name(
                 .with_target_provider(target_provider)
                 .with_reasoning_effort(bodhi_config.reasoning_effort);
 
-            Ok(Arc::new(MaskingProviderDecorator::new(
-                provider,
-                masking_config.clone(),
-            )))
+            Ok(Arc::new(provider.with_masking(masking_config.clone())))
         }
 
         _ => Err(LLMError::Auth(format!(

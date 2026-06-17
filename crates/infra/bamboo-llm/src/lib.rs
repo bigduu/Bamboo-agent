@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod error;
 pub mod http_client;
+pub mod masking;
 pub mod model_catalog;
 pub mod models;
 pub mod prompt_ir;

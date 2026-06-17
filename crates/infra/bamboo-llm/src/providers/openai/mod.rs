@@ -14,7 +14,7 @@ use crate::provider::{
     LLMError, LLMProvider, LLMRequestOptions, LLMStream, ResponsesRequestOptions, Result,
 };
 use crate::types::LLMChunk;
-use bamboo_config::RequestOverridesConfig;
+use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
 use bamboo_domain::Message;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;
@@ -36,6 +36,7 @@ pub struct OpenAIProvider {
     responses_only_models: Vec<String>,
     default_reasoning_effort: Option<ReasoningEffort>,
     request_overrides: Option<RequestOverridesConfig>,
+    masking_config: KeywordMaskingConfig,
 }
 
 impl OpenAIProvider {
@@ -48,7 +49,15 @@ impl OpenAIProvider {
             responses_only_models: vec![],
             default_reasoning_effort: None,
             request_overrides: None,
+            masking_config: KeywordMaskingConfig::default(),
         }
+    }
+
+    /// Configure keyword masking applied as a last-moment scan of every outbound
+    /// request body (see [`crate::masking`]).
+    pub fn with_masking(mut self, masking_config: KeywordMaskingConfig) -> Self {
+        self.masking_config = masking_config;
+        self
     }
 
     /// Sets a custom base URL (e.g., for proxies or alternative endpoints).
@@ -185,6 +194,8 @@ impl OpenAIProvider {
             request_overrides::ENDPOINT_RESPONSES,
             Some(model),
         );
+        // Last-moment scan: mask every text value in the fully-assembled body.
+        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
         tracing::info!(
             "[{}] OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} input_source={} input_messages_before={} input_messages_after={} duplicate_system_fallback={} [{}]",
             session_log_id,
@@ -242,6 +253,7 @@ impl OpenAIProvider {
                     request_overrides::ENDPOINT_RESPONSES,
                     Some(model),
                 );
+                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
                 let fallback_headers =
                     self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
                 let fallback = self
@@ -365,6 +377,7 @@ impl LLMProvider for OpenAIProvider {
             request_overrides::ENDPOINT_CHAT_COMPLETIONS,
             Some(model),
         );
+        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
         tracing::info!(
             "[{}] OpenAI request protocol=chat_completions model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} [{}]",
             session_log_id,
@@ -417,6 +430,7 @@ impl LLMProvider for OpenAIProvider {
                     request_overrides::ENDPOINT_CHAT_COMPLETIONS,
                     Some(model),
                 );
+                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
                 let fallback_headers =
                     self.build_headers(request_overrides::ENDPOINT_CHAT_COMPLETIONS, Some(model))?;
                 let fallback = self
