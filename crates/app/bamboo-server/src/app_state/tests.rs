@@ -264,6 +264,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
                 tool_call_id: "tool-call-write-target",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -291,6 +292,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
                 tool_call_id: "tool-call-write-source",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -317,6 +319,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
                 tool_call_id: "tool-call-merge",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -363,6 +366,7 @@ async fn memory_tool_write_merges_heuristically_similar_memory_when_enabled() {
                 tool_call_id: "tool-call-write-heuristic-original",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -390,6 +394,7 @@ async fn memory_tool_write_merges_heuristically_similar_memory_when_enabled() {
                 tool_call_id: "tool-call-write-heuristic-merge",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -413,6 +418,7 @@ async fn memory_tool_write_merges_heuristically_similar_memory_when_enabled() {
                 tool_call_id: "tool-call-inspect-heuristic-merge",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -452,6 +458,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
                 tool_call_id: "tool-call-write-contradict-target",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -477,6 +484,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
                 tool_call_id: "tool-call-write-contradict-source",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -503,6 +511,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
                 tool_call_id: "tool-call-contradict",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -549,6 +558,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 tool_call_id: "tool-call-write-stale",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -573,6 +583,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 tool_call_id: "tool-call-mark-stale",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -596,6 +607,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 tool_call_id: "tool-call-write-active",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -622,6 +634,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 tool_call_id: "tool-call-batch-purge",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -662,6 +675,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
                 tool_call_id: "tool-call-write-inspect",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -682,6 +696,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
                 tool_call_id: "tool-call-inspect",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -709,6 +724,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
                 tool_call_id: "tool-call-rebuild",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await

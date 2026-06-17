@@ -23,6 +23,7 @@ fn ctx() -> ToolExecutionContext<'static> {
         tool_call_id: "tc",
         event_tx: None,
         available_tool_schemas: None,
+        bypass_permissions: false,
     }
 }
 

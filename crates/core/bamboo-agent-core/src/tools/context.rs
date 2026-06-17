@@ -8,11 +8,46 @@
 use tokio::sync::mpsc;
 
 use crate::tools::ToolSchema;
-use crate::AgentEvent;
+use crate::{AgentEvent, Session};
+
+/// Per-session flags that flow into every tool call's [`ToolExecutionContext`].
+///
+/// These are derived ONCE from the executing [`Session`] (via
+/// [`ToolExecutionSessionFlags::from_session`]) and copied into the context. To
+/// add a new per-session execution flag, add a field here, derive it in
+/// `from_session`, and map it in [`ToolExecutionContext::for_dispatch`]. Because
+/// both agent loops build their context through `for_dispatch`, a new flag
+/// reaches every dispatch path automatically — it can't be wired into one loop
+/// and silently skipped in the other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ToolExecutionSessionFlags {
+    /// When `true`, the session is in "bypass permissions" mode and tool
+    /// permission checks are skipped. Sourced from the session's runtime state.
+    pub bypass_permissions: bool,
+}
+
+impl ToolExecutionSessionFlags {
+    /// Derive the per-session tool-execution flags from a session's runtime
+    /// state. This is the single source of truth for both agent loops.
+    pub fn from_session(session: &Session) -> Self {
+        Self {
+            bypass_permissions: session
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|state| state.bypass_permissions),
+        }
+    }
+}
 
 /// Context passed to tools during execution.
 ///
 /// All fields are optional and should be treated as best-effort hints.
+///
+/// ⚠️ Real tool dispatch must build this via [`ToolExecutionContext::for_dispatch`]
+/// (both agent loops do), NOT a struct literal — that routes every per-session
+/// flag through [`ToolExecutionSessionFlags`] so a new flag can't be wired into
+/// one loop and silently skipped in the other. Struct literals are for tests
+/// and tools that synthesize a child context.
 #[derive(Clone, Copy, Debug)]
 pub struct ToolExecutionContext<'a> {
     /// Bamboo session id that is executing the tool.
@@ -23,6 +58,10 @@ pub struct ToolExecutionContext<'a> {
     pub event_tx: Option<&'a mpsc::Sender<AgentEvent>>,
     /// Snapshot of tools currently available to the executing session.
     pub available_tool_schemas: Option<&'a [ToolSchema]>,
+    /// When `true`, the executing session is in "bypass permissions" mode, so
+    /// tool permission checks are skipped. Sourced per-session from the
+    /// session's runtime state (`runtime.json`), not the global checker.
+    pub bypass_permissions: bool,
 }
 
 impl<'a> ToolExecutionContext<'a> {
@@ -32,6 +71,28 @@ impl<'a> ToolExecutionContext<'a> {
             tool_call_id,
             event_tx: None,
             available_tool_schemas: None,
+            bypass_permissions: false,
+        }
+    }
+
+    /// Build a context for a real tool dispatch, applying every per-session flag
+    /// from [`ToolExecutionSessionFlags`]. This is the SINGLE place that maps
+    /// session flags onto the context, and the only constructor the agent loops
+    /// use — keep both loops (`per_call.rs`, `result_handler.rs`) on it so a new
+    /// per-session field reaches all dispatch paths without per-site edits.
+    pub fn for_dispatch(
+        session_id: &'a str,
+        tool_call_id: &'a str,
+        event_tx: &'a mpsc::Sender<AgentEvent>,
+        available_tool_schemas: &'a [ToolSchema],
+        flags: ToolExecutionSessionFlags,
+    ) -> Self {
+        Self {
+            session_id: Some(session_id),
+            tool_call_id,
+            event_tx: Some(event_tx),
+            available_tool_schemas: Some(available_tool_schemas),
+            bypass_permissions: flags.bypass_permissions,
         }
     }
 
@@ -68,6 +129,44 @@ impl<'a> ToolExecutionContext<'a> {
 }
 
 #[cfg(test)]
+mod session_flags_tests {
+    use super::*;
+    use bamboo_domain::AgentRuntimeState;
+
+    #[test]
+    fn from_session_defaults_false_without_runtime_state() {
+        let session = Session::new("s-none", "test-model");
+        assert_eq!(
+            ToolExecutionSessionFlags::from_session(&session),
+            ToolExecutionSessionFlags { bypass_permissions: false }
+        );
+    }
+
+    #[test]
+    fn from_session_reads_bypass_from_runtime_state() {
+        let mut session = Session::new("s-bypass", "test-model");
+        let mut runtime = AgentRuntimeState::new("run-1");
+        runtime.bypass_permissions = true;
+        session.agent_runtime_state = Some(runtime);
+        assert!(ToolExecutionSessionFlags::from_session(&session).bypass_permissions);
+    }
+
+    #[test]
+    fn for_dispatch_maps_flags_onto_context() {
+        let (tx, _rx) = mpsc::channel(1);
+        let ctx = ToolExecutionContext::for_dispatch(
+            "s1",
+            "call-1",
+            &tx,
+            &[],
+            ToolExecutionSessionFlags { bypass_permissions: true },
+        );
+        assert_eq!(ctx.session_id, Some("s1"));
+        assert!(ctx.bypass_permissions);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -84,6 +183,7 @@ mod tests {
             tool_call_id: "call_1",
             event_tx: Some(&tx),
             available_tool_schemas: None,
+            bypass_permissions: false,
         };
 
         tokio::time::timeout(
@@ -110,6 +210,7 @@ mod tests {
             tool_call_id: "call_123",
             event_tx: Some(&tx),
             available_tool_schemas: None,
+            bypass_permissions: false,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -138,6 +239,7 @@ mod tests {
             tool_call_id: "call_456",
             event_tx: Some(&tx),
             available_tool_schemas: None,
+            bypass_permissions: false,
         };
 
         // Test with various non-Token events
@@ -177,6 +279,7 @@ mod tests {
             tool_call_id: "call_abc",
             event_tx: Some(&tx),
             available_tool_schemas: None,
+            bypass_permissions: false,
         };
 
         ctx.emit_tool_token("convenient output").await;
@@ -227,6 +330,7 @@ mod tests {
             tool_call_id: "call_clone",
             event_tx: Some(&tx),
             available_tool_schemas: None,
+            bypass_permissions: false,
         };
 
         let cloned = ctx.cloned_sender();
@@ -250,6 +354,7 @@ mod tests {
             tool_call_id: "call_multi",
             event_tx: Some(&tx),
             available_tool_schemas: None,
+            bypass_permissions: false,
         };
 
         for i in 0..5 {
@@ -278,6 +383,7 @@ mod tests {
             tool_call_id: "call_copy",
             event_tx: Some(&tx),
             available_tool_schemas: None,
+            bypass_permissions: false,
         };
 
         // Can clone (Copy implies Clone)
@@ -305,6 +411,7 @@ mod tests {
             tool_call_id: "",
             event_tx: Some(&tx),
             available_tool_schemas: None,
+            bypass_permissions: false,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -329,6 +436,7 @@ mod tests {
             tool_call_id: "调用_123",
             event_tx: Some(&tx),
             available_tool_schemas: None,
+            bypass_permissions: false,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -357,6 +465,7 @@ mod tests {
             tool_call_id: "call-with_special.chars:123",
             event_tx: Some(&tx),
             available_tool_schemas: None,
+            bypass_permissions: false,
         };
 
         ctx.emit(AgentEvent::Token {
@@ -381,6 +490,7 @@ mod tests {
             tool_call_id: "call_string",
             event_tx: Some(&tx),
             available_tool_schemas: None,
+            bypass_permissions: false,
         };
 
         let content = String::from("owned string");
@@ -403,6 +513,7 @@ mod tests {
             tool_call_id: "call_str",
             event_tx: Some(&tx),
             available_tool_schemas: None,
+            bypass_permissions: false,
         };
 
         ctx.emit_tool_token("string slice").await;

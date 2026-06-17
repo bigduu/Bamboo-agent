@@ -121,6 +121,7 @@ pub async fn execute_tool(
                 tool_call_id: &call.id,
                 event_tx: None,
                 available_tool_schemas: Some(available_tool_schemas.as_slice()),
+                bypass_permissions: false,
             },
         )
         .await

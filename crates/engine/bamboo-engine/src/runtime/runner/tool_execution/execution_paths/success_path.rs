@@ -30,7 +30,13 @@ pub(super) async fn handle_successful_tool_result(ctx: SuccessPathContext<'_>) -
 
     workspace::maybe_apply_workspace_update(ctx.session, ctx.tool_call, ctx.result, ctx.session_id);
 
-    goal::maybe_apply_goal_update(ctx.session, ctx.tool_call, ctx.result, ctx.config, ctx.round);
+    goal::maybe_apply_goal_update(
+        ctx.session,
+        ctx.tool_call,
+        ctx.result,
+        ctx.config,
+        ctx.round,
+    );
 
     if clarification::maybe_handle_user_question_tool(
         ctx.tool_call,

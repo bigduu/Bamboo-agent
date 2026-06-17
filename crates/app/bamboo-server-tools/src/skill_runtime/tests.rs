@@ -123,6 +123,7 @@ Use this demo skill."#,
         tool_call_id: "tool-call-1",
         event_tx: None,
         available_tool_schemas: None,
+        bypass_permissions: false,
     };
 
     let error = tool
@@ -185,6 +186,7 @@ Use this demo skill."#,
         tool_call_id: "tool-call-2",
         event_tx: None,
         available_tool_schemas: None,
+        bypass_permissions: false,
     };
 
     let _ = tool
@@ -253,12 +255,14 @@ Use this demo skill."#,
         tool_call_id: "tool-call-load",
         event_tx: None,
         available_tool_schemas: None,
+        bypass_permissions: false,
     };
     let read_ctx = ToolExecutionContext {
         session_id: Some(session_id),
         tool_call_id: "tool-call-read",
         event_tx: None,
         available_tool_schemas: None,
+        bypass_permissions: false,
     };
 
     let _ = load_tool

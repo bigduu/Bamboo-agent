@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 // Re-export PermissionMode from the shared location in bamboo-infrastructure
 pub use bamboo_config::settings::PermissionMode;
 
+use crate::rule_parser::ParsedRule;
+
 /// Types of permissions that can be granted
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -599,6 +601,12 @@ pub struct PermissionConfig {
     /// Defaults to `Low` (confirm everything) to preserve legacy behavior; the
     /// server sets it to `High` for the "ask on high-risk" posture.
     confirm_threshold: RwLock<RiskLevel>,
+    /// "Always ask" rules: tool-call patterns (e.g. `Bash(rm -rf *)`,
+    /// `Bash(git push *)`) that force a user confirmation EVEN under bypass or
+    /// other permissive modes. Built-in dangerous-command detection
+    /// (`bash_security` Deny verdict) is layered on top of these. See
+    /// [`PermissionConfig::requires_forced_confirmation`].
+    ask_rules: RwLock<Vec<ParsedRule>>,
 }
 
 impl Default for PermissionConfig {
@@ -617,6 +625,7 @@ impl PermissionConfig {
             enabled: AtomicBool::new(true),
             mode: RwLock::new(PermissionMode::Default),
             confirm_threshold: RwLock::new(RiskLevel::Low),
+            ask_rules: RwLock::new(Vec::new()),
         }
     }
 
@@ -629,6 +638,7 @@ impl PermissionConfig {
             enabled: AtomicBool::new(enabled),
             mode: RwLock::new(PermissionMode::Default),
             confirm_threshold: RwLock::new(RiskLevel::Low),
+            ask_rules: RwLock::new(Vec::new()),
         }
     }
 
@@ -670,6 +680,60 @@ impl PermissionConfig {
             .confirm_threshold
             .write()
             .expect("confirm_threshold lock poisoned") = threshold;
+    }
+
+    /// Replace the "always ask" rules from a list of pattern strings (e.g.
+    /// `["Bash(rm -rf *)", "Bash(git push *)"]`). Unparseable entries degrade to
+    /// a bare tool-name match per [`ParsedRule::parse`].
+    pub fn set_ask_rules(&self, patterns: impl IntoIterator<Item = String>) {
+        let parsed = patterns
+            .into_iter()
+            .map(|p| ParsedRule::parse(&p))
+            .collect();
+        *self.ask_rules.write().expect("ask_rules lock poisoned") = parsed;
+    }
+
+    /// The configured "always ask" rules rendered back to pattern strings, for
+    /// persistence (round-trips `Tool` and `Tool(pattern)` forms).
+    pub fn ask_rule_patterns(&self) -> Vec<String> {
+        self.ask_rules
+            .read()
+            .expect("ask_rules lock poisoned")
+            .iter()
+            .map(|rule| match &rule.pattern {
+                Some(pattern) => format!("{}({})", rule.tool_name, pattern),
+                None => rule.tool_name.clone(),
+            })
+            .collect()
+    }
+
+    /// Whether this tool call must force a user confirmation regardless of the
+    /// active permission mode (including `BypassPermissions`). True when:
+    /// - the command is a built-in hard-dangerous shell command (a
+    ///   `bash_security` `Deny` verdict), or
+    /// - it matches a configured "always ask" rule.
+    pub fn requires_forced_confirmation(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> bool {
+        // Built-in backstop: hard-dangerous shell commands always ask.
+        if tool_name.eq_ignore_ascii_case("Bash") {
+            if let Some(command) = args.get("command").and_then(|v| v.as_str()) {
+                if crate::bash_security::analyze_command(command).verdict
+                    == crate::bash_security::BashVerdict::Deny
+                {
+                    return true;
+                }
+            }
+        }
+
+        // Configured "always ask" rules.
+        self.ask_rules
+            .read()
+            .expect("ask_rules lock poisoned")
+            .iter()
+            .any(|rule| rule.matches_tool_call(tool_name, args))
     }
 
     /// Get the session grant duration
@@ -805,6 +869,7 @@ impl PermissionConfig {
             session_grant_duration_secs: self.session_grant_duration.as_secs(),
             mode: Some(self.mode()),
             confirm_threshold: Some(self.confirm_threshold()),
+            ask_rules: self.ask_rule_patterns(),
         }
     }
 
@@ -818,6 +883,11 @@ impl PermissionConfig {
 
         let mode = config.mode.unwrap_or_default();
         let confirm_threshold = config.confirm_threshold.unwrap_or(RiskLevel::Low);
+        let ask_rules = config
+            .ask_rules
+            .iter()
+            .map(|p| ParsedRule::parse(p))
+            .collect();
 
         Self {
             whitelist,
@@ -826,6 +896,7 @@ impl PermissionConfig {
             enabled: AtomicBool::new(config.enabled),
             mode: RwLock::new(mode),
             confirm_threshold: RwLock::new(confirm_threshold),
+            ask_rules: RwLock::new(ask_rules),
         }
     }
 
@@ -865,6 +936,22 @@ impl PermissionConfig {
         // Enabled flag from other takes precedence
         merged.set_enabled(other.is_enabled());
 
+        // "Always ask" rules: union of both, other's appended after self's.
+        let mut ask_rules = self
+            .ask_rules
+            .read()
+            .expect("ask_rules lock poisoned")
+            .clone();
+        ask_rules.extend(
+            other
+                .ask_rules
+                .read()
+                .expect("ask_rules lock poisoned")
+                .iter()
+                .cloned(),
+        );
+        *merged.ask_rules.write().expect("ask_rules lock poisoned") = ask_rules;
+
         merged
     }
 }
@@ -877,6 +964,10 @@ pub struct SerializablePermissionConfig {
     pub mode: Option<PermissionMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm_threshold: Option<RiskLevel>,
+    /// "Always ask" rule patterns (e.g. `Bash(rm -rf *)`) that force a prompt
+    /// even under bypass. See [`PermissionConfig::requires_forced_confirmation`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ask_rules: Vec<String>,
 }
 
 impl Default for SerializablePermissionConfig {
@@ -887,6 +978,7 @@ impl Default for SerializablePermissionConfig {
             session_grant_duration_secs: 30 * 60, // 30 minutes
             mode: None,
             confirm_threshold: None,
+            ask_rules: Vec::new(),
         }
     }
 }
@@ -1571,5 +1663,53 @@ mod integration_tests {
         let json = r#"{"whitelist":[],"enabled":true,"session_grant_duration_secs":1800}"#;
         let restored = PermissionConfig::from_serializable(serde_json::from_str(json).unwrap());
         assert_eq!(restored.confirm_threshold(), RiskLevel::Low);
+    }
+
+    #[test]
+    fn forced_confirmation_builtin_dangerous_command() {
+        let config = PermissionConfig::new();
+        // Built-in detection: a hard-dangerous (Deny) shell command forces a
+        // prompt even with no configured ask rules.
+        assert!(config.requires_forced_confirmation(
+            "Bash",
+            &serde_json::json!({ "command": "eval 'cat /etc/passwd'" }),
+        ));
+        // A benign command is not forced.
+        assert!(!config.requires_forced_confirmation(
+            "Bash",
+            &serde_json::json!({ "command": "ls -la" }),
+        ));
+    }
+
+    #[test]
+    fn forced_confirmation_configured_ask_rule() {
+        let config = PermissionConfig::new();
+        config.set_ask_rules(["Bash(rm -rf *)".to_string(), "Write(/etc/**)".to_string()]);
+
+        assert!(config.requires_forced_confirmation(
+            "Bash",
+            &serde_json::json!({ "command": "rm -rf /tmp/data" }),
+        ));
+        assert!(config.requires_forced_confirmation(
+            "Write",
+            &serde_json::json!({ "file_path": "/etc/hosts" }),
+        ));
+        // Non-matching call is not forced.
+        assert!(!config.requires_forced_confirmation(
+            "Bash",
+            &serde_json::json!({ "command": "git status" }),
+        ));
+    }
+
+    #[test]
+    fn ask_rules_round_trip_through_serialization() {
+        let config = PermissionConfig::new();
+        config.set_ask_rules(["Bash(rm -rf *)".to_string(), "Read".to_string()]);
+        let json = serde_json::to_string(&config.to_serializable()).unwrap();
+        let restored = PermissionConfig::from_serializable(serde_json::from_str(&json).unwrap());
+        assert_eq!(
+            restored.ask_rule_patterns(),
+            vec!["Bash(rm -rf *)".to_string(), "Read".to_string()]
+        );
     }
 }

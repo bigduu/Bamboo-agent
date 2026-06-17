@@ -256,7 +256,10 @@ mod tests {
         assert_eq!(loaded.declared_at_round, Some(4));
         assert_eq!(loaded.continuation_count, 2);
         assert_eq!(loaded.eval_history.len(), 1);
-        assert_eq!(loaded.eval_history[0].next_action.as_deref(), Some("write the e2e test"));
+        assert_eq!(
+            loaded.eval_history[0].next_action.as_deref(),
+            Some("write the e2e test")
+        );
     }
 
     #[test]

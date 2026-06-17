@@ -291,6 +291,7 @@ fn ctx_for<'a>(session_id: &'a str, tool_call_id: &'static str) -> ToolExecution
         tool_call_id,
         event_tx: None,
         available_tool_schemas: None,
+        bypass_permissions: false,
     }
 }
 
@@ -489,6 +490,7 @@ async fn create_emits_sub_agent_started_event_after_queueing() {
                 tool_call_id: "tool_call_1",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -555,6 +557,7 @@ async fn create_uses_async_subagent_model_resolver() {
                 tool_call_id: "tool_call_async_resolver",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -595,6 +598,7 @@ async fn resident_create_reuses_same_child_session() {
         tool_call_id: tcid,
         event_tx: None,
         available_tool_schemas: None,
+        bypass_permissions: false,
     };
     let create = |name_task: &'static str, prompt: &'static str| {
         json!({
@@ -716,6 +720,7 @@ async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create(
                 tool_call_id: "tool_call_legacy",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -748,6 +753,7 @@ async fn send_message_appends_follow_up_without_replacing_history() {
                 tool_call_id: "tool_call_send_message",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -799,6 +805,7 @@ async fn send_message_queues_on_running_child_without_interrupt() {
                 tool_call_id: "tool_call_running",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -865,6 +872,7 @@ async fn send_message_can_interrupt_running_child() {
                 tool_call_id: "tool_call_interrupt_running",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -914,6 +922,7 @@ async fn send_message_can_queue_child_immediately() {
                 tool_call_id: "tool_call_queue",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -997,6 +1006,7 @@ async fn cancel_stops_running_child() {
                 tool_call_id: "tool_call_cancel",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -1023,6 +1033,7 @@ async fn list_returns_children() {
                 tool_call_id: "tool_call_list",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -1065,6 +1076,7 @@ async fn get_returns_runner_diagnostics() {
                 tool_call_id: "tool_call_get_diagnostics",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -1101,6 +1113,7 @@ async fn create_returns_duration_hint() {
                 tool_call_id: "tool_call_create_hint",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -1149,6 +1162,7 @@ async fn create_persists_explicit_reasoning_effort_to_child_session() {
                 tool_call_id: "tool_call_create_with_effort",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -1200,6 +1214,7 @@ async fn create_without_reasoning_effort_leaves_child_at_provider_default() {
                 tool_call_id: "tool_call_create_default_effort",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -1256,6 +1271,7 @@ async fn update_can_change_reasoning_effort_on_existing_child() {
                 tool_call_id: "tool_call_update_effort",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -1290,6 +1306,7 @@ async fn delete_removes_child() {
                 tool_call_id: "tool_call_delete",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -1326,6 +1343,7 @@ async fn create_requires_workspace() {
                 tool_call_id: "tool_call_no_workspace",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -1363,6 +1381,7 @@ async fn create_sets_child_workspace() {
                 tool_call_id: "tool_call_workspace",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await

@@ -212,6 +212,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                         tool_call_id: reexecute_tool_call_id.as_str(),
                         event_tx: Some(&mpsc_tx),
                         available_tool_schemas: None,
+                        bypass_permissions: false,
                     };
                     executor.execute_with_context(&tool_call, ctx).await
                 };

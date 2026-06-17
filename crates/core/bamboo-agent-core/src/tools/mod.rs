@@ -106,7 +106,7 @@ pub use agentic::{
     convert_from_standard_result, convert_to_standard_result, AgenticContext, AgenticTool,
     AgenticToolExecutor, AgenticToolResult, Interaction, InteractionRole, ToolGoal,
 };
-pub use context::ToolExecutionContext;
+pub use context::{ToolExecutionContext, ToolExecutionSessionFlags};
 pub use executor::{execute_tool_call, execute_tool_call_with_context, ToolError, ToolExecutor};
 pub use registry::{
     global_registry, normalize_tool_name, RegistryError, SharedTool, Tool, ToolRegistry,

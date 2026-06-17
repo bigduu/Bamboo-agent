@@ -56,6 +56,22 @@ pub async fn create_child_action(
         child.reasoning_effort = Some(effort);
     }
 
+    // Children inherit the parent's "bypass permissions" mode: a bypassed
+    // parent shouldn't be re-gated the moment it delegates work to a sub-agent.
+    // Seed the child's runtime state so the flag is live from its first run
+    // (startup carries it forward thereafter) and mirrored into the index.
+    if input
+        .parent_session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|state| state.bypass_permissions)
+    {
+        child
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .bypass_permissions = true;
+    }
+
     child.workspace = Some(input.workspace.clone());
     bamboo_agent_core::workspace_state::set_workspace(
         &child.id,

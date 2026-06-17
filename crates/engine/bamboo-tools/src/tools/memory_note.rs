@@ -189,6 +189,7 @@ mod tests {
                     tool_call_id: "tool_call_unknown",
                     event_tx: None,
                     available_tool_schemas: None,
+                    bypass_permissions: false,
                 },
             )
             .await;
@@ -205,6 +206,7 @@ mod tests {
                     tool_call_id: "tool_call_replace",
                     event_tx: None,
                     available_tool_schemas: None,
+                    bypass_permissions: false,
                 },
             )
             .await;
@@ -227,6 +229,7 @@ mod tests {
                     tool_call_id: "tool_call_append",
                     event_tx: None,
                     available_tool_schemas: None,
+                    bypass_permissions: false,
                 },
             )
             .await
@@ -243,6 +246,7 @@ mod tests {
                     tool_call_id: "tool_call_read",
                     event_tx: None,
                     available_tool_schemas: None,
+                    bypass_permissions: false,
                 },
             )
             .await
@@ -261,6 +265,7 @@ mod tests {
                     tool_call_id: "tool_call_list",
                     event_tx: None,
                     available_tool_schemas: None,
+                    bypass_permissions: false,
                 },
             )
             .await
@@ -277,6 +282,7 @@ mod tests {
                     tool_call_id: "tool_call_clear",
                     event_tx: None,
                     available_tool_schemas: None,
+                    bypass_permissions: false,
                 },
             )
             .await
@@ -299,6 +305,7 @@ mod tests {
                 tool_call_id: "tool_call_replace_long",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -312,6 +319,7 @@ mod tests {
                     tool_call_id: "tool_call_read_long",
                     event_tx: None,
                     available_tool_schemas: None,
+                    bypass_permissions: false,
                 },
             )
             .await
@@ -327,6 +335,7 @@ mod tests {
                 tool_call_id: "tool_call_replace_limit",
                 event_tx: None,
                 available_tool_schemas: None,
+                bypass_permissions: false,
             },
         )
         .await
@@ -340,6 +349,7 @@ mod tests {
                     tool_call_id: "tool_call_append_limit",
                     event_tx: None,
                     available_tool_schemas: None,
+                    bypass_permissions: false,
                 },
             )
             .await

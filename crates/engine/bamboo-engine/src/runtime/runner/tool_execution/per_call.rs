@@ -5,7 +5,8 @@ use tokio::sync::mpsc;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{
-    parse_tool_args_best_effort, ToolCall, ToolExecutionContext, ToolExecutor, ToolResult,
+    parse_tool_args_best_effort, ToolCall, ToolExecutionContext, ToolExecutionSessionFlags,
+    ToolExecutor, ToolResult,
 };
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_metrics::MetricsCollector;
@@ -38,6 +39,11 @@ pub(super) struct ToolExecutionOnlyContext<'a> {
     pub round: usize,
     pub tools: &'a Arc<dyn ToolExecutor>,
     pub config: &'a AgentLoopConfig,
+    /// Per-session execution flags (e.g. bypass permissions), derived from the
+    /// session via `ToolExecutionSessionFlags::from_session` at the call site
+    /// and threaded through so this (parallel-safe) path can apply them without
+    /// borrowing the session.
+    pub session_flags: ToolExecutionSessionFlags,
 }
 
 pub(super) struct ToolExecutionApplyContext<'a> {
@@ -133,12 +139,16 @@ pub(super) async fn execute_tool_call_only(
 
     let tool_timer = std::time::Instant::now();
     let available_tool_schemas = ctx.tools.list_tools();
-    let tool_ctx = ToolExecutionContext {
-        session_id: Some(ctx.session_id),
-        tool_call_id: &ctx.tool_call.id,
-        event_tx: Some(ctx.event_tx),
-        available_tool_schemas: Some(available_tool_schemas.as_slice()),
-    };
+    // THIS is the live server tool-dispatch path (engine runtime). Build via
+    // `for_dispatch` so per-session flags stay in sync with the other loop
+    // (bamboo-agent-core's `result_handler.rs`).
+    let tool_ctx = ToolExecutionContext::for_dispatch(
+        ctx.session_id,
+        &ctx.tool_call.id,
+        ctx.event_tx,
+        available_tool_schemas.as_slice(),
+        ctx.session_flags,
+    );
 
     let result = bamboo_agent_core::tools::executor::execute_tool_call_with_context(
         ctx.tool_call,

@@ -7,6 +7,7 @@ mod access_control;
 mod bamboo_config;
 mod env_vars;
 mod keyword_masking;
+mod permission;
 mod provider;
 mod provider_instances;
 mod redaction;
@@ -26,6 +27,7 @@ pub use env_vars::{delete_env_var, list_env_vars, replace_env_vars, upsert_env_v
 pub use keyword_masking::{
     get_keyword_masking_config, update_keyword_masking_config, validate_keyword_entries,
 };
+pub use permission::{get_permission_ask_rules, update_permission_ask_rules};
 pub use provider::{
     fetch_catalog_models, fetch_provider_models, get_provider_catalog, get_provider_config,
     reload_provider_config, update_provider_config, UpdateProviderRequest,

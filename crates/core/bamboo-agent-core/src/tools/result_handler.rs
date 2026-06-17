@@ -7,7 +7,7 @@ use crate::composition::CompositionExecutor;
 use crate::tools::executor::execute_tool_call_with_context;
 use crate::tools::{
     convert_from_standard_result, AgenticToolResult, ToolCall, ToolError, ToolExecutionContext,
-    ToolExecutor, ToolResult,
+    ToolExecutionSessionFlags, ToolExecutor, ToolResult,
 };
 use crate::{AgentEvent, Message, PendingQuestionSource, Session};
 
@@ -370,12 +370,16 @@ pub async fn execute_sub_actions(
             })
             .await;
 
-        let tool_ctx = ToolExecutionContext {
-            session_id: Some(&session.id),
-            tool_call_id: &action.id,
-            event_tx: Some(event_tx),
-            available_tool_schemas: Some(available_tools.as_slice()),
-        };
+        // NOTE: this is bamboo-agent-core's own loop; the bamboo SERVER runs the
+        // bamboo-engine runtime (`tool_execution/per_call.rs`). Both build the
+        // context via `for_dispatch` so per-session flags stay in sync.
+        let tool_ctx = ToolExecutionContext::for_dispatch(
+            &session.id,
+            &action.id,
+            event_tx,
+            available_tools.as_slice(),
+            ToolExecutionSessionFlags::from_session(session),
+        );
 
         match execute_tool_call_with_context(&action, tools, composition_executor.clone(), tool_ctx)
             .await

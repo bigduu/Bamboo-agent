@@ -69,6 +69,11 @@ pub struct SessionSummary {
     pub running_child_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gold_config: Option<GoldConfig>,
+    /// Per-session "bypass permissions" toggle, read from the session's runtime
+    /// state. Only populated by the detail endpoint (which loads the full
+    /// session); list endpoints leave it `false`.
+    #[serde(default)]
+    pub bypass_permissions: bool,
 }
 
 impl SessionSummary {
@@ -104,6 +109,7 @@ impl SessionSummary {
             plan_mode: entry.plan_mode,
             running_child_count: 0,
             gold_config: parse_session_gold_config(entry.gold_config_json.as_deref()),
+            bypass_permissions: entry.bypass_permissions,
         }
     }
 }
@@ -221,6 +227,10 @@ pub struct PatchSessionRequest {
     pub clear_reasoning_effort: Option<bool>,
     #[serde(default)]
     pub gold_config: Option<serde_json::Value>,
+    /// Toggle the per-session "bypass permissions" mode. When `true`, tool
+    /// permission checks are skipped for this session only.
+    #[serde(default)]
+    pub bypass_permissions: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -352,6 +362,7 @@ mod tests {
     fn test_create_session_response_serialization() {
         let summary = SessionSummary {
             id: "test-id".to_string(),
+            bypass_permissions: false,
             kind: bamboo_agent_core::SessionKind::Root,
             title: "Test".to_string(),
             title_version: 0,
@@ -394,6 +405,7 @@ mod tests {
     fn test_get_session_response_serialization() {
         let summary = SessionSummary {
             id: "session-123".to_string(),
+            bypass_permissions: false,
             kind: bamboo_agent_core::SessionKind::Child,
             title: "My Session".to_string(),
             title_version: 0,
@@ -523,6 +535,7 @@ mod tests {
     fn test_session_summary_debug() {
         let summary = SessionSummary {
             id: "test".to_string(),
+            bypass_permissions: false,
             kind: bamboo_agent_core::SessionKind::Root,
             title: "Test".to_string(),
             title_version: 0,

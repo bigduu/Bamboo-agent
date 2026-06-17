@@ -198,6 +198,7 @@ mod tests {
                     tool_call_id: "call_1",
                     event_tx: None,
                     available_tool_schemas: None,
+                    bypass_permissions: false,
                 },
             )
             .await
@@ -225,6 +226,7 @@ mod tests {
                     tool_call_id: "call_1",
                     event_tx: None,
                     available_tool_schemas: None,
+                    bypass_permissions: false,
                 },
             )
             .await
@@ -240,6 +242,7 @@ mod tests {
                     tool_call_id: "call_2",
                     event_tx: None,
                     available_tool_schemas: None,
+                    bypass_permissions: false,
                 },
             )
             .await
@@ -263,6 +266,7 @@ mod tests {
                     tool_call_id: "call_1",
                     event_tx: None,
                     available_tool_schemas: None,
+                    bypass_permissions: false,
                 },
             )
             .await

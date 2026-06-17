@@ -19,11 +19,7 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     /// a no-op so non-file-backed persisters are unaffected.
     ///
     /// [`Storage::append_token_usage_record`]: crate::storage::Storage::append_token_usage_record
-    async fn append_token_usage_record(
-        &self,
-        session_id: &str,
-        json_line: &str,
-    ) -> io::Result<()> {
+    async fn append_token_usage_record(&self, session_id: &str, json_line: &str) -> io::Result<()> {
         let _ = (session_id, json_line);
         Ok(())
     }
@@ -35,11 +31,7 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
         (**self).save_runtime_session(session).await
     }
 
-    async fn append_token_usage_record(
-        &self,
-        session_id: &str,
-        json_line: &str,
-    ) -> io::Result<()> {
+    async fn append_token_usage_record(&self, session_id: &str, json_line: &str) -> io::Result<()> {
         (**self)
             .append_token_usage_record(session_id, json_line)
             .await
