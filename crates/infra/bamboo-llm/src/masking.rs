@@ -24,6 +24,13 @@ use serde_json::Value;
 /// thinking-signature verification, or corrupt base64/encrypted payloads, so their
 /// direct string value is never masked. (Nested objects/arrays under such a key are
 /// still scanned normally — only the immediate string is exempt.)
+///
+/// ASSUMPTION: these positions carry protocol tokens (IDs, enums, names, MIME
+/// types, URIs, base64) — NOT user free text. A secret deliberately embedded in one
+/// of them (e.g. a credential in a `url`/`fileUri` query string) therefore ships
+/// UNMASKED; that is an accepted trade-off (masking these would corrupt the wire).
+/// Both snake_case (OpenAI/Anthropic) and camelCase (Gemini) spellings are listed so
+/// the exemption is consistent across wire formats.
 const STRUCTURAL_KEYS: &[&str] = &[
     // Identifiers / correlation
     "id",
@@ -43,11 +50,13 @@ const STRUCTURAL_KEYS: &[&str] = &[
     "model",
     "name",
     "url",
+    "fileUri", // Gemini file URI (aligns with `url`)
     // Opaque / verification / binary
     "signature",
     "encrypted_content",
     "data",
     "media_type",
+    "mimeType", // Gemini MIME type (aligns with `media_type`)
 ];
 
 /// Mask keyword matches in every non-structural string value of an outbound request
@@ -192,5 +201,51 @@ mod tests {
         // Second pass changes nothing (the keyword is already gone).
         mask_outbound_body(&mut body, &cfg);
         assert_eq!(body["content"], "a [MASKED]");
+    }
+
+    #[test]
+    fn gemini_camelcase_structural_keys_are_exempt_like_snake_case() {
+        // Gemini serializes to camelCase; mimeType/fileUri are the binary/URI routing
+        // tokens that align with OpenAI/Anthropic's media_type/url and must be exempt
+        // (matching across wire formats), while surrounding text is still masked.
+        let mut body = json!({
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    { "text": "a secret prompt" },
+                    { "inlineData": { "mimeType": "secret/type", "data": "c2VjcmV0" } },
+                    { "fileData": { "mimeType": "x/secret", "fileUri": "gs://b/secret.png" } }
+                ]
+            }]
+        });
+        mask_outbound_body(&mut body, &config("secret"));
+        let part = |i: usize| &body["contents"][0]["parts"][i];
+        assert_eq!(part(0)["text"], "a [MASKED] prompt"); // free text masked
+        assert_eq!(part(1)["inlineData"]["mimeType"], "secret/type"); // exempt
+        assert_eq!(part(1)["inlineData"]["data"], "c2VjcmV0"); // base64 exempt
+        assert_eq!(part(2)["fileData"]["mimeType"], "x/secret"); // exempt
+        assert_eq!(part(2)["fileData"]["fileUri"], "gs://b/secret.png"); // exempt
+    }
+
+    #[test]
+    fn documented_residual_keyword_equal_to_a_json_key_inside_arguments_rewrites_the_key() {
+        // LOCKS the one documented residual (flagged by review): `arguments` is a
+        // JSON-encoded STRING masked as opaque text, so a keyword that collides with a
+        // JSON key inside it rewrites that key — corrupting the args. This pins the
+        // CURRENT behavior so any future change (e.g. JSON-aware masking) is deliberate.
+        let mut body = json!({
+            "input": [{
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "search",
+                "arguments": "{\"q\":\"hello\"}"
+            }]
+        });
+        // A pathological keyword equal to the JSON key `q`.
+        mask_outbound_body(&mut body, &config("q"));
+        assert_eq!(
+            body["input"][0]["arguments"], "{\"[MASKED]\":\"hello\"}",
+            "documented residual: keyword==JSON key corrupts tool-arg JSON (accepted trade-off)"
+        );
     }
 }
