@@ -11,27 +11,23 @@ pub(crate) use external_memory::{
     PromptMemoryRuntimeContext, EXTERNAL_MEMORY_RENDERED_KEY, PROMPT_MEMORY_OBSERVABILITY_KEY,
 };
 
-pub(crate) async fn inject_external_memory_into_system_message(
+pub(crate) async fn refresh_external_memory_context(
     session: &mut bamboo_agent_core::Session,
     prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
 ) {
-    external_memory::inject_external_memory_into_system_message(
-        session,
-        prompt_memory_flags,
-        runtime_context,
-    )
-    .await;
+    external_memory::refresh_external_memory_context(session, prompt_memory_flags, runtime_context)
+        .await;
 }
 
 #[cfg(test)]
-pub(super) async fn inject_external_memory_into_system_message_with_store(
+pub(super) async fn refresh_external_memory_context_with_store(
     session: &mut bamboo_agent_core::Session,
     memory: &bamboo_memory::memory_store::MemoryStore,
     prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
 ) {
-    external_memory::inject_external_memory_into_system_message_with_store(
+    external_memory::refresh_external_memory_context_with_store(
         session,
         memory,
         prompt_memory_flags,

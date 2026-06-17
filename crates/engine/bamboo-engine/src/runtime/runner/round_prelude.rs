@@ -13,8 +13,7 @@ use bamboo_llm::LLMProvider;
 use bamboo_metrics::MetricsCollector;
 
 use super::prompt_context::{
-    inject_external_memory_into_system_message, PromptMemoryRuntimeContext,
-    PROMPT_MEMORY_OBSERVABILITY_KEY,
+    refresh_external_memory_context, PromptMemoryRuntimeContext, PROMPT_MEMORY_OBSERVABILITY_KEY,
 };
 use super::session_setup::prompt_setup::{persist_prompt_snapshot_metadata, PromptAssemblyReport};
 use bamboo_agent_core::PromptSnapshot;
@@ -43,7 +42,7 @@ pub(crate) async fn refresh_round_prompt_context(
     prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
 ) {
-    inject_external_memory_into_system_message(session, prompt_memory_flags, runtime_context).await;
+    refresh_external_memory_context(session, prompt_memory_flags, runtime_context).await;
     // Task list, goal, plan-mode, and plan-runtime context are NOT injected into
     // the system message — they are built as dedicated volatile blocks directly
     // from session state during request assembly (cache-stable system prefix).

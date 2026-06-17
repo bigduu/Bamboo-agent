@@ -149,13 +149,13 @@ fn count_chars(value: &str) -> usize {
     value.chars().count()
 }
 
-pub(super) async fn inject_external_memory_into_system_message(
+pub(super) async fn refresh_external_memory_context(
     session: &mut Session,
     prompt_memory_flags: PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
 ) {
     let memory = MemoryStore::with_defaults();
-    inject_external_memory_into_system_message_with_store(
+    refresh_external_memory_context_with_store(
         session,
         &memory,
         prompt_memory_flags,
@@ -164,7 +164,7 @@ pub(super) async fn inject_external_memory_into_system_message(
     .await;
 }
 
-pub(super) async fn inject_external_memory_into_system_message_with_store(
+pub(super) async fn refresh_external_memory_context_with_store(
     session: &mut Session,
     memory: &MemoryStore,
     prompt_memory_flags: PromptMemoryFlags,
